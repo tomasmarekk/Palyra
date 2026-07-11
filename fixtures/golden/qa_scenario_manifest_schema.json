@@ -99,7 +99,25 @@
     "record_replay",
     "live"
   ],
-  "schema_version": 4,
+  "runtime_path_evidence_schema_version": 1,
+  "runtime_path_expectation_fields": [
+    "runtime_contract_version",
+    "provider_lane",
+    "attempt_owner",
+    "harness_id",
+    "context_engine_id",
+    "mcp_transport_mode",
+    "max_fallback_count",
+    "allowed_fallback_reason_codes"
+  ],
+  "mcp_transport_modes": [
+    "per_call",
+    "persistent"
+  ],
+  "schema_v5_required_expect_fields": [
+    "runtime_path"
+  ],
+  "schema_version": 5,
   "step_actions": [
     "user_prompt",
     "tool_result",
@@ -110,7 +128,8 @@
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "terminal_states": [
     "completed",

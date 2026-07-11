@@ -39,16 +39,7 @@ pub(crate) async fn transition_run_stream_to_cancelled(
     run_id: &str,
     tape_seq: &mut i64,
 ) -> Result<(), Status> {
-    run_state
-        .transition(RunTransition::Cancel)
-        .map_err(|error| Status::internal(error.to_string()))?;
-    runtime_state
-        .update_orchestrator_run_state(
-            run_id.to_owned(),
-            RunLifecycleState::Cancelled,
-            Some(CANCELLED_REASON.to_owned()),
-        )
-        .await?;
+    transition_run_stream_state_to_cancelled(runtime_state, run_state, run_id).await?;
     runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
     // The wire status is Failed (the proto has no dedicated cancelled kind);
     // the tape payload maps CANCELLED_REASON to the "cancelled" lifecycle so
@@ -67,5 +58,34 @@ pub(crate) async fn transition_run_stream_to_cancelled(
         let _ = sender.send(Err(error)).await;
     }
     cleanup_run_resources(runtime_state, run_id, CANCELLED_REASON).await;
+    Ok(())
+}
+
+/// Applies and persists the canonical cancelled transition without emitting terminal effects.
+///
+/// This lower-level boundary lets finalizers insert durable evidence before
+/// the terminal status while ordinary cancellation paths retain the shared
+/// status and cleanup behavior above.
+///
+/// # Errors
+///
+/// Returns `Status::internal` when the state machine rejects the transition,
+/// or a journal error when the cancelled state cannot be persisted.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn transition_run_stream_state_to_cancelled(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_state: &mut RunStateMachine,
+    run_id: &str,
+) -> Result<(), Status> {
+    run_state
+        .transition(RunTransition::Cancel)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    runtime_state
+        .update_orchestrator_run_state(
+            run_id.to_owned(),
+            RunLifecycleState::Cancelled,
+            Some(CANCELLED_REASON.to_owned()),
+        )
+        .await?;
     Ok(())
 }

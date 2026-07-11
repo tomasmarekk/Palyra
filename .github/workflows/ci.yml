@@ -371,6 +371,14 @@ jobs:
       - name: Run QA Lab PR smoke gate
         run: cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/pr_smoke.yaml --output-json artifacts/qa-lab/pr-smoke.json --output-markdown artifacts/qa-lab/pr-smoke.md --json
 
+      - name: Run replay baseline gate
+        env:
+          PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad
+        run: |
+          test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
+          mkdir -p artifacts/qa-lab/baseline-replay
+          cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/baseline_replay.yaml --output-json artifacts/qa-lab/baseline-replay/baseline-replay.json --output-markdown artifacts/qa-lab/baseline-replay/baseline-replay.md --json
+
       - name: Upload QA Lab reports
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

@@ -44,8 +44,9 @@ pub use contract::{
     ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
     ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
     ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
-    ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
-    DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE, MAX_PROVIDER_TURN_TEXT_BYTES,
+    ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext, TerminalOutcomeClass,
+    TerminalOutcomeClassification, DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE,
+    MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 pub use discovery::{
     is_openai_chatgpt_oauth_client_id, parse_discovered_model_ids,

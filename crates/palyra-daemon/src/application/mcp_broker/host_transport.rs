@@ -4,6 +4,10 @@ use super::host_types::default_resource_mime_type;
 use super::*;
 
 impl McpTransport for McpRuntimeTransport {
+    fn invocation_mode(&self, _manifest: &McpServerManifest) -> McpTransportInvocationMode {
+        McpTransportInvocationMode::PerCall
+    }
+
     fn start(&self, manifest: &McpServerManifest) -> Result<(), McpBrokerError> {
         match &manifest.transport {
             McpTransportManifest::Stdio { .. } => {

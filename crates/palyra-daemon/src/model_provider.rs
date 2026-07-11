@@ -28,6 +28,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use palyra_common::qa_runtime_path::{
+    qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256, qa_provider_binding_sha256,
+    ProviderLaneAttestationEvent, ProviderLiveBindingMetadata, PROVIDER_LANE_ATTESTATION_EVENT,
+    PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION, QA_PROVIDER_FIXTURE_MATERIALIZATION,
+    QA_PROVIDER_LIVE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+};
 use reqwest::{header::RETRY_AFTER, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -92,7 +98,8 @@ pub use palyra_model_providers::{
     ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
     ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
     ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
-    ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+    ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext, TerminalOutcomeClass,
+    TerminalOutcomeClassification,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -1190,6 +1197,9 @@ impl RegistryBackedModelProvider {
         response.retry_count = 0;
         response.served_from_cache = true;
         response.failover_count = 0;
+        // A cache hit did not execute the provider adapter for this request,
+        // so it cannot supply authoritative per-run QA lane evidence.
+        response.qa_lane_attestation = None;
         response.attempts = vec![provider_attempt_summary(
             model.provider_id.clone(),
             model.model_id.clone(),
@@ -1457,6 +1467,13 @@ impl ModelProvider for RegistryBackedModelProvider {
                     cached.failover_count = failover_count;
                     rebind_provider_attempts(&mut cached.attempts, attempts.len(), model, runtime);
                     cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
+                    cached.qa_lane_attestation = qa_registry_provider_lane_attestation(
+                        request.qa_attestation_context.as_ref(),
+                        cached.qa_lane_attestation.take(),
+                        &self.config,
+                        model,
+                        runtime,
+                    )?;
                     self.record_runtime_metrics(
                         false,
                         cached.prompt_tokens,
@@ -1474,6 +1491,13 @@ impl ModelProvider for RegistryBackedModelProvider {
                     Ok(mut response) => {
                         response.provider_id = model.provider_id.clone();
                         response.model_id = model.model_id.clone();
+                        response.qa_lane_attestation = qa_registry_provider_lane_attestation(
+                            request.qa_attestation_context.as_ref(),
+                            response.qa_lane_attestation.take(),
+                            &self.config,
+                            model,
+                            runtime,
+                        )?;
                         response.served_from_cache = false;
                         response.failover_count = failover_count;
                         let outcome = if index == 0 { "success" } else { "failover_success" };
@@ -2008,6 +2032,8 @@ fn build_registry_provider_runtime(
         service_tier: base_config.service_tier,
         qa_mock_fixture_path: base_config.qa_mock_fixture_path.clone(),
         qa_mock_fixture_enabled: base_config.qa_mock_fixture_enabled,
+        qa_execution_key_digest: base_config.qa_execution_key_digest.clone(),
+        qa_provider_binding_sha256: base_config.qa_provider_binding_sha256.clone(),
         request_timeout_ms: entry.request_timeout_ms,
         max_retries: entry.max_retries,
         retry_backoff_ms: entry.retry_backoff_ms,
@@ -2075,8 +2101,17 @@ fn build_registry_provider_runtime(
 #[derive(Debug)]
 struct DeterministicProvider {
     config: ModelProviderConfig,
-    qa_mock_fixture: Option<QaMockProviderFixture>,
+    qa_mock_fixture: Option<QaMockProviderRuntimeBinding>,
     runtime_metrics: Mutex<ProviderRuntimeMetrics>,
+}
+
+#[derive(Debug)]
+struct QaMockProviderRuntimeBinding {
+    fixture: QaMockProviderFixture,
+    provider_lane: &'static str,
+    materialization_kind: &'static str,
+    materialized_input_sha256: String,
+    provider_binding_sha256: String,
 }
 
 impl DeterministicProvider {
@@ -2109,7 +2144,7 @@ impl DeterministicProvider {
 
 fn load_qa_mock_provider_fixture(
     config: &ModelProviderConfig,
-) -> Result<Option<QaMockProviderFixture>> {
+) -> Result<Option<QaMockProviderRuntimeBinding>> {
     let Some(path) = config.qa_mock_fixture_path.as_deref() else {
         return Ok(None);
     };
@@ -2118,11 +2153,118 @@ fn load_qa_mock_provider_fixture(
             "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
         );
     }
-    let text = fs::read_to_string(path)
+    let bytes = fs::read(path)
         .with_context(|| format!("failed to read QA mock-provider fixture {}", path.display()))?;
-    parse_qa_mock_provider_fixture_yaml(text.as_str())
-        .with_context(|| format!("failed to parse QA mock-provider fixture {}", path.display()))
-        .map(Some)
+    let text = std::str::from_utf8(bytes.as_slice()).with_context(|| {
+        format!("QA mock-provider fixture {} is not valid UTF-8", path.display())
+    })?;
+    let fixture = parse_qa_mock_provider_fixture_yaml(text)
+        .with_context(|| format!("failed to parse QA mock-provider fixture {}", path.display()))?;
+    let (provider_lane, materialization_kind) = if fixture.capture_provenance().is_some() {
+        ("record_replay", QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION)
+    } else {
+        ("fixture", QA_PROVIDER_FIXTURE_MATERIALIZATION)
+    };
+    let materialized_input_sha256 = crate::sha256_hex(bytes.as_slice());
+    let provider_binding_sha256 = qa_provider_binding_sha256(
+        provider_lane,
+        materialization_kind,
+        materialized_input_sha256.as_str(),
+    )
+    .context("failed to derive QA provider fixture binding digest")?;
+    Ok(Some(QaMockProviderRuntimeBinding {
+        fixture,
+        provider_lane,
+        materialization_kind,
+        materialized_input_sha256,
+        provider_binding_sha256,
+    }))
+}
+
+fn qa_provider_lane_attestation(
+    context: Option<&QaProviderAttestationContext>,
+    provider_id: &str,
+    model_id: &str,
+    runtime_binding: Option<&QaMockProviderRuntimeBinding>,
+) -> Option<ProviderLaneAttestationEvent> {
+    let context = context?;
+    let runtime_binding = runtime_binding?;
+    Some(ProviderLaneAttestationEvent {
+        schema_version: PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION,
+        event_name: PROVIDER_LANE_ATTESTATION_EVENT.to_owned(),
+        execution_key_digest: context.execution_key_digest.clone(),
+        provider_binding_sha256: runtime_binding.provider_binding_sha256.clone(),
+        provider_lane: runtime_binding.provider_lane.to_owned(),
+        materialization_kind: runtime_binding.materialization_kind.to_owned(),
+        materialized_input_sha256: Some(runtime_binding.materialized_input_sha256.clone()),
+        live_binding: None,
+        provider_id: provider_id.to_owned(),
+        model_id: model_id.to_owned(),
+    })
+}
+
+fn qa_registry_provider_lane_attestation(
+    context: Option<&QaProviderAttestationContext>,
+    existing: Option<ProviderLaneAttestationEvent>,
+    base_config: &ModelProviderConfig,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+) -> Result<Option<ProviderLaneAttestationEvent>, ProviderError> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    if let Some(mut attestation) = existing {
+        attestation.execution_key_digest.clone_from(&context.execution_key_digest);
+        attestation.provider_id.clone_from(&model.provider_id);
+        attestation.model_id.clone_from(&model.model_id);
+        return Ok(Some(attestation));
+    }
+    if runtime.entry.kind == ModelProviderKind::Deterministic {
+        return Ok(None);
+    }
+
+    let auth_profile_id = runtime
+        .entry
+        .auth_profile_id
+        .as_deref()
+        .or(base_config.auth_profile_id.as_deref())
+        .ok_or(ProviderError::StatePoisoned)?;
+    let auth_provider_kind = runtime
+        .entry
+        .auth_profile_provider_kind
+        .or(base_config.auth_profile_provider_kind)
+        .ok_or(ProviderError::StatePoisoned)?;
+    let base_url = runtime.entry.base_url.as_deref().unwrap_or(match runtime.entry.kind {
+        ModelProviderKind::OpenAiCompatible => base_config.openai_base_url.as_str(),
+        ModelProviderKind::Anthropic => base_config.anthropic_base_url.as_str(),
+        ModelProviderKind::Deterministic => unreachable!("deterministic provider returned above"),
+    });
+    let live_binding = ProviderLiveBindingMetadata {
+        provider_kind: runtime.entry.kind.as_str().to_owned(),
+        auth_profile_id: auth_profile_id.to_owned(),
+        auth_provider_kind: auth_provider_kind.as_str().to_owned(),
+        base_url_sha256: qa_live_provider_base_url_sha256(base_url)
+            .map_err(|_| ProviderError::StatePoisoned)?,
+        raw_payload_storage: false,
+    };
+    let provider_binding_sha256 = qa_live_provider_binding_sha256(
+        model.provider_id.as_str(),
+        model.model_id.as_str(),
+        &live_binding,
+    )
+    .map_err(|_| ProviderError::StatePoisoned)?;
+    Ok(Some(ProviderLaneAttestationEvent {
+        schema_version: PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION,
+        event_name: PROVIDER_LANE_ATTESTATION_EVENT.to_owned(),
+        execution_key_digest: context.execution_key_digest.clone(),
+        provider_binding_sha256,
+        provider_lane: "live".to_owned(),
+        materialization_kind: QA_PROVIDER_LIVE_MATERIALIZATION.to_owned(),
+        materialized_input_sha256: None,
+        live_binding: Some(live_binding),
+        provider_id: model.provider_id.clone(),
+        model_id: model.model_id.clone(),
+    }))
 }
 
 struct QaMockProviderExecution {
@@ -2571,9 +2713,10 @@ impl ModelProvider for DeterministicProvider {
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
             let actual_model_id =
                 request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
-            let (output, retry_count, attempts) = if let Some(fixture) =
+            let (output, retry_count, attempts) = if let Some(runtime_binding) =
                 self.qa_mock_fixture.as_ref()
             {
+                let fixture = &runtime_binding.fixture;
                 let Some(turn) = qa_mock_provider_turn_for_request(fixture, &request) else {
                     let error = ProviderError::RequestFailed {
                         message: format!(
@@ -2672,10 +2815,16 @@ impl ModelProvider for DeterministicProvider {
                 completion_tokens,
                 retry_count,
                 provider_id: "deterministic-primary".to_owned(),
-                model_id: actual_model_id,
+                model_id: actual_model_id.clone(),
                 served_from_cache: false,
                 failover_count: 0,
                 attempts,
+                qa_lane_attestation: qa_provider_lane_attestation(
+                    request.qa_attestation_context.as_ref(),
+                    "deterministic-primary",
+                    actual_model_id.as_str(),
+                    self.qa_mock_fixture.as_ref(),
+                ),
             })
         })
     }
@@ -3241,9 +3390,12 @@ impl OpenAiCompatibleEmbeddingsProvider {
         for (position, item) in parsed.data.into_iter().enumerate() {
             let index = item.index.unwrap_or(position);
             if index >= ordered_vectors.len() {
-                return Err(AttemptError::invalid_response(format!(
-                    "openai-compatible embeddings response contained out-of-range vector index {index}"
-                ), "openai_compatible_embeddings_vector_index_out_of_range"));
+                return Err(AttemptError::invalid_response(
+                    format!(
+                        "openai-compatible embeddings response contained out-of-range vector index {index}"
+                    ),
+                    "openai_compatible_embeddings_vector_index_out_of_range",
+                ));
             }
             if ordered_vectors[index].is_some() {
                 return Err(AttemptError::invalid_response(
@@ -3287,9 +3439,9 @@ impl OpenAiCompatibleEmbeddingsProvider {
             if dimensions != expected_dimensions as usize {
                 return Err(AttemptError::invalid_response(
                     format!(
-                    "openai-compatible embeddings response returned dims {dimensions}, expected {}",
-                    expected_dimensions
-                ),
+                        "openai-compatible embeddings response returned dims {dimensions}, expected {}",
+                        expected_dimensions
+                    ),
                     "openai_compatible_embeddings_dims_mismatch",
                 ));
             }
@@ -3710,13 +3862,19 @@ impl OpenAiCompatibleProvider {
             failover_count: 0,
             attempts: vec![ProviderAttemptSummary {
                 provider_id: "openai-primary".to_owned(),
-                model_id: actual_model_id,
+                model_id: actual_model_id.clone(),
                 outcome: "success".to_owned(),
                 retryable: false,
                 served_from_cache: false,
                 reason_code: None,
                 state: None,
             }],
+            qa_lane_attestation: qa_provider_lane_attestation(
+                request.qa_attestation_context.as_ref(),
+                "openai-primary",
+                actual_model_id.as_str(),
+                None,
+            ),
         })
     }
 
@@ -4226,13 +4384,19 @@ fn openai_codex_provider_response(
         failover_count: 0,
         attempts: vec![ProviderAttemptSummary {
             provider_id: "openai-primary".to_owned(),
-            model_id: actual_model_id,
+            model_id: actual_model_id.clone(),
             outcome: "success".to_owned(),
             retryable: false,
             served_from_cache: false,
             reason_code: None,
             state: None,
         }],
+        qa_lane_attestation: qa_provider_lane_attestation(
+            request.qa_attestation_context.as_ref(),
+            "openai-primary",
+            actual_model_id.as_str(),
+            None,
+        ),
     })
 }
 
@@ -4990,6 +5154,12 @@ impl AnthropicProvider {
                 reason_code: None,
                 state: None,
             }],
+            qa_lane_attestation: qa_provider_lane_attestation(
+                request.qa_attestation_context.as_ref(),
+                "anthropic-primary",
+                model_name,
+                None,
+            ),
         })
     }
 }
@@ -5482,22 +5652,26 @@ mod tests {
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
-        provider_attempt_index, provider_seconds_to_millis, run_provider_failover_self_check,
-        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
+        provider_attempt_index, provider_seconds_to_millis, qa_live_provider_base_url_sha256,
+        qa_live_provider_binding_sha256, qa_provider_binding_sha256,
+        run_provider_failover_self_check, sanitize_remote_error,
+        validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
         AnthropicProvider, EmbeddingsRequest, ModelProvider, ModelProviderAuthProviderKind,
         ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
         ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, OpenAiCompatibleProvider,
         ProviderCapabilitiesSnapshot, ProviderChatAdapter, ProviderError, ProviderEvent,
         ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
-        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
-        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
-        ProviderRequest, ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator,
-        ProviderStreamEvent, ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
-        ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
+        ProviderLiveBindingMetadata, ProviderMessage, ProviderMessageContentPart,
+        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
+        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
+        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
+        ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator, ProviderStreamEvent,
+        ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext,
+        RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
         FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID,
         FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID, OPENAI_RETRYABLE_STATUS_CODES,
+        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use palyra_model_providers::{
@@ -5519,6 +5693,14 @@ mod tests {
 
     fn qa_mock_retry_fixture_path() -> PathBuf {
         repo_root().join("qa").join("fixtures").join("provider_retry_recovery.yaml")
+    }
+
+    fn qa_mock_record_replay_fixture_path() -> PathBuf {
+        repo_root()
+            .join("qa")
+            .join("fixtures")
+            .join("record_replay")
+            .join("real_agent_runner_replay.yaml")
     }
 
     #[test]
@@ -5675,6 +5857,7 @@ mod tests {
             prompt_segments: Vec::new(),
             prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
             prompt_cache_report: None,
+            qa_attestation_context: None,
         };
 
         let openai_payload =
@@ -5737,6 +5920,7 @@ mod tests {
             prompt_segments: Vec::new(),
             prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
             prompt_cache_report: None,
+            qa_attestation_context: None,
         };
 
         let openai_payload =
@@ -5793,6 +5977,7 @@ mod tests {
             prompt_segments: Vec::new(),
             prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
             prompt_cache_report: None,
+            qa_attestation_context: None,
         };
 
         let anthropic_payload =
@@ -5851,6 +6036,7 @@ mod tests {
             prompt_segments: Vec::new(),
             prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
             prompt_cache_report: None,
+            qa_attestation_context: None,
         };
 
         let anthropic_payload =
@@ -6601,6 +6787,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_provider_attests_actual_fixture_and_replay_materializations() {
+        for (fixture_path, prompt, provider_lane, materialization_kind) in [
+            (
+                qa_mock_fixture_path(),
+                "Say a friendly deterministic answer",
+                "fixture",
+                QA_PROVIDER_FIXTURE_MATERIALIZATION,
+            ),
+            (
+                qa_mock_record_replay_fixture_path(),
+                "return the exact deterministic qa response",
+                "record_replay",
+                QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+            ),
+        ] {
+            let materialized_input_sha256 =
+                crate::sha256_hex(&fs::read(fixture_path.as_path()).expect("fixture should read"));
+            let provider_binding_sha256 = qa_provider_binding_sha256(
+                provider_lane,
+                materialization_kind,
+                materialized_input_sha256.as_str(),
+            )
+            .expect("fixture binding should hash");
+            let provider = build_model_provider(&ModelProviderConfig {
+                qa_mock_fixture_enabled: true,
+                qa_mock_fixture_path: Some(fixture_path),
+                registry: ModelProviderRegistryConfig {
+                    response_cache_enabled: false,
+                    ..ModelProviderRegistryConfig::default()
+                },
+                ..ModelProviderConfig::default()
+            })
+            .expect("QA provider should build");
+            let mut request =
+                ProviderRequest::from_input_text(prompt.to_owned(), false, Vec::new(), None);
+            request.qa_attestation_context = Some(QaProviderAttestationContext {
+                execution_key_digest: "e".repeat(64),
+                provider_binding_sha256: provider_binding_sha256.clone(),
+            });
+
+            let response = provider.complete(request).await.expect("fixture turn should succeed");
+            let attestation = response
+                .qa_lane_attestation
+                .expect("executed QA provider adapter should attest its lane");
+
+            attestation.validate_shape().expect("producer attestation should validate");
+            assert_eq!(attestation.provider_lane, provider_lane);
+            assert_eq!(attestation.materialization_kind, materialization_kind);
+            assert_eq!(attestation.materialized_input_sha256, Some(materialized_input_sha256));
+            assert_eq!(attestation.provider_binding_sha256, provider_binding_sha256);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn deterministic_provider_retries_fixture_failures_and_preserves_attempt_evidence() {
         let provider = build_model_provider(&ModelProviderConfig {
             qa_mock_fixture_enabled: true,
@@ -7065,6 +7305,52 @@ turns:
             snapshot.runtime_metrics.total_completion_tokens, response.completion_tokens,
             "status snapshot should accumulate completion token usage per provider request"
         );
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_attestation_derives_actual_model_instead_of_echoing_parent_binding() {
+        let (base_url, request_count, handle) = spawn_scripted_server(vec![(
+            200_u16,
+            r#"{"choices":[{"message":{"content":"bound response"}}]}"#.to_owned(),
+        )]);
+        let expected_model = "parent-selected-model";
+        let actual_model = "runtime-materialized-model";
+        let live_binding = ProviderLiveBindingMetadata {
+            provider_kind: "openai_compatible".to_owned(),
+            auth_profile_id: "qa-live-selected".to_owned(),
+            auth_provider_kind: "openai".to_owned(),
+            base_url_sha256: qa_live_provider_base_url_sha256(base_url.as_str())
+                .expect("test base URL should hash"),
+            raw_payload_storage: false,
+        };
+        let parent_binding =
+            qa_live_provider_binding_sha256("openai-primary", expected_model, &live_binding)
+                .expect("parent binding should hash");
+        let mut config = openai_test_config(base_url);
+        config.openai_model = actual_model.to_owned();
+        config.auth_profile_id = Some("qa-live-selected".to_owned());
+        config.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+        config.max_retries = 0;
+        config.registry.response_cache_enabled = false;
+        let provider = build_model_provider(&config).expect("openai provider should build");
+        let mut request =
+            ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        request.qa_attestation_context = Some(QaProviderAttestationContext {
+            execution_key_digest: "e".repeat(64),
+            provider_binding_sha256: parent_binding.clone(),
+        });
+
+        let response = provider.complete(request).await.expect("provider call should succeed");
+        let attestation = response
+            .qa_lane_attestation
+            .expect("live provider response should carry registry attestation");
+
+        attestation.validate_shape().expect("actual live binding should validate");
+        assert_eq!(attestation.provider_id, "openai-primary");
+        assert_eq!(attestation.model_id, actual_model);
+        assert_ne!(attestation.provider_binding_sha256, parent_binding);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         handle.join().expect("scripted server thread should exit");
     }
 

@@ -1,0 +1,67 @@
+schema_version: 3
+id: baseline_replay
+mode: pr
+scenario_roots:
+  - qa/scenarios/real_runtime
+expected_scenario_ids:
+  - real_runtime.malformed_stream_recovery
+  - real_runtime.mutation_approval_denied
+  - real_runtime.read_only_tool
+  - real_runtime.record_replay_text
+  - real_runtime.text_exact
+include_tags:
+  - baseline_replay
+allow_provider_modes:
+  - mock
+  - recorded
+allow_runner_modes:
+  - fixture
+  - record_replay
+allow_live_providers: false
+resume:
+  enabled: false
+  reuse_passed: false
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: true
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - approvals
+  - provider_recovery
+  - record_replay
+  - workspace_context
+capability_skips: []
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: api
+      label: API
+      areas: [text]
+      labels: [text_only]
+      required: true
+    - id: tools
+      label: Tools
+      areas: [tools]
+      labels: [read_only]
+      required: true
+    - id: approvals
+      label: Approvals
+      areas: [approvals]
+      labels: [approval_denied]
+      required: true
+    - id: provider_recovery
+      label: Provider recovery
+      areas: [provider]
+      labels: [provider_recovery]
+      required: true
+    - id: replay
+      label: Record replay
+      areas: [replay]
+      labels: [record_replay]
+      required: true

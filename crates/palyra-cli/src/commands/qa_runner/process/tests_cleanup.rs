@@ -584,7 +584,7 @@ fn state_root_path_substitution_cannot_report_workspace_removed() {
     assert!(sandbox.child.is_none());
     assert_eq!(sandbox.daemon_restarts(), 0);
     assert!(sandbox.fault_evidence_sidecar().is_err());
-    let diagnostics = sandbox.failure_diagnostics("qa-runner.v3", "0.1.0", "qa.runner.test", true);
+    let diagnostics = sandbox.failure_diagnostics("qa-runner.v4", "0.1.0", "qa.runner.test", true);
     assert_eq!(diagnostics.fault_sidecar.status, "unavailable");
     assert_eq!(
         diagnostics.fault_sidecar.reason_code,

@@ -7,6 +7,8 @@ pub(super) struct QaDaemonEnvironment<'a> {
     pub(super) config_path: &'a Path,
     pub(super) vault_dir: &'a Path,
     pub(super) provider: &'a QaDaemonProviderEnvironment,
+    pub(super) execution_key_digest: &'a str,
+    pub(super) provider_binding_sha256: &'a str,
     pub(super) admin_token: &'a str,
     pub(super) principal: &'a str,
     pub(super) fault_launch: Option<&'a QaPreparedFaultLaunch>,

@@ -7,6 +7,7 @@
 //! [`ProviderEvent::ModelToken`] preview events by
 //! [`provider_events_from_output`], and oversized text is truncated with an
 //! explicit marker plus a `stream_spill_ref` so the truncation is auditable.
+use palyra_common::qa_runtime_path::ProviderLaneAttestationEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -324,6 +325,16 @@ pub struct ProviderRequest {
     pub prompt_cache_policy: PromptCachePolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_report: Option<PromptCacheReport>,
+    /// QA-only hash correlation injected by the isolated daemon runtime.
+    #[serde(skip_serializing, skip_deserializing)]
+    pub qa_attestation_context: Option<QaProviderAttestationContext>,
+}
+
+/// Secret-free execution-key correlation made available to a QA provider adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QaProviderAttestationContext {
+    pub execution_key_digest: String,
+    pub provider_binding_sha256: String,
 }
 
 /// Stable prompt segment classification for provider cache hints and request explainability.
@@ -465,6 +476,7 @@ impl ProviderRequest {
             prompt_segments: Vec::new(),
             prompt_cache_policy: PromptCachePolicy::default(),
             prompt_cache_report: None,
+            qa_attestation_context: None,
         }
     }
 
@@ -1134,6 +1146,8 @@ pub struct ProviderResponse {
     pub served_from_cache: bool,
     pub failover_count: u32,
     pub attempts: Vec<ProviderAttemptSummary>,
+    /// QA-only proof produced after this adapter served the request.
+    pub qa_lane_attestation: Option<ProviderLaneAttestationEvent>,
 }
 
 /// Returns true when the request carries image input anywhere (top-level

@@ -1,6 +1,6 @@
 # Exercises a real read-only tool call against an isolated copied workspace.
 # The fixture contains no credentials and is removed with the scenario daemon.
-schema_version: 2
+schema_version: 5
 id: real_runtime.read_only_tool
 title: Read-only tool through the real runtime
 area: tools
@@ -40,6 +40,14 @@ expect:
   tool_calls:
     - name: palyra.fs.read_file
       min_count: 1
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v7
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
 forbidden:
   tool_calls:
     - palyra.fs.apply_patch
@@ -62,6 +70,7 @@ maturity:
     - nightly
     - deterministic
     - read_only
+    - baseline_replay
 timeout:
   run_ms: 45000
   step_ms: 15000

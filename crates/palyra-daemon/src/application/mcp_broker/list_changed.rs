@@ -146,6 +146,7 @@ impl McpBroker {
         } = prepared;
         debug_assert!(catalog_generation > 0, "prepared MCP calls require a discovered catalog");
 
+        audit_context.transport_mode = Some(transport.invocation_mode(&record.manifest));
         let response = match transport.call_tool(&record.manifest, &request) {
             Ok(response) => response,
             Err(error) => {

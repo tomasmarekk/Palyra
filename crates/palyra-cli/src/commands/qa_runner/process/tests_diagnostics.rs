@@ -152,7 +152,7 @@ fn failure_diagnostics_are_persistable_before_state_root_removal_without_secrets
     assert!(sandbox.terminate_for_failure_diagnostics());
     assert!(state_root.exists(), "state must survive until diagnostics are persisted");
     let diagnostics =
-        sandbox.failure_diagnostics("qa-runner.v3", "0.1.0", "qa.runner.stream_failed", true);
+        sandbox.failure_diagnostics("qa-runner.v4", "0.1.0", "qa.runner.stream_failed", true);
     let bytes =
         serde_json::to_vec_pretty(&diagnostics).expect("failure diagnostics should serialize");
     let text = String::from_utf8(bytes.clone()).expect("diagnostics should be UTF-8");

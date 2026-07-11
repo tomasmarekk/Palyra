@@ -1,46 +1,14 @@
 {
-  "schema_version": 3,
-  "fixture_contract": "replay-capture-stable-fixtures-v3",
-  "compatibility_allowances": [
-    {
-      "id": "wall_clock_timestamps",
-      "kind": "zero_timestamp",
-      "paths": [
-        "$.generated_at_unix_ms",
-        "$.capture.captured_at_unix_ms",
-        "$.tape_events[*].payload.timestamp",
-        "$.tape_events[*].payload.*_at_unix_ms"
-      ],
-      "reason_code": "replay.compatibility.wall_clock_not_invariant",
-      "justification": "Wall-clock values are normalized while causal tape ordering remains authoritative."
-    },
-    {
-      "id": "provider_usage_rounding",
-      "kind": "numeric_tolerance",
-      "paths": [
-        "$.run.prompt_tokens",
-        "$.run.completion_tokens",
-        "$.run.total_tokens"
-      ],
-      "tolerance": 1,
-      "reason_code": "replay.compatibility.provider_usage_rounding",
-      "justification": "Provider token accounting may differ by one unit at a documented rounding boundary."
-    }
-  ],
+  "schema_version": 1,
+  "captured_output_contract": "replay-capture-production-outputs-v1",
   "cases": [
     {
       "id": "successful_text_run",
-      "category": "text_run",
-      "scenario_id": "real_runtime.text_exact",
-      "source": "qa/scenarios/real_runtime/text_exact.yaml",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000001000,
-        "capture": {"captured_at_unix_ms": 1730000001001},
+        "captured_at_unix_ms": 1730000001001,
         "run": {
           "state": "done",
-          "generation": 1,
-          "reason_code": "run.completed",
           "prompt_tokens": 24,
           "completion_tokens": 7,
           "total_tokens": 31
@@ -83,35 +51,16 @@
         "lifecycle_transitions": [],
         "idempotency_records": [],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 3,
-          "tape_event_types": ["run.started", "assistant.final_answer", "run.terminal"],
-          "final_answer_sha256": "e5d9cf0b773b0fa7d5a05aa4ab3361559763f624fbbe4be3a1e942bdb3405978"
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": ["normalized_user_input"]
-        }
-      },
-      "semantic_sha256": "6586848991663a3bb9edce6c646441a52a1ae015a2eb3209239189f713a0061a"
+        "redacted_fields": ["normalized_user_input"]
+      }
     },
     {
       "id": "read_only_tool_run",
-      "category": "tool_run",
-      "scenario_id": "real_runtime.read_only_tool",
-      "source": "qa/scenarios/real_runtime/read_only_tool.yaml",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000002000,
-        "capture": {"captured_at_unix_ms": 1730000002001},
+        "captured_at_unix_ms": 1730000002001,
         "run": {
           "state": "done",
-          "generation": 1,
-          "reason_code": "run.completed",
           "prompt_tokens": 31,
           "completion_tokens": 12,
           "total_tokens": 43
@@ -184,34 +133,16 @@
             "sha256": "35a5588903d657a25827af29604f78550cd5e723ac860ffb32e89651574c69bc"
           }
         ],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 4,
-          "tape_event_types": ["run.started", "tool.proposed", "tool.result", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": ["tool_output"]
-        }
-      },
-      "semantic_sha256": "505fda2b8cf5be0c16288c29192dd74ac899bfcb6d6342a8d7e621afe7e0f831"
+        "redacted_fields": ["tool_output"]
+      }
     },
     {
       "id": "approval_denial",
-      "category": "approval",
-      "scenario_id": "real_runtime.mutation_approval_denied",
-      "source": "qa/scenarios/real_runtime/mutation_approval_denied.yaml",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000003000,
-        "capture": {"captured_at_unix_ms": 1730000003001},
+        "captured_at_unix_ms": 1730000003001,
         "run": {
           "state": "done",
-          "generation": 1,
-          "reason_code": "run.completed",
           "prompt_tokens": 28,
           "completion_tokens": 6,
           "total_tokens": 34
@@ -278,34 +209,16 @@
         "lifecycle_transitions": [],
         "idempotency_records": [],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 4,
-          "tape_event_types": ["tool.proposed", "approval.requested", "approval.resolved", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": ["tool_input"]
-        }
-      },
-      "semantic_sha256": "62dce30526e0ba54b06bcd62586a0bb207e690b5556a0899a1e26846b3864614"
+        "redacted_fields": ["tool_input"]
+      }
     },
     {
       "id": "compaction_boundary",
-      "category": "compaction",
-      "scenario_id": "compaction.retry_mutating_tool",
-      "source": "qa/scenarios/compaction_retry_mutating_tool.yaml",
-      "capture_kind": "trajectory",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000004000,
-        "capture": {"captured_at_unix_ms": 1730000004001},
+        "captured_at_unix_ms": 1730000004001,
         "run": {
           "state": "done",
-          "generation": 3,
-          "reason_code": "run.completed",
           "prompt_tokens": 4096,
           "completion_tokens": 256,
           "total_tokens": 4352
@@ -355,34 +268,16 @@
             "sha256": "fbb701c879059b217242df647661ed717ab00e694c1f01ec412a99451b95322e"
           }
         ],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 3,
-          "tape_event_types": ["session.compaction.started", "session.compaction.completed", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": ["compaction_source"]
-        }
-      },
-      "semantic_sha256": "ca1a2da930c4fda9a0d5cc96cb3c0484ae4dff892e4ae797a9627209152aeed3"
+        "redacted_fields": ["compaction_source"]
+      }
     },
     {
       "id": "queue_admission",
-      "category": "queue",
-      "scenario_id": "gateway_restart.inflight_run",
-      "source": "qa/scenarios/gateway_restart_inflight_run.yaml",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000005000,
-        "capture": {"captured_at_unix_ms": 1730000005001},
+        "captured_at_unix_ms": 1730000005001,
         "run": {
           "state": "done",
-          "generation": 1,
-          "reason_code": "run.completed",
           "prompt_tokens": 18,
           "completion_tokens": 4,
           "total_tokens": 22
@@ -436,34 +331,16 @@
         "lifecycle_transitions": [],
         "idempotency_records": [],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 3,
-          "tape_event_types": ["run.queued", "run.admitted", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": []
-        }
-      },
-      "semantic_sha256": "ea4cfb09e5936dc224c607013b8c9cb8aef2a38ee0bf3c57fb1b3465b29e4104"
+        "redacted_fields": []
+      }
     },
     {
       "id": "cancel_active_run",
-      "category": "cancellation",
-      "scenario_id": "orchestrator_cancel_freezes_existing_and_late_feature_usage",
-      "source": "crates/palyra-daemon/src/gateway/tests.rs",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000006000,
-        "capture": {"captured_at_unix_ms": 1730000006001},
+        "captured_at_unix_ms": 1730000006001,
         "run": {
           "state": "cancelled",
-          "generation": 1,
-          "reason_code": "run.cancelled.operator_requested",
           "prompt_tokens": 12,
           "completion_tokens": 0,
           "total_tokens": 12,
@@ -506,34 +383,16 @@
         "lifecycle_transitions": [],
         "idempotency_records": [],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "cancelled",
-          "terminal_count": 1,
-          "tape_event_count": 3,
-          "tape_event_types": ["run.started", "run.cancellation_requested", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": []
-        }
-      },
-      "semantic_sha256": "4ecee90fc03fabd56d4205b98fca93d8e22159ce755fadd91ba12354ca8e506f"
+        "redacted_fields": []
+      }
     },
     {
       "id": "final_delivery_boundary",
-      "category": "delivery",
-      "scenario_id": "cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome",
-      "source": "crates/palyra-daemon/src/gateway/tests.rs",
-      "capture_kind": "trajectory",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000007000,
-        "capture": {"captured_at_unix_ms": 1730000007001},
+        "captured_at_unix_ms": 1730000007001,
         "run": {
           "state": "done",
-          "generation": 1,
-          "reason_code": "run.completed",
           "prompt_tokens": 21,
           "completion_tokens": 5,
           "total_tokens": 26
@@ -600,34 +459,16 @@
           }
         ],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 4,
-          "tape_event_types": ["delivery.started", "delivery.ack_uncertain", "delivery.recovered", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": ["channel_payload"]
-        }
-      },
-      "semantic_sha256": "d8757933ae6516ad8cbde233dd6b4aa226441338b69385f6bb81d3c0098b0387"
+        "redacted_fields": ["channel_payload"]
+      }
     },
     {
       "id": "restart_terminalization",
-      "category": "restart_terminalization",
-      "scenario_id": "gateway_restart.inflight_run",
-      "source": "qa/scenarios/gateway_restart_inflight_run.yaml",
-      "capture_kind": "incident_replay",
-      "golden_payload": {
+      "output": {
         "generated_at_unix_ms": 1730000008000,
-        "capture": {"captured_at_unix_ms": 1730000008001},
+        "captured_at_unix_ms": 1730000008001,
         "run": {
           "state": "done",
-          "generation": 2,
-          "reason_code": "run.completed",
           "prompt_tokens": 33,
           "completion_tokens": 8,
           "total_tokens": 41
@@ -712,33 +553,8 @@
           }
         ],
         "artifact_refs": [],
-        "expected": {
-          "terminal_state": "done",
-          "terminal_count": 1,
-          "tape_event_count": 4,
-          "tape_event_types": ["run.started", "daemon.restart_detected", "run.resumed", "run.terminal"]
-        },
-        "redaction": {
-          "raw_secrets_allowed": false,
-          "raw_paths_allowed": false,
-          "raw_prompts_allowed": false,
-          "redacted_fields": []
-        }
-      },
-      "semantic_sha256": "70c9659880686278aff19ff777c9d8882be80f69172d4f5c194acbf055387309"
+        "redacted_fields": []
+      }
     }
-  ],
-  "redaction_snapshot": {
-    "raw_secrets_allowed": false,
-    "raw_paths_allowed": false,
-    "raw_prompts_allowed": false,
-    "model_visible_default": false,
-    "stable_fields": [
-      "redaction_level",
-      "redacted_fields",
-      "path_redactions",
-      "truncated_payloads",
-      "omitted_events"
-    ]
-  }
+  ]
 }

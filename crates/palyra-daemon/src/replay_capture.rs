@@ -27,10 +27,21 @@ use crate::{
     runtime_diagnostics::RunStageTimingReport,
 };
 
+mod fixture_matrix;
+
+pub(crate) const REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION: u32 =
+    fixture_matrix::REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION;
+pub(crate) type ReplayFixtureValidationReport = fixture_matrix::ReplayFixtureValidationReport;
+
+pub(crate) fn validate_replay_fixture_matrix(
+    value: &Value,
+) -> Result<ReplayFixtureValidationReport> {
+    fixture_matrix::validate_replay_fixture_matrix(value)
+}
+
 pub(crate) const RUN_TRACE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const TRAJECTORY_EXPORT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const UNIFIED_SUPPORT_BUNDLE_SCHEMA_VERSION: u32 = 1;
-pub(crate) const REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION: u32 = 1;
 
 const RUN_TRACE_REQUIRED_SUBSYSTEMS: &[&str] = &[
     "provider",
@@ -207,24 +218,6 @@ pub(crate) struct UnifiedSupportBundleManifest {
     pub(crate) operator_summary: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReplayFixtureValidationReport {
-    pub(crate) schema_version: u32,
-    pub(crate) case_count: usize,
-    pub(crate) failure_case_count: usize,
-    pub(crate) expected_terminal_states: Vec<String>,
-    pub(crate) artifact_digest_count: usize,
-    pub(crate) redaction_snapshot_present: bool,
-}
-
-/// Exports one orchestrator run from the journal as a redacted, offline
-/// replayable bundle.
-///
-/// # Errors
-/// Fails when the run id is unknown or any journal read (snapshot, tape,
-/// lifecycle, idempotency, tool-result artifacts) fails; each error carries
-/// the run id as context.
 pub(crate) fn capture_incident_replay_bundle(
     request: IncidentReplayCaptureRequest<'_>,
 ) -> Result<ReplayBundle> {
@@ -517,54 +510,6 @@ pub(crate) fn build_unified_support_bundle_manifest(
             "raw prompts, raw secrets, binary payloads, and local paths are excluded".to_owned(),
             "trajectory export requires the recorded approval gate".to_owned(),
         ],
-    })
-}
-
-pub(crate) fn validate_replay_fixture_matrix(
-    value: &Value,
-) -> Result<ReplayFixtureValidationReport> {
-    if value.get("schema_version").and_then(Value::as_u64)
-        != Some(u64::from(REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION))
-    {
-        bail!("replay fixture matrix schema version mismatch");
-    }
-    let cases = value
-        .get("cases")
-        .and_then(Value::as_array)
-        .context("replay fixture matrix cases missing")?;
-    let mut expected_terminal_states = Vec::new();
-    let mut failure_case_count = 0_usize;
-    let mut artifact_digest_count = 0_usize;
-    for case in cases {
-        let terminal_state = case
-            .get("expected_terminal_state")
-            .and_then(Value::as_str)
-            .context("replay fixture case terminal state missing")?;
-        expected_terminal_states.push(terminal_state.to_owned());
-        if terminal_state != "done" {
-            failure_case_count = failure_case_count.saturating_add(1);
-        }
-        for artifact in case.get("artifact_refs").and_then(Value::as_array).into_iter().flatten() {
-            let digest = artifact
-                .get("sha256")
-                .and_then(Value::as_str)
-                .context("artifact fixture digest missing")?;
-            if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                bail!("artifact fixture digest must be lowercase hex sha256");
-            }
-            artifact_digest_count = artifact_digest_count.saturating_add(1);
-        }
-    }
-    expected_terminal_states.sort();
-    expected_terminal_states.dedup();
-
-    Ok(ReplayFixtureValidationReport {
-        schema_version: REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION,
-        case_count: cases.len(),
-        failure_case_count,
-        expected_terminal_states,
-        artifact_digest_count,
-        redaction_snapshot_present: value.get("redaction_snapshot").is_some(),
     })
 }
 
@@ -1134,20 +1079,16 @@ mod tests {
     }
 
     #[test]
-    fn replay_fixture_matrix_validates_failure_and_artifact_coverage() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../../fixtures/golden/replay_capture_stable_fixtures.json"
-        ))
-        .expect("fixture should parse");
-        let report =
-            validate_replay_fixture_matrix(&fixture).expect("replay fixture should validate");
+    fn replay_gate_artifacts_use_a_fresh_leaf_and_mountpoint_guards() {
+        let script = include_str!("../../../scripts/test/run-replay-gate.sh");
 
-        assert_eq!(report.schema_version, REPLAY_FIXTURE_MATRIX_SCHEMA_VERSION);
-        assert_eq!(report.case_count, 5);
-        assert_eq!(report.failure_case_count, 3);
-        assert!(report.expected_terminal_states.contains(&"cancelled".to_owned()));
-        assert!(report.redaction_snapshot_present);
-        assert!(report.artifact_digest_count > 0);
+        assert!(!script.contains("rm -rf"));
+        assert!(script.contains("is_mount_point"));
+        assert!(script.contains("mountpoint -q"));
+        assert!(script.contains("stat -c '%m'"));
+        assert!(script.contains("stat -f '%d'"));
+        assert!(script.contains("mktemp -d"));
+        assert!(script.contains("ARTIFACT_RELATIVE=\"${ARTIFACT_ABSOLUTE#"));
     }
 
     fn sample_replay_bundle_with_events(events: Vec<(&str, Value)>) -> ReplayBundle {

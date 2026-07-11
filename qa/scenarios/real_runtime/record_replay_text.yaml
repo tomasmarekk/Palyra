@@ -1,5 +1,5 @@
 # Replays a pre-redacted provider capture through the production daemon path.
-schema_version: 3
+schema_version: 5
 id: real_runtime.record_replay_text
 title: Redacted provider replay through the real runtime
 area: replay
@@ -38,6 +38,14 @@ expect:
     - event_type: run.completed
       min_count: 1
   tool_calls: []
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v7
+    provider_lane: record_replay
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
 forbidden:
   tool_calls:
     - "*"
@@ -57,6 +65,7 @@ maturity:
     - nightly
     - deterministic
     - record_replay
+    - baseline_replay
 timeout:
   run_ms: 30000
   step_ms: 10000

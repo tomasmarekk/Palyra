@@ -39,6 +39,8 @@ pub(super) fn start_daemon(
             config_path: launch.config_path.as_path(),
             vault_dir: launch.vault_dir.as_path(),
             provider: &launch.provider,
+            execution_key_digest: launch.execution_key_digest.as_str(),
+            provider_binding_sha256: launch.provider_binding_sha256.as_str(),
             admin_token: launch.admin_token.as_str(),
             principal: launch.principal.as_str(),
             fault_launch: fault_launch.as_ref(),
@@ -235,6 +237,8 @@ pub(super) fn configure_isolated_environment(
         .env("PALYRA_ADMIN_TOKEN", environment.admin_token)
         .env("PALYRA_ADMIN_BOUND_PRINCIPAL", environment.principal)
         .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", environment.allowed_tools)
+        .env("PALYRA_QA_EXECUTION_KEY_DIGEST", environment.execution_key_digest)
+        .env("PALYRA_QA_PROVIDER_BINDING_SHA256", environment.provider_binding_sha256)
         .env("RUST_LOG", "info");
     if let Some(fault_launch) = environment.fault_launch {
         command

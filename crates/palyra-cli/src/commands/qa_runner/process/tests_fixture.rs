@@ -53,6 +53,8 @@ fn no_tool_environment_uses_an_empty_allowlist() {
             config_path: &root.path().join("palyra.toml"),
             vault_dir: &root.path().join("vault"),
             provider: &provider,
+            execution_key_digest: &"a".repeat(64),
+            provider_binding_sha256: &"b".repeat(64),
             admin_token: "test-token",
             principal: "admin:test",
             fault_launch: None,
@@ -65,6 +67,14 @@ fn no_tool_environment_uses_an_empty_allowlist() {
         .and_then(|(_, value)| value)
         .expect("tool allowlist environment should be configured");
     assert!(allowed_tools.is_empty());
+    assert_eq!(
+        command_env(&command, "PALYRA_QA_EXECUTION_KEY_DIGEST"),
+        Some(OsStr::new(&"a".repeat(64)))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_QA_PROVIDER_BINDING_SHA256"),
+        Some(OsStr::new(&"b".repeat(64)))
+    );
 }
 
 #[test]

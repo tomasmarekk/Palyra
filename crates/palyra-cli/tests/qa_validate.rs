@@ -936,8 +936,18 @@ scorecard:
     let execution = payload
         .pointer("/scenarios/0/execution")
         .context("runtime error should retain an execution descriptor")?;
-    assert!(payload.pointer("/scenarios/0/issue_codes").and_then(Value::as_array).is_some_and(
-        |codes| codes.iter().any(|code| code.as_str() == Some("qa.runner.run_timeout"))
+    assert!(
+        payload.pointer("/scenarios/0/issue_codes").and_then(Value::as_array).is_some_and(
+            |codes| codes.iter().any(|code| code.as_str() == Some("qa.runner.run_timeout"))
+        ),
+        "runtime timeout report lost the stable timeout reason: {payload:#}"
+    );
+    assert_eq!(
+        payload.pointer("/scenarios/0/reason").and_then(Value::as_str),
+        Some("qa.runner.run_timeout")
+    );
+    assert!(!payload.pointer("/scenarios/0/issue_codes").and_then(Value::as_array).is_some_and(
+        |codes| codes.iter().any(|code| code.as_str() == Some("qa.runner.stream_decode_failed"))
     ));
     assert_eq!(execution.pointer("/cleanup/session_cleaned").and_then(Value::as_bool), Some(true));
     assert_eq!(
@@ -953,10 +963,15 @@ scorecard:
         execution.pointer("/cleanup/run_terminal_observed").and_then(Value::as_bool),
         Some(false)
     );
-    assert_eq!(
-        execution.pointer("/evidence_artifacts").and_then(Value::as_array).map(Vec::len),
-        Some(0)
-    );
+    let failure_artifacts = execution
+        .pointer("/evidence_artifacts")
+        .and_then(Value::as_array)
+        .context("runtime timeout should retain bounded failure diagnostics")?;
+    assert_eq!(failure_artifacts.len(), 1);
+    assert_eq!(failure_artifacts[0]["kind"], "failure_diagnostics");
+    assert!(failure_artifacts[0]["path"]
+        .as_str()
+        .is_some_and(|path| !PathBuf::from(path).is_absolute()));
     let result_path = execution
         .pointer("/result_artifact/path")
         .and_then(Value::as_str)

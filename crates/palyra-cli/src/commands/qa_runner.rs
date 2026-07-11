@@ -7,6 +7,7 @@
 
 mod observations;
 mod process;
+mod runtime_path;
 
 use std::{
     collections::BTreeSet,
@@ -28,6 +29,11 @@ use palyra_common::{
         QaFaultAction, QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan,
         QA_FAULT_TERMINATE_EXIT_CODE,
     },
+    qa_runtime_path::{
+        qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
+        qa_provider_binding_sha256, ProviderLiveBindingMetadata, RuntimePathEvidence,
+        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+    },
     qa_scenarios::{
         QaScenarioArtifactKind, QaScenarioLiveProviderKind, QaScenarioManifest,
         QaScenarioRunnerMode,
@@ -35,7 +41,10 @@ use palyra_common::{
     redaction::{is_sensitive_key, redact_diagnostic_text},
     runtime_contracts::PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
 };
-use palyra_model_providers::parse_qa_mock_provider_fixture_yaml;
+use palyra_model_providers::{
+    parse_qa_mock_provider_fixture_yaml, ModelProviderAuthProviderKind, ModelProviderConfig,
+    ModelProviderKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,6 +52,8 @@ use ulid::Ulid;
 
 use crate::commands;
 
+#[cfg(test)]
+use palyra_common::qa_runtime_path::RuntimePathComponentEvidence;
 #[cfg(test)]
 use serde_json::json;
 
@@ -52,16 +63,18 @@ use self::{
         QaScenarioObservations,
     },
     process::{QaDaemonSandbox, QaDaemonShutdown, QaFailureDiagnostics},
+    runtime_path::{extract_runtime_path_evidence, RuntimePathExtractionInput},
 };
 
-const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 2;
+const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 3;
 const EXECUTION_RESULT_FORMAT: &str = "palyra-qa-scenario-execution-result";
 const EXECUTION_KEY_SCHEMA_VERSION: u32 = 1;
 const EXECUTION_KEY_FORMAT: &str = "palyra-qa-scenario-execution-key";
-pub(crate) const QA_RUNNER_CONTRACT_VERSION: &str = "qa-runner.v3";
+pub(crate) const QA_RUNNER_CONTRACT_VERSION: &str = "qa-runner.v4";
 const QA_DAEMON_BIN_ENV: &str = "PALYRA_QA_PALYRAD_BIN";
 const MAX_EVIDENCE_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FAILURE_DIAGNOSTICS_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const QA_LIVE_MATERIALIZED_PROFILE_ID: &str = "qa-live-selected";
 
 /// Content-addressed identity for one scenario/runtime/provider binding.
 ///
@@ -221,6 +234,7 @@ pub(crate) struct QaScenarioExecutionResult {
     pub(crate) runner_mode: String,
     pub(crate) verdict: String,
     pub(crate) reason_codes: Vec<String>,
+    pub(crate) runtime_path: RuntimePathEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +272,7 @@ pub(crate) fn qa_scenario_execution_result_schema_snapshot() -> Value {
             "runner_mode",
             "verdict",
             "reason_codes",
+            "runtime_path",
             "evidence_artifacts",
             "cleanup"
         ],
@@ -284,6 +299,22 @@ pub(crate) fn qa_scenario_execution_result_schema_snapshot() -> Value {
             "palyrad_build_profile"
         ],
         "optional_attempt_fields": ["previous_result_artifact"],
+        "runtime_path_fields": [
+            "schema_version",
+            "runtime_version",
+            "runtime_contract_version",
+            "runner_version",
+            "provider_lane",
+            "attempt_owner",
+            "harness",
+            "context_engine",
+            "complete",
+            "source_events",
+            "reason_codes",
+            "fallbacks",
+            "fallback_count"
+        ],
+        "optional_runtime_path_fields": ["mcp_transport_mode"],
         "optional_runtime_fields": ["run_id", "session_id", "terminal_state"],
         "optional_result_fields": ["evidence_output_bindings"],
         "evidence_output_binding": {
@@ -344,10 +375,18 @@ pub(crate) fn prepare_scenario_execution(
                 anyhow::anyhow!("qa.runner.missing_config: fixture binding is incomplete")
             })?;
             fixture_paths.insert(relative.to_owned());
-            resolve_runner_path(repository_root.as_path(), relative, "provider fixture")?;
+            let provider_fixture =
+                resolve_runner_path(repository_root.as_path(), relative, "provider fixture")?;
+            let materialized_input_sha256 = sha256_file(provider_fixture.as_path())
+                .context("qa.runner.provider_fixture_hash_failed")?;
             (
                 QaPreparedRunnerBinding::Fixture { provider_fixture: relative.to_owned() },
-                hash_labeled_fields(&[("lane", "fixture"), ("fixture", relative)]),
+                qa_provider_binding_sha256(
+                    "fixture",
+                    QA_PROVIDER_FIXTURE_MATERIALIZATION,
+                    materialized_input_sha256.as_str(),
+                )
+                .context("qa.runner.provider_binding_hash_failed")?,
             )
         }
         QaScenarioRunnerMode::RecordReplay => {
@@ -358,9 +397,16 @@ pub(crate) fn prepare_scenario_execution(
             let replay_fixture =
                 resolve_runner_path(repository_root.as_path(), relative, "replay fixture")?;
             validate_redacted_replay_fixture(replay_fixture.as_path())?;
+            let materialized_input_sha256 = sha256_file(replay_fixture.as_path())
+                .context("qa.runner.replay_fixture_hash_failed")?;
             (
                 QaPreparedRunnerBinding::RecordReplay { replay_fixture: relative.to_owned() },
-                hash_labeled_fields(&[("lane", "record_replay"), ("fixture", relative)]),
+                qa_provider_binding_sha256(
+                    "record_replay",
+                    QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+                    materialized_input_sha256.as_str(),
+                )
+                .context("qa.runner.provider_binding_hash_failed")?,
             )
         }
         QaScenarioRunnerMode::Live => {
@@ -396,17 +442,38 @@ pub(crate) fn prepare_scenario_execution(
                     anyhow::anyhow!("qa.runner.missing_config: live binding has no model")
                 })?
                 .to_owned();
-            let profile_revision = profile.updated_at_unix_ms.to_string();
-            let binding_digest = hash_labeled_fields(&[
-                ("lane", "live"),
-                ("profile_id", profile.profile_id.as_str()),
-                ("profile_revision", profile_revision.as_str()),
-                ("auth_provider_kind", auth_provider_kind.as_str()),
-                ("provider_kind", provider_kind.as_str()),
-                ("model", model.as_str()),
-                ("base_url", base_url.as_deref().unwrap_or("")),
-                ("raw_payload_storage", "false"),
-            ]);
+            let model_provider_kind = match provider_kind {
+                QaScenarioLiveProviderKind::OpenAiCompatible => ModelProviderKind::OpenAiCompatible,
+                QaScenarioLiveProviderKind::Anthropic => ModelProviderKind::Anthropic,
+            };
+            let auth_provider = ModelProviderAuthProviderKind::parse(auth_provider_kind.as_str())
+                .context("qa.runner.live_profile_provider_kind_invalid")?;
+            let defaults = ModelProviderConfig::default();
+            let effective_base_url = base_url.as_deref().unwrap_or(match model_provider_kind {
+                ModelProviderKind::OpenAiCompatible => defaults.openai_base_url.as_str(),
+                ModelProviderKind::Anthropic => defaults.anthropic_base_url.as_str(),
+                ModelProviderKind::Deterministic => {
+                    unreachable!("live QA provider kind cannot be deterministic")
+                }
+            });
+            let live_binding_metadata = ProviderLiveBindingMetadata {
+                provider_kind: model_provider_kind.as_str().to_owned(),
+                auth_profile_id: QA_LIVE_MATERIALIZED_PROFILE_ID.to_owned(),
+                auth_provider_kind: auth_provider.as_str().to_owned(),
+                base_url_sha256: qa_live_provider_base_url_sha256(effective_base_url)
+                    .context("qa.runner.provider_base_url_hash_failed")?,
+                raw_payload_storage: false,
+            };
+            let provider_id = palyra_model_providers::providers::legacy_provider_id(
+                model_provider_kind,
+                Some(auth_provider),
+            );
+            let binding_digest = qa_live_provider_binding_sha256(
+                provider_id,
+                model.as_str(),
+                &live_binding_metadata,
+            )
+            .context("qa.runner.provider_binding_hash_failed")?;
             (
                 QaPreparedRunnerBinding::Live(Box::new(QaPreparedLiveBinding {
                     profile,
@@ -799,8 +866,31 @@ pub(crate) async fn execute_prepared_scenario(
     );
     let mut sandbox = QaDaemonSandbox::spawn(manifest, prepared)?;
     let deadline = QaRunDeadline::new(manifest)?;
-    let observation_result =
+    let mut observation_result =
         collect_observations_with_fault_recovery(manifest, &mut sandbox, deadline).await;
+    let mut runtime_path = extract_runtime_path_evidence(RuntimePathExtractionInput {
+        tape_events: &[],
+        tool_calls: &[],
+        runtime_version: prepared.runtime_version.as_str(),
+        runtime_contract_version: prepared.runtime_contract_version.as_str(),
+        runner_version: request.runner_version.as_str(),
+        expected_provider_lane: prepared.provider_lane(),
+        execution_key_digest: request.execution_key.digest.as_str(),
+        provider_binding_sha256: request.execution_key.provider_binding_sha256.as_str(),
+    });
+    if let Ok(observations) = observation_result.as_mut() {
+        runtime_path = extract_runtime_path_evidence(RuntimePathExtractionInput {
+            tape_events: observations.evidence.tape_events.as_slice(),
+            tool_calls: observations.evidence.tool_calls.as_slice(),
+            runtime_version: prepared.runtime_version.as_str(),
+            runtime_contract_version: prepared.runtime_contract_version.as_str(),
+            runner_version: request.runner_version.as_str(),
+            expected_provider_lane: prepared.provider_lane(),
+            execution_key_digest: request.execution_key.digest.as_str(),
+            provider_binding_sha256: request.execution_key.provider_binding_sha256.as_str(),
+        });
+        observations.evidence.runtime_path = Some(runtime_path.clone());
+    }
     let terminal_observed =
         observation_result.as_ref().is_ok_and(|observations| observations.terminal_observed);
     let run_id = observation_result
@@ -824,7 +914,7 @@ pub(crate) async fn execute_prepared_scenario(
     {
         // Failed streams can leave the control plane unable to clean up itself. Quiesce the
         // child before reading its durable state, but retain the TempDir until the bundle lands.
-        let session_cleaned = sandbox.active_session_id().is_none();
+        let session_was_absent = sandbox.active_session_id().is_none();
         let daemon_terminated = sandbox.terminate_for_failure_diagnostics();
         let diagnostics = sandbox.failure_diagnostics(
             request.runner_version.as_str(),
@@ -850,6 +940,10 @@ pub(crate) async fn execute_prepared_scenario(
             Err(error) => failure_diagnostics_write_error = Some(stable_runner_error_code(&error)),
         }
         let workspace_removed = sandbox.remove_state_root();
+        // Once the isolated daemon is reaped and its state root is gone, an
+        // active session cannot remain live or durable even when its API was
+        // unavailable during failure diagnostics.
+        let session_cleaned = session_was_absent || (daemon_terminated && workspace_removed);
         (session_cleaned, QaDaemonShutdown { daemon_terminated, workspace_removed })
     } else {
         // Successful observations retain the established API cleanup path and still remove the
@@ -927,6 +1021,7 @@ pub(crate) async fn execute_prepared_scenario(
         runner_mode: manifest.mode.runner.as_str().to_owned(),
         verdict: verdict.to_owned(),
         reason_codes,
+        runtime_path,
         run_id,
         session_id,
         terminal_state,
@@ -1049,6 +1144,11 @@ fn validate_execution_result(result: &QaScenarioExecutionResult) -> Result<()> {
         || result.execution_id.trim().is_empty()
         || result.scenario_id.trim().is_empty()
         || !matches!(result.verdict.as_str(), "passed" | "failed")
+        || result.runtime_path.validate_shape().is_err()
+        || result.runtime_path.runtime_version != result.execution_key.runtime_version
+        || result.runtime_path.runtime_contract_version
+            != result.execution_key.runtime_contract_version
+        || result.runtime_path.runner_version != result.execution_key.runner_version
     {
         anyhow::bail!("qa.runner.execution_result_invalid");
     }
@@ -1082,6 +1182,42 @@ fn validate_execution_result(result: &QaScenarioExecutionResult) -> Result<()> {
         validate_execution_artifact_reference(&binding.artifact)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_runtime_path_evidence(
+    runtime_version: &str,
+    runtime_contract_version: &str,
+    runner_version: &str,
+    provider_lane: &str,
+) -> RuntimePathEvidence {
+    RuntimePathEvidence {
+        schema_version: palyra_common::qa_runtime_path::QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION,
+        runtime_version: runtime_version.to_owned(),
+        runtime_contract_version: runtime_contract_version.to_owned(),
+        runner_version: runner_version.to_owned(),
+        provider_lane: provider_lane.to_owned(),
+        attempt_owner: "embedded_run_stream".to_owned(),
+        harness: RuntimePathComponentEvidence {
+            id: "embedded_run_stream".to_owned(),
+            source_event: "run.runtime_path_summary".to_owned(),
+            reason_code: "runtime_path.harness.embedded_selected".to_owned(),
+        },
+        context_engine: RuntimePathComponentEvidence {
+            id: "legacy_provider_input".to_owned(),
+            source_event: "run.runtime_path_summary".to_owned(),
+            reason_code: "runtime_path.context.legacy_selected".to_owned(),
+        },
+        mcp_transport_mode: None,
+        complete: true,
+        source_events: vec![
+            "runner.execution_key".to_owned(),
+            "run.runtime_path_summary".to_owned(),
+        ],
+        reason_codes: vec!["qa.runner.runtime_path_complete".to_owned()],
+        fallbacks: Vec::new(),
+        fallback_count: 0,
+    }
 }
 
 fn validate_execution_artifact_reference(reference: &QaExecutionArtifactRef) -> Result<()> {
@@ -1659,6 +1795,12 @@ mod tests {
             runner_mode: "fixture".to_owned(),
             verdict: "failed".to_owned(),
             reason_codes: vec!["qa.runner.run_timeout".to_owned()],
+            runtime_path: test_runtime_path_evidence(
+                "palyrad-test",
+                "runtime-contracts.test",
+                "qa-runner.test",
+                "fixture",
+            ),
             run_id: None,
             session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".to_owned()),
             terminal_state: None,
@@ -1711,6 +1853,12 @@ mod tests {
             runner_mode: "fixture".to_owned(),
             verdict: "passed".to_owned(),
             reason_codes: Vec::new(),
+            runtime_path: test_runtime_path_evidence(
+                "palyrad-test",
+                "runtime-contracts.test",
+                "qa-runner.test",
+                "fixture",
+            ),
             run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".to_owned()),
             session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             terminal_state: Some("completed".to_owned()),
@@ -1733,7 +1881,23 @@ mod tests {
         let mut failed = result.clone();
         failed.verdict = "failed".to_owned();
         validate_execution_result(&failed)
-            .expect("v2 failed results may retain only failure diagnostics");
+            .expect("v3 failed results may retain only failure diagnostics");
+
+        let mut missing_attestation = failed.clone();
+        missing_attestation.runtime_path.complete = false;
+        missing_attestation.runtime_path.provider_lane = "unobserved".to_owned();
+        missing_attestation.runtime_path.reason_codes =
+            vec!["qa.runner.runtime_path_provider_attestation_missing".to_owned()];
+        validate_execution_result(&missing_attestation)
+            .expect("missing provider attestation must remain a durable failed descriptor");
+
+        let mut mismatched_attestation = failed.clone();
+        mismatched_attestation.runtime_path.complete = false;
+        mismatched_attestation.runtime_path.provider_lane = "record_replay".to_owned();
+        mismatched_attestation.runtime_path.reason_codes =
+            vec!["qa.runner.runtime_path_provider_lane_mismatch".to_owned()];
+        validate_execution_result(&mismatched_attestation)
+            .expect("provider lane mismatch must remain a durable failed descriptor");
 
         result.evidence_artifacts.push(QaExecutionArtifactRef {
             path: "executions/test/evidence.json".to_owned(),
@@ -1742,7 +1906,7 @@ mod tests {
             size_bytes: 256,
         });
         validate_execution_result(&result)
-            .expect("a physical evidence artifact should satisfy the passing v2 contract");
+            .expect("a physical evidence artifact should satisfy the passing v3 contract");
     }
 
     #[test]

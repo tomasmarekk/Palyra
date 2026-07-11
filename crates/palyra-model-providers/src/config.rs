@@ -361,6 +361,10 @@ pub struct ModelProviderConfig {
     pub service_tier: Option<ProviderServiceTier>,
     pub qa_mock_fixture_path: Option<PathBuf>,
     pub qa_mock_fixture_enabled: bool,
+    /// QA-only digest of the parent-issued execution key; never a credential.
+    pub qa_execution_key_digest: Option<String>,
+    /// QA-only digest of the provider binding named by the execution key.
+    pub qa_provider_binding_sha256: Option<String>,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -393,6 +397,8 @@ impl Default for ModelProviderConfig {
             service_tier: None,
             qa_mock_fixture_path: None,
             qa_mock_fixture_enabled: false,
+            qa_execution_key_digest: None,
+            qa_provider_binding_sha256: None,
             request_timeout_ms: DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
             max_retries: 2,
             retry_backoff_ms: 150,

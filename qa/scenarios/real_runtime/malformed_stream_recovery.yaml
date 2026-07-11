@@ -1,6 +1,6 @@
 # Runs a retryable malformed provider stream through the normal agent endpoint.
 # Recovery is deterministic and credential-free but still uses real runtime evidence.
-schema_version: 2
+schema_version: 5
 id: real_runtime.malformed_stream_recovery
 title: Malformed provider stream recovery through the real runtime
 area: provider
@@ -41,6 +41,14 @@ expect:
     - event_type: run.completed
       min_count: 1
   tool_calls: []
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v7
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
 forbidden:
   tool_calls:
     - "*"
@@ -61,6 +69,7 @@ maturity:
     - nightly
     - deterministic
     - provider_recovery
+    - baseline_replay
 timeout:
   run_ms: 30000
   step_ms: 10000

@@ -18,7 +18,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use palyra_common::{redaction::redact_diagnostic_text, runtime_preview::RuntimePreviewMode};
+use palyra_common::{
+    qa_runtime_path::McpTransportInvocationMode, redaction::redact_diagnostic_text,
+    runtime_preview::RuntimePreviewMode,
+};
 use palyra_egress_proxy::{EgressProxyPolicyService, EgressProxyRequest};
 use palyra_safety::{
     transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
@@ -41,6 +44,7 @@ mod host_policy;
 mod host_surfaces;
 mod host_transport;
 mod host_types;
+mod invocation_types;
 mod list_changed;
 
 pub use host_surfaces::mcp_prompt_cache_epoch;
@@ -51,6 +55,10 @@ pub use host_types::{
     McpResourceReadPayload, McpResourceReadRequest, McpSamplingCreateMessageRequest,
     McpSamplingMode, McpSamplingOutcome, McpSamplingPolicy, McpUtilityAuditRecord,
     McpUtilityListRequest, McpUtilityOutcome,
+};
+pub use invocation_types::{
+    McpInvocationAttestation, McpInvocationPolicyDecision, McpToolCallRequest,
+    McpToolInvocationOutcome, McpToolResponse, McpVaultScopedGrant,
 };
 
 const MCP_SCHEMA_VERSION: u32 = 1;
@@ -915,95 +923,16 @@ pub struct McpToolDiscoveryReport {
     pub(crate) registry_entries: Vec<ToolRegistryEntry>,
 }
 
-/// Result of a transport invocation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct McpToolResponse {
-    pub output: Value,
-    #[serde(default)]
-    pub sampling_requested: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling_model_capability: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress_host_requested: Option<String>,
-}
-
-/// Invocation policy decision supplied by the host before any transport call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpInvocationPolicyDecision {
-    pub allowed: bool,
-    pub approval_required: bool,
-    pub reason: String,
-}
-
-/// Scoped, host-issued grant for one logical MCP vault reference.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpVaultScopedGrant {
-    pub name: String,
-    pub grant_id: String,
-}
-
-/// Broker input for one MCP tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct McpToolCallRequest {
-    pub server_name: String,
-    pub tool_name: String,
-    pub input: Value,
-    pub schema_hash: String,
-    pub policy: McpInvocationPolicyDecision,
-    #[serde(default)]
-    pub approval_granted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    #[serde(default)]
-    pub vault_refs_requested: Vec<String>,
-    #[serde(default)]
-    pub vault_scoped_grants: Vec<McpVaultScopedGrant>,
-}
-
-/// Hash-anchored audit record for an MCP invocation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpInvocationAttestation {
-    pub attestation_id: String,
-    pub server_id: String,
-    pub server_name: String,
-    pub tool_name: String,
-    pub namespaced_tool_id: String,
-    pub schema_hash: String,
-    pub input_hash: String,
-    pub output_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_grant_id: Option<String>,
-    pub transport_id: String,
-    pub result_projection: String,
-    pub policy_outcome: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling_model_capability: Option<String>,
-    pub executed_at_unix_ms: i64,
-    pub output_truncated: bool,
-    #[serde(default)]
-    pub vault_grant_ids: Vec<String>,
-}
-
-/// Final broker outcome for an MCP tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct McpToolInvocationOutcome {
-    pub success: bool,
-    pub output_json: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub attestation: McpInvocationAttestation,
-}
-
 /// Side-effect boundary for MCP transports.
 pub trait McpTransport {
+    /// Returns the connection lifecycle this implementation actually uses for calls.
+    ///
+    /// The conservative default is `per_call`; a future persistent transport
+    /// must opt in explicitly before QA can qualify that path.
+    fn invocation_mode(&self, _manifest: &McpServerManifest) -> McpTransportInvocationMode {
+        McpTransportInvocationMode::PerCall
+    }
+
     fn start(&self, manifest: &McpServerManifest) -> Result<(), McpBrokerError>;
 
     fn list_tools(
@@ -2647,6 +2576,7 @@ struct McpInvocationAuditContext {
     server_id: String,
     namespaced_tool_id: String,
     transport_id: String,
+    transport_mode: Option<McpTransportInvocationMode>,
     result_projection: ToolResultProjectionPolicy,
     oauth_grant_id: Option<String>,
     sampling_model_capability: Option<String>,
@@ -2664,6 +2594,7 @@ impl McpInvocationAuditContext {
             server_id,
             namespaced_tool_id,
             transport_id,
+            transport_mode: None,
             result_projection,
             oauth_grant_id: None,
             sampling_model_capability: None,
@@ -2892,8 +2823,12 @@ fn invocation_attestation(
     let executed_at_unix_ms = current_unix_ms();
     let input_hash = stable_hash_value(&request.input);
     let output_hash = stable_hash_value(raw_output_json);
+    let transport_mode = audit_context
+        .transport_mode
+        .map(McpTransportInvocationMode::as_str)
+        .unwrap_or("not_invoked");
     let attestation_seed = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         audit_context.server_id,
         request.server_name,
         request.tool_name,
@@ -2903,6 +2838,7 @@ fn invocation_attestation(
         request.approval_id.as_deref().unwrap_or_default(),
         audit_context.oauth_grant_id.as_deref().unwrap_or_default(),
         audit_context.transport_id,
+        transport_mode,
         audit_context.vault_grant_ids.join(","),
         audit_context.sampling_model_capability.as_deref().unwrap_or_default(),
         policy_outcome,
@@ -2920,6 +2856,7 @@ fn invocation_attestation(
         approval_id: request.approval_id.clone(),
         oauth_grant_id: audit_context.oauth_grant_id.clone(),
         transport_id: audit_context.transport_id.clone(),
+        transport_mode: audit_context.transport_mode,
         result_projection: audit_context.result_projection.as_str().to_owned(),
         policy_outcome: policy_outcome.to_owned(),
         sampling_model_capability: audit_context.sampling_model_capability.clone(),
@@ -3097,7 +3034,9 @@ mod tests {
         time::Duration,
     };
 
-    use palyra_common::tool_catalog::ToolCatalogExposureMode;
+    use palyra_common::{
+        qa_runtime_path::MCP_TRANSPORT_INVOCATION_EVENT, tool_catalog::ToolCatalogExposureMode,
+    };
 
     use super::*;
     use crate::{
@@ -3126,12 +3065,17 @@ mod tests {
         prompt_payload: Option<McpPromptPayload>,
         response: Option<McpToolResponse>,
         start_error: Option<McpBrokerError>,
+        call_error: Option<McpBrokerError>,
         resource_read_count: Cell<u32>,
         prompt_get_count: Cell<u32>,
         call_count: Cell<u32>,
     }
 
     impl McpTransport for FakeTransport {
+        fn invocation_mode(&self, _manifest: &McpServerManifest) -> McpTransportInvocationMode {
+            McpTransportInvocationMode::PerCall
+        }
+
         fn start(&self, _manifest: &McpServerManifest) -> Result<(), McpBrokerError> {
             if let Some(error) = &self.start_error {
                 return Err(error.clone());
@@ -3192,6 +3136,9 @@ mod tests {
             _request: &McpToolCallRequest,
         ) -> Result<McpToolResponse, McpBrokerError> {
             self.call_count.set(self.call_count.get().saturating_add(1));
+            if let Some(error) = &self.call_error {
+                return Err(error.clone());
+            }
             Ok(self.response.clone().unwrap_or(McpToolResponse {
                 output: json!({"ok": true}),
                 sampling_requested: false,
@@ -3365,6 +3312,14 @@ mod tests {
                 grant_id: "grant.docs.api_token.01".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn runtime_transport_attests_its_current_per_call_lifecycle() {
+        assert_eq!(
+            McpRuntimeTransport.invocation_mode(&manifest()),
+            McpTransportInvocationMode::PerCall
+        );
     }
 
     fn runtime_server(id: &str, enabled: bool) -> McpServerConfig {
@@ -4265,7 +4220,42 @@ mod tests {
 
         assert!(!outcome.success);
         assert_eq!(outcome.attestation.policy_outcome, "mcp.policy_denied");
+        assert_eq!(outcome.attestation.transport_mode, None);
+        assert!(outcome.transport_invocation_event().is_none());
         assert_eq!(transport.call_count.get(), 0);
+    }
+
+    #[test]
+    fn invocation_transport_failure_projects_run_owned_evidence() {
+        let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
+            call_error: Some(McpBrokerError::new(
+                "mcp.transport_test_failure",
+                "transport failed after invocation",
+            )),
+            ..Default::default()
+        };
+        let mut broker = broker_with_discovered_manifest(&transport);
+
+        let outcome = broker
+            .invoke_tool(invocation_request(), &transport)
+            .expect("transport failure should be returned as an attested outcome");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.policy_outcome, "mcp.transport_test_failure");
+        assert_eq!(transport.call_count.get(), 1);
+        let transport_event = outcome
+            .transport_invocation_event()
+            .expect("a crossed transport boundary should produce evidence");
+        transport_event.validate_shape().expect("producer event should satisfy the shared schema");
+        assert_eq!(transport_event.namespaced_tool_id, "mcp.docs.search");
+        assert_eq!(transport_event.transport_mode, McpTransportInvocationMode::PerCall);
+        let payload = serde_json::to_value(transport_event)
+            .expect("transport evidence should serialize for a run-owned tape event");
+        assert!(
+            payload.get("seq").is_none(),
+            "the broker must not manufacture a run tape sequence"
+        );
     }
 
     #[test]
@@ -4435,7 +4425,15 @@ mod tests {
 
         assert!(outcome.success);
         assert!(outcome.attestation.transport_id.starts_with("mcp.transport."));
+        assert_eq!(outcome.attestation.transport_mode, Some(McpTransportInvocationMode::PerCall));
         assert_eq!(outcome.attestation.vault_grant_ids, vec!["grant.docs.api_token.01".to_owned()]);
+        let transport_event = outcome
+            .transport_invocation_event()
+            .expect("an executed invocation should produce transport evidence");
+        transport_event.validate_shape().expect("producer event should satisfy the shared schema");
+        assert_eq!(transport_event.event_name, MCP_TRANSPORT_INVOCATION_EVENT);
+        assert_eq!(transport_event.namespaced_tool_id, "mcp.docs.search");
+        assert_eq!(transport_event.transport_mode, McpTransportInvocationMode::PerCall);
         assert!(!serialized.contains("sk-secret-value"));
         assert!(!serialized.contains("vault://global/docs_api_token"));
         assert_eq!(transport.call_count.get(), 1);

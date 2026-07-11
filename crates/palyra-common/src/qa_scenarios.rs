@@ -17,9 +17,13 @@ use crate::qa_fault_injection::{
     qa_fault_point_descriptor, QaFaultInjectionPlan, QaFaultRecoveryClass,
     QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
 };
+use crate::qa_runtime_path::{
+    McpTransportInvocationMode, NoHiddenFallbackExpectation,
+    QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION,
+};
 
 /// Current QA scenario manifest schema version.
-pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 4;
+pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 5;
 
 /// Stable format label embedded in the schema snapshot and reports.
 pub const QA_SCENARIO_FORMAT: &str = "palyra-qa-scenario";
@@ -38,7 +42,9 @@ const AREA_VALUES: &[&str] = &[
     "security",
     "replay",
 ];
-const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, QA_SCENARIO_SCHEMA_VERSION];
+const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5];
+const FAULT_CONTRACT_MIN_SCHEMA_VERSION: u32 = 4;
+const RUNTIME_PATH_EXPECTATION_MIN_SCHEMA_VERSION: u32 = 5;
 const PROVIDER_MODE_VALUES: &[&str] = &["mock", "recorded", "live"];
 const RUNNER_MODE_VALUES: &[&str] = &["fixture", "record_replay", "live"];
 const LIVE_PROVIDER_KIND_VALUES: &[&str] = &["openai_compatible", "anthropic"];
@@ -748,8 +754,8 @@ pub struct QaScenarioExpectedToolCall {
     /// Optional maximum total call count, regardless of result outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_count: Option<u32>,
-    /// Required tool-result outcome. Schema v4 treats omission as any outcome;
-    /// legacy schemas retain their success-by-default contract.
+    /// Required tool-result outcome. Schema v4 and later treat omission as any
+    /// outcome; legacy schemas retain their success-by-default contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
 }
@@ -784,6 +790,9 @@ pub struct QaScenarioExpect {
     pub events: Vec<QaScenarioExpectedEvent>,
     /// Expected tool calls.
     pub tool_calls: Vec<QaScenarioExpectedToolCall>,
+    /// Exact runtime path and bounded fallback posture required by schema v5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_path: Option<NoHiddenFallbackExpectation>,
     /// Exact activation, recovery, and restart assertions for a fault plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fault_injection: Option<QaScenarioExpectedFaultInjection>,
@@ -1068,7 +1077,24 @@ struct QaScenarioExpectWire {
     #[serde(default)]
     tool_calls: Vec<QaScenarioExpectedToolCallWire>,
     #[serde(default)]
+    runtime_path: Option<NoHiddenFallbackExpectationWire>,
+    #[serde(default)]
     fault_injection: Option<QaScenarioExpectedFaultInjectionWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoHiddenFallbackExpectationWire {
+    runtime_contract_version: Option<String>,
+    provider_lane: Option<String>,
+    attempt_owner: Option<String>,
+    harness_id: Option<String>,
+    context_engine_id: Option<String>,
+    #[serde(default)]
+    mcp_transport_mode: Option<McpTransportInvocationMode>,
+    max_fallback_count: Option<u32>,
+    #[serde(default)]
+    allowed_fallback_reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1210,6 +1236,19 @@ pub fn qa_scenario_manifest_schema_snapshot() -> Value {
         ],
         "optional_sections": ["fault_injection"],
         "fault_injection_plan_schema_version": QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        "runtime_path_evidence_schema_version": QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION,
+        "schema_v5_required_expect_fields": ["runtime_path"],
+        "runtime_path_expectation_fields": [
+            "runtime_contract_version",
+            "provider_lane",
+            "attempt_owner",
+            "harness_id",
+            "context_engine_id",
+            "mcp_transport_mode",
+            "max_fallback_count",
+            "allowed_fallback_reason_codes"
+        ],
+        "mcp_transport_modes": ["per_call", "persistent"],
         "expected_fault_injection_fields": ["activations", "daemon_restarts"],
         "expected_fault_activation_fields": ["activation_id", "recovery_class"],
         "expected_tool_call_fields": ["name", "min_count", "max_count", "success"],
@@ -1253,8 +1292,13 @@ fn build_validated_manifest(
     );
     let requires = validate_requires(wire.requires, &mut issues);
     let steps = validate_steps(wire.steps, schema_version, &mut issues);
-    let expect =
-        validate_expect(wire.expect, schema_version, fault_injection.as_ref(), &mut issues);
+    let expect = validate_expect(
+        wire.expect,
+        schema_version,
+        mode.as_ref().map(|mode| mode.runner),
+        fault_injection.as_ref(),
+        &mut issues,
+    );
     let forbidden = validate_forbidden(wire.forbidden, &mut issues);
     let artifacts = validate_artifacts(wire.artifacts, schema_version, &mut issues);
     let maturity = validate_maturity(wire.maturity, &mut issues);
@@ -2053,13 +2097,13 @@ fn validate_fault_injection_plan(
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<QaFaultInjectionPlan> {
     let plan = value?;
-    if schema_version != Some(QA_SCENARIO_SCHEMA_VERSION) {
+    if schema_version.is_some_and(|version| version < FAULT_CONTRACT_MIN_SCHEMA_VERSION) {
         push_issue(
             issues,
             "fault_injection_requires_schema_v4",
             "$.fault_injection",
-            "fault_injection is supported only by schema_version 4",
-            "Set schema_version to 4 or remove the fault_injection section.",
+            "fault_injection is supported only by schema_version 4 or later",
+            "Set schema_version to at least 4 or remove the fault_injection section.",
         );
         return None;
     }
@@ -2100,6 +2144,7 @@ fn validate_fault_injection_plan(
 fn validate_expect(
     value: Option<QaScenarioExpectWire>,
     schema_version: Option<u32>,
+    runner_mode: Option<QaScenarioRunnerMode>,
     fault_plan: Option<&QaFaultInjectionPlan>,
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<QaScenarioExpect> {
@@ -2119,6 +2164,8 @@ fn validate_expect(
         .map(|answer| validate_text_assertion(answer, "$.expect.final_answer", issues));
     let events = validate_expected_events(value.events, issues);
     let tool_calls = validate_expected_tool_calls(value.tool_calls, schema_version, issues);
+    let runtime_path =
+        validate_runtime_path_expectation(value.runtime_path, schema_version, runner_mode, issues);
     let fault_injection = validate_expected_fault_injection(
         value.fault_injection,
         schema_version,
@@ -2128,13 +2175,14 @@ fn validate_expect(
     if final_answer.is_none()
         && events.is_empty()
         && tool_calls.is_empty()
+        && runtime_path.is_none()
         && fault_injection.is_none()
     {
         push_issue(
             issues,
             "empty_expectations",
             "$.expect",
-            "expect must include final_answer, events, or tool_calls assertions",
+            "expect must include final_answer, events, tool_calls, runtime_path, or fault_injection assertions",
             "Add at least one observable assertion to the expect section.",
         );
     }
@@ -2143,6 +2191,7 @@ fn validate_expect(
         final_answer: final_answer.flatten(),
         events,
         tool_calls,
+        runtime_path,
         fault_injection,
     })
 }
@@ -2229,7 +2278,9 @@ fn validate_expected_tool_calls(
             "tool call name",
             issues,
         ) {
-            let max_count = if schema_version == Some(QA_SCENARIO_SCHEMA_VERSION) {
+            let max_count = if schema_version
+                .is_some_and(|version| version >= FAULT_CONTRACT_MIN_SCHEMA_VERSION)
+            {
                 tool_call.max_count
             } else {
                 if tool_call.max_count.is_some() {
@@ -2237,8 +2288,8 @@ fn validate_expected_tool_calls(
                         issues,
                         "tool_call_max_count_requires_schema_v4",
                         format!("{path}.max_count"),
-                        "max_count is supported only by schema_version 4",
-                        "Set schema_version to 4 or remove max_count.",
+                        "max_count is supported only by schema_version 4 or later",
+                        "Set schema_version to at least 4 or remove max_count.",
                     );
                 }
                 None
@@ -2267,20 +2318,133 @@ fn validate_expected_tool_calls(
     tool_calls
 }
 
+fn validate_runtime_path_expectation(
+    value: Option<NoHiddenFallbackExpectationWire>,
+    schema_version: Option<u32>,
+    runner_mode: Option<QaScenarioRunnerMode>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<NoHiddenFallbackExpectation> {
+    if schema_version.is_none_or(|version| version < RUNTIME_PATH_EXPECTATION_MIN_SCHEMA_VERSION) {
+        if value.is_some() {
+            push_issue(
+                issues,
+                "runtime_path_expectation_requires_schema_v5",
+                "$.expect.runtime_path",
+                "runtime_path expectations are supported only by schema_version 5",
+                "Set schema_version to 5 or remove the runtime_path expectation.",
+            );
+        }
+        return None;
+    }
+
+    let Some(value) = value else {
+        push_issue(
+            issues,
+            "missing_runtime_path_expectation",
+            "$.expect.runtime_path",
+            "schema_version 5 requires an exact runtime_path expectation",
+            "Declare the runtime contract, provider lane, path components, and fallback policy.",
+        );
+        return None;
+    };
+
+    let runtime_contract_version = validate_required_string(
+        value.runtime_contract_version,
+        "$.expect.runtime_path.runtime_contract_version",
+        "runtime contract version",
+        issues,
+    );
+    let provider_lane = validate_enum_string(
+        value.provider_lane,
+        "$.expect.runtime_path.provider_lane",
+        "runtime path provider lane",
+        RUNNER_MODE_VALUES,
+        issues,
+    );
+    if let (Some(provider_lane), Some(runner_mode)) = (provider_lane.as_deref(), runner_mode) {
+        if provider_lane != runner_mode.as_str() {
+            push_issue(
+                issues,
+                "runtime_path_provider_lane_mismatch",
+                "$.expect.runtime_path.provider_lane",
+                format!(
+                    "runtime_path provider lane '{provider_lane}' does not match mode.runner '{}'",
+                    runner_mode.as_str()
+                ),
+                "Use the same provider lane as mode.runner.",
+            );
+        }
+    }
+    let attempt_owner = validate_required_string(
+        value.attempt_owner,
+        "$.expect.runtime_path.attempt_owner",
+        "runtime path attempt owner",
+        issues,
+    );
+    let harness_id = validate_required_string(
+        value.harness_id,
+        "$.expect.runtime_path.harness_id",
+        "runtime path harness id",
+        issues,
+    );
+    let context_engine_id = validate_required_string(
+        value.context_engine_id,
+        "$.expect.runtime_path.context_engine_id",
+        "runtime path context engine id",
+        issues,
+    );
+    let max_fallback_count = match value.max_fallback_count {
+        Some(count) => Some(count),
+        None => {
+            push_issue(
+                issues,
+                "missing_runtime_path_max_fallback_count",
+                "$.expect.runtime_path.max_fallback_count",
+                "runtime path max_fallback_count is required",
+                "Declare the exact maximum fallback count, including zero.",
+            );
+            None
+        }
+    };
+
+    let expectation = NoHiddenFallbackExpectation {
+        runtime_contract_version: runtime_contract_version?,
+        provider_lane: provider_lane?,
+        attempt_owner: attempt_owner?,
+        harness_id: harness_id?,
+        context_engine_id: context_engine_id?,
+        mcp_transport_mode: value.mcp_transport_mode,
+        max_fallback_count: max_fallback_count?,
+        allowed_fallback_reason_codes: value.allowed_fallback_reason_codes,
+    };
+    if let Err(error) = expectation.validate_shape() {
+        let suffix = error.path().strip_prefix('$').unwrap_or(error.path());
+        push_issue(
+            issues,
+            error.code(),
+            format!("$.expect.runtime_path{suffix}"),
+            error.message(),
+            "Correct the bounded runtime-path selectors and fallback policy.",
+        );
+        return None;
+    }
+    Some(expectation)
+}
+
 fn validate_expected_fault_injection(
     value: Option<QaScenarioExpectedFaultInjectionWire>,
     schema_version: Option<u32>,
     fault_plan: Option<&QaFaultInjectionPlan>,
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<QaScenarioExpectedFaultInjection> {
-    if schema_version != Some(QA_SCENARIO_SCHEMA_VERSION) {
+    if schema_version.is_some_and(|version| version < FAULT_CONTRACT_MIN_SCHEMA_VERSION) {
         if value.is_some() {
             push_issue(
                 issues,
                 "fault_expectations_require_schema_v4",
                 "$.expect.fault_injection",
-                "fault_injection expectations are supported only by schema_version 4",
-                "Set schema_version to 4 or remove the fault_injection expectations.",
+                "fault_injection expectations are supported only by schema_version 4 or later",
+                "Set schema_version to at least 4 or remove the fault_injection expectations.",
             );
         }
         return None;
@@ -2509,34 +2673,36 @@ fn validate_artifacts(
         let kind = validate_artifact_kind(artifact.kind, format!("{path}.kind").as_str(), issues)
             .and_then(|kind| {
                 if kind == QaScenarioArtifactKind::Workspace
-                    && schema_version != Some(QA_SCENARIO_SCHEMA_VERSION)
+                    && schema_version
+                        .is_some_and(|version| version < FAULT_CONTRACT_MIN_SCHEMA_VERSION)
                 {
                     push_issue(
                         issues,
                         "workspace_artifact_requires_schema_v4",
                         format!("{path}.kind"),
-                        "workspace artifacts are supported only by schema_version 4",
-                        "Set schema_version to 4 or use a legacy artifact kind.",
+                        "workspace artifacts are supported only by schema_version 4 or later",
+                        "Set schema_version to at least 4 or use a legacy artifact kind.",
                     );
                     None
                 } else {
                     Some(kind)
                 }
             });
-        let sha256 = if schema_version == Some(QA_SCENARIO_SCHEMA_VERSION) {
-            validate_artifact_sha256(artifact.sha256, format!("{path}.sha256").as_str(), issues)
-        } else {
-            if artifact.sha256.is_some() {
-                push_issue(
+        let sha256 =
+            if schema_version.is_some_and(|version| version >= FAULT_CONTRACT_MIN_SCHEMA_VERSION) {
+                validate_artifact_sha256(artifact.sha256, format!("{path}.sha256").as_str(), issues)
+            } else {
+                if artifact.sha256.is_some() {
+                    push_issue(
                     issues,
                     "artifact_sha256_requires_schema_v4",
                     format!("{path}.sha256"),
-                    "artifact sha256 assertions are supported only by schema_version 4",
-                    "Set schema_version to 4 or remove sha256.",
+                    "artifact sha256 assertions are supported only by schema_version 4 or later",
+                    "Set schema_version to at least 4 or remove sha256.",
                 );
-            }
-            None
-        };
+                }
+                None
+            };
         if let (Some(path), Some(kind)) = (artifact_path, kind) {
             artifacts.push(QaScenarioArtifact { path, kind, required: artifact.required, sha256 });
         }
@@ -2955,6 +3121,15 @@ mod tests {
         recovery_class: duplicate_suppressed
     daemon_restarts: 1
 "#;
+    const RUNTIME_PATH_EXPECTATION_BLOCK: &str = r#"  runtime_path:
+    runtime_contract_version: runtime-contracts.v7
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
+"#;
     const V2_FIXTURE_SCENARIO: &str = r#"
 schema_version: 2
 id: runner.fixture.basic
@@ -3202,6 +3377,159 @@ timeout:
         let yaml_round_trip = parse_qa_scenario_manifest_yaml(yaml.as_str())
             .expect("schema-v4 YAML projection should parse");
         assert_eq!(yaml_round_trip, manifest);
+    }
+
+    #[test]
+    fn schema_v5_runtime_path_expectation_round_trips() {
+        let scenario = schema_v5_scenario();
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("schema-v5 runtime-path scenario should parse");
+
+        assert_eq!(manifest.schema_version, 5);
+        let runtime_path = manifest
+            .expect
+            .runtime_path
+            .as_ref()
+            .expect("schema-v5 runtime path should be retained");
+        assert_eq!(runtime_path.runtime_contract_version, "runtime-contracts.v7");
+        assert_eq!(runtime_path.provider_lane, "fixture");
+        assert_eq!(runtime_path.attempt_owner, "embedded_run_stream");
+        assert_eq!(runtime_path.harness_id, "embedded_run_stream");
+        assert_eq!(runtime_path.context_engine_id, "legacy_provider_input");
+        assert_eq!(runtime_path.mcp_transport_mode, None);
+        assert_eq!(runtime_path.max_fallback_count, 0);
+        assert!(runtime_path.allowed_fallback_reason_codes.is_empty());
+
+        let json = serde_json::to_string(&manifest)
+            .expect("schema-v5 runtime-path manifest should serialize as JSON");
+        let json_round_trip = parse_qa_scenario_manifest_yaml(json.as_str())
+            .expect("schema-v5 JSON projection should parse");
+        assert_eq!(json_round_trip, manifest);
+        let yaml = yaml_serde::to_string(&manifest)
+            .expect("schema-v5 runtime-path manifest should serialize as YAML");
+        let yaml_round_trip = parse_qa_scenario_manifest_yaml(yaml.as_str())
+            .expect("schema-v5 YAML projection should parse");
+        assert_eq!(yaml_round_trip, manifest);
+    }
+
+    #[test]
+    fn schema_v5_mcp_transport_mode_is_typed_and_round_trips() {
+        let scenario = schema_v5_scenario().replace(
+            "    context_engine_id: legacy_provider_input\n",
+            "    context_engine_id: legacy_provider_input\n    mcp_transport_mode: per_call\n",
+        );
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("a canonical MCP transport mode should parse");
+        let runtime_path = manifest
+            .expect
+            .runtime_path
+            .as_ref()
+            .expect("schema-v5 runtime path should be retained");
+
+        assert_eq!(runtime_path.mcp_transport_mode, Some(McpTransportInvocationMode::PerCall));
+
+        let yaml = yaml_serde::to_string(&manifest)
+            .expect("typed MCP transport expectation should serialize as YAML");
+        let round_trip = parse_qa_scenario_manifest_yaml(yaml.as_str())
+            .expect("typed MCP transport expectation should round-trip");
+        assert_eq!(round_trip, manifest);
+    }
+
+    #[test]
+    fn schema_v5_requires_runtime_path_expectation() {
+        let scenario = V2_FIXTURE_SCENARIO.replace("schema_version: 2", "schema_version: 5");
+
+        assert_validation_issue(
+            scenario.as_str(),
+            "$.expect.runtime_path",
+            "missing_runtime_path_expectation",
+        );
+    }
+
+    #[test]
+    fn schemas_v1_through_v4_reject_runtime_path_expectation() {
+        for schema_version in [1, 2, 3, 4] {
+            let scenario = schema_v5_scenario().replacen(
+                "schema_version: 5",
+                format!("schema_version: {schema_version}").as_str(),
+                1,
+            );
+
+            assert_validation_issue(
+                scenario.as_str(),
+                "$.expect.runtime_path",
+                "runtime_path_expectation_requires_schema_v5",
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v5_requires_runtime_path_provider_lane_to_match_runner() {
+        let scenario =
+            schema_v5_scenario().replace("provider_lane: fixture", "provider_lane: live");
+
+        assert_validation_issue(
+            scenario.as_str(),
+            "$.expect.runtime_path.provider_lane",
+            "runtime_path_provider_lane_mismatch",
+        );
+    }
+
+    #[test]
+    fn schema_v5_rejects_unsafe_runtime_path_metadata() {
+        let scenario = schema_v5_scenario().replace("runtime-contracts.v7", "runtime contracts v7");
+
+        assert_validation_issue(
+            scenario.as_str(),
+            "$.expect.runtime_path.runtime_contract_version",
+            "runtime_path_metadata_invalid",
+        );
+    }
+
+    #[test]
+    fn schema_v5_rejects_non_transport_mcp_modes() {
+        for mode in ["not_used", "custom_session"] {
+            let scenario = schema_v5_scenario().replace(
+                "    context_engine_id: legacy_provider_input\n",
+                format!(
+                    "    context_engine_id: legacy_provider_input\n    mcp_transport_mode: {mode}\n"
+                )
+                .as_str(),
+            );
+
+            let error = parse_qa_scenario_manifest_yaml(scenario.as_str())
+                .expect_err("an unknown MCP transport mode should fail typed decoding");
+
+            assert!(matches!(error, QaScenarioManifestError::Parse { .. }));
+            assert!(
+                error.to_string().contains("unknown variant"),
+                "unexpected parse error for mode={mode}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v5_preserves_schema_v4_fault_contracts() {
+        let scenario =
+            FAULT_TOOL_SCENARIO.replace("schema_version: 4", "schema_version: 5").replacen(
+                "forbidden:\n",
+                format!("{RUNTIME_PATH_EXPECTATION_BLOCK}forbidden:\n").as_str(),
+                1,
+            );
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("schema-v5 should preserve schema-v4 fault contracts");
+
+        assert!(manifest.expect.runtime_path.is_some());
+        assert_eq!(manifest.fault_injection.as_ref().map(|plan| plan.seed), Some(20_260_710));
+        assert_eq!(
+            manifest.expect.fault_injection.as_ref().map(|expectation| expectation.daemon_restarts),
+            Some(1)
+        );
+        assert_eq!(manifest.expect.tool_calls[0].max_count, Some(1));
+        assert_eq!(
+            manifest.artifacts[0].sha256.as_deref(),
+            Some("78930e608b8acfc1799a5e09e2f1bdb408dde4fd2607d38b86acb16130c2c550")
+        );
     }
 
     #[test]
@@ -3729,6 +4057,13 @@ timeout:
                 "  tool_calls: []\nforbidden:",
                 format!("  tool_calls: []\n{FAULT_EXPECTATION_BLOCK}forbidden:").as_str(),
             )
+    }
+
+    fn schema_v5_scenario() -> String {
+        V2_FIXTURE_SCENARIO.replace("schema_version: 2", "schema_version: 5").replace(
+            "  tool_calls: []\nforbidden:",
+            format!("  tool_calls: []\n{RUNTIME_PATH_EXPECTATION_BLOCK}forbidden:").as_str(),
+        )
     }
 
     fn schema_v3_scenario_with_extra_runner_field(

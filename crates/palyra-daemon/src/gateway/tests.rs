@@ -70,6 +70,7 @@ use crate::objectives::{
 use crate::routines::{
     RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineExecutionConfig, RoutineTriggerKind,
 };
+use crate::self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate};
 use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
 
@@ -1117,6 +1118,8 @@ fn build_test_runtime_state_at_with_fault_injection(
             quic_enabled: true,
             orchestrator_runloop_v1_enabled: true,
             model_provider_request_timeout_ms,
+            qa_execution_key_digest: None,
+            qa_provider_binding_sha256: None,
             node_rpc_mtls_required: true,
             admin_auth_required: true,
             vault_get_approval_required_refs: vec!["global/openai_api_key".to_owned()],
@@ -5901,6 +5904,7 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
             &final_state,
             &mut run_state,
             final_run_id.as_str(),
+            Some("embedded_run_stream"),
             &mut tape_seq,
         )
         .await;
@@ -5922,6 +5926,24 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
     })
     .await
     .expect("finalizer should persist Done before its blocked wire send");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tape = state
+                .journal_store
+                .orchestrator_tape(run_id.as_str())
+                .expect("blocked finalization tape should load");
+            if tape.iter().any(|event| event.event_type == "run.runtime_path_summary") {
+                assert!(
+                    !tape.iter().any(|event| event.event_type == "status"),
+                    "runtime-path summary must be durable before the blocked terminal wire send"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked finalizer should persist its runtime-path summary");
     let cancel = state
         .request_orchestrator_cancel(OrchestratorCancelRequest {
             run_id: run_id.clone(),
@@ -5934,7 +5956,7 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
     receiver.recv().await.expect("barrier event should drain").expect("barrier event should be ok");
     let (outcome, tape_seq) = finalizer.await.expect("finalizer task should join");
     assert_eq!(outcome.expect("finalizer should succeed"), RunStreamPostProviderOutcome::Completed);
-    assert_eq!(tape_seq, 1);
+    assert_eq!(tape_seq, 2);
     let terminal_event = receiver
         .recv()
         .await
@@ -5948,13 +5970,15 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
     assert_eq!(status.kind, common_v1::stream_status::StatusKind::Done as i32);
     assert!(receiver.try_recv().is_err(), "no duplicate terminal wire event is allowed");
 
-    let terminal_rows = state
-        .journal_store
-        .orchestrator_tape(run_id.as_str())
-        .expect("terminal tape should load")
-        .into_iter()
-        .filter(|record| record.event_type == "status")
-        .collect::<Vec<_>>();
+    let tape =
+        state.journal_store.orchestrator_tape(run_id.as_str()).expect("terminal tape should load");
+    assert_eq!(
+        tape.iter().filter(|record| record.event_type == "run.runtime_path_summary").count(),
+        1,
+        "only one terminal runtime-path summary is allowed"
+    );
+    let terminal_rows =
+        tape.into_iter().filter(|record| record.event_type == "status").collect::<Vec<_>>();
     assert_eq!(terminal_rows.len(), 1, "only one terminal tape row is allowed");
     let payload: Value = serde_json::from_str(terminal_rows[0].payload_json.as_str())
         .expect("terminal status payload should decode");
@@ -6777,6 +6801,7 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
         &state,
         &mut run_state,
         run_id.as_str(),
+        Some("embedded_run_stream"),
         &mut tape_seq,
     )
     .await
@@ -6791,7 +6816,106 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
     let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
     let sequence =
         tape.iter().map(|event| (event.seq, event.event_type.as_str())).collect::<Vec<_>>();
-    assert_eq!(sequence, vec![(0, "status"), (1, "run.cleanup")]);
+    assert_eq!(sequence, vec![(0, "run.runtime_path_summary"), (1, "status"), (2, "run.cleanup")]);
+    let summary: Value = serde_json::from_str(tape[0].payload_json.as_str())
+        .expect("runtime-path summary should decode");
+    assert_eq!(summary["terminal_state"], "done");
+    assert_eq!(summary["terminal_reason"], "runtime.terminal.completed");
+    assert_eq!(summary["attempt_owner"], "embedded_run_stream");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_cancel_before_finalization_records_one_summary_and_terminal_status() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "cancel_before_finalization".to_owned(),
+        })
+        .await
+        .expect("cancel request should persist");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let outcome = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &mut tape_seq,
+    )
+    .await
+    .expect("late cancellation should finalize");
+
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Cancelled);
+    assert_eq!(run_state.state(), RunLifecycleState::Cancelled);
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(
+        tape.iter().filter(|event| event.event_type == "run.runtime_path_summary").count(),
+        1
+    );
+    assert_eq!(tape.iter().filter(|event| event.event_type == "status").count(), 1);
+    assert_eq!(
+        tape.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+        ["run.runtime_path_summary", "status"]
+    );
+    let summary: Value = serde_json::from_str(tape[0].payload_json.as_str())
+        .expect("runtime-path summary should decode");
+    assert_eq!(summary["terminal_state"], "cancelled");
+    assert_eq!(summary["terminal_reason"], "runtime.terminal.cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persisted_cancel_wins_done_finalization_with_one_terminal_summary() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .update_orchestrator_run_state(
+            run_id.clone(),
+            RunLifecycleState::Cancelled,
+            Some("cancel_won_done_race".to_owned()),
+        )
+        .await
+        .expect("test should persist the concurrent terminal state");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let outcome = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &mut tape_seq,
+    )
+    .await
+    .expect("persisted cancellation should win finalization");
+
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Cancelled);
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(
+        tape.iter().filter(|event| event.event_type == "run.runtime_path_summary").count(),
+        1
+    );
+    assert_eq!(tape.iter().filter(|event| event.event_type == "status").count(), 1);
+    assert_eq!(
+        tape.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+        ["run.runtime_path_summary", "status"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6815,6 +6939,7 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
         &state,
         &mut run_state,
         run_id.as_str(),
+        Some("embedded_run_stream"),
         &mut tape_seq,
     )
     .await
@@ -6830,6 +6955,115 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
         "client disconnect during Done status must not skip terminal cleanup"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_run_finalization_cleans_resources_when_summary_append_fails() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-summary-conflict");
+    state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        summary: "summary append failure regression".to_owned(),
+    });
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "seed.sequence_conflict".to_owned(),
+            payload_json: json!({"schema_version": 1}).to_string(),
+        })
+        .await
+        .expect("seed tape event should append");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let error = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &mut tape_seq,
+    )
+    .await
+    .expect_err("the injected tape sequence conflict should be reported");
+
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(run_state.state(), RunLifecycleState::Done);
+    assert!(
+        state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
+        "runtime-path summary persistence failures must not skip terminal cleanup"
+    );
+    assert!(
+        state.self_healing_heartbeats().into_iter().all(|heartbeat| heartbeat.object_id != run_id),
+        "runtime-path summary persistence failures must not leave a run heartbeat"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(tape[0].event_type, "seed.sequence_conflict");
+    assert_eq!(tape.last().map(|event| event.event_type.as_str()), Some("run.cleanup"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_cancel_cleans_resources_when_summary_append_fails() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-cancel-summary-conflict");
+    state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        summary: "cancel summary append failure regression".to_owned(),
+    });
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "seed.cancel_sequence_conflict".to_owned(),
+            payload_json: json!({"schema_version": 1}).to_string(),
+        })
+        .await
+        .expect("seed tape event should append");
+    state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "cancel_with_summary_conflict".to_owned(),
+        })
+        .await
+        .expect("cancel request should persist");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let error = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &mut tape_seq,
+    )
+    .await
+    .expect_err("the injected summary conflict should be reported after cleanup");
+
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(run_state.state(), RunLifecycleState::Cancelled);
+    assert!(state.take_run_cleanup_resources(run_id.as_str()).is_empty());
+    assert!(state
+        .self_healing_heartbeats()
+        .into_iter()
+        .all(|heartbeat| heartbeat.object_id != run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2105,6 +2105,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut previous_session_run_id = None::<String>;
             let mut background_budget_tokens = None::<u64>;
             let mut active_approval_cache_generation = None::<u64>;
+            let mut active_attempt_owner = None::<String>;
 
             let mut pending_item = None::<Result<common_v1::RunStreamRequest, Status>>;
             loop {
@@ -2169,6 +2170,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &mut previous_session_run_id,
                     &mut background_budget_tokens,
                     &mut active_approval_cache_generation,
+                    &mut active_attempt_owner,
                     message,
                 )
                 .await
@@ -2209,6 +2211,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &state_for_stream,
                     &mut run_state,
                     run_id.as_str(),
+                    active_attempt_owner.as_deref(),
                     &mut tape_seq,
                 )
                 .await

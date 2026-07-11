@@ -10,6 +10,10 @@
 - Fault activations: 0
 - Daemon restarts: 0
 
+## Runtime Path
+
+- Evidence: `not captured`
+
 ## Checks
 
 | Check | Verdict | Issues |
@@ -27,6 +31,6 @@
 
 - Redacted fields: 0
 - Normalized timestamps: 0
-- Normalized identifiers: 4
+- Normalized identifiers: 6
 - Normalized paths: 0
 - Normalized hashes: 0

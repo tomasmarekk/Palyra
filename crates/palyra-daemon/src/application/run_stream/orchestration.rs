@@ -16,6 +16,10 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use palyra_common::{
+    qa_runtime_path::{
+        ProviderRouteChangeEvent, PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_ROUTE_CHANGE_EVENT,
+        PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION, PROVIDER_ROUTE_CHANGE_EVIDENCE_TRUNCATED_EVENT,
+    },
     redaction::REDACTED,
     runtime_contracts::{
         classify_agent_harness_terminal, AgentHarnessAttemptClassification,
@@ -84,10 +88,11 @@ use crate::{
         ProviderAttemptSummary, ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason,
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
-        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass,
-        TerminalOutcomeClassification, ToolCallAssemblyPolicy,
-        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
-        PROVIDER_RECOVERY_DECISION_EVENT, TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
+        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
+        QaProviderAttestationContext, TerminalOutcomeClass, TerminalOutcomeClassification,
+        ToolCallAssemblyPolicy, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+        PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
+        TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -111,7 +116,7 @@ use super::{
         TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
         VERIFICATION_FINALIZER_NUDGE_EVENT, VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
     },
-    cancellation::transition_run_stream_to_cancelled,
+    cancellation::{transition_run_stream_state_to_cancelled, transition_run_stream_to_cancelled},
     tape::{
         maybe_compact_context_after_tool_results, send_final_status_with_tape,
         send_model_token_with_tape, send_status_with_tape,
@@ -124,6 +129,7 @@ const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
 const PROVIDER_RETRY_STARTED_EVENT: &str = "provider.retry.started";
 const PROVIDER_RETRY_EVIDENCE_TRUNCATED_EVENT: &str = "provider.retry.evidence_truncated";
 const MAX_PROVIDER_RETRY_EVIDENCE_EVENTS: usize = 16;
+const MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS: usize = 16;
 const BEFORE_FINALIZE_EVENT: &str = "run.before_finalize";
 const HARNESS_TOOL_SURFACE_PROJECTION_EVENT: &str = "harness.tool_surface_projection";
 // Turns directly after browser tool results get a much shorter deadline than
@@ -863,11 +869,46 @@ async fn persist_run_stream_delegation_metadata(
         .await
 }
 
+#[allow(clippy::result_large_err)]
+async fn finalize_late_cancelled_run(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    attempt_owner: Option<&str>,
+    tape_seq: &mut i64,
+) -> Result<(), Status> {
+    let cancelled_outcome = Ok(RunStreamMessageProcessingOutcome::Terminate);
+    let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+        runtime_state,
+        Some(run_id),
+        RunLifecycleState::Cancelled,
+        tape_seq,
+        &cancelled_outcome,
+        attempt_owner,
+    )
+    .await;
+    if let Err(error) = send_final_status_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        common_v1::stream_status::StatusKind::Failed,
+        CANCELLED_REASON,
+    )
+    .await
+    {
+        let _ = sender.send(Err(error)).await;
+    }
+    cleanup_run_resources(runtime_state, run_id, CANCELLED_REASON).await;
+    runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
+    summary_result
+}
+
 /// Completes a run after its final provider response, honoring late cancels.
 ///
 /// Checks for a pending cancel before transitioning, persists the done state,
-/// emits the terminal `Done` status with tape row, and releases run
-/// resources. Already-terminal runs pass through unchanged.
+/// emits the terminal runtime-path summary and `Done` status with tape rows,
+/// and releases run resources. Already-terminal runs pass through unchanged.
 ///
 /// # Errors
 ///
@@ -880,11 +921,13 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_state: &mut RunStateMachine,
     run_id: &str,
+    attempt_owner: Option<&str>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamPostProviderOutcome, Status> {
     match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
         Ok(true) => {
-            transition_run_stream_to_cancelled(sender, runtime_state, run_state, run_id, tape_seq)
+            transition_run_stream_state_to_cancelled(runtime_state, run_state, run_id).await?;
+            finalize_late_cancelled_run(sender, runtime_state, run_id, attempt_owner, tape_seq)
                 .await?;
             return Ok(RunStreamPostProviderOutcome::Cancelled);
         }
@@ -906,10 +949,20 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
             runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await,
             Ok(Some(snapshot)) if snapshot.state == RunLifecycleState::Cancelled.as_str()
         ) {
-            cleanup_run_resources(runtime_state, run_id, CANCELLED_REASON).await;
-            runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
+            finalize_late_cancelled_run(sender, runtime_state, run_id, attempt_owner, tape_seq)
+                .await?;
             return Ok(RunStreamPostProviderOutcome::Cancelled);
         }
+        let completed_outcome = Ok(RunStreamMessageProcessingOutcome::Continue);
+        let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+            runtime_state,
+            Some(run_id),
+            run_state.state(),
+            tape_seq,
+            &completed_outcome,
+            attempt_owner,
+        )
+        .await;
         let status_result = send_final_status_with_tape(
             sender,
             runtime_state,
@@ -922,6 +975,7 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
         cleanup_run_resources(runtime_state, run_id, "completed").await;
         runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
         status_result?;
+        summary_result?;
     }
 
     Ok(RunStreamPostProviderOutcome::Completed)
@@ -1685,7 +1739,6 @@ fn run_stream_harness_terminal_payload(
             terminal.classification
         ),
         "replay_safety": terminal.replay_safety,
-        "fallback_used": diagnostics.fallback_used,
         "fallback_policy": diagnostics.fallback_policy,
     })
     .to_string()
@@ -2116,6 +2169,7 @@ pub(crate) async fn process_run_stream_message(
     previous_session_run_id: &mut Option<String>,
     active_background_budget_tokens: &mut Option<u64>,
     active_approval_cache_generation: &mut Option<u64>,
+    active_attempt_owner: &mut Option<String>,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     if !runtime_state.config.feature_rollouts.agent_harness_runtime.enabled {
@@ -2141,6 +2195,7 @@ pub(crate) async fn process_run_stream_message(
             message,
         )
         .await;
+        *active_attempt_owner = Some("embedded_run_stream".to_owned());
         let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
             runtime_state,
             active_run_id.as_deref(),
@@ -2187,6 +2242,7 @@ pub(crate) async fn process_run_stream_message(
         .as_ref()
         .map(|state| state.diagnostics.harness_id.clone())
         .unwrap_or_else(|| "harness_runtime_v1".to_owned());
+    *active_attempt_owner = Some(attempt_owner.clone());
     let terminal = run_stream_harness_terminal_from_state(run_state.state(), &outcome);
     let finish_result = finish_run_stream_harness_lifecycle(
         runtime_state,
@@ -2624,6 +2680,15 @@ async fn process_run_stream_message_inner(
     base_provider_request.prompt_segments = prepared_provider_input.prompt_segments.clone();
     base_provider_request.prompt_cache_policy = prepared_provider_input.prompt_cache_policy.clone();
     base_provider_request.prompt_cache_report = prepared_provider_input.prompt_cache_report.clone();
+    base_provider_request.qa_attestation_context = runtime_state
+        .config
+        .qa_execution_key_digest
+        .as_ref()
+        .zip(runtime_state.config.qa_provider_binding_sha256.as_ref())
+        .map(|(execution_key_digest, provider_binding_sha256)| QaProviderAttestationContext {
+            execution_key_digest: execution_key_digest.clone(),
+            provider_binding_sha256: provider_binding_sha256.clone(),
+        });
     if !prepared_provider_input.provider_messages.is_empty() {
         let mut messages = prepared_provider_input.provider_messages.clone();
         messages.push(ProviderMessage::user_text(base_provider_request.input_text.clone()));
@@ -2934,6 +2999,10 @@ async fn process_run_stream_message_inner(
         provider_request.prompt_segments = base_provider_request.prompt_segments.clone();
         provider_request.prompt_cache_policy = base_provider_request.prompt_cache_policy.clone();
         provider_request.prompt_cache_report = base_provider_request.prompt_cache_report.clone();
+        // Preserve hash-only QA correlation across the per-turn rebuild so the
+        // adapter can attest the exact request path it actually executed.
+        provider_request.qa_attestation_context =
+            base_provider_request.qa_attestation_context.clone();
         if let Some(budget_tokens) = background_budget_tokens {
             let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
             match apply_background_budget_guard(
@@ -3848,8 +3917,32 @@ async fn process_run_stream_provider_response(
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
+    if let Some(attestation) = provider_response.qa_lane_attestation.as_ref() {
+        attestation.validate_shape().map_err(|error| {
+            Status::internal(format!("invalid provider lane attestation: {error}"))
+        })?;
+        let payload_json = serde_json::to_string(attestation).map_err(|error| {
+            Status::internal(format!("failed to serialize provider lane attestation: {error}"))
+        })?;
+        runtime_state
+            .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: *tape_seq,
+                event_type: PROVIDER_LANE_ATTESTATION_EVENT.to_owned(),
+                payload_json,
+            })
+            .await?;
+        *tape_seq = tape_seq.saturating_add(1);
+    }
     let provider_output = bounded_provider_turn_output_for_persistence(&provider_response.output);
     let terminal_outcome = classify_terminal_outcome(&provider_output);
+    persist_run_stream_provider_route_change_evidence(
+        runtime_state,
+        run_id,
+        tape_seq,
+        provider_response.attempts.as_slice(),
+    )
+    .await?;
     persist_run_stream_provider_retry_evidence(
         runtime_state,
         run_id,
@@ -4264,9 +4357,11 @@ fn failed_tool_claim_boundary(tool_name: &str) -> Option<&'static str> {
         crate::gateway::BROWSER_CONSOLE_LOG_TOOL_NAME => Some(
             "browser console diagnostics failed; console status is unknown, so do not claim the page has no console errors or that the console is clean unless a later successful console diagnostic verifies it",
         ),
-        crate::gateway::MEMORY_RETAIN_TOOL_NAME | crate::gateway::MEMORY_RETAIN_ALIAS_TOOL_NAME => Some(
-            "memory retain did not complete as a durable write; do not claim the memory was stored or will be available for future recall unless a later successful retain or ingest verifies it",
-        ),
+        crate::gateway::MEMORY_RETAIN_TOOL_NAME | crate::gateway::MEMORY_RETAIN_ALIAS_TOOL_NAME => {
+            Some(
+                "memory retain did not complete as a durable write; do not claim the memory was stored or will be available for future recall unless a later successful retain or ingest verifies it",
+            )
+        }
         _ => None,
     }
 }
@@ -5609,6 +5704,75 @@ fn bounded_provider_retry_evidence(attempts: &[ProviderAttemptSummary]) -> (Vec<
     (evidence, truncated)
 }
 
+fn bounded_provider_route_change_evidence(
+    attempts: &[ProviderAttemptSummary],
+) -> (Vec<ProviderRouteChangeEvent>, bool) {
+    let mut previous_executed: Option<&ProviderAttemptSummary> = None;
+    let mut route_changes = Vec::new();
+    for attempt in attempts.iter().filter(|attempt| attempt.outcome != "skipped") {
+        if let Some(previous) = previous_executed {
+            if previous.provider_id != attempt.provider_id || previous.model_id != attempt.model_id
+            {
+                route_changes.push(ProviderRouteChangeEvent {
+                    schema_version: PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION,
+                    event_name: PROVIDER_ROUTE_CHANGE_EVENT.to_owned(),
+                    transition_index: u32::try_from(route_changes.len()).unwrap_or(u32::MAX),
+                    from_provider_id: previous.provider_id.clone(),
+                    from_model_id: previous.model_id.clone(),
+                    to_provider_id: attempt.provider_id.clone(),
+                    to_model_id: attempt.model_id.clone(),
+                    reason_code: "runtime_path.provider.route_changed".to_owned(),
+                });
+            }
+        }
+        previous_executed = Some(attempt);
+    }
+    let truncated = route_changes.len() > MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS;
+    route_changes.truncate(MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS);
+    (route_changes, truncated)
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_run_stream_provider_route_change_evidence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    attempts: &[ProviderAttemptSummary],
+) -> Result<(), Status> {
+    let (evidence, truncated) = bounded_provider_route_change_evidence(attempts);
+    for event in evidence {
+        event.validate_shape().map_err(|error| {
+            Status::internal(format!("invalid provider route change evidence: {error}"))
+        })?;
+        let payload_json = serde_json::to_string(&event).map_err(|error| {
+            Status::internal(format!("failed to serialize provider route change evidence: {error}"))
+        })?;
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            PROVIDER_ROUTE_CHANGE_EVENT,
+            payload_json,
+        )
+        .await?;
+    }
+    if truncated {
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            PROVIDER_ROUTE_CHANGE_EVIDENCE_TRUNCATED_EVENT,
+            json!({
+                "schema_version": 1,
+                "retained": MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS,
+            })
+            .to_string(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 async fn persist_run_stream_provider_retry_evidence(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -5652,33 +5816,33 @@ mod tests {
         active_run_steering_guidance, agent_loop_budget_exhausted_message,
         agent_loop_terminal_status_message, apply_background_budget_guard,
         background_budget_overrun_message, background_run_budget_tokens,
-        bounded_provider_retry_evidence, browser_followup_timeout_partial_summary,
-        canonical_events_from_provider_output, configured_run_stream_agent_harness_plugin_id,
-        contains_raw_provider_tool_call_markup, effective_provider_request_deadline,
-        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
-        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
-        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
-        phase_heartbeat_interval, provider_error_partial_summary,
-        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
-        provider_request_deadline_timeout, provider_request_timeout_message,
-        provider_request_timeout_status, provider_status_recovery_decision_payload,
-        provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
-        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
-        run_stream_harness_selection_payload, run_stream_harness_started_payload,
-        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
-        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
-        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
-        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
+        browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
+        configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
+        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
+        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
+        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
+        incomplete_terminal_outcome_message, is_browser_tool_name,
+        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
+        provider_error_partial_summary, provider_model_override_for_routing,
+        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
+        provider_request_timeout_message, provider_request_timeout_status,
+        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
+        provider_turn_anomaly_from_response_failure, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
+        run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
+        run_stream_harness_started_payload, run_stream_harness_terminal_event,
+        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
+        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
+        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
@@ -5947,6 +6111,7 @@ mod tests {
         assert_eq!(selection["selection_mode"], "embedded");
         assert_eq!(selection["support_outcome"], "supported");
         assert_eq!(selection["selection_reason_code"], "harness.embedded_default");
+        assert_eq!(selection["fallback_used"], false);
         assert_eq!(started["event"], HARNESS_RUN_STARTED_EVENT);
         assert!(!serialized_started.contains("secret-token"));
     }
@@ -5999,10 +6164,32 @@ mod tests {
         assert_eq!(payload["terminal_status"], "failed");
         assert_eq!(payload["terminal_classification"], "provider_error");
         assert_eq!(payload["replay_safety"], "not_replay_safe");
+        assert!(payload.get("fallback_used").is_none());
         assert_eq!(cleanup["event"], HARNESS_RUN_CLEANED_UP_EVENT);
         assert_eq!(cleanup["terminal_status"], "cancelled");
         assert_eq!(cleanup["terminal_classification"], "cancelled");
         assert_eq!(cleanup["cleanup_completed"], true);
+    }
+
+    #[test]
+    fn run_stream_harness_records_fallback_only_at_selection() {
+        let mut lifecycle = harness_lifecycle();
+        lifecycle.diagnostics.fallback_used = true;
+        lifecycle.diagnostics.reason_code = "harness.preferred_plugin_unavailable".to_owned();
+        let selection: Value = serde_json::from_str(
+            run_stream_harness_selection_payload(&lifecycle, harness_start_request()).as_str(),
+        )
+        .expect("selection payload should be JSON");
+        let terminal = run_stream_harness_terminal_from_outcome(&Ok(
+            RunStreamMessageProcessingOutcome::Continue,
+        ));
+        let terminal_payload: Value = serde_json::from_str(
+            run_stream_harness_terminal_payload(&lifecycle, terminal).as_str(),
+        )
+        .expect("terminal payload should be JSON");
+
+        assert_eq!(selection["fallback_used"], true);
+        assert!(terminal_payload.get("fallback_used").is_none());
     }
 
     #[test]
@@ -6902,6 +7089,35 @@ mod tests {
         assert_eq!(evidence[0]["reason_code"], "qa_mock_malformed_output");
         assert_eq!(evidence[0]["error_class"], "malformed_response");
         assert!(evidence[0].get("credential_id").is_none());
+    }
+
+    #[test]
+    fn provider_route_evidence_counts_only_executed_identity_changes() {
+        let attempt = |provider_id: &str, model_id: &str, outcome: &str| ProviderAttemptSummary {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+            outcome: outcome.to_owned(),
+            retryable: outcome == "error",
+            served_from_cache: false,
+            reason_code: None,
+            state: None,
+        };
+        let attempts = vec![
+            attempt("provider-a", "model-a", "error"),
+            attempt("provider-a", "model-a", "error"),
+            attempt("provider-b", "model-b", "skipped"),
+            attempt("provider-c", "model-c", "failover_success"),
+        ];
+
+        let (events, truncated) = bounded_provider_route_change_evidence(attempts.as_slice());
+
+        assert!(!truncated);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].from_provider_id, "provider-a");
+        assert_eq!(events[0].from_model_id, "model-a");
+        assert_eq!(events[0].to_provider_id, "provider-c");
+        assert_eq!(events[0].to_model_id, "model-c");
+        events[0].validate_shape().expect("route change evidence should validate");
     }
 
     #[test]

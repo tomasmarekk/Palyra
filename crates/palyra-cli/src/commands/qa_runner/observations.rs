@@ -37,6 +37,7 @@ const MAX_WORKSPACE_ARTIFACTS: usize = 256;
 const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 const TAPE_PAGE_SIZE: usize = 256;
+const CONTROL_PLANE_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) struct QaScenarioObservations {
     pub(super) run_id: String,
@@ -331,7 +332,10 @@ async fn authenticated_client(
     deadline: QaRunDeadline,
 ) -> Result<ControlPlaneClient> {
     let mut config = ControlPlaneClientConfig::new(sandbox.admin_url());
-    config.request_timeout = deadline.step_budget()?;
+    // The QA deadline owns timeout classification. Keep the transport timeout
+    // behind it as a fail-safe for a client that does not react to cancellation.
+    config.request_timeout =
+        deadline.remaining_budget()?.saturating_add(CONTROL_PLANE_TIMEOUT_GRACE);
     config.safe_read_retries = 0;
     config.max_json_response_bytes = MAX_JSON_RESPONSE_BYTES;
     let mut client = ControlPlaneClient::new(config).context("qa.runner.client_init_failed")?;

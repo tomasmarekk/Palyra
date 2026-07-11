@@ -1760,6 +1760,20 @@ pub fn load_config() -> Result<LoadedConfig> {
         )?;
         source.push_str(" +env(PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH)");
     }
+    if let Ok(execution_key_digest) = env::var("PALYRA_QA_EXECUTION_KEY_DIGEST") {
+        model_provider.qa_execution_key_digest = parse_optional_sha256_digest_field(
+            execution_key_digest.as_str(),
+            "PALYRA_QA_EXECUTION_KEY_DIGEST",
+        )?;
+        source.push_str(" +env(PALYRA_QA_EXECUTION_KEY_DIGEST)");
+    }
+    if let Ok(provider_binding_sha256) = env::var("PALYRA_QA_PROVIDER_BINDING_SHA256") {
+        model_provider.qa_provider_binding_sha256 = parse_optional_sha256_digest_field(
+            provider_binding_sha256.as_str(),
+            "PALYRA_QA_PROVIDER_BINDING_SHA256",
+        )?;
+        source.push_str(" +env(PALYRA_QA_PROVIDER_BINDING_SHA256)");
+    }
 
     if let Ok(openai_base_url) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL") {
         model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
@@ -2546,6 +2560,23 @@ pub fn load_config() -> Result<LoadedConfig> {
         anyhow::bail!(
             "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
         );
+    }
+    match (
+        model_provider.qa_execution_key_digest.is_some(),
+        model_provider.qa_provider_binding_sha256.is_some(),
+    ) {
+        (false, false) => {}
+        (true, true) if model_provider.qa_mock_fixture_enabled => {}
+        (true, true) => {
+            anyhow::bail!(
+                "QA provider attestation digests require qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
+            );
+        }
+        _ => {
+            anyhow::bail!(
+                "PALYRA_QA_EXECUTION_KEY_DIGEST and PALYRA_QA_PROVIDER_BINDING_SHA256 must be configured together"
+            );
+        }
     }
     if model_provider.kind == ModelProviderKind::OpenAiCompatible {
         validate_openai_base_url_network_policy(

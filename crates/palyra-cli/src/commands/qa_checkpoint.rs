@@ -17,7 +17,7 @@ use super::qa_runner::{
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_FORMAT: &str = "palyra-qa-campaign-checkpoint";
 const CHECKPOINT_ARTIFACT_KIND: &str = "campaign_checkpoint";
-const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 2;
+const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 3;
 const EXECUTION_RESULT_FORMAT: &str = "palyra-qa-scenario-execution-result";
 const EXECUTION_RESULT_ARTIFACT_KIND: &str = "execution_result";
 const MAX_ATTEMPT_REASON_CODES: usize = 64;
@@ -726,6 +726,11 @@ fn verify_result_artifact(artifact_root: &Path, expected: QaResultExpectation<'_
         || result.runner_mode != expected.execution_key.provider_lane
         || result.verdict != expected.verdict
         || result.reason_codes.as_slice() != expected.reason_codes
+        || result.runtime_path.validate_shape().is_err()
+        || result.runtime_path.runtime_version != expected.execution_key.runtime_version
+        || result.runtime_path.runtime_contract_version
+            != expected.execution_key.runtime_contract_version
+        || result.runtime_path.runner_version != expected.runner_version
     {
         anyhow::bail!("qa.resume.execution_result_mismatch");
     }
@@ -1175,6 +1180,12 @@ mod tests {
             runner_mode: token.execution_key.provider_lane.clone(),
             verdict: verdict.to_owned(),
             reason_codes: reason_codes.clone(),
+            runtime_path: crate::commands::qa_runner::test_runtime_path_evidence(
+                token.execution_key.runtime_version.as_str(),
+                token.execution_key.runtime_contract_version.as_str(),
+                token.runner_version.as_str(),
+                token.execution_key.provider_lane.as_str(),
+            ),
             run_id: passed.then_some("run-1".to_owned()),
             session_id: passed.then_some("session-1".to_owned()),
             terminal_state: passed.then_some("completed".to_owned()),

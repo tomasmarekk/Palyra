@@ -148,6 +148,8 @@ struct QaSuiteConfig {
     mode: String,
     scenario_roots: Vec<String>,
     #[serde(default)]
+    expected_scenario_ids: Vec<String>,
+    #[serde(default)]
     include_tags: Vec<String>,
     #[serde(default)]
     exclude_tags: Vec<String>,
@@ -612,6 +614,9 @@ async fn build_gate_report(
             detail: "a runtime qualification gate must select at least one scenario".to_owned(),
         });
     }
+    if let Some(violation) = expected_scenario_set_policy_violation(&suite, &scenarios) {
+        policy_violations.push(violation);
+    }
     if suite.require_p0_green && summary.p0_failed > 0 {
         policy_violations.push(QaGatePolicyViolation {
             code: "release_p0_not_green".to_owned(),
@@ -674,15 +679,16 @@ fn load_suite_config(path: &Path) -> Result<QaSuiteConfig> {
         .with_context(|| format!("failed to read QA suite {}", path.display()))?;
     let raw = yaml_serde::from_str::<serde_json::Value>(text.as_str())
         .with_context(|| format!("failed to parse QA suite {}", path.display()))?;
-    validate_suite_v2_fields(&raw, path)?;
+    validate_suite_versioned_fields(&raw, path)?;
     let suite = yaml_serde::from_str::<QaSuiteConfig>(text.as_str())
         .with_context(|| format!("failed to parse QA suite {}", path.display()))?;
     validate_suite_config(&suite, path)?;
     Ok(suite)
 }
 
-fn validate_suite_v2_fields(value: &serde_json::Value, path: &Path) -> Result<()> {
-    if value.get("schema_version").and_then(serde_json::Value::as_u64) != Some(2) {
+fn validate_suite_versioned_fields(value: &serde_json::Value, path: &Path) -> Result<()> {
+    let schema_version = value.get("schema_version").and_then(serde_json::Value::as_u64);
+    if !matches!(schema_version, Some(2 | 3)) {
         return Ok(());
     }
     const FIELDS: &[&str] = &[
@@ -690,6 +696,7 @@ fn validate_suite_v2_fields(value: &serde_json::Value, path: &Path) -> Result<()
         "id",
         "mode",
         "scenario_roots",
+        "expected_scenario_ids",
         "include_tags",
         "exclude_tags",
         "allow_provider_modes",
@@ -708,11 +715,17 @@ fn validate_suite_v2_fields(value: &serde_json::Value, path: &Path) -> Result<()
     if let Some(field) = object.keys().find(|field| !FIELDS.contains(&field.as_str())) {
         anyhow::bail!("QA suite {} contains unsupported field {}", path.display(), field);
     }
+    if schema_version == Some(2) && object.contains_key("expected_scenario_ids") {
+        anyhow::bail!(
+            "QA suite {} must use schema_version 3 before pinning expected_scenario_ids",
+            path.display()
+        );
+    }
     Ok(())
 }
 
 fn validate_suite_config(suite: &QaSuiteConfig, path: &Path) -> Result<()> {
-    if !matches!(suite.schema_version, 1 | 2) {
+    if !matches!(suite.schema_version, 1..=3) {
         anyhow::bail!(
             "QA suite {} uses unsupported schema_version {}",
             path.display(),
@@ -724,6 +737,25 @@ fn validate_suite_config(suite: &QaSuiteConfig, path: &Path) -> Result<()> {
     }
     if suite.scenario_roots.is_empty() {
         anyhow::bail!("QA suite {} must define at least one scenario root", path.display());
+    }
+    if suite.schema_version < 3 && !suite.expected_scenario_ids.is_empty() {
+        anyhow::bail!(
+            "QA suite {} must use schema_version 3 before pinning expected scenario ids",
+            path.display()
+        );
+    }
+    if suite.schema_version == 3 {
+        let expected_ids =
+            suite.expected_scenario_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if expected_ids.is_empty()
+            || expected_ids.len() != suite.expected_scenario_ids.len()
+            || expected_ids.iter().any(|id| id.trim().is_empty())
+        {
+            anyhow::bail!(
+                "QA suite {} schema_version 3 requires unique non-empty expected_scenario_ids",
+                path.display()
+            );
+        }
     }
     if suite.scorecard.categories.is_empty() {
         anyhow::bail!("QA suite {} must define scorecard categories", path.display());
@@ -1251,6 +1283,33 @@ fn schema_preview_policy_violations(
         .collect()
 }
 
+fn expected_scenario_set_policy_violation(
+    suite: &QaSuiteConfig,
+    scenarios: &[QaPackScenarioReport],
+) -> Option<QaGatePolicyViolation> {
+    if suite.expected_scenario_ids.is_empty() {
+        return None;
+    }
+    let expected = suite.expected_scenario_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let actual = scenarios
+        .iter()
+        .filter(|scenario| scenario.status != QaPackScenarioStatus::Skipped)
+        .map(|scenario| scenario.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual == expected {
+        return None;
+    }
+    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+    let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+    Some(QaGatePolicyViolation {
+        code: "qa.runner.expected_scenario_set_mismatch".to_owned(),
+        scenario_id: None,
+        detail: format!(
+            "runtime qualification scenario set drifted: missing={missing:?} extra={extra:?}"
+        ),
+    })
+}
+
 fn build_maturity_scorecard(
     config: &QaScorecardConfig,
     scenarios: &[QaPackScenarioReport],
@@ -1656,7 +1715,7 @@ fn schema_preview_evidence(manifest: &QaScenarioManifest) -> QaEvidenceBuildInpu
             (0..count).map(|_| QaToolCallEvidence {
                 name: tool.name.clone(),
                 proposal_id: None,
-                success: tool.success,
+                success: Some(tool.success.unwrap_or(true)),
             })
         })
         .collect::<Vec<_>>();
@@ -2062,8 +2121,8 @@ fn is_yaml_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::commands::qa_runner::{
-        QaExecutionArtifactRef, QaScenarioAttemptProvenance, QaScenarioCleanupResult,
-        QaScenarioExecutionKey, QaScenarioExecutionResult,
+        test_runtime_path_evidence, QaExecutionArtifactRef, QaScenarioAttemptProvenance,
+        QaScenarioCleanupResult, QaScenarioExecutionKey, QaScenarioExecutionResult,
     };
 
     #[test]
@@ -2171,11 +2230,74 @@ mod tests {
     }
 
     #[test]
+    fn baseline_replay_suite_pins_every_required_runtime_scenario() {
+        let suite_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("qa/suites/baseline_replay.yaml");
+        let suite =
+            load_suite_config(suite_path.as_path()).expect("baseline replay suite should parse");
+
+        assert_eq!(suite.schema_version, 3);
+        assert_eq!(
+            suite.expected_scenario_ids,
+            [
+                "real_runtime.malformed_stream_recovery",
+                "real_runtime.mutation_approval_denied",
+                "real_runtime.read_only_tool",
+                "real_runtime.record_replay_text",
+                "real_runtime.text_exact",
+            ]
+        );
+        assert!(suite.scorecard.categories.iter().all(|category| category.required));
+    }
+
+    #[test]
+    fn expected_runtime_scenario_set_fails_closed_on_missing_or_extra_members() {
+        let mut suite = qa_suite_config();
+        suite.schema_version = 3;
+        suite.expected_scenario_ids = vec!["baseline.a".to_owned(), "baseline.b".to_owned()];
+        let report = |id: &str, status| {
+            let mut report = pack_failure(
+                Path::new("qa/scenarios/baseline.yaml"),
+                id,
+                "unit",
+                "unit".to_owned(),
+            );
+            report.status = status;
+            report
+        };
+
+        let exact = [
+            report("baseline.a", QaPackScenarioStatus::Pass),
+            report("baseline.b", QaPackScenarioStatus::Fail),
+        ];
+        assert!(expected_scenario_set_policy_violation(&suite, &exact).is_none());
+
+        let missing = [
+            report("baseline.a", QaPackScenarioStatus::Pass),
+            report("baseline.b", QaPackScenarioStatus::Skipped),
+        ];
+        let missing_violation = expected_scenario_set_policy_violation(&suite, &missing)
+            .expect("a tag-filtered baseline scenario must fail the exact set");
+        assert_eq!(missing_violation.code, "qa.runner.expected_scenario_set_mismatch");
+        assert!(missing_violation.detail.contains("baseline.b"));
+
+        let extra = [
+            report("baseline.a", QaPackScenarioStatus::Pass),
+            report("baseline.b", QaPackScenarioStatus::Pass),
+            report("baseline.c", QaPackScenarioStatus::Pass),
+        ];
+        let extra_violation = expected_scenario_set_policy_violation(&suite, &extra)
+            .expect("an unpinned baseline scenario must fail the exact set");
+        assert!(extra_violation.detail.contains("baseline.c"));
+    }
+
+    #[test]
     fn runtime_mismatch_fails_without_embedding_observation_payloads() {
         let manifest = mcp_manifest();
         let execution = QaScenarioExecutionReport {
             result: QaScenarioExecutionResult {
-                schema_version: 2,
+                schema_version: 3,
                 format: "palyra-qa-scenario-execution-result".to_owned(),
                 execution_key: test_execution_key(),
                 attempt: QaScenarioAttemptProvenance {
@@ -2197,6 +2319,12 @@ mod tests {
                     "final_answer_mismatch".to_owned(),
                     "qa.runner.cleanup_verified".to_owned(),
                 ],
+                runtime_path: test_runtime_path_evidence(
+                    "palyrad-test",
+                    "runtime-contracts.test",
+                    "qa-runner.test",
+                    "fixture",
+                ),
                 run_id: Some("run-opaque".to_owned()),
                 session_id: Some("session-opaque".to_owned()),
                 terminal_state: Some("completed".to_owned()),
@@ -2347,6 +2475,7 @@ mod tests {
             id: "unit".to_owned(),
             mode: "pr".to_owned(),
             scenario_roots: vec!["qa/scenarios".to_owned()],
+            expected_scenario_ids: Vec::new(),
             include_tags: Vec::new(),
             exclude_tags: Vec::new(),
             allow_provider_modes: vec!["mock".to_owned()],

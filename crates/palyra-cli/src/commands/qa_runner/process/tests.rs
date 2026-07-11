@@ -242,6 +242,8 @@ fn test_sandbox() -> (QaDaemonSandbox, PathBuf) {
                 provider: QaDaemonProviderEnvironment::Deterministic {
                     provider_fixture: root_path.join("provider.yaml"),
                 },
+                execution_key_digest: "a".repeat(64),
+                provider_binding_sha256: "b".repeat(64),
                 admin_token: "test-only-token".to_owned(),
                 principal: "user:test".to_owned(),
                 allowed_tools: String::new(),

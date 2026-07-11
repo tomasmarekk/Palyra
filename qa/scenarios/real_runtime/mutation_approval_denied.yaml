@@ -1,6 +1,6 @@
 # Verifies that a real mutating tool proposal reaches the production approval gate.
 # The explicit denial must be journaled and leave the copied workspace unchanged.
-schema_version: 2
+schema_version: 5
 id: real_runtime.mutation_approval_denied
 title: Explicitly denied mutation through the real runtime
 area: approvals
@@ -50,6 +50,14 @@ expect:
     - name: palyra.fs.apply_patch
       min_count: 1
       success: false
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v7
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
 forbidden:
   tool_calls: []
   events:
@@ -71,6 +79,7 @@ maturity:
     - nightly
     - deterministic
     - approval_denied
+    - baseline_replay
 timeout:
   run_ms: 45000
   step_ms: 15000
