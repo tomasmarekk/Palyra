@@ -41,17 +41,22 @@ use crate::{
         WorkspaceCheckpointRestoreMarkRequest, WorkspaceRestoreActivityFilter,
         WorkspaceRestoreActivitySummary, WorkspaceRestoreReportCreateRequest,
         WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord,
+        WORKSPACE_CHECKPOINT_LIST_LIMIT_MAX, WORKSPACE_CHECKPOINT_SESSION_RETENTION_LIMIT,
     },
 };
 
 const TEXT_PREVIEW_CHAR_LIMIT: usize = 480;
 const TEXT_SEARCH_CHAR_LIMIT: usize = 64 * 1024;
-const MAX_ARTIFACT_LIST_LIMIT: usize = 256;
+const MAX_ARTIFACT_LIST_LIMIT: usize = WORKSPACE_CHECKPOINT_LIST_LIMIT_MAX;
 const MAX_COMPARE_FILE_LIMIT: usize = 256;
 const MAX_INLINE_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_DIFF_TEXT_BYTES: usize = 64 * 1024;
 const MAX_DIFF_LINES: usize = 160;
 const MAX_ACTIVITY_LIST_LIMIT: usize = 32;
+
+// A run is a subset of one session, so this endpoint can inspect every retained
+// checkpoint before deciding whether its bounded artifact projection is complete.
+const _: () = assert!(WORKSPACE_CHECKPOINT_SESSION_RETENTION_LIMIT <= MAX_ARTIFACT_LIST_LIMIT);
 
 /// Identity of one tracked workspace file: which root it lives under plus its
 /// root-relative path.
@@ -296,6 +301,10 @@ pub(crate) struct WorkspaceRestoreRequest<'a> {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunWorkspaceArtifactsResponse {
     pub artifacts: Vec<WorkspaceArtifactRecord>,
+    /// Total matching retained artifacts before the response limit is applied.
+    pub artifact_count: usize,
+    /// True only when `artifacts` contains the complete matching retained set.
+    pub artifacts_complete: bool,
     pub workspace_checkpoints: Vec<WorkspaceCheckpointSummary>,
     pub background_tasks: Vec<OrchestratorBackgroundTaskRecord>,
     pub compactions: Vec<OrchestratorCompactionArtifactRecord>,
@@ -409,15 +418,18 @@ pub(crate) async fn load_run_workspace_artifacts(
     let artifacts =
         aggregate_run_workspace_artifacts(runtime_state, checkpoints.as_slice()).await?;
     let normalized_query = query.query.map(normalize_query).filter(|value| !value.is_empty());
-    let artifacts = artifacts
+    let matching_artifacts = artifacts
         .into_iter()
         .filter(|artifact| {
             normalized_query
                 .as_deref()
                 .is_none_or(|needle| artifact_matches_query(artifact, needle))
         })
-        .take(query.limit.clamp(1, MAX_ARTIFACT_LIST_LIMIT))
         .collect::<Vec<_>>();
+    let artifact_count = matching_artifacts.len();
+    let artifact_limit = query.limit.clamp(1, MAX_ARTIFACT_LIST_LIMIT);
+    let artifacts_complete = artifact_count <= artifact_limit;
+    let artifacts = matching_artifacts.into_iter().take(artifact_limit).collect::<Vec<_>>();
 
     let background_tasks = runtime_state
         .list_orchestrator_background_tasks(OrchestratorBackgroundTaskListFilter {
@@ -438,6 +450,8 @@ pub(crate) async fn load_run_workspace_artifacts(
 
     Ok(RunWorkspaceArtifactsResponse {
         artifacts,
+        artifact_count,
+        artifacts_complete,
         workspace_checkpoints: checkpoints.into_iter().map(workspace_checkpoint_summary).collect(),
         background_tasks,
         compactions: runtime_state

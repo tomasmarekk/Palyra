@@ -1,4 +1,4 @@
-//! Arguments for `palyra qa`: QA Lab scenario validation and discovery.
+//! Arguments for QA Lab schema previews and runtime-backed qualification gates.
 
 use clap::Subcommand;
 
@@ -11,7 +11,7 @@ pub enum QaCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    #[command(about = "Run a local deterministic QA scenario pack")]
+    #[command(about = "Preview a deterministic QA pack from scenario schemas")]
     RunPack {
         #[arg(long, default_value = "qa/scenarios")]
         path: String,

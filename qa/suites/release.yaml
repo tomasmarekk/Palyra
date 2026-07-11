@@ -1,38 +1,26 @@
 schema_version: 1
-id: release
+# This scorecard is the first real-runtime release baseline. The preserved
+# non-runtime predecessor lives in release_schema_preview.yaml and is exercised
+# with `palyra qa run-pack`, never counted as runtime qualification.
+id: release_runtime_v1
 mode: release
 scenario_roots:
-  - qa/scenarios
-  - qa/scenarios/execution_backends
-  - qa/scenarios/provider
-  - qa/scenarios/mcp
+  - qa/scenarios/real_runtime
 include_tags:
   - p0
+  - real_runtime
 allow_provider_modes:
   - mock
+allow_runner_modes:
+  - fixture
 require_p0_green: true
 available_capabilities:
   - agent_run
   - qa_lab
   - approvals
-  - context_compaction
-  - delegation
-  - execution_backend_parity
-  - gateway_recovery
-  - hook_policy
-  - mcp
-  - patch_verification
-  - process_background
-  - provider_compat
   - provider_recovery
-  - provider_routing
-  - provider_stream_normalizer
-  - redaction
-  - session_compaction
   - workspace_context
-capability_skips:
-  - capability: live_provider
-    reason: "Release gate uses recorded or mock P0 coverage unless release secrets explicitly enable live provider jobs."
+capability_skips: []
 flaky_policy:
   max_retries: 0
   fail_on_flaky: true
@@ -45,24 +33,15 @@ scorecard:
       label: API
       areas: [text]
       labels: [text_only]
-    - id: mcp
-      label: MCP
-      labels: [mcp]
-    - id: subagents
-      label: Subagents
-      labels: [delegation]
+    - id: tools
+      label: Tools
+      areas: [tools]
+      labels: [read_only]
+    - id: approvals
+      label: Approvals
+      areas: [approvals]
+      labels: [approval_denied]
     - id: provider_recovery
       label: Provider recovery
-      labels: [provider, provider_compat]
-    - id: execution_backends
-      label: Execution backends
-      labels: [execution_backend_parity, process, mutating]
-    - id: hooks
-      label: Hooks
-      labels: [security]
-    - id: observability
-      label: Observability
-      labels: [workflow, gateway]
-    - id: security
-      label: Security
-      labels: [security]
+      areas: [provider]
+      labels: [provider_recovery]

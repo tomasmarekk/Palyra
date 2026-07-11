@@ -1,0 +1,65 @@
+# Runs a retryable malformed provider stream through the normal agent endpoint.
+# Recovery is deterministic and credential-free but still uses real runtime evidence.
+schema_version: 2
+id: real_runtime.malformed_stream_recovery
+title: Malformed provider stream recovery through the real runtime
+area: provider
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_retry_recovery.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_provider_recovery
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - provider_recovery
+  tools: []
+  fixtures:
+    - qa/fixtures/provider_retry_recovery.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Recover a streamed answer."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "Recovered after a retryable malformed response."
+  events:
+    - event_type: run.started
+      min_count: 1
+    - event_type: provider.retry.started
+      min_count: 1
+    - event_type: model_token
+      min_count: 1
+    - event_type: model.delta
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/real_runtime/malformed_stream_recovery.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - real_runtime
+    - deterministic
+    - provider_recovery
+timeout:
+  run_ms: 30000
+  step_ms: 10000

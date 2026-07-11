@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use crate::{
     errors::provider_failure_classification, invalid_response_classification,
-    provider_events_from_output, retry_provider_classification, ProviderError, ProviderEvent,
+    provider_events_from_output, retry_provider_classification,
+    retryable_invalid_response_classification, sanitize_remote_error, ProviderError, ProviderEvent,
     ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderMessageRole,
     ProviderRawProviderRefs, ProviderRequest, ProviderStreamAccumulator, ProviderStreamEvent,
     ProviderTurnOutput,
@@ -21,6 +22,18 @@ pub const QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION: u32 = 1;
 
 /// Stable format label embedded in fixture schema snapshots.
 pub const QA_MOCK_PROVIDER_FIXTURE_FORMAT: &str = "palyra-qa-mock-provider-fixture";
+
+/// Minimum number of attempts in an explicit retry sequence.
+pub const MIN_QA_MOCK_PROVIDER_ATTEMPTS: usize = 2;
+
+/// Maximum number of provider attempts one QA fixture turn may execute.
+pub const MAX_QA_MOCK_PROVIDER_ATTEMPTS: usize = 4;
+
+/// Maximum deterministic latency assigned to one fixture attempt.
+pub const MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS: u64 = 5_000;
+
+/// Maximum cumulative deterministic latency assigned to one fixture turn.
+pub const MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS: u64 = 10_000;
 
 const BEHAVIOR_KIND_VALUES: &[&str] = &[
     "text",
@@ -34,6 +47,10 @@ const BEHAVIOR_KIND_VALUES: &[&str] = &[
 ];
 const FINISH_REASON_VALUES: &[&str] =
     &["stop", "length", "tool_calls", "content_filter", "cancelled", "error", "unknown"];
+const RETRYABLE_INTERMEDIATE_BEHAVIOR_KIND_VALUES: &[&str] =
+    &["malformed_output", "malformed_tool_args", "stream_error"];
+const SUCCESS_CAPABLE_TERMINAL_BEHAVIOR_KIND_VALUES: &[&str] =
+    &["text", "tool_calls", "empty", "approval_required"];
 
 /// Parsed and validated QA mock-provider fixture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,14 +64,39 @@ pub struct QaMockProviderFixture {
 }
 
 /// One deterministic provider turn from a QA fixture.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QaMockProviderTurn {
     /// Stable turn identifier scoped to one fixture.
     pub id: String,
     /// Request selector used to choose this turn.
     pub matcher: QaMockProviderTurnMatcher,
-    /// Provider behavior emitted by this turn.
+    /// Single behavior, or the terminal behavior cached from `attempts`.
     pub behavior: QaMockProviderBehavior,
+    /// Explicit validated provider-attempt sequence; empty means execute
+    /// `behavior` once.
+    pub attempts: Vec<QaMockProviderBehavior>,
+}
+
+// The parser requires behavior and attempts to be mutually exclusive, so the
+// serialized fixture must not expose the cached terminal behavior beside an
+// explicit attempt sequence.
+impl Serialize for QaMockProviderTurn {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let mut turn = serializer.serialize_struct("QaMockProviderTurn", 3)?;
+        turn.serialize_field("id", &self.id)?;
+        turn.serialize_field("match", &self.matcher)?;
+        if self.attempts.is_empty() {
+            turn.serialize_field("behavior", &self.behavior)?;
+        } else {
+            turn.serialize_field("attempts", &self.attempts)?;
+        }
+        turn.end()
+    }
 }
 
 impl QaMockProviderTurn {
@@ -62,6 +104,38 @@ impl QaMockProviderTurn {
     #[must_use]
     pub fn matches_request(&self, request: &ProviderRequest) -> bool {
         self.matcher.matches_request(request)
+    }
+
+    /// Returns the number of provider attempts executed for this turn.
+    #[must_use]
+    pub fn attempt_count(&self) -> usize {
+        if self.attempts.is_empty() {
+            1
+        } else {
+            self.attempts.len()
+        }
+    }
+
+    /// Returns whether the turn declares an explicit retry sequence.
+    ///
+    /// This remains distinct from [`Self::attempt_count`] because a directly
+    /// constructed, invalid one-entry sequence also reports one attempt.
+    #[must_use]
+    pub fn has_explicit_attempt_sequence(&self) -> bool {
+        !self.attempts.is_empty()
+    }
+
+    /// Returns the configured latency for one zero-based provider attempt.
+    #[must_use]
+    pub fn attempt_latency_ms(&self, attempt_index: usize) -> Option<u64> {
+        self.behavior_for_attempt(attempt_index).map(|behavior| behavior.latency_ms)
+    }
+
+    fn behavior_for_attempt(&self, attempt_index: usize) -> Option<&QaMockProviderBehavior> {
+        if self.attempts.is_empty() {
+            return (attempt_index == 0).then_some(&self.behavior);
+        }
+        self.attempts.get(attempt_index)
     }
 }
 
@@ -73,6 +147,9 @@ pub struct QaMockProviderTurnMatcher {
     /// Optional tool-call id that must already have a tool result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result_call_id: Option<String>,
+    /// Optional required outcome for the selected tool result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_success: Option<bool>,
 }
 
 impl QaMockProviderTurnMatcher {
@@ -82,10 +159,9 @@ impl QaMockProviderTurnMatcher {
             .prompt_contains
             .iter()
             .all(|needle| text.contains(needle.trim().to_ascii_lowercase().as_str()));
-        let tool_result_matches = self
-            .tool_result_call_id
-            .as_deref()
-            .is_none_or(|tool_call_id| request_has_tool_result(request, tool_call_id));
+        let tool_result_matches = self.tool_result_call_id.as_deref().is_none_or(|tool_call_id| {
+            request_has_tool_result(request, tool_call_id, self.tool_result_success)
+        });
         prompt_matches && tool_result_matches
     }
 }
@@ -159,6 +235,9 @@ pub struct QaMockProviderBehavior {
     /// Optional completion-token fixture override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
+    /// Deterministic delay applied before this behavior resolves.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub latency_ms: u64,
 }
 
 /// Tool call proposed by a mock turn.
@@ -284,6 +363,7 @@ struct QaMockProviderTurnWire {
     #[serde(default, rename = "match")]
     matcher: Option<QaMockProviderTurnMatcherWire>,
     behavior: Option<QaMockProviderBehaviorWire>,
+    attempts: Option<Vec<QaMockProviderBehaviorWire>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +373,8 @@ struct QaMockProviderTurnMatcherWire {
     prompt_contains: Vec<String>,
     #[serde(default)]
     tool_result_call_id: Option<String>,
+    #[serde(default)]
+    tool_result_success: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +395,8 @@ struct QaMockProviderBehaviorWire {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,7 +422,8 @@ pub fn parse_qa_mock_provider_fixture_yaml(
     build_validated_fixture(wire)
 }
 
-/// Returns the versioned schema snapshot used by QA mock-provider tooling.
+/// Returns the versioned schema snapshot and bounded execution contract used
+/// by QA mock-provider tooling.
 #[must_use]
 pub fn qa_mock_provider_fixture_schema_snapshot() -> Value {
     json!({
@@ -353,6 +438,39 @@ pub fn qa_mock_provider_fixture_schema_snapshot() -> Value {
         ],
         "behavior_kinds": BEHAVIOR_KIND_VALUES,
         "finish_reasons": FINISH_REASON_VALUES,
+        "execution_contract": {
+            "forms": {
+                "behavior": {
+                    "mode": "single_attempt",
+                    "backward_compatible": true
+                },
+                "attempts": {
+                    "mode": "bounded_retry_sequence",
+                    "min_attempts": MIN_QA_MOCK_PROVIDER_ATTEMPTS,
+                    "max_attempts": MAX_QA_MOCK_PROVIDER_ATTEMPTS,
+                    "retryable_intermediate_behavior_kinds":
+                        RETRYABLE_INTERMEDIATE_BEHAVIOR_KIND_VALUES,
+                    "success_capable_terminal_behavior_kinds":
+                        SUCCESS_CAPABLE_TERMINAL_BEHAVIOR_KIND_VALUES
+                }
+            },
+            "forms_mutually_exclusive": true,
+            "latency": {
+                "field": "latency_ms",
+                "unit": "milliseconds",
+                "default_ms": 0,
+                "max_per_attempt_ms": MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS,
+                "max_total_per_turn_ms": MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS
+            }
+        },
+        "matcher_contract": {
+            "tool_result": {
+                "call_id_field": "tool_result_call_id",
+                "success_field": "tool_result_success",
+                "success_requires_call_id": true,
+                "unwrapped_json_defaults_to_success": true
+            }
+        },
         "path_convention": "jsonpath"
     })
 }
@@ -370,29 +488,56 @@ pub fn qa_mock_provider_turn_for_request<'a>(
 ///
 /// # Errors
 /// Returns a [`ProviderError`] for negative fixture behaviors such as
-/// malformed output, context overflow, or stream failure.
+/// malformed output, context overflow, or stream failure. Explicit attempt
+/// sequences must use [`qa_mock_provider_output_for_attempt`] so retries
+/// cannot be skipped accidentally.
 #[allow(clippy::result_large_err)]
 pub fn qa_mock_provider_stream_events_for_turn(
     turn: &QaMockProviderTurn,
     request: &ProviderRequest,
     provider_model_id: Option<String>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    if let Some(error) = provider_error_for_behavior(turn) {
+    if !turn.attempts.is_empty() {
+        return Err(invalid_attempt_plan_error(
+            turn.id.as_str(),
+            0,
+            "explicit attempt sequence requires indexed execution",
+        ));
+    }
+    qa_mock_provider_stream_events_for_behavior(
+        turn.id.as_str(),
+        &turn.behavior,
+        request,
+        provider_model_id,
+        0,
+        false,
+    )
+}
+
+fn qa_mock_provider_stream_events_for_behavior(
+    turn_id: &str,
+    behavior: &QaMockProviderBehavior,
+    request: &ProviderRequest,
+    provider_model_id: Option<String>,
+    retry_count: u32,
+    retryable_malformed_response: bool,
+) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+    if let Some(error) =
+        provider_error_for_behavior(turn_id, behavior, retry_count, retryable_malformed_response)
+    {
         return Err(error);
     }
 
     let model_id = provider_model_id.unwrap_or_else(|| "qa-mock".to_owned());
-    let prompt_tokens = turn
-        .behavior
+    let prompt_tokens = behavior
         .prompt_tokens
         .unwrap_or_else(|| estimate_fixture_tokens(request.input_text.as_str()));
-    let completion_tokens = turn.behavior.completion_tokens.unwrap_or_else(|| {
-        let text_tokens = text_segments_for_behavior(&turn.behavior)
+    let completion_tokens = behavior.completion_tokens.unwrap_or_else(|| {
+        let text_tokens = text_segments_for_behavior(behavior)
             .iter()
             .map(|segment| estimate_fixture_tokens(segment.as_str()))
             .sum::<u64>();
-        let tool_tokens = turn
-            .behavior
+        let tool_tokens = behavior
             .tool_calls
             .iter()
             .map(|tool_call| estimate_fixture_tokens(tool_call.input_json.to_string().as_str()))
@@ -403,10 +548,10 @@ pub fn qa_mock_provider_stream_events_for_turn(
         provider_id: "qa-mock-provider".to_owned(),
         model_id: model_id.clone(),
     }];
-    for delta in text_segments_for_behavior(&turn.behavior) {
+    for delta in text_segments_for_behavior(behavior) {
         events.push(ProviderStreamEvent::Delta { text: delta });
     }
-    for tool_call in &turn.behavior.tool_calls {
+    for tool_call in &behavior.tool_calls {
         events.push(ProviderStreamEvent::ToolDelta {
             proposal_id: tool_call.proposal_id.clone(),
             tool_name: tool_call.tool_name.clone(),
@@ -421,12 +566,12 @@ pub fn qa_mock_provider_stream_events_for_turn(
         cache_write_tokens: None,
     });
     events.push(ProviderStreamEvent::Completed {
-        finish_reason: finish_reason_for_behavior(&turn.behavior),
+        finish_reason: finish_reason_for_behavior(behavior),
         raw_provider_refs: ProviderRawProviderRefs {
-            provider_response_id: Some(format!("qa-mock:{}", turn.id)),
+            provider_response_id: Some(format!("qa-mock:{turn_id}")),
             provider_model_id: Some(model_id),
             system_fingerprint: Some(QA_MOCK_PROVIDER_FIXTURE_FORMAT.to_owned()),
-            provider_trace_ref: Some(format!("qa_mock_provider:{}", turn.id)),
+            provider_trace_ref: Some(format!("qa_mock_provider:{turn_id}")),
             stream_spill_ref: None,
         },
     });
@@ -437,16 +582,100 @@ pub fn qa_mock_provider_stream_events_for_turn(
 ///
 /// # Errors
 /// Returns a [`ProviderError`] for negative fixture behaviors such as
-/// malformed output, context overflow, or stream failure.
+/// malformed output, context overflow, or stream failure. Explicit attempt
+/// sequences must use [`qa_mock_provider_output_for_attempt`] so retries
+/// cannot be skipped accidentally.
 #[allow(clippy::result_large_err)]
 pub fn qa_mock_provider_output_for_turn(
     turn: &QaMockProviderTurn,
     request: &ProviderRequest,
     provider_model_id: Option<String>,
 ) -> Result<ProviderTurnOutput, ProviderError> {
+    if !turn.attempts.is_empty() {
+        return Err(invalid_attempt_plan_error(
+            turn.id.as_str(),
+            0,
+            "explicit attempt sequence requires indexed execution",
+        ));
+    }
+    qa_mock_provider_output_for_behavior(
+        turn.id.as_str(),
+        &turn.behavior,
+        request,
+        provider_model_id,
+        0,
+        false,
+    )
+}
+
+/// Projects one indexed fixture attempt into a bounded provider output.
+///
+/// Intermediate attempts are accepted only when they represent retryable
+/// stream or malformed-response failures. The final attempt must be capable
+/// of producing a successful response.
+///
+/// # Errors
+/// Returns a [`ProviderError`] for the configured attempt failure or when the
+/// attempt index/ordering violates the validated execution contract.
+#[allow(clippy::result_large_err)]
+pub fn qa_mock_provider_output_for_attempt(
+    turn: &QaMockProviderTurn,
+    attempt_index: usize,
+    request: &ProviderRequest,
+    provider_model_id: Option<String>,
+) -> Result<ProviderTurnOutput, ProviderError> {
+    let retry_count = u32::try_from(attempt_index).unwrap_or(u32::MAX);
+    let Some(behavior) = turn.behavior_for_attempt(attempt_index) else {
+        return Err(invalid_attempt_plan_error(
+            turn.id.as_str(),
+            retry_count,
+            "attempt index is outside the configured sequence",
+        ));
+    };
+    let has_followup = attempt_index.saturating_add(1) < turn.attempt_count();
+    if has_followup && !is_retryable_failure_behavior(behavior.kind) {
+        return Err(invalid_attempt_plan_error(
+            turn.id.as_str(),
+            retry_count,
+            "intermediate attempt is not a retryable failure",
+        ));
+    }
+    if !has_followup && !is_success_capable_behavior(behavior.kind) && !turn.attempts.is_empty() {
+        return Err(invalid_attempt_plan_error(
+            turn.id.as_str(),
+            retry_count,
+            "final explicit attempt is not success-capable",
+        ));
+    }
+
+    qa_mock_provider_output_for_behavior(
+        turn.id.as_str(),
+        behavior,
+        request,
+        provider_model_id,
+        retry_count,
+        has_followup,
+    )
+}
+
+fn qa_mock_provider_output_for_behavior(
+    turn_id: &str,
+    behavior: &QaMockProviderBehavior,
+    request: &ProviderRequest,
+    provider_model_id: Option<String>,
+    retry_count: u32,
+    retryable_malformed_response: bool,
+) -> Result<ProviderTurnOutput, ProviderError> {
     let model_id = provider_model_id.clone().unwrap_or_else(|| "qa-mock".to_owned());
     let mut accumulator = ProviderStreamAccumulator::new("qa-mock-provider", model_id);
-    for event in qa_mock_provider_stream_events_for_turn(turn, request, provider_model_id)? {
+    for event in qa_mock_provider_stream_events_for_behavior(
+        turn_id,
+        behavior,
+        request,
+        provider_model_id,
+        retry_count,
+        retryable_malformed_response,
+    )? {
         accumulator.apply(event);
     }
     let mut output = accumulator.finalize();
@@ -458,7 +687,8 @@ pub fn qa_mock_provider_output_for_turn(
 ///
 /// # Errors
 /// Returns a [`ProviderError`] when the fixture turn represents a provider
-/// failure instead of a successful response.
+/// failure instead of a successful response or declares an explicit attempt
+/// sequence that requires indexed execution.
 #[allow(clippy::result_large_err)]
 pub fn qa_mock_provider_events_for_turn(
     turn: &QaMockProviderTurn,
@@ -563,13 +793,144 @@ fn validate_turns(
             }
         }
         let matcher = validate_matcher(turn.matcher, format!("{path}.match").as_str(), issues);
-        let behavior =
-            validate_behavior(turn.behavior, format!("{path}.behavior").as_str(), issues);
-        if let (Some(id), Some(matcher), Some(behavior)) = (id, matcher, behavior) {
-            turns.push(QaMockProviderTurn { id, matcher, behavior });
+        let execution =
+            validate_turn_execution(turn.behavior, turn.attempts, path.as_str(), issues);
+        if let (Some(id), Some(matcher), Some((behavior, attempts))) = (id, matcher, execution) {
+            turns.push(QaMockProviderTurn { id, matcher, behavior, attempts });
         }
     }
     Some(turns)
+}
+
+fn validate_turn_execution(
+    behavior: Option<QaMockProviderBehaviorWire>,
+    attempts: Option<Vec<QaMockProviderBehaviorWire>>,
+    path: &str,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<(QaMockProviderBehavior, Vec<QaMockProviderBehavior>)> {
+    match (behavior, attempts) {
+        (Some(behavior), None) => {
+            validate_behavior(Some(behavior), format!("{path}.behavior").as_str(), issues)
+                .map(|behavior| (behavior, Vec::new()))
+        }
+        (None, Some(attempts)) => {
+            validate_attempt_sequence(attempts, format!("{path}.attempts").as_str(), issues)
+        }
+        (None, None) => {
+            push_issue(
+                issues,
+                "missing_behavior",
+                format!("{path}.behavior"),
+                "behavior or attempts section is required",
+                "Declare one behavior or an explicit provider-attempt sequence.",
+            );
+            None
+        }
+        (Some(behavior), Some(attempts)) => {
+            push_issue(
+                issues,
+                "conflicting_attempt_configuration",
+                path,
+                "behavior and attempts are mutually exclusive",
+                "Keep behavior for one attempt or attempts for an explicit retry sequence.",
+            );
+            let _ = validate_behavior(Some(behavior), format!("{path}.behavior").as_str(), issues);
+            let _ =
+                validate_attempt_sequence(attempts, format!("{path}.attempts").as_str(), issues);
+            None
+        }
+    }
+}
+
+fn validate_attempt_sequence(
+    values: Vec<QaMockProviderBehaviorWire>,
+    path: &str,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<(QaMockProviderBehavior, Vec<QaMockProviderBehavior>)> {
+    let attempt_count = values.len();
+    if attempt_count < MIN_QA_MOCK_PROVIDER_ATTEMPTS {
+        push_issue(
+            issues,
+            "insufficient_attempts",
+            path,
+            format!(
+                "explicit attempts must contain at least {MIN_QA_MOCK_PROVIDER_ATTEMPTS} behaviors"
+            ),
+            "Use behavior for one attempt or add a retryable failure before the final success.",
+        );
+    }
+    if attempt_count > MAX_QA_MOCK_PROVIDER_ATTEMPTS {
+        push_issue(
+            issues,
+            "too_many_attempts",
+            path,
+            format!(
+                "attempts contains {attempt_count} behaviors, maximum is {MAX_QA_MOCK_PROVIDER_ATTEMPTS}"
+            ),
+            "Reduce the provider-attempt sequence to the supported bound.",
+        );
+    }
+
+    let mut total_latency_ms = 0_u64;
+    let mut latency_overflow = false;
+    let mut parsed = Vec::with_capacity(attempt_count.min(MAX_QA_MOCK_PROVIDER_ATTEMPTS));
+    let mut all_behaviors_valid = true;
+    for (index, value) in values.into_iter().enumerate() {
+        let attempt_path = format!("{path}[{index}]");
+        let latency_ms = value.latency_ms.unwrap_or_default();
+        match total_latency_ms.checked_add(latency_ms) {
+            Some(total) => total_latency_ms = total,
+            None => latency_overflow = true,
+        }
+        match validate_behavior(Some(value), attempt_path.as_str(), issues) {
+            Some(behavior) => parsed.push(behavior),
+            None => all_behaviors_valid = false,
+        }
+    }
+    if latency_overflow || total_latency_ms > MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS {
+        push_issue(
+            issues,
+            "total_latency_exceeded",
+            path,
+            format!(
+                "attempt latency exceeds the {MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS}ms per-turn maximum"
+            ),
+            "Reduce per-attempt latency values so their sum stays within the turn budget.",
+        );
+    }
+
+    if parsed.len() == attempt_count {
+        for (index, behavior) in parsed.iter().enumerate() {
+            let is_final = index.saturating_add(1) == attempt_count;
+            if !is_final && !is_retryable_failure_behavior(behavior.kind) {
+                push_issue(
+                    issues,
+                    "non_retryable_intermediate_attempt",
+                    format!("{path}[{index}].kind"),
+                    "intermediate attempts must be retryable stream or malformed-response failures",
+                    "Use stream_error, malformed_output, or malformed_tool_args before the final attempt.",
+                );
+            }
+            if is_final && !is_success_capable_behavior(behavior.kind) {
+                push_issue(
+                    issues,
+                    "terminal_attempt_cannot_succeed",
+                    format!("{path}[{index}].kind"),
+                    "final attempt must be capable of producing text, tools, or an empty success",
+                    "Use text, tool_calls, approval_required, or empty for the final attempt.",
+                );
+            }
+        }
+    }
+
+    if !all_behaviors_valid || parsed.len() != attempt_count || parsed.is_empty() {
+        return None;
+    }
+    let terminal_behavior = parsed
+        .last()
+        .cloned()
+        .expect("non-empty validated attempt sequence has a terminal behavior");
+    Some((terminal_behavior, parsed))
 }
 
 fn validate_matcher(
@@ -580,6 +941,7 @@ fn validate_matcher(
     let value = value.unwrap_or(QaMockProviderTurnMatcherWire {
         prompt_contains: Vec::new(),
         tool_result_call_id: None,
+        tool_result_success: None,
     });
     validate_string_list(
         value.prompt_contains.as_slice(),
@@ -593,7 +955,20 @@ fn validate_matcher(
         format!("{path}.tool_result_call_id").as_str(),
         issues,
     );
-    Some(QaMockProviderTurnMatcher { prompt_contains: value.prompt_contains, tool_result_call_id })
+    if value.tool_result_success.is_some() && tool_result_call_id.is_none() {
+        push_issue(
+            issues,
+            "tool_result_success_requires_call_id",
+            format!("{path}.tool_result_success"),
+            "tool_result_success requires tool_result_call_id",
+            "Set tool_result_call_id or remove the outcome constraint.",
+        );
+    }
+    Some(QaMockProviderTurnMatcher {
+        prompt_contains: value.prompt_contains,
+        tool_result_call_id,
+        tool_result_success: value.tool_result_success,
+    })
 }
 
 fn validate_behavior(
@@ -630,6 +1005,18 @@ fn validate_behavior(
         format!("{path}.error_message").as_str(),
         issues,
     );
+    let latency_ms = value.latency_ms.unwrap_or_default();
+    if latency_ms > MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS {
+        push_issue(
+            issues,
+            "attempt_latency_exceeded",
+            format!("{path}.latency_ms"),
+            format!(
+                "latency_ms is {latency_ms}, maximum is {MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS}"
+            ),
+            "Reduce the deterministic attempt latency to the supported bound.",
+        );
+    }
     validate_behavior_shape(
         path,
         kind,
@@ -648,6 +1035,7 @@ fn validate_behavior(
         error_message,
         prompt_tokens: value.prompt_tokens,
         completion_tokens: value.completion_tokens,
+        latency_ms,
     })
 }
 
@@ -795,17 +1183,41 @@ fn finish_reason_for_behavior(behavior: &QaMockProviderBehavior) -> ProviderFini
     })
 }
 
-fn provider_error_for_behavior(turn: &QaMockProviderTurn) -> Option<ProviderError> {
-    let message = turn
-        .behavior
+const fn is_retryable_failure_behavior(kind: QaMockProviderBehaviorKind) -> bool {
+    matches!(
+        kind,
+        QaMockProviderBehaviorKind::MalformedOutput
+            | QaMockProviderBehaviorKind::MalformedToolArgs
+            | QaMockProviderBehaviorKind::StreamError
+    )
+}
+
+const fn is_success_capable_behavior(kind: QaMockProviderBehaviorKind) -> bool {
+    matches!(
+        kind,
+        QaMockProviderBehaviorKind::Text
+            | QaMockProviderBehaviorKind::ToolCalls
+            | QaMockProviderBehaviorKind::Empty
+            | QaMockProviderBehaviorKind::ApprovalRequired
+    )
+}
+
+fn provider_error_for_behavior(
+    turn_id: &str,
+    behavior: &QaMockProviderBehavior,
+    retry_count: u32,
+    retryable_malformed_response: bool,
+) -> Option<ProviderError> {
+    let message = behavior
         .error_message
-        .clone()
-        .unwrap_or_else(|| format!("QA mock-provider turn {} failed", turn.id));
-    match turn.behavior.kind {
+        .as_deref()
+        .map(sanitize_remote_error)
+        .unwrap_or_else(|| format!("QA mock-provider turn {turn_id} failed"));
+    match behavior.kind {
         QaMockProviderBehaviorKind::ContextOverflow => Some(ProviderError::RequestFailed {
             message,
             retryable: false,
-            retry_count: 0,
+            retry_count,
             classification: provider_failure_classification(
                 ProviderFailureClass::ContextWindowExceeded,
                 ProviderFailureAction::UserActionRequired,
@@ -815,24 +1227,40 @@ fn provider_error_for_behavior(turn: &QaMockProviderTurn) -> Option<ProviderErro
         }),
         QaMockProviderBehaviorKind::MalformedOutput => Some(ProviderError::InvalidResponse {
             message,
-            retry_count: 0,
-            classification: invalid_response_classification("qa_mock_malformed_output"),
+            retry_count,
+            classification: if retryable_malformed_response {
+                retryable_invalid_response_classification("qa_mock_malformed_output")
+            } else {
+                invalid_response_classification("qa_mock_malformed_output")
+            },
         }),
         QaMockProviderBehaviorKind::MalformedToolArgs => Some(ProviderError::InvalidResponse {
             message,
-            retry_count: 0,
-            classification: invalid_response_classification("qa_mock_malformed_tool_args"),
+            retry_count,
+            classification: if retryable_malformed_response {
+                retryable_invalid_response_classification("qa_mock_malformed_tool_args")
+            } else {
+                invalid_response_classification("qa_mock_malformed_tool_args")
+            },
         }),
         QaMockProviderBehaviorKind::StreamError => Some(ProviderError::RequestFailed {
             message,
             retryable: true,
-            retry_count: 0,
+            retry_count,
             classification: retry_provider_classification("qa_mock_stream_error"),
         }),
         QaMockProviderBehaviorKind::Text
         | QaMockProviderBehaviorKind::ToolCalls
         | QaMockProviderBehaviorKind::Empty
         | QaMockProviderBehaviorKind::ApprovalRequired => None,
+    }
+}
+
+fn invalid_attempt_plan_error(turn_id: &str, retry_count: u32, reason: &str) -> ProviderError {
+    ProviderError::InvalidResponse {
+        message: format!("QA mock-provider turn {turn_id} has an invalid attempt plan: {reason}"),
+        retry_count,
+        classification: invalid_response_classification("qa_mock_invalid_attempt_plan"),
     }
 }
 
@@ -853,15 +1281,33 @@ fn searchable_request_text(request: &ProviderRequest) -> String {
     parts.join("\n").to_ascii_lowercase()
 }
 
-fn request_has_tool_result(request: &ProviderRequest, tool_call_id: &str) -> bool {
+fn request_has_tool_result(
+    request: &ProviderRequest,
+    tool_call_id: &str,
+    expected_success: Option<bool>,
+) -> bool {
     request.messages.iter().any(|message| {
-        message.role == ProviderMessageRole::Tool
-            && message.tool_call_id.as_deref() == Some(tool_call_id)
+        if message.role != ProviderMessageRole::Tool
+            || message.tool_call_id.as_deref() != Some(tool_call_id)
+        {
+            return false;
+        }
+        expected_success.is_none_or(|expected| {
+            serde_json::from_str::<Value>(message.text_content().as_str()).ok().map(|value| {
+                // Successful runtime tool results are re-fed as their raw
+                // JSON output; failed results carry an explicit envelope.
+                value.get("success").and_then(Value::as_bool).unwrap_or(true)
+            }) == Some(expected)
+        })
     })
 }
 
 fn estimate_fixture_tokens(text: &str) -> u64 {
     u64::try_from(text.split_whitespace().count()).unwrap_or(u64::MAX).max(1)
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn validate_required_slug(
@@ -990,6 +1436,7 @@ mod tests {
     use crate::{ProviderMessage, ProviderMessageContentPart};
 
     const EXAMPLE_FIXTURE: &str = include_str!("../../../qa/fixtures/provider_basic.yaml");
+    const RETRY_FIXTURE: &str = include_str!("../../../qa/fixtures/provider_retry_recovery.yaml");
     const SCHEMA_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_mock_provider_fixture_schema.json");
 
@@ -1067,6 +1514,80 @@ mod tests {
     }
 
     #[test]
+    fn explicit_malformed_failure_retries_into_text_output() {
+        let fixture =
+            parse_qa_mock_provider_fixture_yaml(RETRY_FIXTURE).expect("retry fixture should parse");
+        let request = ProviderRequest::from_input_text(
+            "Recover a streamed answer".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let turn = qa_mock_provider_turn_for_request(&fixture, &request)
+            .expect("stream recovery prompt should select a turn");
+
+        let first_error = qa_mock_provider_output_for_attempt(turn, 0, &request, None)
+            .expect_err("first attempt should fail retryably");
+        let final_output = qa_mock_provider_output_for_attempt(turn, 1, &request, None)
+            .expect("second attempt should produce text");
+        let bypass_error = qa_mock_provider_output_for_turn(turn, &request, None)
+            .expect_err("legacy projection must not bypass an explicit retry sequence");
+
+        assert_eq!(turn.attempt_count(), 2);
+        assert_eq!(turn.attempt_latency_ms(0), Some(12));
+        assert_eq!(turn.attempt_latency_ms(1), Some(8));
+        assert_eq!(first_error.retry_count(), 0);
+        assert_eq!(first_error.classification().class, ProviderFailureClass::MalformedResponse);
+        assert_eq!(first_error.classification().recommended_action, ProviderFailureAction::Retry);
+        assert_eq!(
+            bypass_error.classification().provider_detail.as_deref(),
+            Some("qa_mock_invalid_attempt_plan")
+        );
+        assert_eq!(final_output.full_text, "Recovered after a retryable malformed response.");
+    }
+
+    #[test]
+    fn explicit_malformed_failure_retries_into_tool_output() {
+        let fixture =
+            parse_qa_mock_provider_fixture_yaml(RETRY_FIXTURE).expect("retry fixture should parse");
+        let request = ProviderRequest::from_input_text(
+            "Recover with a tool call".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let turn = qa_mock_provider_turn_for_request(&fixture, &request)
+            .expect("tool recovery prompt should select a turn");
+
+        let first_error = qa_mock_provider_output_for_attempt(turn, 0, &request, None)
+            .expect_err("malformed first attempt should fail retryably");
+        let final_output = qa_mock_provider_output_for_attempt(turn, 1, &request, None)
+            .expect("second attempt should propose a tool");
+
+        assert_eq!(first_error.classification().class, ProviderFailureClass::MalformedResponse);
+        assert_eq!(first_error.classification().recommended_action, ProviderFailureAction::Retry);
+        assert!(matches!(
+            final_output.content_parts.as_slice(),
+            [crate::ProviderOutputContentPart::ToolCall { proposal_id, tool_name, .. }]
+                if proposal_id == "qa-recovered-read" && tool_name == "palyra.fs.read_file"
+        ));
+    }
+
+    #[test]
+    fn serializes_explicit_attempts_without_conflicting_terminal_behavior() {
+        let fixture =
+            parse_qa_mock_provider_fixture_yaml(RETRY_FIXTURE).expect("retry fixture should parse");
+
+        let serialized = serde_json::to_value(&fixture).expect("fixture should serialize");
+        let turn = &serialized["turns"][0];
+
+        assert!(turn.get("attempts").is_some());
+        assert!(turn.get("behavior").is_none());
+        assert!(turn.get("match").is_some());
+        assert!(turn.get("matcher").is_none());
+    }
+
+    #[test]
     fn tool_result_matcher_selects_followup_turn() {
         let fixture = parse_qa_mock_provider_fixture_yaml(EXAMPLE_FIXTURE)
             .expect("example QA mock-provider fixture should parse");
@@ -1088,6 +1609,74 @@ mod tests {
             .expect("tool-result matcher should select followup");
 
         assert_eq!(turn.id, "after_tool_result");
+    }
+
+    #[test]
+    fn tool_result_matcher_requires_the_configured_outcome() {
+        let fixture = parse_qa_mock_provider_fixture_yaml(
+            r#"
+schema_version: 1
+id: qa.mock.tool-result-outcome
+turns:
+  - id: denied
+    match:
+      tool_result_call_id: call-01
+      tool_result_success: false
+    behavior: { kind: text, text: denied }
+  - id: completed
+    match:
+      tool_result_call_id: call-01
+      tool_result_success: true
+    behavior: { kind: text, text: completed }
+"#,
+        )
+        .expect("outcome-sensitive fixture should parse");
+        let mut request = ProviderRequest::from_input_text(
+            "Continue after tool result".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        request.messages.push(ProviderMessage::tool_result(
+            "call-01",
+            r#"{"value":"unwrapped successful output"}"#,
+        ));
+
+        let turn = qa_mock_provider_turn_for_request(&fixture, &request)
+            .expect("successful tool result should select the success followup");
+
+        assert_eq!(turn.id, "completed");
+
+        request.messages.pop();
+        request.messages.push(ProviderMessage::tool_result(
+            "call-01",
+            r#"{"success":false,"error":"approval denied"}"#,
+        ));
+        let turn = qa_mock_provider_turn_for_request(&fixture, &request)
+            .expect("failed tool result should select the denied followup");
+        assert_eq!(turn.id, "denied");
+    }
+
+    #[test]
+    fn rejects_tool_result_outcome_without_call_id() {
+        let error = parse_qa_mock_provider_fixture_yaml(
+            r#"
+schema_version: 1
+id: qa.mock.invalid-tool-result-outcome
+turns:
+  - id: invalid
+    match:
+      tool_result_success: true
+    behavior: { kind: text, text: invalid }
+"#,
+        )
+        .expect_err("tool-result outcome without identity should be rejected");
+        let issues = error.issues().expect("validation issues should be available");
+
+        assert!(
+            issues.iter().any(|issue| issue.code == "tool_result_success_requires_call_id"),
+            "missing outcome/call-id validation issue: {issues:?}"
+        );
     }
 
     #[test]
@@ -1119,6 +1708,137 @@ turns:
     }
 
     #[test]
+    fn rejects_attempt_sequences_that_violate_execution_bounds() {
+        let cases = [
+            (
+                r#"
+schema_version: 1
+id: qa.mock.one-attempt
+turns:
+  - id: invalid
+    attempts:
+      - { kind: text, text: done }
+"#,
+                "insufficient_attempts",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.too-many
+turns:
+  - id: invalid
+    attempts:
+      - { kind: stream_error, error_message: retry }
+      - { kind: stream_error, error_message: retry }
+      - { kind: stream_error, error_message: retry }
+      - { kind: stream_error, error_message: retry }
+      - { kind: text, text: done }
+"#,
+                "too_many_attempts",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.per-attempt-latency
+turns:
+  - id: invalid
+    attempts:
+      - { kind: stream_error, error_message: retry, latency_ms: 5001 }
+      - { kind: text, text: done }
+"#,
+                "attempt_latency_exceeded",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.total-latency
+turns:
+  - id: invalid
+    attempts:
+      - { kind: stream_error, error_message: retry, latency_ms: 4000 }
+      - { kind: malformed_output, error_message: retry, latency_ms: 4000 }
+      - { kind: text, text: done, latency_ms: 4000 }
+"#,
+                "total_latency_exceeded",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.non-retryable-middle
+turns:
+  - id: invalid
+    attempts:
+      - { kind: context_overflow, error_message: stop }
+      - { kind: text, text: done }
+"#,
+                "non_retryable_intermediate_attempt",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.terminal-failure
+turns:
+  - id: invalid
+    attempts:
+      - { kind: stream_error, error_message: retry }
+      - { kind: malformed_output, error_message: stop }
+"#,
+                "terminal_attempt_cannot_succeed",
+            ),
+            (
+                r#"
+schema_version: 1
+id: qa.mock.conflicting
+turns:
+  - id: invalid
+    behavior: { kind: text, text: fallback }
+    attempts:
+      - { kind: stream_error, error_message: retry }
+      - { kind: text, text: done }
+"#,
+                "conflicting_attempt_configuration",
+            ),
+        ];
+
+        for (fixture, expected_code) in cases {
+            let error = parse_qa_mock_provider_fixture_yaml(fixture)
+                .expect_err("invalid attempt sequence should be rejected");
+            let issues = error.issues().expect("validation issues should be available");
+            assert!(
+                issues.iter().any(|issue| issue.code == expected_code),
+                "missing issue code {expected_code}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_errors_redact_secret_shaped_fragments() {
+        let fixture = parse_qa_mock_provider_fixture_yaml(
+            r#"
+schema_version: 1
+id: qa.mock.redaction
+turns:
+  - id: redacted
+    behavior:
+      kind: stream_error
+      error_message: "Bearer secret.token api_key=sk-secret123456789"
+"#,
+        )
+        .expect("redaction fixture should parse");
+        let request =
+            ProviderRequest::from_input_text("redact".to_owned(), false, Vec::new(), None);
+        let turn = qa_mock_provider_turn_for_request(&fixture, &request).expect("turn exists");
+
+        let error = qa_mock_provider_output_for_turn(turn, &request, None)
+            .expect_err("stream error behavior should fail");
+        let message = error.failure_snapshot().message;
+
+        assert!(message.contains("<redacted>"));
+        assert!(!message.contains("secret.token"));
+        assert!(!message.contains("sk-secret"));
+    }
+
+    #[test]
     fn empty_behavior_projects_no_text_or_tools() {
         let fixture = QaMockProviderFixture {
             schema_version: QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
@@ -1128,6 +1848,7 @@ turns:
                 matcher: QaMockProviderTurnMatcher {
                     prompt_contains: Vec::new(),
                     tool_result_call_id: None,
+                    tool_result_success: None,
                 },
                 behavior: QaMockProviderBehavior {
                     kind: QaMockProviderBehaviorKind::Empty,
@@ -1138,7 +1859,9 @@ turns:
                     error_message: None,
                     prompt_tokens: Some(1),
                     completion_tokens: Some(0),
+                    latency_ms: 0,
                 },
+                attempts: Vec::new(),
             }],
         };
         let request = ProviderRequest::from_input_text("empty".to_owned(), false, Vec::new(), None);

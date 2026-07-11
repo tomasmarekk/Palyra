@@ -750,7 +750,7 @@ file = "eval-bundle-create-help.txt"
 path = "qa"
 category = "top_level"
 status = "done"
-summary = "QA Lab scenario manifest validation and local pack dry-run surface."
+summary = "QA Lab manifest validation, schema previews, and runtime-backed qualification gates."
 
 [entries.snapshot]
 path = "qa"
@@ -771,7 +771,7 @@ file = "qa-validate-help.txt"
 path = "qa run-pack"
 category = "nested_surface"
 status = "done"
-summary = "Run deterministic local QA scenario packs for selected mock manifests."
+summary = "Preview deterministic QA scenario schemas without executing the runtime."
 required_flags = ["path", "tag", "output", "json"]
 
 [entries.snapshot]
@@ -793,7 +793,7 @@ file = "qa-provider-compat-help.txt"
 path = "qa gate"
 category = "nested_surface"
 status = "done"
-summary = "Run QA Lab suite gates and maturity scorecards for CI dry-runs."
+summary = "Run QA Lab suite gates through isolated runtimes and emit maturity scorecards."
 required_flags = ["suite", "output-json", "output-markdown", "allow-live", "json"]
 
 [entries.snapshot]

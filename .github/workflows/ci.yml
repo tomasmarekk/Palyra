@@ -59,6 +59,10 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo clean
 
+      - name: Rebuild QA daemon runtime for integration tests
+        if: runner.os != 'Windows'
+        run: cargo build -p palyra-daemon --bin palyrad --locked
+
       - name: Cargo test
         run: cargo test --workspace --locked
 
@@ -316,6 +320,16 @@ jobs:
         uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: 1.95.0
+
+      - name: Build QA daemon runtime
+        run: cargo build -p palyra-daemon --bin palyrad --locked
+
+      - name: Preview preserved legacy P0 coverage
+        run: |
+          cargo run -p palyra-cli --locked -- qa run-pack --path qa/scenarios --tag p0 --output artifacts/qa-lab/release-schema-preview-core.json
+          cargo run -p palyra-cli --locked -- qa run-pack --path qa/scenarios/execution_backends --tag p0 --output artifacts/qa-lab/release-schema-preview-backends.json
+          cargo run -p palyra-cli --locked -- qa run-pack --path qa/scenarios/provider --tag p0 --output artifacts/qa-lab/release-schema-preview-provider.json
+          cargo run -p palyra-cli --locked -- qa run-pack --path qa/scenarios/mcp --tag p0 --output artifacts/qa-lab/release-schema-preview-mcp.json
 
       - name: Run QA Lab PR smoke gate
         run: cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/pr_smoke.yaml --output-json artifacts/qa-lab/pr-smoke.json --output-markdown artifacts/qa-lab/pr-smoke.md --json

@@ -84,6 +84,10 @@ const MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS: i64 = 60_000;
 const SESSION_WRITE_LEASE_TTL_MS: i64 = 30_000;
 const SESSION_WRITE_LEASE_OWNER_LABEL: &str = "journal.session_writer";
 const SESSION_WRITE_LEASE_MAX_TEXT_LEN: usize = 128;
+/// Maximum workspace checkpoints retained for one orchestrator session.
+pub(crate) const WORKSPACE_CHECKPOINT_SESSION_RETENTION_LIMIT: usize = 128;
+/// Maximum workspace checkpoints returned by one journal list query.
+pub(crate) const WORKSPACE_CHECKPOINT_LIST_LIMIT_MAX: usize = 256;
 const FLOW_DEPENDENCY_STARTUP_AUDIT_ACTOR: &str = "system:flow-dependency-startup-audit";
 const FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE: usize = 64;
 const FLOW_DEPENDENCY_STARTUP_AUDIT_CONFLICT_RETRIES: usize = 1;
@@ -13363,6 +13367,12 @@ impl JournalStore {
             )?;
         }
 
+        let checkpoint_retention_offset =
+            i64::try_from(WORKSPACE_CHECKPOINT_SESSION_RETENTION_LIMIT).map_err(|_| {
+                JournalError::InvalidArgument(
+                    "workspace checkpoint retention limit is invalid".to_owned(),
+                )
+            })?;
         let mut stale_checkpoint_ids = Vec::new();
         {
             let mut statement = transaction.prepare(
@@ -13371,10 +13381,11 @@ impl JournalStore {
                     FROM workspace_checkpoints
                     WHERE session_ulid = ?1
                     ORDER BY created_at_unix_ms DESC
-                    LIMIT -1 OFFSET 128
+                    LIMIT -1 OFFSET ?2
                 "#,
             )?;
-            let mut rows = statement.query(params![request.session_id])?;
+            let mut rows =
+                statement.query(params![request.session_id, checkpoint_retention_offset])?;
             while let Some(row) = rows.next()? {
                 stale_checkpoint_ids.push(row.get::<_, String>(0)?);
             }
@@ -13433,9 +13444,13 @@ impl JournalStore {
         filter: &WorkspaceCheckpointListFilter,
     ) -> Result<Vec<WorkspaceCheckpointRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let limit = i64::try_from(filter.limit.unwrap_or(64).clamp(1, 256)).map_err(|_| {
-            JournalError::InvalidArgument("workspace checkpoint limit is invalid".to_owned())
-        })?;
+        let limit =
+            i64::try_from(filter.limit.unwrap_or(64).clamp(1, WORKSPACE_CHECKPOINT_LIST_LIMIT_MAX))
+                .map_err(|_| {
+                    JournalError::InvalidArgument(
+                        "workspace checkpoint limit is invalid".to_owned(),
+                    )
+                })?;
         let mut sql = r#"
                 SELECT
                     checkpoint_ulid,

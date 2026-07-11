@@ -98,13 +98,14 @@ pub use providers::{
 };
 pub use qa_mock::{
     parse_qa_mock_provider_fixture_yaml, qa_mock_provider_events_for_turn,
-    qa_mock_provider_fixture_schema_snapshot, qa_mock_provider_output_for_turn,
-    qa_mock_provider_stream_events_for_turn, qa_mock_provider_turn_for_request,
-    QaMockProviderBehavior, QaMockProviderBehaviorKind, QaMockProviderFixture,
-    QaMockProviderFixtureError, QaMockProviderFixtureIssue, QaMockProviderIssueSeverity,
-    QaMockProviderToolCall, QaMockProviderTurn, QaMockProviderTurnMatcher,
-    QaMockProviderValidationError, QA_MOCK_PROVIDER_FIXTURE_FORMAT,
-    QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
+    qa_mock_provider_fixture_schema_snapshot, qa_mock_provider_output_for_attempt,
+    qa_mock_provider_output_for_turn, qa_mock_provider_stream_events_for_turn,
+    qa_mock_provider_turn_for_request, QaMockProviderBehavior, QaMockProviderBehaviorKind,
+    QaMockProviderFixture, QaMockProviderFixtureError, QaMockProviderFixtureIssue,
+    QaMockProviderIssueSeverity, QaMockProviderToolCall, QaMockProviderTurn,
+    QaMockProviderTurnMatcher, QaMockProviderValidationError, MAX_QA_MOCK_PROVIDER_ATTEMPTS,
+    MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS, MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
+    QA_MOCK_PROVIDER_FIXTURE_FORMAT, QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
 };
 pub use redaction::{redact_remote_secret_fragments, sanitize_remote_error};
 pub use snapshots::{

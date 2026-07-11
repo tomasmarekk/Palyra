@@ -1,0 +1,60 @@
+# Exercises exact text projection through the production daemon and journal path.
+# The evidence artifact remains separate from the bounded gate result descriptor.
+schema_version: 2
+id: real_runtime.text_exact
+title: Exact fixture text through the real runtime
+area: text
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_no_tools
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+  tools: []
+  fixtures:
+    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Return the exact deterministic QA response."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "The deterministic QA response is exact."
+  events:
+    - event_type: run.started
+      min_count: 1
+    - event_type: model.delta
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/real_runtime/text_exact.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - real_runtime
+    - deterministic
+    - text_only
+timeout:
+  run_ms: 30000
+  step_ms: 10000

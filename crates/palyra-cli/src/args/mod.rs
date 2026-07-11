@@ -284,11 +284,13 @@ Examples:
   palyra qa validate --path qa/scenarios --json
   palyra qa run-pack --tag p0 --json
   palyra qa run-pack --tag release_smoke --output artifacts/qa-pack-report.json
+  palyra qa gate --suite qa/suites/pr_smoke.yaml --json
   palyra qa provider-compat --path fixtures/provider_compat --json
 
 Discoverability:
   `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.
-  `qa run-pack` performs a local deterministic dry-run of selected mock scenarios.
+  `qa run-pack` previews selected scenario schemas without executing the runtime.
+  `qa gate` executes selected fixture scenarios through an isolated daemon runtime.
   `qa provider-compat` validates sanitized provider quirk fixtures and recovery expectations.";
 
 const DEPLOYMENT_AFTER_HELP: &str = "\
@@ -1023,7 +1025,7 @@ pub enum Command {
         command: EvalCommand,
     },
     #[command(
-        about = "Validate QA Lab scenario manifests and run local QA packs",
+        about = "Validate, preview, and execute QA Lab scenarios",
         after_long_help = QA_AFTER_HELP
     )]
     Qa {

@@ -23,6 +23,8 @@ pub const QA_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// Stable format label embedded in generated evidence bundles.
 pub const QA_EVIDENCE_BUNDLE_FORMAT: &str = "palyra-qa-evidence-bundle";
 
+const NORMALIZED_ABSOLUTE_PATH: &str = "<normalized:absolute_path>";
+
 /// Verdict emitted by QA evidence assertion checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,7 +203,8 @@ pub struct QaEvidenceRedactionReport {
 struct ObservedEvidence {
     final_answer: Option<String>,
     terminal_state: Option<String>,
-    event_sequence: Vec<String>,
+    public_event_sequence: Vec<String>,
+    tape_event_sequence: Vec<String>,
     event_counts: BTreeMap<String, usize>,
     tool_calls: Vec<QaToolCallEvidence>,
     artifacts: Vec<QaArtifactEvidence>,
@@ -236,7 +239,7 @@ pub fn build_qa_evidence_bundle(
         .iter()
         .map(|message| QaTranscriptMessage {
             role: message.role.clone(),
-            content: redact_evidence_text(message.content.as_str()),
+            content: redact_evidence_text(message.content.as_str(), &mut redaction),
         })
         .collect::<Vec<_>>();
     let artifacts = input
@@ -254,7 +257,9 @@ pub fn build_qa_evidence_bundle(
         })
         .collect::<Vec<_>>();
     let observed = ObservedEvidence::from_input(&input);
-    let checks = evaluate_checks(manifest, &observed, &input);
+    let checks =
+        normalize_evidence_checks(evaluate_checks(manifest, &observed, &input), &mut redaction);
+    let tool_calls = normalize_tool_calls(&observed.tool_calls, &mut redaction);
     let check_count = checks.len();
     let issue_count = checks.iter().map(|check| check.issues.len()).sum::<usize>();
     let fake_progress_detected = checks.iter().any(|check| {
@@ -272,19 +277,22 @@ pub fn build_qa_evidence_bundle(
             run_id: input.run_id.as_deref().map(normalized_identifier),
             session_id: input.session_id.as_deref().map(normalized_identifier),
             terminal_state: observed.terminal_state.clone(),
-            final_answer: observed.final_answer.as_deref().map(redact_evidence_text),
+            final_answer: observed
+                .final_answer
+                .as_deref()
+                .map(|answer| redact_evidence_text(answer, &mut redaction)),
         },
         transcript,
         public_events,
         redacted_tape,
         artifacts_index: artifacts,
-        tool_calls: observed.tool_calls.clone(),
+        tool_calls,
         checks,
         summary: QaEvidenceSummary {
             verdict,
             issue_count,
             check_count,
-            observed_event_count: observed.event_sequence.len(),
+            observed_event_count: observed.observed_event_count(),
             observed_tool_call_count: observed.tool_calls.len(),
             artifact_count: observed.artifacts.len(),
             fake_progress_detected,
@@ -360,15 +368,19 @@ impl ObservedEvidence {
     fn from_input(input: &QaEvidenceBuildInput) -> Self {
         let final_answer =
             input.final_answer.clone().or_else(|| derive_final_answer(&input.tape_events));
-        let mut event_sequence = Vec::new();
-        event_sequence.extend(input.public_events.iter().map(|event| event.event_type.clone()));
         let mut tape_events = input.tape_events.clone();
         tape_events.sort_by_key(|event| event.seq);
-        event_sequence.extend(tape_events.iter().map(|event| event.event_type.clone()));
-        let event_counts = event_sequence.iter().fold(BTreeMap::new(), |mut counts, event| {
-            *counts.entry(event.clone()).or_insert(0) += 1;
-            counts
-        });
+        let public_event_sequence =
+            input.public_events.iter().map(|event| event.event_type.clone()).collect::<Vec<_>>();
+        let tape_event_sequence =
+            tape_events.iter().map(|event| event.event_type.clone()).collect::<Vec<_>>();
+        let event_counts = public_event_sequence.iter().chain(&tape_event_sequence).fold(
+            BTreeMap::new(),
+            |mut counts, event| {
+                *counts.entry(event.clone()).or_insert(0) += 1;
+                counts
+            },
+        );
         let tool_calls = if input.tool_calls.is_empty() {
             derive_tool_calls(input)
         } else {
@@ -377,11 +389,16 @@ impl ObservedEvidence {
         Self {
             final_answer,
             terminal_state: input.terminal_state.clone(),
-            event_sequence,
+            public_event_sequence,
+            tape_event_sequence,
             event_counts,
             tool_calls,
             artifacts: input.artifacts.clone(),
         }
+    }
+
+    fn observed_event_count(&self) -> usize {
+        self.public_event_sequence.len() + self.tape_event_sequence.len()
     }
 }
 
@@ -487,22 +504,36 @@ fn check_required_tool_calls(
 ) -> QaEvidenceCheck {
     let mut issues = Vec::new();
     for (index, expected_tool) in manifest.expect.tool_calls.iter().enumerate() {
-        let count = observed
+        let matching_calls = observed
             .tool_calls
             .iter()
             .filter(|tool| token_matches(expected_tool.name.as_str(), tool.name.as_str()))
-            .count();
+            .collect::<Vec<_>>();
+        let expected_success = expected_tool.success.unwrap_or(true);
+        let matching_outcome_count =
+            matching_calls.iter().filter(|tool| tool.success == expected_success).count();
         let min_count = expected_tool.min_count.unwrap_or(1) as usize;
-        if count < min_count {
+        if matching_outcome_count < min_count {
+            let code = if matching_calls.len() >= min_count {
+                if expected_success {
+                    "tool_call_failed"
+                } else {
+                    "tool_call_unexpected_success"
+                }
+            } else {
+                "missing_tool_call"
+            };
             issues.push(QaEvidenceIssue {
-                code: "missing_tool_call".to_owned(),
+                code: code.to_owned(),
                 path: format!("$.expect.tool_calls[{index}]"),
                 message: format!(
-                    "expected at least {min_count} `{}` tool call(s), observed {count}",
-                    expected_tool.name
+                    "expected at least {min_count} `{}` tool call(s) with success={expected_success}, observed {} matching outcome(s) of {} named call(s)",
+                    expected_tool.name,
+                    matching_outcome_count,
+                    matching_calls.len()
                 ),
                 expected: Some(expected_tool.name.clone()),
-                actual: Some(count.to_string()),
+                actual: Some(matching_outcome_count.to_string()),
             });
         }
     }
@@ -531,8 +562,9 @@ fn check_forbidden_observations(
     }
     for forbidden in &manifest.forbidden.events {
         for event_type in observed
-            .event_sequence
+            .public_event_sequence
             .iter()
+            .chain(&observed.tape_event_sequence)
             .filter(|event_type| token_matches(forbidden.as_str(), event_type.as_str()))
         {
             issues.push(QaEvidenceIssue {
@@ -833,11 +865,29 @@ fn required_event_order_issues(
     expected_events: &[QaScenarioExpectedEvent],
     observed: &ObservedEvidence,
 ) -> Vec<QaEvidenceIssue> {
+    let mut issues = required_event_order_issues_for_surface(
+        expected_events,
+        &observed.public_event_sequence,
+        "$.public_events",
+    );
+    issues.extend(required_event_order_issues_for_surface(
+        expected_events,
+        &observed.tape_event_sequence,
+        "$.tape_events",
+    ));
+    issues
+}
+
+fn required_event_order_issues_for_surface(
+    expected_events: &[QaScenarioExpectedEvent],
+    observed_events: &[String],
+    evidence_path: &str,
+) -> Vec<QaEvidenceIssue> {
     let mut issues = Vec::new();
     let mut last_position = None;
     for expected_event in expected_events {
         let Some(position) =
-            first_event_position(&observed.event_sequence, expected_event.event_type.as_str())
+            first_event_position(observed_events, expected_event.event_type.as_str())
         else {
             continue;
         };
@@ -845,27 +895,29 @@ fn required_event_order_issues(
             if position < previous {
                 issues.push(QaEvidenceIssue {
                     code: "event_order_mismatch".to_owned(),
-                    path: "$.expect.events".to_owned(),
+                    path: evidence_path.to_owned(),
                     message: format!(
-                        "event `{}` appeared before an earlier expected event",
-                        expected_event.event_type
+                        "event `{}` appeared before an earlier expected event on the same evidence surface",
+                        expected_event.event_type,
                     ),
-                    expected: Some("expected event order".to_owned()),
+                    expected: Some(format!("expected event order within {evidence_path}")),
                     actual: Some(format!("position {position}")),
                 });
             }
+            last_position = Some(previous.max(position));
+        } else {
+            last_position = Some(position);
         }
-        last_position = Some(position);
     }
     issues
 }
 
 fn lifecycle_order_issues(observed: &ObservedEvidence) -> Vec<QaEvidenceIssue> {
-    let queued = first_event_position(&observed.event_sequence, "run.queued");
-    let started = first_event_position(&observed.event_sequence, "run.started");
+    let queued = first_event_position(&observed.public_event_sequence, "run.queued");
+    let started = first_event_position(&observed.public_event_sequence, "run.started");
     let terminal = ["run.completed", "run.failed", "run.cancelled"]
         .iter()
-        .filter_map(|event| first_event_position(&observed.event_sequence, event))
+        .filter_map(|event| first_event_position(&observed.public_event_sequence, event))
         .min();
     let mut issues = Vec::new();
     if let (Some(started), Some(queued)) = (started, queued) {
@@ -991,6 +1043,41 @@ fn looks_like_fake_progress_claim(answer: &str) -> bool {
     action_claim && work_object
 }
 
+fn normalize_evidence_checks(
+    mut checks: Vec<QaEvidenceCheck>,
+    report: &mut QaEvidenceRedactionReport,
+) -> Vec<QaEvidenceCheck> {
+    for check in &mut checks {
+        for issue in &mut check.issues {
+            issue.message = redact_evidence_text(issue.message.as_str(), report);
+            if let Some(expected) = issue.expected.as_mut() {
+                *expected = redact_evidence_text(expected.as_str(), report);
+            }
+            if let Some(actual) = issue.actual.as_mut() {
+                *actual = redact_evidence_text(actual.as_str(), report);
+            }
+        }
+    }
+    checks
+}
+
+fn normalize_tool_calls(
+    tool_calls: &[QaToolCallEvidence],
+    report: &mut QaEvidenceRedactionReport,
+) -> Vec<QaToolCallEvidence> {
+    tool_calls
+        .iter()
+        .map(|tool_call| QaToolCallEvidence {
+            name: tool_call.name.clone(),
+            proposal_id: tool_call.proposal_id.as_ref().map(|proposal_id| {
+                report.normalized_identifiers += 1;
+                normalized_identifier(proposal_id)
+            }),
+            success: tool_call.success,
+        })
+        .collect()
+}
+
 fn normalize_evidence_value(value: &Value, report: &mut QaEvidenceRedactionReport) -> Value {
     match value {
         Value::Object(object) => Value::Object(
@@ -1002,7 +1089,7 @@ fn normalize_evidence_value(value: &Value, report: &mut QaEvidenceRedactionRepor
         Value::Array(values) => Value::Array(
             values.iter().map(|child| normalize_evidence_value(child, report)).collect(),
         ),
-        Value::String(text) => Value::String(redact_evidence_text(text.as_str())),
+        Value::String(text) => Value::String(redact_evidence_text(text.as_str(), report)),
         _ => value.clone(),
     }
 }
@@ -1048,9 +1135,9 @@ fn normalize_path_value(value: &Value, report: &mut QaEvidenceRedactionReport) -
     match value {
         Value::String(path) if path_is_absolute(path.as_str()) => {
             report.normalized_paths += 1;
-            Value::String("<normalized:absolute_path>".to_owned())
+            Value::String(NORMALIZED_ABSOLUTE_PATH.to_owned())
         }
-        Value::String(path) => Value::String(redact_evidence_text(path.as_str())),
+        Value::String(path) => Value::String(redact_evidence_text(path.as_str(), report)),
         _ => normalize_evidence_value(value, report),
     }
 }
@@ -1083,25 +1170,180 @@ fn is_path_key(key: &str) -> bool {
 fn normalize_artifact_path(path: &str, report: &mut QaEvidenceRedactionReport) -> String {
     if path_is_absolute(path) {
         report.normalized_paths += 1;
-        "<normalized:absolute_path>".to_owned()
+        NORMALIZED_ABSOLUTE_PATH.to_owned()
     } else {
-        redact_evidence_text(path)
+        redact_evidence_text(path, report)
     }
 }
 
 fn path_is_absolute(path: &str) -> bool {
-    Path::new(path).is_absolute()
-        || path.starts_with('/')
-        || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+    Path::new(path).is_absolute() || absolute_path_prefix_len(path, 0).is_some()
 }
 
 fn normalized_identifier(_value: &str) -> String {
     "<normalized:id>".to_owned()
 }
 
-fn redact_evidence_text(text: &str) -> String {
+fn redact_evidence_text(text: &str, report: &mut QaEvidenceRedactionReport) -> String {
     let url_redacted = redact_url_segments_in_text(text);
-    redact_auth_error(url_redacted.as_str())
+    let auth_redacted = redact_auth_error(url_redacted.as_str());
+    normalize_absolute_paths_in_text(auth_redacted.as_str(), report)
+}
+
+fn normalize_absolute_paths_in_text(text: &str, report: &mut QaEvidenceRedactionReport) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        if let Some(prefix_len) = absolute_path_prefix_len(text, cursor) {
+            let path_end = absolute_path_end(text, cursor, prefix_len);
+            output.push_str(NORMALIZED_ABSOLUTE_PATH);
+            report.normalized_paths += 1;
+            cursor = path_end;
+            continue;
+        }
+        if let Some(url_end) = url_span_end(text, cursor) {
+            output.push_str(&text[cursor..url_end]);
+            cursor = url_end;
+            continue;
+        }
+        let Some(ch) = text[cursor..].chars().next() else {
+            break;
+        };
+        output.push(ch);
+        cursor += ch.len_utf8();
+    }
+    output
+}
+
+fn absolute_path_prefix_len(text: &str, start: usize) -> Option<usize> {
+    if !path_has_left_boundary(text, start) {
+        return None;
+    }
+    let remaining = text.get(start..)?;
+    let bytes = remaining.as_bytes();
+    if bytes.first().is_some_and(|byte| byte.is_ascii_alphabetic()) && bytes.get(1) == Some(&b':') {
+        if bytes.get(2).is_some_and(|byte| matches!(*byte, b'/' | b'\\')) {
+            return Some(3);
+        }
+        if bytes.get(2).is_some_and(is_unquoted_path_component_byte) {
+            return Some(2);
+        }
+    }
+    if (remaining.starts_with("\\\\") || remaining.starts_with("//"))
+        && bytes.get(2).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'\\' | b'\'' | b'"' | b'`')
+        })
+    {
+        return Some(2);
+    }
+    if remaining.starts_with('/') && bytes.get(1).is_some_and(is_unquoted_path_component_byte) {
+        return Some(1);
+    }
+    if remaining.starts_with('\\') && bytes.get(1).is_some_and(is_unquoted_path_component_byte) {
+        return Some(1);
+    }
+    None
+}
+
+fn is_unquoted_path_component_byte(byte: &u8) -> bool {
+    !byte.is_ascii_whitespace()
+        && !matches!(*byte, b'/' | b'\\' | b'\'' | b'"' | b'`' | b')' | b']' | b'}')
+}
+
+fn path_has_left_boundary(text: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    text.get(..start).and_then(|prefix| prefix.chars().next_back()).is_some_and(|ch| {
+        ch.is_whitespace() || (!ch.is_alphanumeric() && !matches!(ch, '_' | '.' | '/' | '\\'))
+    })
+}
+
+fn absolute_path_end(text: &str, start: usize, prefix_len: usize) -> usize {
+    let quoted_by = text
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back())
+        .filter(|ch| matches!(ch, '"' | '\'' | '`'));
+    let scan_start = start + prefix_len;
+    let mut end = text.len();
+    for (offset, ch) in text[scan_start..].char_indices() {
+        let is_boundary = if let Some(quote) = quoted_by {
+            ch == quote
+        } else {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\''
+                        | '`'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '='
+                        | '!'
+                        | '?'
+                        | '#'
+                )
+        };
+        if is_boundary {
+            end = scan_start + offset;
+            break;
+        }
+    }
+    if quoted_by.is_none() {
+        while end > scan_start {
+            let Some(ch) = text[..end].chars().next_back() else {
+                break;
+            };
+            if ch != '.' {
+                break;
+            }
+            end -= ch.len_utf8();
+        }
+    }
+    end
+}
+
+fn url_span_end(text: &str, start: usize) -> Option<usize> {
+    if !path_has_left_boundary(text, start) {
+        return None;
+    }
+    let remaining = text.get(start..)?;
+    let url_prefix_len = if remaining.starts_with("www.") {
+        4
+    } else {
+        let scheme_end = remaining.find("://")?;
+        let scheme = remaining.get(..scheme_end)?;
+        if scheme.is_empty()
+            || !scheme.as_bytes().first().is_some_and(|byte| byte.is_ascii_alphabetic())
+            || !scheme
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
+        {
+            return None;
+        }
+        scheme_end + 3
+    };
+    let url_body = remaining.get(url_prefix_len..)?;
+    if url_body.is_empty() {
+        return None;
+    }
+    let relative_end = url_body
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (ch.is_whitespace() || matches!(ch, '"' | '\'' | '`'))
+                .then_some(url_prefix_len + offset)
+        })
+        .unwrap_or(remaining.len());
+    Some(start + relative_end)
 }
 
 #[cfg(test)]
@@ -1112,25 +1354,11 @@ mod tests {
     use crate::qa_scenarios::parse_qa_scenario_manifest_yaml;
 
     const BASIC_SCENARIO: &str = include_str!("../../../qa/scenarios/text_run_basic.yaml");
+    const MALFORMED_RECOVERY_SCENARIO: &str =
+        include_str!("../../../qa/scenarios/real_runtime/malformed_stream_recovery.yaml");
     const MARKDOWN_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_evidence_report_basic.md");
-
-    #[test]
-    fn evidence_bundle_passes_basic_manifest() {
-        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
-            .expect("basic QA scenario should parse");
-        let bundle = build_qa_evidence_bundle(&manifest, passing_input());
-
-        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Passed);
-        assert_eq!(bundle.summary.issue_count, 0);
-        assert_eq!(bundle.redacted_tape[0].payload["run_id"], "<normalized:id>");
-        assert_eq!(qa_evidence_json_report(&bundle)["verdict"], "passed");
-    }
-
-    #[test]
-    fn missing_tool_call_reports_precise_failure() {
-        let manifest = parse_qa_scenario_manifest_yaml(
-            r#"
+    const REQUIRED_TOOL_SCENARIO: &str = r#"
 schema_version: 1
 id: tool.required
 area: tools
@@ -1159,9 +1387,24 @@ maturity:
   labels: [p0]
 timeout:
   run_ms: 30000
-"#,
-        )
-        .expect("tool scenario should parse");
+"#;
+
+    #[test]
+    fn evidence_bundle_passes_basic_manifest() {
+        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let bundle = build_qa_evidence_bundle(&manifest, passing_input());
+
+        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(bundle.summary.issue_count, 0);
+        assert_eq!(bundle.redacted_tape[0].payload["run_id"], "<normalized:id>");
+        assert_eq!(qa_evidence_json_report(&bundle)["verdict"], "passed");
+    }
+
+    #[test]
+    fn missing_tool_call_reports_precise_failure() {
+        let manifest = parse_qa_scenario_manifest_yaml(REQUIRED_TOOL_SCENARIO)
+            .expect("tool scenario should parse");
         let bundle = build_qa_evidence_bundle(
             &manifest,
             QaEvidenceBuildInput {
@@ -1176,6 +1419,58 @@ timeout:
             check.issues.iter().any(|issue| {
                 issue.code == "missing_tool_call" && issue.path == "$.expect.tool_calls[0]"
             })
+        }));
+    }
+
+    #[test]
+    fn failed_tool_call_does_not_satisfy_required_tool_evidence() {
+        let manifest = parse_qa_scenario_manifest_yaml(REQUIRED_TOOL_SCENARIO)
+            .expect("tool scenario should parse");
+        let bundle = build_qa_evidence_bundle(
+            &manifest,
+            QaEvidenceBuildInput {
+                terminal_state: Some("completed".to_owned()),
+                final_answer: Some("Done.".to_owned()),
+                tool_calls: vec![QaToolCallEvidence {
+                    name: "palyra.fs.read_file".to_owned(),
+                    proposal_id: Some("proposal-1".to_owned()),
+                    success: false,
+                }],
+                ..QaEvidenceBuildInput::default()
+            },
+        );
+
+        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Failed);
+        assert!(bundle.checks.iter().any(|check| {
+            check.issues.iter().any(|issue| {
+                issue.code == "tool_call_failed" && issue.path == "$.expect.tool_calls[0]"
+            })
+        }));
+    }
+
+    #[test]
+    fn explicit_denial_expectation_requires_a_failed_tool_outcome() {
+        let scenario = REQUIRED_TOOL_SCENARIO
+            .replace("      min_count: 1", "      min_count: 1\n      success: false");
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("denial scenario should parse");
+        let mut input = QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            tool_calls: vec![QaToolCallEvidence {
+                name: "palyra.fs.read_file".to_owned(),
+                proposal_id: Some("proposal-1".to_owned()),
+                success: false,
+            }],
+            ..QaEvidenceBuildInput::default()
+        };
+
+        let denied = build_qa_evidence_bundle(&manifest, input.clone());
+        assert_eq!(denied.summary.verdict, QaEvidenceVerdict::Passed);
+
+        input.tool_calls[0].success = true;
+        let unexpectedly_allowed = build_qa_evidence_bundle(&manifest, input);
+        assert!(unexpectedly_allowed.checks.iter().any(|check| {
+            check.issues.iter().any(|issue| issue.code == "tool_call_unexpected_success")
         }));
     }
 
@@ -1204,6 +1499,11 @@ timeout:
                         "url": "https://example.com/token/secret-value"
                     }),
                 }],
+                tool_calls: vec![QaToolCallEvidence {
+                    name: "palyra.fs.read_file".to_owned(),
+                    proposal_id: Some("qa-real-read".to_owned()),
+                    success: true,
+                }],
                 artifacts: vec![QaArtifactEvidence {
                     path: "qa/reports/text_run_basic.json".to_owned(),
                     kind: "report".to_owned(),
@@ -1221,9 +1521,129 @@ timeout:
         assert_eq!(payload["created_at_unix_ms"], 0);
         assert_eq!(payload["path"], "<normalized:absolute_path>");
         assert_eq!(payload["sha256"], "<normalized:hash>");
+        assert_eq!(bundle.tool_calls[0].proposal_id.as_deref(), Some("<normalized:id>"));
         assert!(bundle.redaction.redacted_fields >= 1);
         assert!(bundle.redaction.normalized_timestamps >= 1);
         assert!(bundle.redaction.normalized_hashes >= 2);
+    }
+
+    #[test]
+    fn normalizes_embedded_host_paths_across_free_text_surfaces() {
+        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let mut input = passing_input();
+        input.final_answer = Some("A friendly result is at /tmp/result.txt.".to_owned());
+        input.transcript = vec![QaTranscriptMessage {
+            role: "assistant".to_owned(),
+            content: r#"before C:\Users\qa-user\one.txt, C:/Users/qa-user/two.txt, C:private\suite.yaml, \Users\qa-user\root.txt, and "C:\Program Files\Palyra\config.toml" after"#
+                .to_owned(),
+        }];
+        input.public_events[1].payload = json!({
+            "message": "public /home/qa-user/config beside https://example.test/Users/public"
+        });
+        input.tape_events[0].payload = json!({
+            "message": r"tape \\server\share\secret.txt beside /Users/qa-user/private.key"
+        });
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+
+        assert_eq!(
+            bundle.run.final_answer.as_deref(),
+            Some("A friendly result is at <normalized:absolute_path>.")
+        );
+        assert_eq!(
+            bundle.transcript[0].content,
+            "before <normalized:absolute_path>, <normalized:absolute_path>, <normalized:absolute_path>, <normalized:absolute_path>, and \"<normalized:absolute_path>\" after"
+        );
+        assert_eq!(
+            bundle.public_events[1].payload["message"],
+            "public <normalized:absolute_path> beside https://example.test/Users/public"
+        );
+        assert_eq!(
+            bundle.redacted_tape[0].payload["message"],
+            "tape <normalized:absolute_path> beside <normalized:absolute_path>"
+        );
+        assert_eq!(bundle.redaction.normalized_paths, 9);
+    }
+
+    #[test]
+    fn redacts_host_paths_from_assertion_issues() {
+        let mut manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let final_answer = manifest
+            .expect
+            .final_answer
+            .as_mut()
+            .expect("basic scenario should require a final answer");
+        final_answer.equals = Some(r"C:\Users\qa-user\expected.txt".to_owned());
+        final_answer.contains.clear();
+        let mut input = passing_input();
+        input.final_answer = Some(r"mismatch D:\Users\qa-user\actual.txt".to_owned());
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+        let issue = bundle
+            .checks
+            .iter()
+            .flat_map(|check| &check.issues)
+            .find(|issue| issue.code == "final_answer_mismatch")
+            .expect("mismatched answer should produce an issue");
+
+        assert_eq!(issue.expected.as_deref(), Some("<normalized:absolute_path>"));
+        assert_eq!(issue.actual.as_deref(), Some("mismatch <normalized:absolute_path>"));
+        assert_eq!(bundle.run.final_answer.as_deref(), Some("mismatch <normalized:absolute_path>"));
+        let serialized = serde_json::to_string(&bundle).expect("evidence bundle should serialize");
+        assert!(!serialized.contains("expected.txt"), "{serialized}");
+        assert!(!serialized.contains("actual.txt"), "{serialized}");
+        assert_eq!(bundle.redaction.normalized_paths, 3);
+    }
+
+    #[test]
+    fn expected_event_order_does_not_compare_unrelated_evidence_surfaces() {
+        let mut manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        manifest.expect.events = vec![
+            expected_event("provider.retry.started"),
+            expected_event("run.started"),
+            expected_event("run.completed"),
+        ];
+        let mut input = passing_input();
+        input.tape_events.push(QaRunTapeEvent {
+            seq: 1,
+            event_type: "provider.retry.started".to_owned(),
+            payload: json!({}),
+        });
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+
+        assert_eq!(required_events_check(&bundle).verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(bundle.summary.observed_event_count, 5);
+    }
+
+    #[test]
+    fn malformed_recovery_requires_surface_local_retry_and_completion_order() {
+        let manifest = parse_qa_scenario_manifest_yaml(MALFORMED_RECOVERY_SCENARIO)
+            .expect("malformed recovery scenario should parse");
+        let input = malformed_recovery_input();
+
+        let ordered = build_qa_evidence_bundle(&manifest, input.clone());
+        assert_eq!(required_events_check(&ordered).verdict, QaEvidenceVerdict::Passed);
+
+        let mut reversed_tape = input.clone();
+        reversed_tape.tape_events[0].seq = 20;
+        reversed_tape.tape_events[1].seq = 10;
+        let reversed_tape = build_qa_evidence_bundle(&manifest, reversed_tape);
+        assert!(required_events_check(&reversed_tape)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "event_order_mismatch" && issue.path == "$.tape_events"));
+
+        let mut reversed_public = input;
+        reversed_public.public_events.swap(1, 2);
+        let reversed_public = build_qa_evidence_bundle(&manifest, reversed_public);
+        assert!(required_events_check(&reversed_public)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "event_order_mismatch" && issue.path == "$.public_events"));
     }
 
     #[test]
@@ -1380,6 +1800,53 @@ timeout:
         let bundle = build_qa_evidence_bundle(&manifest, passing_input());
 
         assert_eq!(qa_evidence_markdown_report(&bundle), MARKDOWN_GOLDEN.replace("\r\n", "\n"));
+    }
+
+    fn expected_event(event_type: &str) -> QaScenarioExpectedEvent {
+        QaScenarioExpectedEvent { event_type: event_type.to_owned(), min_count: Some(1) }
+    }
+
+    fn required_events_check(bundle: &QaEvidenceBundle) -> &QaEvidenceCheck {
+        bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "required_events")
+            .expect("required event check should be present")
+    }
+
+    fn malformed_recovery_input() -> QaEvidenceBuildInput {
+        QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            final_answer: Some("Recovered after a retryable malformed response.".to_owned()),
+            public_events: vec![
+                QaPublicEventEvidence { event_type: "run.started".to_owned(), payload: json!({}) },
+                QaPublicEventEvidence { event_type: "model.delta".to_owned(), payload: json!({}) },
+                QaPublicEventEvidence {
+                    event_type: "run.completed".to_owned(),
+                    payload: json!({}),
+                },
+            ],
+            tape_events: vec![
+                QaRunTapeEvent {
+                    seq: 10,
+                    event_type: "provider.retry.started".to_owned(),
+                    payload: json!({}),
+                },
+                QaRunTapeEvent {
+                    seq: 20,
+                    event_type: "model_token".to_owned(),
+                    payload: json!({}),
+                },
+            ],
+            artifacts: vec![QaArtifactEvidence {
+                path: "qa/reports/real_runtime/malformed_stream_recovery.evidence.json".to_owned(),
+                kind: "evidence".to_owned(),
+                present: true,
+                sha256: None,
+                size_bytes: Some(512),
+            }],
+            ..QaEvidenceBuildInput::default()
+        }
     }
 
     fn passing_input() -> QaEvidenceBuildInput {

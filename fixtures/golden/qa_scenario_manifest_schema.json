@@ -1,4 +1,8 @@
 {
+  "approval_decisions": [
+    "allow",
+    "deny"
+  ],
   "areas": [
     "text",
     "tools",
@@ -19,6 +23,11 @@
   ],
   "encoding": "yaml",
   "examples_root": "qa/scenarios",
+  "expected_tool_call_fields": [
+    "name",
+    "min_count",
+    "success"
+  ],
   "forbidden_fields": [
     "tool_calls",
     "events",
@@ -48,12 +57,26 @@
     "maturity",
     "timeout"
   ],
-  "schema_version": 1,
+  "runner_config_fields": [
+    "provider_fixture",
+    "workspace_fixture",
+    "policy_profile"
+  ],
+  "runner_modes": [
+    "fixture",
+    "record_replay",
+    "live"
+  ],
+  "schema_version": 2,
   "step_actions": [
     "user_prompt",
     "tool_result",
     "approval_decision",
     "wait_for_event"
+  ],
+  "supported_schema_versions": [
+    1,
+    2
   ],
   "terminal_states": [
     "completed",

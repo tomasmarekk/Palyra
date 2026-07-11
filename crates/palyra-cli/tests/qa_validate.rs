@@ -1,9 +1,10 @@
-//! Integration tests for the `palyra qa validate` command.
+//! Integration tests for the `palyra qa` command family.
 
 use std::{fs, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -12,6 +13,14 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("workspace crates directory has a repository parent")
         .to_path_buf()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[test]
@@ -264,10 +273,466 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         .context("qa gate should write Markdown report")?;
 
     assert_eq!(stdout_payload, file_payload, "stdout and JSON report should match");
+    assert_eq!(stdout_payload.pointer("/schema_version").and_then(Value::as_u64), Some(2));
     assert_eq!(stdout_payload.pointer("/decision").and_then(Value::as_str), Some("pass"));
+    assert_eq!(
+        stdout_payload.pointer("/artifact_reference_base").and_then(Value::as_str),
+        Some(".")
+    );
     assert_eq!(stdout_payload.pointer("/summary/failed").and_then(Value::as_u64), Some(0));
+    let scenarios = stdout_payload
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .context("real QA gate should include scenario executions")?;
+    assert_eq!(scenarios.len(), 4);
+    assert!(scenarios.iter().all(|scenario| {
+        let execution = &scenario["execution"];
+        execution["run_id"].as_str().is_some_and(|value| value.len() == 26)
+            && execution["session_id"].as_str().is_some_and(|value| value.len() == 26)
+            && execution["cleanup"]["verified"].as_bool() == Some(true)
+            && execution["result_artifact"]["sha256"].as_str().is_some_and(is_sha256)
+            && execution["evidence_artifacts"][0]["sha256"].as_str().is_some_and(is_sha256)
+    }));
+    let serialized = serde_json::to_string(&stdout_payload)
+        .context("QA gate report should serialize for bounded-shape assertions")?;
+    assert!(!serialized.contains("\"transcript\""));
+    assert!(!serialized.contains("\"tape_events\""));
+    let normalized_temp_root = temp_dir.path().to_string_lossy().replace('\\', "/");
+    assert!(!serialized.replace('\\', "/").contains(normalized_temp_root.as_str()));
+    assert!(!markdown.replace('\\', "/").contains(normalized_temp_root.as_str()));
     assert!(markdown.contains("# QA Lab Gate: pr_smoke"));
+    assert!(markdown.contains("- Artifact reference base: `.`"));
     assert!(markdown.contains("## Maturity Scorecard"));
+
+    let first_references = scenarios
+        .iter()
+        .flat_map(|scenario| {
+            let execution = &scenario["execution"];
+            std::iter::once(&execution["result_artifact"])
+                .chain(execution["evidence_artifacts"].as_array().into_iter().flatten())
+        })
+        .map(|reference| {
+            Ok((
+                reference["path"]
+                    .as_str()
+                    .context("artifact reference should contain a relative path")?
+                    .to_owned(),
+                reference["sha256"]
+                    .as_str()
+                    .context("artifact reference should contain a digest")?
+                    .to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let second_json_path = temp_dir.path().join("qa-lab").join("pr-smoke-second.json");
+    let second_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/pr_smoke.yaml", "--output-json"])
+        .arg(second_json_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute a second palyra qa gate")?;
+    assert!(
+        second_output.status.success(),
+        "second QA gate should pass: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    for (relative_path, expected_hash) in first_references {
+        assert!(!PathBuf::from(relative_path.as_str()).is_absolute());
+        let bytes = fs::read(
+            json_path
+                .parent()
+                .context("QA report should have a parent directory")?
+                .join(relative_path.as_str()),
+        )
+        .with_context(|| format!("failed to reopen referenced artifact {relative_path}"))?;
+        assert_eq!(sha256_hex(bytes.as_slice()), expected_hash);
+    }
+    Ok(())
+}
+
+#[test]
+fn qa_gate_rejects_reports_with_different_artifact_reference_directories() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/pr_smoke.yaml", "--output-json"])
+        .arg(temp_dir.path().join("json").join("gate.json"))
+        .arg("--output-markdown")
+        .arg(temp_dir.path().join("markdown").join("gate.md"))
+        .arg("--json")
+        .output()
+        .context("failed to execute gate with split report directories")?;
+
+    assert!(!output.status.success(), "split report directories must fail closed");
+    assert!(String::from_utf8_lossy(output.stderr.as_slice())
+        .contains("qa.runner.output_directory_mismatch"));
+    Ok(())
+}
+
+#[test]
+fn qa_gate_fails_a_real_runtime_answer_mismatch() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_dir = temp_dir.path().join("scenarios");
+    fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
+    fs::write(
+        scenario_dir.join("answer-mismatch.yaml"),
+        r#"
+schema_version: 2
+id: real_runtime.answer_mismatch
+area: text
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_no_tools
+requires:
+  model: text
+  capabilities: [agent_run, qa_lab]
+  tools: []
+  fixtures:
+    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Return the exact deterministic QA response."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "This intentionally differs from the fixture output."
+  events:
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: ["*"]
+  events: [run.failed]
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/real_runtime/answer_mismatch.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels: [p0, negative_real_runtime]
+timeout:
+  run_ms: 30000
+  step_ms: 10000
+"#,
+    )
+    .context("failed to write mismatch scenario")?;
+    let suite_path = temp_dir.path().join("mismatch-suite.yaml");
+    fs::write(
+        suite_path.as_path(),
+        format!(
+            r#"
+schema_version: 1
+id: answer_mismatch
+mode: pr
+scenario_roots:
+  - "{}"
+include_tags: [negative_real_runtime]
+allow_runner_modes: [fixture]
+available_capabilities: [agent_run, qa_lab]
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  fail_on_required_blockers: true
+  categories:
+    - id: text
+      label: Text
+      areas: [text]
+      required: true
+"#,
+            scenario_dir.display().to_string().replace('\\', "/")
+        ),
+    )
+    .context("failed to write mismatch suite")?;
+    let report_path = temp_dir.path().join("reports").join("mismatch.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite"])
+        .arg(suite_path.as_os_str())
+        .arg("--output-json")
+        .arg(report_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute mismatching real QA gate")?;
+
+    assert!(!output.status.success(), "an actual answer mismatch must fail the gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("mismatch gate JSON should parse")?;
+    assert_eq!(payload.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert!(payload.pointer("/scenarios/0/issue_codes").and_then(Value::as_array).is_some_and(
+        |codes| { codes.iter().any(|code| code.as_str() == Some("final_answer_mismatch")) }
+    ));
+    assert_eq!(
+        payload.pointer("/scenarios/0/execution/cleanup/verified").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(payload
+        .pointer("/scenarios/0/execution/result_artifact/sha256")
+        .and_then(Value::as_str)
+        .is_some_and(is_sha256));
+    let serialized = serde_json::to_string(&payload)
+        .context("mismatch gate report should serialize for bounded-shape assertions")?;
+    assert!(!serialized.contains("\"transcript\""));
+    assert!(!serialized.contains("\"tape_events\""));
+    let normalized_temp_root = temp_dir.path().to_string_lossy().replace('\\', "/");
+    assert!(!serialized.replace('\\', "/").contains(normalized_temp_root.as_str()));
+    assert_eq!(
+        payload.pointer("/suite_path").and_then(Value::as_str),
+        Some("<normalized:absolute_path>")
+    );
+    assert_eq!(
+        payload.pointer("/scenario_roots/0").and_then(Value::as_str),
+        Some("<normalized:absolute_path>")
+    );
+    assert_eq!(
+        payload.pointer("/scenarios/0/path").and_then(Value::as_str),
+        Some("<normalized:absolute_path>")
+    );
+    Ok(())
+}
+
+#[test]
+fn qa_gate_rejects_recovery_without_failed_attempt_evidence() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_dir = temp_dir.path().join("scenarios");
+    fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
+    fs::write(
+        scenario_dir.join("missing-retry.yaml"),
+        r#"
+schema_version: 2
+id: real_runtime.missing_retry_evidence
+area: provider
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_retry_missing_attempt.yaml
+  policy_profile: qa_provider_recovery
+requires:
+  model: text
+  capabilities: [agent_run, qa_lab, provider_recovery]
+  tools: []
+  fixtures: [qa/fixtures/provider_retry_missing_attempt.yaml]
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Recover a malformed response without retry evidence."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "Recovered after a retryable malformed response."
+  events:
+    - event_type: provider.retry.started
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: ["*"]
+  events: [run.failed]
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/real_runtime/missing_retry_evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels: [p0, negative_retry_evidence]
+timeout:
+  run_ms: 30000
+  step_ms: 10000
+"#,
+    )
+    .context("failed to write missing-retry scenario")?;
+    let suite_path = temp_dir.path().join("missing-retry-suite.yaml");
+    fs::write(
+        suite_path.as_path(),
+        format!(
+            r#"
+schema_version: 1
+id: missing_retry_evidence
+mode: pr
+scenario_roots:
+  - {}
+include_tags: [negative_retry_evidence]
+allow_runner_modes: [fixture]
+require_p0_green: true
+available_capabilities: [agent_run, qa_lab, provider_recovery]
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  fail_on_required_blockers: true
+  categories:
+    - id: provider
+      label: Provider
+      areas: [provider]
+      required: true
+"#,
+            scenario_dir.display().to_string().replace('\\', "/")
+        ),
+    )
+    .context("failed to write missing-retry suite")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite"])
+        .arg(suite_path.as_os_str())
+        .arg("--output-json")
+        .arg(temp_dir.path().join("reports/missing-retry.json"))
+        .arg("--json")
+        .output()
+        .context("failed to execute missing-retry gate")?;
+
+    assert!(!output.status.success(), "missing retry evidence must fail the gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("missing-retry gate JSON should parse")?;
+    assert!(payload
+        .pointer("/scenarios/0/issue_codes")
+        .and_then(Value::as_array)
+        .is_some_and(|codes| codes.iter().any(|code| code.as_str() == Some("missing_event"))));
+    assert_eq!(
+        payload.pointer("/scenarios/0/execution/cleanup/verified").and_then(Value::as_bool),
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn qa_gate_persists_verified_cleanup_after_runtime_timeout() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_dir = temp_dir.path().join("scenarios");
+    fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
+    fs::write(
+        scenario_dir.join("runtime-timeout.yaml"),
+        r#"
+schema_version: 2
+id: real_runtime.timeout_cleanup
+area: provider
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_slow_timeout.yaml
+  policy_profile: qa_provider_recovery
+requires:
+  model: text
+  capabilities: [agent_run, qa_lab]
+  tools: []
+  fixtures: [qa/fixtures/provider_slow_timeout.yaml]
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exceed the QA runner deadline."
+expect:
+  terminal_state: completed
+  events:
+    - event_type: run.completed
+  tool_calls: []
+forbidden:
+  tool_calls: ["*"]
+  events: []
+  artifacts: []
+  claims: []
+artifacts: []
+maturity:
+  labels: [p0, negative_error_cleanup]
+timeout:
+  run_ms: 50
+  step_ms: 50
+"#,
+    )
+    .context("failed to write runtime-timeout scenario")?;
+    let suite_path = temp_dir.path().join("runtime-timeout-suite.yaml");
+    fs::write(
+        suite_path.as_path(),
+        format!(
+            r#"
+schema_version: 1
+id: runtime_timeout_cleanup
+mode: pr
+scenario_roots:
+  - {}
+include_tags: [negative_error_cleanup]
+allow_runner_modes: [fixture]
+require_p0_green: true
+available_capabilities: [agent_run, qa_lab]
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  fail_on_required_blockers: true
+  categories:
+    - id: provider
+      label: Provider
+      areas: [provider]
+      required: true
+"#,
+            scenario_dir.display().to_string().replace('\\', "/")
+        ),
+    )
+    .context("failed to write runtime-timeout suite")?;
+    let report_path = temp_dir.path().join("reports/runtime-timeout.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite"])
+        .arg(suite_path.as_os_str())
+        .arg("--output-json")
+        .arg(report_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute runtime-timeout gate")?;
+
+    assert!(!output.status.success(), "runtime timeout must fail the gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("runtime-timeout gate JSON should parse")?;
+    let execution = payload
+        .pointer("/scenarios/0/execution")
+        .context("runtime error should retain an execution descriptor")?;
+    assert!(payload.pointer("/scenarios/0/issue_codes").and_then(Value::as_array).is_some_and(
+        |codes| codes.iter().any(|code| code.as_str() == Some("qa.runner.run_timeout"))
+    ));
+    assert_eq!(execution.pointer("/cleanup/session_cleaned").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        execution.pointer("/cleanup/daemon_terminated").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        execution.pointer("/cleanup/workspace_removed").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(execution.pointer("/cleanup/verified").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        execution.pointer("/cleanup/run_terminal_observed").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        execution.pointer("/evidence_artifacts").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    let result_path = execution
+        .pointer("/result_artifact/path")
+        .and_then(Value::as_str)
+        .context("runtime error should reference its result descriptor")?;
+    assert!(!PathBuf::from(result_path).is_absolute());
+    assert!(report_path
+        .parent()
+        .context("runtime-timeout report should have a parent")?
+        .join(result_path)
+        .is_file());
     Ok(())
 }
 
@@ -286,10 +751,12 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
     );
     let payload: Value = serde_json::from_slice(output.stdout.as_slice())
         .context("qa gate release JSON should parse")?;
+    assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(2));
     let scorecard = payload
         .get("maturity_scorecard")
         .context("QA gate report should include maturity_scorecard")?;
-    let golden_path = repo_root().join("fixtures/golden/qa_release_maturity_scorecard.json");
+    let golden_path =
+        repo_root().join("fixtures/golden/qa_release_runtime_maturity_scorecard_v1.json");
     let golden: Value = serde_json::from_slice(
         fs::read(golden_path.as_path())
             .with_context(|| format!("failed to read {}", golden_path.display()))?
@@ -302,8 +769,92 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
 }
 
 #[test]
+fn qa_gate_rejects_legacy_suite_as_schema_preview_instead_of_simulating_runtime() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/nightly.yaml", "--json"])
+        .output()
+        .context("failed to execute legacy nightly gate")?;
+
+    assert!(!output.status.success(), "schema preview must not qualify as a runtime gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("legacy gate JSON should parse")?;
+    assert_eq!(payload.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert!(payload
+        .pointer("/summary/unsupported")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0));
+    let encoded = serde_json::to_string(&payload).context("legacy gate report should serialize")?;
+    assert!(encoded.contains("qa.runner.schema_preview_only"));
+    assert!(!encoded.contains("qa.runner.missing_config"));
+    Ok(())
+}
+
+#[test]
+fn qa_gate_fails_when_tag_filters_select_no_scenarios() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/backend_harness_conformance.yaml", "--json"])
+        .output()
+        .context("failed to execute empty-selection QA gate")?;
+
+    assert!(!output.status.success(), "an empty runtime gate must fail closed");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("empty-selection gate JSON should parse")?;
+    assert_eq!(payload.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert_eq!(payload.pointer("/summary/selected_count").and_then(Value::as_u64), Some(0));
+    assert!(payload.pointer("/policy_violations").and_then(Value::as_array).is_some_and(
+        |violations| violations.iter().any(|violation| {
+            violation.get("code").and_then(Value::as_str) == Some("qa.runner.no_scenarios_selected")
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn qa_gate_fails_unavailable_capability_without_skip_reason() -> Result<()> {
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_dir = temp_dir.path().join("scenarios");
+    fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
+    fs::write(
+        scenario_dir.join("capability-unavailable.yaml"),
+        r#"
+schema_version: 2
+id: runtime.capability_unavailable
+area: text
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  policy_profile: qa_no_tools
+requires:
+  model: text
+  capabilities: [agent_run, qa_lab]
+  tools: []
+  fixtures: [qa/fixtures/real_agent_runner.yaml]
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Return the exact deterministic QA response."
+expect:
+  terminal_state: completed
+  events:
+    - event_type: run.completed
+  tool_calls: []
+forbidden:
+  tool_calls: ["*"]
+  events: []
+  artifacts: []
+  claims: []
+artifacts: []
+maturity:
+  labels: [release_smoke]
+timeout:
+  run_ms: 30000
+"#,
+    )
+    .context("failed to write unavailable-capability scenario")?;
     let suite_path = temp_dir.path().join("missing-skip-reason.yaml");
     fs::write(
         suite_path.as_path(),
@@ -315,7 +866,7 @@ mode: pr
 scenario_roots:
   - "{}"
 include_tags: [release_smoke]
-allow_provider_modes: [mock]
+allow_runner_modes: [fixture]
 available_capabilities:
   - qa_lab
 flaky_policy:
@@ -328,7 +879,7 @@ scorecard:
       label: Security
       labels: [security]
 "#,
-            repo_root().join("qa/scenarios").display().to_string().replace('\\', "/")
+            scenario_dir.display().to_string().replace('\\', "/")
         ),
     )
     .context("failed to write suite fixture")?;
@@ -360,12 +911,15 @@ fn qa_gate_release_blocks_failing_p0_scenario() -> Result<()> {
     fs::write(
         scenario_dir.join("failing-p0.yaml"),
         r#"
-schema_version: 1
+schema_version: 2
 id: p0.fixture_missing
 area: tools
 mode:
-  provider: mock
+  runner: fixture
   deterministic: true
+runner:
+  provider_fixture: missing/fixture.yaml
+  policy_profile: qa_no_tools
 requires:
   capabilities: [agent_run, qa_lab]
   tools: []
@@ -407,7 +961,7 @@ mode: release
 scenario_roots:
   - "{}"
 include_tags: [p0]
-allow_provider_modes: [mock]
+allow_runner_modes: [fixture]
 require_p0_green: true
 available_capabilities:
   - agent_run

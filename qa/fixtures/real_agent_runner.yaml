@@ -1,0 +1,71 @@
+# Credential-free provider turns for black-box QA execution through the daemon.
+# Tool-result matchers precede prompt matchers because fixture selection is first-match.
+schema_version: 1
+id: qa.mock.provider.real-agent-runner
+turns:
+  - id: read_only_after_tool_result
+    match:
+      tool_result_call_id: qa-real-read
+      tool_result_success: true
+    behavior:
+      kind: text
+      deltas:
+        - "The workspace fixture contains "
+        - "initial sandbox content."
+      finish_reason: stop
+      prompt_tokens: 10
+      completion_tokens: 7
+      latency_ms: 2
+  - id: denied_mutation_after_tool_result
+    match:
+      tool_result_call_id: qa-real-denied-patch
+      tool_result_success: false
+    behavior:
+      kind: text
+      text: "The requested mutation was denied; no file changed."
+      finish_reason: stop
+      prompt_tokens: 12
+      completion_tokens: 9
+      latency_ms: 2
+  - id: exact_text
+    match:
+      prompt_contains:
+        - return the exact deterministic qa response
+    behavior:
+      kind: text
+      deltas:
+        - "The deterministic QA "
+        - "response is exact."
+      finish_reason: stop
+      prompt_tokens: 7
+      completion_tokens: 6
+      latency_ms: 2
+  - id: read_only_tool
+    match:
+      prompt_contains:
+        - inspect the qa workspace fixture with the read-only tool
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-real-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: src/app.txt
+            max_bytes: 4096
+      prompt_tokens: 11
+      completion_tokens: 8
+      latency_ms: 2
+  - id: denied_mutation
+    match:
+      prompt_contains:
+        - propose the qa mutation that must be denied
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-real-denied-patch
+          tool_name: palyra.fs.apply_patch
+          input_json:
+            patch: "*** Begin Patch\n*** Add File: src/denied.txt\n+must-not-exist\n*** End Patch\n"
+      prompt_tokens: 10
+      completion_tokens: 12
+      latency_ms: 2

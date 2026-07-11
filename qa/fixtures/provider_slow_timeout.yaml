@@ -1,0 +1,15 @@
+# Negative QA fixture used to force a runner timeout after session/run creation.
+schema_version: 1
+id: qa.mock.provider.slow-timeout
+turns:
+  - id: delayed_text
+    match:
+      prompt_contains:
+        - exceed the qa runner deadline
+    behavior:
+      kind: text
+      text: "This response must arrive too late."
+      finish_reason: stop
+      prompt_tokens: 5
+      completion_tokens: 6
+      latency_ms: 500

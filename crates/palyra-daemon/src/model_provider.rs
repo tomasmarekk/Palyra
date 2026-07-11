@@ -42,7 +42,6 @@ use adapters::{
     openai_responses_tool_wire_name_map, AnthropicCompatibleChatAdapter,
     OpenAiCompatibleChatAdapter, OpenAiResponsesChatAdapter, ProviderChatAdapter,
 };
-use palyra_model_providers::parse_qa_mock_provider_fixture_yaml;
 #[cfg(test)]
 pub(crate) use palyra_model_providers::MAX_TOOL_ARGUMENT_BYTES;
 pub(crate) use palyra_model_providers::{
@@ -74,12 +73,14 @@ pub use palyra_model_providers::{
 };
 use palyra_model_providers::{
     classify_http_provider_failure, classify_reqwest_provider_failure,
-    fail_closed_provider_classification, failover_provider_classification,
-    invalid_response_classification, provider_output_from_text_and_tools,
-    provider_request_has_vision, qa_mock_provider_output_for_turn,
-    qa_mock_provider_turn_for_request, retry_provider_classification,
-    retryable_invalid_response_classification, user_action_provider_classification,
-    ANTHROPIC_API_VERSION, OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
+    classify_transport_provider_failure, fail_closed_provider_classification,
+    failover_provider_classification, invalid_response_classification,
+    provider_output_from_text_and_tools, provider_request_has_vision,
+    qa_mock_provider_output_for_attempt, qa_mock_provider_turn_for_request,
+    retry_provider_classification, retryable_invalid_response_classification,
+    user_action_provider_classification, ANTHROPIC_API_VERSION, MAX_QA_MOCK_PROVIDER_ATTEMPTS,
+    MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS, MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
+    OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -100,6 +101,9 @@ pub use palyra_model_providers::{
     ProviderStreamSegment, ToolProposalCandidate, ToolRepairAuditEvent, ToolRepairBoundary,
     ToolRepairBoundaryState, ToolRepairCandidate, ToolRepairCandidateFormat, ToolRepairDecision,
     ToolRepairDecisionStatus, ToolRepairStreamNormalizer, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+};
+use palyra_model_providers::{
+    parse_qa_mock_provider_fixture_yaml, qa_mock::MIN_QA_MOCK_PROVIDER_ATTEMPTS,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -867,6 +871,26 @@ fn provider_attempt_skipped_state(
     }
 }
 
+fn rebind_provider_attempts(
+    attempts: &mut [ProviderAttemptSummary],
+    attempt_offset: usize,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+) {
+    let credential_id = registry_provider_credential_id(&runtime.entry);
+    for (local_index, attempt) in attempts.iter_mut().enumerate() {
+        attempt.provider_id = model.provider_id.clone();
+        attempt.model_id = model.model_id.clone();
+        if let Some(state) = attempt.state.as_mut() {
+            state.attempt_index =
+                provider_attempt_index(attempt_offset.saturating_add(local_index));
+            state.provider_profile_id = model.provider_id.clone();
+            state.credential_id.clone_from(&credential_id);
+            state.model_id = model.model_id.clone();
+        }
+    }
+}
+
 fn provider_attempt_error_disposition(failure: &ProviderFailureSnapshot) -> &'static str {
     match failure.recovery.category.as_str() {
         "auth" => "credential_refresh_required",
@@ -1431,6 +1455,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                     self.lookup_cached_response(cache_key.as_str(), model, runtime)
                 {
                     cached.failover_count = failover_count;
+                    rebind_provider_attempts(&mut cached.attempts, attempts.len(), model, runtime);
                     cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
                     self.record_runtime_metrics(
                         false,
@@ -1452,17 +1477,42 @@ impl ModelProvider for RegistryBackedModelProvider {
                         response.served_from_cache = false;
                         response.failover_count = failover_count;
                         let outcome = if index == 0 { "success" } else { "failover_success" };
-                        attempts.push(provider_attempt_summary(
-                            model.provider_id.clone(),
-                            model.model_id.clone(),
-                            outcome,
-                            false,
-                            false,
-                            (index > 0).then(|| "failover_success".to_owned()),
-                            Some(provider_attempt_success_state(
-                                index, model, runtime, &response, outcome, false,
-                            )),
-                        ));
+                        let mut provider_attempts = std::mem::take(&mut response.attempts);
+                        if provider_attempts.len() > 1 {
+                            let attempt_offset = attempts.len();
+                            rebind_provider_attempts(
+                                &mut provider_attempts,
+                                attempt_offset,
+                                model,
+                                runtime,
+                            );
+                            let final_attempt_index = attempt_offset
+                                .saturating_add(provider_attempts.len())
+                                .saturating_sub(1);
+                            if let Some(final_attempt) = provider_attempts.last_mut() {
+                                final_attempt.outcome = outcome.to_owned();
+                                final_attempt.reason_code =
+                                    (index > 0).then(|| "failover_success".to_owned());
+                                let mut state = provider_attempt_success_state(
+                                    index, model, runtime, &response, outcome, false,
+                                );
+                                state.attempt_index = provider_attempt_index(final_attempt_index);
+                                final_attempt.state = Some(state);
+                            }
+                            attempts.extend(provider_attempts);
+                        } else {
+                            attempts.push(provider_attempt_summary(
+                                model.provider_id.clone(),
+                                model.model_id.clone(),
+                                outcome,
+                                false,
+                                false,
+                                (index > 0).then(|| "failover_success".to_owned()),
+                                Some(provider_attempt_success_state(
+                                    index, model, runtime, &response, outcome, false,
+                                )),
+                            ));
+                        }
                         response.attempts = attempts;
                         self.insert_cached_response(cache_key, &response);
                         self.record_runtime_metrics(
@@ -2075,6 +2125,240 @@ fn load_qa_mock_provider_fixture(
         .map(Some)
 }
 
+struct QaMockProviderExecution {
+    output: ProviderTurnOutput,
+    retry_count: u32,
+    attempts: Vec<ProviderAttemptSummary>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QaMockProviderExecutionPolicy {
+    request_timeout: Duration,
+    max_retries: u32,
+    retry_backoff_ms: u64,
+}
+
+impl QaMockProviderExecutionPolicy {
+    fn from_config(config: &ModelProviderConfig) -> Self {
+        Self {
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
+            max_retries: config.max_retries,
+            retry_backoff_ms: config.retry_backoff_ms,
+        }
+    }
+
+    fn backoff_for_retry(self, retry_index: u32) -> Duration {
+        let exponent = retry_index.min(8);
+        let multiplier = 1_u64 << exponent;
+        Duration::from_millis(self.retry_backoff_ms.saturating_mul(multiplier))
+    }
+}
+
+async fn execute_qa_mock_provider_turn(
+    turn: &palyra_model_providers::QaMockProviderTurn,
+    request: &ProviderRequest,
+    model_id: &str,
+    config: &ModelProviderConfig,
+) -> Result<QaMockProviderExecution, ProviderError> {
+    validate_qa_mock_provider_attempt_bounds(turn)?;
+    let policy = QaMockProviderExecutionPolicy::from_config(config);
+    let attempt_count = turn.attempt_count();
+    let mut attempts = Vec::with_capacity(attempt_count);
+    let provider_id = "deterministic-primary";
+    let credential_id = normalized_provider_credential_id(
+        provider_id,
+        config.auth_profile_id.as_deref(),
+        config.credential_source,
+    );
+
+    for attempt_index in 0..attempt_count {
+        let retry_count = u32::try_from(attempt_index).unwrap_or(u32::MAX);
+        let latency_ms = turn.attempt_latency_ms(attempt_index).ok_or_else(|| {
+            qa_mock_provider_plan_error(retry_count, "attempt latency is unavailable")
+        })?;
+        let attempt_result = tokio::time::timeout(policy.request_timeout, async {
+            if latency_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(latency_ms)).await;
+            }
+            qa_mock_provider_output_for_attempt(
+                turn,
+                attempt_index,
+                request,
+                Some(model_id.to_owned()),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| Err(qa_mock_provider_timeout_error(retry_count)));
+
+        match attempt_result {
+            Ok(output) => {
+                let state = qa_mock_provider_success_state(
+                    attempt_index,
+                    provider_id,
+                    credential_id.as_str(),
+                    model_id,
+                    &output,
+                );
+                attempts.push(provider_attempt_summary(
+                    provider_id.to_owned(),
+                    model_id.to_owned(),
+                    "success",
+                    false,
+                    false,
+                    None,
+                    Some(state),
+                ));
+                return Ok(QaMockProviderExecution { output, retry_count, attempts });
+            }
+            Err(error) => {
+                let classification = error.classification();
+                let retryable = classification.recommended_action == ProviderFailureAction::Retry;
+                let reason_code = classification
+                    .provider_detail
+                    .clone()
+                    .or_else(|| Some(classification.class.as_str().to_owned()));
+                let state = qa_mock_provider_error_state(
+                    attempt_index,
+                    provider_id,
+                    credential_id.as_str(),
+                    model_id,
+                    &error,
+                    current_unix_ms().unwrap_or_default(),
+                );
+                attempts.push(provider_attempt_summary(
+                    provider_id.to_owned(),
+                    model_id.to_owned(),
+                    "error",
+                    retryable,
+                    false,
+                    reason_code,
+                    Some(state),
+                ));
+                let has_followup = attempt_index.saturating_add(1) < attempt_count;
+                if retryable && has_followup && retry_count < policy.max_retries {
+                    tokio::time::sleep(policy.backoff_for_retry(retry_count)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err(qa_mock_provider_plan_error(
+        u32::try_from(attempt_count).unwrap_or(u32::MAX),
+        "attempt sequence completed without a terminal result",
+    ))
+}
+
+fn validate_qa_mock_provider_attempt_bounds(
+    turn: &palyra_model_providers::QaMockProviderTurn,
+) -> Result<(), ProviderError> {
+    let attempt_count = turn.attempt_count();
+    if turn.has_explicit_attempt_sequence() && attempt_count < MIN_QA_MOCK_PROVIDER_ATTEMPTS {
+        return Err(qa_mock_provider_plan_error(
+            0,
+            "explicit attempt sequence is shorter than the supported minimum",
+        ));
+    }
+    if attempt_count == 0 || attempt_count > MAX_QA_MOCK_PROVIDER_ATTEMPTS {
+        return Err(qa_mock_provider_plan_error(0, "attempt count exceeds the supported bound"));
+    }
+
+    let mut total_latency_ms = 0_u64;
+    for attempt_index in 0..attempt_count {
+        let latency_ms = turn
+            .attempt_latency_ms(attempt_index)
+            .ok_or_else(|| qa_mock_provider_plan_error(0, "attempt latency is unavailable"))?;
+        if latency_ms > MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS {
+            return Err(qa_mock_provider_plan_error(
+                0,
+                "attempt latency exceeds the supported bound",
+            ));
+        }
+        total_latency_ms = total_latency_ms
+            .checked_add(latency_ms)
+            .ok_or_else(|| qa_mock_provider_plan_error(0, "attempt latency total overflowed"))?;
+    }
+    if total_latency_ms > MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS {
+        return Err(qa_mock_provider_plan_error(
+            0,
+            "attempt latency total exceeds the supported bound",
+        ));
+    }
+    Ok(())
+}
+
+fn qa_mock_provider_plan_error(retry_count: u32, reason: &str) -> ProviderError {
+    ProviderError::InvalidResponse {
+        message: format!("QA mock-provider fixture has an invalid attempt plan: {reason}"),
+        retry_count,
+        classification: invalid_response_classification("qa_mock_invalid_attempt_plan"),
+    }
+}
+
+fn qa_mock_provider_timeout_error(retry_count: u32) -> ProviderError {
+    ProviderError::RequestFailed {
+        message: "QA mock-provider fixture attempt exceeded the configured request timeout"
+            .to_owned(),
+        retryable: true,
+        retry_count,
+        classification: classify_transport_provider_failure("qa_mock_fixture_attempt", true),
+    }
+}
+
+fn qa_mock_provider_success_state(
+    attempt_index: usize,
+    provider_id: &str,
+    credential_id: &str,
+    model_id: &str,
+    output: &ProviderTurnOutput,
+) -> ProviderAttemptState {
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: provider_id.to_owned(),
+        credential_id: credential_id.to_owned(),
+        model_id: model_id.to_owned(),
+        error_class: None,
+        retry_after_ms: None,
+        cooldown_until_unix_ms: None,
+        prompt_tokens: output.usage.prompt_tokens,
+        output_tokens: output.usage.completion_tokens,
+        cache_tokens: 0,
+        estimated_cost_microusd: None,
+        final_disposition: "success".to_owned(),
+        repair_hint: None,
+    }
+}
+
+fn qa_mock_provider_error_state(
+    attempt_index: usize,
+    provider_id: &str,
+    credential_id: &str,
+    model_id: &str,
+    error: &ProviderError,
+    observed_at_unix_ms: i64,
+) -> ProviderAttemptState {
+    let failure = error.failure_snapshot();
+    let retry_after_ms = failure.recovery.retry_after_ms;
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: provider_id.to_owned(),
+        credential_id: credential_id.to_owned(),
+        model_id: model_id.to_owned(),
+        error_class: Some(failure.class.as_str().to_owned()),
+        retry_after_ms,
+        cooldown_until_unix_ms: retry_after_ms.map(|value| {
+            observed_at_unix_ms.saturating_add(i64::try_from(value).unwrap_or(i64::MAX))
+        }),
+        prompt_tokens: 0,
+        output_tokens: 0,
+        cache_tokens: 0,
+        estimated_cost_microusd: None,
+        final_disposition: provider_attempt_error_disposition(&failure).to_owned(),
+        repair_hint: provider_attempt_repair_hint(&failure),
+    }
+}
+
 // Scripted three-turn tool-call fixture for offline regression: turn 1
 // proposes a workspace patch write, turn 2 (after the write result) proposes
 // a read-back, turn 3 (after the read result) emits the final text. The turn
@@ -2285,7 +2569,11 @@ impl ModelProvider for DeterministicProvider {
             }
 
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
-            let output = if let Some(fixture) = self.qa_mock_fixture.as_ref() {
+            let actual_model_id =
+                request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
+            let (output, retry_count, attempts) = if let Some(fixture) =
+                self.qa_mock_fixture.as_ref()
+            {
                 let Some(turn) = qa_mock_provider_turn_for_request(fixture, &request) else {
                     let error = ProviderError::RequestFailed {
                         message: format!(
@@ -2308,12 +2596,15 @@ impl ModelProvider for DeterministicProvider {
                     );
                     return Err(error);
                 };
-                match qa_mock_provider_output_for_turn(
+                match execute_qa_mock_provider_turn(
                     turn,
                     &request,
-                    request.model_override.clone(),
-                ) {
-                    Ok(output) => output,
+                    actual_model_id.as_str(),
+                    &self.config,
+                )
+                .await
+                {
+                    Ok(execution) => (execution.output, execution.retry_count, execution.attempts),
                     Err(error) => {
                         self.record_runtime_metrics(
                             true,
@@ -2327,41 +2618,50 @@ impl ModelProvider for DeterministicProvider {
                     }
                 }
             } else {
-                deterministic_tool_fixture_output(&request, prompt_tokens).unwrap_or_else(|| {
-                    let completion_source = if request.json_mode {
-                        r#"{"ack":"ok"}"#.to_owned()
-                    } else if let Some(user_visible_input_text) = request
-                        .user_visible_input_text
-                        .as_ref()
-                        .filter(|value| !value.trim().is_empty())
-                    {
-                        user_visible_input_text.clone()
-                    } else {
-                        request.input_text.clone()
-                    };
-
-                    deterministic_text_output(
-                        if completion_source.trim().is_empty() {
-                            "ack".to_owned()
+                let output = deterministic_tool_fixture_output(&request, prompt_tokens)
+                    .unwrap_or_else(|| {
+                        let completion_source = if request.json_mode {
+                            r#"{"ack":"ok"}"#.to_owned()
+                        } else if let Some(user_visible_input_text) = request
+                            .user_visible_input_text
+                            .as_ref()
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            user_visible_input_text.clone()
                         } else {
-                            completion_source
-                        },
-                        prompt_tokens,
-                        request.model_override.clone(),
-                        "deterministic",
-                    )
-                })
+                            request.input_text.clone()
+                        };
+
+                        deterministic_text_output(
+                            if completion_source.trim().is_empty() {
+                                "ack".to_owned()
+                            } else {
+                                completion_source
+                            },
+                            prompt_tokens,
+                            request.model_override.clone(),
+                            "deterministic",
+                        )
+                    });
+                let attempts = vec![provider_attempt_summary(
+                    "deterministic-primary".to_owned(),
+                    actual_model_id.clone(),
+                    "success",
+                    false,
+                    false,
+                    None,
+                    None,
+                )];
+                (output, 0, attempts)
             };
             let prompt_tokens = output.usage.prompt_tokens;
             let completion_tokens = output.usage.completion_tokens;
             let events = provider_events_from_output(&output);
-            let actual_model_id =
-                request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
             self.record_runtime_metrics(
                 false,
                 prompt_tokens,
                 completion_tokens,
-                0,
+                retry_count,
                 elapsed_millis_since(started_at),
                 None,
             );
@@ -2370,20 +2670,12 @@ impl ModelProvider for DeterministicProvider {
                 events,
                 prompt_tokens,
                 completion_tokens,
-                retry_count: 0,
+                retry_count,
                 provider_id: "deterministic-primary".to_owned(),
-                model_id: actual_model_id.clone(),
+                model_id: actual_model_id,
                 served_from_cache: false,
                 failover_count: 0,
-                attempts: vec![ProviderAttemptSummary {
-                    provider_id: "deterministic-primary".to_owned(),
-                    model_id: actual_model_id,
-                    outcome: "success".to_owned(),
-                    retryable: false,
-                    served_from_cache: false,
-                    reason_code: None,
-                    state: None,
-                }],
+                attempts,
             })
         })
     }
@@ -5175,6 +5467,7 @@ fn extract_completion_text(content: Option<Value>) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{BufRead, BufReader, Read, Write},
         net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream},
         path::PathBuf,
@@ -5189,8 +5482,9 @@ mod tests {
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
-        provider_seconds_to_millis, run_provider_failover_self_check, sanitize_remote_error,
-        validate_openai_base_url_network_policy_with_resolver, AnthropicCompatibleChatAdapter,
+        provider_attempt_index, provider_seconds_to_millis, run_provider_failover_self_check,
+        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
+        validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
         AnthropicProvider, EmbeddingsRequest, ModelProvider, ModelProviderAuthProviderKind,
         ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
         ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, OpenAiCompatibleProvider,
@@ -5206,7 +5500,9 @@ mod tests {
         FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID, OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use palyra_model_providers::classify_transport_provider_failure;
+    use palyra_model_providers::{
+        classify_transport_provider_failure, parse_qa_mock_provider_fixture_yaml,
+    };
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5219,6 +5515,10 @@ mod tests {
 
     fn qa_mock_fixture_path() -> PathBuf {
         repo_root().join("qa").join("fixtures").join("provider_basic.yaml")
+    }
+
+    fn qa_mock_retry_fixture_path() -> PathBuf {
+        repo_root().join("qa").join("fixtures").join("provider_retry_recovery.yaml")
     }
 
     #[test]
@@ -5994,6 +6294,96 @@ mod tests {
         }
     }
 
+    fn deterministic_fixture_failover_config(openai_base_url: String) -> ModelProviderConfig {
+        ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_base_url: openai_base_url.clone(),
+            allow_private_base_url: true,
+            openai_model: "gpt-4o-mini".to_owned(),
+            openai_api_key: Some("sk-openai-test".to_owned()),
+            qa_mock_fixture_path: Some(qa_mock_retry_fixture_path()),
+            qa_mock_fixture_enabled: true,
+            registry: ModelProviderRegistryConfig {
+                providers: vec![
+                    ProviderRegistryEntryConfig {
+                        provider_id: "openai-primary".to_owned(),
+                        display_name: Some("OpenAI".to_owned()),
+                        kind: ModelProviderKind::OpenAiCompatible,
+                        base_url: Some(openai_base_url),
+                        allow_private_base_url: true,
+                        enabled: true,
+                        auth_profile_id: None,
+                        auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openai),
+                        api_key: Some("sk-openai-test".to_owned()),
+                        api_key_secret_ref: None,
+                        api_key_vault_ref: None,
+                        credential_source: None,
+                        request_timeout_ms: 5_000,
+                        max_retries: 0,
+                        retry_backoff_ms: 1,
+                        circuit_breaker_failure_threshold: 1,
+                        circuit_breaker_cooldown_ms: 60_000,
+                    },
+                    ProviderRegistryEntryConfig {
+                        provider_id: "deterministic-fallback".to_owned(),
+                        display_name: Some("Deterministic fixture".to_owned()),
+                        kind: ModelProviderKind::Deterministic,
+                        base_url: None,
+                        allow_private_base_url: false,
+                        enabled: true,
+                        auth_profile_id: None,
+                        auth_profile_provider_kind: None,
+                        api_key: None,
+                        api_key_secret_ref: None,
+                        api_key_vault_ref: None,
+                        credential_source: None,
+                        request_timeout_ms: 5_000,
+                        max_retries: 2,
+                        retry_backoff_ms: 1,
+                        circuit_breaker_failure_threshold: 1,
+                        circuit_breaker_cooldown_ms: 60_000,
+                    },
+                ],
+                models: vec![
+                    ProviderModelEntryConfig {
+                        model_id: "gpt-4o-mini".to_owned(),
+                        provider_id: "openai-primary".to_owned(),
+                        role: ProviderModelRole::Chat,
+                        enabled: true,
+                        metadata_source: ProviderMetadataSource::Static,
+                        operator_override: false,
+                        capabilities: capability_defaults_for_kind(
+                            ModelProviderKind::OpenAiCompatible,
+                            ProviderModelRole::Chat,
+                        ),
+                    },
+                    ProviderModelEntryConfig {
+                        model_id: "deterministic-fixture".to_owned(),
+                        provider_id: "deterministic-fallback".to_owned(),
+                        role: ProviderModelRole::Chat,
+                        enabled: true,
+                        metadata_source: ProviderMetadataSource::Static,
+                        operator_override: false,
+                        capabilities: capability_defaults_for_kind(
+                            ModelProviderKind::Deterministic,
+                            ProviderModelRole::Chat,
+                        ),
+                    },
+                ],
+                default_chat_model_id: Some("gpt-4o-mini".to_owned()),
+                failover_enabled: true,
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            request_timeout_ms: 5_000,
+            max_retries: 0,
+            retry_backoff_ms: 1,
+            circuit_breaker_failure_threshold: 1,
+            circuit_breaker_cooldown_ms: 60_000,
+            ..ModelProviderConfig::default()
+        }
+    }
+
     fn tool_catalog_response_cache_fixture(
         created_at_unix_ms: i64,
         snapshot_id: &str,
@@ -6208,6 +6598,266 @@ mod tests {
             .expect_err("malformed fixture turn should fail");
         assert!(matches!(error, ProviderError::InvalidResponse { .. }));
         assert_eq!(error.classification().class, ProviderFailureClass::MalformedResponse);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_provider_retries_fixture_failures_and_preserves_attempt_evidence() {
+        let provider = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(qa_mock_retry_fixture_path()),
+            request_timeout_ms: 5_000,
+            max_retries: 2,
+            retry_backoff_ms: 40,
+            registry: ModelProviderRegistryConfig {
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        })
+        .expect("QA retry fixture provider should build when enabled");
+
+        let started_at = Instant::now();
+        let text_response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Recover a streamed answer".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("retryable malformed response should recover into text");
+
+        assert_eq!(
+            text_response.output.full_text,
+            "Recovered after a retryable malformed response."
+        );
+        assert_eq!(text_response.retry_count, 1);
+        assert_eq!(text_response.attempts.len(), 2);
+        assert_eq!(text_response.attempts[0].outcome, "error");
+        assert!(text_response.attempts[0].retryable);
+        assert_eq!(
+            text_response.attempts[0].reason_code.as_deref(),
+            Some("qa_mock_malformed_output")
+        );
+        assert_eq!(text_response.attempts[1].outcome, "success");
+        for (attempt_index, attempt) in text_response.attempts.iter().enumerate() {
+            let state = attempt.state.as_ref().expect("fixture attempt should expose state");
+            assert_eq!(state.attempt_index, provider_attempt_index(attempt_index));
+            assert_eq!(state.provider_profile_id, "deterministic-primary");
+            assert_eq!(state.model_id, "deterministic");
+            assert!(!state.credential_id.is_empty());
+        }
+        let error_state = text_response.attempts[0]
+            .state
+            .as_ref()
+            .expect("failed fixture attempt should expose state");
+        assert_eq!(error_state.error_class.as_deref(), Some("malformed_response"));
+        let success_state = text_response.attempts[1]
+            .state
+            .as_ref()
+            .expect("successful fixture attempt should expose state");
+        assert_eq!(success_state.prompt_tokens, text_response.prompt_tokens);
+        assert_eq!(success_state.output_tokens, text_response.completion_tokens);
+        assert_eq!(success_state.final_disposition, "success");
+        assert!(text_response
+            .events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ModelToken { token, .. } if token.contains("Recovered"))));
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(60),
+            "configured attempt latencies and retry backoff should precede completion"
+        );
+
+        let tool_response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Recover with a tool call".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("retryable malformed response should recover into a tool call");
+
+        assert_eq!(tool_response.retry_count, 1);
+        assert_eq!(tool_response.attempts.len(), 2);
+        assert!(tool_response.attempts[0].retryable);
+        assert_eq!(
+            tool_response.attempts[0].reason_code.as_deref(),
+            Some("qa_mock_malformed_output")
+        );
+        assert!(matches!(
+            tool_response.events.last(),
+            Some(ProviderEvent::ToolProposal { proposal_id, tool_name, .. })
+                if proposal_id == "qa-recovered-read" && tool_name == "palyra.fs.read_file"
+        ));
+
+        let snapshot = provider.status_snapshot();
+        assert_eq!(snapshot.runtime_metrics.request_count, 2);
+        assert_eq!(snapshot.runtime_metrics.error_count, 0);
+        assert_eq!(snapshot.runtime_metrics.total_retry_attempts, 2);
+        assert!(snapshot.runtime_metrics.max_latency_ms >= 20);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_fixture_respects_zero_retry_budget() {
+        let provider = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(qa_mock_retry_fixture_path()),
+            max_retries: 0,
+            retry_backoff_ms: 1,
+            registry: ModelProviderRegistryConfig {
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        })
+        .expect("QA retry fixture provider should build when enabled");
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text(
+                "Recover a streamed answer".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect_err("zero retry budget must stop after the first fixture failure");
+
+        assert_eq!(error.retry_count(), 0);
+        assert_eq!(error.classification().class, ProviderFailureClass::MalformedResponse);
+        let snapshot = provider.status_snapshot();
+        assert_eq!(snapshot.runtime_metrics.request_count, 1);
+        assert_eq!(snapshot.runtime_metrics.error_count, 1);
+        assert_eq!(snapshot.runtime_metrics.total_retry_attempts, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_fixture_stops_when_retry_budget_is_exhausted() {
+        let mut fixture_file =
+            tempfile::NamedTempFile::new().expect("temporary QA fixture file should be created");
+        fixture_file
+            .write_all(
+                br#"schema_version: 1
+id: qa.mock.provider.exhausted-retries
+turns:
+  - id: exhaust
+    match:
+      prompt_contains: [exhaust fixture retries]
+    attempts:
+      - { kind: malformed_output, error_message: first failure }
+      - { kind: stream_error, error_message: second failure }
+      - { kind: text, text: unreachable success }
+"#,
+            )
+            .expect("temporary QA fixture should be written");
+        let provider = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(fixture_file.path().to_path_buf()),
+            max_retries: 1,
+            retry_backoff_ms: 1,
+            registry: ModelProviderRegistryConfig {
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        })
+        .expect("bounded retry fixture should build");
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text(
+                "Exhaust fixture retries".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect_err("the third fixture attempt must remain outside a one-retry budget");
+
+        assert_eq!(error.retry_count(), 1);
+        assert_eq!(error.classification().provider_detail.as_deref(), Some("qa_mock_stream_error"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_fixture_applies_timeout_to_each_attempt() {
+        let mut fixture_file =
+            tempfile::NamedTempFile::new().expect("temporary QA fixture file should be created");
+        fixture_file
+            .write_all(
+                br#"schema_version: 1
+id: qa.mock.provider.attempt-timeout
+turns:
+  - id: recover
+    match:
+      prompt_contains: [recover after attempt timeout]
+    attempts:
+      - { kind: malformed_output, error_message: must time out, latency_ms: 100 }
+      - { kind: text, text: recovered after timeout, latency_ms: 1 }
+"#,
+            )
+            .expect("temporary QA fixture should be written");
+        let provider = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(fixture_file.path().to_path_buf()),
+            request_timeout_ms: 10,
+            max_retries: 1,
+            retry_backoff_ms: 1,
+            registry: ModelProviderRegistryConfig {
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        })
+        .expect("QA retry fixture provider should build when enabled");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Recover after attempt timeout".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("second attempt should complete inside its request timeout");
+
+        assert_eq!(response.retry_count, 1);
+        assert_eq!(response.attempts.len(), 2);
+        assert_eq!(
+            response.attempts[0].reason_code.as_deref(),
+            Some("qa_mock_fixture_attempt:timeout")
+        );
+        let timeout_state = response.attempts[0]
+            .state
+            .as_ref()
+            .expect("timed-out fixture attempt should expose state");
+        assert_eq!(timeout_state.error_class.as_deref(), Some("provider_timeout"));
+        assert_eq!(response.attempts[1].outcome, "success");
+    }
+
+    #[test]
+    fn deterministic_fixture_rejects_direct_one_attempt_sequence() {
+        let fixture = parse_qa_mock_provider_fixture_yaml(
+            fs::read_to_string(qa_mock_retry_fixture_path())
+                .expect("retry fixture should be readable")
+                .as_str(),
+        )
+        .expect("retry fixture should parse");
+        let fixture_turn = fixture.turns.first().expect("retry fixture should contain a turn");
+        let behavior = fixture_turn.behavior.clone();
+        let direct_turn = palyra_model_providers::QaMockProviderTurn {
+            id: "direct-one-attempt".to_owned(),
+            matcher: fixture_turn.matcher.clone(),
+            behavior: behavior.clone(),
+            attempts: vec![behavior],
+        };
+
+        let error = validate_qa_mock_provider_attempt_bounds(&direct_turn)
+            .expect_err("direct one-attempt sequence should fail defensively");
+
+        assert_eq!(
+            error.classification().provider_detail.as_deref(),
+            Some("qa_mock_invalid_attempt_plan")
+        );
+        assert!(error.failure_snapshot().message.contains("shorter than the supported minimum"));
     }
 
     #[test]
@@ -6678,6 +7328,53 @@ mod tests {
 
         openai_handle.join().expect("openai scripted server thread should exit");
         anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_rebinds_and_offsets_all_fixture_retry_states_after_failover() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            503_u16,
+            r#"{"error":{"message":"temporary upstream error"}}"#.to_owned(),
+        )]);
+        let provider =
+            build_model_provider(&deterministic_fixture_failover_config(openai_base_url))
+                .expect("fixture failover provider should build");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Recover a streamed answer".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("deterministic fallback should recover after its fixture retry");
+
+        assert_eq!(response.provider_id, "deterministic-fallback");
+        assert_eq!(response.model_id, "deterministic-fixture");
+        assert_eq!(response.failover_count, 1);
+        assert_eq!(response.retry_count, 1);
+        assert_eq!(response.attempts.len(), 3);
+        assert_eq!(response.attempts[0].provider_id, "openai-primary");
+        for (attempt_index, attempt) in response.attempts[1..].iter().enumerate() {
+            let expected_index = provider_attempt_index(attempt_index.saturating_add(1));
+            let state = attempt.state.as_ref().expect("fixture retry should expose state");
+            assert_eq!(attempt.provider_id, "deterministic-fallback");
+            assert_eq!(attempt.model_id, "deterministic-fixture");
+            assert_eq!(state.attempt_index, expected_index);
+            assert_eq!(state.provider_profile_id, "deterministic-fallback");
+            assert_eq!(state.model_id, "deterministic-fixture");
+            assert!(!state.credential_id.is_empty());
+        }
+        assert_eq!(response.attempts[1].outcome, "error");
+        assert_eq!(response.attempts[2].outcome, "failover_success");
+        assert_eq!(
+            response.attempts[2].state.as_ref().map(|state| state.final_disposition.as_str()),
+            Some("failover_success")
+        );
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]

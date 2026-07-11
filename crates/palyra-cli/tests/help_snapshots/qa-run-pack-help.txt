@@ -1,4 +1,4 @@
-Run a local deterministic QA scenario pack
+Preview a deterministic QA pack from scenario schemas
 
 Usage: palyra qa run-pack [OPTIONS]
 

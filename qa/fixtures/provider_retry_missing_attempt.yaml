@@ -1,0 +1,16 @@
+# Negative QA fixture: returns the recovery text without the required failed
+# provider attempt so the real runtime scenario must reject missing evidence.
+schema_version: 1
+id: qa.mock.provider.retry-missing-attempt
+turns:
+  - id: final_text_without_retry
+    match:
+      prompt_contains:
+        - recover a malformed response without retry evidence
+    behavior:
+      kind: text
+      text: "Recovered after a retryable malformed response."
+      finish_reason: stop
+      prompt_tokens: 5
+      completion_tokens: 7
+      latency_ms: 1

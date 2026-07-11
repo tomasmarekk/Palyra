@@ -1,0 +1,37 @@
+schema_version: 1
+id: qa.mock.provider.retry-recovery
+turns:
+  - id: stream_then_text
+    match:
+      prompt_contains:
+        - recover a streamed answer
+    attempts:
+      - kind: malformed_output
+        error_message: "fixture emitted malformed provider output"
+        latency_ms: 12
+      - kind: text
+        deltas:
+          - "Recovered "
+          - "after a retryable malformed response."
+        finish_reason: stop
+        prompt_tokens: 5
+        completion_tokens: 7
+        latency_ms: 8
+  - id: malformed_then_tool
+    match:
+      prompt_contains:
+        - recover with a tool call
+    attempts:
+      - kind: malformed_output
+        error_message: "fixture emitted malformed provider output"
+        latency_ms: 1
+      - kind: tool_calls
+        tool_calls:
+          - proposal_id: qa-recovered-read
+            tool_name: palyra.fs.read_file
+            input_json:
+              path: qa/fixtures/provider_retry_recovery.yaml
+              max_bytes: 4096
+        prompt_tokens: 6
+        completion_tokens: 9
+        latency_ms: 1

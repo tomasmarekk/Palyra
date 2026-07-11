@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::errors::{ControlPlaneClientError, ErrorEnvelope};
 use crate::models::*;
+use crate::ndjson::{ControlPlaneNdjsonStream, NdjsonStreamLimits};
 use crate::transport::{fallback_error_message, urlencoding};
 
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
@@ -2643,6 +2644,55 @@ impl ControlPlaneClient {
             false,
         )
         .await
+    }
+
+    /// Opens a streaming NDJSON response from a relative control-plane POST endpoint.
+    ///
+    /// The request uses this client's cookie store and attaches its current CSRF
+    /// token. The endpoint must resolve to the configured base URL's origin;
+    /// absolute cross-origin URLs are rejected before any request is sent.
+    /// Values are read incrementally through
+    /// [`ControlPlaneNdjsonStream::next_value`] so callers can handle approval
+    /// events before the response closes.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError::InvalidBaseUrl`] when `path` cannot be
+    /// joined safely, [`ControlPlaneClientError::Transport`] when the POST
+    /// cannot be sent, [`ControlPlaneClientError::Http`] for a non-success
+    /// response, or [`ControlPlaneClientError::Decode`] when a bounded error
+    /// response body cannot be read.
+    pub async fn post_ndjson_stream<B>(
+        &self,
+        path: impl AsRef<str>,
+        body: &B,
+        limits: NdjsonStreamLimits,
+    ) -> Result<ControlPlaneNdjsonStream, ControlPlaneClientError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let relative = path.as_ref().trim_start_matches('/');
+        let url = self
+            .base_url
+            .join(relative)
+            .map_err(|error| ControlPlaneClientError::InvalidBaseUrl(error.to_string()))?;
+        if url.origin() != self.base_url.origin() {
+            return Err(ControlPlaneClientError::InvalidBaseUrl(
+                "stream endpoint must stay on the configured control-plane origin".to_owned(),
+            ));
+        }
+        let mut request = self
+            .client
+            .post(url)
+            .header(reqwest::header::ACCEPT, "application/x-ndjson")
+            .json(body);
+        if let Some(token) = self.csrf_token.as_deref() {
+            request = request.header("x-palyra-csrf-token", token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ControlPlaneClientError::Transport(error.to_string()))?;
+        ControlPlaneNdjsonStream::from_response(response, limits).await
     }
 
     /// Shared request path: joins `path` onto the base URL, attaches the CSRF

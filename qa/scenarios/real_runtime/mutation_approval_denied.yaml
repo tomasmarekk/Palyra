@@ -1,0 +1,75 @@
+# Verifies that a real mutating tool proposal reaches the production approval gate.
+# The explicit denial must be journaled and leave the copied workspace unchanged.
+schema_version: 2
+id: real_runtime.mutation_approval_denied
+title: Explicitly denied mutation through the real runtime
+area: approvals
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_approval_denied
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - approvals
+    - workspace_context
+  tools:
+    - palyra.fs.apply_patch
+  fixtures:
+    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Propose the QA mutation that must be denied."
+  - id: deny_mutation
+    action: approval_decision
+    proposal_id: qa-real-denied-patch
+    decision: deny
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "The requested mutation was denied; no file changed."
+  events:
+    - event_type: tool.call.started
+      min_count: 1
+    - event_type: approval.required
+      min_count: 1
+    - event_type: approval.resolved
+      min_count: 1
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.fs.apply_patch
+      min_count: 1
+      success: false
+forbidden:
+  tool_calls: []
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts:
+    - src/denied.txt
+  claims:
+    - mutation applied
+artifacts:
+  - path: qa/reports/real_runtime/mutation_approval_denied.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - real_runtime
+    - deterministic
+    - approval_denied
+timeout:
+  run_ms: 45000
+  step_ms: 15000

@@ -81,13 +81,13 @@ use crate::{
         classify_terminal_outcome, decide_tool_repair_candidate,
         normalize_assistant_output_for_tool_repair, provider_events_from_output,
         tool_repair_audit_events_for_decision, validate_canonical_provider_stream,
-        ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason, ProviderMessage,
-        ProviderMessageContentPart, ProviderMessageRole, ProviderOutputContentPart,
-        ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderRouteSelectionTrace,
-        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
-        ToolCallAssemblyPolicy, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
-        PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
-        TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
+        ProviderAttemptSummary, ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
+        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass,
+        TerminalOutcomeClassification, ToolCallAssemblyPolicy,
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
+        PROVIDER_RECOVERY_DECISION_EVENT, TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -120,6 +120,9 @@ use super::{
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
+const PROVIDER_RETRY_STARTED_EVENT: &str = "provider.retry.started";
+const PROVIDER_RETRY_EVIDENCE_TRUNCATED_EVENT: &str = "provider.retry.evidence_truncated";
+const MAX_PROVIDER_RETRY_EVIDENCE_EVENTS: usize = 16;
 const BEFORE_FINALIZE_EVENT: &str = "run.before_finalize";
 const HARNESS_TOOL_SURFACE_PROJECTION_EVENT: &str = "harness.tool_surface_projection";
 // Turns directly after browser tool results get a much shorter deadline than
@@ -3846,6 +3849,13 @@ async fn process_run_stream_provider_response(
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
     let provider_output = bounded_provider_turn_output_for_persistence(&provider_response.output);
     let terminal_outcome = classify_terminal_outcome(&provider_output);
+    persist_run_stream_provider_retry_evidence(
+        runtime_state,
+        run_id,
+        tape_seq,
+        provider_response.attempts.as_slice(),
+    )
+    .await?;
     // Turns with tool proposals stream their text immediately (it is progress
     // narration). Turns without tool proposals defer token emission: the text
     // is a candidate final answer that may still be rejected by the
@@ -5563,38 +5573,111 @@ async fn persist_run_stream_provider_turn_output(
     Ok(())
 }
 
+fn bounded_provider_retry_evidence(attempts: &[ProviderAttemptSummary]) -> (Vec<Value>, bool) {
+    let retryable_failures = attempts
+        .iter()
+        .enumerate()
+        .filter(|(_, attempt)| attempt.retryable && attempt.outcome == "error")
+        .collect::<Vec<_>>();
+    let truncated = retryable_failures.len() > MAX_PROVIDER_RETRY_EVIDENCE_EVENTS;
+    let evidence = retryable_failures
+        .into_iter()
+        .take(MAX_PROVIDER_RETRY_EVIDENCE_EVENTS)
+        .map(|(index, attempt)| {
+            let state = attempt.state.as_ref();
+            json!({
+                "schema_version": 1,
+                "attempt_index": state
+                    .map(|value| value.attempt_index)
+                    .unwrap_or_else(|| u32::try_from(index).unwrap_or(u32::MAX)),
+                "provider_profile_id": state
+                    .map(|value| value.provider_profile_id.as_str())
+                    .unwrap_or(attempt.provider_id.as_str()),
+                "model_id": state
+                    .map(|value| value.model_id.as_str())
+                    .unwrap_or(attempt.model_id.as_str()),
+                "reason_code": attempt.reason_code.as_deref().unwrap_or("provider.retry.unclassified"),
+                "error_class": state.and_then(|value| value.error_class.as_deref()),
+                "retry_after_ms": state.and_then(|value| value.retry_after_ms),
+                "final_disposition": state
+                    .map(|value| value.final_disposition.as_str())
+                    .unwrap_or("retry"),
+            })
+        })
+        .collect();
+    (evidence, truncated)
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_run_stream_provider_retry_evidence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    attempts: &[ProviderAttemptSummary],
+) -> Result<(), Status> {
+    let (evidence, truncated) = bounded_provider_retry_evidence(attempts);
+    for payload in evidence {
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            PROVIDER_RETRY_STARTED_EVENT,
+            payload.to_string(),
+        )
+        .await?;
+    }
+    if truncated {
+        // A marker preserves bounded storage without letting downstream QA
+        // mistake a partial retry history for a complete one.
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            PROVIDER_RETRY_EVIDENCE_TRUNCATED_EVENT,
+            json!({
+                "schema_version": 1,
+                "retained": MAX_PROVIDER_RETRY_EVIDENCE_EVENTS,
+            })
+            .to_string(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         active_run_steering_guidance, agent_loop_budget_exhausted_message,
         agent_loop_terminal_status_message, apply_background_budget_guard,
         background_budget_overrun_message, background_run_budget_tokens,
-        browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
-        configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
-        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
-        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
-        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-        incomplete_terminal_outcome_message, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
-        provider_error_partial_summary, provider_model_override_for_routing,
-        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
-        provider_request_timeout_message, provider_request_timeout_status,
-        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
-        provider_turn_anomaly_from_response_failure, provider_waiting_status_message,
-        repeated_tool_failure_signature, run_loop_phase_timeout_message,
-        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
-        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
-        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
-        run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
-        run_stream_harness_started_payload, run_stream_harness_terminal_event,
-        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
-        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        bounded_provider_retry_evidence, browser_followup_timeout_partial_summary,
+        canonical_events_from_provider_output, configured_run_stream_agent_harness_plugin_id,
+        contains_raw_provider_tool_call_markup, effective_provider_request_deadline,
+        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
+        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
+        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
+        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        phase_heartbeat_interval, provider_error_partial_summary,
+        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
+        provider_request_deadline_timeout, provider_request_timeout_message,
+        provider_request_timeout_status, provider_status_recovery_decision_payload,
+        provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
+        provider_waiting_status_message, repeated_tool_failure_signature,
+        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
+        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
+        run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
+        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
+        run_stream_harness_selection_payload, run_stream_harness_started_payload,
+        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
+        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
@@ -5612,10 +5695,10 @@ mod tests {
     use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
     use crate::journal::OrchestratorQueuedInputRecord;
     use crate::model_provider::{
-        ProviderFinishReason, ProviderMessage, ProviderMessageContentPart,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
-        ProviderRouteCandidateTrace, ProviderRouteSelectionTrace, ProviderTurnOutput,
-        ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+        ProviderAttemptState, ProviderAttemptSummary, ProviderFinishReason, ProviderMessage,
+        ProviderMessageContentPart, ProviderOutputContentPart, ProviderRawProviderRefs,
+        ProviderRequest, ProviderRouteCandidateTrace, ProviderRouteSelectionTrace,
+        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
     };
     use palyra_common::runtime_contracts::{
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
@@ -6780,6 +6863,44 @@ mod tests {
             .as_str()
             .expect("message should be a string")
             .contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn retry_evidence_is_bounded_and_contains_only_stable_attempt_metadata() {
+        let attempts = (0_u32..18)
+            .map(|attempt_index| ProviderAttemptSummary {
+                provider_id: "provider-a".to_owned(),
+                model_id: "model-a".to_owned(),
+                outcome: "error".to_owned(),
+                retryable: true,
+                served_from_cache: false,
+                reason_code: Some("qa_mock_malformed_output".to_owned()),
+                state: Some(ProviderAttemptState {
+                    attempt_index,
+                    provider_profile_id: "provider-a".to_owned(),
+                    credential_id: "credential-ref".to_owned(),
+                    model_id: "model-a".to_owned(),
+                    error_class: Some("malformed_response".to_owned()),
+                    retry_after_ms: None,
+                    cooldown_until_unix_ms: None,
+                    prompt_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_microusd: None,
+                    final_disposition: "retry".to_owned(),
+                    repair_hint: None,
+                }),
+            })
+            .collect::<Vec<_>>();
+
+        let (evidence, truncated) = bounded_provider_retry_evidence(attempts.as_slice());
+
+        assert!(truncated);
+        assert_eq!(evidence.len(), 16);
+        assert_eq!(evidence[0]["attempt_index"], 0);
+        assert_eq!(evidence[0]["reason_code"], "qa_mock_malformed_output");
+        assert_eq!(evidence[0]["error_class"], "malformed_response");
+        assert!(evidence[0].get("credential_id").is_none());
     }
 
     #[test]

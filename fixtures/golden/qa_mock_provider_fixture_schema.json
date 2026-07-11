@@ -11,6 +11,38 @@
   ],
   "encoding": "yaml",
   "examples_root": "qa/fixtures",
+  "execution_contract": {
+    "forms": {
+      "attempts": {
+        "max_attempts": 4,
+        "min_attempts": 2,
+        "mode": "bounded_retry_sequence",
+        "retryable_intermediate_behavior_kinds": [
+          "malformed_output",
+          "malformed_tool_args",
+          "stream_error"
+        ],
+        "success_capable_terminal_behavior_kinds": [
+          "text",
+          "tool_calls",
+          "empty",
+          "approval_required"
+        ]
+      },
+      "behavior": {
+        "backward_compatible": true,
+        "mode": "single_attempt"
+      }
+    },
+    "forms_mutually_exclusive": true,
+    "latency": {
+      "default_ms": 0,
+      "field": "latency_ms",
+      "max_per_attempt_ms": 5000,
+      "max_total_per_turn_ms": 10000,
+      "unit": "milliseconds"
+    }
+  },
   "finish_reasons": [
     "stop",
     "length",
@@ -21,6 +53,14 @@
     "unknown"
   ],
   "format": "palyra-qa-mock-provider-fixture",
+  "matcher_contract": {
+    "tool_result": {
+      "call_id_field": "tool_result_call_id",
+      "success_field": "tool_result_success",
+      "success_requires_call_id": true,
+      "unwrapped_json_defaults_to_success": true
+    }
+  },
   "path_convention": "jsonpath",
   "required_sections": [
     "schema_version",
