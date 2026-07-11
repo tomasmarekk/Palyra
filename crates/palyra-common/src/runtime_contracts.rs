@@ -12,6 +12,10 @@
 //! - Wire names, aliases, and serialized shapes are pinned by the runtime-contract
 //!   snapshot gate (`scripts/test/check-runtime-contract-snapshots.sh`): add aliases
 //!   instead of renaming canonical strings.
+mod error_taxonomy;
+
+pub use error_taxonomy::*;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, fmt};
@@ -19,7 +23,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v6";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v7";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,8 +125,9 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds agent hook, harness, and tool-result middleware contracts to the public runtime snapshot.",
+        "changelog_note": "Adds the strict runtime error taxonomy and binding invariant registry while preserving the existing public error envelopes.",
         "compatibility_policy": compatibility_policy_snapshot(),
+        "runtime_error_contract": runtime_error_contract_snapshot(),
         "public_runtime_events": public_runtime_event_taxonomy_snapshot(),
         "runtime_enums": [
             enum_contract_snapshot(

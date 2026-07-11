@@ -1232,6 +1232,8 @@ fn collect_console_feature_rollouts_diagnostics(
 /// Reports the shared runtime-roadmap contract catalog used by upcoming
 /// runtime-loop work.
 fn collect_console_runtime_roadmap_diagnostics() -> Value {
+    let runtime_error_contract =
+        crate::runtime_diagnostics::build_runtime_error_contract_diagnostics();
     let phase0_harness = match runtime_roadmap_phase0_harness_projection() {
         Ok(projection) => json!({
             "valid": true,
@@ -1285,6 +1287,9 @@ fn collect_console_runtime_roadmap_diagnostics() -> Value {
         "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
         "capabilities": runtime_roadmap_capability_catalog(),
         "boundary_taxonomy": runtime_boundary_event_taxonomy(),
+        "invariant_contract": runtime_error_contract["invariant_contract"].clone(),
+        "error_taxonomy": runtime_error_contract["error_taxonomy"].clone(),
+        "runtime_error_metadata_trace": runtime_error_contract["metadata_trace"].clone(),
         "host_authority": host_authority,
         "backend_runtime_fixtures": backend_runtime_fixtures,
         "phase0_harness": phase0_harness,

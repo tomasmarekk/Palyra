@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/runtime-error-envelope.v1.json",
+  "title": "Palyra runtime error envelope v1",
+  "description": "Strict, redacted runtime error metadata used for retry, recovery, diagnostics, and replay-safety decisions.",
+  "type": "object",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "class": {
+            "enum": ["tool_execution_unknown", "delivery_unknown"]
+          }
+        },
+        "required": ["class"]
+      },
+      "then": {
+        "properties": {
+          "side_effect_may_have_occurred": { "const": true }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "side_effect_may_have_occurred": { "const": true }
+        },
+        "required": ["side_effect_may_have_occurred"]
+      },
+      "then": {
+        "properties": {
+          "retryability": {
+            "not": { "enum": ["safe_same_request", "safe_after_backoff"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "output_emitted": { "const": true }
+        },
+        "required": ["output_emitted"]
+      },
+      "then": {
+        "properties": {
+          "retryability": {
+            "not": { "enum": ["safe_same_request", "safe_after_backoff"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "class": { "const": "approval_required" }
+        },
+        "required": ["class"]
+      },
+      "then": {
+        "properties": {
+          "retryability": { "const": "requires_approval" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "class": { "const": "cancelled" }
+        },
+        "required": ["class"]
+      },
+      "then": {
+        "properties": {
+          "retryability": { "const": "not_retryable" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "class": {
+            "enum": [
+              "invalid_request",
+              "policy_denied",
+              "auth_unavailable",
+              "provider_terminal",
+              "plugin_contract_violation",
+              "internal_invariant_violation"
+            ]
+          }
+        },
+        "required": ["class"]
+      },
+      "then": {
+        "properties": {
+          "retryability": {
+            "not": { "enum": ["safe_same_request", "safe_after_backoff"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "user_visibility": {
+            "enum": ["safe_message", "action_required"]
+          }
+        },
+        "required": ["user_visibility"]
+      },
+      "then": {
+        "properties": {
+          "safe_message": { "minLength": 1, "pattern": "\\S" }
+        }
+      }
+    }
+  ],
+  "required": [
+    "schema_version",
+    "class",
+    "reason_code",
+    "subsystem",
+    "phase",
+    "retryability",
+    "security_class",
+    "user_visibility",
+    "output_emitted",
+    "side_effect_may_have_occurred",
+    "safe_message",
+    "recovery_hint"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "class": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "policy_denied",
+        "approval_required",
+        "auth_unavailable",
+        "provider_retryable",
+        "provider_terminal",
+        "tool_execution_unknown",
+        "plugin_contract_violation",
+        "recovery_blocked",
+        "delivery_unknown",
+        "cancelled",
+        "internal_invariant_violation"
+      ]
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^(?!.*[./]{2})[a-z0-9][a-z0-9._/-]*[a-z0-9]$"
+    },
+    "subsystem": {
+      "type": "string",
+      "enum": [
+        "runtime_kernel",
+        "run_stream",
+        "control_plane",
+        "auth",
+        "provider",
+        "policy",
+        "approval",
+        "tool",
+        "plugin",
+        "recovery",
+        "delivery",
+        "background_queue",
+        "session",
+        "worker",
+        "mcp",
+        "browser"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "request_validation",
+        "admission",
+        "queueing",
+        "runtime_selection",
+        "context_assembly",
+        "provider_call",
+        "provider_recovery",
+        "provider_finalization",
+        "policy_evaluation",
+        "tool_validation",
+        "tool_gate",
+        "approval",
+        "tool_execution",
+        "result_projection",
+        "compaction",
+        "verification",
+        "recovery",
+        "delivery_intent",
+        "delivery_queue",
+        "delivery_send",
+        "delivery_acknowledgement",
+        "finalization",
+        "cancellation",
+        "plugin_negotiation",
+        "plugin_host_call_authorization",
+        "plugin_execution",
+        "internal"
+      ]
+    },
+    "retryability": {
+      "type": "string",
+      "enum": [
+        "not_retryable",
+        "safe_same_request",
+        "safe_after_backoff",
+        "requires_credential_refresh",
+        "requires_request_transform",
+        "requires_context_compaction",
+        "requires_provider_failover",
+        "requires_approval",
+        "requires_idempotency_guard",
+        "requires_operator_review"
+      ]
+    },
+    "security_class": {
+      "type": "string",
+      "enum": ["public", "operator", "internal", "sensitive"]
+    },
+    "user_visibility": {
+      "type": "string",
+      "enum": ["silent", "status_only", "safe_message", "action_required"]
+    },
+    "output_emitted": {
+      "type": "boolean"
+    },
+    "side_effect_may_have_occurred": {
+      "type": "boolean"
+    },
+    "safe_message": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "recovery_hint": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "maxLength": 512
+    }
+  }
+}

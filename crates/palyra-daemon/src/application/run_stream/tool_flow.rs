@@ -3221,8 +3221,9 @@ mod tests {
     use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
     use palyra_common::runtime_contracts::{
-        ArtifactRetentionPolicy, ToolResultArtifactRef, ToolResultProjectionPolicyKind,
-        ToolResultSensitivity, ToolTurnBudget,
+        project_legacy_runtime_error, ArtifactRetentionPolicy, RuntimeErrorClass,
+        RuntimeErrorObservation, RuntimeRetryability, ToolResultArtifactRef,
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
     };
     use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
@@ -3336,6 +3337,19 @@ mod tests {
         assert!(!report.provider_retry_allowed);
         assert!(report.explicit_guard_required);
         assert_eq!(report.reason_code, "tool_replay.mutating_timeout_requires_guard");
+        let runtime_error = project_legacy_runtime_error(
+            report.reason_code.as_str(),
+            RuntimeErrorObservation {
+                output_emitted: false,
+                side_effect_may_have_occurred: report.explicit_guard_required,
+            },
+            "mutating tool outcome is unknown after timeout",
+            "reconcile the tool effect before an idempotency-guarded retry",
+        )
+        .expect("typed replay-safety report should project");
+        assert_eq!(runtime_error.class(), RuntimeErrorClass::ToolExecutionUnknown);
+        assert_eq!(runtime_error.retryability(), RuntimeRetryability::RequiresIdempotencyGuard);
+        assert!(runtime_error.side_effect_may_have_occurred());
     }
 
     #[test]

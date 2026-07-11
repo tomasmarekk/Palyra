@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "provider_body_and_bearer",
+      "safe_message": "raw provider body: {\"error\":\"Authorization: Bearer sk-runtime-secret\"}",
+      "recovery_hint": "inspect the classified provider failure without copying the raw body",
+      "forbidden": ["sk-runtime-secret", "Authorization: Bearer"]
+    },
+    {
+      "id": "tool_stderr_and_windows_path",
+      "safe_message": "stderr: process failed at C:\\Users\\operator\\private\\tool.log token=tool-secret",
+      "recovery_hint": "review stderr: C:\\Users\\operator\\private\\retry.log",
+      "forbidden": ["tool-secret", "C:\\\\Users", "operator\\\\private"]
+    },
+    {
+      "id": "url_query_credentials",
+      "safe_message": "request failed at https://provider.example/callback?access_token=url-secret&mode=retry",
+      "recovery_hint": "retry without refresh_token=refresh-secret",
+      "forbidden": ["url-secret", "refresh-secret"]
+    },
+    {
+      "id": "stack_trace_and_internal_run",
+      "safe_message": "stack backtrace:\n at runtime::dispatch C:\\work\\runtime.rs:42\nrun_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "recovery_hint": "inspect the bounded diagnostic summary",
+      "forbidden": ["stack backtrace", "runtime.rs", "01ARZ3NDEKTSV4RRFFQ69G5FAV"]
+    }
+  ]
+}

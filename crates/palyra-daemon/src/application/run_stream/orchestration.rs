@@ -20,7 +20,7 @@ use palyra_common::{
     runtime_contracts::{
         classify_agent_harness_terminal, AgentHarnessAttemptClassification,
         AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
-        AgentHarnessSelectionMode, QueuedInputState,
+        AgentHarnessSelectionMode, QueuedInputState, RuntimeTerminalOutcome,
     },
     runtime_preview::RuntimePreviewMode,
 };
@@ -2273,15 +2273,11 @@ async fn append_run_runtime_path_summary_tape_event_if_terminal(
     let Some(run_id) = run_id else {
         return Ok(());
     };
-    let terminal_reason = outcome
-        .as_ref()
-        .err()
-        .map(|error| format!("{:?}", error.code()))
-        .unwrap_or_else(|| "terminal_state".to_owned());
+    let terminal_reason = run_runtime_path_terminal_reason(terminal_state, outcome);
     let summary = crate::runtime_diagnostics::build_run_runtime_path_summary(
         &runtime_state.config.feature_rollouts,
         Some(terminal_state.as_str()),
-        Some(terminal_reason.as_str()),
+        Some(terminal_reason),
         attempt_owner,
     );
     let payload_json = serde_json::to_string(&summary).map_err(|error| {
@@ -2298,6 +2294,59 @@ async fn append_run_runtime_path_summary_tape_event_if_terminal(
         .await?;
     *tape_seq = tape_seq.saturating_add(1);
     Ok(())
+}
+
+fn run_runtime_path_terminal_reason(
+    terminal_state: RunLifecycleState,
+    outcome: &Result<RunStreamMessageProcessingOutcome, Status>,
+) -> &'static str {
+    match terminal_state {
+        RunLifecycleState::Done => RuntimeTerminalOutcome::Completed.reason_code(),
+        RunLifecycleState::Cancelled => RuntimeTerminalOutcome::Cancelled.reason_code(),
+        RunLifecycleState::Failed => match outcome {
+            Err(error) if error.code() == Code::DeadlineExceeded => {
+                RuntimeTerminalOutcome::TimedOut.reason_code()
+            }
+            Err(error) if error.code() != Code::Cancelled => {
+                run_stream_status_reason_code(error.code())
+            }
+            Ok(_) | Err(_) => RuntimeTerminalOutcome::Failed.reason_code(),
+        },
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => match outcome {
+            Err(error) if error.code() == Code::Cancelled => {
+                RuntimeTerminalOutcome::Cancelled.reason_code()
+            }
+            Err(error) if error.code() == Code::DeadlineExceeded => {
+                RuntimeTerminalOutcome::TimedOut.reason_code()
+            }
+            Err(error) => run_stream_status_reason_code(error.code()),
+            Ok(_) => "runtime.terminal.not_closed",
+        },
+    }
+}
+
+const fn run_stream_status_reason_code(code: Code) -> &'static str {
+    match code {
+        Code::Ok => "run_stream.status.ok",
+        Code::Cancelled => "run_stream.status.cancelled",
+        Code::Unknown => "run_stream.status.unknown",
+        Code::InvalidArgument => "run_stream.status.invalid_argument",
+        Code::DeadlineExceeded => "run_stream.status.deadline_exceeded",
+        Code::NotFound => "run_stream.status.not_found",
+        Code::AlreadyExists => "run_stream.status.already_exists",
+        Code::PermissionDenied => "run_stream.status.permission_denied",
+        Code::ResourceExhausted => "run_stream.status.resource_exhausted",
+        Code::FailedPrecondition => "run_stream.status.failed_precondition",
+        Code::Aborted => "run_stream.status.aborted",
+        Code::OutOfRange => "run_stream.status.out_of_range",
+        Code::Unimplemented => "run_stream.status.unimplemented",
+        Code::Internal => "run_stream.status.internal",
+        Code::Unavailable => "run_stream.status.unavailable",
+        Code::DataLoss => "run_stream.status.data_loss",
+        Code::Unauthenticated => "run_stream.status.unauthenticated",
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -5535,17 +5584,17 @@ mod tests {
         repeated_tool_failure_signature, run_loop_phase_timeout_message,
         run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
         run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
-        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
-        run_stream_harness_selection_payload, run_stream_harness_started_payload,
-        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
-        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
-        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
-        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
+        run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
+        run_stream_harness_started_payload, run_stream_harness_terminal_event,
+        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
+        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
+        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
@@ -5870,6 +5919,61 @@ mod tests {
         assert_eq!(cleanup["terminal_status"], "cancelled");
         assert_eq!(cleanup["terminal_classification"], "cancelled");
         assert_eq!(cleanup["cleanup_completed"], true);
+    }
+
+    #[test]
+    fn runtime_path_terminal_reason_is_stable_for_success_failure_cancel_and_timeout() {
+        use crate::orchestrator::RunLifecycleState;
+
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Done,
+                &Ok(RunStreamMessageProcessingOutcome::Continue),
+            ),
+            "runtime.terminal.completed"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Failed,
+                &Ok(RunStreamMessageProcessingOutcome::Terminate),
+            ),
+            "runtime.terminal.failed"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Cancelled,
+                &Err(Status::cancelled("caller cancelled")),
+            ),
+            "runtime.terminal.cancelled"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Failed,
+                &Err(Status::deadline_exceeded("provider timeout")),
+            ),
+            "runtime.terminal.timed_out"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Failed,
+                &Err(Status::permission_denied("policy denied")),
+            ),
+            "run_stream.status.permission_denied"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Done,
+                &Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
+            ),
+            "runtime.terminal.completed"
+        );
+        assert_eq!(
+            run_runtime_path_terminal_reason(
+                RunLifecycleState::Failed,
+                &Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
+            ),
+            "runtime.terminal.failed"
+        );
     }
 
     #[test]

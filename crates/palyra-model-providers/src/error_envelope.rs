@@ -5,6 +5,11 @@
 //! surfaces: a coarse kind/severity/retryability triple, a failover
 //! eligibility flag, and a message scrubbed of credential material. The
 //! serde shape is a published contract; extend it additively only.
+use palyra_common::runtime_contracts::{
+    RuntimeErrorClass, RuntimeErrorEnvelopeV1, RuntimeErrorEnvelopeV1Input, RuntimeErrorPhase,
+    RuntimeErrorSecurityClass, RuntimeErrorUserVisibility, RuntimeErrorValidationError,
+    RuntimeRetryability, RuntimeSubsystem,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{sanitize_remote_error, ProviderError, ProviderFailureClass, ProviderFailureSnapshot};
@@ -169,6 +174,167 @@ impl ProviderErrorEnvelope {
             provider_trace_ref: classification.provider_detail.clone(),
             classification: redacted_classification,
             recovery_decision,
+        }
+    }
+
+    /// Projects this typed provider failure into the shared runtime-error contract.
+    ///
+    /// `output_emitted` must describe externally visible model output observed before
+    /// the provider failure. Provider retryability and recovery posture come from the
+    /// typed fields on this envelope and never from `redacted_message` wording.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeErrorValidationError`] if an existing provider reason code or
+    /// sanitized presentation field violates the shared runtime contract.
+    pub fn runtime_error_envelope(
+        &self,
+        output_emitted: bool,
+    ) -> Result<RuntimeErrorEnvelopeV1, RuntimeErrorValidationError> {
+        let decision = self.recovery_decision.decision;
+        let retryability = provider_runtime_retryability(self.retryability, decision);
+        let retryability = if output_emitted && retryability.allows_automatic_retry() {
+            RuntimeRetryability::RequiresOperatorReview
+        } else {
+            retryability
+        };
+        RuntimeErrorEnvelopeV1::try_new(RuntimeErrorEnvelopeV1Input {
+            class: provider_runtime_error_class(self.kind, self.retryability, decision),
+            reason_code: self.recovery_decision.reason_code.clone(),
+            subsystem: provider_runtime_subsystem(self.kind, decision),
+            phase: provider_runtime_phase(decision),
+            retryability,
+            security_class: RuntimeErrorSecurityClass::Sensitive,
+            user_visibility: provider_runtime_user_visibility(decision),
+            output_emitted,
+            side_effect_may_have_occurred: false,
+            safe_message: self.redacted_message.clone(),
+            recovery_hint: provider_runtime_recovery_hint(decision).to_owned(),
+        })
+    }
+}
+
+const fn provider_runtime_subsystem(
+    kind: ProviderErrorKind,
+    decision: ProviderRecoveryDecisionKind,
+) -> RuntimeSubsystem {
+    if matches!(kind, ProviderErrorKind::Auth | ProviderErrorKind::MissingConfiguration)
+        || matches!(decision, ProviderRecoveryDecisionKind::RefreshCredential)
+    {
+        RuntimeSubsystem::Auth
+    } else {
+        RuntimeSubsystem::Provider
+    }
+}
+
+const fn provider_runtime_phase(decision: ProviderRecoveryDecisionKind) -> RuntimeErrorPhase {
+    if matches!(
+        decision,
+        ProviderRecoveryDecisionKind::Abort | ProviderRecoveryDecisionKind::FailClosed
+    ) {
+        RuntimeErrorPhase::ProviderFinalization
+    } else {
+        RuntimeErrorPhase::ProviderRecovery
+    }
+}
+
+const fn provider_runtime_error_class(
+    kind: ProviderErrorKind,
+    retryability: ProviderRetryability,
+    decision: ProviderRecoveryDecisionKind,
+) -> RuntimeErrorClass {
+    if matches!(kind, ProviderErrorKind::Auth | ProviderErrorKind::MissingConfiguration) {
+        return RuntimeErrorClass::AuthUnavailable;
+    }
+    if !matches!(retryability, ProviderRetryability::NotRetryable)
+        || matches!(
+            decision,
+            ProviderRecoveryDecisionKind::RetrySameProvider
+                | ProviderRecoveryDecisionKind::RetryAfter
+                | ProviderRecoveryDecisionKind::RetryTransformed
+                | ProviderRecoveryDecisionKind::FailoverProvider
+                | ProviderRecoveryDecisionKind::CompactAndRetry
+        )
+    {
+        RuntimeErrorClass::ProviderRetryable
+    } else {
+        RuntimeErrorClass::ProviderTerminal
+    }
+}
+
+const fn provider_runtime_retryability(
+    retryability: ProviderRetryability,
+    decision: ProviderRecoveryDecisionKind,
+) -> RuntimeRetryability {
+    match retryability {
+        ProviderRetryability::RetrySameProvider => RuntimeRetryability::SafeSameRequest,
+        ProviderRetryability::RetryAfter => RuntimeRetryability::SafeAfterBackoff,
+        ProviderRetryability::RefreshCredential => RuntimeRetryability::RequiresCredentialRefresh,
+        ProviderRetryability::NotRetryable => match decision {
+            ProviderRecoveryDecisionKind::RetryTransformed => {
+                RuntimeRetryability::RequiresRequestTransform
+            }
+            ProviderRecoveryDecisionKind::FailoverProvider => {
+                RuntimeRetryability::RequiresProviderFailover
+            }
+            ProviderRecoveryDecisionKind::CompactAndRetry => {
+                RuntimeRetryability::RequiresContextCompaction
+            }
+            ProviderRecoveryDecisionKind::AskUser => RuntimeRetryability::RequiresOperatorReview,
+            ProviderRecoveryDecisionKind::RetrySameProvider
+            | ProviderRecoveryDecisionKind::RetryAfter
+            | ProviderRecoveryDecisionKind::RefreshCredential
+            | ProviderRecoveryDecisionKind::Abort
+            | ProviderRecoveryDecisionKind::FailClosed => RuntimeRetryability::NotRetryable,
+        },
+    }
+}
+
+const fn provider_runtime_user_visibility(
+    decision: ProviderRecoveryDecisionKind,
+) -> RuntimeErrorUserVisibility {
+    match decision {
+        ProviderRecoveryDecisionKind::AskUser | ProviderRecoveryDecisionKind::RefreshCredential => {
+            RuntimeErrorUserVisibility::ActionRequired
+        }
+        ProviderRecoveryDecisionKind::Abort | ProviderRecoveryDecisionKind::FailClosed => {
+            RuntimeErrorUserVisibility::SafeMessage
+        }
+        ProviderRecoveryDecisionKind::RetrySameProvider
+        | ProviderRecoveryDecisionKind::RetryAfter
+        | ProviderRecoveryDecisionKind::RetryTransformed
+        | ProviderRecoveryDecisionKind::FailoverProvider
+        | ProviderRecoveryDecisionKind::CompactAndRetry => RuntimeErrorUserVisibility::StatusOnly,
+    }
+}
+
+const fn provider_runtime_recovery_hint(decision: ProviderRecoveryDecisionKind) -> &'static str {
+    match decision {
+        ProviderRecoveryDecisionKind::RetrySameProvider => {
+            "retry the provider request within the configured retry budget"
+        }
+        ProviderRecoveryDecisionKind::RetryAfter => {
+            "wait for the structured backoff interval before retrying"
+        }
+        ProviderRecoveryDecisionKind::RetryTransformed => {
+            "transform the rejected provider request before retrying"
+        }
+        ProviderRecoveryDecisionKind::RefreshCredential => {
+            "refresh the provider credential through the auth boundary"
+        }
+        ProviderRecoveryDecisionKind::FailoverProvider => {
+            "select an eligible provider through the host-owned failover policy"
+        }
+        ProviderRecoveryDecisionKind::CompactAndRetry => {
+            "compact provider context through the host-owned context boundary before retrying"
+        }
+        ProviderRecoveryDecisionKind::AskUser => {
+            "request safe user or operator action before continuing"
+        }
+        ProviderRecoveryDecisionKind::Abort => {
+            "stop the provider attempt and preserve its redacted evidence"
+        }
+        ProviderRecoveryDecisionKind::FailClosed => {
+            "stop automatic recovery and inspect redacted provider diagnostics"
         }
     }
 }
@@ -360,6 +526,105 @@ mod tests {
         assert!(!envelope.redacted_message.contains("sk-secret-token"));
         assert!(!envelope.classification.message.contains("live-token"));
         assert!(!envelope.recovery_decision.redacted_message.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn provider_retry_after_projects_from_typed_retryability() {
+        let error = ProviderError::RequestFailed {
+            message: "rate limited by provider".to_owned(),
+            retryable: true,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                429,
+                true,
+                "openai_chat_http",
+                "rate limit",
+            ),
+        };
+        let provider = ProviderErrorEnvelope::from_error(&error);
+        let runtime =
+            provider.runtime_error_envelope(false).expect("typed provider failure should project");
+
+        assert_eq!(runtime.class(), RuntimeErrorClass::ProviderRetryable);
+        assert_eq!(runtime.retryability(), RuntimeRetryability::SafeAfterBackoff);
+        assert_eq!(runtime.reason_code(), "provider.recovery.retry_after");
+        assert!(!runtime.output_emitted());
+        assert!(!runtime.side_effect_may_have_occurred());
+
+        let partial = provider
+            .runtime_error_envelope(true)
+            .expect("partial output should project conservatively");
+        assert_eq!(partial.retryability(), RuntimeRetryability::RequiresOperatorReview);
+        assert!(!partial.to_palyra_error_envelope().retryable);
+    }
+
+    #[test]
+    fn provider_runtime_projection_never_copies_raw_credentials() {
+        let error = ProviderError::RequestFailed {
+            message: "401 bearer live-token api_key=sk-secret-token".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                401,
+                false,
+                "openai_chat_http",
+                "invalid api key",
+            ),
+        };
+        let runtime = ProviderErrorEnvelope::from_error(&error)
+            .runtime_error_envelope(false)
+            .expect("redacted provider failure should project");
+        let encoded = serde_json::to_string(&runtime).expect("runtime error should serialize");
+
+        assert_eq!(runtime.class(), RuntimeErrorClass::AuthUnavailable);
+        assert!(!encoded.contains("live-token"));
+        assert!(!encoded.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn provider_runtime_classification_does_not_depend_on_message_wording() {
+        let classification =
+            classify_http_provider_failure(503, true, "openai_chat_http", "provider unavailable");
+        let first = ProviderError::RequestFailed {
+            message: "first safe wording".to_owned(),
+            retryable: true,
+            retry_count: 0,
+            classification: classification.clone(),
+        };
+        let second = ProviderError::RequestFailed {
+            message: "different safe wording".to_owned(),
+            retryable: true,
+            retry_count: 0,
+            classification,
+        };
+        let first = ProviderErrorEnvelope::from_error(&first)
+            .runtime_error_envelope(false)
+            .expect("first provider failure should project");
+        let second = ProviderErrorEnvelope::from_error(&second)
+            .runtime_error_envelope(false)
+            .expect("second provider failure should project");
+
+        assert_eq!(first.class(), second.class());
+        assert_eq!(first.retryability(), second.retryability());
+        assert_eq!(first.reason_code(), second.reason_code());
+    }
+
+    #[test]
+    fn provider_runtime_projection_matches_exact_compatibility_metadata() {
+        for error in [ProviderError::MissingApiKey, ProviderError::StatePoisoned] {
+            let runtime = ProviderErrorEnvelope::from_error(&error)
+                .runtime_error_envelope(false)
+                .expect("typed provider failure should project");
+            let mapping = palyra_common::runtime_contracts::legacy_runtime_error_mapping(
+                runtime.reason_code(),
+            )
+            .expect("tested provider reason should have an exact compatibility mapping");
+
+            assert_eq!(runtime.class(), mapping.class);
+            assert_eq!(runtime.subsystem(), mapping.subsystem);
+            assert_eq!(runtime.phase(), mapping.phase);
+            assert_eq!(runtime.retryability(), mapping.retryability);
+        }
     }
 
     #[test]

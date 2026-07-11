@@ -5,7 +5,7 @@
 //! to callers, carrying the parsed envelope when one was present.
 
 use palyra_common::runtime_contracts::{
-    PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue,
+    PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, RuntimeErrorEnvelopeV1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,6 +79,12 @@ impl From<PalyraErrorEnvelope> for ErrorEnvelope {
                 .map(ValidationIssue::from)
                 .collect(),
         }
+    }
+}
+
+impl From<RuntimeErrorEnvelopeV1> for ErrorEnvelope {
+    fn from(envelope: RuntimeErrorEnvelopeV1) -> Self {
+        Self::from(envelope.to_palyra_error_envelope())
     }
 }
 
@@ -191,5 +197,38 @@ mod tests {
         assert_eq!(encoded["category"], "dependency");
         assert_eq!(encoded["redacted"], true);
         assert_eq!(encoded["validation_errors"][0]["field"], "model");
+    }
+
+    #[test]
+    fn strict_runtime_error_projects_without_changing_legacy_wire_shape() {
+        use palyra_common::runtime_contracts::{
+            RuntimeErrorClass, RuntimeErrorEnvelopeV1Input, RuntimeErrorPhase,
+            RuntimeErrorSecurityClass, RuntimeErrorUserVisibility, RuntimeRetryability,
+            RuntimeSubsystem,
+        };
+
+        let strict = RuntimeErrorEnvelopeV1::try_new(RuntimeErrorEnvelopeV1Input {
+            class: RuntimeErrorClass::ApprovalRequired,
+            reason_code: "approval.required".to_owned(),
+            subsystem: RuntimeSubsystem::Approval,
+            phase: RuntimeErrorPhase::Approval,
+            retryability: RuntimeRetryability::RequiresApproval,
+            security_class: RuntimeErrorSecurityClass::Internal,
+            user_visibility: RuntimeErrorUserVisibility::ActionRequired,
+            output_emitted: false,
+            side_effect_may_have_occurred: false,
+            safe_message: "approval is required".to_owned(),
+            recovery_hint: "approve or deny the pending operation".to_owned(),
+        })
+        .expect("strict runtime error should construct");
+        let legacy = ErrorEnvelope::from(strict);
+        let encoded = serde_json::to_value(&legacy).expect("legacy error should serialize");
+
+        assert_eq!(encoded["code"], "approval.required");
+        assert_eq!(encoded["category"], "policy");
+        assert_eq!(encoded["retryable"], false);
+        assert_eq!(encoded["redacted"], true);
+        assert_eq!(encoded.as_object().map(serde_json::Map::len), Some(5));
+        assert!(encoded.get("runtime_error").is_none());
     }
 }

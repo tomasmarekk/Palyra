@@ -112,6 +112,8 @@ pub(crate) async fn admin_status_handler(
     let trace_export = crate::runtime_diagnostics::build_trace_exporter_contract();
     let diagnostics_timeline =
         crate::runtime_diagnostics::build_diagnostics_timeline_contract(generated_at_unix_ms);
+    let runtime_error_contract =
+        crate::runtime_diagnostics::build_runtime_error_contract_diagnostics();
     let active_tool_jobs = json!({
         "total": tool_jobs.len(),
         "active": tool_jobs.iter().filter(|job| job.state.is_active()).count(),
@@ -141,6 +143,7 @@ pub(crate) async fn admin_status_handler(
             "metrics_catalog": metrics_catalog.clone(),
             "timeline": diagnostics_timeline.clone(),
             "trace_export": trace_export.clone(),
+            "runtime_error_contract": runtime_error_contract.clone(),
         }),
     );
     let feature_usage = state.runtime.feature_usage_snapshot();
@@ -188,11 +191,13 @@ pub(crate) async fn admin_status_handler(
         map.insert("agent_runtime_metrics".to_owned(), runtime_metrics);
         map.insert("metrics_catalog".to_owned(), metrics_catalog);
         map.insert("trace_export".to_owned(), trace_export.clone());
+        map.insert("runtime_error_contract".to_owned(), runtime_error_contract.clone());
         map.insert(
             "runtime_diagnostics".to_owned(),
             json!({
                 "timeline": diagnostics_timeline,
                 "trace_export": trace_export,
+                "runtime_error_contract": runtime_error_contract,
                 "shutdown_forensics": shutdown_forensics,
                 "support_runtime": support_runtime,
             }),

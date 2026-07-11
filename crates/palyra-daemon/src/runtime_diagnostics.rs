@@ -14,6 +14,7 @@ use palyra_common::feature_rollouts::{FeatureRolloutSetting, FeatureRolloutSourc
 use palyra_common::redaction::{
     is_sensitive_key, redact_diagnostic_text, redact_internal_runtime_paths,
 };
+use palyra_common::runtime_contracts::runtime_error_contract_snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -72,6 +73,8 @@ pub(crate) const RUN_STAGE_TIMING_SCHEMA_VERSION: u32 = 1;
 pub(crate) const RUN_RUNTIME_PATH_SCHEMA_VERSION: u32 = 1;
 /// Journal/tape event name for terminal runtime path summaries.
 pub(crate) const RUN_RUNTIME_PATH_SUMMARY_EVENT: &str = "run.runtime_path_summary";
+/// Schema version for runtime invariant and error-taxonomy diagnostics.
+pub(crate) const RUNTIME_ERROR_DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the test-only ABI contract snapshot suite.
 #[cfg(test)]
 pub(crate) const CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -109,6 +112,37 @@ const FORBIDDEN_METRIC_LABEL_KEYS: &[&str] =
     &["run_id", "session_id", "tool_call_id", "path", "principal", "raw_user", "prompt"];
 const BOUNDED_METRIC_LABEL_KEYS: &[&str] =
     &["component", "provider_kind", "state", "stat", "status", "token_type"];
+
+/// Builds the metadata-only runtime invariant and error-taxonomy diagnostics contract.
+///
+/// The payload is static and deterministic. It does not inspect live errors or raw runtime
+/// payloads, and it documents the existing terminal runtime-path trace field that carries
+/// stable reason codes without changing that schema-version-1 tape event.
+#[must_use]
+pub(crate) fn build_runtime_error_contract_diagnostics() -> Value {
+    let error_taxonomy = runtime_error_contract_snapshot();
+    json!({
+        "schema_version": RUNTIME_ERROR_DIAGNOSTICS_SCHEMA_VERSION,
+        "status": "contract_ready",
+        "reason_code": "runtime.error_contract.ready",
+        "invariant_contract": {
+            "schema_version": RUNTIME_ERROR_DIAGNOSTICS_SCHEMA_VERSION,
+            "authority": "host_runtime",
+            "journal_authoritative": true,
+            "diagnostics_authoritative": false,
+            "descriptors": error_taxonomy["invariants"].clone(),
+        },
+        "error_taxonomy": error_taxonomy,
+        "metadata_trace": {
+            "event_name": RUN_RUNTIME_PATH_SUMMARY_EVENT,
+            "terminal_reason_field": "terminal_reason",
+            "stable_reason_code_required": true,
+            "full_error_envelope_embedded": false,
+            "redaction_level": "metadata_only",
+            "reason_code": "runtime.error_contract.trace_projection_ready",
+        },
+    })
+}
 
 /// Run-time path posture for one subsystem in the agent loop.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2534,6 +2568,21 @@ mod tests {
             active_ref_count: 0,
             lease_expires_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn runtime_error_contract_diagnostics_are_metadata_only_and_traceable() {
+        let payload = build_runtime_error_contract_diagnostics();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["status"], "contract_ready");
+        assert_eq!(payload["reason_code"], "runtime.error_contract.ready");
+        assert_eq!(payload["invariant_contract"]["descriptors"].as_array().map(Vec::len), Some(6));
+        assert_eq!(payload["error_taxonomy"]["classes"].as_array().map(Vec::len), Some(12));
+        assert_eq!(payload["metadata_trace"]["event_name"], RUN_RUNTIME_PATH_SUMMARY_EVENT);
+        assert_eq!(payload["metadata_trace"]["terminal_reason_field"], "terminal_reason");
+        assert_eq!(payload["metadata_trace"]["stable_reason_code_required"], true);
+        assert_eq!(payload["error_taxonomy"]["raw_provider_payload_allowed"], false);
+        assert_eq!(payload["error_taxonomy"]["raw_stderr_allowed"], false);
     }
 
     #[test]

@@ -80,6 +80,25 @@ fn admin_status_requires_token_and_context() -> Result<()> {
     assert!(success.contains("\"grpc_port\""));
     assert!(success.contains("\"runtime_health\""));
     assert!(success.contains("\"agent_runtime_metrics\""));
+    let success_payload =
+        serde_json::from_str::<Value>(&success).context("failed to parse admin status response")?;
+    assert_eq!(
+        success_payload.pointer("/runtime_error_contract/schema_version").and_then(Value::as_u64),
+        Some(1),
+        "admin status should expose the strict runtime error contract version"
+    );
+    assert_eq!(
+        success_payload.pointer("/runtime_error_contract/reason_code").and_then(Value::as_str),
+        Some("runtime.error_contract.ready"),
+        "admin status should expose the stable contract readiness reason"
+    );
+    assert_eq!(
+        success_payload
+            .pointer("/runtime_diagnostics/runtime_error_contract/metadata_trace/event_name")
+            .and_then(Value::as_str),
+        Some("run.runtime_path_summary"),
+        "admin diagnostics should identify the terminal metadata trace"
+    );
 
     let metrics_url = format!("http://127.0.0.1:{admin_port}/admin/v1/metrics");
     let metrics = client
@@ -3485,6 +3504,36 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
                 })
             }),
         "diagnostics should publish the tool repair roadmap capability"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/runtime_roadmap/invariant_contract/descriptors")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(6),
+        "diagnostics should publish every frozen runtime invariant"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/runtime_roadmap/error_taxonomy/classes")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(12),
+        "diagnostics should publish the complete runtime error taxonomy"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/runtime_roadmap/runtime_error_metadata_trace/event_name")
+            .and_then(Value::as_str),
+        Some("run.runtime_path_summary"),
+        "diagnostics should identify the existing terminal metadata event"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/runtime_roadmap/runtime_error_metadata_trace/stable_reason_code_required")
+            .and_then(Value::as_bool),
+        Some(true),
+        "terminal metadata diagnostics should require stable reason codes"
     );
 
     let initial_events = client

@@ -3,6 +3,11 @@
 //! The `parse_*_row` helpers expect column order to match the SELECT lists in
 //! the sibling query modules; keep both sides in sync when columns change.
 
+use palyra_common::runtime_contracts::{
+    RuntimeErrorClass, RuntimeErrorEnvelopeV1, RuntimeErrorEnvelopeV1Input, RuntimeErrorPhase,
+    RuntimeErrorSecurityClass, RuntimeErrorUserVisibility, RuntimeErrorValidationError,
+    RuntimeRetryability, RuntimeSubsystem,
+};
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,7 +165,7 @@ pub enum DeliveryIntentStatus {
     Queued,
     /// Adapter send has started and the platform outcome is not final yet.
     AdapterSendStarted,
-    /// Adapter outcome was retry/unknown; an operator can safely retry.
+    /// Adapter outcome is unknown; reconciliation or a proven idempotency guard is required.
     PlatformOutcomeUnknown,
     /// Platform acknowledged delivery.
     Delivered,
@@ -246,6 +251,91 @@ pub struct DeliveryIntentRecord {
     pub redaction_summary_json: Option<String>,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
+}
+
+impl DeliveryIntentRecord {
+    /// Projects a failed or outcome-unknown durable delivery intent into runtime error metadata.
+    ///
+    /// Active, delivered, and intentionally suppressed intents return `Ok(None)`. The projection
+    /// never copies outbound text, connector responses, or arbitrary failure detail. A send attempt
+    /// without a final acknowledgement is treated as side-effect uncertain and therefore requires
+    /// the durable idempotency guard before retry.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeErrorValidationError`] if a repository-owned projection constant violates
+    /// the shared contract. Persisted adapter failure text is never reused as a reason code.
+    pub fn runtime_error_envelope(
+        &self,
+        output_emitted: bool,
+    ) -> Result<Option<RuntimeErrorEnvelopeV1>, RuntimeErrorValidationError> {
+        let projection = match self.status {
+            DeliveryIntentStatus::PlatformOutcomeUnknown => Some((
+                RuntimeErrorClass::DeliveryUnknown,
+                RuntimeErrorPhase::DeliveryAcknowledgement,
+                RuntimeRetryability::RequiresIdempotencyGuard,
+                true,
+                RuntimeErrorUserVisibility::ActionRequired,
+                "delivery platform outcome is unknown",
+                "reconcile the durable delivery intent before an idempotency-guarded retry",
+                "delivery.intent.platform_outcome_unknown",
+            )),
+            DeliveryIntentStatus::Failed | DeliveryIntentStatus::DeadLettered => {
+                let side_effect_may_have_occurred = self.send_attempts > 0;
+                Some((
+                    RuntimeErrorClass::RecoveryBlocked,
+                    RuntimeErrorPhase::DeliveryAcknowledgement,
+                    if side_effect_may_have_occurred {
+                        RuntimeRetryability::RequiresIdempotencyGuard
+                    } else {
+                        RuntimeRetryability::RequiresOperatorReview
+                    },
+                    side_effect_may_have_occurred,
+                    RuntimeErrorUserVisibility::ActionRequired,
+                    "delivery intent reached a terminal failure state",
+                    "inspect the durable intent and retry only through the operator delivery workflow",
+                    if self.status == DeliveryIntentStatus::DeadLettered {
+                        "delivery.intent.dead_lettered"
+                    } else {
+                        "delivery.intent.failed"
+                    },
+                ))
+            }
+            DeliveryIntentStatus::Created
+            | DeliveryIntentStatus::Planned
+            | DeliveryIntentStatus::Queued
+            | DeliveryIntentStatus::AdapterSendStarted
+            | DeliveryIntentStatus::Delivered
+            | DeliveryIntentStatus::Suppressed => None,
+        };
+        let Some((
+            class,
+            phase,
+            retryability,
+            side_effect_may_have_occurred,
+            user_visibility,
+            safe_message,
+            recovery_hint,
+            fallback_reason_code,
+        )) = projection
+        else {
+            return Ok(None);
+        };
+
+        RuntimeErrorEnvelopeV1::try_new(RuntimeErrorEnvelopeV1Input {
+            class,
+            reason_code: fallback_reason_code.to_owned(),
+            subsystem: RuntimeSubsystem::Delivery,
+            phase,
+            retryability,
+            security_class: RuntimeErrorSecurityClass::Internal,
+            user_visibility,
+            output_emitted,
+            side_effect_may_have_occurred,
+            safe_message: safe_message.to_owned(),
+            recovery_hint: recovery_hint.to_owned(),
+        })
+        .map(Some)
+    }
 }
 
 /// Result of operator retrying a delivery intent.
@@ -473,5 +563,90 @@ pub(super) fn to_queue_depth(snapshot: &ConnectorQueueSnapshot) -> ConnectorQueu
     ConnectorQueueDepth {
         pending_outbox: snapshot.pending_outbox,
         dead_letters: snapshot.dead_letters,
+    }
+}
+
+#[cfg(test)]
+mod runtime_error_tests {
+    use super::*;
+
+    fn intent(status: DeliveryIntentStatus) -> DeliveryIntentRecord {
+        DeliveryIntentRecord {
+            intent_id: "intent-1".to_owned(),
+            connector_id: "connector-1".to_owned(),
+            ingress_event_id: 1,
+            ingress_envelope_id: "ingress-1".to_owned(),
+            session_id: Some("session-1".to_owned()),
+            run_id: Some("run-1".to_owned()),
+            principal: "principal-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            outbox_envelope_id: "outbox-1".to_owned(),
+            output_index: 0,
+            payload_hash: "sha256:payload".to_owned(),
+            visible_text_preview: "must not enter runtime error metadata".to_owned(),
+            status,
+            send_attempts: 0,
+            native_message_id: None,
+            last_reason_code: None,
+            redaction_summary_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        }
+    }
+
+    #[test]
+    fn platform_outcome_unknown_requires_idempotency_guard() {
+        let mut intent = intent(DeliveryIntentStatus::PlatformOutcomeUnknown);
+        intent.send_attempts = 1;
+        intent.last_reason_code = Some("connector timed out with bearer live-token".to_owned());
+        let error = intent
+            .runtime_error_envelope(false)
+            .expect("delivery intent should project")
+            .expect("unknown outcome should produce runtime error metadata");
+
+        assert_eq!(error.class(), RuntimeErrorClass::DeliveryUnknown);
+        assert_eq!(error.phase(), RuntimeErrorPhase::DeliveryAcknowledgement);
+        assert_eq!(error.retryability(), RuntimeRetryability::RequiresIdempotencyGuard);
+        assert!(error.side_effect_may_have_occurred());
+        assert_eq!(error.reason_code(), "delivery.intent.platform_outcome_unknown");
+        assert!(!serde_json::to_string(&error)
+            .expect("runtime error should serialize")
+            .contains("must not enter runtime error metadata"));
+    }
+
+    #[test]
+    fn known_delivery_failure_before_send_requires_operator_review() {
+        let error = intent(DeliveryIntentStatus::Failed)
+            .runtime_error_envelope(false)
+            .expect("delivery intent should project")
+            .expect("failed intent should produce runtime error metadata");
+
+        assert_eq!(error.class(), RuntimeErrorClass::RecoveryBlocked);
+        assert_eq!(error.retryability(), RuntimeRetryability::RequiresOperatorReview);
+        assert!(!error.side_effect_may_have_occurred());
+        assert_eq!(error.reason_code(), "delivery.intent.failed");
+    }
+
+    #[test]
+    fn delivered_intent_has_no_runtime_error_projection() {
+        assert!(intent(DeliveryIntentStatus::Delivered)
+            .runtime_error_envelope(true)
+            .expect("delivered intent should be valid")
+            .is_none());
+    }
+
+    #[test]
+    fn persisted_delivery_failure_text_is_never_reused_as_reason_code() {
+        let mut intent = intent(DeliveryIntentStatus::PlatformOutcomeUnknown);
+        intent.last_reason_code = Some("api_key=sk-secret raw connector error".to_owned());
+
+        let error = intent
+            .runtime_error_envelope(false)
+            .expect("status-owned reason code should remain valid")
+            .expect("unknown outcome should produce runtime error metadata");
+        let encoded = serde_json::to_string(&error).expect("runtime error should serialize");
+
+        assert_eq!(error.reason_code(), "delivery.intent.platform_outcome_unknown");
+        assert!(!encoded.contains("sk-secret"));
     }
 }

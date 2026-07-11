@@ -15,6 +15,12 @@
 use palyra_common::feature_rollouts::{
     EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
 };
+#[cfg(test)]
+use palyra_common::runtime_contracts::{
+    RuntimeErrorClass, RuntimeErrorEnvelopeV1, RuntimeErrorEnvelopeV1Input, RuntimeErrorPhase,
+    RuntimeErrorSecurityClass, RuntimeErrorUserVisibility, RuntimeErrorValidationError,
+    RuntimeRetryability, RuntimeSubsystem,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -81,6 +87,70 @@ pub(crate) struct ExecutionGateReport {
     pub(crate) final_reason_code: String,
     pub(crate) final_decision: ExecutionGateDecisionSnapshot,
     pub(crate) steps: Vec<ExecutionGateStep>,
+}
+
+#[cfg(test)]
+impl ExecutionGateReport {
+    /// Projects a blocked or approval-pending gate result into shared runtime error metadata.
+    ///
+    /// Allowed and informationally skipped reports return `Ok(None)`. Classification uses the
+    /// typed final verdict and the already-emitted stable reason code; it never re-parses the
+    /// human-readable decision text. Tool execution has not started at this boundary, so the
+    /// projection always records `side_effect_may_have_occurred=false`.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeErrorValidationError`] if the report's stable reason code or sanitized
+    /// presentation text violates the shared runtime error contract.
+    pub(crate) fn runtime_error_envelope(
+        &self,
+    ) -> Result<Option<RuntimeErrorEnvelopeV1>, RuntimeErrorValidationError> {
+        let (class, retryability, subsystem, phase, user_visibility) = match self.final_verdict {
+            ExecutionGateVerdict::RequireApproval => (
+                RuntimeErrorClass::ApprovalRequired,
+                RuntimeRetryability::RequiresApproval,
+                RuntimeSubsystem::Approval,
+                RuntimeErrorPhase::Approval,
+                RuntimeErrorUserVisibility::ActionRequired,
+            ),
+            ExecutionGateVerdict::Block => (
+                RuntimeErrorClass::PolicyDenied,
+                RuntimeRetryability::NotRetryable,
+                if self.final_reason_code.starts_with("approval.") {
+                    RuntimeSubsystem::Approval
+                } else {
+                    RuntimeSubsystem::Policy
+                },
+                if self.final_reason_code.starts_with("approval.") {
+                    RuntimeErrorPhase::Approval
+                } else {
+                    RuntimeErrorPhase::PolicyEvaluation
+                },
+                RuntimeErrorUserVisibility::SafeMessage,
+            ),
+            ExecutionGateVerdict::Allow | ExecutionGateVerdict::Skipped => return Ok(None),
+        };
+        let recovery_hint = self
+            .steps
+            .iter()
+            .rev()
+            .find_map(|step| step.remediation.as_deref())
+            .unwrap_or("review the execution gate report before retrying the tool proposal");
+
+        RuntimeErrorEnvelopeV1::try_new(RuntimeErrorEnvelopeV1Input {
+            class,
+            reason_code: self.final_reason_code.clone(),
+            subsystem,
+            phase,
+            retryability,
+            security_class: RuntimeErrorSecurityClass::Internal,
+            user_visibility,
+            output_emitted: false,
+            side_effect_may_have_occurred: false,
+            safe_message: self.final_decision.reason.clone(),
+            recovery_hint: recovery_hint.to_owned(),
+        })
+        .map(Some)
+    }
 }
 
 /// Pipeline result: the enforced decision, the legacy budget counter, and the
@@ -971,6 +1041,9 @@ fn approval_pending_decision(
 mod tests {
     use std::path::PathBuf;
 
+    use palyra_common::runtime_contracts::{
+        RuntimeErrorClass, RuntimeErrorPhase, RuntimeRetryability,
+    };
     use serde_json::json;
 
     use crate::{
@@ -1093,6 +1166,17 @@ mod tests {
         }
     }
 
+    fn denied_outcome(reason: &str) -> ToolApprovalOutcome {
+        ToolApprovalOutcome {
+            approval_id: "approval-1".to_owned(),
+            approved: false,
+            reason: reason.to_owned(),
+            decision: ApprovalDecision::Deny,
+            decision_scope: ApprovalDecisionScope::Once,
+            decision_scope_ttl_ms: None,
+        }
+    }
+
     #[test]
     fn pipeline_keeps_sensitive_tool_pending_without_consuming_budget() {
         let mut outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
@@ -1117,6 +1201,44 @@ mod tests {
         assert_eq!(outcome.report.final_reason_code, "approval.pending");
         assert_eq!(outcome.report.final_verdict, ExecutionGateVerdict::RequireApproval);
         assert!(outcome.decision.reason.contains("pending approval_id=approval-1"));
+        let runtime_error = outcome
+            .report
+            .runtime_error_envelope()
+            .expect("pending approval report should project")
+            .expect("pending approval should be a runtime error");
+        assert_eq!(runtime_error.class(), RuntimeErrorClass::ApprovalRequired);
+        assert_eq!(runtime_error.retryability(), RuntimeRetryability::RequiresApproval);
+        assert!(!runtime_error.side_effect_may_have_occurred());
+    }
+
+    #[test]
+    fn pipeline_approval_denial_projects_as_policy_denied() {
+        let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
+            tool_call_config: &tool_call_config(&["palyra.process.run"]),
+            request_context: &request_context(),
+            tool_name: "palyra.process.run",
+            skill_context: None,
+            skill_gate_decision: None,
+            proposal_approval_required: false,
+            effective_posture: &effective_posture(ToolPostureState::AskEachTime),
+            backend_selection: &local_backend_selection(),
+            approval_state: ToolProposalApprovalState {
+                outcome: Some(&denied_outcome("operator denied process execution")),
+                pending_approval_id: None,
+            },
+            remaining_budget: 2,
+        });
+        let runtime_error = outcome
+            .report
+            .runtime_error_envelope()
+            .expect("denied approval report should project")
+            .expect("denied approval should be a runtime error");
+
+        assert_eq!(outcome.report.final_reason_code, "approval.denied");
+        assert_eq!(runtime_error.class(), RuntimeErrorClass::PolicyDenied);
+        assert_eq!(runtime_error.phase(), RuntimeErrorPhase::Approval);
+        assert_eq!(runtime_error.retryability(), RuntimeRetryability::NotRetryable);
+        assert!(!runtime_error.side_effect_may_have_occurred());
     }
 
     #[test]
