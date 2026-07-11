@@ -33,6 +33,7 @@ use palyra_common::{
     },
     process_risk::{classify_process_run, ProcessRiskContext},
     process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    qa_fault_injection::{QaFaultAction, QaFaultActivationDirective, QaFaultDirective},
     redaction::{is_sensitive_key, redact_diagnostic_text},
     secret_refs::SecretRef,
     workspace_patch::{
@@ -65,9 +66,8 @@ use crate::{
     },
     tool_protocol::{
         build_tool_execution_outcome, build_tool_execution_outcome_with_manifest,
-        execute_tool_call_with_cancellation_and_progress, ExecutionAttestationManifest,
-        ExecutionCleanupEvidence, ExecutionCleanupResourceEvidence, ToolCallConfig,
-        ToolExecutionOutcome,
+        ExecutionAttestationManifest, ExecutionCleanupEvidence, ExecutionCleanupResourceEvidence,
+        ToolCallConfig, ToolExecutionOutcome,
     },
 };
 
@@ -733,6 +733,103 @@ fn local_sandbox_cleanup_evidence(outcome: &ToolExecutionOutcome) -> ExecutionCl
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PreparedExecutionBackendCleanupFault {
+    Timeout(String),
+    TerminateProcess,
+}
+
+fn prepare_execution_backend_cleanup_fault(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    directive: &QaFaultActivationDirective,
+) -> Result<PreparedExecutionBackendCleanupFault, String> {
+    let prepared = match &directive.activation.action {
+        QaFaultAction::Timeout => PreparedExecutionBackendCleanupFault::Timeout(format!(
+            "qa_fault.execution_backend_cleanup_timeout: activation={}",
+            directive.activation.id
+        )),
+        QaFaultAction::TerminateProcess => PreparedExecutionBackendCleanupFault::TerminateProcess,
+        action => {
+            return Err(format!(
+                "qa_fault.execution_backend_action_unsupported: {}",
+                action.kind().as_str()
+            ));
+        }
+    };
+    fault_injection
+        .record_immediate_recovery(directive)
+        .map_err(|error| format!("qa_fault.execution_backend_recovery_failed: {error}"))?;
+    Ok(prepared)
+}
+
+fn apply_execution_backend_cleanup_fault(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    actor: &str,
+) -> Result<(), String> {
+    match fault_injection
+        .checkpoint("execution_backend.during_cleanup", actor)
+        .map_err(|error| format!("qa_fault.execution_backend_checkpoint_failed: {error}"))?
+    {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => {
+            match prepare_execution_backend_cleanup_fault(fault_injection, &directive)? {
+                PreparedExecutionBackendCleanupFault::Timeout(error) => Err(error),
+                PreparedExecutionBackendCleanupFault::TerminateProcess => {
+                    #[cfg(feature = "qa-fault-injection")]
+                    fault_injection.terminate_process();
+                    #[cfg(not(feature = "qa-fault-injection"))]
+                Err("qa_fault.feature_disabled: terminate directive reached a feature-off build"
+                    .to_owned())
+                }
+            }
+        }
+    }
+}
+
+fn apply_cleanup_fault_to_verified_outcome(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    actor: &str,
+    outcome: &mut ToolExecutionOutcome,
+) {
+    let cleanup_verified =
+        outcome.attestation.execution_manifest.as_ref().is_some_and(|manifest| {
+            cleanup_manifest_has_verified_required_resources(manifest.as_ref())
+        });
+    if cleanup_verified {
+        if let Err(error) = apply_execution_backend_cleanup_fault(fault_injection, actor) {
+            outcome.success = false;
+            outcome.error = error;
+        }
+    }
+}
+
+fn cleanup_manifest_has_verified_required_resources(
+    manifest: &ExecutionAttestationManifest,
+) -> bool {
+    let required_kinds: &[&str] = match manifest.backend_id.as_str() {
+        "docker" => &["container", "workspace_volume"],
+        "ssh_tunnel" => &["remote_workspace", "remote_artifacts", "remote_logs"],
+        // Local process execution has a separate managed-process fault boundary. Its manifest
+        // does not yet carry a cross-platform owned-tree inactive proof, so the generic backend
+        // cleanup seam must not classify it as CleanupSucceeded.
+        _ => return false,
+    };
+    manifest.cleanup.success
+        && manifest
+            .cleanup
+            .resources
+            .iter()
+            .filter(|resource| resource.cleanup_required)
+            .all(|resource| resource.cleanup_verified)
+        && required_kinds.iter().all(|required_kind| {
+            manifest
+                .cleanup
+                .resources
+                .iter()
+                .any(|resource| resource.kind == *required_kind && resource.cleanup_verified)
+        })
+}
+
 /// Health probe result for a concrete execution runner implementation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendRunnerHealth {
@@ -751,6 +848,7 @@ pub(crate) struct ExecutionBackendProcessRunRequest<'a> {
     pub(crate) vault: Option<&'a Vault>,
     pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
     pub(crate) process_progress_sink: Option<ProcessProgressSink>,
+    pub(crate) fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 }
 
 /// Tool-program dispatch placeholder for runner implementations.
@@ -968,13 +1066,15 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
         request: ExecutionBackendProcessRunRequest<'a>,
     ) -> RunnerExecutionFuture<'a> {
         Box::pin(async move {
-            let mut outcome = execute_tool_call_with_cancellation_and_progress(
+            let fault_injection = request.fault_injection.clone();
+            let mut outcome = crate::tool_protocol::execute_tool_call_with_fault_injection(
                 request.config,
                 request.proposal_id,
                 request.tool_name,
                 request.input_json,
                 request.cancellation_requested,
                 request.process_progress_sink,
+                request.fault_injection,
             )
             .await;
             outcome.attestation.execution_manifest =
@@ -984,6 +1084,11 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
                     request.input_json,
                     &outcome,
                 )));
+            apply_cleanup_fault_to_verified_outcome(
+                &fault_injection,
+                request.proposal_id,
+                &mut outcome,
+            );
             outcome
         })
     }
@@ -1948,6 +2053,7 @@ fn normalize_docker_vault_ref(raw: &str) -> Result<String, DockerEngineError> {
 
 const DOCKER_WORKSPACE_ROOT: &str = "/workspace";
 const DOCKER_EGRESS_PROXY_NETWORK: &str = "palyra-egress-proxy";
+const DOCKER_CLEANUP_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1024;
 
 /// Runtime plan passed to a Docker engine implementation.
 #[derive(Debug, Clone)]
@@ -1996,16 +2102,33 @@ impl Drop for DockerEnvFileCleanupGuard {
 pub(crate) struct DockerCleanupAttestation {
     pub(crate) strategy: String,
     pub(crate) container_removed: bool,
+    pub(crate) workspace_cleanup_required: bool,
     pub(crate) volume_removed: bool,
     pub(crate) success: bool,
     pub(crate) reason_code: String,
 }
 
+impl DockerCleanupAttestation {
+    fn verified_success(&self) -> bool {
+        self.success
+            && self.container_removed
+            && (!self.workspace_cleanup_required || self.volume_removed)
+    }
+
+    fn verified_reason_code(&self) -> &str {
+        if self.success && !self.verified_success() {
+            "docker.cleanup.evidence_inconsistent"
+        } else {
+            self.reason_code.as_str()
+        }
+    }
+}
+
 fn docker_cleanup_evidence(cleanup: &DockerCleanupAttestation) -> ExecutionCleanupEvidence {
     ExecutionCleanupEvidence {
         strategy: cleanup.strategy.clone(),
-        success: cleanup.success,
-        reason_code: cleanup.reason_code.clone(),
+        success: cleanup.verified_success(),
+        reason_code: cleanup.verified_reason_code().to_owned(),
         resources: vec![
             cleanup_resource(
                 "container",
@@ -2015,9 +2138,15 @@ fn docker_cleanup_evidence(cleanup: &DockerCleanupAttestation) -> ExecutionClean
             ),
             cleanup_resource(
                 "workspace_volume",
-                if cleanup.volume_removed { "removed" } else { "remove_failed" },
-                true,
-                cleanup.volume_removed,
+                if !cleanup.workspace_cleanup_required {
+                    "not_created"
+                } else if cleanup.volume_removed {
+                    "removed"
+                } else {
+                    "remove_failed"
+                },
+                cleanup.workspace_cleanup_required,
+                !cleanup.workspace_cleanup_required || cleanup.volume_removed,
             ),
         ],
     }
@@ -2176,8 +2305,9 @@ impl DockerEngine for DockerCliEngine {
         Box::pin(async move {
             let started = Instant::now();
             let (run_plan, writeback_capture) = prepare_docker_run_plan(&plan)?;
+            let container_name = format!("palyra-{}", Ulid::new().to_string().to_ascii_lowercase());
             let mut command = tokio::process::Command::new("docker");
-            command.arg("run").arg("--rm");
+            command.arg("run").arg("--rm").arg("--name").arg(container_name.as_str());
             if run_plan.readonly_rootfs {
                 command.arg("--read-only");
             }
@@ -2209,10 +2339,15 @@ impl DockerEngine for DockerCliEngine {
                     run_plan.profile_id
                 ),
             })?;
+            let container_removed =
+                ensure_docker_container_removed(container_name.as_str()).await?;
+            let workspace_cleanup_required = writeback_capture.is_some();
             let patch_bundle = match writeback_capture {
                 Some(capture) => capture.finish()?,
                 None => None,
             };
+            let volume_removed = true;
+            let cleanup_success = container_removed && volume_removed;
             Ok(DockerRunReport {
                 exit_code: output.status.code().unwrap_or(1),
                 stdout: output.stdout,
@@ -2224,15 +2359,74 @@ impl DockerEngine for DockerCliEngine {
                 },
                 cleanup: DockerCleanupAttestation {
                     strategy: plan.cleanup_strategy,
-                    container_removed: true,
-                    volume_removed: true,
-                    success: true,
-                    reason_code: "docker.cleanup.ok".to_owned(),
+                    container_removed,
+                    workspace_cleanup_required,
+                    volume_removed,
+                    success: cleanup_success,
+                    reason_code: if cleanup_success {
+                        "docker.cleanup.ok"
+                    } else {
+                        "docker.cleanup.container_residual"
+                    }
+                    .to_owned(),
                 },
                 patch_bundle,
             })
         })
     }
+}
+
+async fn ensure_docker_container_removed(container_name: &str) -> Result<bool, DockerEngineError> {
+    if docker_exact_name_container_absent(container_name).await? {
+        return Ok(true);
+    }
+
+    let removal =
+        tokio::process::Command::new("docker").args(["rm", "-f", container_name]).output().await;
+    let absent_after_removal = docker_exact_name_container_absent(container_name).await?;
+    if absent_after_removal {
+        return Ok(true);
+    }
+    if let Err(error) = removal {
+        return Err(DockerEngineError {
+            reason_code: "docker.cleanup.container_remove_spawn_failed".to_owned(),
+            message: format!(
+                "failed to launch Docker container cleanup for generated name {container_name}: {error}"
+            ),
+        });
+    }
+    Ok(false)
+}
+
+async fn docker_exact_name_container_absent(
+    container_name: &str,
+) -> Result<bool, DockerEngineError> {
+    let filter = format!("name=^/{container_name}$");
+    let output = tokio::process::Command::new("docker")
+        .args(["ps", "-a", "--filter", filter.as_str(), "--format", "{{.ID}}"])
+        .output()
+        .await
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.cleanup.container_probe_spawn_failed".to_owned(),
+            message: format!(
+                "failed to launch Docker residual-container probe for generated name {container_name}: {error}"
+            ),
+        })?;
+    if !output.status.success() {
+        let stderr = &output.stderr[..output.stderr.len().min(DOCKER_CLEANUP_DIAGNOSTIC_MAX_BYTES)];
+        return Err(DockerEngineError {
+            reason_code: "docker.cleanup.container_probe_failed".to_owned(),
+            message: format!(
+                "Docker residual-container probe failed for generated name {container_name}: {}",
+                redact_diagnostic_text(String::from_utf8_lossy(stderr).as_ref())
+            ),
+        });
+    }
+    Ok(docker_exact_name_probe_is_empty(output.stdout.as_slice()))
+}
+
+fn docker_exact_name_probe_is_empty(stdout: &[u8]) -> bool {
+    stdout.iter().all(u8::is_ascii_whitespace)
 }
 
 #[derive(Debug)]
@@ -2867,13 +3061,21 @@ impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
                 }
             };
             match self.engine.run(plan.clone()).await {
-                Ok(report) => docker_process_run_outcome(
-                    request.proposal_id,
-                    request.tool_name,
-                    request.input_json,
-                    &plan,
-                    report,
-                ),
+                Ok(report) => {
+                    let mut outcome = docker_process_run_outcome(
+                        request.proposal_id,
+                        request.tool_name,
+                        request.input_json,
+                        &plan,
+                        report,
+                    );
+                    apply_cleanup_fault_to_verified_outcome(
+                        &request.fault_injection,
+                        request.proposal_id,
+                        &mut outcome,
+                    );
+                    outcome
+                }
                 Err(error) => docker_error_outcome(
                     request.proposal_id,
                     request.tool_name,
@@ -3006,8 +3208,11 @@ fn docker_process_run_outcome(
     plan: &DockerRunPlan,
     report: DockerRunReport,
 ) -> ToolExecutionOutcome {
-    let cleanup = report.cleanup.clone();
-    let cleanup_success = cleanup.success;
+    let mut cleanup = report.cleanup.clone();
+    let cleanup_success = cleanup.verified_success();
+    let cleanup_reason_code = cleanup.verified_reason_code().to_owned();
+    cleanup.success = cleanup_success;
+    cleanup.reason_code = cleanup_reason_code;
     let success = report.exit_code == 0 && cleanup_success;
     let stdout_view = docker_stream_output_view(&report.stdout);
     let stderr_view = docker_stream_output_view(&report.stderr);
@@ -3588,6 +3793,7 @@ impl<T: SshWorkerRpcTransport> SshWorkerRunner<T> {
         proposal_id: &'a str,
         tool_name: &'a str,
         input_json: &'a [u8],
+        fault_injection: Option<crate::qa_fault_injection::QaFaultRuntime>,
     ) -> RunnerExecutionFuture<'a> {
         Box::pin(async move {
             let request = match build_ssh_worker_rpc_request(&self.profile, tool_name, input_json) {
@@ -3616,14 +3822,18 @@ impl<T: SshWorkerRpcTransport> SshWorkerRunner<T> {
                     );
                 }
             };
-            ssh_worker_outcome_from_rpc_result(
+            let mut outcome = ssh_worker_outcome_from_rpc_result(
                 proposal_id,
                 tool_name,
                 input_json,
                 &self.profile,
                 &request,
                 result,
-            )
+            );
+            if let Some(fault_injection) = fault_injection.as_ref() {
+                apply_cleanup_fault_to_verified_outcome(fault_injection, proposal_id, &mut outcome);
+            }
+            outcome
         })
     }
 }
@@ -3661,21 +3871,26 @@ impl<T: SshWorkerRpcTransport> ExecutionBackendRunner for SshWorkerRunner<T> {
                 )
             });
         }
-        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+        self.dispatch_remote_tool(
+            request.proposal_id,
+            request.tool_name,
+            request.input_json,
+            Some(request.fault_injection),
+        )
     }
 
     fn run_tool_program<'a>(
         &'a self,
         request: ExecutionBackendToolProgramRequest<'a>,
     ) -> RunnerExecutionFuture<'a> {
-        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json, None)
     }
 
     fn read_artifact<'a>(
         &'a self,
         request: ExecutionBackendArtifactRequest<'a>,
     ) -> RunnerExecutionFuture<'a> {
-        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json, None)
     }
 
     fn health_probe(&self) -> ExecutionBackendRunnerHealth {
@@ -5078,6 +5293,13 @@ mod tests {
     };
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
+    #[cfg(feature = "qa-fault-injection")]
+    use palyra_common::qa_fault_injection::{
+        parse_qa_fault_evidence_sidecar_ndjson, QaFaultAction, QaFaultActivation, QaFaultDirective,
+        QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan, QaFaultLaunchDocument,
+        QaFaultRecoveryClass, QA_FAULT_INJECTION_PLAN_FORMAT,
+        QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION, QA_FAULT_LAUNCH_SCHEMA_VERSION,
+    };
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use palyra_common::workspace_patch::{
         apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
@@ -5132,8 +5354,7 @@ mod tests {
         WorkspaceWritebackMode,
     };
 
-    const SAFE_DOCKER_IMAGE: &str =
-        "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const SAFE_DOCKER_IMAGE: &str = "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
     fn test_policy() -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
@@ -5305,6 +5526,7 @@ mod tests {
             cleanup: DockerCleanupAttestation {
                 strategy: "remove_container_and_volume".to_owned(),
                 container_removed: true,
+                workspace_cleanup_required: true,
                 volume_removed: true,
                 success: true,
                 reason_code: "docker.cleanup.ok".to_owned(),
@@ -6011,6 +6233,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6067,6 +6290,32 @@ mod tests {
             .contains("read-only"));
     }
 
+    #[test]
+    fn docker_exact_name_probe_requires_an_empty_container_listing() {
+        assert!(super::docker_exact_name_probe_is_empty(b"\r\n"));
+        assert!(!super::docker_exact_name_probe_is_empty(b"7a31b6e86f15\n"));
+        assert!(!super::docker_exact_name_probe_is_empty(b"probe-error"));
+    }
+
+    #[test]
+    fn docker_cleanup_evidence_marks_uncreated_workspace_as_not_required() {
+        let mut cleanup = docker_report_success().cleanup;
+        cleanup.workspace_cleanup_required = false;
+        cleanup.volume_removed = false;
+
+        let evidence = super::docker_cleanup_evidence(&cleanup);
+
+        assert!(evidence.success);
+        let workspace = evidence
+            .resources
+            .iter()
+            .find(|resource| resource.kind == "workspace_volume")
+            .expect("workspace cleanup resource should be present");
+        assert_eq!(workspace.status, "not_created");
+        assert!(!workspace.cleanup_required);
+        assert!(workspace.cleanup_verified);
+    }
+
     #[tokio::test]
     async fn docker_runner_fake_process_run_matches_local_output_schema() {
         let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
@@ -6085,6 +6334,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6128,6 +6378,214 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qa-fault-injection")]
+    #[test]
+    fn terminate_cleanup_fault_records_recovery_before_process_exit() {
+        let temporary = tempfile::tempdir().expect("cleanup evidence root should be created");
+        let plan = QaFaultInjectionPlan {
+            schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+            format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+            seed: 20260713,
+            activations: vec![QaFaultActivation {
+                id: "docker-cleanup-terminate".to_owned(),
+                point_id: "execution_backend.during_cleanup".to_owned(),
+                actor: Some("proposal-docker-cleanup-terminate".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::TerminateProcess,
+            }],
+        };
+        let launch = QaFaultLaunchDocument {
+            schema_version: QA_FAULT_LAUNCH_SCHEMA_VERSION,
+            launch_id: "docker-cleanup-terminate-launch".to_owned(),
+            plan_path: temporary.path().join("plan.json").to_string_lossy().into_owned(),
+            plan_sha256: plan.canonical_sha256().expect("cleanup plan should hash"),
+            capability_sha256: "d".repeat(64),
+            evidence_path: temporary.path().join("evidence.ndjson").to_string_lossy().into_owned(),
+            expires_at_unix_ms: i64::MAX,
+        };
+        let evidence_path = temporary.path().join("evidence.ndjson");
+        let fault_injection = crate::qa_fault_injection::QaFaultRuntime::active_for_test(
+            plan.clone(),
+            launch.clone(),
+            evidence_path.clone(),
+        )
+        .expect("cleanup fault runtime should initialize");
+        let directive = match fault_injection
+            .checkpoint("execution_backend.during_cleanup", "proposal-docker-cleanup-terminate")
+            .expect("cleanup fault checkpoint should activate")
+        {
+            QaFaultDirective::Activate(directive) => directive,
+            QaFaultDirective::Continue => panic!("cleanup fault checkpoint should not continue"),
+        };
+
+        let prepared = super::prepare_execution_backend_cleanup_fault(&fault_injection, &directive)
+            .expect("verified cleanup recovery should be persisted");
+
+        assert_eq!(prepared, super::PreparedExecutionBackendCleanupFault::TerminateProcess);
+        let evidence = fs::read(evidence_path).expect("cleanup fault evidence should be readable");
+        let parsed = parse_qa_fault_evidence_sidecar_ndjson(evidence.as_slice(), &launch, &plan)
+            .expect("cleanup fault evidence should validate");
+        assert!(matches!(
+            parsed.records().last(),
+            Some(QaFaultEvidenceSidecarRecord::RecoveryRecorded(record))
+                if record.activation_id == "docker-cleanup-terminate"
+                    && record.recovery_class == QaFaultRecoveryClass::CleanupSucceeded
+        ));
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    #[tokio::test]
+    async fn docker_runner_faults_only_after_verified_cleanup_and_records_recovery() {
+        let temporary = tempfile::tempdir().expect("cleanup evidence root should be created");
+        let plan = QaFaultInjectionPlan {
+            schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+            format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+            seed: 20260711,
+            activations: vec![QaFaultActivation {
+                id: "docker-cleanup-timeout".to_owned(),
+                point_id: "execution_backend.during_cleanup".to_owned(),
+                actor: Some("proposal-docker-cleanup-fault".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::Timeout,
+            }],
+        };
+        let launch = QaFaultLaunchDocument {
+            schema_version: QA_FAULT_LAUNCH_SCHEMA_VERSION,
+            launch_id: "docker-cleanup-launch".to_owned(),
+            plan_path: temporary.path().join("plan.json").to_string_lossy().into_owned(),
+            plan_sha256: plan.canonical_sha256().expect("cleanup plan should hash"),
+            capability_sha256: "e".repeat(64),
+            evidence_path: temporary.path().join("evidence.ndjson").to_string_lossy().into_owned(),
+            expires_at_unix_ms: i64::MAX,
+        };
+        let evidence_path = temporary.path().join("evidence.ndjson");
+        let fault_injection = crate::qa_fault_injection::QaFaultRuntime::active_for_test(
+            plan.clone(),
+            launch.clone(),
+            evidence_path.clone(),
+        )
+        .expect("cleanup fault runtime should initialize");
+        let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-cleanup-fault",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                fault_injection,
+            })
+            .await;
+
+        assert_eq!(plans.lock().expect("fake Docker plans").len(), 1);
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("qa_fault.execution_backend_cleanup_timeout"));
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("faulted outcome should retain the execution manifest");
+        assert!(manifest.cleanup.success, "fault seam must follow verified cleanup");
+        let evidence = fs::read(evidence_path).expect("cleanup fault evidence should be readable");
+        let parsed = parse_qa_fault_evidence_sidecar_ndjson(evidence.as_slice(), &launch, &plan)
+            .expect("cleanup fault evidence should validate");
+        assert!(matches!(
+            parsed.records().last(),
+            Some(QaFaultEvidenceSidecarRecord::RecoveryRecorded(record))
+                if record.activation_id == "docker-cleanup-timeout"
+                    && record.recovery_class == QaFaultRecoveryClass::CleanupSucceeded
+        ));
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    #[tokio::test]
+    async fn docker_cleanup_fault_rejects_inconsistent_required_resource_evidence() {
+        let temporary = tempfile::tempdir().expect("cleanup evidence root should be created");
+        let plan = QaFaultInjectionPlan {
+            schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+            format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+            seed: 20260712,
+            activations: vec![QaFaultActivation {
+                id: "docker-inconsistent-cleanup".to_owned(),
+                point_id: "execution_backend.during_cleanup".to_owned(),
+                actor: Some("proposal-docker-inconsistent-cleanup".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::Timeout,
+            }],
+        };
+        let launch = QaFaultLaunchDocument {
+            schema_version: QA_FAULT_LAUNCH_SCHEMA_VERSION,
+            launch_id: "docker-inconsistent-launch".to_owned(),
+            plan_path: temporary.path().join("plan.json").to_string_lossy().into_owned(),
+            plan_sha256: plan.canonical_sha256().expect("cleanup plan should hash"),
+            capability_sha256: "f".repeat(64),
+            evidence_path: temporary.path().join("evidence.ndjson").to_string_lossy().into_owned(),
+            expires_at_unix_ms: i64::MAX,
+        };
+        let evidence_path = temporary.path().join("evidence.ndjson");
+        let fault_injection = crate::qa_fault_injection::QaFaultRuntime::active_for_test(
+            plan.clone(),
+            launch.clone(),
+            evidence_path.clone(),
+        )
+        .expect("cleanup fault runtime should initialize");
+        let mut report = docker_report_success();
+        report.cleanup.container_removed = false;
+        // Deliberately preserve the aggregate bit to prove the seam validates resource evidence.
+        report.cleanup.success = true;
+        let (engine, plans) = FakeDockerEngine::new(Ok(report));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-inconsistent-cleanup",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                fault_injection,
+            })
+            .await;
+
+        assert_eq!(plans.lock().expect("fake Docker plans").len(), 1);
+        assert!(!outcome.success, "inconsistent cleanup evidence must fail closed");
+        assert!(outcome.error.contains("cleanup failed"));
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("Docker outcome should retain the execution manifest");
+        assert!(!manifest.cleanup.success, "resource evidence must override the aggregate bit");
+        assert_eq!(manifest.cleanup.reason_code, "docker.cleanup.evidence_inconsistent");
+        assert!(manifest
+            .cleanup
+            .resources
+            .iter()
+            .any(|resource| resource.kind == "container" && !resource.cleanup_verified));
+        let evidence = fs::read(evidence_path).expect("cleanup fault evidence should be readable");
+        let parsed = parse_qa_fault_evidence_sidecar_ndjson(evidence.as_slice(), &launch, &plan)
+            .expect("non-activated cleanup evidence should validate");
+        assert_eq!(parsed.records().len(), 1, "fault rule must not activate");
+        assert!(matches!(
+            parsed.records().first(),
+            Some(QaFaultEvidenceSidecarRecord::LaunchLoaded(_))
+        ));
+    }
+
     #[tokio::test]
     async fn docker_runner_materializes_vault_env_file_without_leaking_secret() {
         let (_vault_dir, vault) =
@@ -6153,6 +6611,7 @@ mod tests {
                 vault: Some(&vault),
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6198,6 +6657,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6228,6 +6688,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6264,6 +6725,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6314,6 +6776,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6353,6 +6816,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6420,6 +6884,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6489,6 +6954,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6518,6 +6984,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 
@@ -6563,6 +7030,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
 

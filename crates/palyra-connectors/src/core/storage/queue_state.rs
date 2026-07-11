@@ -133,6 +133,7 @@ impl ConnectorStore {
             FROM outbox
             WHERE connector_id = ?1
               AND status = 'pending'
+              AND effect_state = 'ready'
               AND next_attempt_unix_ms <= ?2
               AND claim_expires_unix_ms <= ?2
             "#,
@@ -161,6 +162,7 @@ impl ConnectorStore {
                 FROM outbox
                 WHERE connector_id = ?1
                   AND status = 'pending'
+                  AND effect_state = 'ready'
                 "#,
             params![connector_id],
             |row| row.get::<_, Option<i64>>(0),
@@ -171,6 +173,7 @@ impl ConnectorStore {
                 FROM outbox
                 WHERE connector_id = ?1
                   AND status = 'pending'
+                  AND effect_state = 'ready'
                 "#,
             params![connector_id],
             |row| row.get::<_, Option<i64>>(0),

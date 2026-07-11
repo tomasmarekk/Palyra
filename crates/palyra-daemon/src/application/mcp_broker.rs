@@ -41,6 +41,7 @@ mod host_policy;
 mod host_surfaces;
 mod host_transport;
 mod host_types;
+mod list_changed;
 
 pub use host_surfaces::mcp_prompt_cache_epoch;
 pub use host_types::{
@@ -1111,7 +1112,29 @@ struct McpServerRecord {
     manifest: McpServerManifest,
     state: McpServerLifecycleState,
     protocol_violations: u32,
+    catalog_generation: u64,
     imported_tools: BTreeMap<String, ToolRegistryEntry>,
+}
+
+#[derive(Debug)]
+enum McpToolInvocationPreparation {
+    Denied(Box<McpToolInvocationOutcome>),
+    Ready(Box<McpPreparedToolInvocation>),
+}
+
+impl McpToolInvocationPreparation {
+    fn denied(outcome: McpToolInvocationOutcome) -> Self {
+        Self::Denied(Box::new(outcome))
+    }
+}
+
+#[derive(Debug)]
+struct McpPreparedToolInvocation {
+    request: McpToolCallRequest,
+    server_id: String,
+    catalog_generation: u64,
+    record: McpServerRecord,
+    audit_context: McpInvocationAuditContext,
 }
 
 /// In-process MCP broker state.
@@ -1166,6 +1189,7 @@ impl McpBroker {
                 manifest,
                 state: McpServerLifecycleState::Stopped,
                 protocol_violations: 0,
+                catalog_generation: 0,
                 imported_tools: BTreeMap::new(),
             },
         );
@@ -1234,16 +1258,65 @@ impl McpBroker {
         let report = import_discovered_tools(&manifest, state, tools);
         let has_protocol_violation =
             report.filtered_tools.iter().any(mcp_discovery_filter_is_protocol_violation);
-        self.server_record_mut(server_id.as_str())?.imported_tools = report
+        let record = self.server_record_mut(server_id.as_str())?;
+        record.imported_tools = report
             .registry_entries
             .iter()
             .cloned()
             .map(|entry| (entry.name.clone(), entry))
             .collect();
+        record.catalog_generation = record.catalog_generation.saturating_add(1);
         if has_protocol_violation {
             self.record_discovery_protocol_violation(server_id.as_str())?;
         }
         Ok(report)
+    }
+
+    /// Applies one server notification to broker-owned state.
+    ///
+    /// `notifications/tools/list_changed` refreshes the catalog for future calls. Prepared calls
+    /// retain their cloned manifest and catalog generation, so a notification cannot rewrite an
+    /// invocation that is already in flight. Other well-formed notifications are left to their
+    /// owning capability and return `None`.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error for malformed JSON-RPC notifications or when catalog refresh
+    /// fails.
+    pub fn handle_server_notification(
+        &mut self,
+        server_name: &str,
+        notification: &Value,
+        transport: &dyn McpTransport,
+    ) -> Result<Option<McpToolDiscoveryReport>, McpBrokerError> {
+        let object = notification.as_object().ok_or_else(|| {
+            McpBrokerError::new(
+                "mcp.notification_invalid",
+                "MCP notification must be a JSON object",
+            )
+        })?;
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || object.contains_key("id")
+        {
+            return Err(McpBrokerError::new(
+                "mcp.notification_invalid",
+                "MCP notification must use JSON-RPC 2.0 and omit id",
+            ));
+        }
+        let method = object.get("method").and_then(Value::as_str).ok_or_else(|| {
+            McpBrokerError::new(
+                "mcp.notification_invalid",
+                "MCP notification must include a method",
+            )
+        })?;
+        if method != "notifications/tools/list_changed" {
+            return Ok(None);
+        }
+        if object.get("params").is_some_and(|params| !params.is_null() && !params.is_object()) {
+            return Err(McpBrokerError::new(
+                "mcp.notification_invalid",
+                "tools/list_changed notification params must be an object when present",
+            ));
+        }
+        self.discover_tools(server_name, transport).map(Some)
     }
 
     /// Invokes one MCP tool through host policy, approval, vault, and output gates.
@@ -1256,184 +1329,12 @@ impl McpBroker {
         request: McpToolCallRequest,
         transport: &dyn McpTransport,
     ) -> Result<McpToolInvocationOutcome, McpBrokerError> {
-        let server_id = normalize_mcp_identifier(request.server_name.as_str(), "server_name")?;
-        let namespaced_tool_id =
-            namespaced_tool_id(request.server_name.as_str(), request.tool_name.as_str())?;
-        let record = self.server_record(server_id.as_str())?.clone();
-        let transport_id = transport_id_for_manifest(&record.manifest);
-        let mut audit_context = McpInvocationAuditContext::new(
-            server_id.clone(),
-            namespaced_tool_id,
-            transport_id,
-            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
-        );
-        if record.state != McpServerLifecycleState::Healthy {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.server_not_ready",
-                format!("MCP server is {}", record.state.as_str()).as_str(),
-            ));
-        }
-        if !tool_allowed_by_manifest(&record.manifest, request.tool_name.as_str()) {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.tool_not_allowed",
-                "tool is not allowed by the MCP server manifest",
-            ));
-        }
-        let Some(registry_entry) =
-            record.imported_tools.get(audit_context.namespaced_tool_id.as_str())
-        else {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.tool_not_discovered",
-                "tool must be discovered and cataloged before invocation",
-            ));
-        };
-        audit_context.result_projection = registry_entry.projection_policy;
-        if request.schema_hash != registry_entry.schema_hash {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.schema_hash_mismatch",
-                "request schema_hash does not match the discovered MCP tool schema",
-            ));
-        }
-        if !request.policy.allowed {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.policy_denied",
-                request.policy.reason.as_str(),
-            ));
-        }
-        let approval_required = request.policy.approval_required
-            || mcp_registry_entry_requires_approval(registry_entry);
-        if approval_required && !request.approval_granted {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.approval_required",
-                "operator approval is required before this MCP tool may execute",
-            ));
-        }
-        if approval_required && !valid_optional_invocation_id(request.approval_id.as_deref()) {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.approval_id_required",
-                "operator approval must include a bounded approval id",
-            ));
-        }
-        if !request.input.is_object() {
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.input_not_object",
-                "MCP tool input must be a JSON object",
-            ));
-        }
-        match evaluate_mcp_oauth_grant(&record.manifest, current_unix_ms()) {
-            Ok(grant_id) => {
-                audit_context.oauth_grant_id = grant_id;
-            }
-            Err(error) => {
-                return Ok(denied_invocation_with_hint(
-                    &request,
-                    &audit_context,
-                    error.reason_code.as_str(),
-                    error.message.as_str(),
-                    Some(error.repair_hint.as_str()),
-                ));
+        match self.prepare_tool_invocation(request)? {
+            McpToolInvocationPreparation::Denied(outcome) => Ok(*outcome),
+            McpToolInvocationPreparation::Ready(prepared) => {
+                self.execute_prepared_tool_invocation(*prepared, transport)
             }
         }
-        match resolve_scoped_vault_grants(
-            request.vault_refs_requested.as_slice(),
-            record.manifest.vault_refs.as_slice(),
-            request.vault_scoped_grants.as_slice(),
-        ) {
-            Ok(vault_grant_ids) => {
-                audit_context.vault_grant_ids = vault_grant_ids;
-            }
-            Err(error) => {
-                return Ok(denied_invocation(
-                    &request,
-                    &audit_context,
-                    error.reason_code.as_str(),
-                    error.message.as_str(),
-                ));
-            }
-        }
-
-        let response = match transport.call_tool(&record.manifest, &request) {
-            Ok(response) => response,
-            Err(error) => {
-                self.record_protocol_violation(server_id.as_str())?;
-                return Ok(denied_invocation(
-                    &request,
-                    &audit_context,
-                    error.reason_code.as_str(),
-                    error.message.as_str(),
-                ));
-            }
-        };
-        if response.sampling_requested {
-            audit_context.sampling_model_capability = response.sampling_model_capability.clone();
-            if !host_policy::sampling_allowed_by_manifest(
-                &record.manifest,
-                response.sampling_model_capability.as_deref(),
-            ) {
-                self.record_protocol_violation(server_id.as_str())?;
-                return Ok(denied_invocation_with_hint(
-                    &request,
-                    &audit_context,
-                    "mcp.sampling_denied",
-                    "MCP sampling is denied unless this server allowlists the requested model capability",
-                    Some(
-                        "set mcp.servers[].sampling_policy.mode=allowlist and add the model capability",
-                    ),
-                ));
-            }
-        }
-        if let Some(host) = response.egress_host_requested.as_deref() {
-            if !host_allowed_by_manifest(host, record.manifest.egress_allowlist.as_slice()) {
-                self.record_protocol_violation(server_id.as_str())?;
-                return Ok(denied_invocation(
-                    &request,
-                    &audit_context,
-                    "mcp.egress_denied",
-                    "MCP tool attempted egress outside its manifest allowlist",
-                ));
-            }
-        }
-        let projected_output = project_mcp_output(
-            &response.output,
-            record.manifest.max_response_bytes,
-            audit_context.result_projection,
-        );
-        Ok(McpToolInvocationOutcome {
-            success: true,
-            output_json: projected_output.output_json.clone(),
-            error: None,
-            attestation: invocation_attestation(
-                &request,
-                &audit_context,
-                &response.output,
-                "allowed",
-                projected_output.output_truncated,
-            ),
-        })
-    }
-
-    /// Records a protocol violation and quarantines repeated offenders.
-    pub fn record_protocol_violation(
-        &mut self,
-        server_name: &str,
-    ) -> Result<McpServerLifecycleState, McpBrokerError> {
-        self.record_protocol_violation_with_policy(server_name, true)
     }
 
     fn record_discovery_protocol_violation(
@@ -4395,6 +4296,74 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.attestation.policy_outcome, "mcp.schema_hash_mismatch");
         assert_eq!(transport.call_count.get(), 0);
+    }
+
+    #[test]
+    fn tools_list_changed_notification_refreshes_future_calls_without_rewriting_in_flight_call() {
+        let initial_transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&initial_transport);
+        let stale_request = invocation_request();
+        let prepared = match broker
+            .prepare_tool_invocation(stale_request.clone())
+            .expect("initial invocation should prepare")
+        {
+            McpToolInvocationPreparation::Ready(prepared) => prepared,
+            McpToolInvocationPreparation::Denied(outcome) => {
+                panic!("initial invocation should not be denied: {outcome:?}")
+            }
+        };
+        assert_eq!(prepared.catalog_generation, 1);
+
+        let refreshed_schema = json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "integer" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        });
+        let refreshed_transport = FakeTransport {
+            tools: vec![discovered_tool_with_schema("search", refreshed_schema.clone())],
+            ..Default::default()
+        };
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        });
+        let refresh = broker
+            .handle_server_notification("docs", &notification, &refreshed_transport)
+            .expect("list_changed should refresh while the call is prepared")
+            .expect("list_changed should produce a discovery report");
+        assert_eq!(refresh.imported_count, 1);
+        assert_eq!(
+            broker
+                .server_record("docs")
+                .expect("server should remain registered")
+                .catalog_generation,
+            2
+        );
+
+        // The transport call owns the generation-one manifest and schema
+        // snapshot even though future calls now use generation two.
+        let in_flight = broker
+            .execute_prepared_tool_invocation(*prepared, &initial_transport)
+            .expect("in-flight invocation should complete against its pinned snapshot");
+        assert!(in_flight.success);
+
+        let stale = broker
+            .invoke_tool(stale_request, &refreshed_transport)
+            .expect("stale request should produce an attested denial");
+        assert!(!stale.success);
+        assert_eq!(stale.attestation.policy_outcome, "mcp.schema_hash_mismatch");
+
+        let mut refreshed_request = invocation_request();
+        refreshed_request.input = json!({"query": 42});
+        refreshed_request.schema_hash = stable_hash_value(&refreshed_schema);
+        let refreshed = broker
+            .invoke_tool(refreshed_request, &refreshed_transport)
+            .expect("generation-two request should execute");
+        assert!(refreshed.success);
     }
 
     #[test]

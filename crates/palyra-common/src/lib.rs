@@ -22,6 +22,7 @@ pub mod process_risk;
 pub mod process_runner_input;
 pub mod project_context;
 pub mod qa_evidence;
+pub mod qa_fault_injection;
 pub mod qa_scenarios;
 pub mod redaction;
 pub mod release_evals;

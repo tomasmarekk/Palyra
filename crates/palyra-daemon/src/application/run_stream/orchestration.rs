@@ -113,8 +113,9 @@ use super::{
     },
     cancellation::transition_run_stream_to_cancelled,
     tape::{
-        maybe_compact_context_after_tool_results, send_model_token_with_tape,
-        send_status_with_tape, RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
+        maybe_compact_context_after_tool_results, send_final_status_with_tape,
+        send_model_token_with_tape, send_status_with_tape,
+        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
 
@@ -909,7 +910,7 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
             runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
             return Ok(RunStreamPostProviderOutcome::Cancelled);
         }
-        let status_result = send_status_with_tape(
+        let status_result = send_final_status_with_tape(
             sender,
             runtime_state,
             run_id,
@@ -1893,7 +1894,7 @@ async fn terminate_run_stream_with_agent_loop_reason(
         )
         .await?;
     runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
-    let status_result = send_status_with_tape(
+    let status_result = send_final_status_with_tape(
         sender,
         runtime_state,
         run_id,

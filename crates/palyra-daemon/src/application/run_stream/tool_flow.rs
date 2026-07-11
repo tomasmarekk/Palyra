@@ -22,6 +22,7 @@ use std::{
 };
 
 use palyra_common::{
+    qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
         ArtifactRetentionPolicy, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
@@ -114,6 +115,9 @@ const TOOL_RESULT_MIDDLEWARE_EVENT: &str = "tool.result.middleware";
 const TOOL_REPAIR_CANDIDATE_DETECTED_EVENT: &str = "tool.repair.candidate_detected";
 const TOOL_REPAIR_ACCEPTED_EVENT: &str = "tool.repair.accepted";
 const TOOL_REPAIR_REJECTED_EVENT: &str = "tool.repair.rejected";
+const TOOL_EFFECT_STARTED_EVENT: &str = "tool_effect_started";
+
+type RunStreamProgressSender = mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>;
 
 /// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
@@ -138,6 +142,17 @@ pub(crate) struct RunStreamPreparedToolExecution {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
     backend_selection: ToolProposalBackendSelection,
+}
+
+struct PreparedToolRuntimeExecution<'a> {
+    progress_sender: Option<&'a RunStreamProgressSender>,
+    runtime_state: &'a Arc<GatewayRuntimeState>,
+    request_context: &'a RequestContext,
+    run_id: &'a str,
+    progress_tape_seq: Option<&'a mut i64>,
+    effect_started_tape_seq: Option<i64>,
+    prepared: &'a RunStreamPreparedToolExecution,
+    remaining_tool_budget: Option<SharedToolBudget>,
 }
 
 /// Result of preparing one tool proposal.
@@ -1313,20 +1328,23 @@ async fn execute_parallel_prepared_tool_group(
     // same pool, and the caller's counter is re-synced after the group joins.
     let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
     for (order, prepared) in prepared_tools.into_iter().enumerate() {
+        let effect_started_tape_seq = *tape_seq;
+        *tape_seq = (*tape_seq).saturating_add(1);
         let runtime_state = Arc::clone(runtime_state);
         let request_context = request_context.clone();
         let run_id = run_id.to_owned();
         let nested_tool_budget = nested_tool_budget.clone();
         join_set.spawn(async move {
-            match execute_prepared_tool_runtime(
-                None,
-                &runtime_state,
-                &request_context,
-                run_id.as_str(),
-                None,
-                &prepared,
-                Some(nested_tool_budget),
-            )
+            match execute_prepared_tool_runtime(PreparedToolRuntimeExecution {
+                progress_sender: None,
+                runtime_state: &runtime_state,
+                request_context: &request_context,
+                run_id: run_id.as_str(),
+                progress_tape_seq: None,
+                effect_started_tape_seq: Some(effect_started_tape_seq),
+                prepared: &prepared,
+                remaining_tool_budget: Some(nested_tool_budget),
+            })
             .await?
             {
                 Some(outcome) => {
@@ -2092,6 +2110,28 @@ fn process_progress_status_message(proposal_id: &str, progress: &ProcessProgress
 }
 
 #[allow(clippy::result_large_err)]
+pub(crate) async fn append_tool_effect_started_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: i64,
+    proposal_id: &str,
+    tool_name: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: tape_seq,
+            event_type: TOOL_EFFECT_STARTED_EVENT.to_owned(),
+            payload_json: json!({
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+            })
+            .to_string(),
+        })
+        .await
+}
+
+#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn execute_prepared_run_stream_tool_proposal(
     sender: &mpsc::Sender<
@@ -2106,15 +2146,16 @@ async fn execute_prepared_run_stream_tool_proposal(
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
-    let execution_outcome = match execute_prepared_tool_runtime(
-        Some(sender),
+    let execution_outcome = match execute_prepared_tool_runtime(PreparedToolRuntimeExecution {
+        progress_sender: Some(sender),
         runtime_state,
         request_context,
         run_id,
-        Some(tape_seq),
-        &prepared,
-        Some(nested_tool_budget.clone()),
-    )
+        progress_tape_seq: Some(tape_seq),
+        effect_started_tape_seq: None,
+        prepared: &prepared,
+        remaining_tool_budget: Some(nested_tool_budget.clone()),
+    })
     .await?
     {
         Some(outcome) => outcome,
@@ -2139,18 +2180,18 @@ async fn execute_prepared_run_stream_tool_proposal(
 
 #[allow(clippy::result_large_err)]
 async fn execute_prepared_tool_runtime(
-    progress_sender: Option<
-        &mpsc::Sender<
-            Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
-        >,
-    >,
-    runtime_state: &Arc<GatewayRuntimeState>,
-    request_context: &RequestContext,
-    run_id: &str,
-    mut progress_tape_seq: Option<&mut i64>,
-    prepared: &RunStreamPreparedToolExecution,
-    remaining_tool_budget: Option<SharedToolBudget>,
+    execution: PreparedToolRuntimeExecution<'_>,
 ) -> Result<Option<ToolExecutionOutcome>, Status> {
+    let PreparedToolRuntimeExecution {
+        progress_sender,
+        runtime_state,
+        request_context,
+        run_id,
+        mut progress_tape_seq,
+        effect_started_tape_seq,
+        prepared,
+        remaining_tool_budget,
+    } = execution;
     if !prepared.decision.allowed {
         return Ok(Some(denied_execution_outcome(
             prepared.proposal_id.as_str(),
@@ -2181,6 +2222,31 @@ async fn execute_prepared_tool_runtime(
     );
     let (process_progress_sink, mut process_progress_rx) =
         process_progress_channel_for_tool(prepared.tool_name.as_str(), progress_sender.is_some());
+    apply_tool_fault(runtime_state, "tool.before_effect", prepared.proposal_id.as_str())?;
+    if let Some(seq) = effect_started_tape_seq {
+        append_tool_effect_started_tape_event(
+            runtime_state,
+            run_id,
+            seq,
+            prepared.proposal_id.as_str(),
+            prepared.tool_name.as_str(),
+        )
+        .await?;
+    } else if let Some(tape_seq) = progress_tape_seq.as_deref_mut() {
+        append_tool_effect_started_tape_event(
+            runtime_state,
+            run_id,
+            *tape_seq,
+            prepared.proposal_id.as_str(),
+            prepared.tool_name.as_str(),
+        )
+        .await?;
+        *tape_seq = (*tape_seq).saturating_add(1);
+    } else {
+        return Err(Status::internal(
+            "tool effect start requires an assigned durable tape sequence",
+        ));
+    }
     let mut execution_future = Box::pin(
         execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
             runtime_state,
@@ -2259,6 +2325,7 @@ async fn execute_prepared_tool_runtime(
             }
         }
     };
+    apply_tool_fault(runtime_state, "tool.after_effect_before_ack", prepared.proposal_id.as_str())?;
     record_tool_execution_outcome_metrics(
         runtime_state,
         crate::gateway::ToolExecutionTraceContext {
@@ -2372,6 +2439,11 @@ async fn finalize_prepared_tool_execution_outcome(
     )
     .await?;
     runtime_state.record_tool_attestation_emitted();
+    apply_tool_fault(
+        runtime_state,
+        "tool.after_ack_before_transition",
+        prepared.proposal_id.as_str(),
+    )?;
 
     let _ = build_and_ingest_tool_result_memory_summary(
         runtime_state,
@@ -2396,6 +2468,63 @@ async fn finalize_prepared_tool_execution_outcome(
         input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
+}
+
+fn apply_tool_fault(
+    runtime_state: &GatewayRuntimeState,
+    point_id: &'static str,
+    actor: &str,
+) -> Result<(), Status> {
+    match runtime_state
+        .fault_injection
+        .checkpoint(point_id, actor)
+        .map_err(|error| Status::internal(format!("qa_fault.tool_checkpoint_failed: {error}")))?
+    {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+            QaFaultAction::Timeout => {
+                runtime_state.fault_injection.record_immediate_recovery(&directive).map_err(
+                    |error| Status::internal(format!("qa_fault.tool_recovery_failed: {error}")),
+                )?;
+                Err(Status::deadline_exceeded(format!(
+                    "qa_fault.tool_timeout: activation={}",
+                    directive.activation.id
+                )))
+            }
+            QaFaultAction::TerminateProcess => {
+                let recovery_class = match point_id {
+                    "tool.before_effect" => QaFaultRecoveryClass::FailedClosed,
+                    "tool.after_effect_before_ack" => QaFaultRecoveryClass::OutcomeUnknown,
+                    "tool.after_ack_before_transition" => QaFaultRecoveryClass::TransitionPending,
+                    _ => {
+                        return Err(Status::internal(format!(
+                            "qa_fault.tool_recovery_unclassified: {point_id}"
+                        )));
+                    }
+                };
+                runtime_state
+                    .fault_injection
+                    .record_verified_recovery(
+                        &directive,
+                        recovery_class,
+                        "qa_fault.tool_boundary_classified_before_termination",
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("qa_fault.tool_recovery_failed: {error}"))
+                    })?;
+                #[cfg(feature = "qa-fault-injection")]
+                runtime_state.fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(Status::internal(
+                    "qa_fault.feature_disabled: terminate directive reached a feature-off build",
+                ))
+            }
+            action => Err(Status::internal(format!(
+                "qa_fault.tool_action_unsupported: {}",
+                action.kind().as_str()
+            ))),
+        },
+    }
 }
 
 #[allow(clippy::result_large_err)]

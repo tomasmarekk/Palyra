@@ -16,7 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
+use palyra_common::{
+    qa_fault_injection::QaFaultProbeHandle, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
+};
 use palyra_connectors::{
     providers::default_adapters, ChannelIngressRecord, ChannelIngressStatus, ConnectorAvailability,
     ConnectorConversationTarget, ConnectorKind, ConnectorMessageDeleteRequest,
@@ -78,6 +80,15 @@ pub use discord::{
 const CHANNEL_WORKER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DEFAULT_CHANNEL_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOG_PAGE_LIMIT: usize = 100;
+#[cfg(feature = "qa-fault-injection")]
+const CONNECTOR_QA_CRASH_RECOVERY_POINTS: [&str; 6] = [
+    "connector.outbox.before_intent",
+    "connector.outbox.after_intent",
+    "connector.outbox.before_effect",
+    "connector.outbox.during_delivery",
+    "connector.outbox.after_effect_before_ack",
+    "connector.outbox.after_ack_before_transition",
+];
 
 /// Failure modes of channel-platform operations; supervisor, store, and
 /// media errors pass through transparently.
@@ -181,11 +192,39 @@ impl ChannelPlatform {
     /// Returns a store or media error when the backing databases cannot be
     /// opened, and a supervisor error when default connectors fail to
     /// register.
+    #[cfg(any(not(feature = "qa-fault-injection"), test))]
     pub fn initialize(
         grpc_url: String,
         auth: GatewayAuthConfig,
         db_path: PathBuf,
         media_config: MediaRuntimeConfig,
+    ) -> Result<Self, ChannelPlatformError> {
+        Self::initialize_with_probe(
+            grpc_url,
+            auth,
+            db_path,
+            media_config,
+            QaFaultProbeHandle::default(),
+        )
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    pub(crate) fn initialize_with_qa_fault_probe(
+        grpc_url: String,
+        auth: GatewayAuthConfig,
+        db_path: PathBuf,
+        media_config: MediaRuntimeConfig,
+        qa_fault_probe: QaFaultProbeHandle,
+    ) -> Result<Self, ChannelPlatformError> {
+        Self::initialize_with_probe(grpc_url, auth, db_path, media_config, qa_fault_probe)
+    }
+
+    fn initialize_with_probe(
+        grpc_url: String,
+        auth: GatewayAuthConfig,
+        db_path: PathBuf,
+        media_config: MediaRuntimeConfig,
+        qa_fault_probe: QaFaultProbeHandle,
     ) -> Result<Self, ChannelPlatformError> {
         let store = Arc::new(palyra_connectors::ConnectorStore::open(db_path)?);
         let media_store = Arc::new(MediaArtifactStore::open(
@@ -196,12 +235,20 @@ impl ChannelPlatform {
         let router =
             Arc::new(GrpcChannelRouter { grpc_url, auth, media_store: Arc::clone(&media_store) });
         let supervisor_config = connector_supervisor_config_from_env()?;
-        let supervisor = Arc::new(ConnectorSupervisor::new(
+        let supervisor = ConnectorSupervisor::new(
             Arc::clone(&store),
             router,
             default_adapters(),
             supervisor_config.clone(),
-        ));
+        );
+        #[cfg(feature = "qa-fault-injection")]
+        let supervisor = supervisor.with_qa_fault_probe(qa_fault_probe);
+        #[cfg(not(feature = "qa-fault-injection"))]
+        let supervisor = {
+            let _ = qa_fault_probe;
+            supervisor
+        };
+        let supervisor = Arc::new(supervisor);
         let platform = Self {
             supervisor,
             media_store,
@@ -210,6 +257,54 @@ impl ChannelPlatform {
         };
         platform.ensure_default_connector_inventory()?;
         Ok(platform)
+    }
+
+    /// Reconciles connector-owned crash boundaries before the generic QA startup sweep.
+    ///
+    /// Connector recovery must be proved from the durable outbox fence. Recording a generic
+    /// outcome first would make a claimed row wait for its lease expiry and could misclassify an
+    /// effect whose delivery had already started.
+    ///
+    /// # Errors
+    /// Returns a precondition error when evidence cannot be inspected or recorded, and a
+    /// supervisor error when the exact outbox actor does not have the expected durable state.
+    #[cfg(feature = "qa-fault-injection")]
+    pub(crate) fn reconcile_pending_qa_fault_recoveries(
+        &self,
+        runtime: &crate::qa_fault_injection::QaFaultRuntime,
+    ) -> Result<usize, ChannelPlatformError> {
+        let mut recovered = 0usize;
+        for point_id in CONNECTOR_QA_CRASH_RECOVERY_POINTS {
+            let actors =
+                runtime.pending_activation_actors_for_point(point_id).map_err(|error| {
+                    ChannelPlatformError::Precondition(format!(
+                        "failed to inspect pending connector QA activations at {point_id}: {error}"
+                    ))
+                })?;
+            for actor in actors {
+                let recovery_class =
+                    self.supervisor.reconcile_pending_qa_fault_actor(point_id, actor.as_str())?;
+                let recorded = runtime
+                    .record_pending_recovery_for_point_actor(
+                        point_id,
+                        actor.as_str(),
+                        recovery_class,
+                        "qa_fault.connector_store_recovery_proved",
+                    )
+                    .map_err(|error| {
+                        ChannelPlatformError::Precondition(format!(
+                            "failed to record connector QA recovery at {point_id} for {actor}: {error}"
+                        ))
+                    })?;
+                if !recorded {
+                    return Err(ChannelPlatformError::Precondition(format!(
+                        "connector QA recovery at {point_id} for {actor} lost its pending activation"
+                    )));
+                }
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
     }
 
     /// Lists connector statuses, hiding deferred connectors from the

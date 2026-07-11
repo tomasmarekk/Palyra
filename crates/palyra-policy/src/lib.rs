@@ -263,6 +263,9 @@ when {
 };
 "#;
 
+const POLICY_EVALUATION_MIN_STACK_BYTES: usize = 2 * 1024 * 1024;
+const POLICY_EVALUATION_STACK_BYTES: usize = 2 * 1024 * 1024;
+
 // INTENTIONAL: these reason strings are mapped to stable reason codes in
 // `policy_reason_code` and may be pinned by golden fixtures in consuming crates —
 // keep them byte-identical when editing.
@@ -392,8 +395,14 @@ pub fn evaluate_with_context(
     let cedar_request = Request::new(principal_uid, action_uid, resource_uid, context, None)
         .map_err(|error| PolicyEngineError::InvalidRequest { message: error.to_string() })?;
 
-    let response =
-        Authorizer::new().is_authorized(&cedar_request, default_policy_set()?, &entities);
+    let policy_set = default_policy_set()?;
+    // Policy checks can run deep in async request handling. Reserve stack headroom here so
+    // Cedar's fail-closed recursion guard reflects policy depth instead of caller stack usage.
+    let response = stacker::maybe_grow(
+        POLICY_EVALUATION_MIN_STACK_BYTES,
+        POLICY_EVALUATION_STACK_BYTES,
+        || Authorizer::new().is_authorized(&cedar_request, policy_set, &entities),
+    );
 
     let mut matched_policy_ids =
         response.diagnostics().reason().map(ToString::to_string).collect::<Vec<_>>();
@@ -1546,6 +1555,43 @@ mod tests {
         )
         .expect("well-formed request evaluates without engine error");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn approved_sensitive_tool_evaluates_on_bounded_worker_stack() {
+        let evaluation = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                evaluate_with_context(
+                    &PolicyRequest {
+                        principal: "user:qa".to_owned(),
+                        action: "tool.execute".to_owned(),
+                        resource: "tool:palyra.fs.apply_patch".to_owned(),
+                    },
+                    &PolicyRequestContext {
+                        channel: Some("qa".to_owned()),
+                        session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+                        run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
+                        tool_name: Some("palyra.fs.apply_patch".to_owned()),
+                        capabilities: vec!["filesystem_write".to_owned()],
+                        ..PolicyRequestContext::default()
+                    },
+                    &PolicyEvaluationConfig {
+                        allowlisted_tools: vec!["palyra.fs.apply_patch".to_owned()],
+                        allow_sensitive_tools: true,
+                        sensitive_tool_names: vec!["palyra.fs.apply_patch".to_owned()],
+                        sensitive_capability_names: vec!["filesystem_write".to_owned()],
+                        ..PolicyEvaluationConfig::default()
+                    },
+                )
+            })
+            .expect("bounded worker thread should start")
+            .join()
+            .expect("policy evaluation should not panic on a bounded worker stack")
+            .expect("well-formed request evaluates without engine diagnostics");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(evaluation.explanation.diagnostics_errors.is_empty());
     }
 
     #[test]

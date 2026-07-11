@@ -13,7 +13,7 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    io::{Read, Write as IoWrite},
+    io::{self, Read, Write as IoWrite},
     path::{Component, Path, PathBuf},
 };
 
@@ -21,7 +21,13 @@ use anyhow::{Context, Result};
 use palyra_auth::{AuthProfileRecord, AuthProfileRegistry, AuthProviderKind};
 use palyra_common::{
     build_metadata, default_identity_store_root,
-    qa_evidence::{build_qa_evidence_bundle, QaArtifactEvidence, QaEvidenceBundle},
+    qa_evidence::{
+        build_qa_evidence_bundle, qa_fault_injection_evidence_from_sidecar, QaEvidenceBundle,
+    },
+    qa_fault_injection::{
+        QaFaultAction, QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan,
+        QA_FAULT_TERMINATE_EXIT_CODE,
+    },
     qa_scenarios::{
         QaScenarioArtifactKind, QaScenarioLiveProviderKind, QaScenarioManifest,
         QaScenarioRunnerMode,
@@ -41,16 +47,21 @@ use crate::commands;
 use serde_json::json;
 
 use self::{
-    observations::collect_scenario_observations,
-    process::{QaDaemonSandbox, QaDaemonShutdown},
+    observations::{
+        collect_recovered_scenario_observations, collect_scenario_observations, QaRunDeadline,
+        QaScenarioObservations,
+    },
+    process::{QaDaemonSandbox, QaDaemonShutdown, QaFailureDiagnostics},
 };
 
 const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 2;
 const EXECUTION_RESULT_FORMAT: &str = "palyra-qa-scenario-execution-result";
 const EXECUTION_KEY_SCHEMA_VERSION: u32 = 1;
 const EXECUTION_KEY_FORMAT: &str = "palyra-qa-scenario-execution-key";
-pub(crate) const QA_RUNNER_CONTRACT_VERSION: &str = "qa-runner.v2";
+pub(crate) const QA_RUNNER_CONTRACT_VERSION: &str = "qa-runner.v3";
 const QA_DAEMON_BIN_ENV: &str = "PALYRA_QA_PALYRAD_BIN";
+const MAX_EVIDENCE_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FAILURE_DIAGNOSTICS_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Content-addressed identity for one scenario/runtime/provider binding.
 ///
@@ -102,6 +113,18 @@ pub(crate) struct QaExecutionArtifactRef {
     pub(crate) kind: String,
     pub(crate) sha256: String,
     pub(crate) size_bytes: u64,
+}
+
+/// Manifest-facing alias bound to one physically persisted evidence artifact.
+///
+/// The alias is never presented as a filesystem path containing the physical
+/// bytes. Its nested reference carries the only digest of the immutable file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct QaEvidenceOutputBinding {
+    /// Manifest-declared logical output name; it is not read as a physical file.
+    pub(crate) logical_alias: String,
+    /// Immutable artifact that contains the bytes and their exact digest.
+    pub(crate) artifact: QaExecutionArtifactRef,
 }
 
 /// Explicit teardown outcome for the isolated scenario runtime.
@@ -205,6 +228,8 @@ pub(crate) struct QaScenarioExecutionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_state: Option<String>,
     pub(crate) evidence_artifacts: Vec<QaExecutionArtifactRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) evidence_output_bindings: Vec<QaEvidenceOutputBinding>,
     pub(crate) cleanup: QaScenarioCleanupResult,
 }
 
@@ -260,6 +285,11 @@ pub(crate) fn qa_scenario_execution_result_schema_snapshot() -> Value {
         ],
         "optional_attempt_fields": ["previous_result_artifact"],
         "optional_runtime_fields": ["run_id", "session_id", "terminal_state"],
+        "optional_result_fields": ["evidence_output_bindings"],
+        "evidence_output_binding": {
+            "logical_alias": "manifest_relative_path",
+            "artifact": "artifact_reference"
+        },
         "artifact_reference": {
             "path": "relative_no_parent_components",
             "sha256": "lowercase_hex_64",
@@ -762,8 +792,15 @@ pub(crate) async fn execute_prepared_scenario(
     );
     let result_path =
         scenario_result_artifact_path(request.execution_id.as_str(), &request.execution_key);
+    let failure_diagnostics_path = scenario_artifact_path(
+        request.execution_id.as_str(),
+        request.execution_key.digest.as_str(),
+        "failure-diagnostics.json",
+    );
     let mut sandbox = QaDaemonSandbox::spawn(manifest, prepared)?;
-    let observation_result = collect_scenario_observations(manifest, &mut sandbox).await;
+    let deadline = QaRunDeadline::new(manifest)?;
+    let observation_result =
+        collect_observations_with_fault_recovery(manifest, &mut sandbox, deadline).await;
     let terminal_observed =
         observation_result.as_ref().is_ok_and(|observations| observations.terminal_observed);
     let run_id = observation_result
@@ -779,40 +816,69 @@ pub(crate) async fn execute_prepared_scenario(
     let terminal_state =
         observation_result.as_ref().ok().map(|observations| observations.terminal_state.clone());
     let runtime_health = sandbox.runtime_health().clone();
-
-    // Teardown is deliberately performed before any fallible artifact write,
-    // so a full disk or invalid destination cannot strand the child runtime.
-    let session_cleaned = sandbox.cleanup_active_session().await;
-    let shutdown = sandbox.shutdown();
+    let observation_failure_code = observation_result.as_ref().err().map(stable_runner_error_code);
+    let mut failure_diagnostics_artifact = None;
+    let mut failure_diagnostics_write_error = None;
+    let (session_cleaned, shutdown) = if let Some(failure_reason_code) =
+        observation_failure_code.as_deref()
+    {
+        // Failed streams can leave the control plane unable to clean up itself. Quiesce the
+        // child before reading its durable state, but retain the TempDir until the bundle lands.
+        let session_cleaned = sandbox.active_session_id().is_none();
+        let daemon_terminated = sandbox.terminate_for_failure_diagnostics();
+        let diagnostics = sandbox.failure_diagnostics(
+            request.runner_version.as_str(),
+            prepared.runtime_version.as_str(),
+            failure_reason_code,
+            daemon_terminated,
+        );
+        let diagnostics_write =
+            encode_failure_diagnostics_artifact(&diagnostics).and_then(|bytes| {
+                if sandbox.contains_secret(bytes.as_slice()) {
+                    Err(anyhow::anyhow!("qa.runner.secret_leak_detected"))
+                } else {
+                    write_artifact_bytes(
+                        artifact_root,
+                        failure_diagnostics_path.as_path(),
+                        "failure_diagnostics",
+                        bytes.as_slice(),
+                    )
+                }
+            });
+        match diagnostics_write {
+            Ok(reference) => failure_diagnostics_artifact = Some(reference),
+            Err(error) => failure_diagnostics_write_error = Some(stable_runner_error_code(&error)),
+        }
+        let workspace_removed = sandbox.remove_state_root();
+        (session_cleaned, QaDaemonShutdown { daemon_terminated, workspace_removed })
+    } else {
+        // Successful observations retain the established API cleanup path and still remove the
+        // isolated root before any evidence write can fail.
+        let session_cleaned = sandbox.cleanup_active_session().await;
+        let shutdown = sandbox.shutdown();
+        (session_cleaned, shutdown)
+    };
     let cleanup = cleanup_result(terminal_observed, session_cleaned, shutdown);
     let mut reason_codes = cleanup.reason_codes.clone();
-    let mut evidence_artifacts = Vec::new();
+    reason_codes.extend(failure_diagnostics_write_error);
+    let mut evidence_artifacts = failure_diagnostics_artifact.into_iter().collect::<Vec<_>>();
+    let mut evidence_output_bindings = Vec::new();
     let mut evidence_passed = false;
     match observation_result {
         Ok(observations) => {
-            let mut evidence_input = observations.evidence;
-            let logical_evidence_path = manifest
+            let mut runtime_manifest = manifest.clone();
+            // Runner-owned evidence bytes do not exist until this bundle is
+            // serialized. Their output contract is checked against the
+            // immutable write below, outside the runtime-observation engine.
+            runtime_manifest
                 .artifacts
-                .iter()
-                .find(|artifact| artifact.kind == QaScenarioArtifactKind::Evidence)
-                .map(|artifact| artifact.path.clone())
-                .unwrap_or_else(|| display_path_slash(evidence_path.as_path()));
-            evidence_input.artifacts.push(QaArtifactEvidence {
-                path: logical_evidence_path,
-                kind: QaScenarioArtifactKind::Evidence.as_str().to_owned(),
-                present: true,
-                // The evidence builder normalizes hashes in its serialized
-                // artifact index, so this placeholder avoids a self-hash cycle.
-                sha256: Some("0".repeat(64)),
-                size_bytes: None,
-            });
-            let evidence = build_qa_evidence_bundle(manifest, evidence_input);
+                .retain(|artifact| artifact.kind != QaScenarioArtifactKind::Evidence);
+            let evidence = build_qa_evidence_bundle(&runtime_manifest, observations.evidence);
             reason_codes.extend(evidence_reason_codes(&evidence));
-            evidence_passed = evidence.summary.verdict.as_str() == "passed";
-            let evidence_bytes =
-                serde_json::to_vec_pretty(&evidence).context("qa.runner.artifact_encode_failed")?;
-            let evidence_write = if sandbox.contains_live_secret(evidence_bytes.as_slice()) {
-                Err(anyhow::anyhow!("qa.runner.live_secret_leak_detected"))
+            let runtime_evidence_passed = evidence.summary.verdict.as_str() == "passed";
+            let evidence_bytes = encode_evidence_artifact(&evidence)?;
+            let evidence_write = if sandbox.contains_secret(evidence_bytes.as_slice()) {
+                Err(anyhow::anyhow!("qa.runner.secret_leak_detected"))
             } else {
                 write_artifact_bytes(
                     artifact_root,
@@ -822,7 +888,14 @@ pub(crate) async fn execute_prepared_scenario(
                 )
             };
             match evidence_write {
-                Ok(reference) => evidence_artifacts.push(reference),
+                Ok(reference) => {
+                    let output_contract = bind_evidence_outputs(manifest, &reference);
+                    evidence_passed =
+                        runtime_evidence_passed && output_contract.reason_codes.is_empty();
+                    reason_codes.extend(output_contract.reason_codes);
+                    evidence_output_bindings = output_contract.bindings;
+                    evidence_artifacts.push(reference);
+                }
                 Err(error) => {
                     evidence_passed = false;
                     reason_codes.push(stable_runner_error_code(&error));
@@ -858,13 +931,14 @@ pub(crate) async fn execute_prepared_scenario(
         session_id,
         terminal_state,
         evidence_artifacts,
+        evidence_output_bindings,
         cleanup,
     };
     validate_execution_result(&result)?;
     let result_bytes =
         serde_json::to_vec_pretty(&result).context("qa.runner.artifact_encode_failed")?;
-    if sandbox.contains_live_secret(result_bytes.as_slice()) {
-        anyhow::bail!("qa.runner.live_secret_leak_detected");
+    if sandbox.contains_secret(result_bytes.as_slice()) {
+        anyhow::bail!("qa.runner.secret_leak_detected");
     }
     let result_artifact = write_artifact_bytes(
         artifact_root,
@@ -873,6 +947,90 @@ pub(crate) async fn execute_prepared_scenario(
         result_bytes.as_slice(),
     )?;
     Ok(QaScenarioExecutionReport { result, result_artifact })
+}
+
+async fn collect_observations_with_fault_recovery(
+    manifest: &QaScenarioManifest,
+    sandbox: &mut QaDaemonSandbox,
+    deadline: QaRunDeadline,
+) -> Result<QaScenarioObservations> {
+    let initial = collect_scenario_observations(manifest, sandbox, deadline).await;
+    let Some(plan) = manifest.fault_injection.as_ref() else {
+        return initial;
+    };
+    let expected =
+        manifest.expect.fault_injection.as_ref().context("qa.runner.fault_expectations_missing")?;
+    if expected.daemon_restarts == 0 {
+        let mut observations = initial?;
+        attach_fault_evidence(plan, sandbox, &mut observations)?;
+        return Ok(observations);
+    }
+    if expected.daemon_restarts != 1
+        || plan
+            .activations
+            .iter()
+            .filter(|activation| matches!(&activation.action, QaFaultAction::TerminateProcess))
+            .count()
+            != 1
+    {
+        anyhow::bail!("qa.runner.unsupported_fault_restart_plan");
+    }
+    let initial_error = match initial {
+        Ok(_) => anyhow::bail!("qa.runner.expected_fault_exit_not_observed"),
+        Err(error) => error,
+    };
+    let terminate_activation_id = plan
+        .activations
+        .iter()
+        .find(|activation| matches!(&activation.action, QaFaultAction::TerminateProcess))
+        .map(|activation| activation.id.as_str())
+        .context("qa.runner.expected_fault_activation_missing")?;
+    let exit_budget = deadline.step_budget()?;
+    deadline.normalize_sync_result(
+        sandbox.wait_for_expected_exit(QA_FAULT_TERMINATE_EXIT_CODE, exit_budget),
+    )?;
+    let sidecar = match sandbox.fault_evidence_sidecar() {
+        Ok(Some(sidecar)) => sidecar,
+        Ok(None) | Err(_) => return Err(initial_error),
+    };
+    // A complete sidecar read is trustworthy only after the writer has exited and the
+    // child has been reaped. The durable activation then binds the stream failure to the
+    // declared terminate rule instead of an unrelated observation failure.
+    if !fault_activation_recorded(sidecar.records(), terminate_activation_id) {
+        return Err(initial_error);
+    }
+    let restart_budget = deadline.step_budget()?;
+    deadline.normalize_sync_result(sandbox.restart_preserving_state(restart_budget))?;
+    let mut observations = collect_recovered_scenario_observations(sandbox, deadline).await?;
+    attach_fault_evidence(plan, sandbox, &mut observations)?;
+    Ok(observations)
+}
+
+fn fault_activation_recorded(
+    records: &[QaFaultEvidenceSidecarRecord],
+    activation_id: &str,
+) -> bool {
+    records.iter().any(|record| {
+        matches!(
+            record,
+            QaFaultEvidenceSidecarRecord::RuleActivated(activation)
+                if activation.activation_id == activation_id
+                    && matches!(&activation.action, QaFaultAction::TerminateProcess)
+        )
+    })
+}
+
+fn attach_fault_evidence(
+    plan: &QaFaultInjectionPlan,
+    sandbox: &QaDaemonSandbox,
+    observations: &mut QaScenarioObservations,
+) -> Result<()> {
+    let sidecar = sandbox.fault_evidence_sidecar()?.context("qa.runner.fault_evidence_missing")?;
+    observations.evidence.fault_injections =
+        qa_fault_injection_evidence_from_sidecar(&sidecar, plan)
+            .context("qa.runner.fault_evidence_projection_failed")?;
+    observations.evidence.daemon_restart_count = sandbox.daemon_restarts();
+    Ok(())
 }
 
 fn validate_execution_result(result: &QaScenarioExecutionResult) -> Result<()> {
@@ -898,20 +1056,43 @@ fn validate_execution_result(result: &QaScenarioExecutionResult) -> Result<()> {
         && (result.run_id.is_none()
             || result.session_id.is_none()
             || result.terminal_state.is_none()
-            || result.evidence_artifacts.is_empty()
+            || !result
+                .evidence_artifacts
+                .iter()
+                .any(|artifact| artifact.kind == QaScenarioArtifactKind::Evidence.as_str())
             || !result.cleanup.verified)
     {
         anyhow::bail!("qa.runner.execution_result_incomplete");
     }
     for reference in &result.evidence_artifacts {
-        let path = Path::new(reference.path.as_str());
-        if path.is_absolute()
-            || path.components().any(|component| !matches!(component, Component::Normal(_)))
-            || reference.sha256.len() != 64
-            || !reference.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        validate_execution_artifact_reference(reference)?;
+    }
+    let mut logical_aliases = BTreeSet::new();
+    for binding in &result.evidence_output_bindings {
+        let alias = Path::new(binding.logical_alias.as_str());
+        if binding.logical_alias.trim().is_empty()
+            || alias.is_absolute()
+            || alias.components().any(|component| !matches!(component, Component::Normal(_)))
+            || !logical_aliases.insert(binding.logical_alias.as_str())
+            || binding.artifact.kind != QaScenarioArtifactKind::Evidence.as_str()
+            || !result.evidence_artifacts.contains(&binding.artifact)
         {
-            anyhow::bail!("qa.runner.execution_artifact_reference_invalid");
+            anyhow::bail!("qa.runner.evidence_output_binding_invalid");
         }
+        validate_execution_artifact_reference(&binding.artifact)?;
+    }
+    Ok(())
+}
+
+fn validate_execution_artifact_reference(reference: &QaExecutionArtifactRef) -> Result<()> {
+    let path = Path::new(reference.path.as_str());
+    if path.is_absolute()
+        || path.components().any(|component| !matches!(component, Component::Normal(_)))
+        || reference.kind.trim().is_empty()
+        || reference.sha256.len() != 64
+        || !reference.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("qa.runner.execution_artifact_reference_invalid");
     }
     Ok(())
 }
@@ -942,6 +1123,74 @@ pub(crate) fn scenario_result_artifact_path(
     execution_key: &QaScenarioExecutionKey,
 ) -> PathBuf {
     scenario_artifact_path(execution_id, execution_key.digest.as_str(), "result.json")
+}
+
+fn encode_evidence_artifact(evidence: &QaEvidenceBundle) -> Result<Vec<u8>> {
+    encode_evidence_artifact_with_limit(evidence, MAX_EVIDENCE_ARTIFACT_BYTES)
+}
+
+fn encode_evidence_artifact_with_limit<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    encode_bounded_json_artifact(value, max_bytes, "qa.runner.evidence_artifact_limit_exceeded")
+}
+
+fn encode_failure_diagnostics_artifact(diagnostics: &QaFailureDiagnostics) -> Result<Vec<u8>> {
+    encode_bounded_json_artifact(
+        diagnostics,
+        MAX_FAILURE_DIAGNOSTICS_ARTIFACT_BYTES,
+        "qa.runner.failure_diagnostics_artifact_limit_exceeded",
+    )
+}
+
+fn encode_bounded_json_artifact<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+    limit_error_code: &'static str,
+) -> Result<Vec<u8>> {
+    let mut output = BoundedJsonBuffer::new(max_bytes);
+    let serialization = serde_json::to_writer_pretty(&mut output, value);
+    if output.limit_exceeded {
+        anyhow::bail!("{limit_error_code}");
+    }
+    serialization.context("qa.runner.artifact_encode_failed")?;
+    Ok(output.bytes)
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(16 * 1024)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl IoWrite for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if json_write_exceeds_limit(self.bytes.len(), buffer.len(), self.max_bytes) {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("bounded evidence JSON limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_write_exceeds_limit(current: usize, incoming: usize, max_bytes: usize) -> bool {
+    incoming > max_bytes.saturating_sub(current)
 }
 
 #[cfg(test)]
@@ -1173,6 +1422,37 @@ fn evidence_reason_codes(evidence: &QaEvidenceBundle) -> Vec<String> {
     codes
 }
 
+struct QaEvidenceOutputContract {
+    bindings: Vec<QaEvidenceOutputBinding>,
+    reason_codes: Vec<String>,
+}
+
+fn bind_evidence_outputs(
+    manifest: &QaScenarioManifest,
+    physical: &QaExecutionArtifactRef,
+) -> QaEvidenceOutputContract {
+    let mut bindings = Vec::new();
+    let mut reason_codes = Vec::new();
+    for expected in manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == QaScenarioArtifactKind::Evidence)
+    {
+        bindings.push(QaEvidenceOutputBinding {
+            logical_alias: expected.path.clone(),
+            artifact: physical.clone(),
+        });
+        if expected.required
+            && expected.sha256.as_deref().is_some_and(|digest| digest != physical.sha256)
+        {
+            reason_codes.push("artifact_digest_mismatch".to_owned());
+        }
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
+    QaEvidenceOutputContract { bindings, reason_codes }
+}
+
 fn cleanup_result(
     terminal_observed: bool,
     session_cleaned: bool,
@@ -1222,6 +1502,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn fault_recovery_requires_matching_terminate_activation_evidence() {
+        let activation = QaFaultEvidenceSidecarRecord::RuleActivated(
+            palyra_common::qa_fault_injection::QaFaultRuleActivatedRecord {
+                schema_version: 1,
+                sequence: 2,
+                launch_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                plan_sha256: "a".repeat(64),
+                activation_id: "tool-effect-before-ack".to_owned(),
+                point_id: "tool.after_effect_before_ack".to_owned(),
+                actors: vec!["qa-fault-mutation".to_owned()],
+                occurrence: 1,
+                action: QaFaultAction::TerminateProcess,
+                activation_sequence: 1,
+                release_order: vec!["qa-fault-mutation".to_owned()],
+            },
+        );
+
+        assert!(!fault_activation_recorded(&[], "tool-effect-before-ack"));
+        assert!(!fault_activation_recorded(
+            std::slice::from_ref(&activation),
+            "different-activation"
+        ));
+        assert!(fault_activation_recorded(
+            std::slice::from_ref(&activation),
+            "tool-effect-before-ack"
+        ));
+    }
 
     #[test]
     fn artifact_paths_are_execution_unique_and_collision_resistant() {
@@ -1354,6 +1663,7 @@ mod tests {
             session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".to_owned()),
             terminal_state: None,
             evidence_artifacts: Vec::new(),
+            evidence_output_bindings: Vec::new(),
             cleanup: QaScenarioCleanupResult {
                 run_terminal_observed: false,
                 session_cleaned: true,
@@ -1371,6 +1681,134 @@ mod tests {
         assert_eq!(decoded, result);
         assert!(value.get("transcript").is_none());
         assert!(value.get("tape_events").is_none());
+    }
+
+    #[test]
+    fn passed_execution_result_requires_a_physical_evidence_artifact() {
+        let failure_diagnostics = QaExecutionArtifactRef {
+            path: "executions/test/failure-diagnostics.json".to_owned(),
+            kind: "failure_diagnostics".to_owned(),
+            sha256: "2".repeat(64),
+            size_bytes: 128,
+        };
+        let mut result = QaScenarioExecutionResult {
+            schema_version: EXECUTION_RESULT_SCHEMA_VERSION,
+            format: EXECUTION_RESULT_FORMAT.to_owned(),
+            execution_key: test_execution_key(),
+            attempt: QaScenarioAttemptProvenance {
+                generation: 1,
+                runner_version: "qa-runner.test".to_owned(),
+                runtime_version: "palyrad-test".to_owned(),
+                runtime_contract_version: "runtime-contracts.test".to_owned(),
+                palyrad_binary_sha256: "1".repeat(64),
+                palyrad_version: "0.1.0".to_owned(),
+                palyrad_git_hash: "test".to_owned(),
+                palyrad_build_profile: "debug".to_owned(),
+                previous_result_artifact: None,
+            },
+            execution_id: "01ARZ3NDEKTSV4RRFFQ69G5FAT".to_owned(),
+            scenario_id: "qa.result".to_owned(),
+            runner_mode: "fixture".to_owned(),
+            verdict: "passed".to_owned(),
+            reason_codes: Vec::new(),
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".to_owned()),
+            session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            terminal_state: Some("completed".to_owned()),
+            evidence_artifacts: vec![failure_diagnostics],
+            evidence_output_bindings: Vec::new(),
+            cleanup: QaScenarioCleanupResult {
+                run_terminal_observed: true,
+                session_cleaned: true,
+                daemon_terminated: true,
+                workspace_removed: true,
+                verified: true,
+                reason_codes: vec!["qa.runner.cleanup_verified".to_owned()],
+            },
+        };
+
+        let error = validate_execution_result(&result)
+            .expect_err("failure diagnostics alone must not prove a passing execution");
+        assert_eq!(error.to_string(), "qa.runner.execution_result_incomplete");
+
+        let mut failed = result.clone();
+        failed.verdict = "failed".to_owned();
+        validate_execution_result(&failed)
+            .expect("v2 failed results may retain only failure diagnostics");
+
+        result.evidence_artifacts.push(QaExecutionArtifactRef {
+            path: "executions/test/evidence.json".to_owned(),
+            kind: QaScenarioArtifactKind::Evidence.as_str().to_owned(),
+            sha256: "3".repeat(64),
+            size_bytes: 256,
+        });
+        validate_execution_result(&result)
+            .expect("a physical evidence artifact should satisfy the passing v2 contract");
+    }
+
+    #[test]
+    fn evidence_output_binding_keeps_the_alias_distinct_from_physical_bytes() {
+        let manifest = palyra_common::qa_scenarios::parse_qa_scenario_manifest_yaml(include_str!(
+            "../../../../qa/scenarios/real_runtime/text_exact.yaml"
+        ))
+        .expect("scenario manifest should parse");
+        let physical = QaExecutionArtifactRef {
+            path: "executions/execution-id/key/evidence.json".to_owned(),
+            kind: QaScenarioArtifactKind::Evidence.as_str().to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 128,
+        };
+
+        let contract = bind_evidence_outputs(&manifest, &physical);
+
+        assert!(contract.reason_codes.is_empty());
+        assert_eq!(contract.bindings.len(), 1);
+        assert_eq!(
+            contract.bindings[0].logical_alias,
+            "qa/reports/real_runtime/text_exact.evidence.json"
+        );
+        assert_ne!(contract.bindings[0].logical_alias, physical.path);
+        assert_eq!(contract.bindings[0].artifact, physical);
+    }
+
+    #[test]
+    fn evidence_output_digest_is_checked_against_the_physical_reference() {
+        let mut manifest = palyra_common::qa_scenarios::parse_qa_scenario_manifest_yaml(
+            include_str!("../../../../qa/scenarios/real_runtime/text_exact.yaml"),
+        )
+        .expect("scenario manifest should parse");
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.kind == QaScenarioArtifactKind::Evidence)
+            .expect("scenario should declare evidence output")
+            .sha256 = Some("b".repeat(64));
+        let physical = QaExecutionArtifactRef {
+            path: "executions/execution-id/key/evidence.json".to_owned(),
+            kind: QaScenarioArtifactKind::Evidence.as_str().to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 128,
+        };
+
+        let contract = bind_evidence_outputs(&manifest, &physical);
+
+        assert_eq!(contract.reason_codes, vec!["artifact_digest_mismatch"]);
+        assert_eq!(contract.bindings[0].artifact.sha256, physical.sha256);
+    }
+
+    #[test]
+    fn evidence_json_writer_rejects_before_crossing_the_64_mib_cap() {
+        assert_eq!(MAX_EVIDENCE_ARTIFACT_BYTES, 64 * 1024 * 1024);
+        assert!(json_write_exceeds_limit(
+            MAX_EVIDENCE_ARTIFACT_BYTES,
+            1,
+            MAX_EVIDENCE_ARTIFACT_BYTES,
+        ));
+        let payload = json!({"payload": "x".repeat(128)});
+
+        let error = encode_evidence_artifact_with_limit(&payload, 64)
+            .expect_err("pretty JSON larger than the configured cap must be rejected");
+
+        assert_eq!(error.to_string(), "qa.runner.evidence_artifact_limit_exceeded");
     }
 
     fn test_execution_key() -> QaScenarioExecutionKey {

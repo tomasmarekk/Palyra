@@ -279,15 +279,21 @@ mod tests {
         assert_eq!(ack.external_message_id.as_deref(), Some("native-1"));
         assert_eq!(ack.idempotency_key, "echo:default:env-1:0");
 
-        let unknown = DeliveryOutcome::Retry {
+        let safe_retry = DeliveryOutcome::Retry {
             class: RetryClass::RateLimit,
             reason: "retry later".to_owned(),
             retry_after_ms: Some(250),
         }
         .to_receipt(&request);
+        assert_eq!(safe_retry.state, DeliveryReceiptState::Unknown);
+        assert_eq!(safe_retry.retry_after_ms, Some(250));
+        assert!(safe_retry.reason.as_deref().is_some_and(|reason| reason.contains("rate_limit")));
+
+        let unknown = DeliveryOutcome::OutcomeUnknown { reason: "response lost".to_owned() }
+            .to_receipt(&request);
         assert_eq!(unknown.state, DeliveryReceiptState::Unknown);
-        assert_eq!(unknown.retry_after_ms, Some(250));
-        assert!(unknown.reason.as_deref().is_some_and(|reason| reason.contains("rate_limit")));
+        assert_eq!(unknown.retry_after_ms, None);
+        assert_eq!(unknown.reason.as_deref(), Some("response lost"));
 
         let nack = DeliveryOutcome::PermanentFailure { reason: "message rejected".to_owned() }
             .to_receipt(&request);

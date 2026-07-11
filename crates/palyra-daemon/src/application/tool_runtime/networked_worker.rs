@@ -303,6 +303,7 @@ pub(crate) async fn execute_networked_worker_tool(
     if let Err(error) = runtime_state
         .complete_networked_worker_lease(
             lease.worker_id.as_str(),
+            lease.identity(),
             remote_result.cleanup_report.clone(),
         )
         .await
@@ -394,6 +395,7 @@ async fn complete_networked_worker_lease_after_remote_failure(
     runtime_state
         .complete_networked_worker_lease(
             lease.worker_id.as_str(),
+            lease.identity(),
             WorkerCleanupReport {
                 removed_workspace_scope: true,
                 removed_artifacts: true,

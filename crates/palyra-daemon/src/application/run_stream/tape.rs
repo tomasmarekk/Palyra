@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
 use palyra_common::{
+    qa_fault_injection::{QaFaultAction, QaFaultDirective},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_preview::{RuntimeDecisionPayload, RuntimePreviewCapability},
 };
@@ -394,11 +395,43 @@ pub(crate) async fn send_status_with_tape(
     kind: common_v1::stream_status::StatusKind,
     message: &str,
 ) -> Result<(), Status> {
+    send_status_with_tape_boundary(sender, runtime_state, run_id, tape_seq, kind, message, false)
+        .await
+}
+
+/// Sends a terminal status and exposes the wire-before-tape uncertainty gap
+/// to the authenticated fault adapter.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn send_final_status_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    kind: common_v1::stream_status::StatusKind,
+    message: &str,
+) -> Result<(), Status> {
+    send_status_with_tape_boundary(sender, runtime_state, run_id, tape_seq, kind, message, true)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_status_with_tape_boundary(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    kind: common_v1::stream_status::StatusKind,
+    message: &str,
+    final_status: bool,
+) -> Result<(), Status> {
     let event = status_event(run_id.to_owned(), kind, message.to_owned());
     sender
         .send(Ok(event))
         .await
         .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+    if final_status {
+        apply_final_delivery_fault(runtime_state, run_id)?;
+    }
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -409,6 +442,32 @@ pub(crate) async fn send_status_with_tape(
         .await?;
     *tape_seq += 1;
     Ok(())
+}
+
+fn apply_final_delivery_fault(
+    runtime_state: &GatewayRuntimeState,
+    run_id: &str,
+) -> Result<(), Status> {
+    let point_id = "run.final_delivery.after_effect_before_ack";
+    match runtime_state.fault_injection.checkpoint(point_id, run_id).map_err(|error| {
+        Status::internal(format!("qa_fault.final_delivery_checkpoint_failed: {error}"))
+    })? {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => match directive.activation.action {
+            QaFaultAction::TerminateProcess => {
+                #[cfg(feature = "qa-fault-injection")]
+                runtime_state.fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(Status::internal(
+                    "qa_fault.feature_disabled: terminate directive reached a feature-off build",
+                ))
+            }
+            action => Err(Status::internal(format!(
+                "qa_fault.final_delivery_action_unsupported: {}",
+                action.kind().as_str()
+            ))),
+        },
+    }
 }
 
 /// Streams a redacted model token to the client and records it on the tape.

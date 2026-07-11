@@ -91,6 +91,7 @@ mod openai_surface;
 mod orchestrator;
 mod plugins;
 mod provider_leases;
+mod qa_fault_injection;
 mod quic_runtime;
 mod realtime;
 #[allow(dead_code)]
@@ -2249,11 +2250,15 @@ pub async fn run() -> Result<()> {
 
     let identity_runtime = load_identity_runtime(loaded.gateway.identity_store_dir.clone())
         .context("failed to initialize gateway identity runtime")?;
+    let runtime_state_root = resolve_runtime_state_root(identity_runtime.store_root.as_path())
+        .context("failed to resolve daemon runtime state root")?;
+    let qa_fault_runtime = qa_fault_injection::load_fault_injection(runtime_state_root.as_path())
+        .context("failed QA fault-injection startup preflight")?;
     let offline_mode = offline_mode_enabled()?;
     let memory_embedding_selection =
         build_memory_embedding_runtime_selection(&loaded.model_provider, offline_mode)
             .context("failed to resolve retrieval embeddings runtime")?;
-    let journal_store = JournalStore::open_with_memory_embedding_runtime(
+    let journal_store = JournalStore::open_with_memory_embedding_runtime_and_fault_injection(
         JournalConfig {
             db_path: loaded.storage.journal_db_path.clone(),
             hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
@@ -2262,6 +2267,7 @@ pub async fn run() -> Result<()> {
         },
         Arc::clone(&memory_embedding_selection.provider),
         memory_embedding_selection.profile.clone(),
+        qa_fault_runtime.clone(),
     )
     .context("failed to initialize event journal storage")?;
     let vault = Arc::new(
@@ -2308,8 +2314,6 @@ pub async fn run() -> Result<()> {
         .context("failed to initialize agent registry state")?;
     ensure_local_default_agent(&agent_registry, &loaded)
         .context("failed to ensure local default agent state")?;
-    let runtime_state_root = resolve_runtime_state_root(identity_runtime.store_root.as_path())
-        .context("failed to resolve webhook registry state root")?;
     let acp_runtime = Arc::new(
         acp::AcpRuntime::open(acp::acp_root_from_state_root(runtime_state_root.as_path()))
             .context("failed to initialize ACP runtime state")?,
@@ -2515,6 +2519,7 @@ pub async fn run() -> Result<()> {
             )),
             external_retrieval_index,
             conversation_bindings,
+            fault_injection: qa_fault_runtime,
         },
     )
     .context("failed to initialize gateway runtime state")?;
@@ -2571,13 +2576,10 @@ pub async fn run() -> Result<()> {
         )
         .await
         .context("failed to terminalize orphaned orchestrator runs during startup")?;
-    if startup_run_recovery.terminalized_count > 0 {
-        warn!(
-            terminalized_count = startup_run_recovery.terminalized_count,
-            terminalized_run_ids = ?startup_run_recovery.terminalized_run_ids,
-            "terminalized orphaned active runs during startup"
-        );
-    }
+    let recovered_journal_fault_activations = runtime
+        .journal_store
+        .reconcile_pending_qa_fault_recoveries()
+        .context("failed to reconcile committed journal effects after QA fault restart")?;
 
     let build = build_metadata();
     info!(
@@ -2788,15 +2790,46 @@ pub async fn run() -> Result<()> {
     let grpc_url = loopback_grpc_url(grpc_bound, loaded.gateway.tls.enabled);
     let connectors_db_path =
         connector_db_path_from_journal_path(loaded.storage.journal_db_path.as_path());
-    let channels = Arc::new(
-        channels::ChannelPlatform::initialize(
-            grpc_url.clone(),
-            auth.clone(),
-            connectors_db_path,
-            loaded.media.clone(),
-        )
-        .context("failed to initialize channel connector platform")?,
+    #[cfg(feature = "qa-fault-injection")]
+    let channels = channels::ChannelPlatform::initialize_with_qa_fault_probe(
+        grpc_url.clone(),
+        auth.clone(),
+        connectors_db_path,
+        loaded.media.clone(),
+        runtime.fault_injection.probe_handle(),
     );
+    #[cfg(not(feature = "qa-fault-injection"))]
+    let channels = channels::ChannelPlatform::initialize(
+        grpc_url.clone(),
+        auth.clone(),
+        connectors_db_path,
+        loaded.media.clone(),
+    );
+    let channels = Arc::new(channels.context("failed to initialize channel connector platform")?);
+    #[cfg(feature = "qa-fault-injection")]
+    let recovered_connector_fault_activations = channels
+        .reconcile_pending_qa_fault_recoveries(&runtime.fault_injection)
+        .context("failed to reconcile connector outbox effects after QA fault restart")?;
+    #[cfg(not(feature = "qa-fault-injection"))]
+    let recovered_connector_fault_activations = 0usize;
+    let recovered_generic_fault_activations = runtime
+        .fault_injection
+        .record_startup_orphan_recoveries()
+        .context("failed to record QA fault recovery after subsystem reconciliation")?;
+    let recovered_fault_activations = recovered_journal_fault_activations
+        .saturating_add(recovered_connector_fault_activations)
+        .saturating_add(recovered_generic_fault_activations);
+    if startup_run_recovery.terminalized_count > 0 || recovered_fault_activations > 0 {
+        warn!(
+            terminalized_count = startup_run_recovery.terminalized_count,
+            terminalized_run_ids = ?startup_run_recovery.terminalized_run_ids,
+            recovered_journal_fault_activations,
+            recovered_connector_fault_activations,
+            recovered_generic_fault_activations,
+            recovered_fault_activations,
+            "completed startup recovery for orphaned runs and pending QA fault activations"
+        );
+    }
     runtime.configure_routines_runtime(RoutinesRuntimeConfig {
         registry: Arc::clone(&routine_registry),
         objectives: Arc::clone(&objective_registry),

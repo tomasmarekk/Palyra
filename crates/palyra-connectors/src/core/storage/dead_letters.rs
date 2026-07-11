@@ -59,6 +59,7 @@ impl ConnectorStore {
                         max_attempts = ?4,
                         next_attempt_unix_ms = ?5,
                         status = 'pending',
+                        effect_state = 'ready',
                         native_message_id = NULL,
                         last_error = NULL,
                         claim_token = NULL,

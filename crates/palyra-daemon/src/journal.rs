@@ -31,6 +31,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use palyra_a2ui::{apply_patch_document, parse_patch_document};
+use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass};
 use palyra_common::runtime_contracts::{
     ArtifactReadResponse, ArtifactRetentionPolicy, FlowState, IdempotencyOperationState,
     IdempotencyRecordSnapshot, IdempotencyReplayDecision, RunLifecyclePhase,
@@ -67,6 +68,7 @@ use crate::{
         WorkspaceDocumentState,
     },
     orchestrator::RunLifecycleState,
+    qa_fault_injection::QaFaultRuntime,
     retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
 };
 
@@ -4458,6 +4460,8 @@ pub enum JournalError {
     },
     #[error("journal lock poisoned")]
     LockPoisoned,
+    #[error("QA fault injection at {point_id}: {message}")]
+    FaultInjection { point_id: &'static str, message: String },
     #[error("journal event already exists: {event_id}")]
     DuplicateEventId { event_id: String },
     #[error("orchestrator run already exists: {run_id}")]
@@ -8081,6 +8085,7 @@ pub struct JournalStore {
     memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
     query_embedding_cache: Mutex<QueryEmbeddingCacheState>,
     write_guard: Mutex<state_health::JournalWriteGuardState>,
+    fault_injection: QaFaultRuntime,
 }
 
 impl fmt::Debug for JournalStore {
@@ -8134,6 +8139,108 @@ impl JournalStore {
         self.config.max_payload_bytes
     }
 
+    fn apply_journal_fault(&self, point_id: &'static str, actor: &str) -> Result<(), JournalError> {
+        match self.fault_injection.checkpoint(point_id, actor).map_err(|error| {
+            JournalError::FaultInjection { point_id, message: error.to_string() }
+        })? {
+            QaFaultDirective::Continue => Ok(()),
+            QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+                QaFaultAction::Timeout => {
+                    self.fault_injection.record_immediate_recovery(&directive).map_err(
+                        |error| JournalError::FaultInjection {
+                            point_id,
+                            message: error.to_string(),
+                        },
+                    )?;
+                    Err(JournalError::FaultInjection {
+                        point_id,
+                        message: format!(
+                            "activation {} injected a deterministic timeout before journal mutation",
+                            directive.activation.id
+                        ),
+                    })
+                }
+                QaFaultAction::TerminateProcess => {
+                    if point_id == "journal.before_effect" {
+                        self.fault_injection.record_immediate_recovery(&directive).map_err(
+                            |error| JournalError::FaultInjection {
+                                point_id,
+                                message: error.to_string(),
+                            },
+                        )?;
+                    }
+                    #[cfg(feature = "qa-fault-injection")]
+                    self.fault_injection.terminate_process();
+                    #[cfg(not(feature = "qa-fault-injection"))]
+                    Err(JournalError::FaultInjection {
+                        point_id,
+                        message: "terminate_process directive reached a feature-off build"
+                            .to_owned(),
+                    })
+                }
+                action => Err(JournalError::FaultInjection {
+                    point_id,
+                    message: format!("unsupported journal fault action {}", action.kind().as_str()),
+                }),
+            },
+        }
+    }
+
+    /// Confirms committed post-effect fault activations against the durable event table.
+    ///
+    /// This is a subsystem-owned startup proof: the generic fault loader cannot infer whether a
+    /// journal transaction committed, while the unique event id used as the fault actor can.
+    ///
+    /// # Errors
+    /// Returns a journal or fault-evidence error when durable state cannot prove every pending
+    /// post-effect activation.
+    pub(crate) fn reconcile_pending_qa_fault_recoveries(&self) -> Result<usize, JournalError> {
+        const POINT_ID: &str = "journal.after_effect_before_ack";
+
+        let actors = self.fault_injection.pending_activation_actors_for_point(POINT_ID).map_err(
+            |error| JournalError::FaultInjection { point_id: POINT_ID, message: error.to_string() },
+        )?;
+        if actors.is_empty() {
+            return Ok(0);
+        }
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        for actor in &actors {
+            let committed = guard.query_row(
+                "SELECT EXISTS(SELECT 1 FROM journal_events WHERE event_ulid = ?1)",
+                params![actor],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !committed {
+                return Err(JournalError::FaultInjection {
+                    point_id: POINT_ID,
+                    message: "pending post-effect activation has no committed journal event"
+                        .to_owned(),
+                });
+            }
+        }
+        drop(guard);
+
+        let mut recovered = 0usize;
+        for actor in actors {
+            while self
+                .fault_injection
+                .record_pending_recovery_for_point_actor(
+                    POINT_ID,
+                    actor.as_str(),
+                    QaFaultRecoveryClass::EffectConfirmed,
+                    "qa_fault.journal_committed_effect_confirmed",
+                )
+                .map_err(|error| JournalError::FaultInjection {
+                    point_id: POINT_ID,
+                    message: error.to_string(),
+                })?
+            {
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Opens (creating if needed) the journal database with the default
     /// hash-fallback embedding provider.
     ///
@@ -8181,6 +8288,28 @@ impl JournalStore {
         memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
         memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
     ) -> Result<Self, JournalError> {
+        Self::open_with_memory_embedding_runtime_and_fault_injection(
+            config,
+            memory_embedding_provider,
+            memory_embedding_runtime,
+            QaFaultRuntime::default(),
+        )
+    }
+
+    /// Opens the journal with an explicitly injected QA fault boundary.
+    ///
+    /// Normal callers use [`Self::open_with_memory_embedding_runtime`], which
+    /// supplies the side-effect-free disabled adapter.
+    ///
+    /// # Errors
+    /// Returns the same validation, filesystem, SQLite, and migration errors
+    /// as [`Self::open_with_memory_embedding_runtime`].
+    pub(crate) fn open_with_memory_embedding_runtime_and_fault_injection(
+        config: JournalConfig,
+        memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
+        memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
+        fault_injection: QaFaultRuntime,
+    ) -> Result<Self, JournalError> {
         if config.max_payload_bytes == 0 {
             return Err(JournalError::InvalidPayloadLimit);
         }
@@ -8222,6 +8351,7 @@ impl JournalStore {
             memory_embedding_runtime,
             query_embedding_cache: Mutex::new(QueryEmbeddingCacheState::default()),
             write_guard: Mutex::new(state_health::JournalWriteGuardState::default()),
+            fault_injection,
         })
     }
 
@@ -8439,6 +8569,7 @@ impl JournalStore {
             None
         };
 
+        self.apply_journal_fault("journal.before_effect", request.event_id.as_str())?;
         match transaction.execute(
             r#"
                 INSERT INTO journal_events (
@@ -8483,11 +8614,23 @@ impl JournalStore {
                             .as_deref()
                             .is_some_and(|value| value.contains("journal_events.event_ulid"))) =>
             {
+                self.fault_injection
+                    .record_pending_recovery_for_point_actor(
+                        "journal.after_effect_before_ack",
+                        request.event_id.as_str(),
+                        QaFaultRecoveryClass::DuplicateSuppressed,
+                        "qa_fault.journal_duplicate_suppressed",
+                    )
+                    .map_err(|fault_error| JournalError::FaultInjection {
+                        point_id: "journal.after_effect_before_ack",
+                        message: fault_error.to_string(),
+                    })?;
                 return Err(JournalError::DuplicateEventId { event_id: request.event_id.clone() });
             }
             Err(error) => return Err(error.into()),
         }
         transaction.commit()?;
+        self.apply_journal_fault("journal.after_effect_before_ack", request.event_id.as_str())?;
 
         Ok(JournalAppendOutcome { redacted, hash, prev_hash, write_duration: started_at.elapsed() })
     }

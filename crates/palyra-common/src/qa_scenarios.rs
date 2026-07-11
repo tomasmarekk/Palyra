@@ -13,13 +13,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::qa_fault_injection::{
+    qa_fault_point_descriptor, QaFaultInjectionPlan, QaFaultRecoveryClass,
+    QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+};
+
 /// Current QA scenario manifest schema version.
-pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 3;
+pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 4;
 
 /// Stable format label embedded in the schema snapshot and reports.
 pub const QA_SCENARIO_FORMAT: &str = "palyra-qa-scenario";
 
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_EXPECTED_DAEMON_RESTARTS: u32 = 32;
 
 const AREA_VALUES: &[&str] = &[
     "text",
@@ -32,7 +38,7 @@ const AREA_VALUES: &[&str] = &[
     "security",
     "replay",
 ];
-const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, QA_SCENARIO_SCHEMA_VERSION];
+const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, QA_SCENARIO_SCHEMA_VERSION];
 const PROVIDER_MODE_VALUES: &[&str] = &["mock", "recorded", "live"];
 const RUNNER_MODE_VALUES: &[&str] = &["fixture", "record_replay", "live"];
 const LIVE_PROVIDER_KIND_VALUES: &[&str] = &["openai_compatible", "anthropic"];
@@ -42,7 +48,7 @@ const STEP_ACTION_VALUES: &[&str] =
     &["user_prompt", "tool_result", "approval_decision", "wait_for_event"];
 const TERMINAL_STATE_VALUES: &[&str] = &["completed", "failed", "cancelled", "approval_required"];
 const ARTIFACT_KIND_VALUES: &[&str] =
-    &["report", "transcript", "replay_bundle", "trajectory", "evidence"];
+    &["report", "transcript", "replay_bundle", "trajectory", "evidence", "workspace"];
 
 /// Validated QA scenario manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +65,8 @@ pub struct QaScenarioManifest {
     pub mode: QaScenarioMode,
     /// Typed provider binding and common runner inputs when the schema supports them.
     pub runner: Option<QaScenarioRunnerConfig>,
+    /// Optional deterministic fault plan supported by schema version 4 and later.
+    pub fault_injection: Option<QaFaultInjectionPlan>,
     /// Runtime capabilities and fixtures required before the scenario can run.
     pub requires: QaScenarioRequires,
     /// Ordered operator/runtime steps.
@@ -93,6 +101,11 @@ impl Serialize for QaScenarioManifest {
                 deterministic: self.mode.deterministic,
             },
             runner: if is_schema_v1 { None } else { self.runner.as_ref() },
+            fault_injection: if self.schema_version >= 4 {
+                self.fault_injection.as_ref()
+            } else {
+                None
+            },
             requires: &self.requires,
             steps: self.steps.as_slice(),
             expect: &self.expect,
@@ -115,6 +128,8 @@ struct QaScenarioManifestSerialization<'a> {
     mode: QaScenarioModeSerialization,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner: Option<&'a QaScenarioRunnerConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fault_injection: Option<&'a QaFaultInjectionPlan>,
     requires: &'a QaScenarioRequires,
     steps: &'a [QaScenarioStep],
     expect: &'a QaScenarioExpect,
@@ -730,9 +745,31 @@ pub struct QaScenarioExpectedToolCall {
     /// Optional minimum call count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_count: Option<u32>,
-    /// Required tool-result outcome; omitted manifests default to success.
+    /// Optional maximum total call count, regardless of result outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_count: Option<u32>,
+    /// Required tool-result outcome. Schema v4 treats omission as any outcome;
+    /// legacy schemas retain their success-by-default contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
+}
+
+/// One expected activation and its required recovery classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaScenarioExpectedFaultActivation {
+    /// Activation id declared by the scenario's fault plan.
+    pub activation_id: String,
+    /// Recovery class the runtime must prove in evidence.
+    pub recovery_class: QaFaultRecoveryClass,
+}
+
+/// Exact fault outcomes required for a scenario verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaScenarioExpectedFaultInjection {
+    /// Expected activations; validation requires one entry per planned activation.
+    pub activations: Vec<QaScenarioExpectedFaultActivation>,
+    /// Exact number of daemon restarts expected during the scenario.
+    pub daemon_restarts: u32,
 }
 
 /// Observable expectations for a scenario.
@@ -747,6 +784,9 @@ pub struct QaScenarioExpect {
     pub events: Vec<QaScenarioExpectedEvent>,
     /// Expected tool calls.
     pub tool_calls: Vec<QaScenarioExpectedToolCall>,
+    /// Exact activation, recovery, and restart assertions for a fault plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault_injection: Option<QaScenarioExpectedFaultInjection>,
 }
 
 /// Forbidden runtime observations.
@@ -771,6 +811,7 @@ pub enum QaScenarioArtifactKind {
     ReplayBundle,
     Trajectory,
     Evidence,
+    Workspace,
 }
 
 impl QaScenarioArtifactKind {
@@ -783,6 +824,7 @@ impl QaScenarioArtifactKind {
             Self::ReplayBundle => "replay_bundle",
             Self::Trajectory => "trajectory",
             Self::Evidence => "evidence",
+            Self::Workspace => "workspace",
         }
     }
 
@@ -793,6 +835,7 @@ impl QaScenarioArtifactKind {
             "replay_bundle" => Some(Self::ReplayBundle),
             "trajectory" => Some(Self::Trajectory),
             "evidence" => Some(Self::Evidence),
+            "workspace" => Some(Self::Workspace),
             _ => None,
         }
     }
@@ -807,6 +850,9 @@ pub struct QaScenarioArtifact {
     pub kind: QaScenarioArtifactKind,
     /// Whether the artifact is required for a passing verdict.
     pub required: bool,
+    /// Optional exact lowercase SHA-256 digest of the observed content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// Scenario maturity metadata.
@@ -934,6 +980,8 @@ struct QaScenarioManifestWire {
     mode: Option<QaScenarioModeWire>,
     #[serde(default)]
     runner: Option<QaScenarioRunnerConfigWire>,
+    #[serde(default)]
+    fault_injection: Option<QaFaultInjectionPlan>,
     requires: Option<QaScenarioRequiresWire>,
     steps: Option<Vec<QaScenarioStepWire>>,
     expect: Option<QaScenarioExpectWire>,
@@ -1019,6 +1067,23 @@ struct QaScenarioExpectWire {
     events: Vec<QaScenarioExpectedEventWire>,
     #[serde(default)]
     tool_calls: Vec<QaScenarioExpectedToolCallWire>,
+    #[serde(default)]
+    fault_injection: Option<QaScenarioExpectedFaultInjectionWire>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QaScenarioExpectedFaultInjectionWire {
+    #[serde(default)]
+    activations: Vec<QaScenarioExpectedFaultActivationWire>,
+    daemon_restarts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QaScenarioExpectedFaultActivationWire {
+    activation_id: Option<String>,
+    recovery_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1045,6 +1110,8 @@ struct QaScenarioExpectedToolCallWire {
     #[serde(default)]
     min_count: Option<u32>,
     #[serde(default)]
+    max_count: Option<u32>,
+    #[serde(default)]
     success: Option<bool>,
 }
 
@@ -1068,6 +1135,8 @@ struct QaScenarioArtifactWire {
     kind: Option<String>,
     #[serde(default = "default_required")]
     required: bool,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1139,10 +1208,15 @@ pub fn qa_scenario_manifest_schema_snapshot() -> Value {
             "workspace_fixture",
             "policy_profile"
         ],
-        "expected_tool_call_fields": ["name", "min_count", "success"],
+        "optional_sections": ["fault_injection"],
+        "fault_injection_plan_schema_version": QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        "expected_fault_injection_fields": ["activations", "daemon_restarts"],
+        "expected_fault_activation_fields": ["activation_id", "recovery_class"],
+        "expected_tool_call_fields": ["name", "min_count", "max_count", "success"],
         "step_actions": STEP_ACTION_VALUES,
         "terminal_states": TERMINAL_STATE_VALUES,
         "artifact_kinds": ARTIFACT_KIND_VALUES,
+        "artifact_fields": ["path", "kind", "required", "sha256"],
         "forbidden_fields": [
             "tool_calls",
             "events",
@@ -1171,11 +1245,18 @@ fn build_validated_manifest(
         mode.as_ref().map(|mode| mode.runner),
         &mut issues,
     );
+    let fault_injection = validate_fault_injection_plan(
+        wire.fault_injection,
+        schema_version,
+        mode.as_ref(),
+        &mut issues,
+    );
     let requires = validate_requires(wire.requires, &mut issues);
     let steps = validate_steps(wire.steps, schema_version, &mut issues);
-    let expect = validate_expect(wire.expect, &mut issues);
+    let expect =
+        validate_expect(wire.expect, schema_version, fault_injection.as_ref(), &mut issues);
     let forbidden = validate_forbidden(wire.forbidden, &mut issues);
-    let artifacts = validate_artifacts(wire.artifacts, &mut issues);
+    let artifacts = validate_artifacts(wire.artifacts, schema_version, &mut issues);
     let maturity = validate_maturity(wire.maturity, &mut issues);
     let timeout = validate_timeout(wire.timeout, &mut issues);
 
@@ -1190,6 +1271,7 @@ fn build_validated_manifest(
         area: area.expect("area validated without issues"),
         mode: mode.expect("mode validated without issues"),
         runner,
+        fault_injection,
         requires: requires.expect("requires validated without issues"),
         steps: steps.expect("steps validated without issues"),
         expect: expect.expect("expect validated without issues"),
@@ -1964,8 +2046,61 @@ fn validate_step_shape(
     }
 }
 
+fn validate_fault_injection_plan(
+    value: Option<QaFaultInjectionPlan>,
+    schema_version: Option<u32>,
+    mode: Option<&QaScenarioMode>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<QaFaultInjectionPlan> {
+    let plan = value?;
+    if schema_version != Some(QA_SCENARIO_SCHEMA_VERSION) {
+        push_issue(
+            issues,
+            "fault_injection_requires_schema_v4",
+            "$.fault_injection",
+            "fault_injection is supported only by schema_version 4",
+            "Set schema_version to 4 or remove the fault_injection section.",
+        );
+        return None;
+    }
+    if mode.is_some_and(|mode| mode.runner == QaScenarioRunnerMode::Live) {
+        push_issue(
+            issues,
+            "fault_injection_live_runner_forbidden",
+            "$.fault_injection",
+            "fault injection is not available for live runner mode",
+            "Use fixture or record_replay mode for deterministic fault injection.",
+        );
+    }
+    if mode.is_some_and(|mode| !mode.deterministic) {
+        push_issue(
+            issues,
+            "fault_injection_requires_deterministic_mode",
+            "$.mode.deterministic",
+            "fault injection requires deterministic mode",
+            "Set mode.deterministic to true.",
+        );
+    }
+    if let Err(error) = plan.validate() {
+        for issue in error.issues() {
+            let suffix = issue.path.strip_prefix('$').unwrap_or(issue.path.as_str());
+            push_issue(
+                issues,
+                issue.code.clone(),
+                format!("$.fault_injection{suffix}"),
+                issue.message.clone(),
+                "Correct the versioned fault plan before running the scenario.",
+            );
+        }
+        return None;
+    }
+    Some(plan)
+}
+
 fn validate_expect(
     value: Option<QaScenarioExpectWire>,
+    schema_version: Option<u32>,
+    fault_plan: Option<&QaFaultInjectionPlan>,
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<QaScenarioExpect> {
     let Some(value) = value else {
@@ -1983,8 +2118,18 @@ fn validate_expect(
         .final_answer
         .map(|answer| validate_text_assertion(answer, "$.expect.final_answer", issues));
     let events = validate_expected_events(value.events, issues);
-    let tool_calls = validate_expected_tool_calls(value.tool_calls, issues);
-    if final_answer.is_none() && events.is_empty() && tool_calls.is_empty() {
+    let tool_calls = validate_expected_tool_calls(value.tool_calls, schema_version, issues);
+    let fault_injection = validate_expected_fault_injection(
+        value.fault_injection,
+        schema_version,
+        fault_plan,
+        issues,
+    );
+    if final_answer.is_none()
+        && events.is_empty()
+        && tool_calls.is_empty()
+        && fault_injection.is_none()
+    {
         push_issue(
             issues,
             "empty_expectations",
@@ -1998,6 +2143,7 @@ fn validate_expect(
         final_answer: final_answer.flatten(),
         events,
         tool_calls,
+        fault_injection,
     })
 }
 
@@ -2071,6 +2217,7 @@ fn validate_expected_events(
 
 fn validate_expected_tool_calls(
     values: Vec<QaScenarioExpectedToolCallWire>,
+    schema_version: Option<u32>,
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Vec<QaScenarioExpectedToolCall> {
     let mut tool_calls = Vec::with_capacity(values.len());
@@ -2082,14 +2229,211 @@ fn validate_expected_tool_calls(
             "tool call name",
             issues,
         ) {
+            let max_count = if schema_version == Some(QA_SCENARIO_SCHEMA_VERSION) {
+                tool_call.max_count
+            } else {
+                if tool_call.max_count.is_some() {
+                    push_issue(
+                        issues,
+                        "tool_call_max_count_requires_schema_v4",
+                        format!("{path}.max_count"),
+                        "max_count is supported only by schema_version 4",
+                        "Set schema_version to 4 or remove max_count.",
+                    );
+                }
+                None
+            };
+            let effective_min_count = tool_call.min_count.unwrap_or(1);
+            if max_count.is_some_and(|max_count| max_count < effective_min_count) {
+                push_issue(
+                    issues,
+                    "invalid_expected_tool_call_count_range",
+                    format!("{path}.max_count"),
+                    format!(
+                        "max_count must be greater than or equal to the effective min_count {effective_min_count}"
+                    ),
+                    "Increase max_count or lower min_count.",
+                );
+                continue;
+            }
             tool_calls.push(QaScenarioExpectedToolCall {
                 name,
                 min_count: tool_call.min_count,
+                max_count,
                 success: tool_call.success,
             });
         }
     }
     tool_calls
+}
+
+fn validate_expected_fault_injection(
+    value: Option<QaScenarioExpectedFaultInjectionWire>,
+    schema_version: Option<u32>,
+    fault_plan: Option<&QaFaultInjectionPlan>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<QaScenarioExpectedFaultInjection> {
+    if schema_version != Some(QA_SCENARIO_SCHEMA_VERSION) {
+        if value.is_some() {
+            push_issue(
+                issues,
+                "fault_expectations_require_schema_v4",
+                "$.expect.fault_injection",
+                "fault_injection expectations are supported only by schema_version 4",
+                "Set schema_version to 4 or remove the fault_injection expectations.",
+            );
+        }
+        return None;
+    }
+
+    let Some(value) = value else {
+        if fault_plan.is_some() {
+            push_issue(
+                issues,
+                "missing_fault_expectations",
+                "$.expect.fault_injection",
+                "a fault plan requires exact activation, recovery, and restart expectations",
+                "Add expect.fault_injection for every planned activation.",
+            );
+        }
+        return None;
+    };
+    let Some(fault_plan) = fault_plan else {
+        push_issue(
+            issues,
+            "fault_expectations_require_plan",
+            "$.expect.fault_injection",
+            "fault expectations require a valid fault_injection plan",
+            "Add and correct the top-level fault_injection plan.",
+        );
+        return None;
+    };
+
+    let daemon_restarts = match value.daemon_restarts {
+        Some(restarts) if restarts <= MAX_EXPECTED_DAEMON_RESTARTS => Some(restarts),
+        Some(restarts) => {
+            push_issue(
+                issues,
+                "invalid_expected_daemon_restarts",
+                "$.expect.fault_injection.daemon_restarts",
+                format!(
+                    "daemon_restarts must be in range 0..={MAX_EXPECTED_DAEMON_RESTARTS}, got {restarts}"
+                ),
+                "Use an exact bounded daemon restart count.",
+            );
+            None
+        }
+        None => {
+            push_issue(
+                issues,
+                "missing_expected_daemon_restarts",
+                "$.expect.fault_injection.daemon_restarts",
+                "daemon_restarts is required for fault-injection expectations",
+                "Declare the exact expected daemon restart count, including zero.",
+            );
+            None
+        }
+    };
+
+    if value.activations.is_empty() {
+        push_issue(
+            issues,
+            "empty_expected_fault_activations",
+            "$.expect.fault_injection.activations",
+            "fault-injection expectations must include every planned activation",
+            "Add one expected activation for every fault plan activation.",
+        );
+    }
+    let planned_by_id = fault_plan
+        .activations
+        .iter()
+        .map(|activation| (activation.id.as_str(), activation))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut expected_ids = BTreeSet::new();
+    let mut activations = Vec::with_capacity(value.activations.len());
+    for (index, expected) in value.activations.into_iter().enumerate() {
+        let path = format!("$.expect.fault_injection.activations[{index}]");
+        let activation_id = validate_required_slug(
+            expected.activation_id,
+            format!("{path}.activation_id").as_str(),
+            "fault activation id",
+            issues,
+        );
+        let recovery_class = validate_required_string(
+            expected.recovery_class,
+            format!("{path}.recovery_class").as_str(),
+            "fault recovery class",
+            issues,
+        )
+        .and_then(|value| {
+            let recovery_class = QaFaultRecoveryClass::parse(value.as_str());
+            if recovery_class.is_none() {
+                push_issue(
+                    issues,
+                    "unknown_fault_recovery_class",
+                    format!("{path}.recovery_class"),
+                    format!("unknown fault recovery class `{value}`"),
+                    "Use a recovery class from the fault-injection schema snapshot.",
+                );
+            }
+            recovery_class
+        });
+        let Some(activation_id) = activation_id else {
+            continue;
+        };
+        if !expected_ids.insert(activation_id.clone()) {
+            push_issue(
+                issues,
+                "duplicate_expected_fault_activation",
+                format!("{path}.activation_id"),
+                format!("fault activation `{activation_id}` is expected more than once"),
+                "Keep exactly one expectation for each planned activation.",
+            );
+        }
+        let Some(planned) = planned_by_id.get(activation_id.as_str()) else {
+            push_issue(
+                issues,
+                "unplanned_expected_fault_activation",
+                format!("{path}.activation_id"),
+                format!("fault activation `{activation_id}` is not declared by the plan"),
+                "Reference an activation id from the top-level fault_injection plan.",
+            );
+            continue;
+        };
+        let Some(recovery_class) = recovery_class else {
+            continue;
+        };
+        if let Some(descriptor) = qa_fault_point_descriptor(planned.point_id.as_str()) {
+            if !descriptor.supports_recovery(recovery_class) {
+                push_issue(
+                    issues,
+                    "unsupported_fault_recovery_class",
+                    format!("{path}.recovery_class"),
+                    format!(
+                        "fault point `{}` cannot prove recovery class `{}`",
+                        planned.point_id,
+                        recovery_class.as_str()
+                    ),
+                    "Choose a recovery class supported by the registered fault point.",
+                );
+            }
+        }
+        activations.push(QaScenarioExpectedFaultActivation { activation_id, recovery_class });
+    }
+    for planned in &fault_plan.activations {
+        if !expected_ids.contains(planned.id.as_str()) {
+            push_issue(
+                issues,
+                "missing_expected_fault_activation",
+                "$.expect.fault_injection.activations",
+                format!("planned fault activation `{}` has no expectation", planned.id),
+                "Add one expected recovery class for the planned activation.",
+            );
+        }
+    }
+
+    daemon_restarts
+        .map(|daemon_restarts| QaScenarioExpectedFaultInjection { activations, daemon_restarts })
 }
 
 fn validate_forbidden(
@@ -2144,6 +2488,7 @@ fn validate_forbidden(
 
 fn validate_artifacts(
     value: Option<Vec<QaScenarioArtifactWire>>,
+    schema_version: Option<u32>,
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<Vec<QaScenarioArtifact>> {
     let Some(value) = value else {
@@ -2161,12 +2506,63 @@ fn validate_artifacts(
         let path = format!("$.artifacts[{index}]");
         let artifact_path =
             validate_artifact_path(artifact.path, format!("{path}.path").as_str(), issues);
-        let kind = validate_artifact_kind(artifact.kind, format!("{path}.kind").as_str(), issues);
+        let kind = validate_artifact_kind(artifact.kind, format!("{path}.kind").as_str(), issues)
+            .and_then(|kind| {
+                if kind == QaScenarioArtifactKind::Workspace
+                    && schema_version != Some(QA_SCENARIO_SCHEMA_VERSION)
+                {
+                    push_issue(
+                        issues,
+                        "workspace_artifact_requires_schema_v4",
+                        format!("{path}.kind"),
+                        "workspace artifacts are supported only by schema_version 4",
+                        "Set schema_version to 4 or use a legacy artifact kind.",
+                    );
+                    None
+                } else {
+                    Some(kind)
+                }
+            });
+        let sha256 = if schema_version == Some(QA_SCENARIO_SCHEMA_VERSION) {
+            validate_artifact_sha256(artifact.sha256, format!("{path}.sha256").as_str(), issues)
+        } else {
+            if artifact.sha256.is_some() {
+                push_issue(
+                    issues,
+                    "artifact_sha256_requires_schema_v4",
+                    format!("{path}.sha256"),
+                    "artifact sha256 assertions are supported only by schema_version 4",
+                    "Set schema_version to 4 or remove sha256.",
+                );
+            }
+            None
+        };
         if let (Some(path), Some(kind)) = (artifact_path, kind) {
-            artifacts.push(QaScenarioArtifact { path, kind, required: artifact.required });
+            artifacts.push(QaScenarioArtifact { path, kind, required: artifact.required, sha256 });
         }
     }
     Some(artifacts)
+}
+
+fn validate_artifact_sha256(
+    value: Option<String>,
+    path: &str,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<String> {
+    let value = value?;
+    let valid = value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if valid {
+        return Some(value);
+    }
+    push_issue(
+        issues,
+        "invalid_artifact_sha256",
+        path,
+        "artifact sha256 must contain exactly 64 lowercase hexadecimal characters",
+        "Use the canonical lowercase SHA-256 digest of the expected artifact content.",
+    );
+    None
 }
 
 fn validate_artifact_kind(
@@ -2517,6 +2913,8 @@ mod tests {
     const EXAMPLE_SCENARIO: &str = include_str!("../../../qa/scenarios/text_run_basic.yaml");
     const LEGACY_APPROVAL_SCENARIO: &str =
         include_str!("../../../qa/scenarios/mcp/mcp_write_tool_approval.yaml");
+    const FAULT_TOOL_SCENARIO: &str =
+        include_str!("../../../qa/scenarios/fault_injection/tool_effect_before_ack.yaml");
     const SCHEMA_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_scenario_manifest_schema.json");
     const FIXTURE_RUNNER_BLOCK: &str = r#"runner:
@@ -2539,6 +2937,23 @@ mod tests {
   raw_payload_storage: false
   workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
   policy_profile: qa_read_only
+"#;
+    const FAULT_PLAN_BLOCK: &str = r#"fault_injection:
+  schema_version: 1
+  format: palyra-qa-fault-injection-plan
+  seed: 4242
+  activations:
+    - id: tool-crash-after-effect
+      point_id: tool.after_effect_before_ack
+      occurrence: 1
+      action:
+        type: terminate_process
+"#;
+    const FAULT_EXPECTATION_BLOCK: &str = r#"  fault_injection:
+    activations:
+      - activation_id: tool-crash-after-effect
+        recovery_class: duplicate_suppressed
+    daemon_restarts: 1
 "#;
     const V2_FIXTURE_SCENARIO: &str = r#"
 schema_version: 2
@@ -2754,6 +3169,192 @@ timeout:
 
         assert_eq!(runner.runner_mode(), QaScenarioRunnerMode::Fixture);
         assert_eq!(runner.provider_fixture(), Some("qa/fixtures/provider_basic.yaml"));
+    }
+
+    #[test]
+    fn schema_v4_fault_plan_and_expectations_round_trip() {
+        let scenario = schema_v4_fault_scenario();
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("schema-v4 fault scenario should parse");
+
+        assert_eq!(manifest.schema_version, 4);
+        let plan = manifest.fault_injection.as_ref().expect("fault plan should be retained");
+        assert_eq!(plan.seed, 4242);
+        assert_eq!(plan.activations.len(), 1);
+        let expectations = manifest
+            .expect
+            .fault_injection
+            .as_ref()
+            .expect("fault expectations should be retained");
+        assert_eq!(expectations.daemon_restarts, 1);
+        assert_eq!(
+            expectations.activations[0].recovery_class,
+            QaFaultRecoveryClass::DuplicateSuppressed
+        );
+
+        let json = serde_json::to_string(&manifest)
+            .expect("schema-v4 fault manifest should serialize as JSON");
+        let json_round_trip = parse_qa_scenario_manifest_yaml(json.as_str())
+            .expect("schema-v4 JSON projection should parse");
+        assert_eq!(json_round_trip, manifest);
+        let yaml = yaml_serde::to_string(&manifest)
+            .expect("schema-v4 fault manifest should serialize as YAML");
+        let yaml_round_trip = parse_qa_scenario_manifest_yaml(yaml.as_str())
+            .expect("schema-v4 YAML projection should parse");
+        assert_eq!(yaml_round_trip, manifest);
+    }
+
+    #[test]
+    fn schema_v4_retains_exact_tool_count_and_artifact_digest_expectations() {
+        let manifest = parse_qa_scenario_manifest_yaml(FAULT_TOOL_SCENARIO)
+            .expect("fault tool scenario should parse");
+
+        assert_eq!(manifest.expect.tool_calls[0].min_count, Some(1));
+        assert_eq!(manifest.expect.tool_calls[0].max_count, Some(1));
+        assert_eq!(manifest.expect.tool_calls[0].success, None);
+        assert_eq!(
+            manifest.artifacts[0].sha256.as_deref(),
+            Some("78930e608b8acfc1799a5e09e2f1bdb408dde4fd2607d38b86acb16130c2c550")
+        );
+    }
+
+    #[test]
+    fn schema_v4_rejects_inverted_tool_count_and_noncanonical_artifact_digest() {
+        let invalid_count = FAULT_TOOL_SCENARIO.replace("max_count: 1", "max_count: 0");
+        assert_validation_issue(
+            invalid_count.as_str(),
+            "$.expect.tool_calls[0].max_count",
+            "invalid_expected_tool_call_count_range",
+        );
+
+        let invalid_digest = FAULT_TOOL_SCENARIO
+            .replace("78930e608b8acfc1799a5e09e2f1bdb408dde4fd2607d38b86acb16130c2c550", "ABC123");
+        assert_validation_issue(
+            invalid_digest.as_str(),
+            "$.artifacts[0].sha256",
+            "invalid_artifact_sha256",
+        );
+    }
+
+    #[test]
+    fn schemas_v1_through_v3_reject_fault_contracts() {
+        for schema_version in [1, 2, 3] {
+            let scenario = schema_v4_fault_scenario().replacen(
+                "schema_version: 4",
+                format!("schema_version: {schema_version}").as_str(),
+                1,
+            );
+            assert_validation_issue(
+                scenario.as_str(),
+                "$.fault_injection",
+                "fault_injection_requires_schema_v4",
+            );
+            assert_validation_issue(
+                scenario.as_str(),
+                "$.expect.fault_injection",
+                "fault_expectations_require_schema_v4",
+            );
+        }
+    }
+
+    #[test]
+    fn schemas_v1_through_v3_reject_v4_tool_and_artifact_contracts() {
+        let scenario = V2_FIXTURE_SCENARIO
+            .replacen(
+                "  tool_calls: []",
+                "  tool_calls:\n    - name: palyra.fs.read_file\n      max_count: 1",
+                1,
+            )
+            .replace(
+                "\nartifacts: []\n",
+                "\nartifacts:\n  - path: src/app.txt\n    kind: workspace\n    required: true\n    sha256: 78930e608b8acfc1799a5e09e2f1bdb408dde4fd2607d38b86acb16130c2c550\n",
+            );
+        for schema_version in [1, 2, 3] {
+            let versioned = scenario.replacen(
+                "schema_version: 2",
+                format!("schema_version: {schema_version}").as_str(),
+                1,
+            );
+            assert_validation_issue(
+                versioned.as_str(),
+                "$.expect.tool_calls[0].max_count",
+                "tool_call_max_count_requires_schema_v4",
+            );
+            assert_validation_issue(
+                versioned.as_str(),
+                "$.artifacts[0].kind",
+                "workspace_artifact_requires_schema_v4",
+            );
+            assert_validation_issue(
+                versioned.as_str(),
+                "$.artifacts[0].sha256",
+                "artifact_sha256_requires_schema_v4",
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v4_requires_plan_and_expectations_together() {
+        let scenario = schema_v4_fault_scenario();
+        let without_expectations = scenario.replace(FAULT_EXPECTATION_BLOCK, "");
+        assert_validation_issue(
+            without_expectations.as_str(),
+            "$.expect.fault_injection",
+            "missing_fault_expectations",
+        );
+
+        let without_plan = scenario.replace(FAULT_PLAN_BLOCK, "");
+        assert_validation_issue(
+            without_plan.as_str(),
+            "$.expect.fault_injection",
+            "fault_expectations_require_plan",
+        );
+    }
+
+    #[test]
+    fn schema_v4_rejects_invalid_or_unsupported_fault_recovery() {
+        let unknown =
+            schema_v4_fault_scenario().replace("duplicate_suppressed", "not_a_recovery_class");
+        assert_validation_issue(
+            unknown.as_str(),
+            "$.expect.fault_injection.activations[0].recovery_class",
+            "unknown_fault_recovery_class",
+        );
+
+        let unsupported =
+            schema_v4_fault_scenario().replace("duplicate_suppressed", "cleanup_succeeded");
+        assert_validation_issue(
+            unsupported.as_str(),
+            "$.expect.fault_injection.activations[0].recovery_class",
+            "unsupported_fault_recovery_class",
+        );
+    }
+
+    #[test]
+    fn schema_v4_projects_plan_validation_paths_under_fault_injection() {
+        let scenario = schema_v4_fault_scenario().replace("occurrence: 1", "occurrence: 0");
+
+        assert_validation_issue(
+            scenario.as_str(),
+            "$.fault_injection.activations[0].occurrence",
+            "invalid_occurrence",
+        );
+    }
+
+    #[test]
+    fn schema_v4_workspace_artifact_accepts_exact_relative_effect_path() {
+        let scenario = V2_FIXTURE_SCENARIO
+            .replace("schema_version: 2", "schema_version: 4")
+            .replace(
+            "\nartifacts: []\n",
+            "\nartifacts:\n  - path: src/fault-once.txt\n    kind: workspace\n    required: true\n",
+        );
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("schema-v4 workspace artifact should parse");
+
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].path, "src/fault-once.txt");
+        assert_eq!(manifest.artifacts[0].kind, QaScenarioArtifactKind::Workspace);
     }
 
     #[test]
@@ -3115,6 +3716,19 @@ timeout:
             .replace("schema_version: 2", "schema_version: 3")
             .replace("runner: fixture", &format!("runner: {runner_mode}"))
             .replace(FIXTURE_RUNNER_BLOCK, runner_block)
+    }
+
+    fn schema_v4_fault_scenario() -> String {
+        V2_FIXTURE_SCENARIO
+            .replace("schema_version: 2", "schema_version: 4")
+            .replace(
+                FIXTURE_RUNNER_BLOCK,
+                format!("{FIXTURE_RUNNER_BLOCK}{FAULT_PLAN_BLOCK}").as_str(),
+            )
+            .replace(
+                "  tool_calls: []\nforbidden:",
+                format!("  tool_calls: []\n{FAULT_EXPECTATION_BLOCK}forbidden:").as_str(),
+            )
     }
 
     fn schema_v3_scenario_with_extra_runner_field(

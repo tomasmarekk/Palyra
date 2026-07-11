@@ -40,12 +40,18 @@ use std::os::windows::{io::AsRawHandle, process::CommandExt};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-        TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        },
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+        Threading::{OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME},
     },
 };
 
@@ -59,6 +65,7 @@ use palyra_common::{
         parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
         ProcessWatchStream,
     },
+    qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
 };
 use palyra_safety::{
@@ -71,6 +78,7 @@ use palyra_sandbox::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 // Input-shape caps applied before any spawn. They bound attacker-controlled argv/env size and
 // the allocations derived from it; raising any of them is a security-review change.
@@ -385,18 +393,42 @@ impl ProcessFailureClass {
 
     const fn repair_hint(self) -> &'static str {
         match self {
-            Self::Disabled => "enable tool_call.process_runner and allowlist palyra.process.run before retrying",
-            Self::InvalidInput => "fix the process.run JSON shape, path, lifetime, or interaction flags before retrying",
-            Self::CommandNotFound => "install the executable on the daemon PATH, use an allowed exact path, or provide a trusted prepend_path",
-            Self::PermissionDenied => "fix file permissions or choose an executable the daemon user can run",
-            Self::TimedOut => "for tests/builds, fix the hang or increase timeout_ms; for servers, use background=true and stop the returned handle",
-            Self::Killed => "inspect cancellation/signal cause and rerun only if the process tree can complete within the run lifecycle",
-            Self::NonzeroExit => "inspect the redacted stdout/stderr tail, fix the command or inputs, then rerun",
-            Self::OutputLimit => "rerun with narrower output, redirect verbose logs to a file, or raise max_output_bytes by policy",
-            Self::SandboxDenied => "keep paths and executables inside the configured workspace/policy or adjust the policy explicitly",
-            Self::EgressDenied => "declare allowed requested_egress_hosts or use an offline command",
-            Self::UnsupportedPlatform => "select a supported runner/backend or change policy to a mode the platform can enforce",
-            Self::RuntimeFailure => "inspect the error and retry only after the underlying runtime issue is fixed",
+            Self::Disabled => {
+                "enable tool_call.process_runner and allowlist palyra.process.run before retrying"
+            }
+            Self::InvalidInput => {
+                "fix the process.run JSON shape, path, lifetime, or interaction flags before retrying"
+            }
+            Self::CommandNotFound => {
+                "install the executable on the daemon PATH, use an allowed exact path, or provide a trusted prepend_path"
+            }
+            Self::PermissionDenied => {
+                "fix file permissions or choose an executable the daemon user can run"
+            }
+            Self::TimedOut => {
+                "for tests/builds, fix the hang or increase timeout_ms; for servers, use background=true and stop the returned handle"
+            }
+            Self::Killed => {
+                "inspect cancellation/signal cause and rerun only if the process tree can complete within the run lifecycle"
+            }
+            Self::NonzeroExit => {
+                "inspect the redacted stdout/stderr tail, fix the command or inputs, then rerun"
+            }
+            Self::OutputLimit => {
+                "rerun with narrower output, redirect verbose logs to a file, or raise max_output_bytes by policy"
+            }
+            Self::SandboxDenied => {
+                "keep paths and executables inside the configured workspace/policy or adjust the policy explicitly"
+            }
+            Self::EgressDenied => {
+                "declare allowed requested_egress_hosts or use an offline command"
+            }
+            Self::UnsupportedPlatform => {
+                "select a supported runner/backend or change policy to a mode the platform can enforce"
+            }
+            Self::RuntimeFailure => {
+                "inspect the error and retry only after the underlying runtime issue is fixed"
+            }
         }
     }
 
@@ -644,6 +676,158 @@ struct ProcessExecutionCapture {
     duration_ms: u64,
 }
 
+struct ManagedChildGuard {
+    child: Option<Child>,
+    exit_status: Option<ExitStatus>,
+    termination_requested: bool,
+    #[cfg(test)]
+    termination_probe: Option<Arc<AtomicUsize>>,
+}
+
+impl ManagedChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            exit_status: None,
+            termination_requested: false,
+            #[cfg(test)]
+            termination_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_termination_probe(child: Child, termination_probe: Arc<AtomicUsize>) -> Self {
+        Self {
+            child: Some(child),
+            exit_status: None,
+            termination_requested: false,
+            termination_probe: Some(termination_probe),
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("managed child guard must own a child").id()
+    }
+
+    fn child(&self) -> &Child {
+        self.child.as_ref().expect("managed child guard must own a child")
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("managed child guard must own a child")
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.exit_status.is_some() {
+            return Ok(self.exit_status);
+        }
+        let status = self.child_mut().try_wait()?;
+        if let Some(status) = status {
+            self.exit_status = Some(status);
+        }
+        Ok(status)
+    }
+
+    fn request_termination(&mut self) -> io::Result<()> {
+        if self.try_wait()?.is_some() || self.termination_requested {
+            return Ok(());
+        }
+        self.force_termination()
+    }
+
+    fn force_termination(&mut self) -> io::Result<()> {
+        if self.termination_requested {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(probe) = self.termination_probe.as_ref() {
+            probe.fetch_add(1, Ordering::SeqCst);
+        }
+        terminate_child_process_tree(self.child_mut())?;
+        self.termination_requested = true;
+        Ok(())
+    }
+
+    fn note_owned_tree_termination_requested(&mut self) {
+        self.termination_requested = true;
+    }
+
+    fn wait_for_exit(&mut self, max_wait: Duration) -> io::Result<Option<ExitStatus>> {
+        let started_at = Instant::now();
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(Some(status));
+            }
+            if started_at.elapsed() >= max_wait {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(CAPTURE_POLL_INTERVAL_MS));
+        }
+    }
+
+    fn terminate_and_reap(&mut self, max_wait: Duration) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.try_wait()? {
+            return Ok(Some(status));
+        }
+        self.request_termination()?;
+        self.wait_for_exit(max_wait)
+    }
+}
+
+impl Drop for ManagedChildGuard {
+    fn drop(&mut self) {
+        if self.child.is_none() || self.exit_status.is_some() {
+            return;
+        }
+        match self.terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
+            Ok(Some(_)) => {}
+            Ok(None) => warn!(
+                pid = self.id(),
+                "managed child did not exit within the bounded drop cleanup window"
+            ),
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    pid = self.id(),
+                    "managed child drop cleanup wait failed; forcing one bounded best-effort termination"
+                );
+                if let Err(termination_error) = self.force_termination() {
+                    warn!(
+                        error = ?termination_error,
+                        pid = self.id(),
+                        "managed child drop termination failed"
+                    );
+                } else {
+                    match self.wait_for_exit(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => warn!(
+                            pid = self.id(),
+                            "managed child remained live after drop termination"
+                        ),
+                        Err(wait_error) => warn!(
+                            error = ?wait_error,
+                            pid = self.id(),
+                            "managed child drop reap verification failed"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ForegroundProcessExecutionRequest<'a> {
+    policy: &'a SandboxProcessRunnerPolicy,
+    input: &'a ProcessRunnerInput,
+    workspace_root: &'a Path,
+    cwd: &'a Path,
+    timeout: Duration,
+    cancellation_requested: Option<Arc<AtomicBool>>,
+    progress_sink: Option<ProcessProgressSink>,
+    fault_injection: &'a crate::qa_fault_injection::QaFaultRuntime,
+}
+
 #[derive(Debug, Clone, Default)]
 struct StreamCapture {
     bytes: Vec<u8>,
@@ -688,6 +872,7 @@ struct BackgroundProcessSpawnRequest<'a> {
     max_lifetime: Duration,
     auto_background_reason: Option<&'static str>,
     lifetime_mode: BackgroundLifetimeMode,
+    fault_injection: &'a crate::qa_fault_injection::QaFaultRuntime,
 }
 
 struct BackgroundLauncherCompletedContext<'a> {
@@ -945,9 +1130,52 @@ fn mark_background_process_stopped(pid: u32) {
     }
 }
 
-fn mark_background_process_stopped_if_inactive(pid: u32) {
-    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true) {
-        mark_background_process_stopped(pid);
+/// RAII owner for temporary Win32 handles used while a background process is initialized.
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsOwnedHandle {
+    handle: HANDLE,
+    kind: &'static str,
+}
+
+#[cfg(windows)]
+impl WindowsOwnedHandle {
+    fn new(handle: HANDLE, kind: &'static str) -> io::Result<Self> {
+        if !windows_handle_is_valid(handle) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle, kind })
+    }
+
+    fn get(&self) -> HANDLE {
+        self.handle
+    }
+
+    fn close(mut self) -> io::Result<()> {
+        let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        // SAFETY: ownership was transferred to this wrapper at construction and the null
+        // replacement prevents Drop from closing the same handle twice.
+        if unsafe { CloseHandle(handle) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOwnedHandle {
+    fn drop(&mut self) {
+        if !windows_handle_is_valid(self.handle) {
+            return;
+        }
+        // SAFETY: the wrapper still owns this valid handle and this is its final close path.
+        if unsafe { CloseHandle(self.handle) } == 0 {
+            warn!(
+                error = ?io::Error::last_os_error(),
+                handle_kind = self.kind,
+                "temporary Windows handle close failed"
+            );
+        }
     }
 }
 
@@ -959,31 +1187,50 @@ fn mark_background_process_stopped_if_inactive(pid: u32) {
 #[derive(Debug)]
 struct WindowsBackgroundJob {
     handle: HANDLE,
-    terminated: AtomicBool,
+    termination_succeeded: Mutex<bool>,
 }
 
 // SAFETY: `HANDLE` is a process-wide kernel handle, valid from any thread; this wrapper owns it
-// exclusively until Drop and the only mutable state (`terminated`) is an atomic.
+// exclusively until Drop and serializes its mutable termination state behind a mutex.
 #[cfg(windows)]
 unsafe impl Send for WindowsBackgroundJob {}
 
 // SAFETY: see the Send rationale above; all &self methods are thread-safe Win32 calls guarded
-// by the `terminated` atomic.
+// by immutable handle ownership or the termination mutex.
 #[cfg(windows)]
 unsafe impl Sync for WindowsBackgroundJob {}
 
 #[cfg(windows)]
 impl WindowsBackgroundJob {
     fn terminate(&self) -> io::Result<()> {
-        // The swap makes termination idempotent: only the first caller issues the kill.
-        if self.terminated.swap(true, Ordering::SeqCst) {
+        self.terminate_with(|handle| {
+            // SAFETY: `handle` is a valid job handle owned by this wrapper until Drop closes it.
+            if unsafe { TerminateJobObject(handle, 1) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+
+    fn terminate_with(
+        &self,
+        terminate_operation: impl FnOnce(HANDLE) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut termination_succeeded = match self.termination_succeeded.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                warn!("Windows background job termination lock was poisoned; retrying cleanup");
+                poisoned.into_inner()
+            }
+        };
+        if *termination_succeeded {
             return Ok(());
         }
-        // SAFETY: `handle` is a valid job handle owned by this wrapper until Drop closes it.
-        let terminated = unsafe { TerminateJobObject(self.handle, 1) };
-        if terminated == 0 {
-            return Err(io::Error::last_os_error());
-        }
+
+        terminate_operation(self.handle)?;
+        // A failed OS operation leaves this false, so the next caller retries instead of
+        // reporting an idempotent false success while descendants may still be alive.
+        *termination_succeeded = true;
         Ok(())
     }
 
@@ -1161,6 +1408,24 @@ pub fn run_constrained_process_with_cancellation_and_progress(
     cancellation_requested: Option<Arc<AtomicBool>>,
     progress_sink: Option<ProcessProgressSink>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    run_constrained_process_with_fault_injection(
+        policy,
+        input_json,
+        execution_timeout,
+        cancellation_requested,
+        progress_sink,
+        crate::qa_fault_injection::QaFaultRuntime::default(),
+    )
+}
+
+pub(crate) fn run_constrained_process_with_fault_injection(
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+    execution_timeout: Duration,
+    cancellation_requested: Option<Arc<AtomicBool>>,
+    progress_sink: Option<ProcessProgressSink>,
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     if !policy.enabled {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::Disabled,
@@ -1300,20 +1565,22 @@ pub fn run_constrained_process_with_cancellation_and_progress(
             max_lifetime: max_background_lifetime,
             auto_background_reason: None,
             lifetime_mode: input.effective_lifetime_mode(),
+            fault_injection: &fault_injection,
         });
     }
 
     let per_call_timeout = foreground_process_timeout(input.timeout_ms, execution_timeout);
 
-    let capture = execute_process(
+    let capture = execute_process(ForegroundProcessExecutionRequest {
         policy,
-        &input,
-        workspace_root.as_path(),
-        working_directory.as_path(),
-        per_call_timeout,
+        input: &input,
+        workspace_root: workspace_root.as_path(),
+        cwd: working_directory.as_path(),
+        timeout: per_call_timeout,
         cancellation_requested,
         progress_sink,
-    )?;
+        fault_injection: &fault_injection,
+    })?;
     if capture.cancelled {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::Cancelled,
@@ -1749,7 +2016,9 @@ fn process_stream_output_view(
         redacted_process_output_text(decoded.text.as_str());
     let inline_truncated = text.len() > PROCESS_STREAM_INLINE_TEXT_BYTES;
     let model_text = if inline_truncated {
-        format!("<{stream_name} omitted: size_bytes={size_bytes} sha256={sha256}; see streams.{stream_name}.head and streams.{stream_name}.tail>")
+        format!(
+            "<{stream_name} omitted: size_bytes={size_bytes} sha256={sha256}; see streams.{stream_name}.head and streams.{stream_name}.tail>"
+        )
     } else {
         text.clone()
     };
@@ -2967,7 +3236,15 @@ fn background_process_tree_status(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn background_process_tree_status(
+    pid: u32,
+    _direct_pid_alive: bool,
+) -> io::Result<(bool, Option<u32>)> {
+    Ok((unix_process_group_is_alive(pid)?, None))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn background_process_tree_status(
     _pid: u32,
     direct_pid_alive: bool,
@@ -6144,34 +6421,262 @@ fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool 
     })
 }
 
+fn managed_process_fault(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    point_id: &'static str,
+    actor: &'static str,
+) -> Result<QaFaultDirective, SandboxProcessRunError> {
+    fault_injection.checkpoint(point_id, actor).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("qa_fault.managed_process_checkpoint_failed: {error}"),
+    })
+}
+
+fn apply_managed_process_fault_without_child(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    point_id: &'static str,
+    actor: &'static str,
+) -> Result<(), SandboxProcessRunError> {
+    match managed_process_fault(fault_injection, point_id, actor)? {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+            QaFaultAction::Timeout => {
+                fault_injection.record_immediate_recovery(&directive).map_err(|error| {
+                    SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                    }
+                })?;
+                Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::TimedOut,
+                    message: format!(
+                        "qa_fault.managed_process_timeout: activation={}",
+                        directive.activation.id
+                    ),
+                })
+            }
+            QaFaultAction::TerminateProcess => {
+                fault_injection.record_immediate_recovery(&directive).map_err(|error| {
+                    SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                    }
+                })?;
+                #[cfg(feature = "qa-fault-injection")]
+                fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message:
+                        "qa_fault.feature_disabled: terminate directive reached a feature-off build"
+                            .to_owned(),
+                })
+            }
+            action => Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "qa_fault.managed_process_action_unsupported: {}",
+                    action.kind().as_str()
+                ),
+            }),
+        },
+    }
+}
+
+fn apply_managed_process_fault_with_child(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    point_id: &'static str,
+    actor: &'static str,
+    child: ManagedChildGuard,
+) -> Result<ManagedChildGuard, SandboxProcessRunError> {
+    match managed_process_fault(fault_injection, point_id, actor)? {
+        QaFaultDirective::Continue => Ok(child),
+        QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+            QaFaultAction::TerminateProcess => {
+                let recovery_class = match point_id {
+                    "managed_process.after_effect_before_ack" => {
+                        QaFaultRecoveryClass::OutcomeUnknown
+                    }
+                    "managed_process.after_ack_before_transition" => {
+                        QaFaultRecoveryClass::CleanupSucceeded
+                    }
+                    _ => {
+                        return Err(SandboxProcessRunError {
+                            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                            message: format!(
+                                "qa_fault.managed_process_recovery_unclassified: {point_id}"
+                            ),
+                        });
+                    }
+                };
+                terminate_background_child(child)?;
+                fault_injection
+                    .record_verified_recovery(
+                        &directive,
+                        recovery_class,
+                        "qa_fault.managed_process_owned_tree_cleanup_verified",
+                    )
+                    .map_err(|error| SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                    })?;
+                #[cfg(feature = "qa-fault-injection")]
+                fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message:
+                        "qa_fault.feature_disabled: terminate directive reached a feature-off build"
+                            .to_owned(),
+                })
+            }
+            action => Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "qa_fault.managed_process_action_unsupported: {}",
+                    action.kind().as_str()
+                ),
+            }),
+        },
+    }
+}
+
+fn apply_managed_process_fault_after_verified_cleanup(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    point_id: &'static str,
+    actor: &'static str,
+) -> Result<(), SandboxProcessRunError> {
+    match managed_process_fault(fault_injection, point_id, actor)? {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => {
+            let recovery_class = QaFaultRecoveryClass::CleanupSucceeded;
+            match directive.activation.action.clone() {
+                QaFaultAction::Timeout => {
+                    fault_injection
+                        .record_verified_recovery(
+                            &directive,
+                            recovery_class,
+                            "qa_fault.managed_process_owned_tree_cleanup_verified",
+                        )
+                        .map_err(|error| SandboxProcessRunError {
+                            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                            message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                        })?;
+                    Err(SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::TimedOut,
+                        message: format!(
+                            "qa_fault.managed_process_timeout: activation={}",
+                            directive.activation.id
+                        ),
+                    })
+                }
+                QaFaultAction::TerminateProcess => {
+                    fault_injection
+                        .record_verified_recovery(
+                            &directive,
+                            recovery_class,
+                            "qa_fault.managed_process_owned_tree_cleanup_verified",
+                        )
+                        .map_err(|error| SandboxProcessRunError {
+                            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                            message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                        })?;
+                    #[cfg(feature = "qa-fault-injection")]
+                    fault_injection.terminate_process();
+                    #[cfg(not(feature = "qa-fault-injection"))]
+                    Err(SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: "qa_fault.feature_disabled: terminate directive reached a feature-off build"
+                            .to_owned(),
+                    })
+                }
+                action => Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!(
+                        "qa_fault.managed_process_action_unsupported: {}",
+                        action.kind().as_str()
+                    ),
+                }),
+            }
+        }
+    }
+}
+
 fn execute_process(
-    policy: &SandboxProcessRunnerPolicy,
-    input: &ProcessRunnerInput,
-    workspace_root: &Path,
-    cwd: &Path,
-    timeout: Duration,
-    cancellation_requested: Option<Arc<AtomicBool>>,
-    progress_sink: Option<ProcessProgressSink>,
+    request: ForegroundProcessExecutionRequest<'_>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
+    let ForegroundProcessExecutionRequest {
+        policy,
+        input,
+        workspace_root,
+        cwd,
+        timeout,
+        cancellation_requested,
+        progress_sink,
+        fault_injection,
+    } = request;
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
+    configure_background_child_suspended(&mut command);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if !process_runner_allows_host_access(policy) {
         attach_resource_limits_unix(&mut command, policy);
     }
 
-    let mut child = command.spawn().map_err(|error| SandboxProcessRunError {
+    apply_managed_process_fault_without_child(
+        fault_injection,
+        "managed_process.before_effect",
+        "foreground",
+    )?;
+    let child = command.spawn().map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::SpawnFailed,
         message: process_spawn_failed_message(policy, input, cwd, &error),
     })?;
-
-    capture_child_output(
+    // Windows children start suspended so the kill-on-close job owns the full descendant tree
+    // before user code can run and before a post-spawn fault may terminate the daemon.
+    #[cfg(windows)]
+    let child = prepare_windows_background_child(ManagedChildGuard::new(child))?;
+    #[cfg(not(windows))]
+    let child = ManagedChildGuard::new(child);
+    let mut child = apply_managed_process_fault_with_child(
+        fault_injection,
+        "managed_process.after_effect_before_ack",
+        "foreground",
+        child,
+    )?;
+    let capture = capture_child_output(
         &mut child,
         timeout,
         policy.max_output_bytes as usize,
         cancellation_requested,
         progress_sink,
-    )
+    );
+    let cleanup = terminate_background_child(child);
+    if let Err(cleanup_error) = cleanup {
+        return Err(match capture {
+            Ok(_) => cleanup_error,
+            Err(capture_error) => SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "{}; owned-tree cleanup verification also failed: {}",
+                    capture_error.message, cleanup_error.message
+                ),
+            },
+        });
+    }
+    apply_managed_process_fault_after_verified_cleanup(
+        fault_injection,
+        "managed_process.during_cleanup",
+        "foreground",
+    )?;
+    if capture.is_ok() {
+        apply_managed_process_fault_after_verified_cleanup(
+            fault_injection,
+            "managed_process.after_ack_before_transition",
+            "foreground",
+        )?;
+    }
+    capture
 }
 
 fn process_spawn_failed_message(
@@ -6207,6 +6712,17 @@ fn configure_child_process_group(command: &mut Command) {
 #[cfg(not(unix))]
 fn configure_child_process_group(_command: &mut Command) {}
 
+// Windows has no pre-exec hook that can atomically attach a new process to a job. Starting the
+// initial thread suspended closes that ownership gap: user code cannot create descendants before
+// the daemon has installed and registered the kill-on-close job boundary.
+#[cfg(windows)]
+fn configure_background_child_suspended(command: &mut Command) {
+    command.creation_flags(CREATE_SUSPENDED);
+}
+
+#[cfg(not(windows))]
+fn configure_background_child_suspended(_command: &mut Command) {}
+
 fn spawn_background_process(
     request: BackgroundProcessSpawnRequest<'_>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
@@ -6220,9 +6736,11 @@ fn spawn_background_process(
         max_lifetime,
         auto_background_reason,
         lifetime_mode,
+        fault_injection,
     } = request;
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
+    configure_background_child_suspended(&mut command);
     let capabilities = BackgroundProcessHandleCapabilities::from_input(input);
     command
         .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
@@ -6238,20 +6756,36 @@ fn spawn_background_process(
     let lifetime_ms = lifetime.as_millis() as u64;
     let startup_budget = background_process_startup_metadata_budget(lifetime)
         .ok_or_else(|| background_process_startup_budget_expired_error(input, lifetime_ms))?;
-    let mut child = command.spawn().map_err(|error| SandboxProcessRunError {
+    apply_managed_process_fault_without_child(
+        fault_injection,
+        "managed_process.before_effect",
+        "background",
+    )?;
+    let child = command.spawn().map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::SpawnFailed,
         message: process_spawn_failed_message(policy, input, cwd, &error),
     })?;
-    let pid = child.id();
-    // Job binding is best effort: a bind failure downgrades stop/status to direct-pid tracking
-    // (reported via windows_job_object=false) rather than failing the whole run.
+    // The advertised lifetime starts once the OS process exists. Fault handling, Windows owner
+    // binding/resume, and registry contention must not give a live process unmetered runtime.
+    let started_at = Instant::now();
     #[cfg(windows)]
-    let windows_job_bound = bind_child_to_windows_background_job(&child, pid).is_ok();
+    let child = prepare_windows_background_child(ManagedChildGuard::new(child))?;
+    #[cfg(not(windows))]
+    let child = ManagedChildGuard::new(child);
+    let mut child = apply_managed_process_fault_with_child(
+        fault_injection,
+        "managed_process.after_effect_before_ack",
+        "background",
+        child,
+    )?;
+    let pid = child.id();
+    #[cfg(windows)]
+    let windows_job_bound = true;
     #[cfg(not(windows))]
     let windows_job_bound = false;
-    let stdin = capabilities.stdin.then(|| child.stdin.take()).flatten();
+    let stdin = capabilities.stdin.then(|| child.child_mut().stdin.take()).flatten();
     if capabilities.stdin && stdin.is_none() {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!(
@@ -6261,20 +6795,21 @@ fn spawn_background_process(
         });
     }
     if let Err(error) = register_background_process_pid(pid, capabilities, lifetime_mode, stdin) {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(error);
     }
-    let started_at = Instant::now();
-    let output_monitor =
-        match start_background_output_monitor(&mut child, policy.max_output_bytes as usize) {
-            Ok(output_monitor) => output_monitor,
-            Err(error) => {
-                terminate_background_child(child);
-                return Err(error);
-            }
-        };
+    let output_monitor = match start_background_output_monitor(
+        child.child_mut(),
+        policy.max_output_bytes as usize,
+    ) {
+        Ok(output_monitor) => output_monitor,
+        Err(error) => {
+            terminate_background_child(child)?;
+            return Err(error);
+        }
+    };
     if let Err(error) = attach_background_output_monitor(pid, output_monitor.clone()) {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(error);
     }
     let Some(startup_check_wait) = bounded_background_process_wait(
@@ -6282,21 +6817,29 @@ fn spawn_background_process(
         started_at.elapsed(),
         Duration::from_millis(BACKGROUND_STARTUP_CHECK_MS),
     ) else {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     };
     thread::sleep(startup_check_wait);
     if remaining_background_process_lifetime(startup_budget, started_at.elapsed()).is_none() {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     }
-    if let Some(status) = child.try_wait().map_err(|error| SandboxProcessRunError {
-        kind: SandboxProcessRunErrorKind::RuntimeFailure,
-        message: format!(
-            "sandbox background process startup check failed for command '{}': {error}",
-            input.command
-        ),
-    })? {
+    let startup_status = match child.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let error = SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "sandbox background process startup check failed for command '{}': {error}",
+                    input.command
+                ),
+            };
+            terminate_background_child(child)?;
+            return Err(error);
+        }
+    };
+    if let Some(status) = startup_status {
         let startup_output_drain = bounded_background_process_wait(
             startup_budget,
             started_at.elapsed(),
@@ -6305,7 +6848,7 @@ fn spawn_background_process(
         .unwrap_or(Duration::ZERO);
         let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
         if status.success() {
-            terminate_background_child(child);
+            terminate_background_child(child)?;
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -6320,7 +6863,7 @@ fn spawn_background_process(
                 },
             );
         }
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
     let cleanup = background_cleanup_metadata(pid, lifetime_ms, windows_job_bound);
@@ -6339,9 +6882,17 @@ fn spawn_background_process(
     .unwrap_or(Duration::ZERO);
     // Second exit probe after the output drain: catches commands that print something and then
     // die (e.g. an unknown-subcommand banner), which the first probe is too early to see.
-    if let Some(status) = wait_for_background_process_exit(&mut child, post_output_exit_check)? {
+    let post_output_status =
+        match wait_for_background_process_exit(&mut child, post_output_exit_check) {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_background_child(child)?;
+                return Err(error);
+            }
+        };
+    if let Some(status) = post_output_status {
         if status.success() {
-            terminate_background_child(child);
+            terminate_background_child(child)?;
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -6356,18 +6907,31 @@ fn spawn_background_process(
                 },
             );
         }
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
     let Some(remaining_lifetime) =
         remaining_background_process_lifetime(lifetime, started_at.elapsed())
     else {
-        terminate_background_child(child);
+        terminate_background_child(child)?;
         return Err(background_process_lifetime_expired_error(input, lifetime_ms));
     };
+    let child = apply_managed_process_fault_with_child(
+        fault_injection,
+        "managed_process.after_ack_before_transition",
+        "background",
+        child,
+    )?;
     // The monitor thread owns the child from here; it reaps a natural exit or kills the tree
     // when the remaining lifetime expires, so no background process can outlive its budget.
-    thread::spawn(move || monitor_background_child_until_lifetime(child, remaining_lifetime));
+    let background_fault_injection = fault_injection.clone();
+    thread::spawn(move || {
+        monitor_background_child_until_lifetime(
+            child,
+            remaining_lifetime,
+            background_fault_injection,
+        )
+    });
 
     let RedactedProcessOutputText {
         text: stdout_text,
@@ -6779,7 +7343,7 @@ terminal run cleanup."
 }
 
 fn wait_for_background_process_exit(
-    child: &mut Child,
+    child: &mut ManagedChildGuard,
     max_wait: Duration,
 ) -> Result<Option<ExitStatus>, SandboxProcessRunError> {
     let started_at = Instant::now();
@@ -6905,15 +7469,151 @@ fn spawn_background_capture_reader<R>(
     });
 }
 
-fn terminate_background_child(mut child: Child) {
-    let pid = child.id();
-    terminate_child_process_tree(&mut child);
-    // Reap the direct child so a failed background startup never leaves a zombie behind.
-    let _ = child.wait();
-    mark_background_process_stopped_if_inactive(pid);
+#[cfg(windows)]
+fn terminate_owned_background_process_tree(pid: u32) -> io::Result<()> {
+    windows_background_job(pid)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("background process {pid} has no owned Windows job object"),
+            )
+        })?
+        .terminate()
 }
 
-fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration) {
+#[cfg(unix)]
+fn terminate_owned_background_process_tree(pid: u32) -> io::Result<()> {
+    match terminate_unix_process_group(pid) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_owned_background_process_tree(pid: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("background process tree ownership is unavailable for pid {pid}"),
+    ))
+}
+
+#[cfg(windows)]
+fn owned_background_process_tree_is_alive(pid: u32) -> io::Result<bool> {
+    windows_background_job_active_process_count(pid)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("background process {pid} has no owned Windows job object"),
+            )
+        })?
+        .map(|active_count| active_count > 0)
+}
+
+#[cfg(unix)]
+fn owned_background_process_tree_is_alive(pid: u32) -> io::Result<bool> {
+    unix_process_group_is_alive(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn owned_background_process_tree_is_alive(pid: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("background process tree ownership is unavailable for pid {pid}"),
+    ))
+}
+
+fn wait_for_owned_background_tree_inactive(pid: u32, max_wait: Duration) -> io::Result<bool> {
+    let started_at = Instant::now();
+    loop {
+        if !owned_background_process_tree_is_alive(pid)? {
+            return Ok(true);
+        }
+        if started_at.elapsed() >= max_wait {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
+    }
+}
+
+fn release_verified_background_process_tracking(pid: u32) {
+    mark_background_process_stopped(pid);
+    #[cfg(windows)]
+    remove_windows_background_job(pid);
+}
+
+fn terminate_background_child(mut child: ManagedChildGuard) -> Result<(), SandboxProcessRunError> {
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            terminate_owned_background_process_tree(pid).map_err(|error| {
+                SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!(
+                        "sandbox background descendant cleanup failed for reaped pid {pid}: {error}"
+                    ),
+                }
+            })?;
+        }
+        Ok(None) => {
+            child.request_termination().map_err(|error| SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "sandbox background process cleanup failed for pid {pid}: {error}"
+                ),
+            })?;
+        }
+        Err(wait_error) => {
+            terminate_owned_background_process_tree(pid).map_err(|termination_error| {
+                SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!(
+                        "sandbox background wait probe failed for pid {pid}: {wait_error}; owned-tree termination also failed: {termination_error}"
+                    ),
+                }
+            })?;
+            child.note_owned_tree_termination_requested();
+        }
+    }
+    let direct_exit = child
+        .wait_for_exit(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("sandbox background process cleanup failed for pid {pid}: {error}"),
+        })?;
+    if direct_exit.is_none() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process {pid} did not exit within the bounded cleanup window"
+            ),
+        });
+    }
+    let tree_inactive = wait_for_owned_background_tree_inactive(
+        pid,
+        Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+    )
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("sandbox background tree verification failed for pid {pid}: {error}"),
+    })?;
+    if !tree_inactive {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process tree {pid} remained active after bounded cleanup"
+            ),
+        });
+    }
+    release_verified_background_process_tracking(pid);
+    Ok(())
+}
+
+fn monitor_background_child_until_lifetime(
+    mut child: ManagedChildGuard,
+    lifetime: Duration,
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+) {
     let pid = child.id();
     let started_at = Instant::now();
     let mut direct_child_exited = false;
@@ -6924,20 +7624,27 @@ fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration)
                     direct_child_exited = true;
                 }
                 Ok(None) => {}
-                Err(_) => {
-                    direct_child_exited = true;
+                Err(error) => {
+                    warn!(error = ?error, pid, "background process wait failed; forcing bounded cleanup");
+                    if let Err(cleanup_error) = terminate_background_child(child) {
+                        warn!(error = ?cleanup_error, pid, "background process wait-failure cleanup failed");
+                    }
+                    return;
                 }
             }
         }
         if direct_child_exited {
-            match background_process_runtime_status(pid) {
-                Ok(status) if !status.alive() => {
-                    mark_background_process_stopped(pid);
+            match owned_background_process_tree_is_alive(pid) {
+                Ok(false) => {
+                    release_verified_background_process_tracking(pid);
                     return;
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    mark_background_process_stopped(pid);
+                Ok(true) => {}
+                Err(error) => {
+                    warn!(error = ?error, pid, "owned background tree status failed; forcing bounded cleanup");
+                    if let Err(cleanup_error) = terminate_background_child(child) {
+                        warn!(error = ?cleanup_error, pid, "background status-failure cleanup failed");
+                    }
                     return;
                 }
             }
@@ -6945,12 +7652,20 @@ fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration)
 
         let elapsed = started_at.elapsed();
         if elapsed >= lifetime {
-            terminate_child_process_tree(&mut child);
-            let _ = wait_for_background_process_exit(
-                &mut child,
-                Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
-            );
-            mark_background_process_stopped_if_inactive(pid);
+            match terminate_background_child(child) {
+                Ok(()) => {
+                    if let Err(error) = apply_managed_process_fault_after_verified_cleanup(
+                        &fault_injection,
+                        "managed_process.during_cleanup",
+                        "background",
+                    ) {
+                        warn!(error = ?error, pid, "background process cleanup fault adapter returned an error");
+                    }
+                }
+                Err(error) => {
+                    warn!(error = ?error, pid, "background process cleanup verification failed");
+                }
+            }
             return;
         }
 
@@ -6960,7 +7675,66 @@ fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration)
 }
 
 #[cfg(windows)]
+fn prepare_windows_background_child(
+    child: ManagedChildGuard,
+) -> Result<ManagedChildGuard, SandboxProcessRunError> {
+    prepare_windows_background_child_with_operations(
+        child,
+        bind_child_to_windows_background_job,
+        resume_suspended_windows_process,
+    )
+}
+
+#[cfg(windows)]
+fn prepare_windows_background_child_with_operations<Bind, Resume>(
+    mut child: ManagedChildGuard,
+    bind: Bind,
+    resume: Resume,
+) -> Result<ManagedChildGuard, SandboxProcessRunError>
+where
+    Bind: FnOnce(&Child, u32) -> io::Result<()>,
+    Resume: FnOnce(u32) -> io::Result<()>,
+{
+    let pid = child.id();
+    if let Err(bind_error) = bind(child.child(), pid) {
+        let cleanup = child
+            .terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+            .map(|status| status.is_some());
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process {pid} could not bind its required Windows job object before resume: {bind_error}; bounded direct-exit verification: {cleanup:?}"
+            ),
+        });
+    }
+
+    if let Err(resume_error) = resume(pid) {
+        let cleanup = terminate_background_child(child);
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process {pid} could not resume after Windows job ownership was established: {resume_error}; bounded owned-tree cleanup verification: {cleanup:?}"
+            ),
+        });
+    }
+
+    Ok(child)
+}
+
+#[cfg(windows)]
 fn bind_child_to_windows_background_job(child: &Child, pid: u32) -> io::Result<()> {
+    bind_child_to_windows_background_job_with_register(child, pid, register_windows_background_job)
+}
+
+#[cfg(windows)]
+fn bind_child_to_windows_background_job_with_register<Register>(
+    child: &Child,
+    pid: u32,
+    register: Register,
+) -> io::Result<()>
+where
+    Register: FnOnce(u32, Arc<WindowsBackgroundJob>) -> io::Result<()>,
+{
     let job = create_windows_background_job()?;
     let child_handle = child.as_raw_handle() as HANDLE;
     if !windows_handle_is_valid(child_handle) {
@@ -6977,7 +7751,131 @@ fn bind_child_to_windows_background_job(child: &Child, pid: u32) -> io::Result<(
         return Err(io::Error::last_os_error());
     }
 
-    register_windows_background_job(pid, Arc::new(job))
+    register(pid, Arc::new(job))
+}
+
+#[cfg(windows)]
+fn resume_suspended_windows_process(pid: u32) -> io::Result<()> {
+    // SAFETY: TH32CS_SNAPTHREAD ignores the process-id parameter and returns an owned snapshot
+    // handle on success.
+    let snapshot_handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    let snapshot =
+        WindowsOwnedHandle::new(snapshot_handle, "thread snapshot").map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to snapshot threads before resuming process {pid}: {error}"),
+            )
+        })?;
+    let resume_result = resume_suspended_windows_process_from_snapshot(snapshot.get(), pid);
+    combine_windows_operation_and_close_result(resume_result, snapshot.close(), "thread snapshot")
+}
+
+#[cfg(windows)]
+fn resume_suspended_windows_process_from_snapshot(snapshot: HANDLE, pid: u32) -> io::Result<()> {
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: `snapshot` is a live ToolHelp snapshot and `entry` is a writable structure whose
+    // required size field is initialized.
+    if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("failed to enumerate the initial suspended thread for process {pid}: {error}"),
+        ));
+    }
+
+    let mut resumed_threads = 0_u32;
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            resume_suspended_windows_thread(pid, entry.th32ThreadID)?;
+            resumed_threads = resumed_threads.saturating_add(1);
+        }
+
+        // SAFETY: the snapshot and output structure remain valid for the full enumeration.
+        if unsafe { Thread32Next(snapshot, &mut entry) } != 0 {
+            continue;
+        }
+        // SAFETY: GetLastError has no preconditions and is read immediately after Thread32Next.
+        let error_code = unsafe { GetLastError() };
+        if error_code != ERROR_NO_MORE_FILES {
+            return Err(io::Error::new(
+                io::Error::from_raw_os_error(error_code as i32).kind(),
+                format!(
+                    "thread enumeration failed while resuming process {pid}: {}",
+                    io::Error::from_raw_os_error(error_code as i32)
+                ),
+            ));
+        }
+        break;
+    }
+
+    if resumed_threads == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no suspended thread was found for background process {pid}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resume_suspended_windows_thread(pid: u32, thread_id: u32) -> io::Result<()> {
+    // SAFETY: the access mask requests only resume rights, handle inheritance is disabled, and
+    // `thread_id` came from the live ToolHelp snapshot.
+    let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    let thread =
+        WindowsOwnedHandle::new(thread_handle, "background process thread").map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to open suspended thread {thread_id} for process {pid}: {error}"),
+            )
+        })?;
+
+    // SAFETY: `thread` owns a live handle opened with THREAD_SUSPEND_RESUME access.
+    let previous_suspend_count = unsafe { ResumeThread(thread.get()) };
+    let resume_result = if previous_suspend_count == u32::MAX {
+        let error = io::Error::last_os_error();
+        Err(io::Error::new(
+            error.kind(),
+            format!("failed to resume thread {thread_id} for process {pid}: {error}"),
+        ))
+    } else if previous_suspend_count != 1 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "thread {thread_id} for process {pid} had unexpected suspend count {previous_suspend_count}; expected exactly one CREATE_SUSPENDED hold"
+            ),
+        ))
+    } else {
+        Ok(())
+    };
+
+    combine_windows_operation_and_close_result(
+        resume_result,
+        thread.close(),
+        "background process thread",
+    )
+}
+
+#[cfg(windows)]
+fn combine_windows_operation_and_close_result(
+    operation: io::Result<()>,
+    close: io::Result<()>,
+    handle_kind: &str,
+) -> io::Result<()> {
+    match (operation, close) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(close_error)) => Err(io::Error::new(
+            close_error.kind(),
+            format!("failed to close {handle_kind} handle: {close_error}"),
+        )),
+        (Err(error), Err(close_error)) => Err(io::Error::other(format!(
+            "{error}; failed to close {handle_kind} handle: {close_error}"
+        ))),
+    }
 }
 
 #[cfg(windows)]
@@ -6988,7 +7886,7 @@ fn create_windows_background_job() -> io::Result<WindowsBackgroundJob> {
         return Err(io::Error::last_os_error());
     }
 
-    let job = WindowsBackgroundJob { handle, terminated: AtomicBool::new(false) };
+    let job = WindowsBackgroundJob { handle, termination_succeeded: Mutex::new(false) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     // Kill-on-close means the OS tears the whole tree down if the daemon exits or the last job
     // handle is dropped, so orphaned background trees cannot survive a daemon crash.
@@ -7248,6 +8146,23 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
+#[cfg(unix)]
+fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
+    let process_group_id = unix_pid_from_u32(pid)?;
+    // Signal 0 probes the owned process group without changing it. A missing group is the only
+    // successful cleanup proof; permission and other failures stay fail-closed.
+    // SAFETY: kill(2) with signal 0 has no side effect and the return value is checked.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
 #[cfg(windows)]
 fn process_id_is_alive(pid: u32) -> io::Result<bool> {
     palyra_common::windows_security::process_is_alive(pid)
@@ -7299,24 +8214,16 @@ fn process_id_is_alive(pid: u32) -> io::Result<bool> {
     ))
 }
 
-fn terminate_child_process_tree(child: &mut Child) {
-    #[cfg(windows)]
-    {
-        let pid = child.id();
-        if terminate_background_process_tree(pid).is_ok() {
-            return;
-        }
+fn terminate_child_process_tree(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
+    match terminate_background_process_tree(pid) {
+        Ok(()) => Ok(()),
+        Err(tree_error) => child.kill().map_err(|direct_error| {
+            io::Error::other(format!(
+                "failed to terminate process tree or direct child {pid}: tree termination failed: {tree_error}; direct child kill failed: {direct_error}"
+            ))
+        }),
     }
-    #[cfg(unix)]
-    {
-        let pid = child.id();
-        if terminate_background_process_tree(pid).is_ok() {
-            return;
-        }
-    }
-    // Last resort: kills only the direct child, so grandchildren may survive. Acceptable only
-    // because the tree-wide paths above are tried first on every supported platform.
-    let _ = child.kill();
 }
 
 fn background_cleanup_metadata(
@@ -8564,17 +9471,17 @@ fn cpu_ms_to_rlimit_seconds(cpu_time_limit_ms: u64) -> u64 {
 }
 
 fn capture_child_output(
-    child: &mut Child,
+    child: &mut ManagedChildGuard,
     timeout: Duration,
     max_output_bytes: usize,
     cancellation_requested: Option<Arc<AtomicBool>>,
     progress_sink: Option<ProcessProgressSink>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
-    let stdout = child.stdout.take().ok_or_else(|| SandboxProcessRunError {
+    let stdout = child.child_mut().stdout.take().ok_or_else(|| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: "sandbox process stdout pipe is unavailable".to_owned(),
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| SandboxProcessRunError {
+    let stderr = child.child_mut().stderr.take().ok_or_else(|| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: "sandbox process stderr pipe is unavailable".to_owned(),
     })?;
@@ -8604,7 +9511,7 @@ fn capture_child_output(
     let mut timed_out = false;
     let mut quota_exceeded = false;
     let mut cancelled = false;
-    let mut termination_requested = false;
+    let mut termination_requested_at = None;
     let mut last_progress_emitted_at = None;
     let mut last_progress_stdout_bytes = 0_usize;
     let mut last_progress_stderr_bytes = 0_usize;
@@ -8623,29 +9530,49 @@ fn capture_child_output(
             .is_some_and(|requested| requested.load(Ordering::Relaxed))
         {
             cancelled = true;
-            if !termination_requested {
-                terminate_child_process_tree(child);
-                termination_requested = true;
+            if termination_requested_at.is_none() {
+                child.request_termination().map_err(|error| SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!("sandbox process cancellation cleanup failed: {error}"),
+                })?;
+                termination_requested_at = Some(Instant::now());
             }
         }
         if quota_triggered.load(Ordering::Relaxed) {
             quota_exceeded = true;
-            if !termination_requested {
-                terminate_child_process_tree(child);
-                termination_requested = true;
+            if termination_requested_at.is_none() {
+                child.request_termination().map_err(|error| SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!("sandbox process quota cleanup failed: {error}"),
+                })?;
+                termination_requested_at = Some(Instant::now());
             }
         }
         if started_at.elapsed() > timeout {
             timed_out = true;
-            if !termination_requested {
-                terminate_child_process_tree(child);
-                termination_requested = true;
+            if termination_requested_at.is_none() {
+                child.request_termination().map_err(|error| SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!("sandbox process timeout cleanup failed: {error}"),
+                })?;
+                termination_requested_at = Some(Instant::now());
             }
         }
 
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(CAPTURE_POLL_INTERVAL_MS)),
+            Ok(None) => {
+                if termination_requested_at.is_some_and(|requested_at| {
+                    requested_at.elapsed() >= Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)
+                }) {
+                    return Err(SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: "sandbox process did not exit within the bounded cleanup window"
+                            .to_owned(),
+                    });
+                }
+                thread::sleep(Duration::from_millis(CAPTURE_POLL_INTERVAL_MS));
+            }
             Err(error) => {
                 return Err(SandboxProcessRunError {
                     kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -8669,7 +9596,6 @@ fn capture_child_output(
         || quota_triggered.load(Ordering::Relaxed)
         || stdout.truncated
         || stderr.truncated;
-
     Ok(ProcessExecutionCapture {
         exit_status,
         stdout,
@@ -8794,9 +9720,9 @@ mod tests {
         ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex, OnceLock,
         },
         thread,
@@ -8804,6 +9730,14 @@ mod tests {
     };
 
     use palyra_common::process_runner_input::ProcessWatchStream;
+    #[cfg(feature = "qa-fault-injection")]
+    use palyra_common::qa_fault_injection::{
+        parse_qa_fault_evidence_sidecar_ndjson, QaFaultAction, QaFaultActivation,
+        QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan, QaFaultLaunchDocument,
+        QaFaultRecoveryClass, QA_FAULT_INJECTION_PLAN_FORMAT,
+        QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION, QA_FAULT_LAUNCH_SCHEMA_VERSION,
+        QA_FAULT_TERMINATE_EXIT_CODE,
+    };
     use palyra_sandbox::TierCCommandPlan;
     use serde_json::Value;
 
@@ -8830,8 +9764,8 @@ mod tests {
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
         validate_process_termination_scope, validate_runtime_egress_enforcement,
-        BackgroundLifetimeMode, EgressEnforcementMode, PathAccessMode, ProcessCompletionState,
-        ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
+        BackgroundLifetimeMode, EgressEnforcementMode, ManagedChildGuard, PathAccessMode,
+        ProcessCompletionState, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
         ProcessSuccessOutputJsonInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
         SandboxProcessRunnerTier, StreamCapture, BACKGROUND_MONITOR_POLL_MS,
         BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS,
@@ -8844,6 +9778,16 @@ mod tests {
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
     const BACKGROUND_TEST_SCRIPT_SLEEP_SECS: u64 = 8;
+    const MANAGED_CHILD_GUARD_TEST_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_CHILD";
+    const MANAGED_CHILD_GUARD_MARKER_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_MARKER";
+    const MANAGED_CHILD_GUARD_GATE_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_GATE";
+    const MANAGED_CHILD_GUARD_STARTED_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_STARTED";
+    const MANAGED_CHILD_GUARD_LAUNCHER_STARTED_ENV: &str =
+        "PALYRA_MANAGED_CHILD_GUARD_TEST_LAUNCHER_STARTED";
+    #[cfg(feature = "qa-fault-injection")]
+    const MANAGED_PROCESS_FAULT_TEST_MODE_ENV: &str = "PALYRA_MANAGED_PROCESS_FAULT_TEST_MODE";
+    #[cfg(feature = "qa-fault-injection")]
+    const MANAGED_PROCESS_FAULT_TEST_ROOT_ENV: &str = "PALYRA_MANAGED_PROCESS_FAULT_TEST_ROOT";
     static PROCESS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn empty_process_risk_report() -> palyra_common::process_risk::ProcessRiskReport {
@@ -8890,6 +9834,526 @@ mod tests {
             error.to_string().contains("exceeds Unix pid_t range"),
             "error should explain the rejected pid range"
         );
+    }
+
+    #[test]
+    fn managed_child_guard_drop_terminates_and_reaps_the_child() {
+        match std::env::var(MANAGED_CHILD_GUARD_TEST_ENV).ok().as_deref() {
+            Some("sleep") => {
+                thread::sleep(Duration::from_secs(5));
+                fs::write(
+                    std::env::var_os(MANAGED_CHILD_GUARD_MARKER_ENV)
+                        .expect("managed child marker path should be provided"),
+                    b"child completed without being reaped",
+                )
+                .expect("managed child marker should be writable");
+                return;
+            }
+            Some("exit") => return,
+            _ => {}
+        }
+
+        let marker_root = unique_temp_dir("managed-child-guard");
+        fs::create_dir_all(marker_root.as_path()).expect("marker root should be created");
+        let marker = marker_root.join("completed.txt");
+        let child = Command::new(
+            std::env::current_exe().expect("current test executable should resolve"),
+        )
+        .args([
+            "--exact",
+            "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
+            "--nocapture",
+        ])
+        .env(MANAGED_CHILD_GUARD_TEST_ENV, "sleep")
+        .env(MANAGED_CHILD_GUARD_MARKER_ENV, marker.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("managed child should spawn");
+        let termination_probe = Arc::new(AtomicUsize::new(0));
+        let started_at = Instant::now();
+
+        drop(ManagedChildGuard::with_termination_probe(child, Arc::clone(&termination_probe)));
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(4),
+            "guard drop waited for the child's natural completion instead of terminating it"
+        );
+        assert_eq!(termination_probe.load(Ordering::SeqCst), 1);
+        assert!(!marker.exists(), "terminated child must not reach its completion marker");
+        fs::remove_dir_all(marker_root).expect("marker root should be removable after reap");
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    #[test]
+    fn managed_process_post_spawn_fault_verifies_cleanup_before_exit() {
+        match std::env::var(MANAGED_PROCESS_FAULT_TEST_MODE_ENV).ok().as_deref() {
+            Some("process") => {
+                thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            Some("adapter") => run_managed_process_fault_adapter_child(),
+            _ => {}
+        }
+
+        let temporary = tempfile::tempdir().expect("managed-process fault root should be created");
+        let output = Command::new(
+            std::env::current_exe().expect("current test executable should resolve"),
+        )
+        .args([
+            "--exact",
+            "sandbox_runner::tests::managed_process_post_spawn_fault_verifies_cleanup_before_exit",
+            "--nocapture",
+        ])
+        .env(MANAGED_PROCESS_FAULT_TEST_MODE_ENV, "adapter")
+        .env(MANAGED_PROCESS_FAULT_TEST_ROOT_ENV, temporary.path())
+        .output()
+        .expect("managed-process fault adapter child should launch");
+        assert_eq!(
+            output.status.code(),
+            Some(QA_FAULT_TERMINATE_EXIT_CODE),
+            "adapter stderr: {}",
+            String::from_utf8_lossy(output.stderr.as_slice())
+        );
+
+        let pid = fs::read_to_string(temporary.path().join("process.pid"))
+            .expect("adapter should persist the owned process pid")
+            .trim()
+            .parse::<u32>()
+            .expect("owned process pid should be numeric");
+        assert!(
+            super::wait_for_process_not_alive(pid, Duration::from_secs(5)),
+            "managed process {pid} must be reaped before recovery evidence is accepted"
+        );
+
+        let plan = managed_process_fault_test_plan();
+        let launch = managed_process_fault_test_launch(temporary.path(), &plan);
+        let evidence = fs::read(temporary.path().join("evidence.ndjson"))
+            .expect("managed-process fault evidence should be readable");
+        let parsed = parse_qa_fault_evidence_sidecar_ndjson(evidence.as_slice(), &launch, &plan)
+            .expect("managed-process fault evidence should validate");
+        assert!(matches!(
+            parsed.records().last(),
+            Some(QaFaultEvidenceSidecarRecord::RecoveryRecorded(record))
+                if record.activation_id == "managed-process-post-spawn"
+                    && record.recovery_class == QaFaultRecoveryClass::OutcomeUnknown
+                    && record.reason_code
+                        == "qa_fault.managed_process_owned_tree_cleanup_verified"
+        ));
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    fn run_managed_process_fault_adapter_child() -> ! {
+        let root = PathBuf::from(
+            std::env::var_os(MANAGED_PROCESS_FAULT_TEST_ROOT_ENV)
+                .expect("managed-process fault root should be provided"),
+        );
+        let plan = managed_process_fault_test_plan();
+        let launch = managed_process_fault_test_launch(root.as_path(), &plan);
+        let runtime = crate::qa_fault_injection::QaFaultRuntime::active_for_test(
+            plan,
+            launch,
+            root.join("evidence.ndjson"),
+        )
+        .expect("managed-process fault runtime should initialize");
+
+        let mut command =
+            Command::new(std::env::current_exe().expect("current test executable should resolve"));
+        command
+            .args([
+                "--exact",
+                "sandbox_runner::tests::managed_process_post_spawn_fault_verifies_cleanup_before_exit",
+                "--nocapture",
+            ])
+            .env(MANAGED_PROCESS_FAULT_TEST_MODE_ENV, "process")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        super::configure_child_process_group(&mut command);
+        super::configure_background_child_suspended(&mut command);
+        let child = command.spawn().expect("managed test process should spawn");
+        #[cfg(windows)]
+        let child = super::prepare_windows_background_child(ManagedChildGuard::new(child))
+            .expect("managed test process should bind to an owned Windows job");
+        #[cfg(not(windows))]
+        let child = ManagedChildGuard::new(child);
+        fs::write(root.join("process.pid"), child.id().to_string())
+            .expect("managed test process pid should be persisted");
+
+        let _ = super::apply_managed_process_fault_with_child(
+            &runtime,
+            "managed_process.after_effect_before_ack",
+            "managed-process-test",
+            child,
+        );
+        panic!("terminate fault must exit after verified process-tree cleanup")
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    fn managed_process_fault_test_plan() -> QaFaultInjectionPlan {
+        QaFaultInjectionPlan {
+            schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+            format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+            seed: 20260711,
+            activations: vec![QaFaultActivation {
+                id: "managed-process-post-spawn".to_owned(),
+                point_id: "managed_process.after_effect_before_ack".to_owned(),
+                actor: Some("managed-process-test".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::TerminateProcess,
+            }],
+        }
+    }
+
+    #[cfg(feature = "qa-fault-injection")]
+    fn managed_process_fault_test_launch(
+        root: &Path,
+        plan: &QaFaultInjectionPlan,
+    ) -> QaFaultLaunchDocument {
+        QaFaultLaunchDocument {
+            schema_version: QA_FAULT_LAUNCH_SCHEMA_VERSION,
+            launch_id: "managed-process-fault-launch".to_owned(),
+            plan_path: root.join("plan.json").to_string_lossy().into_owned(),
+            plan_sha256: plan.canonical_sha256().expect("managed-process plan should hash"),
+            capability_sha256: "a".repeat(64),
+            evidence_path: root.join("evidence.ndjson").to_string_lossy().into_owned(),
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
+
+    #[test]
+    fn managed_child_guard_never_terminates_after_observing_direct_exit() {
+        let child = Command::new(
+            std::env::current_exe().expect("current test executable should resolve"),
+        )
+        .args([
+            "--exact",
+            "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
+            "--nocapture",
+        ])
+        .env(MANAGED_CHILD_GUARD_TEST_ENV, "exit")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("short managed child should spawn");
+        let termination_probe = Arc::new(AtomicUsize::new(0));
+        let mut child =
+            ManagedChildGuard::with_termination_probe(child, Arc::clone(&termination_probe));
+        let started_at = Instant::now();
+        loop {
+            if child.try_wait().expect("short child wait should succeed").is_some() {
+                break;
+            }
+            assert!(started_at.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(child);
+
+        assert_eq!(
+            termination_probe.load(Ordering::SeqCst),
+            0,
+            "observed exit must disarm every numerical termination path"
+        );
+    }
+
+    #[test]
+    fn background_guard_cleans_descendants_after_launcher_exit() {
+        match std::env::var(MANAGED_CHILD_GUARD_TEST_ENV).ok().as_deref() {
+            Some("descendant") => {
+                fs::write(
+                    std::env::var_os(MANAGED_CHILD_GUARD_STARTED_ENV)
+                        .expect("descendant start marker should be provided"),
+                    b"started",
+                )
+                .expect("descendant start marker should be writable");
+                thread::sleep(Duration::from_secs(5));
+                fs::write(
+                    std::env::var_os(MANAGED_CHILD_GUARD_MARKER_ENV)
+                        .expect("descendant completion marker should be provided"),
+                    b"descendant survived cleanup",
+                )
+                .expect("descendant completion marker should be writable");
+                return;
+            }
+            Some("launcher") => {
+                if let Some(marker) = std::env::var_os(MANAGED_CHILD_GUARD_LAUNCHER_STARTED_ENV) {
+                    fs::write(marker, b"launcher started")
+                        .expect("launcher start marker should be writable");
+                }
+                let gate = PathBuf::from(
+                    std::env::var_os(MANAGED_CHILD_GUARD_GATE_ENV)
+                        .expect("launcher gate should be provided"),
+                );
+                let gate_wait = Instant::now();
+                while !gate.exists() {
+                    assert!(gate_wait.elapsed() < Duration::from_secs(5));
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let mut descendant = Command::new(
+                    std::env::current_exe().expect("current test executable should resolve"),
+                )
+                .args([
+                    "--exact",
+                    "sandbox_runner::tests::background_guard_cleans_descendants_after_launcher_exit",
+                    "--nocapture",
+                ])
+                .env(MANAGED_CHILD_GUARD_TEST_ENV, "descendant")
+                .env(
+                    MANAGED_CHILD_GUARD_STARTED_ENV,
+                    std::env::var_os(MANAGED_CHILD_GUARD_STARTED_ENV)
+                        .expect("descendant start marker should be forwarded"),
+                )
+                .env(
+                    MANAGED_CHILD_GUARD_MARKER_ENV,
+                    std::env::var_os(MANAGED_CHILD_GUARD_MARKER_ENV)
+                        .expect("descendant completion marker should be forwarded"),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("descendant should spawn");
+                thread::spawn(move || {
+                    let _ = descendant.wait();
+                });
+                let started = PathBuf::from(
+                    std::env::var_os(MANAGED_CHILD_GUARD_STARTED_ENV)
+                        .expect("descendant start marker should be available"),
+                );
+                let start_wait = Instant::now();
+                while !started.exists() {
+                    assert!(start_wait.elapsed() < Duration::from_secs(5));
+                    thread::sleep(Duration::from_millis(5));
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let root = unique_temp_dir("managed-background-descendant");
+        fs::create_dir_all(root.as_path()).expect("background marker root should be created");
+        let gate = root.join("gate");
+        let started = root.join("started");
+        let completed = root.join("completed");
+        let mut command =
+            Command::new(std::env::current_exe().expect("current test executable should resolve"));
+        command
+            .args([
+                "--exact",
+                "sandbox_runner::tests::background_guard_cleans_descendants_after_launcher_exit",
+                "--nocapture",
+            ])
+            .env(MANAGED_CHILD_GUARD_TEST_ENV, "launcher")
+            .env(MANAGED_CHILD_GUARD_GATE_ENV, gate.as_os_str())
+            .env(MANAGED_CHILD_GUARD_STARTED_ENV, started.as_os_str())
+            .env(MANAGED_CHILD_GUARD_MARKER_ENV, completed.as_os_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        super::configure_child_process_group(&mut command);
+        super::configure_background_child_suspended(&mut command);
+        let child = command.spawn().expect("background launcher should spawn");
+        #[cfg(windows)]
+        let mut child = super::prepare_windows_background_child(ManagedChildGuard::new(child))
+            .expect("background launcher should bind to an owned job and resume");
+        #[cfg(not(windows))]
+        let mut child = ManagedChildGuard::new(child);
+        fs::write(gate.as_path(), b"release").expect("launcher gate should open");
+        let exit_wait = Instant::now();
+        loop {
+            if child.try_wait().expect("launcher wait should succeed").is_some() {
+                break;
+            }
+            assert!(exit_wait.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(started.exists(), "launcher must start its descendant before exiting");
+
+        super::terminate_background_child(child)
+            .expect("owned background tree should terminate and verify inactive");
+
+        assert!(!completed.exists(), "descendant must not survive verified tree cleanup");
+        fs::remove_dir_all(root).expect("background marker root should be removable");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_background_startup_failures_keep_process_tree_owned() {
+        fn injected_bind_failure(_child: &std::process::Child, pid: u32) -> io::Result<()> {
+            // If CREATE_SUSPENDED regresses, this window lets the launcher leave deterministic
+            // evidence before the injected bind failure triggers cleanup.
+            thread::sleep(Duration::from_millis(250));
+            Err(io::Error::other(format!("injected Windows job binding failure for pid {pid}")))
+        }
+
+        for failure_stage in ["bind", "register", "resume"] {
+            let root = unique_temp_dir(&format!("windows-background-{failure_stage}-failure"));
+            fs::create_dir_all(root.as_path()).expect("background marker root should be created");
+            let gate = root.join("gate");
+            let launcher_started = root.join("launcher-started");
+            let descendant_started = root.join("descendant-started");
+            let descendant_completed = root.join("descendant-completed");
+            fs::write(gate.as_path(), b"already open").expect("launcher gate should be writable");
+
+            let mut command = Command::new(
+                std::env::current_exe().expect("current test executable should resolve"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "sandbox_runner::tests::background_guard_cleans_descendants_after_launcher_exit",
+                    "--nocapture",
+                ])
+                .env(MANAGED_CHILD_GUARD_TEST_ENV, "launcher")
+                .env(MANAGED_CHILD_GUARD_GATE_ENV, gate.as_os_str())
+                .env(
+                    MANAGED_CHILD_GUARD_LAUNCHER_STARTED_ENV,
+                    launcher_started.as_os_str(),
+                )
+                .env(MANAGED_CHILD_GUARD_STARTED_ENV, descendant_started.as_os_str())
+                .env(MANAGED_CHILD_GUARD_MARKER_ENV, descendant_completed.as_os_str())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            super::configure_background_child_suspended(&mut command);
+            let child = command.spawn().expect("suspended background launcher should spawn");
+            let child = ManagedChildGuard::new(child);
+            let pid = child.id();
+            let launcher_started_after_resume = launcher_started.clone();
+            let descendant_started_after_resume = descendant_started.clone();
+
+            let preparation = match failure_stage {
+                "bind" => super::prepare_windows_background_child_with_operations(
+                    child,
+                    injected_bind_failure,
+                    super::resume_suspended_windows_process,
+                ),
+                "register" => super::prepare_windows_background_child_with_operations(
+                    child,
+                    |child, pid| {
+                        super::bind_child_to_windows_background_job_with_register(
+                            child,
+                            pid,
+                            |registered_pid, job| {
+                                // This matches a registry error after assignment: the
+                                // unregistered Arc is the final kill-on-close owner of the
+                                // still-suspended job.
+                                drop(job);
+                                Err(io::Error::other(format!(
+                                    "injected Windows job registry failure for pid {registered_pid}"
+                                )))
+                            },
+                        )
+                    },
+                    super::resume_suspended_windows_process,
+                ),
+                "resume" => super::prepare_windows_background_child_with_operations(
+                    child,
+                    super::bind_child_to_windows_background_job,
+                    move |pid| {
+                        super::resume_suspended_windows_process(pid)?;
+                        // Wait for deterministic proof that both launcher and descendant ran.
+                        // Returning the injected error only then exercises partial-resume tree
+                        // cleanup without relying on scheduler timing in loaded Windows CI.
+                        let marker_wait = Instant::now();
+                        while !launcher_started_after_resume.exists()
+                            || !descendant_started_after_resume.exists()
+                        {
+                            if marker_wait.elapsed() >= Duration::from_secs(5) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!(
+                                        "process {pid} did not produce partial-resume markers before the test deadline"
+                                    ),
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(io::Error::other(format!(
+                            "injected Windows thread resume failure for pid {pid}"
+                        )))
+                    },
+                ),
+                _ => unreachable!("test enumerates every Windows startup failure stage"),
+            };
+            let error = match preparation {
+                Ok(child) => {
+                    drop(child);
+                    panic!("injected {failure_stage} failure should reject startup");
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                error.message.contains("could not"),
+                "failure should retain startup-stage context: {}",
+                error.message
+            );
+            assert!(
+                !super::process_id_is_alive(pid)
+                    .expect("direct process liveness probe should succeed"),
+                "failed startup must leave no live direct process"
+            );
+            assert!(
+                super::windows_background_job(pid).is_none(),
+                "failed startup must release any registered job handle"
+            );
+            if failure_stage != "resume" {
+                assert!(
+                    !launcher_started.exists(),
+                    "launcher code must not run before Windows ownership is established"
+                );
+                assert!(
+                    !descendant_started.exists(),
+                    "pre-resume failure must not create a descendant"
+                );
+            } else {
+                assert!(
+                    launcher_started.exists(),
+                    "partial-resume case must prove that launcher code executed"
+                );
+                assert!(
+                    descendant_started.exists(),
+                    "partial-resume case must create a descendant before cleanup"
+                );
+            }
+            assert!(
+                !descendant_completed.exists(),
+                "failed startup must not leave a descendant completion marker"
+            );
+            fs::remove_dir_all(root).expect("background marker root should be removable");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_background_job_termination_retries_after_operation_failure() {
+        let job = super::create_windows_background_job()
+            .expect("empty kill-on-close job should be created");
+        let attempts = AtomicUsize::new(0);
+
+        let first_error = job
+            .terminate_with(|_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("injected TerminateJobObject failure"))
+            })
+            .expect_err("first termination operation should fail");
+        assert!(first_error.to_string().contains("injected TerminateJobObject failure"));
+
+        job.terminate_with(|_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("termination should retry after the failed operation");
+        job.terminate_with(|_| -> io::Result<()> {
+            panic!("successful termination must make later calls idempotent")
+        })
+        .expect("idempotent termination should preserve the successful result");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     fn background_test_execution_timeout() -> Duration {

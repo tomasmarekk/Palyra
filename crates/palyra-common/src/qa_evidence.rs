@@ -13,12 +13,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
+    qa_fault_injection::{
+        qa_fault_point_descriptor, DeterministicQaFaultScheduler, QaFaultAction,
+        QaFaultEvidenceSidecar, QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan,
+        QaFaultInjectionPlanDigestError, QaFaultRecoveryClass,
+    },
     qa_scenarios::{QaScenarioExpectedEvent, QaScenarioManifest},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
 };
 
 /// Current QA evidence bundle schema version.
-pub const QA_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const QA_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// Stable format label embedded in generated evidence bundles.
 pub const QA_EVIDENCE_BUNDLE_FORMAT: &str = "palyra-qa-evidence-bundle";
@@ -81,8 +86,9 @@ pub struct QaToolCallEvidence {
     /// Optional proposal or call id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal_id: Option<String>,
-    /// Whether the call produced a successful result.
-    pub success: bool,
+    /// Result outcome, or `None` when execution started but no durable result
+    /// was observed (for example, because the process crashed before ACK).
+    pub success: Option<bool>,
 }
 
 /// One artifact reference observed or produced by a QA runner.
@@ -94,12 +100,42 @@ pub struct QaArtifactEvidence {
     pub kind: String,
     /// Whether the artifact exists in the bundle index.
     pub present: bool,
-    /// Optional content digest. Digests are normalized in redacted outputs.
+    /// Optional content digest. Arbitrary digests are normalized; an exact
+    /// manifest-declared digest is retained as an auditable proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// Optional size in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+}
+
+/// Typed, redaction-safe evidence for one planned fault activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaFaultInjectionEvidence {
+    /// Canonical digest of the plan that selected this activation.
+    pub plan_sha256: String,
+    /// Reproduction seed from the validated plan.
+    pub seed: u64,
+    /// Stable activation id from the plan.
+    pub activation_id: String,
+    /// Exact namespaced registry point.
+    pub point_id: String,
+    /// One-based planned and observed occurrence.
+    pub occurrence: u32,
+    /// Typed action applied at the checkpoint.
+    pub action: QaFaultAction,
+    /// One-based ordering among distinct campaign activations.
+    pub activation_sequence: u32,
+    /// Complete bounded actor set that participated in the activation.
+    pub actors: Vec<String>,
+    /// Seeded release order; equals `actors` for a non-barrier action.
+    pub release_order: Vec<String>,
+    /// Recovery class recorded after activation, possibly by a restarted launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_class: Option<QaFaultRecoveryClass>,
+    /// Stable bounded reason code accompanying recovery evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason_code: Option<String>,
 }
 
 /// Observed data handed to the QA assertion engine by a runner.
@@ -123,6 +159,10 @@ pub struct QaEvidenceBuildInput {
     pub tool_calls: Vec<QaToolCallEvidence>,
     /// Artifact index captured or produced by the runner.
     pub artifacts: Vec<QaArtifactEvidence>,
+    /// Typed activation and recovery evidence from the validated private sidecar.
+    pub fault_injections: Vec<QaFaultInjectionEvidence>,
+    /// Number of daemon restarts observed during this scenario campaign.
+    pub daemon_restart_count: u32,
 }
 
 /// Top-level QA evidence bundle produced per scenario run.
@@ -139,6 +179,8 @@ pub struct QaEvidenceBundle {
     pub redacted_tape: Vec<QaRunTapeEvent>,
     pub artifacts_index: Vec<QaArtifactEvidence>,
     pub tool_calls: Vec<QaToolCallEvidence>,
+    pub fault_injections: Vec<QaFaultInjectionEvidence>,
+    pub daemon_restart_count: u32,
     pub checks: Vec<QaEvidenceCheck>,
     pub summary: QaEvidenceSummary,
     pub redaction: QaEvidenceRedactionReport,
@@ -186,6 +228,8 @@ pub struct QaEvidenceSummary {
     pub observed_event_count: usize,
     pub observed_tool_call_count: usize,
     pub artifact_count: usize,
+    pub observed_fault_activation_count: usize,
+    pub daemon_restart_count: u32,
     pub fake_progress_detected: bool,
 }
 
@@ -207,7 +251,61 @@ struct ObservedEvidence {
     tape_event_sequence: Vec<String>,
     event_counts: BTreeMap<String, usize>,
     tool_calls: Vec<QaToolCallEvidence>,
+    tool_call_issues: Vec<QaEvidenceIssue>,
     artifacts: Vec<QaArtifactEvidence>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallDerivation {
+    calls: Vec<QaToolCallEvidence>,
+    issues: Vec<QaEvidenceIssue>,
+}
+
+/// Projects a validated private sidecar into redaction-safe typed evidence.
+///
+/// # Errors
+/// Returns an error only if the validated plan cannot be canonicalized.
+pub fn qa_fault_injection_evidence_from_sidecar(
+    sidecar: &QaFaultEvidenceSidecar,
+    plan: &QaFaultInjectionPlan,
+) -> Result<Vec<QaFaultInjectionEvidence>, QaFaultInjectionPlanDigestError> {
+    let plan_sha256 = plan.canonical_sha256()?;
+    let mut evidence_by_id = BTreeMap::<String, QaFaultInjectionEvidence>::new();
+    for record in sidecar.records() {
+        match record {
+            QaFaultEvidenceSidecarRecord::LaunchLoaded(_) => {}
+            QaFaultEvidenceSidecarRecord::CheckpointObserved(_) => {}
+            QaFaultEvidenceSidecarRecord::BarrierJoined(_) => {}
+            QaFaultEvidenceSidecarRecord::BarrierReleased(_) => {}
+            QaFaultEvidenceSidecarRecord::RuleActivated(activation) => {
+                evidence_by_id.insert(
+                    activation.activation_id.clone(),
+                    QaFaultInjectionEvidence {
+                        plan_sha256: plan_sha256.clone(),
+                        seed: plan.seed,
+                        activation_id: activation.activation_id.clone(),
+                        point_id: activation.point_id.clone(),
+                        occurrence: activation.occurrence,
+                        action: activation.action.clone(),
+                        activation_sequence: activation.activation_sequence,
+                        actors: activation.actors.clone(),
+                        release_order: activation.release_order.clone(),
+                        recovery_class: None,
+                        recovery_reason_code: None,
+                    },
+                );
+            }
+            QaFaultEvidenceSidecarRecord::RecoveryRecorded(recovery) => {
+                if let Some(evidence) = evidence_by_id.get_mut(recovery.activation_id.as_str()) {
+                    evidence.recovery_class = Some(recovery.recovery_class);
+                    evidence.recovery_reason_code = Some(recovery.reason_code.clone());
+                }
+            }
+        }
+    }
+    let mut evidence = evidence_by_id.into_values().collect::<Vec<_>>();
+    evidence.sort_by_key(|activation| activation.activation_sequence);
+    Ok(evidence)
 }
 
 /// Builds a redacted evidence bundle and evaluates scenario assertions.
@@ -245,21 +343,36 @@ pub fn build_qa_evidence_bundle(
     let artifacts = input
         .artifacts
         .iter()
-        .map(|artifact| QaArtifactEvidence {
-            path: normalize_artifact_path(artifact.path.as_str(), &mut redaction),
-            kind: artifact.kind.clone(),
-            present: artifact.present,
-            sha256: artifact.sha256.as_ref().map(|_| {
-                redaction.normalized_hashes += 1;
-                "<normalized:hash>".to_owned()
-            }),
-            size_bytes: artifact.size_bytes,
+        .map(|artifact| {
+            let verified_manifest_digest = artifact.present
+                && manifest.artifacts.iter().any(|expected| {
+                    expected.path.as_str() == artifact.path.as_str()
+                        && expected.kind.as_str() == artifact.kind.as_str()
+                        && expected.sha256.as_deref() == artifact.sha256.as_deref()
+                        && expected.sha256.is_some()
+                });
+            QaArtifactEvidence {
+                path: normalize_artifact_path(artifact.path.as_str(), &mut redaction),
+                kind: artifact.kind.clone(),
+                present: artifact.present,
+                sha256: artifact.sha256.as_ref().map(|digest| {
+                    if verified_manifest_digest {
+                        digest.clone()
+                    } else {
+                        redaction.normalized_hashes += 1;
+                        "<normalized:hash>".to_owned()
+                    }
+                }),
+                size_bytes: artifact.size_bytes,
+            }
         })
         .collect::<Vec<_>>();
     let observed = ObservedEvidence::from_input(&input);
     let checks =
         normalize_evidence_checks(evaluate_checks(manifest, &observed, &input), &mut redaction);
     let tool_calls = normalize_tool_calls(&observed.tool_calls, &mut redaction);
+    let fault_injections =
+        normalize_fault_injections(input.fault_injections.as_slice(), &mut redaction);
     let check_count = checks.len();
     let issue_count = checks.iter().map(|check| check.issues.len()).sum::<usize>();
     let fake_progress_detected = checks.iter().any(|check| {
@@ -287,6 +400,8 @@ pub fn build_qa_evidence_bundle(
         redacted_tape,
         artifacts_index: artifacts,
         tool_calls,
+        fault_injections,
+        daemon_restart_count: input.daemon_restart_count,
         checks,
         summary: QaEvidenceSummary {
             verdict,
@@ -295,6 +410,8 @@ pub fn build_qa_evidence_bundle(
             observed_event_count: observed.observed_event_count(),
             observed_tool_call_count: observed.tool_calls.len(),
             artifact_count: observed.artifacts.len(),
+            observed_fault_activation_count: input.fault_injections.len(),
+            daemon_restart_count: input.daemon_restart_count,
             fake_progress_detected,
         },
         redaction,
@@ -312,6 +429,8 @@ pub fn qa_evidence_json_report(bundle: &QaEvidenceBundle) -> Value {
         "issue_count": bundle.summary.issue_count,
         "checks": bundle.checks,
         "artifacts": bundle.artifacts_index,
+        "fault_injections": bundle.fault_injections,
+        "daemon_restart_count": bundle.daemon_restart_count,
         "redaction": bundle.redaction,
     })
 }
@@ -329,6 +448,8 @@ pub fn qa_evidence_markdown_report(bundle: &QaEvidenceBundle) -> String {
         format!("- Events: {}", bundle.summary.observed_event_count),
         format!("- Tool calls: {}", bundle.summary.observed_tool_call_count),
         format!("- Artifacts: {}", bundle.summary.artifact_count),
+        format!("- Fault activations: {}", bundle.summary.observed_fault_activation_count),
+        format!("- Daemon restarts: {}", bundle.summary.daemon_restart_count),
         String::new(),
         "## Checks".to_owned(),
         String::new(),
@@ -381,11 +502,14 @@ impl ObservedEvidence {
                 counts
             },
         );
-        let tool_calls = if input.tool_calls.is_empty() {
-            derive_tool_calls(input)
-        } else {
-            input.tool_calls.clone()
-        };
+        let has_durable_execution_attempts =
+            tape_events.iter().any(|event| event.event_type == "tool_effect_started");
+        let ToolCallDerivation { calls: tool_calls, issues: tool_call_issues } =
+            if has_durable_execution_attempts || input.tool_calls.is_empty() {
+                derive_tool_calls(input)
+            } else {
+                ToolCallDerivation { calls: input.tool_calls.clone(), issues: Vec::new() }
+            };
         Self {
             final_answer,
             terminal_state: input.terminal_state.clone(),
@@ -393,6 +517,7 @@ impl ObservedEvidence {
             tape_event_sequence,
             event_counts,
             tool_calls,
+            tool_call_issues,
             artifacts: input.artifacts.clone(),
         }
     }
@@ -412,10 +537,283 @@ fn evaluate_checks(
         check_final_answer(manifest, observed),
         check_required_events(manifest, observed),
         check_required_tool_calls(manifest, observed),
+        check_fault_injection(manifest, input),
         check_forbidden_observations(manifest, observed),
         check_artifacts_and_fake_progress(manifest, observed),
         check_backend_attestation_manifests(input),
     ]
+}
+
+fn check_fault_injection(
+    manifest: &QaScenarioManifest,
+    input: &QaEvidenceBuildInput,
+) -> QaEvidenceCheck {
+    let mut issues = Vec::new();
+    let Some(plan) = manifest.fault_injection.as_ref() else {
+        for (index, activation) in input.fault_injections.iter().enumerate() {
+            issues.push(QaEvidenceIssue {
+                code: "unplanned_fault_activation".to_owned(),
+                path: format!("$.fault_injections[{index}]"),
+                message: format!(
+                    "fault activation `{}` was observed without a scenario fault plan",
+                    activation.activation_id
+                ),
+                expected: Some("no fault activation".to_owned()),
+                actual: Some(activation.activation_id.clone()),
+            });
+        }
+        if input.daemon_restart_count != 0 {
+            issues.push(QaEvidenceIssue {
+                code: "unexpected_daemon_restart".to_owned(),
+                path: "$.daemon_restart_count".to_owned(),
+                message: "daemon restarted during a scenario without fault expectations".to_owned(),
+                expected: Some("0".to_owned()),
+                actual: Some(input.daemon_restart_count.to_string()),
+            });
+        }
+        return check("fault_injection", issues);
+    };
+
+    let expected_plan_sha256 = match plan.canonical_sha256() {
+        Ok(digest) => Some(digest),
+        Err(error) => {
+            issues.push(QaEvidenceIssue {
+                code: "fault_plan_digest_unavailable".to_owned(),
+                path: "$.fault_injection".to_owned(),
+                message: error.to_string(),
+                expected: Some("valid canonical fault plan".to_owned()),
+                actual: None,
+            });
+            None
+        }
+    };
+    let planned_by_id = plan
+        .activations
+        .iter()
+        .map(|activation| (activation.id.as_str(), activation))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_by_id = BTreeMap::<&str, Vec<(usize, &QaFaultInjectionEvidence)>>::new();
+    let mut observed_sequences = BTreeMap::<u32, &str>::new();
+
+    for (index, observed) in input.fault_injections.iter().enumerate() {
+        let path = format!("$.fault_injections[{index}]");
+        observed_by_id.entry(observed.activation_id.as_str()).or_default().push((index, observed));
+        if observed.activation_sequence == 0 {
+            issues.push(QaEvidenceIssue {
+                code: "invalid_fault_activation_sequence".to_owned(),
+                path: format!("{path}.activation_sequence"),
+                message: "fault activation_sequence must be one-based".to_owned(),
+                expected: Some("positive sequence".to_owned()),
+                actual: Some("0".to_owned()),
+            });
+        } else if let Some(existing) =
+            observed_sequences.insert(observed.activation_sequence, observed.activation_id.as_str())
+        {
+            issues.push(QaEvidenceIssue {
+                code: "duplicate_fault_activation_sequence".to_owned(),
+                path: format!("{path}.activation_sequence"),
+                message: format!(
+                    "activation_sequence {} is shared with `{existing}`",
+                    observed.activation_sequence
+                ),
+                expected: Some("unique sequence".to_owned()),
+                actual: Some(observed.activation_sequence.to_string()),
+            });
+        }
+        if expected_plan_sha256.as_deref().is_some_and(|digest| observed.plan_sha256 != digest) {
+            issues.push(QaEvidenceIssue {
+                code: "fault_plan_digest_mismatch".to_owned(),
+                path: format!("{path}.plan_sha256"),
+                message: "activation evidence belongs to a different fault plan".to_owned(),
+                expected: expected_plan_sha256.clone(),
+                actual: Some(observed.plan_sha256.clone()),
+            });
+        }
+        if observed.seed != plan.seed {
+            issues.push(QaEvidenceIssue {
+                code: "fault_seed_mismatch".to_owned(),
+                path: format!("{path}.seed"),
+                message: "activation evidence uses a different reproduction seed".to_owned(),
+                expected: Some(plan.seed.to_string()),
+                actual: Some(observed.seed.to_string()),
+            });
+        }
+        let Some(planned) = planned_by_id.get(observed.activation_id.as_str()) else {
+            issues.push(QaEvidenceIssue {
+                code: "unplanned_fault_activation".to_owned(),
+                path: path.clone(),
+                message: format!(
+                    "fault activation `{}` is not declared by the scenario plan",
+                    observed.activation_id
+                ),
+                expected: Some("planned activation id".to_owned()),
+                actual: Some(observed.activation_id.clone()),
+            });
+            continue;
+        };
+        if observed.point_id != planned.point_id
+            || observed.occurrence != planned.occurrence
+            || observed.action != planned.action
+        {
+            issues.push(QaEvidenceIssue {
+                code: "fault_activation_contract_mismatch".to_owned(),
+                path: path.clone(),
+                message: "observed point, occurrence, or action differs from the plan".to_owned(),
+                expected: Some(format!(
+                    "{} occurrence {} action {}",
+                    planned.point_id,
+                    planned.occurrence,
+                    planned.action.kind().as_str()
+                )),
+                actual: Some(format!(
+                    "{} occurrence {} action {}",
+                    observed.point_id,
+                    observed.occurrence,
+                    observed.action.kind().as_str()
+                )),
+            });
+        }
+        let unique_actors = observed.actors.iter().collect::<BTreeSet<_>>();
+        let actors_valid = !observed.actors.is_empty()
+            && unique_actors.len() == observed.actors.len()
+            && observed.actors.iter().all(|actor| fault_label_is_valid(actor, true));
+        let schedule_valid = match planned.action {
+            QaFaultAction::Barrier { participants } => {
+                observed.actors.len() == usize::from(participants)
+                    && DeterministicQaFaultScheduler::new(plan.seed)
+                        .release_order(planned, observed.actors.as_slice())
+                        .is_ok_and(|expected| expected == observed.release_order)
+            }
+            _ => {
+                observed.actors.len() == 1
+                    && observed.release_order == observed.actors
+                    && planned.actor.as_deref().is_none_or(|actor| {
+                        observed.actors.first().is_some_and(|actual| actual == actor)
+                    })
+            }
+        };
+        if !actors_valid || !schedule_valid {
+            issues.push(QaEvidenceIssue {
+                code: "fault_actor_schedule_invalid".to_owned(),
+                path: format!("{path}.actors"),
+                message: "activation actors or seeded release order violate the plan".to_owned(),
+                expected: Some("bounded actors in deterministic release order".to_owned()),
+                actual: Some(format!("{} actor(s)", observed.actors.len())),
+            });
+        }
+        match (observed.recovery_class, observed.recovery_reason_code.as_deref()) {
+            (Some(recovery), Some(reason)) => {
+                if !fault_label_is_valid(reason, false)
+                    || qa_fault_point_descriptor(planned.point_id.as_str())
+                        .is_some_and(|descriptor| !descriptor.supports_recovery(recovery))
+                {
+                    issues.push(QaEvidenceIssue {
+                        code: "fault_recovery_evidence_invalid".to_owned(),
+                        path: format!("{path}.recovery_class"),
+                        message: "recovery class or reason code is invalid for the fault point"
+                            .to_owned(),
+                        expected: Some(
+                            "registered recovery class and bounded reason code".to_owned(),
+                        ),
+                        actual: Some(recovery.as_str().to_owned()),
+                    });
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => issues.push(QaEvidenceIssue {
+                code: "fault_recovery_evidence_incomplete".to_owned(),
+                path: path.clone(),
+                message: "recovery class and reason code must be recorded together".to_owned(),
+                expected: Some("recovery_class plus recovery_reason_code".to_owned()),
+                actual: Some("partial recovery evidence".to_owned()),
+            }),
+            (None, None) => {}
+        }
+    }
+
+    for (activation_id, observations) in &observed_by_id {
+        if observations.len() > 1 {
+            issues.push(QaEvidenceIssue {
+                code: "duplicate_fault_activation".to_owned(),
+                path: "$.fault_injections".to_owned(),
+                message: format!(
+                    "fault activation `{activation_id}` was observed {} times",
+                    observations.len()
+                ),
+                expected: Some("exactly once".to_owned()),
+                actual: Some(observations.len().to_string()),
+            });
+        }
+    }
+    for planned in &plan.activations {
+        if !observed_by_id.contains_key(planned.id.as_str()) {
+            issues.push(QaEvidenceIssue {
+                code: "fault_injection_not_activated".to_owned(),
+                path: "$.fault_injections".to_owned(),
+                message: format!("planned fault activation `{}` was not observed", planned.id),
+                expected: Some(planned.id.clone()),
+                actual: Some("missing".to_owned()),
+            });
+        }
+    }
+
+    if let Some(expected) = manifest.expect.fault_injection.as_ref() {
+        for (index, expected_activation) in expected.activations.iter().enumerate() {
+            if let Some((_, observed)) = observed_by_id
+                .get(expected_activation.activation_id.as_str())
+                .and_then(|observations| observations.first())
+            {
+                if observed.recovery_class != Some(expected_activation.recovery_class) {
+                    issues.push(QaEvidenceIssue {
+                        code: "fault_recovery_class_mismatch".to_owned(),
+                        path: format!("$.expect.fault_injection.activations[{index}]"),
+                        message: format!(
+                            "fault activation `{}` did not prove the expected recovery",
+                            expected_activation.activation_id
+                        ),
+                        expected: Some(expected_activation.recovery_class.as_str().to_owned()),
+                        actual: observed
+                            .recovery_class
+                            .map(|recovery| recovery.as_str().to_owned())
+                            .or_else(|| Some("missing".to_owned())),
+                    });
+                }
+            }
+        }
+        if input.daemon_restart_count != expected.daemon_restarts {
+            issues.push(QaEvidenceIssue {
+                code: "fault_restart_count_mismatch".to_owned(),
+                path: "$.daemon_restart_count".to_owned(),
+                message: "observed daemon restart count differs from the scenario expectation"
+                    .to_owned(),
+                expected: Some(expected.daemon_restarts.to_string()),
+                actual: Some(input.daemon_restart_count.to_string()),
+            });
+        }
+    } else {
+        issues.push(QaEvidenceIssue {
+            code: "fault_expectations_missing".to_owned(),
+            path: "$.expect.fault_injection".to_owned(),
+            message: "scenario fault plan has no typed expectations".to_owned(),
+            expected: Some("fault expectations".to_owned()),
+            actual: Some("missing".to_owned()),
+        });
+    }
+
+    let expected_sequences = (1..=input.fault_injections.len())
+        .filter_map(|sequence| u32::try_from(sequence).ok())
+        .collect::<Vec<_>>();
+    let actual_sequences = observed_sequences.keys().copied().collect::<Vec<_>>();
+    if actual_sequences != expected_sequences {
+        issues.push(QaEvidenceIssue {
+            code: "fault_activation_sequence_mismatch".to_owned(),
+            path: "$.fault_injections".to_owned(),
+            message: "fault activation sequences are not unique and contiguous".to_owned(),
+            expected: Some(format!("{expected_sequences:?}")),
+            actual: Some(format!("{actual_sequences:?}")),
+        });
+    }
+
+    check("fault_injection", issues)
 }
 
 fn check_terminal_state(
@@ -502,20 +900,26 @@ fn check_required_tool_calls(
     manifest: &QaScenarioManifest,
     observed: &ObservedEvidence,
 ) -> QaEvidenceCheck {
-    let mut issues = Vec::new();
+    let mut issues = observed.tool_call_issues.clone();
     for (index, expected_tool) in manifest.expect.tool_calls.iter().enumerate() {
         let matching_calls = observed
             .tool_calls
             .iter()
             .filter(|tool| token_matches(expected_tool.name.as_str(), tool.name.as_str()))
             .collect::<Vec<_>>();
-        let expected_success = expected_tool.success.unwrap_or(true);
-        let matching_outcome_count =
-            matching_calls.iter().filter(|tool| tool.success == expected_success).count();
+        let expected_success = if manifest.schema_version >= 4 {
+            expected_tool.success
+        } else {
+            Some(expected_tool.success.unwrap_or(true))
+        };
+        let matching_outcome_count = matching_calls
+            .iter()
+            .filter(|tool| expected_success.is_none_or(|expected| tool.success == Some(expected)))
+            .count();
         let min_count = expected_tool.min_count.unwrap_or(1) as usize;
         if matching_outcome_count < min_count {
             let code = if matching_calls.len() >= min_count {
-                if expected_success {
+                if expected_success == Some(true) {
                     "tool_call_failed"
                 } else {
                     "tool_call_unexpected_success"
@@ -527,14 +931,33 @@ fn check_required_tool_calls(
                 code: code.to_owned(),
                 path: format!("$.expect.tool_calls[{index}]"),
                 message: format!(
-                    "expected at least {min_count} `{}` tool call(s) with success={expected_success}, observed {} matching outcome(s) of {} named call(s)",
+                    "expected at least {min_count} `{}` tool call(s) with {}, observed {} matching outcome(s) of {} named call(s)",
                     expected_tool.name,
+                    expected_success.map_or_else(
+                        || "any durable result state".to_owned(),
+                        |success| format!("success={success}"),
+                    ),
                     matching_outcome_count,
                     matching_calls.len()
                 ),
                 expected: Some(expected_tool.name.clone()),
                 actual: Some(matching_outcome_count.to_string()),
             });
+        }
+        if let Some(max_count) = expected_tool.max_count {
+            if matching_calls.len() > max_count as usize {
+                issues.push(QaEvidenceIssue {
+                    code: "too_many_tool_calls".to_owned(),
+                    path: format!("$.expect.tool_calls[{index}].max_count"),
+                    message: format!(
+                        "expected at most {max_count} `{}` tool call(s), observed {} across all outcomes",
+                        expected_tool.name,
+                        matching_calls.len()
+                    ),
+                    expected: Some(max_count.to_string()),
+                    actual: Some(matching_calls.len().to_string()),
+                });
+            }
         }
     }
     check("required_tool_calls", issues)
@@ -617,11 +1040,16 @@ fn check_artifacts_and_fake_progress(
         }
         let expected_path = expected_artifact.path.as_str();
         let expected_kind = expected_artifact.kind.as_str();
-        let present = observed.artifacts.iter().any(|artifact| {
-            artifact.present
-                && (artifact.path == expected_path || artifact.kind.as_str() == expected_kind)
-        });
-        if !present {
+        let matching = observed
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.present
+                    && artifact.path == expected_path
+                    && artifact.kind.as_str() == expected_kind
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
             issues.push(QaEvidenceIssue {
                 code: "missing_artifact".to_owned(),
                 path: format!("$.artifacts[{index}]"),
@@ -631,6 +1059,21 @@ fn check_artifacts_and_fake_progress(
                 expected: Some(expected_path.to_owned()),
                 actual: Some("missing".to_owned()),
             });
+            continue;
+        }
+        if let Some(expected_sha256) = expected_artifact.sha256.as_deref() {
+            if !matching.iter().any(|artifact| artifact.sha256.as_deref() == Some(expected_sha256))
+            {
+                issues.push(QaEvidenceIssue {
+                    code: "artifact_digest_mismatch".to_owned(),
+                    path: format!("$.artifacts[{index}].sha256"),
+                    message: format!(
+                        "required `{expected_kind}` artifact `{expected_path}` has an unexpected content digest"
+                    ),
+                    expected: Some(expected_sha256.to_owned()),
+                    actual: matching.first().and_then(|artifact| artifact.sha256.clone()),
+                });
+            }
         }
     }
     if let Some(answer) = observed.final_answer.as_deref() {
@@ -966,55 +1409,191 @@ fn derive_final_answer(tape_events: &[QaRunTapeEvent]) -> Option<String> {
     })
 }
 
-fn derive_tool_calls(input: &QaEvidenceBuildInput) -> Vec<QaToolCallEvidence> {
-    let mut calls = Vec::new();
-    for event in &input.public_events {
-        if !event.event_type.contains("tool") && !event.event_type.contains("approval") {
-            continue;
-        }
-        if let Some(tool_name) = event.payload.get("tool_name").and_then(Value::as_str) {
-            calls.push(QaToolCallEvidence {
+fn derive_tool_calls(input: &QaEvidenceBuildInput) -> ToolCallDerivation {
+    let mut ordered_tape = input.tape_events.iter().collect::<Vec<_>>();
+    ordered_tape.sort_by_key(|event| event.seq);
+    if ordered_tape.iter().any(|event| event.event_type == "tool_effect_started") {
+        return derive_durable_tool_attempts(ordered_tape.as_slice());
+    }
+
+    let legacy_tape_results = derive_legacy_tool_results(ordered_tape.as_slice());
+    if !legacy_tape_results.is_empty() {
+        return ToolCallDerivation { calls: legacy_tape_results, issues: Vec::new() };
+    }
+
+    let calls = input
+        .public_events
+        .iter()
+        .filter_map(|event| {
+            let is_result = matches!(
+                event.event_type.as_str(),
+                "tool_result" | "tool.call.completed" | "tool.call.failed"
+            );
+            let tool_name = is_result
+                .then(|| event.payload.get("tool_name").and_then(Value::as_str))
+                .flatten()?;
+            let success = event
+                .payload
+                .get("success")
+                .and_then(Value::as_bool)
+                .or_else(|| {
+                    matches!(event.event_type.as_str(), "tool.call.completed").then_some(true)
+                })
+                .or_else(|| {
+                    matches!(event.event_type.as_str(), "tool.call.failed").then_some(false)
+                });
+            Some(QaToolCallEvidence {
                 name: tool_name.to_owned(),
                 proposal_id: event
                     .payload
                     .get("proposal_id")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-                success: event.event_type != "tool.call.failed",
-            });
-        }
-    }
-    for event in &input.tape_events {
-        if !event.event_type.contains("tool") {
-            continue;
-        }
-        if let Some(tool_name) = event.payload.get("tool_name").and_then(Value::as_str) {
-            calls.push(QaToolCallEvidence {
-                name: tool_name.to_owned(),
-                proposal_id: event
-                    .payload
-                    .get("proposal_id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                success: event.event_type != "tool_result_failed",
-            });
-        }
-    }
-    dedupe_tool_calls(calls)
+                success,
+            })
+        })
+        .collect();
+    ToolCallDerivation { calls, issues: Vec::new() }
 }
 
-fn dedupe_tool_calls(calls: Vec<QaToolCallEvidence>) -> Vec<QaToolCallEvidence> {
-    let mut seen = BTreeSet::new();
+fn derive_durable_tool_attempts(tape_events: &[&QaRunTapeEvent]) -> ToolCallDerivation {
+    let mut names_by_proposal = BTreeMap::<String, String>::new();
+    let mut derivation = ToolCallDerivation::default();
+    for event in tape_events {
+        match event.event_type.as_str() {
+            "tool_proposal" => {
+                let proposal_id = non_empty_payload_string(event, "proposal_id");
+                let tool_name = non_empty_payload_string(event, "tool_name");
+                if proposal_id.is_none() || tool_name.is_none() {
+                    derivation.issues.push(malformed_tool_attempt_issue(
+                        event,
+                        "non-empty string `proposal_id` and `tool_name`",
+                    ));
+                }
+                if let (Some(proposal_id), Some(tool_name)) = (proposal_id, tool_name) {
+                    names_by_proposal.insert(proposal_id.to_owned(), tool_name.to_owned());
+                }
+            }
+            "tool_effect_started" => {
+                let proposal_id = non_empty_payload_string(event, "proposal_id");
+                let tool_name = non_empty_payload_string(event, "tool_name");
+                if proposal_id.is_none() || tool_name.is_none() {
+                    derivation.issues.push(malformed_tool_attempt_issue(
+                        event,
+                        "non-empty string `proposal_id` and `tool_name`",
+                    ));
+                }
+                // Preserve recoverable call surfaces after reporting malformed rows; dropping
+                // them would let max-count and forbidden assertions pass open.
+                let name = tool_name.or_else(|| {
+                    proposal_id.and_then(|id| names_by_proposal.get(id).map(String::as_str))
+                });
+                let Some(name) = name else {
+                    continue;
+                };
+                derivation.calls.push(QaToolCallEvidence {
+                    name: name.to_owned(),
+                    proposal_id: proposal_id.map(ToOwned::to_owned),
+                    success: None,
+                });
+            }
+            "tool_result" => {
+                let proposal_id = non_empty_payload_string(event, "proposal_id");
+                let success = event.payload.get("success").and_then(Value::as_bool);
+                let malformed = proposal_id.is_none() || success.is_none();
+                if malformed {
+                    derivation.issues.push(malformed_tool_attempt_issue(
+                        event,
+                        "non-empty string `proposal_id` and boolean `success`",
+                    ));
+                }
+                if let Some(proposal_id) = proposal_id {
+                    if let Some(attempt) = derivation.calls.iter_mut().rev().find(|attempt| {
+                        attempt.proposal_id.as_deref() == Some(proposal_id)
+                            && attempt.success.is_none()
+                    }) {
+                        if let Some(success) = success {
+                            attempt.success = Some(success);
+                        }
+                        continue;
+                    }
+                }
+
+                // Denied calls have a durable result but deliberately never cross the
+                // effect boundary. Preserve them alongside authoritative effect attempts.
+                let name = proposal_id
+                    .and_then(|id| names_by_proposal.get(id).map(String::as_str))
+                    .or_else(|| non_empty_payload_string(event, "tool_name"));
+                if let Some(name) = name {
+                    derivation.calls.push(QaToolCallEvidence {
+                        name: name.to_owned(),
+                        proposal_id: proposal_id.map(ToOwned::to_owned),
+                        success,
+                    });
+                } else if !malformed {
+                    derivation.issues.push(malformed_tool_attempt_issue(
+                        event,
+                        "a matching proposal or non-empty string `tool_name`",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    derivation
+}
+
+fn non_empty_payload_string<'a>(event: &'a QaRunTapeEvent, field: &str) -> Option<&'a str> {
+    event.payload.get(field).and_then(Value::as_str).filter(|value| !value.trim().is_empty())
+}
+
+fn malformed_tool_attempt_issue(event: &QaRunTapeEvent, expected: &str) -> QaEvidenceIssue {
+    QaEvidenceIssue {
+        code: "malformed_tool_attempt_evidence".to_owned(),
+        path: "$.tape_events".to_owned(),
+        message: format!(
+            "malformed `{}` tool attempt evidence at tape sequence {}",
+            event.event_type, event.seq
+        ),
+        expected: Some(expected.to_owned()),
+        actual: Some("invalid or missing required payload fields".to_owned()),
+    }
+}
+
+fn derive_legacy_tool_results(tape_events: &[&QaRunTapeEvent]) -> Vec<QaToolCallEvidence> {
+    let mut names_by_proposal = BTreeMap::<String, String>::new();
+    let mut calls = Vec::new();
+    for event in tape_events {
+        match event.event_type.as_str() {
+            "tool_proposal" => {
+                if let (Some(proposal_id), Some(tool_name)) = (
+                    event.payload.get("proposal_id").and_then(Value::as_str),
+                    event.payload.get("tool_name").and_then(Value::as_str),
+                ) {
+                    names_by_proposal.insert(proposal_id.to_owned(), tool_name.to_owned());
+                }
+            }
+            "tool_result" => {
+                let Some(proposal_id) = event.payload.get("proposal_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(success) = event.payload.get("success").and_then(Value::as_bool) else {
+                    continue;
+                };
+                let Some(name) = names_by_proposal.get(proposal_id) else {
+                    continue;
+                };
+                calls.push(QaToolCallEvidence {
+                    name: name.clone(),
+                    proposal_id: Some(proposal_id.to_owned()),
+                    success: Some(success),
+                });
+            }
+            _ => {}
+        }
+    }
     calls
-        .into_iter()
-        .filter(|call| {
-            seen.insert((
-                call.name.clone(),
-                call.proposal_id.clone().unwrap_or_default(),
-                call.success,
-            ))
-        })
-        .collect()
 }
 
 fn token_matches(pattern: &str, value: &str) -> bool {
@@ -1076,6 +1655,73 @@ fn normalize_tool_calls(
             success: tool_call.success,
         })
         .collect()
+}
+
+fn normalize_fault_injections(
+    evidence: &[QaFaultInjectionEvidence],
+    report: &mut QaEvidenceRedactionReport,
+) -> Vec<QaFaultInjectionEvidence> {
+    evidence
+        .iter()
+        .map(|activation| QaFaultInjectionEvidence {
+            plan_sha256: if is_lowercase_sha256(activation.plan_sha256.as_str()) {
+                activation.plan_sha256.clone()
+            } else {
+                report.redacted_fields += 1;
+                REDACTED.to_owned()
+            },
+            seed: activation.seed,
+            activation_id: normalize_fault_label(activation.activation_id.as_str(), false, report),
+            point_id: normalize_fault_label(activation.point_id.as_str(), false, report),
+            occurrence: activation.occurrence,
+            action: activation.action.clone(),
+            activation_sequence: activation.activation_sequence,
+            actors: activation
+                .actors
+                .iter()
+                .map(|actor| normalize_fault_label(actor.as_str(), true, report))
+                .collect(),
+            release_order: activation
+                .release_order
+                .iter()
+                .map(|actor| normalize_fault_label(actor.as_str(), true, report))
+                .collect(),
+            recovery_class: activation.recovery_class,
+            recovery_reason_code: activation
+                .recovery_reason_code
+                .as_deref()
+                .map(|reason| normalize_fault_label(reason, false, report)),
+        })
+        .collect()
+}
+
+fn normalize_fault_label(
+    value: &str,
+    allow_uppercase: bool,
+    report: &mut QaEvidenceRedactionReport,
+) -> String {
+    if fault_label_is_valid(value, allow_uppercase) {
+        value.to_owned()
+    } else {
+        report.redacted_fields += 1;
+        REDACTED.to_owned()
+    }
+}
+
+fn fault_label_is_valid(value: &str, allow_uppercase: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value.bytes().all(|byte| {
+            (allow_uppercase && byte.is_ascii_uppercase())
+                || byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b':')
+        })
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn normalize_evidence_value(value: &Value, report: &mut QaEvidenceRedactionReport) -> Value {
@@ -1358,6 +2004,8 @@ mod tests {
         include_str!("../../../qa/scenarios/real_runtime/malformed_stream_recovery.yaml");
     const MARKDOWN_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_evidence_report_basic.md");
+    const FAULT_JSON_GOLDEN: &str =
+        include_str!("../../../fixtures/golden/qa_evidence_fault_report_v2.json");
     const REQUIRED_TOOL_SCENARIO: &str = r#"
 schema_version: 1
 id: tool.required
@@ -1388,6 +2036,95 @@ maturity:
 timeout:
   run_ms: 30000
 "#;
+    const V4_ASSERTION_SCENARIO: &str = r#"
+schema_version: 4
+id: evidence.v4.assertions
+area: tools
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_basic.yaml
+requires:
+  capabilities: [qa_lab]
+  tools: [palyra.fs.read_file]
+  fixtures: []
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Read the fixture."
+expect:
+  terminal_state: completed
+  events: []
+  tool_calls:
+    - name: palyra.fs.read_file
+      min_count: 1
+      max_count: 1
+forbidden:
+  tool_calls: []
+  events: []
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/v4-assertion.json
+    kind: report
+    required: true
+    sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+maturity:
+  labels: [p0, deterministic]
+timeout:
+  run_ms: 30000
+"#;
+    const FAULT_SCENARIO: &str = r#"
+schema_version: 4
+id: fault.tool.crash
+area: tools
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_basic.yaml
+fault_injection:
+  schema_version: 1
+  format: palyra-qa-fault-injection-plan
+  seed: 4242
+  activations:
+    - id: tool-crash
+      point_id: tool.after_effect_before_ack
+      actor: daemon
+      occurrence: 1
+      action:
+        type: terminate_process
+requires:
+  capabilities: [qa_lab]
+  tools: []
+  fixtures: []
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exercise recovery."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains: ["done"]
+  events: []
+  tool_calls: []
+  fault_injection:
+    activations:
+      - activation_id: tool-crash
+        recovery_class: duplicate_suppressed
+    daemon_restarts: 1
+forbidden:
+  tool_calls: []
+  events: []
+  artifacts: []
+  claims: []
+artifacts: []
+maturity:
+  labels: [p0, deterministic]
+timeout:
+  run_ms: 30000
+"#;
 
     #[test]
     fn evidence_bundle_passes_basic_manifest() {
@@ -1399,6 +2136,343 @@ timeout:
         assert_eq!(bundle.summary.issue_count, 0);
         assert_eq!(bundle.redacted_tape[0].payload["run_id"], "<normalized:id>");
         assert_eq!(qa_evidence_json_report(&bundle)["verdict"], "passed");
+        assert_eq!(bundle.schema_version, 2);
+    }
+
+    #[test]
+    fn tool_call_max_count_rejects_duplicate_durable_attempts_with_the_same_outcome() {
+        let manifest = parse_qa_scenario_manifest_yaml(V4_ASSERTION_SCENARIO)
+            .expect("schema-v4 assertion scenario should parse");
+        let mut input = v4_assertion_input();
+        input.tape_events = vec![
+            tool_attempt_event(1, "proposal-1"),
+            tool_result_event(2, "proposal-1", true),
+            tool_attempt_event(3, "proposal-1"),
+            tool_result_event(4, "proposal-1", true),
+        ];
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+
+        assert!(bundle
+            .checks
+            .iter()
+            .any(|check| { check.issues.iter().any(|issue| issue.code == "too_many_tool_calls") }));
+        assert_eq!(bundle.summary.observed_tool_call_count, 2);
+        assert_eq!(
+            bundle.tool_calls.iter().map(|call| call.success).collect::<Vec<_>>(),
+            [Some(true), Some(true)]
+        );
+    }
+
+    #[test]
+    fn malformed_duplicate_durable_attempt_fails_closed_and_still_counts() {
+        let manifest = parse_qa_scenario_manifest_yaml(V4_ASSERTION_SCENARIO)
+            .expect("schema-v4 assertion scenario should parse");
+        let mut input = v4_assertion_input();
+        input.tape_events = vec![
+            tool_proposal_event(1, "proposal-1", "palyra.fs.read_file"),
+            tool_attempt_event(2, "proposal-1"),
+            QaRunTapeEvent {
+                seq: 3,
+                event_type: "tool_effect_started".to_owned(),
+                payload: json!({"proposal_id": "proposal-1"}),
+            },
+        ];
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+        let required_tool_calls = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "required_tool_calls")
+            .expect("required tool-call check should exist");
+
+        assert!(required_tool_calls
+            .issues
+            .iter()
+            .any(|issue| issue.code == "malformed_tool_attempt_evidence"));
+        assert!(required_tool_calls.issues.iter().any(|issue| issue.code == "too_many_tool_calls"));
+        assert_eq!(bundle.summary.observed_tool_call_count, 2);
+    }
+
+    #[test]
+    fn malformed_durable_proposal_fails_required_tool_call_check() {
+        let manifest = parse_qa_scenario_manifest_yaml(V4_ASSERTION_SCENARIO)
+            .expect("schema-v4 assertion scenario should parse");
+        let mut input = v4_assertion_input();
+        input.tape_events = vec![
+            QaRunTapeEvent {
+                seq: 1,
+                event_type: "tool_proposal".to_owned(),
+                payload: json!({"proposal_id": "proposal-1"}),
+            },
+            tool_attempt_event(2, "proposal-1"),
+        ];
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+        let required_tool_calls = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "required_tool_calls")
+            .expect("required tool-call check should exist");
+
+        assert!(required_tool_calls
+            .issues
+            .iter()
+            .any(|issue| issue.code == "malformed_tool_attempt_evidence"));
+        assert_eq!(bundle.summary.observed_tool_call_count, 1);
+    }
+
+    #[test]
+    fn legacy_tool_proposal_without_result_does_not_satisfy_success_expectation() {
+        let manifest = parse_qa_scenario_manifest_yaml(REQUIRED_TOOL_SCENARIO)
+            .expect("legacy required-tool scenario should parse");
+        let bundle = build_qa_evidence_bundle(
+            &manifest,
+            QaEvidenceBuildInput {
+                terminal_state: Some("completed".to_owned()),
+                tape_events: vec![QaRunTapeEvent {
+                    seq: 1,
+                    event_type: "tool_proposal".to_owned(),
+                    payload: json!({
+                        "proposal_id": "proposal-1",
+                        "tool_name": "palyra.fs.read_file",
+                    }),
+                }],
+                ..QaEvidenceBuildInput::default()
+            },
+        );
+
+        let tool_check = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "required_tool_calls")
+            .expect("required tool-call check should exist");
+        assert_eq!(tool_check.verdict, QaEvidenceVerdict::Failed);
+        assert!(tool_check.issues.iter().any(|issue| issue.code == "missing_tool_call"));
+        assert_eq!(bundle.summary.observed_tool_call_count, 0);
+    }
+
+    #[test]
+    fn schema_v4_omitted_success_accepts_one_unknown_execution_attempt() {
+        let manifest = parse_qa_scenario_manifest_yaml(V4_ASSERTION_SCENARIO)
+            .expect("schema-v4 assertion scenario should parse");
+        let mut input = v4_assertion_input();
+        input.tape_events = vec![tool_attempt_event(1, "proposal-1")];
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+
+        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(bundle.tool_calls[0].success, None);
+    }
+
+    #[test]
+    fn durable_attempt_derivation_preserves_denied_calls_from_the_same_run() {
+        let scenario = REQUIRED_TOOL_SCENARIO
+            .replace(
+                "      min_count: 1",
+                "      min_count: 1\n    - name: palyra.fs.write_file\n      min_count: 1\n      success: false",
+            )
+            .replace(
+                "tools: [palyra.fs.read_file]",
+                "tools: [palyra.fs.read_file, palyra.fs.write_file]",
+            );
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("mixed tool scenario should parse");
+        let input = QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            tape_events: vec![
+                tool_proposal_event(1, "allowed-proposal", "palyra.fs.read_file"),
+                tool_attempt_event(2, "allowed-proposal"),
+                tool_result_event(3, "allowed-proposal", true),
+                tool_proposal_event(4, "denied-proposal", "palyra.fs.write_file"),
+                tool_result_event(5, "denied-proposal", false),
+            ],
+            ..QaEvidenceBuildInput::default()
+        };
+
+        let bundle = build_qa_evidence_bundle(&manifest, input.clone());
+        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(
+            bundle
+                .tool_calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.success))
+                .collect::<Vec<_>>(),
+            [("palyra.fs.read_file", Some(true)), ("palyra.fs.write_file", Some(false)),]
+        );
+
+        let forbidden_scenario = scenario.replace(
+            "forbidden:\n  tool_calls: []",
+            "forbidden:\n  tool_calls: [palyra.fs.write_file]",
+        );
+        let forbidden_manifest = parse_qa_scenario_manifest_yaml(forbidden_scenario.as_str())
+            .expect("forbidden mixed tool scenario should parse");
+        let forbidden = build_qa_evidence_bundle(&forbidden_manifest, input);
+        assert!(forbidden.checks.iter().any(|check| {
+            check.issues.iter().any(|issue| issue.code == "unexpected_tool_call")
+        }));
+    }
+
+    #[test]
+    fn malformed_denied_result_fails_required_and_forbidden_tool_surfaces() {
+        let scenario = REQUIRED_TOOL_SCENARIO.replace(
+            "forbidden:\n  tool_calls: []",
+            "forbidden:\n  tool_calls: [palyra.fs.write_file]",
+        );
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("forbidden tool scenario should parse");
+        let input = QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            tape_events: vec![
+                tool_proposal_event(1, "allowed-proposal", "palyra.fs.read_file"),
+                tool_attempt_event(2, "allowed-proposal"),
+                tool_result_event(3, "allowed-proposal", true),
+                tool_proposal_event(4, "denied-proposal", "palyra.fs.write_file"),
+                QaRunTapeEvent {
+                    seq: 5,
+                    event_type: "tool_result".to_owned(),
+                    payload: json!({"proposal_id": "denied-proposal"}),
+                },
+            ],
+            ..QaEvidenceBuildInput::default()
+        };
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+        let required_tool_calls = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "required_tool_calls")
+            .expect("required tool-call check should exist");
+        let forbidden_observations = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "forbidden_observations")
+            .expect("forbidden-observations check should exist");
+
+        assert!(required_tool_calls
+            .issues
+            .iter()
+            .any(|issue| issue.code == "malformed_tool_attempt_evidence"));
+        assert!(forbidden_observations
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unexpected_tool_call"));
+        assert!(bundle
+            .tool_calls
+            .iter()
+            .any(|call| call.name == "palyra.fs.write_file" && call.success.is_none()));
+    }
+
+    #[test]
+    fn artifact_assertions_require_exact_path_kind_and_digest() {
+        let expected_digest = "a".repeat(64);
+        let manifest = parse_qa_scenario_manifest_yaml(V4_ASSERTION_SCENARIO)
+            .expect("schema-v4 artifact digest scenario should parse");
+        let passing = v4_assertion_input();
+        let passing_bundle = build_qa_evidence_bundle(&manifest, passing.clone());
+        assert_eq!(passing_bundle.summary.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(passing_bundle.artifacts_index[0].sha256, Some(expected_digest.clone()));
+        assert_eq!(passing_bundle.redaction.normalized_hashes, 0);
+
+        for (path, kind, digest, expected_code) in [
+            ("qa/reports/other.json", "report", expected_digest.as_str(), "missing_artifact"),
+            (
+                "qa/reports/v4-assertion.json",
+                "workspace",
+                expected_digest.as_str(),
+                "missing_artifact",
+            ),
+            (
+                "qa/reports/v4-assertion.json",
+                "report",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "artifact_digest_mismatch",
+            ),
+        ] {
+            let mut input = passing.clone();
+            input.artifacts[0].path = path.to_owned();
+            input.artifacts[0].kind = kind.to_owned();
+            input.artifacts[0].sha256 = Some(digest.to_owned());
+            let bundle = build_qa_evidence_bundle(&manifest, input);
+            assert!(bundle
+                .checks
+                .iter()
+                .any(|check| { check.issues.iter().any(|issue| issue.code == expected_code) }));
+        }
+    }
+
+    #[test]
+    fn exact_fault_activation_recovery_and_restart_evidence_passes() {
+        let manifest =
+            parse_qa_scenario_manifest_yaml(FAULT_SCENARIO).expect("fault scenario should parse");
+        let bundle = build_qa_evidence_bundle(&manifest, passing_fault_input(&manifest));
+
+        assert_eq!(bundle.summary.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(bundle.summary.observed_fault_activation_count, 1);
+        assert_eq!(bundle.summary.daemon_restart_count, 1);
+        assert_eq!(fault_check(&bundle).verdict, QaEvidenceVerdict::Passed);
+        let actual_report = qa_evidence_json_report(&bundle);
+        let expected_report: Value =
+            serde_json::from_str(FAULT_JSON_GOLDEN).expect("fault report golden should parse");
+        assert_eq!(actual_report, expected_report);
+    }
+
+    #[test]
+    fn missing_duplicate_and_unplanned_fault_activations_fail_strictly() {
+        let manifest =
+            parse_qa_scenario_manifest_yaml(FAULT_SCENARIO).expect("fault scenario should parse");
+        let missing = build_qa_evidence_bundle(
+            &manifest,
+            QaEvidenceBuildInput {
+                terminal_state: Some("completed".to_owned()),
+                final_answer: Some("done".to_owned()),
+                daemon_restart_count: 1,
+                ..QaEvidenceBuildInput::default()
+            },
+        );
+        assert!(fault_check(&missing)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "fault_injection_not_activated"));
+
+        let mut duplicate_input = passing_fault_input(&manifest);
+        let mut duplicate = duplicate_input.fault_injections[0].clone();
+        duplicate.activation_sequence = 2;
+        duplicate_input.fault_injections.push(duplicate);
+        let duplicate = build_qa_evidence_bundle(&manifest, duplicate_input);
+        assert!(fault_check(&duplicate)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "duplicate_fault_activation"));
+
+        let mut unplanned_input = passing_fault_input(&manifest);
+        let mut unplanned = unplanned_input.fault_injections[0].clone();
+        unplanned.activation_id = "unplanned".to_owned();
+        unplanned.activation_sequence = 2;
+        unplanned_input.fault_injections.push(unplanned);
+        let unplanned = build_qa_evidence_bundle(&manifest, unplanned_input);
+        assert!(fault_check(&unplanned)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unplanned_fault_activation"));
+    }
+
+    #[test]
+    fn wrong_fault_recovery_and_restart_count_fail() {
+        let manifest =
+            parse_qa_scenario_manifest_yaml(FAULT_SCENARIO).expect("fault scenario should parse");
+        let mut input = passing_fault_input(&manifest);
+        input.fault_injections[0].recovery_class = Some(QaFaultRecoveryClass::OutcomeUnknown);
+        input.daemon_restart_count = 0;
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+        let issue_codes = fault_check(&bundle)
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(issue_codes.contains("fault_recovery_class_mismatch"));
+        assert!(issue_codes.contains("fault_restart_count_mismatch"));
     }
 
     #[test]
@@ -1434,7 +2508,7 @@ timeout:
                 tool_calls: vec![QaToolCallEvidence {
                     name: "palyra.fs.read_file".to_owned(),
                     proposal_id: Some("proposal-1".to_owned()),
-                    success: false,
+                    success: Some(false),
                 }],
                 ..QaEvidenceBuildInput::default()
             },
@@ -1459,7 +2533,7 @@ timeout:
             tool_calls: vec![QaToolCallEvidence {
                 name: "palyra.fs.read_file".to_owned(),
                 proposal_id: Some("proposal-1".to_owned()),
-                success: false,
+                success: Some(false),
             }],
             ..QaEvidenceBuildInput::default()
         };
@@ -1467,7 +2541,7 @@ timeout:
         let denied = build_qa_evidence_bundle(&manifest, input.clone());
         assert_eq!(denied.summary.verdict, QaEvidenceVerdict::Passed);
 
-        input.tool_calls[0].success = true;
+        input.tool_calls[0].success = Some(true);
         let unexpectedly_allowed = build_qa_evidence_bundle(&manifest, input);
         assert!(unexpectedly_allowed.checks.iter().any(|check| {
             check.issues.iter().any(|issue| issue.code == "tool_call_unexpected_success")
@@ -1502,7 +2576,7 @@ timeout:
                 tool_calls: vec![QaToolCallEvidence {
                     name: "palyra.fs.read_file".to_owned(),
                     proposal_id: Some("qa-real-read".to_owned()),
-                    success: true,
+                    success: Some(true),
                 }],
                 artifacts: vec![QaArtifactEvidence {
                     path: "qa/reports/text_run_basic.json".to_owned(),
@@ -1691,7 +2765,7 @@ timeout:
             .find(|check| check.name == "backend_attestation_manifests")
             .expect("backend manifest check should be present");
         assert_eq!(check.verdict, QaEvidenceVerdict::Passed);
-        assert_eq!(bundle.summary.check_count, 7);
+        assert_eq!(bundle.summary.check_count, 8);
     }
 
     #[test]
@@ -1814,6 +2888,38 @@ timeout:
             .expect("required event check should be present")
     }
 
+    fn fault_check(bundle: &QaEvidenceBundle) -> &QaEvidenceCheck {
+        bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "fault_injection")
+            .expect("fault-injection check should be present")
+    }
+
+    fn passing_fault_input(manifest: &QaScenarioManifest) -> QaEvidenceBuildInput {
+        let plan = manifest.fault_injection.as_ref().expect("fault scenario must contain a plan");
+        let plan_sha256 = plan.canonical_sha256().expect("fault plan should hash");
+        QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            final_answer: Some("done".to_owned()),
+            fault_injections: vec![QaFaultInjectionEvidence {
+                plan_sha256,
+                seed: plan.seed,
+                activation_id: "tool-crash".to_owned(),
+                point_id: "tool.after_effect_before_ack".to_owned(),
+                occurrence: 1,
+                action: QaFaultAction::TerminateProcess,
+                activation_sequence: 1,
+                actors: vec!["daemon".to_owned()],
+                release_order: vec!["daemon".to_owned()],
+                recovery_class: Some(QaFaultRecoveryClass::DuplicateSuppressed),
+                recovery_reason_code: Some("tool.duplicate_suppressed".to_owned()),
+            }],
+            daemon_restart_count: 1,
+            ..QaEvidenceBuildInput::default()
+        }
+    }
+
     fn malformed_recovery_input() -> QaEvidenceBuildInput {
         QaEvidenceBuildInput {
             terminal_state: Some("completed".to_owned()),
@@ -1846,6 +2952,54 @@ timeout:
                 size_bytes: Some(512),
             }],
             ..QaEvidenceBuildInput::default()
+        }
+    }
+
+    fn v4_assertion_input() -> QaEvidenceBuildInput {
+        QaEvidenceBuildInput {
+            terminal_state: Some("completed".to_owned()),
+            tape_events: vec![tool_attempt_event(1, "proposal-1")],
+            artifacts: vec![QaArtifactEvidence {
+                path: "qa/reports/v4-assertion.json".to_owned(),
+                kind: "report".to_owned(),
+                present: true,
+                sha256: Some("a".repeat(64)),
+                size_bytes: Some(128),
+            }],
+            ..QaEvidenceBuildInput::default()
+        }
+    }
+
+    fn tool_attempt_event(seq: i64, proposal_id: &str) -> QaRunTapeEvent {
+        QaRunTapeEvent {
+            seq,
+            event_type: "tool_effect_started".to_owned(),
+            payload: json!({
+                "proposal_id": proposal_id,
+                "tool_name": "palyra.fs.read_file",
+            }),
+        }
+    }
+
+    fn tool_proposal_event(seq: i64, proposal_id: &str, tool_name: &str) -> QaRunTapeEvent {
+        QaRunTapeEvent {
+            seq,
+            event_type: "tool_proposal".to_owned(),
+            payload: json!({
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+            }),
+        }
+    }
+
+    fn tool_result_event(seq: i64, proposal_id: &str, success: bool) -> QaRunTapeEvent {
+        QaRunTapeEvent {
+            seq,
+            event_type: "tool_result".to_owned(),
+            payload: json!({
+                "proposal_id": proposal_id,
+                "success": success,
+            }),
         }
     }
 

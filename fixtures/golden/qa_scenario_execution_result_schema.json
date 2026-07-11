@@ -6,6 +6,10 @@
     "write_policy": "same_directory_temp_sync_atomic_no_clobber"
   },
   "artifact_reference_base": "qa_gate_report.artifact_reference_base",
+  "evidence_output_binding": {
+    "artifact": "artifact_reference",
+    "logical_alias": "manifest_relative_path"
+  },
   "cleanup_fields": [
     "run_terminal_observed",
     "session_cleaned",
@@ -50,6 +54,9 @@
     "run_id",
     "session_id",
     "terminal_state"
+  ],
+  "optional_result_fields": [
+    "evidence_output_bindings"
   ],
   "required_fields": [
     "schema_version",

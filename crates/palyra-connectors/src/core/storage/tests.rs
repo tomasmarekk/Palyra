@@ -1,7 +1,7 @@
 //! Unit tests for `ConnectorStore`: instance lifecycle, inbound dedupe,
 //! outbox claim transitions, dead-letter replay/discard, and queue snapshots.
 
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
 use super::super::protocol::{
@@ -9,7 +9,7 @@ use super::super::protocol::{
 };
 use super::{
     ChannelIngressStatus, ConnectorStore, ConnectorStoreError, DeliveryIntentDraft,
-    DeliveryIntentStatus,
+    DeliveryIntentStatus, OutboxEffectState, OutboxReconciliationEvidence,
 };
 
 fn open_store() -> (TempDir, ConnectorStore) {
@@ -17,6 +17,148 @@ fn open_store() -> (TempDir, ConnectorStore) {
     let db_path = tempdir.path().join("connectors.sqlite3");
     let store = ConnectorStore::open(db_path).expect("connector store should initialize");
     (tempdir, store)
+}
+
+#[test]
+fn opening_legacy_outbox_parks_claimed_rows_and_keeps_unclaimed_rows_ready() {
+    let tempdir = TempDir::new().expect("tempdir should initialize");
+    let db_path = tempdir.path().join("legacy-connectors.sqlite3");
+    let connection = Connection::open(db_path.as_path()).expect("legacy database should open");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE outbox (
+                outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connector_id TEXT NOT NULL,
+                envelope_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL,
+                next_attempt_unix_ms INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'dead')),
+                native_message_id TEXT,
+                last_error TEXT,
+                claim_token TEXT,
+                claim_expires_unix_ms INTEGER NOT NULL DEFAULT 0,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                UNIQUE(connector_id, envelope_id)
+            );
+
+            CREATE TABLE delivery_intents (
+                intent_id TEXT PRIMARY KEY,
+                connector_id TEXT NOT NULL,
+                ingress_event_id INTEGER NOT NULL,
+                ingress_envelope_id TEXT NOT NULL,
+                session_id TEXT,
+                run_id TEXT,
+                principal TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                output_index INTEGER NOT NULL,
+                outbox_envelope_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                visible_text_preview TEXT NOT NULL,
+                status TEXT NOT NULL,
+                send_attempts INTEGER NOT NULL DEFAULT 0,
+                native_message_id TEXT,
+                last_reason_code TEXT,
+                redaction_summary_json TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                UNIQUE(connector_id, ingress_event_id, output_index, outbox_envelope_id)
+            );
+            "#,
+        )
+        .expect("legacy outbox schema should initialize");
+    let claimed_payload = serde_json::to_string(&sample_outbound("env-legacy-claimed"))
+        .expect("claimed legacy payload should encode");
+    let ready_payload = serde_json::to_string(&sample_outbound("env-legacy-ready"))
+        .expect("ready legacy payload should encode");
+    connection
+        .execute(
+            r#"
+            INSERT INTO outbox (
+                connector_id, envelope_id, payload_json, attempts, max_attempts,
+                next_attempt_unix_ms, status, native_message_id, last_error,
+                claim_token, claim_expires_unix_ms, created_at_unix_ms, updated_at_unix_ms
+            )
+            VALUES ('echo:default', 'env-legacy-claimed', ?1, 1, 3, 1000,
+                    'pending', NULL, NULL, 'legacy-claim', 60000, 1000, 1001)
+            "#,
+            params![claimed_payload],
+        )
+        .expect("claimed legacy outbox row should insert");
+    connection
+        .execute(
+            r#"
+            INSERT INTO outbox (
+                connector_id, envelope_id, payload_json, attempts, max_attempts,
+                next_attempt_unix_ms, status, native_message_id, last_error,
+                claim_token, claim_expires_unix_ms, created_at_unix_ms, updated_at_unix_ms
+            )
+            VALUES ('echo:default', 'env-legacy-ready', ?1, 0, 3, 1000,
+                    'pending', NULL, NULL, NULL, 0, 1000, 1000)
+            "#,
+            params![ready_payload],
+        )
+        .expect("unclaimed legacy outbox row should insert");
+    connection
+        .execute(
+            r#"
+            INSERT INTO delivery_intents (
+                intent_id, connector_id, ingress_event_id, ingress_envelope_id,
+                session_id, run_id, principal, conversation_id, output_index,
+                outbox_envelope_id, payload_hash, visible_text_preview, status,
+                send_attempts, native_message_id, last_reason_code,
+                redaction_summary_json, created_at_unix_ms, updated_at_unix_ms
+            )
+            VALUES (
+                'intent-legacy-claimed', 'echo:default', 1, 'ingress-legacy',
+                NULL, NULL, 'channel:echo:default', 'conv-1', 0,
+                'env-legacy-claimed', 'hash-legacy', 'legacy preview',
+                'adapter_send_started', 1, NULL, NULL, NULL, 1000, 1001
+            )
+            "#,
+            [],
+        )
+        .expect("claimed legacy delivery intent should insert");
+    drop(connection);
+
+    let store = ConnectorStore::open(db_path).expect("legacy database should migrate");
+    let ready = store
+        .load_due_outbox(100_000, 10, Some("echo:default"), true)
+        .expect("only the unclaimed legacy row should be claimable");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].envelope_id, "env-legacy-ready");
+    assert_eq!(ready[0].effect_state, OutboxEffectState::Ready);
+
+    let unknown = store
+        .list_outbox_unknown("echo:default", 10)
+        .expect("claimed legacy row should require reconciliation");
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].envelope_id, "env-legacy-claimed");
+    assert_eq!(unknown[0].last_reason_code.as_deref(), Some("outbox.legacy_claim_outcome_unknown"));
+    let migrated_intent = store
+        .get_delivery_intent("intent-legacy-claimed")
+        .expect("legacy delivery intent should migrate with its outbox row");
+    assert_eq!(migrated_intent.status, DeliveryIntentStatus::PlatformOutcomeUnknown);
+    assert_eq!(
+        migrated_intent.last_reason_code.as_deref(),
+        Some("outbox.legacy_claim_outcome_unknown")
+    );
+
+    store
+        .reconcile_outbox_unknown(
+            unknown[0].outbox_id,
+            &OutboxReconciliationEvidence::ConfirmedAbsent,
+            100_001,
+        )
+        .expect("confirmed absence should make the legacy row retryable");
+    let reconciled = store
+        .load_due_outbox(100_001, 10, Some("echo:default"), true)
+        .expect("reconciled legacy row should become claimable");
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].envelope_id, "env-legacy-claimed");
 }
 
 fn sample_spec() -> ConnectorInstanceSpec {
@@ -257,31 +399,64 @@ fn delivery_intent_lifecycle_reports_without_raw_payload_and_retries_safe_state(
     assert_eq!(intent.visible_text_preview, "hello");
     assert_eq!(intent.payload_hash, "hash-visible");
 
+    let claimed = store
+        .load_due_outbox(1_100, 1, Some("echo:default"), false)
+        .expect("outbox row should be claimable")
+        .into_iter()
+        .next()
+        .expect("outbox row should exist");
     store
-        .mark_delivery_intent_send_started_for_outbox("echo:default", "env-delivery:0", 1_100)
+        .mark_outbox_delivery_intent_started(claimed.outbox_id, claimed.claim_token.as_str(), 1_100)
         .expect("send-start transition should succeed");
     let started = store.get_delivery_intent(draft.intent_id.as_str()).expect("intent should load");
     assert_eq!(started.status, DeliveryIntentStatus::AdapterSendStarted);
     assert_eq!(started.send_attempts, 1);
 
     store
-        .mark_delivery_intent_unknown_for_outbox(
-            "echo:default",
-            "env-delivery:0",
+        .mark_outbox_effect_started(claimed.outbox_id, claimed.claim_token.as_str(), 1_150)
+        .expect("effect fence should start");
+    store
+        .mark_outbox_outcome_unknown(
+            claimed.outbox_id,
+            claimed.claim_token.as_str(),
             "transient_network",
             1_200,
         )
         .expect("unknown transition should succeed");
-    let retry = store
+    let error = store
         .retry_delivery_intent(draft.intent_id.as_str(), 3, 1_300)
-        .expect("platform-unknown intent should be retryable");
-    assert!(retry.requeued);
-    assert_eq!(retry.intent.status, DeliveryIntentStatus::Queued);
+        .expect_err("platform-unknown intent must require reconciliation evidence");
+    assert!(matches!(error, ConnectorStoreError::InvalidDeliveryIntentRetry { .. }));
+    let reconciliation = store
+        .reconcile_outbox_unknown(
+            claimed.outbox_id,
+            &OutboxReconciliationEvidence::ConfirmedAbsent,
+            1_300,
+        )
+        .expect("confirmed absence should requeue safely");
+    assert!(reconciliation.requeued);
+    assert_eq!(reconciliation.effect_state, OutboxEffectState::Ready);
 
+    let reclaimed = store
+        .load_due_outbox(1_400, 1, Some("echo:default"), false)
+        .expect("reconciled row should be claimable")
+        .into_iter()
+        .next()
+        .expect("reconciled row should exist");
     store
-        .mark_delivery_intent_delivered_for_outbox(
-            "echo:default",
-            "env-delivery:0",
+        .mark_outbox_delivery_intent_started(
+            reclaimed.outbox_id,
+            reclaimed.claim_token.as_str(),
+            1_400,
+        )
+        .expect("reconciled intent should start");
+    store
+        .mark_outbox_effect_started(reclaimed.outbox_id, reclaimed.claim_token.as_str(), 1_400)
+        .expect("reconciled effect should start");
+    store
+        .mark_outbox_and_delivery_intents_delivered(
+            reclaimed.outbox_id,
+            reclaimed.claim_token.as_str(),
             "native-1",
             1_400,
         )
@@ -597,6 +772,119 @@ fn outbox_due_claims_are_exclusive_between_loads() {
         .load_due_outbox(1_000, 10, Some("echo:default"), false)
         .expect("second load should succeed");
     assert!(second.is_empty(), "second due load should not re-claim entry while lease is active");
+}
+
+#[test]
+fn expired_effect_started_claim_is_parked_until_explicit_reconciliation() {
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    store
+        .enqueue_outbox_if_absent(&sample_outbound("env-effect-expired"), 2, 1_000)
+        .expect("outbox enqueue should succeed");
+    let claimed = store
+        .load_due_outbox(1_000, 1, Some("echo:default"), false)
+        .expect("outbox should be claimable")
+        .into_iter()
+        .next()
+        .expect("claimed outbox should exist");
+    store
+        .mark_outbox_effect_started(claimed.outbox_id, claimed.claim_token.as_str(), 1_001)
+        .expect("effect fence should start");
+
+    let reclaimed = store
+        .load_due_outbox(61_000, 1, Some("echo:default"), false)
+        .expect("expired claim scan should succeed");
+    assert!(reclaimed.is_empty(), "an uncertain effect must never be reclaimed for blind send");
+    let unknown =
+        store.list_outbox_unknown("echo:default", 10).expect("unknown outbox should be visible");
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].outbox_id, claimed.outbox_id);
+    assert_eq!(
+        unknown[0].last_reason_code.as_deref(),
+        Some("outbox.claim_expired_after_effect_started")
+    );
+    assert!(
+        store
+            .load_due_outbox(120_000, 1, Some("echo:default"), false)
+            .expect("later scans should remain safe")
+            .is_empty(),
+        "outcome-unknown must stay parked across repeated scans"
+    );
+
+    let outcome = store
+        .reconcile_outbox_unknown(
+            claimed.outbox_id,
+            &OutboxReconciliationEvidence::ConfirmedAbsent,
+            120_001,
+        )
+        .expect("confirmed absence should remove the effect fence");
+    assert!(outcome.requeued);
+    let safe_retry = store
+        .load_due_outbox(120_001, 1, Some("echo:default"), false)
+        .expect("reconciled outbox should be claimable");
+    assert_eq!(safe_retry.len(), 1);
+    assert_eq!(safe_retry[0].effect_state, OutboxEffectState::Ready);
+}
+
+#[test]
+fn expired_effect_started_backlog_is_parked_in_bounded_passes() {
+    const BACKLOG_SIZE: usize = 23;
+    const DRAIN_LIMIT: usize = 4;
+
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    for index in 0..BACKLOG_SIZE {
+        store
+            .enqueue_outbox_if_absent(
+                &sample_outbound(format!("env-effect-expired-{index}").as_str()),
+                2,
+                1_000,
+            )
+            .expect("outbox enqueue should succeed");
+    }
+    let claimed = store
+        .load_due_outbox(1_000, BACKLOG_SIZE, Some("echo:default"), false)
+        .expect("the complete backlog should be claimable initially");
+    assert_eq!(claimed.len(), BACKLOG_SIZE);
+    for entry in &claimed {
+        store
+            .mark_outbox_effect_started(entry.outbox_id, entry.claim_token.as_str(), 1_001)
+            .expect("effect fence should start");
+    }
+
+    let first_pass = store
+        .load_due_outbox(61_000, DRAIN_LIMIT, Some("echo:default"), false)
+        .expect("first expired-claim scan should succeed");
+    assert!(
+        first_pass.is_empty(),
+        "expired effects outside the recovery bound must remain fenced from delivery"
+    );
+    let first_unknown = store
+        .list_outbox_unknown("echo:default", BACKLOG_SIZE)
+        .expect("first recovery pass should expose parked rows");
+    assert_eq!(
+        first_unknown.len(),
+        DRAIN_LIMIT,
+        "one drain transaction must not park more expired effects than its limit"
+    );
+
+    let remaining_passes = (BACKLOG_SIZE - DRAIN_LIMIT).div_ceil(DRAIN_LIMIT);
+    for _ in 0..remaining_passes {
+        let claimed_again = store
+            .load_due_outbox(61_000, DRAIN_LIMIT, Some("echo:default"), false)
+            .expect("later expired-claim scan should succeed");
+        assert!(
+            claimed_again.is_empty(),
+            "an uncertain external effect must never become a blind retry"
+        );
+    }
+    let all_unknown = store
+        .list_outbox_unknown("echo:default", BACKLOG_SIZE)
+        .expect("later recovery passes should finish the backlog");
+    assert_eq!(all_unknown.len(), BACKLOG_SIZE);
+    assert!(all_unknown.iter().all(|entry| {
+        entry.last_reason_code.as_deref() == Some("outbox.claim_expired_after_effect_started")
+    }));
 }
 
 #[test]

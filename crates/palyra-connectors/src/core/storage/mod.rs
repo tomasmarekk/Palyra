@@ -2,8 +2,10 @@
 //! outbox, dead letters, queue pause state, and operational events.
 //!
 //! [`ConnectorStore`] serializes all access through one mutex-guarded
-//! connection; the outbox uses claim-token leases so concurrent drains never
-//! deliver the same entry twice. Per-table operations live in sibling modules.
+//! connection. The outbox combines claim-token leases with a durable effect
+//! fence: pre-effect claims are reclaimable, while expired in-flight effects
+//! are parked for reconciliation instead of being sent twice. Per-table
+//! operations live in sibling modules.
 
 use std::{
     fs,
@@ -23,6 +25,7 @@ mod events;
 mod ingress;
 mod instances;
 mod outbox;
+mod outbox_reconciliation;
 mod queue_state;
 mod records;
 mod schema;
@@ -34,7 +37,8 @@ pub use records::{
     ChannelIngressEnqueueOutcome, ChannelIngressRecord, ChannelIngressStatus, ConnectorEventRecord,
     ConnectorInstanceRecord, ConnectorQueueSnapshot, DeadLetterRecord, DeliveryIntentDraft,
     DeliveryIntentRecord, DeliveryIntentRetryOutcome, DeliveryIntentStatus,
-    IngressBlockedLaneSnapshot, OutboxEnqueueOutcome, OutboxEntryRecord,
+    IngressBlockedLaneSnapshot, OutboxEffectState, OutboxEnqueueOutcome, OutboxEntryRecord,
+    OutboxReconciliationEvidence, OutboxReconciliationOutcome, OutboxUnknownRecord,
 };
 
 /// Handle to the connector sqlite database; cheap to share behind an `Arc`.
@@ -63,6 +67,8 @@ pub enum ConnectorStoreError {
     UnknownIngressStatus(String),
     #[error("connector storage schema contains unknown delivery intent status '{0}'")]
     UnknownDeliveryIntentStatus(String),
+    #[error("connector storage schema contains unknown outbox effect state '{0}'")]
+    UnknownOutboxEffectState(String),
     #[error("connector storage value overflow while converting '{field}'")]
     ValueOverflow { field: &'static str },
     #[error("connector record not found: {0}")]
@@ -75,6 +81,10 @@ pub enum ConnectorStoreError {
     InvalidDeliveryIntentRetry { intent_id: String, status: String },
     #[error("outbox entry not found: {0}")]
     OutboxNotFound(i64),
+    #[error("outbox entry is not outcome-unknown: {0}")]
+    OutboxNotOutcomeUnknown(i64),
+    #[error("outbox reconciliation delivered message id must not be empty")]
+    MissingReconciledNativeMessageId,
     #[error("dead-letter entry not found: {0}")]
     DeadLetterNotFound(i64),
     #[error(

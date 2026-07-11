@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+qa-fault-injection = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

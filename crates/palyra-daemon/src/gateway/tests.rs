@@ -11,7 +11,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,6 +21,13 @@ use std::{
 use std::io::{BufRead, BufReader};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+#[cfg(feature = "qa-fault-injection")]
+use palyra_common::qa_fault_injection::{
+    parse_qa_fault_evidence_sidecar_ndjson, QaFaultAction, QaFaultActivation,
+    QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan, QaFaultLaunchDocument,
+    QaFaultRecoveryClass, QA_FAULT_INJECTION_PLAN_FORMAT, QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+    QA_FAULT_LAUNCH_SCHEMA_VERSION,
+};
 use palyra_common::{
     runtime_contracts::{
         AuxiliaryTaskKind, AuxiliaryTaskState, FlowState, FlowStepState, QueueMode,
@@ -1069,6 +1076,26 @@ fn build_test_runtime_state_at(
     feature_rollouts: crate::config::FeatureRolloutsConfig,
     tool_call: crate::tool_protocol::ToolCallConfig,
 ) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_at_with_fault_injection(
+        db_path,
+        state_root,
+        hash_chain_enabled,
+        allow_private_targets,
+        feature_rollouts,
+        tool_call,
+        crate::qa_fault_injection::QaFaultRuntime::default(),
+    )
+}
+
+fn build_test_runtime_state_at_with_fault_injection(
+    db_path: PathBuf,
+    state_root: PathBuf,
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+    tool_call: crate::tool_protocol::ToolCallConfig,
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+) -> std::sync::Arc<GatewayRuntimeState> {
     let agent_registry =
         crate::agents::AgentRegistry::open_for_test_state_root(state_root.as_path())
             .expect("agent registry should initialize");
@@ -1081,7 +1108,7 @@ fn build_test_runtime_state_at(
     .expect("journal store should initialize");
     let model_provider_request_timeout_ms =
         crate::model_provider::ModelProviderConfig::default().request_timeout_ms;
-    GatewayRuntimeState::new(
+    GatewayRuntimeState::new_with_fault_injection(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: "127.0.0.1".to_owned(),
             grpc_port: 7443,
@@ -1168,8 +1195,24 @@ fn build_test_runtime_state_at(
         journal_store,
         0,
         agent_registry,
+        fault_injection,
     )
     .expect("runtime state should initialize")
+}
+
+#[cfg(feature = "qa-fault-injection")]
+fn build_test_runtime_state_with_fault_injection(
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_at_with_fault_injection(
+        unique_temp_journal_path(),
+        unique_temp_test_root("palyra-gateway-fault-state"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+        fault_injection,
+    )
 }
 
 fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
@@ -4858,6 +4901,96 @@ fn status_snapshot_reports_journal_counters_and_storage_metadata() {
     );
 }
 
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fixture_provider_fault_adapter_runs_through_the_real_provider_path() {
+    let temporary = tempfile::tempdir().expect("provider fault root should be created");
+    let plan = QaFaultInjectionPlan {
+        schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+        seed: 20260711,
+        activations: vec![
+            QaFaultActivation {
+                id: "provider-before-effect-timeout".to_owned(),
+                point_id: "provider.fixture.before_effect".to_owned(),
+                actor: Some("test-provider".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::Timeout,
+            },
+            QaFaultActivation {
+                id: "provider-after-effect-malformed".to_owned(),
+                point_id: "provider.fixture.after_effect_before_ack".to_owned(),
+                actor: Some("test-provider".to_owned()),
+                occurrence: 1,
+                action: QaFaultAction::MalformedEvent,
+            },
+        ],
+    };
+    let evidence_path = temporary.path().join("evidence.ndjson");
+    let launch = QaFaultLaunchDocument {
+        schema_version: QA_FAULT_LAUNCH_SCHEMA_VERSION,
+        launch_id: "provider-adapter-launch".to_owned(),
+        plan_path: temporary.path().join("plan.json").to_string_lossy().into_owned(),
+        plan_sha256: plan.canonical_sha256().expect("provider fault plan should hash"),
+        capability_sha256: "b".repeat(64),
+        evidence_path: evidence_path.to_string_lossy().into_owned(),
+        expires_at_unix_ms: i64::MAX,
+    };
+    let fault_injection = crate::qa_fault_injection::QaFaultRuntime::active_for_test(
+        plan.clone(),
+        launch.clone(),
+        evidence_path.clone(),
+    )
+    .expect("provider fault runtime should initialize");
+    let state = build_test_runtime_state_with_fault_injection(fault_injection);
+
+    let before_effect = state
+        .execute_model_provider(ProviderRequest::from_input_text(
+            "provider before-effect fault".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        ))
+        .await
+        .expect_err("before-effect timeout must stop the provider call");
+    assert_eq!(before_effect.code(), Code::DeadlineExceeded);
+    assert!(before_effect.message().contains("qa_fault.provider_timeout"));
+
+    let after_effect = state
+        .execute_model_provider(ProviderRequest::from_input_text(
+            "provider after-effect fault".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        ))
+        .await
+        .expect_err("post-effect malformed event must hide the completed provider response");
+    assert_eq!(after_effect.code(), Code::DataLoss);
+    assert!(after_effect.message().contains("qa_fault.provider_malformed_event"));
+
+    let evidence = fs::read(evidence_path).expect("provider fault evidence should be readable");
+    let parsed = parse_qa_fault_evidence_sidecar_ndjson(evidence.as_slice(), &launch, &plan)
+        .expect("provider fault evidence should validate");
+    let recoveries = parsed
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            QaFaultEvidenceSidecarRecord::RecoveryRecorded(record) => {
+                Some((record.activation_id.as_str(), record.recovery_class))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        recoveries.get("provider-before-effect-timeout"),
+        Some(&QaFaultRecoveryClass::FailedClosed)
+    );
+    assert_eq!(
+        recoveries.get("provider-after-effect-malformed"),
+        Some(&QaFaultRecoveryClass::OutcomeUnknown)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn status_snapshot_surfaces_model_provider_runtime_aggregates() {
     let state = build_test_runtime_state(false);
@@ -4977,6 +5110,7 @@ async fn networked_worker_lifecycle_events_are_journaled() {
     let completed = state
         .complete_networked_worker_lease(
             "worker-01",
+            lease.identity(),
             WorkerCleanupReport {
                 removed_workspace_scope: true,
                 removed_artifacts: true,
@@ -5026,7 +5160,7 @@ async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
         .register_networked_worker(test_worker_attestation("worker-cleanup-failure"))
         .await
         .expect("worker registration should succeed");
-    state
+    let (lease, _) = state
         .assign_networked_worker_lease(
             "worker-cleanup-failure",
             test_worker_lease_request("run-worker-cleanup-failure"),
@@ -5037,6 +5171,7 @@ async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
     let error = state
         .complete_networked_worker_lease(
             "worker-cleanup-failure",
+            lease.identity(),
             WorkerCleanupReport {
                 removed_workspace_scope: true,
                 removed_artifacts: false,
@@ -5742,6 +5877,90 @@ async fn terminal_cancel_cleanup_drains_registered_resources_after_noop_snapshot
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run should enter progress");
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(Ok(common_v1::RunStreamEvent::default()))
+        .await
+        .expect("barrier event should fill the wire channel");
+    let final_state = Arc::clone(&state);
+    let final_run_id = run_id.clone();
+    let finalizer = tokio::spawn(async move {
+        let mut tape_seq = 0;
+        let outcome = finalize_run_stream_after_provider_response(
+            &sender,
+            &final_state,
+            &mut run_state,
+            final_run_id.as_str(),
+            &mut tape_seq,
+        )
+        .await;
+        (outcome, tape_seq)
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = state
+                .orchestrator_run_status_snapshot(run_id.clone())
+                .await
+                .expect("run snapshot should load")
+                .expect("run should exist");
+            if snapshot.state == RunLifecycleState::Done.as_str() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finalizer should persist Done before its blocked wire send");
+    let cancel = state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "cancel_raced_final_delivery".to_owned(),
+        })
+        .await
+        .expect("terminal cancel should resolve deterministically");
+    assert!(!cancel.cancel_requested, "Done must remain the single terminal transition");
+
+    receiver.recv().await.expect("barrier event should drain").expect("barrier event should be ok");
+    let (outcome, tape_seq) = finalizer.await.expect("finalizer task should join");
+    assert_eq!(outcome.expect("finalizer should succeed"), RunStreamPostProviderOutcome::Completed);
+    assert_eq!(tape_seq, 1);
+    let terminal_event = receiver
+        .recv()
+        .await
+        .expect("one terminal wire event should arrive")
+        .expect("terminal wire event should be ok");
+    let common_v1::run_stream_event::Body::Status(status) =
+        terminal_event.body.expect("terminal event should have a body")
+    else {
+        panic!("terminal event should be a status");
+    };
+    assert_eq!(status.kind, common_v1::stream_status::StatusKind::Done as i32);
+    assert!(receiver.try_recv().is_err(), "no duplicate terminal wire event is allowed");
+
+    let terminal_rows = state
+        .journal_store
+        .orchestrator_tape(run_id.as_str())
+        .expect("terminal tape should load")
+        .into_iter()
+        .filter(|record| record.event_type == "status")
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_rows.len(), 1, "only one terminal tape row is allowed");
+    let payload: Value = serde_json::from_str(terminal_rows[0].payload_json.as_str())
+        .expect("terminal status payload should decode");
+    assert_eq!(payload["kind"], "done");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_cancel_freezes_existing_and_late_feature_usage() {
     let state = build_test_runtime_state(false);
@@ -6303,6 +6522,43 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
             .is_some_and(|note| note.contains("PID files")),
         "cleanup event should explain process-owned artifacts may remain: {payload}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_tool_effect_starts_append_distinct_ordered_tape_rows() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    for seq in 0..2 {
+        crate::application::run_stream::tool_flow::append_tool_effect_started_tape_event(
+            &state,
+            run_id.as_str(),
+            seq,
+            "proposal-retried",
+            "palyra.echo",
+        )
+        .await
+        .expect("tool effect start should append");
+    }
+
+    let tape = state
+        .journal_store
+        .orchestrator_tape(run_id.as_str())
+        .expect("tool effect tape should load");
+    let effect_rows =
+        tape.iter().filter(|record| record.event_type == "tool_effect_started").collect::<Vec<_>>();
+    assert_eq!(effect_rows.len(), 2);
+    assert_eq!(effect_rows.iter().map(|record| record.seq).collect::<Vec<_>>(), vec![0, 1]);
+    let expected_payload = json!({
+        "proposal_id": "proposal-retried",
+        "tool_name": "palyra.echo",
+    })
+    .to_string();
+    assert!(effect_rows
+        .iter()
+        .all(|record| record.payload_json.as_str() == expected_payload.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

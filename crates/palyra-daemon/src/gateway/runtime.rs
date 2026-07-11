@@ -116,6 +116,7 @@ use crate::provider_leases::{
     ProviderLeaseAcquireRequest, ProviderLeaseExecutionContext, ProviderLeaseManager,
     ProviderLeaseManagerSnapshot, ProviderLeasePreviewRequest, ProviderLeasePreviewSnapshot,
 };
+use crate::qa_fault_injection::QaFaultRuntime;
 use crate::retrieval::{
     lexical_overlap_score, recency_score as retrieval_recency_score, score_memory_candidates,
     score_with_profile, score_workspace_candidates, workspace_source_quality,
@@ -135,6 +136,7 @@ use crate::tool_posture::{
 };
 use crate::usage_governance::SmartRoutingRuntimeConfig;
 use palyra_auth::{AuthHealthReport, AuthProfileFailureKind};
+use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultDirective};
 use palyra_common::replay_bundle::ReplayBundle;
 use palyra_common::runtime_contracts::{
     ArtifactReadResponse, IdempotencyReplayDecision, QueueDecision, QueueMode, QueuedInputState,
@@ -146,8 +148,8 @@ use palyra_common::runtime_preview::{
 };
 use palyra_workerd::{
     WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
-    WorkerFleetSnapshot, WorkerLease, WorkerLeaseRequest, WorkerLifecycleEvent,
-    WORKER_REMOTE_TOOL_CAPABILITIES,
+    WorkerFleetSnapshot, WorkerLease, WorkerLeaseIdentity, WorkerLeaseRequest,
+    WorkerLifecycleEvent, WORKER_REMOTE_TOOL_CAPABILITIES,
 };
 use ring::hmac;
 use serde_json::{json, Value};
@@ -660,7 +662,7 @@ pub struct GatewayJournalConfigSnapshot {
 /// Externally constructed collaborators injected into
 /// [`GatewayRuntimeState::new_with_provider`].
 #[rustfmt::skip]
-pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore }
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime }
 
 /// Maps internal lease preview reason codes to operator-facing wording.
 /// Internal codes must not leak into user-visible errors (pinned by tests).
@@ -840,6 +842,7 @@ pub struct GatewayRuntimeState {
     pub(crate) counters: RuntimeCounters,
     feature_usage: FeatureUsageRegistry,
     pub(crate) journal_store: JournalStore,
+    pub(crate) fault_injection: QaFaultRuntime,
     revoked_certificate_count: usize,
     model_provider: RwLock<Arc<dyn ModelProvider>>,
     model_provider_generation: AtomicU64,
@@ -1723,6 +1726,26 @@ impl GatewayRuntimeState {
         revoked_certificate_count: usize,
         agent_registry: AgentRegistry,
     ) -> Result<Arc<Self>, JournalError> {
+        Self::new_with_fault_injection(
+            config,
+            journal_config,
+            journal_store,
+            revoked_certificate_count,
+            agent_registry,
+            QaFaultRuntime::default(),
+        )
+    }
+
+    /// Test-only constructor that wires an explicit QA fault runtime through the real gateway.
+    #[cfg(test)]
+    pub(crate) fn new_with_fault_injection(
+        config: GatewayRuntimeConfigSnapshot,
+        journal_config: GatewayJournalConfigSnapshot,
+        journal_store: JournalStore,
+        revoked_certificate_count: usize,
+        agent_registry: AgentRegistry,
+        fault_injection: QaFaultRuntime,
+    ) -> Result<Arc<Self>, JournalError> {
         let default_provider = crate::model_provider::build_model_provider(
             &crate::model_provider::ModelProviderConfig::default(),
         )
@@ -1733,7 +1756,7 @@ impl GatewayRuntimeState {
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
-        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp() };
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection };
         Self::new_with_provider(
             config,
             journal_config,
@@ -1762,7 +1785,7 @@ impl GatewayRuntimeState {
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
         #[rustfmt::skip]
-        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings } = dependencies;
+        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection } = dependencies;
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
@@ -1801,6 +1824,11 @@ impl GatewayRuntimeState {
         let channel_router = ChannelRouter::new(config.channel_router.clone());
         let inbound_coalescer =
             InboundCoalescer::new(config.channel_router.inbound_coalescing.clone());
+        #[cfg(feature = "qa-fault-injection")]
+        let worker_fleet =
+            WorkerFleetManager::default().with_qa_fault_probe(fault_injection.probe_handle());
+        #[cfg(not(feature = "qa-fault-injection"))]
+        let worker_fleet = WorkerFleetManager::default();
         Ok(Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
@@ -1897,6 +1925,7 @@ impl GatewayRuntimeState {
             },
             feature_usage: FeatureUsageRegistry::new(),
             journal_store,
+            fault_injection,
             revoked_certificate_count,
             model_provider: RwLock::new(model_provider),
             model_provider_generation: AtomicU64::new(1),
@@ -1916,7 +1945,7 @@ impl GatewayRuntimeState {
             run_cleanup_resources: Mutex::new(HashMap::new()),
             run_detached_resources: Mutex::new(HashMap::new()),
             closed_browser_sessions: Mutex::new(ClosedBrowserSessionLedger::default()),
-            worker_fleet: RwLock::new(WorkerFleetManager::default()),
+            worker_fleet: RwLock::new(worker_fleet),
             networked_worker_remote_dispatcher: RwLock::new(None),
             provider_leases: ProviderLeaseManager::default(),
             retrieval_backend,
@@ -4069,6 +4098,70 @@ impl GatewayRuntimeState {
         Arc::clone(&self.model_provider.read().unwrap_or_else(|error| error.into_inner()))
     }
 
+    fn apply_fixture_provider_fault(
+        &self,
+        point_id: &'static str,
+        actor: &str,
+    ) -> Result<(), Status> {
+        match self.fault_injection.checkpoint(point_id, actor).map_err(|error| {
+            Status::internal(format!("qa_fault.provider_checkpoint_failed: {error}"))
+        })? {
+            QaFaultDirective::Continue => Ok(()),
+            QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+                QaFaultAction::Timeout => {
+                    self.fault_injection.record_immediate_recovery(&directive).map_err(
+                        |error| {
+                            Status::internal(format!("qa_fault.provider_recovery_failed: {error}"))
+                        },
+                    )?;
+                    Err(Status::deadline_exceeded(format!(
+                        "qa_fault.provider_timeout: activation={}",
+                        directive.activation.id
+                    )))
+                }
+                QaFaultAction::Disconnect => {
+                    self.fault_injection.record_immediate_recovery(&directive).map_err(
+                        |error| {
+                            Status::internal(format!("qa_fault.provider_recovery_failed: {error}"))
+                        },
+                    )?;
+                    Err(Status::unavailable(format!(
+                        "qa_fault.provider_disconnect: activation={}",
+                        directive.activation.id
+                    )))
+                }
+                QaFaultAction::MalformedEvent => {
+                    self.fault_injection.record_immediate_recovery(&directive).map_err(
+                        |error| {
+                            Status::internal(format!("qa_fault.provider_recovery_failed: {error}"))
+                        },
+                    )?;
+                    Err(Status::data_loss(format!(
+                        "qa_fault.provider_malformed_event: activation={}",
+                        directive.activation.id
+                    )))
+                }
+                QaFaultAction::TerminateProcess => {
+                    self.fault_injection.record_immediate_recovery(&directive).map_err(
+                        |error| {
+                            Status::internal(format!("qa_fault.provider_recovery_failed: {error}"))
+                        },
+                    )?;
+                    #[cfg(feature = "qa-fault-injection")]
+                    self.fault_injection.terminate_process();
+                    #[cfg(not(feature = "qa-fault-injection"))]
+                    Err(Status::internal(
+                        "qa_fault.feature_disabled: terminate directive reached a feature-off build",
+                    ))
+                }
+                action => Err(Status::internal(format!(
+                    "qa_fault.provider_action_unsupported: {}",
+                    action.kind().as_str()
+                ))),
+            },
+        }
+    }
+
     /// Replaces the model provider used by new requests and returns the new generation.
     #[must_use]
     pub fn configure_model_provider(&self, model_provider: Arc<dyn ModelProvider>) -> u64 {
@@ -4150,7 +4243,13 @@ impl GatewayRuntimeState {
     ) -> Result<crate::model_provider::ProviderResponse, Status> {
         self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
         let model_provider = self.current_model_provider();
-        match model_provider.complete(request).await {
+        self.apply_fixture_provider_fault("provider.fixture.before_effect", "test-provider")?;
+        let result = model_provider.complete(request).await;
+        self.apply_fixture_provider_fault(
+            "provider.fixture.after_effect_before_ack",
+            "test-provider",
+        )?;
+        match result {
             Ok(response) => {
                 if response.retry_count > 0 {
                     self.counters
@@ -4192,6 +4291,12 @@ impl GatewayRuntimeState {
         request: ProviderRequest,
         lease_context: ProviderLeaseExecutionContext,
     ) -> Result<crate::model_provider::ProviderResponse, Status> {
+        let fault_actor = lease_context
+            .run_id
+            .as_deref()
+            .or(lease_context.session_id.as_deref())
+            .unwrap_or("provider");
+        self.apply_fixture_provider_fault("provider.fixture.before_intent", fault_actor)?;
         let model_provider = self.current_model_provider();
         let _lease = self
             .provider_leases
@@ -4213,8 +4318,12 @@ impl GatewayRuntimeState {
                     provider_lease_timeout_status(waited_ms, &lease_context, preview)
                 }
             })?;
+        self.apply_fixture_provider_fault("provider.fixture.after_intent", fault_actor)?;
         self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
-        match model_provider.complete(request).await {
+        self.apply_fixture_provider_fault("provider.fixture.before_effect", fault_actor)?;
+        let result = model_provider.complete(request).await;
+        self.apply_fixture_provider_fault("provider.fixture.after_effect_before_ack", fault_actor)?;
+        match result {
             Ok(response) => {
                 let provider_status = model_provider.status_snapshot();
                 if let Some(attribution) = provider_credential_attribution_for_provider(
@@ -10420,20 +10529,21 @@ impl GatewayRuntimeState {
     pub async fn complete_networked_worker_lease(
         self: &Arc<Self>,
         worker_id: &str,
+        lease_identity: WorkerLeaseIdentity,
         cleanup_report: WorkerCleanupReport,
     ) -> Result<WorkerLifecycleEvent, Status> {
         let now_unix_ms = current_unix_ms();
         let outcome = match self.worker_fleet.write() {
-            Ok(mut manager) => {
-                manager.finalize_work(worker_id, cleanup_report, now_unix_ms).map_err(|error| {
+            Ok(mut manager) => manager
+                .finalize_work(worker_id, &lease_identity, cleanup_report, now_unix_ms)
+                .map_err(|error| {
                     Status::failed_precondition(format!("networked worker cleanup failed: {error}"))
-                })?
-            }
+                })?,
             Err(poisoned) => {
                 warn!("worker fleet lock poisoned while completing worker lease");
                 poisoned
                     .into_inner()
-                    .finalize_work(worker_id, cleanup_report, now_unix_ms)
+                    .finalize_work(worker_id, &lease_identity, cleanup_report, now_unix_ms)
                     .map_err(|error| {
                         Status::failed_precondition(format!(
                             "networked worker cleanup failed: {error}"
@@ -10480,7 +10590,12 @@ impl GatewayRuntimeState {
                 warn!("worker fleet lock poisoned while reaping expired workers");
                 poisoned.into_inner().reap_expired_workers(now_unix_ms)
             }
-        };
+        }
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "networked worker expiry reconciliation failed: {error}"
+            ))
+        })?;
         for event in &events {
             self.record_networked_worker_lifecycle_event_with_details(
                 event,

@@ -407,11 +407,7 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
                 let reason = redact_auth_error(error.to_string().as_str());
                 self.record_last_error(reason.as_str());
                 self.record_route_transient_failure(route_key.as_str(), reason.as_str())?;
-                return Ok(DeliveryOutcome::Retry {
-                    class: RetryClass::TransientNetwork,
-                    reason,
-                    retry_after_ms: None,
-                });
+                return Ok(DeliveryOutcome::OutcomeUnknown { reason });
             }
         };
 
@@ -465,11 +461,7 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
             self.record_last_error(reason.as_str());
             self.record_route_transient_failure(route_key.as_str(), reason.as_str())?;
             self.record_route_failure_status(route_key.as_str(), response.status, reason.as_str())?;
-            return Ok(DeliveryOutcome::Retry {
-                class: RetryClass::TransientNetwork,
-                reason,
-                retry_after_ms: None,
-            });
+            return Ok(DeliveryOutcome::OutcomeUnknown { reason });
         }
 
         if !(200..300).contains(&response.status) {

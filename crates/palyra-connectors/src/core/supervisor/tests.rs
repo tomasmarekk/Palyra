@@ -3,13 +3,24 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
+#[cfg(feature = "qa-fault-injection")]
+use palyra_common::qa_fault_injection::{
+    DeterministicQaFaultController, QaFaultAction, QaFaultActivation, QaFaultActiveBarrier,
+    QaFaultCheckpoint, QaFaultControllerRecord, QaFaultDirective, QaFaultInjectionPlan,
+    QaFaultProbe, QaFaultProbeError, QaFaultProbeHandle, QaFaultRecoveryClass,
+    QA_FAULT_INJECTION_PLAN_FORMAT, QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+};
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use crate::{
     protocol::{
@@ -18,13 +29,13 @@ use crate::{
     },
     storage::{
         ChannelIngressRecord, ChannelIngressStatus, ConnectorStore, DeliveryIntentDraft,
-        DeliveryIntentStatus,
+        DeliveryIntentStatus, OutboxReconciliationEvidence,
     },
 };
 
 use super::{
     unix_ms_now, ConnectorAdapter, ConnectorAdapterError, ConnectorRouter, ConnectorRouterError,
-    ConnectorSupervisor, ConnectorSupervisorConfig, DeliveryPipelineMode,
+    ConnectorSupervisor, ConnectorSupervisorConfig, ConnectorSupervisorError, DeliveryPipelineMode,
 };
 
 struct RouterStub;
@@ -208,6 +219,47 @@ struct SlowCountingAdapter {
     sends: Mutex<HashMap<String, usize>>,
 }
 
+#[derive(Default)]
+struct GatedAdapter {
+    started: Notify,
+    release: Notify,
+    sends: AtomicUsize,
+}
+
+impl GatedAdapter {
+    fn release_delivery(&self) {
+        self.release.notify_one();
+    }
+
+    fn sends(&self) -> usize {
+        self.sends.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ConnectorAdapter for GatedAdapter {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind::Echo
+    }
+
+    fn availability(&self) -> ConnectorAvailability {
+        ConnectorAvailability::InternalTestOnly
+    }
+
+    async fn send_outbound(
+        &self,
+        _instance: &crate::storage::ConnectorInstanceRecord,
+        request: &crate::protocol::OutboundMessageRequest,
+    ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        let sequence = self.sends.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(DeliveryOutcome::Delivered {
+            native_message_id: format!("native-{}-{sequence}", request.envelope_id),
+        })
+    }
+}
+
 impl SlowCountingAdapter {
     fn sends_for(&self, envelope_id: &str) -> usize {
         self.sends
@@ -248,6 +300,37 @@ impl ConnectorAdapter for SlowCountingAdapter {
 
 struct PermanentFailureAdapter {
     reason: &'static str,
+}
+
+#[derive(Default)]
+struct OutcomeUnknownAdapter {
+    sends: AtomicUsize,
+}
+
+impl OutcomeUnknownAdapter {
+    fn sends(&self) -> usize {
+        self.sends.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ConnectorAdapter for OutcomeUnknownAdapter {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind::Echo
+    }
+
+    fn availability(&self) -> ConnectorAvailability {
+        ConnectorAvailability::InternalTestOnly
+    }
+
+    async fn send_outbound(
+        &self,
+        _instance: &crate::storage::ConnectorInstanceRecord,
+        _request: &crate::protocol::OutboundMessageRequest,
+    ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        Ok(DeliveryOutcome::OutcomeUnknown { reason: "response lost after send".to_owned() })
+    }
 }
 
 #[async_trait]
@@ -635,7 +718,7 @@ async fn route_quarantine_does_not_enqueue_or_send_outbound() {
 }
 
 #[tokio::test]
-async fn platform_retry_marks_delivery_intent_unknown_before_replay_delivery() {
+async fn proven_safe_retry_requeues_intent_before_replay_delivery() {
     let (_tempdir, supervisor, adapter) = open_supervisor();
     supervisor.register_connector(&sample_spec()).expect("register should succeed");
 
@@ -649,16 +732,12 @@ async fn platform_retry_marks_delivery_intent_unknown_before_replay_delivery() {
         .expect("ingest should enqueue and attempt delivery");
     assert!(ingest.accepted);
     assert_eq!(adapter.sends_for("env-platform-unknown:0"), 1);
-    let unknown_intents = supervisor
+    let queued_intents = supervisor
         .store()
-        .list_delivery_intents(
-            "echo:default",
-            Some(DeliveryIntentStatus::PlatformOutcomeUnknown),
-            16,
-        )
-        .expect("unknown delivery intents should be readable");
-    assert_eq!(unknown_intents.len(), 1);
-    assert_eq!(unknown_intents[0].outbox_envelope_id, "env-platform-unknown:0");
+        .list_delivery_intents("echo:default", Some(DeliveryIntentStatus::Queued), 16)
+        .expect("safe retry intents should be readable");
+    assert_eq!(queued_intents.len(), 1);
+    assert_eq!(queued_intents[0].outbox_envelope_id, "env-platform-unknown:0");
 
     let mut delivered = 0_usize;
     for _ in 0..20 {
@@ -674,13 +753,77 @@ async fn platform_retry_marks_delivery_intent_unknown_before_replay_delivery() {
     assert_eq!(
         adapter.sends_for("env-platform-unknown:0"),
         2,
-        "one retry should resolve the unknown platform outcome"
+        "an adapter-proven no-effect outcome may be sent again"
     );
     let intent = supervisor
         .store()
-        .get_delivery_intent(unknown_intents[0].intent_id.as_str())
+        .get_delivery_intent(queued_intents[0].intent_id.as_str())
         .expect("delivery intent should be readable after retry");
     assert_eq!(intent.status, DeliveryIntentStatus::Delivered);
+}
+
+#[tokio::test]
+async fn outcome_unknown_stays_parked_until_explicit_reconciliation() {
+    let tempdir = TempDir::new().expect("tempdir should initialize");
+    let store = Arc::new(
+        ConnectorStore::open(tempdir.path().join("connectors.sqlite3"))
+            .expect("store should initialize"),
+    );
+    let adapter = Arc::new(OutcomeUnknownAdapter::default());
+    let supervisor = ConnectorSupervisor::new(
+        store,
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    );
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+
+    let ingest = supervisor
+        .ingest_inbound(sample_inbound_for(
+            "echo:default",
+            "env-response-lost",
+            "hello after ambiguous send",
+        ))
+        .await
+        .expect("ambiguous delivery should be durably parked");
+    assert!(ingest.accepted);
+    assert_eq!(adapter.sends(), 1);
+
+    let no_blind_retry =
+        supervisor.drain_due_outbox(16).await.expect("parked drain should succeed");
+    assert_eq!(no_blind_retry.processed, 0);
+    assert_eq!(adapter.sends(), 1, "outcome-unknown must not trigger a second physical send");
+    let unknown = supervisor
+        .store()
+        .list_outbox_unknown("echo:default", 10)
+        .expect("outcome-unknown row should be operator-visible");
+    assert_eq!(unknown.len(), 1);
+    let intents = supervisor
+        .store()
+        .list_delivery_intents(
+            "echo:default",
+            Some(DeliveryIntentStatus::PlatformOutcomeUnknown),
+            10,
+        )
+        .expect("outcome-unknown intent should be operator-visible");
+    assert_eq!(intents.len(), 1);
+
+    supervisor
+        .store()
+        .reconcile_outbox_unknown(
+            unknown[0].outbox_id,
+            &OutboxReconciliationEvidence::Delivered {
+                native_message_id: "native-reconciled".to_owned(),
+            },
+            unix_ms_now().expect("clock should resolve"),
+        )
+        .expect("platform receipt should reconcile delivery");
+    let reconciled = supervisor
+        .store()
+        .get_delivery_intent(intents[0].intent_id.as_str())
+        .expect("reconciled intent should load");
+    assert_eq!(reconciled.status, DeliveryIntentStatus::Delivered);
+    assert_eq!(adapter.sends(), 1, "reconciliation must not call the adapter again");
 }
 
 #[tokio::test]
@@ -766,6 +909,649 @@ async fn concurrent_drains_do_not_double_send_same_outbox_entry() {
         1,
         "adapter send should run exactly once across concurrent drains"
     );
+}
+
+#[tokio::test]
+async fn expired_in_flight_claim_is_parked_without_a_duplicate_send() {
+    let tempdir = TempDir::new().expect("tempdir should initialize");
+    let store = Arc::new(
+        ConnectorStore::open(tempdir.path().join("connectors.sqlite3"))
+            .expect("store should initialize"),
+    );
+    let adapter = Arc::new(GatedAdapter::default());
+    let supervisor = Arc::new(ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    ));
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+    supervisor
+        .enqueue_outbound(&sample_outbound_request("env-expired-in-flight", "deliver once"))
+        .expect("outbox enqueue should succeed");
+
+    let started = adapter.started.notified();
+    let drain = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.drain_due_outbox(1).await }
+    });
+    started.await;
+
+    let reclaimed = store
+        .load_due_outbox(i64::MAX / 4, 1, Some("echo:default"), false)
+        .expect("expired claim scan should succeed");
+    assert!(
+        reclaimed.is_empty(),
+        "an expired effect-started claim must be parked instead of reclaimed"
+    );
+    adapter.release_delivery();
+    let drain_error = drain
+        .await
+        .expect("drain task should join")
+        .expect_err("the stale sender must not acknowledge a parked row");
+    assert!(matches!(
+        drain_error,
+        ConnectorSupervisorError::Store(
+            super::super::storage::ConnectorStoreError::OutboxNotFound(_)
+        )
+    ));
+    assert_eq!(adapter.sends(), 1);
+    assert_eq!(store.list_outbox_unknown("echo:default", 10).unwrap().len(), 1);
+
+    let unknown = store.list_outbox_unknown("echo:default", 1).unwrap().remove(0);
+    store
+        .reconcile_outbox_unknown(
+            unknown.outbox_id,
+            &OutboxReconciliationEvidence::Delivered {
+                native_message_id: "native-env-expired-in-flight-1".to_owned(),
+            },
+            i64::MAX / 4,
+        )
+        .expect("platform receipt should reconcile the unknown effect");
+    let later = supervisor.drain_due_outbox(1).await.expect("later drain should succeed");
+    assert_eq!(later.processed, 0);
+    assert_eq!(adapter.sends(), 1, "reconciliation must not repeat the physical send");
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn connector_fault_adapter_self_tests_every_registered_outbox_boundary() {
+    struct FaultCase {
+        point_id: &'static str,
+        action: QaFaultAction,
+        sends_at_fault: usize,
+        outcome_unknown: bool,
+        recovery_class: QaFaultRecoveryClass,
+    }
+
+    let cases = [
+        FaultCase {
+            point_id: "connector.outbox.before_intent",
+            action: QaFaultAction::Disconnect,
+            sends_at_fault: 0,
+            outcome_unknown: false,
+            recovery_class: QaFaultRecoveryClass::FailedClosed,
+        },
+        FaultCase {
+            point_id: "connector.outbox.after_intent",
+            action: QaFaultAction::Disconnect,
+            sends_at_fault: 0,
+            outcome_unknown: false,
+            recovery_class: QaFaultRecoveryClass::FailedClosed,
+        },
+        FaultCase {
+            point_id: "connector.outbox.before_effect",
+            action: QaFaultAction::Timeout,
+            sends_at_fault: 0,
+            outcome_unknown: false,
+            recovery_class: QaFaultRecoveryClass::FailedClosed,
+        },
+        FaultCase {
+            point_id: "connector.outbox.during_delivery",
+            action: QaFaultAction::Timeout,
+            sends_at_fault: 0,
+            outcome_unknown: true,
+            recovery_class: QaFaultRecoveryClass::OutcomeUnknown,
+        },
+        FaultCase {
+            point_id: "connector.outbox.after_effect_before_ack",
+            action: QaFaultAction::Disconnect,
+            sends_at_fault: 1,
+            outcome_unknown: true,
+            recovery_class: QaFaultRecoveryClass::OutcomeUnknown,
+        },
+        FaultCase {
+            point_id: "connector.outbox.after_ack_before_transition",
+            action: QaFaultAction::TerminateProcess,
+            sends_at_fault: 1,
+            outcome_unknown: true,
+            recovery_class: QaFaultRecoveryClass::TransitionPending,
+        },
+    ];
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let activation_id = format!("connector-boundary-{index}");
+        let envelope_id = format!("env-fault-boundary-{index}");
+        let controller = DeterministicQaFaultController::new(QaFaultInjectionPlan {
+            schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+            format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+            seed: 73,
+            activations: vec![QaFaultActivation {
+                id: activation_id.clone(),
+                point_id: case.point_id.to_owned(),
+                actor: Some("outbox-1".to_owned()),
+                occurrence: 1,
+                action: case.action.clone(),
+            }],
+        })
+        .unwrap();
+        let probe = QaFaultProbeHandle::from_probe(controller);
+        let tempdir = TempDir::new().unwrap();
+        let store =
+            Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+        let adapter = Arc::new(GatedAdapter::default());
+        let supervisor = ConnectorSupervisor::new(
+            store.clone(),
+            Arc::new(RouterStub),
+            vec![adapter.clone()],
+            ConnectorSupervisorConfig::default(),
+        )
+        .with_qa_fault_probe(probe.clone());
+        supervisor.register_connector(&sample_spec()).unwrap();
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id.as_str(), "fault me"))
+            .unwrap();
+        if case.sends_at_fault > 0 {
+            adapter.release_delivery();
+        }
+
+        let error = supervisor
+            .drain_due_outbox(1)
+            .await
+            .expect_err("the configured boundary must surface its typed fault");
+        match error {
+            ConnectorSupervisorError::QaFaultActivated { point_id, action, .. } => {
+                assert_eq!(point_id, case.point_id);
+                assert_eq!(action, case.action);
+            }
+            other => panic!("unexpected connector fault error: {other:?}"),
+        }
+        assert_eq!(adapter.sends(), case.sends_at_fault, "point={}", case.point_id);
+        assert_eq!(
+            probe.records().unwrap()[0].recovery_class,
+            Some(case.recovery_class),
+            "point={} must record subsystem-owned recovery",
+            case.point_id
+        );
+
+        if case.outcome_unknown {
+            let unknown = store.list_outbox_unknown("echo:default", 1).unwrap().remove(0);
+            let no_blind_retry = supervisor.drain_due_outbox(1).await.unwrap();
+            assert_eq!(no_blind_retry.processed, 0);
+            assert_eq!(adapter.sends(), case.sends_at_fault);
+
+            if case.sends_at_fault == 0 {
+                store
+                    .reconcile_outbox_unknown(
+                        unknown.outbox_id,
+                        &OutboxReconciliationEvidence::ConfirmedAbsent,
+                        unix_ms_now().unwrap(),
+                    )
+                    .unwrap();
+                adapter.release_delivery();
+                let retry = supervisor.drain_due_outbox(1).await.unwrap();
+                assert_eq!(retry.delivered, 1);
+            } else {
+                store
+                    .reconcile_outbox_unknown(
+                        unknown.outbox_id,
+                        &OutboxReconciliationEvidence::Delivered {
+                            native_message_id: format!("native-{envelope_id}-1"),
+                        },
+                        unix_ms_now().unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(supervisor.drain_due_outbox(1).await.unwrap().processed, 0);
+            }
+        } else {
+            assert!(
+                store.list_outbox_unknown("echo:default", 1).unwrap().is_empty(),
+                "point={} must remain retry-safe",
+                case.point_id
+            );
+            adapter.release_delivery();
+            let retry = supervisor.drain_due_outbox(1).await.unwrap();
+            assert_eq!(retry.delivered, 1);
+        }
+        assert_eq!(adapter.sends(), 1, "point={} must produce one final send", case.point_id);
+    }
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn connector_fault_actor_does_not_alias_same_envelope_across_connectors() {
+    let controller = DeterministicQaFaultController::new(QaFaultInjectionPlan {
+        schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+        seed: 37,
+        activations: vec![QaFaultActivation {
+            id: "connector-identity-fault".to_owned(),
+            point_id: "connector.outbox.before_effect".to_owned(),
+            actor: Some("outbox-1".to_owned()),
+            occurrence: 1,
+            action: QaFaultAction::Timeout,
+        }],
+    })
+    .unwrap();
+    let probe = QaFaultProbeHandle::from_probe(controller);
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let adapter = Arc::new(FlakyAdapter::default());
+    let supervisor = ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    )
+    .with_qa_fault_probe(probe.clone());
+    let mut first_spec = sample_spec();
+    first_spec.connector_id = "echo:first".to_owned();
+    let mut second_spec = sample_spec();
+    second_spec.connector_id = "echo:second".to_owned();
+    supervisor.register_connector(&first_spec).unwrap();
+    supervisor.register_connector(&second_spec).unwrap();
+    let mut first = sample_outbound_request("shared-envelope", "first connector");
+    first.connector_id = first_spec.connector_id.clone();
+    let mut second = sample_outbound_request("shared-envelope", "second connector");
+    second.connector_id = second_spec.connector_id.clone();
+    supervisor.enqueue_outbound(&first).unwrap();
+    supervisor.enqueue_outbound(&second).unwrap();
+
+    supervisor.drain_due_outbox(2).await.unwrap_err();
+
+    assert_eq!(probe.records().unwrap()[0].actors, ["outbox-1"]);
+    assert_eq!(adapter.sends_for("shared-envelope"), 0);
+    let first_retry = store
+        .load_due_outbox(unix_ms_now().unwrap(), 1, Some(first_spec.connector_id.as_str()), false)
+        .unwrap();
+    assert_eq!(first_retry.len(), 1);
+    let unrelated = supervisor.queue_snapshot(second_spec.connector_id.as_str()).unwrap();
+    assert_eq!(unrelated.pending_outbox, 1);
+    assert_eq!(unrelated.claimed_outbox, 1);
+    assert_eq!(unrelated.dead_letters, 0);
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[test]
+fn startup_reconciliation_releases_only_the_exact_ready_outbox_actor() {
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let supervisor = ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![Arc::new(FlakyAdapter::default())],
+        ConnectorSupervisorConfig::default(),
+    );
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["startup-ready-a", "startup-ready-b"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "startup recovery"))
+            .unwrap();
+    }
+    let claimed =
+        store.load_due_outbox(unix_ms_now().unwrap(), 2, Some("echo:default"), false).unwrap();
+    assert_eq!(claimed.len(), 2);
+
+    let recovery = supervisor
+        .reconcile_pending_qa_fault_actor("connector.outbox.before_intent", "outbox-1")
+        .unwrap();
+
+    assert_eq!(recovery, QaFaultRecoveryClass::FailedClosed);
+    assert_eq!(
+        supervisor
+            .reconcile_pending_qa_fault_actor("connector.outbox.before_intent", "outbox-1")
+            .unwrap(),
+        QaFaultRecoveryClass::FailedClosed
+    );
+    let reclaimed =
+        store.load_due_outbox(unix_ms_now().unwrap(), 2, Some("echo:default"), false).unwrap();
+    assert_eq!(reclaimed.iter().map(|entry| entry.outbox_id).collect::<Vec<_>>(), [1]);
+    assert!(supervisor
+        .reconcile_pending_qa_fault_actor("connector.outbox.before_intent", "not-an-outbox")
+        .is_err());
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[test]
+fn startup_reconciliation_parks_only_provable_effect_started_actors() {
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let supervisor = ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![Arc::new(FlakyAdapter::default())],
+        ConnectorSupervisorConfig::default(),
+    );
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["startup-effect-a", "startup-effect-b"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "startup recovery"))
+            .unwrap();
+    }
+    let now = unix_ms_now().unwrap();
+    let claimed = store.load_due_outbox(now, 2, Some("echo:default"), false).unwrap();
+    for entry in &claimed {
+        store
+            .mark_outbox_delivery_intent_started(entry.outbox_id, entry.claim_token.as_str(), now)
+            .unwrap();
+        store.mark_outbox_effect_started(entry.outbox_id, entry.claim_token.as_str(), now).unwrap();
+    }
+
+    assert_eq!(
+        supervisor
+            .reconcile_pending_qa_fault_actor("connector.outbox.during_delivery", "outbox-1")
+            .unwrap(),
+        QaFaultRecoveryClass::OutcomeUnknown
+    );
+    assert_eq!(
+        supervisor
+            .reconcile_pending_qa_fault_actor(
+                "connector.outbox.after_ack_before_transition",
+                "outbox-2",
+            )
+            .unwrap(),
+        QaFaultRecoveryClass::TransitionPending
+    );
+    assert_eq!(
+        supervisor
+            .reconcile_pending_qa_fault_actor("connector.outbox.during_delivery", "outbox-1")
+            .unwrap(),
+        QaFaultRecoveryClass::OutcomeUnknown
+    );
+    assert_eq!(
+        supervisor
+            .reconcile_pending_qa_fault_actor(
+                "connector.outbox.after_ack_before_transition",
+                "outbox-2",
+            )
+            .unwrap(),
+        QaFaultRecoveryClass::TransitionPending
+    );
+    assert_eq!(store.list_outbox_unknown("echo:default", 10).unwrap().len(), 2);
+    assert!(supervisor
+        .reconcile_pending_qa_fault_actor("connector.outbox.before_effect", "outbox-1")
+        .is_err());
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[derive(Clone)]
+struct RecoveredBarrierProbe {
+    releases: Arc<Mutex<Vec<String>>>,
+    recoveries: Arc<Mutex<Vec<(String, QaFaultRecoveryClass)>>>,
+    barrier: Arc<Mutex<Option<QaFaultActiveBarrier>>>,
+}
+
+#[cfg(feature = "qa-fault-injection")]
+impl Default for RecoveredBarrierProbe {
+    fn default() -> Self {
+        Self::with_released_actors(Vec::new())
+    }
+}
+
+#[cfg(feature = "qa-fault-injection")]
+impl RecoveredBarrierProbe {
+    fn fully_released() -> Self {
+        Self::with_released_actors(vec!["outbox-2".to_owned(), "outbox-1".to_owned()])
+    }
+
+    fn with_released_actors(released_actors: Vec<String>) -> Self {
+        Self {
+            releases: Arc::new(Mutex::new(Vec::new())),
+            recoveries: Arc::new(Mutex::new(Vec::new())),
+            barrier: Arc::new(Mutex::new(Some(QaFaultActiveBarrier {
+                activation_id: "connector-recovered-barrier".to_owned(),
+                point_id: "connector.outbox.batch_before_effect".to_owned(),
+                participants: 2,
+                actors: vec!["outbox-1".to_owned(), "outbox-2".to_owned()],
+                release_order: Some(vec!["outbox-2".to_owned(), "outbox-1".to_owned()]),
+                released_actors,
+            }))),
+        }
+    }
+}
+
+#[cfg(feature = "qa-fault-injection")]
+impl QaFaultProbe for RecoveredBarrierProbe {
+    fn checkpoint(
+        &self,
+        checkpoint: QaFaultCheckpoint<'_>,
+    ) -> Result<QaFaultDirective, QaFaultProbeError> {
+        if checkpoint.point_id == "connector.outbox.batch_before_effect"
+            && matches!(checkpoint.actor, "outbox-1" | "outbox-2")
+        {
+            self.releases.lock().unwrap().push(checkpoint.actor.to_owned());
+            if let Some(barrier) = self.barrier.lock().unwrap().as_mut() {
+                barrier.released_actors.push(checkpoint.actor.to_owned());
+            }
+        }
+        Ok(QaFaultDirective::Continue)
+    }
+
+    fn record_recovery(
+        &self,
+        activation_id: &str,
+        recovery_class: QaFaultRecoveryClass,
+    ) -> Result<(), QaFaultProbeError> {
+        if self.barrier.lock().unwrap().take().is_none() {
+            return Err(QaFaultProbeError::RecoveryAlreadyRecorded(activation_id.to_owned()));
+        }
+        self.recoveries.lock().unwrap().push((activation_id.to_owned(), recovery_class));
+        Ok(())
+    }
+
+    fn records(&self) -> Result<Vec<QaFaultControllerRecord>, QaFaultProbeError> {
+        Ok(Vec::new())
+    }
+
+    fn active_barriers(&self) -> Result<Vec<QaFaultActiveBarrier>, QaFaultProbeError> {
+        Ok(self.barrier.lock().unwrap().iter().cloned().collect())
+    }
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn recovered_barrier_consumes_terminal_actor_release_without_redispatch() {
+    let probe = RecoveredBarrierProbe::default();
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let adapter = Arc::new(FlakyAdapter::default());
+    let supervisor = ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    )
+    .with_qa_fault_probe(QaFaultProbeHandle::from_probe(probe.clone()));
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["barrier-terminal", "barrier-ready"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "barrier restart"))
+            .unwrap();
+    }
+    let now = unix_ms_now().unwrap();
+    let claimed = store.load_due_outbox(now, 2, Some("echo:default"), false).unwrap();
+    assert_eq!(claimed.iter().map(|entry| entry.outbox_id).collect::<Vec<_>>(), [1, 2]);
+    store
+        .move_outbox_to_dead_letter(
+            claimed[0].outbox_id,
+            claimed[0].claim_token.as_str(),
+            "qa terminal actor",
+            now,
+        )
+        .unwrap();
+    store
+        .schedule_outbox_retry(
+            claimed[1].outbox_id,
+            claimed[1].claim_token.as_str(),
+            claimed[1].attempts,
+            "qa reclaim ready actor",
+            now,
+        )
+        .unwrap();
+    store
+        .mark_delivery_intent_retry_queued_for_outbox(
+            claimed[1].connector_id.as_str(),
+            claimed[1].envelope_id.as_str(),
+            "qa reclaim ready actor",
+            now,
+        )
+        .unwrap();
+
+    let outcome = supervisor.drain_due_outbox(2).await.unwrap();
+
+    assert_eq!(outcome.delivered, 1);
+    assert_eq!(adapter.sends_for("barrier-terminal"), 0);
+    assert_eq!(adapter.sends_for("barrier-ready"), 1);
+    assert_eq!(*probe.releases.lock().unwrap(), ["outbox-2", "outbox-1"]);
+    assert_eq!(
+        *probe.recoveries.lock().unwrap(),
+        [("connector-recovered-barrier".to_owned(), QaFaultRecoveryClass::Resumed)]
+    );
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn concurrent_adopted_barrier_drains_record_one_recovery_without_claim_race() {
+    let probe = RecoveredBarrierProbe::fully_released();
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let adapter = Arc::new(GatedAdapter::default());
+    let supervisor = Arc::new(
+        ConnectorSupervisor::new(
+            store,
+            Arc::new(RouterStub),
+            vec![adapter.clone()],
+            ConnectorSupervisorConfig::default(),
+        )
+        .with_qa_fault_probe(QaFaultProbeHandle::from_probe(probe.clone())),
+    );
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["barrier-concurrent-a", "barrier-concurrent-b"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "barrier concurrency"))
+            .unwrap();
+    }
+
+    let first_started = adapter.started.notified();
+    let first_supervisor = supervisor.clone();
+    let first = tokio::spawn(async move { first_supervisor.drain_due_outbox(2).await });
+    first_started.await;
+    let second_supervisor = supervisor.clone();
+    let second = tokio::spawn(async move { second_supervisor.drain_due_outbox(2).await });
+    tokio::task::yield_now().await;
+    assert!(!second.is_finished(), "a concurrent drain must wait for active barrier adoption");
+    let second_delivery_started = adapter.started.notified();
+    adapter.release_delivery();
+    second_delivery_started.await;
+    adapter.release_delivery();
+
+    let first_outcome = first.await.unwrap().unwrap();
+    let second_outcome = second.await.unwrap().unwrap();
+    assert_eq!(first_outcome.delivered + second_outcome.delivered, 2);
+    assert_eq!(adapter.sends(), 2);
+    assert_eq!(probe.recoveries.lock().unwrap().len(), 1);
+    assert_eq!(supervisor.drain_due_outbox(2).await.unwrap().processed, 0);
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn connector_before_effect_barrier_releases_declared_actors_and_skips_batch_overflow() {
+    let controller = DeterministicQaFaultController::new(QaFaultInjectionPlan {
+        schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+        seed: 91,
+        activations: vec![QaFaultActivation {
+            id: "connector-batch-barrier".to_owned(),
+            point_id: "connector.outbox.batch_before_effect".to_owned(),
+            actor: None,
+            occurrence: 1,
+            action: QaFaultAction::Barrier { participants: 2 },
+        }],
+    })
+    .unwrap();
+    let probe = QaFaultProbeHandle::from_probe(controller);
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let adapter = Arc::new(FlakyAdapter::default());
+    let supervisor = ConnectorSupervisor::new(
+        store,
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    )
+    .with_qa_fault_probe(probe.clone());
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["barrier-a", "barrier-b", "barrier-c"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "barrier delivery"))
+            .unwrap();
+    }
+
+    let outcome = supervisor.drain_due_outbox(3).await.unwrap();
+
+    assert_eq!(outcome.delivered, 3);
+    for envelope_id in ["barrier-a", "barrier-b", "barrier-c"] {
+        assert_eq!(adapter.sends_for(envelope_id), 1);
+    }
+    let records = probe.records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].actors, ["outbox-1", "outbox-2"]);
+    assert_eq!(records[0].recovery_class, Some(QaFaultRecoveryClass::Resumed));
+}
+
+#[cfg(feature = "qa-fault-injection")]
+#[tokio::test]
+async fn incomplete_connector_barrier_releases_claims_without_false_recovery() {
+    let controller = DeterministicQaFaultController::new(QaFaultInjectionPlan {
+        schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
+        format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
+        seed: 17,
+        activations: vec![QaFaultActivation {
+            id: "connector-incomplete-barrier".to_owned(),
+            point_id: "connector.outbox.batch_before_effect".to_owned(),
+            actor: None,
+            occurrence: 1,
+            action: QaFaultAction::Barrier { participants: 3 },
+        }],
+    })
+    .unwrap();
+    let probe = QaFaultProbeHandle::from_probe(controller);
+    let tempdir = TempDir::new().unwrap();
+    let store = Arc::new(ConnectorStore::open(tempdir.path().join("connectors.sqlite3")).unwrap());
+    let adapter = Arc::new(FlakyAdapter::default());
+    let supervisor = ConnectorSupervisor::new(
+        store.clone(),
+        Arc::new(RouterStub),
+        vec![adapter.clone()],
+        ConnectorSupervisorConfig::default(),
+    )
+    .with_qa_fault_probe(probe.clone());
+    supervisor.register_connector(&sample_spec()).unwrap();
+    for envelope_id in ["barrier-incomplete-a", "barrier-incomplete-b"] {
+        supervisor
+            .enqueue_outbound(&sample_outbound_request(envelope_id, "barrier delivery"))
+            .unwrap();
+    }
+
+    let error = supervisor.drain_due_outbox(2).await.unwrap_err();
+
+    assert!(matches!(error, ConnectorSupervisorError::Validation(_)));
+    assert_eq!(adapter.sends_for("barrier-incomplete-a"), 0);
+    assert_eq!(adapter.sends_for("barrier-incomplete-b"), 0);
+    assert_eq!(probe.records().unwrap()[0].recovery_class, None);
+    let reclaimed =
+        store.load_due_outbox(unix_ms_now().unwrap(), 2, Some("echo:default"), false).unwrap();
+    assert_eq!(reclaimed.len(), 2, "incomplete barrier claims must be released immediately");
 }
 
 #[tokio::test]

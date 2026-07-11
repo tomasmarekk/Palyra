@@ -1,6 +1,11 @@
 //! Runtime observation collection for fixture-backed QA scenarios.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    io,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use palyra_common::{
@@ -16,6 +21,7 @@ use palyra_control_plane::{
     ApprovalDecisionRequest, ConsoleLoginRequest, ControlPlaneClient, ControlPlaneClientConfig,
     NdjsonStreamLimits,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::process::QaDaemonSandbox;
@@ -28,6 +34,8 @@ const MAX_TAPE_EVENTS: usize = 1_024;
 const MAX_TRANSCRIPT_ROWS: usize = 128;
 const MAX_FINAL_ANSWER_CHARS: usize = 64 * 1024;
 const MAX_WORKSPACE_ARTIFACTS: usize = 256;
+const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 const TAPE_PAGE_SIZE: usize = 256;
 
 pub(super) struct QaScenarioObservations {
@@ -36,6 +44,125 @@ pub(super) struct QaScenarioObservations {
     pub(super) terminal_state: String,
     pub(super) terminal_observed: bool,
     pub(super) evidence: QaEvidenceBuildInput,
+}
+
+struct QaObservationBudget {
+    consumed_bytes: usize,
+    max_bytes: usize,
+}
+
+impl QaObservationBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self { consumed_bytes: 0, max_bytes }
+    }
+
+    fn consume_serialized<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+        let mut counter = SerializedByteCounter::default();
+        serde_json::to_writer(&mut counter, value)
+            .context("qa.runner.observation_size_encode_failed")?;
+        self.consume(counter.bytes)
+    }
+
+    fn consume(&mut self, bytes: usize) -> Result<()> {
+        let next = self
+            .consumed_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("qa.runner.evidence_byte_limit_exceeded"))?;
+        if next > self.max_bytes {
+            anyhow::bail!("qa.runner.evidence_byte_limit_exceeded");
+        }
+        self.consumed_bytes = next;
+        Ok(())
+    }
+}
+
+impl Default for QaObservationBudget {
+    fn default() -> Self {
+        Self::new(MAX_OBSERVATION_BYTES)
+    }
+}
+
+#[derive(Default)]
+struct SerializedByteCounter {
+    bytes: usize,
+}
+
+impl io::Write for SerializedByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One absolute run deadline with a narrower cap for each external step.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QaRunDeadline {
+    expires_at: Instant,
+    step_timeout: Duration,
+}
+
+impl QaRunDeadline {
+    pub(super) fn new(manifest: &QaScenarioManifest) -> Result<Self> {
+        Self::from_timeouts(
+            Duration::from_millis(manifest.timeout.run_ms),
+            Duration::from_millis(manifest.timeout.step_ms.unwrap_or(manifest.timeout.run_ms)),
+        )
+    }
+
+    fn from_timeouts(run_timeout: Duration, step_timeout: Duration) -> Result<Self> {
+        let expires_at = Instant::now()
+            .checked_add(run_timeout)
+            .ok_or_else(|| anyhow::anyhow!("qa.runner.run_deadline_overflow"))?;
+        Ok(Self { expires_at, step_timeout })
+    }
+
+    pub(super) fn step_budget(self) -> Result<Duration> {
+        let remaining = self.remaining_budget()?;
+        Ok(remaining.min(self.step_timeout))
+    }
+
+    pub(super) fn remaining_budget(self) -> Result<Duration> {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("qa.runner.run_timeout"))
+    }
+
+    pub(super) fn normalize_sync_result<T>(self, result: Result<T>) -> Result<T> {
+        match result {
+            Err(_) if self.remaining_budget().is_err() => {
+                Err(anyhow::anyhow!("qa.runner.run_timeout"))
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn run_step<T, F>(self, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let now = Instant::now();
+        let remaining = self
+            .expires_at
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("qa.runner.run_timeout"))?;
+        let limited_by_run = remaining <= self.step_timeout;
+        let budget = remaining.min(self.step_timeout);
+        let deadline = tokio::time::Instant::from_std(
+            now.checked_add(budget)
+                .ok_or_else(|| anyhow::anyhow!("qa.runner.step_deadline_overflow"))?,
+        );
+        match tokio::time::timeout_at(deadline, future).await {
+            Ok(result) => result,
+            Err(_) if limited_by_run => Err(anyhow::anyhow!("qa.runner.run_timeout")),
+            Err(_) => Err(anyhow::anyhow!("qa.runner.step_timeout")),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -55,10 +182,12 @@ struct StreamObservations {
 pub(super) async fn collect_scenario_observations(
     manifest: &QaScenarioManifest,
     sandbox: &mut QaDaemonSandbox,
+    deadline: QaRunDeadline,
 ) -> Result<QaScenarioObservations> {
+    let mut observation_budget = QaObservationBudget::default();
     let prompt = scenario_user_prompt(manifest)?;
-    let mut client = authenticated_client(manifest, sandbox).await?;
-    let session_id = create_session(&client, manifest).await?;
+    let mut client = authenticated_client(sandbox, deadline).await?;
+    let session_id = deadline.run_step(create_session(&client, manifest)).await?;
     sandbox.record_session_id(session_id.as_str());
     let stream_path = format!("console/v1/chat/sessions/{session_id}/messages/stream");
     let message = json!({
@@ -76,35 +205,45 @@ pub(super) async fn collect_scenario_observations(
         "attachments": [],
     });
     let limits = NdjsonStreamLimits::new(MAX_STREAM_BUFFER_BYTES, MAX_ERROR_BODY_BYTES);
-    let mut stream = client
-        .post_ndjson_stream(stream_path, &message, limits)
-        .await
-        .context("qa.runner.stream_open_failed")?;
+    let mut stream = deadline
+        .run_step(async {
+            client
+                .post_ndjson_stream(stream_path, &message, limits)
+                .await
+                .context("qa.runner.stream_open_failed")
+        })
+        .await?;
     let mut observed = StreamObservations::default();
     let approval_steps = manifest
         .steps
         .iter()
         .filter(|step| step.action == QaScenarioStepAction::ApprovalDecision)
         .collect::<Vec<_>>();
-    let run_timeout = Duration::from_millis(manifest.timeout.run_ms);
-    tokio::time::timeout(run_timeout, async {
-        while let Some(line) =
-            stream.next_value().await.context("qa.runner.stream_decode_failed")?
-        {
-            observed.event_count = observed.event_count.saturating_add(1);
-            if observed.event_count > MAX_STREAM_EVENTS {
-                anyhow::bail!("qa.runner.stream_event_limit_exceeded");
-            }
-            process_stream_line(&mut client, &line, approval_steps.as_slice(), &mut observed)
+    deadline
+        .run_step(async {
+            while let Some(line) =
+                stream.next_value().await.context("qa.runner.stream_decode_failed")?
+            {
+                observed.event_count = observed.event_count.saturating_add(1);
+                if observed.event_count > MAX_STREAM_EVENTS {
+                    anyhow::bail!("qa.runner.stream_event_limit_exceeded");
+                }
+                process_stream_line(
+                    &mut client,
+                    &line,
+                    approval_steps.as_slice(),
+                    &mut observed,
+                    &mut observation_budget,
+                    deadline,
+                )
                 .await?;
-            if let Some(run_id) = observed.run_id.as_deref() {
-                sandbox.record_run_id(run_id);
+                if let Some(run_id) = observed.run_id.as_deref() {
+                    sandbox.record_run_id(run_id);
+                }
             }
-        }
-        Result::<()>::Ok(())
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("qa.runner.run_timeout"))??;
+            Result::<()>::Ok(())
+        })
+        .await?;
 
     let run_id = observed.run_id.clone().context("qa.runner.missing_run_id")?;
     if observed.session_id.as_deref() != Some(session_id.as_str()) {
@@ -114,21 +253,29 @@ pub(super) async fn collect_scenario_observations(
         anyhow::bail!("qa.runner.approval_step_not_observed");
     }
 
-    let status = load_run_status(&client, run_id.as_str()).await?;
+    let status = deadline.run_step(load_run_status(&client, run_id.as_str())).await?;
     let terminal_state = canonical_terminal_state(&status, observed.complete_status.as_deref());
     let terminal_observed = is_terminal_state(terminal_state.as_str());
-    let tape_events = load_run_tape(&client, run_id.as_str()).await?;
-    let mut transcript = transcript_from_tape(tape_events.as_slice());
-    if !observed.final_answer.is_empty() && transcript.len() < MAX_TRANSCRIPT_ROWS {
-        transcript.push(QaTranscriptMessage {
-            role: "assistant".to_owned(),
-            content: observed.final_answer.clone(),
-        });
+    let tape_events =
+        deadline.run_step(load_run_tape(&client, run_id.as_str(), &mut observation_budget)).await?;
+    let mut transcript = transcript_from_tape(tape_events.as_slice(), &mut observation_budget)?;
+    if !observed.final_answer.is_empty() {
+        observation_budget.consume_serialized(&observed.final_answer)?;
+        if transcript.len() < MAX_TRANSCRIPT_ROWS {
+            let final_message = QaTranscriptMessage {
+                role: "assistant".to_owned(),
+                content: observed.final_answer.clone(),
+            };
+            observation_budget.consume_serialized(&final_message)?;
+            transcript.push(final_message);
+        }
     }
     // The session view is queried even though the tape is the safer text
     // source; this verifies that the normal transcript projection is healthy.
-    verify_session_transcript(&client, session_id.as_str()).await?;
-    let artifacts = load_workspace_artifacts(&client, run_id.as_str()).await?;
+    deadline.run_step(verify_session_transcript(&client, session_id.as_str())).await?;
+    let artifacts = deadline
+        .run_step(load_workspace_artifacts(&client, run_id.as_str(), &mut observation_budget))
+        .await?;
     let evidence = QaEvidenceBuildInput {
         run_id: Some(run_id.clone()),
         session_id: Some(session_id.clone()),
@@ -139,28 +286,68 @@ pub(super) async fn collect_scenario_observations(
         public_events: observed.public_events,
         tool_calls: observed.tool_calls,
         artifacts,
+        ..QaEvidenceBuildInput::default()
+    };
+    Ok(QaScenarioObservations { run_id, session_id, terminal_state, terminal_observed, evidence })
+}
+
+/// Reloads durable run evidence after an expected daemon restart.
+pub(super) async fn collect_recovered_scenario_observations(
+    sandbox: &QaDaemonSandbox,
+    deadline: QaRunDeadline,
+) -> Result<QaScenarioObservations> {
+    let mut observation_budget = QaObservationBudget::default();
+    let run_id = sandbox.active_run_id().context("qa.runner.recovery_run_id_missing")?.to_owned();
+    let session_id =
+        sandbox.active_session_id().context("qa.runner.recovery_session_id_missing")?.to_owned();
+    let client = authenticated_client(sandbox, deadline).await?;
+    let status = deadline.run_step(load_run_status(&client, run_id.as_str())).await?;
+    let terminal_state = canonical_terminal_state(&status, None);
+    let terminal_observed = is_terminal_state(terminal_state.as_str());
+    if !terminal_observed {
+        anyhow::bail!("qa.runner.recovery_run_not_terminal");
+    }
+    let tape_events =
+        deadline.run_step(load_run_tape(&client, run_id.as_str(), &mut observation_budget)).await?;
+    let transcript = transcript_from_tape(tape_events.as_slice(), &mut observation_budget)?;
+    deadline.run_step(verify_session_transcript(&client, session_id.as_str())).await?;
+    let artifacts = deadline
+        .run_step(load_workspace_artifacts(&client, run_id.as_str(), &mut observation_budget))
+        .await?;
+    let evidence = QaEvidenceBuildInput {
+        run_id: Some(run_id.clone()),
+        session_id: Some(session_id.clone()),
+        terminal_state: Some(terminal_state.clone()),
+        transcript,
+        tape_events,
+        artifacts,
+        ..QaEvidenceBuildInput::default()
     };
     Ok(QaScenarioObservations { run_id, session_id, terminal_state, terminal_observed, evidence })
 }
 
 async fn authenticated_client(
-    manifest: &QaScenarioManifest,
     sandbox: &QaDaemonSandbox,
+    deadline: QaRunDeadline,
 ) -> Result<ControlPlaneClient> {
-    let timeout = Duration::from_millis(manifest.timeout.run_ms.saturating_add(5_000));
     let mut config = ControlPlaneClientConfig::new(sandbox.admin_url());
-    config.request_timeout = timeout;
+    config.request_timeout = deadline.step_budget()?;
     config.safe_read_retries = 0;
+    config.max_json_response_bytes = MAX_JSON_RESPONSE_BYTES;
     let mut client = ControlPlaneClient::new(config).context("qa.runner.client_init_failed")?;
-    client
-        .login(&ConsoleLoginRequest {
-            admin_token: Some(sandbox.admin_token().to_owned()),
-            principal: sandbox.principal().to_owned(),
-            device_id: sandbox.device_id().to_owned(),
-            channel: Some("qa".to_owned()),
+    deadline
+        .run_step(async {
+            client
+                .login(&ConsoleLoginRequest {
+                    admin_token: Some(sandbox.admin_token().to_owned()),
+                    principal: sandbox.principal().to_owned(),
+                    device_id: sandbox.device_id().to_owned(),
+                    channel: Some("qa".to_owned()),
+                })
+                .await
+                .context("qa.runner.console_login_failed")
         })
-        .await
-        .context("qa.runner.console_login_failed")?;
+        .await?;
     Ok(client)
 }
 
@@ -187,9 +374,12 @@ async fn process_stream_line(
     line: &Value,
     approval_steps: &[&QaScenarioStep],
     observed: &mut StreamObservations,
+    observation_budget: &mut QaObservationBudget,
+    deadline: QaRunDeadline,
 ) -> Result<()> {
     match line.get("type").and_then(Value::as_str) {
         Some("meta") => {
+            observation_budget.consume_serialized(line)?;
             set_consistent_identity(
                 &mut observed.run_id,
                 required_string(line, "/run_id", "qa.runner.stream_run_id_missing")?,
@@ -201,8 +391,19 @@ async fn process_stream_line(
                 "qa.runner.stream_session_id_changed",
             )?;
         }
-        Some("event") => process_runtime_event(client, line, approval_steps, observed).await?,
+        Some("event") => {
+            process_runtime_event(
+                client,
+                line,
+                approval_steps,
+                observed,
+                observation_budget,
+                deadline,
+            )
+            .await?
+        }
         Some("complete") => {
+            observation_budget.consume_serialized(line)?;
             observed.complete_status =
                 Some(line.get("status").and_then(Value::as_str).unwrap_or("unknown").to_owned());
         }
@@ -217,12 +418,15 @@ async fn process_runtime_event(
     line: &Value,
     approval_steps: &[&QaScenarioStep],
     observed: &mut StreamObservations,
+    observation_budget: &mut QaObservationBudget,
+    deadline: QaRunDeadline,
 ) -> Result<()> {
     let event = line.get("event").context("qa.runner.stream_event_missing")?;
     if let Some(public_event) = event.get("public_event") {
         if observed.public_events.len() >= MAX_PUBLIC_EVENTS {
             anyhow::bail!("qa.runner.public_event_limit_exceeded");
         }
+        observation_budget.consume_serialized(public_event)?;
         observed.public_events.push(QaPublicEventEvidence {
             event_type: required_string(
                 public_event,
@@ -239,6 +443,8 @@ async fn process_runtime_event(
             }
         }
         Some("tool_proposal") => {
+            let proposal = event.get("tool_proposal").context("qa.runner.tool_proposal_missing")?;
+            observation_budget.consume_serialized(proposal)?;
             let proposal_id = required_string(
                 event,
                 "/tool_proposal/proposal_id",
@@ -249,31 +455,31 @@ async fn process_runtime_event(
             observed.tool_names_by_proposal.insert(proposal_id, tool_name);
         }
         Some("tool_result") => {
+            let result = event.get("tool_result").context("qa.runner.tool_result_missing")?;
+            observation_budget.consume_serialized(result)?;
             let proposal_id = required_string(
-                event,
-                "/tool_result/proposal_id",
+                result,
+                "/proposal_id",
                 "qa.runner.tool_result_proposal_id_missing",
             )?;
+            let success =
+                required_bool(result, "/success", "qa.runner.tool_result_success_missing")?;
             let name = observed
                 .tool_names_by_proposal
                 .get(proposal_id.as_str())
                 .cloned()
-                .unwrap_or_else(|| "<unknown>".to_owned());
-            observed.tool_calls.push(QaToolCallEvidence {
-                name,
-                proposal_id: Some(proposal_id),
-                success: event
-                    .pointer("/tool_result/success")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            });
+                .context("qa.runner.tool_result_proposal_unknown")?;
+            let tool_call =
+                QaToolCallEvidence { name, proposal_id: Some(proposal_id), success: Some(success) };
+            observation_budget.consume_serialized(&tool_call)?;
+            observed.tool_calls.push(tool_call);
         }
         Some("tool_approval_request") => {
             let step = approval_steps
                 .get(observed.approval_cursor)
                 .copied()
                 .context("qa.runner.unexpected_approval_request")?;
-            decide_approval(client, event, step).await?;
+            deadline.run_step(decide_approval(client, event, step)).await?;
             observed.approval_cursor = observed.approval_cursor.saturating_add(1);
         }
         _ => {}
@@ -332,7 +538,11 @@ async fn load_run_status(client: &ControlPlaneClient, run_id: &str) -> Result<Va
         .context("qa.runner.run_status_failed")
 }
 
-async fn load_run_tape(client: &ControlPlaneClient, run_id: &str) -> Result<Vec<QaRunTapeEvent>> {
+async fn load_run_tape(
+    client: &ControlPlaneClient,
+    run_id: &str,
+    observation_budget: &mut QaObservationBudget,
+) -> Result<Vec<QaRunTapeEvent>> {
     let mut events = Vec::new();
     let mut after_seq = None;
     loop {
@@ -349,6 +559,7 @@ async fn load_run_tape(client: &ControlPlaneClient, run_id: &str) -> Result<Vec<
             if events.len() >= MAX_TAPE_EVENTS {
                 anyhow::bail!("qa.runner.tape_event_limit_exceeded");
             }
+            observation_budget.consume_serialized(event)?;
             events.push(QaRunTapeEvent {
                 seq: event
                     .get("seq")
@@ -374,18 +585,26 @@ async fn load_run_tape(client: &ControlPlaneClient, run_id: &str) -> Result<Vec<
     Ok(events)
 }
 
-fn transcript_from_tape(tape: &[QaRunTapeEvent]) -> Vec<QaTranscriptMessage> {
-    tape.iter()
-        .filter_map(|event| match event.event_type.as_str() {
-            "message.received" => {
-                event.payload.get("text").and_then(Value::as_str).map(|content| {
-                    QaTranscriptMessage { role: "user".to_owned(), content: content.to_owned() }
-                })
-            }
-            _ => None,
-        })
-        .take(MAX_TRANSCRIPT_ROWS.saturating_sub(1))
-        .collect()
+fn transcript_from_tape(
+    tape: &[QaRunTapeEvent],
+    observation_budget: &mut QaObservationBudget,
+) -> Result<Vec<QaTranscriptMessage>> {
+    let mut transcript = Vec::new();
+    for event in tape {
+        if transcript.len() >= MAX_TRANSCRIPT_ROWS.saturating_sub(1) {
+            break;
+        }
+        if event.event_type != "message.received" {
+            continue;
+        }
+        let Some(content) = event.payload.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let message = QaTranscriptMessage { role: "user".to_owned(), content: content.to_owned() };
+        observation_budget.consume_serialized(&message)?;
+        transcript.push(message);
+    }
+    Ok(transcript)
 }
 
 async fn verify_session_transcript(client: &ControlPlaneClient, session_id: &str) -> Result<()> {
@@ -403,6 +622,7 @@ async fn verify_session_transcript(client: &ControlPlaneClient, session_id: &str
 async fn load_workspace_artifacts(
     client: &ControlPlaneClient,
     run_id: &str,
+    observation_budget: &mut QaObservationBudget,
 ) -> Result<Vec<QaArtifactEvidence>> {
     let response = client
         .get_json_value(format!(
@@ -410,10 +630,13 @@ async fn load_workspace_artifacts(
         ))
         .await
         .context("qa.runner.workspace_observation_failed")?;
-    parse_workspace_artifacts_response(&response)
+    parse_workspace_artifacts_response(&response, observation_budget)
 }
 
-fn parse_workspace_artifacts_response(response: &Value) -> Result<Vec<QaArtifactEvidence>> {
+fn parse_workspace_artifacts_response(
+    response: &Value,
+    observation_budget: &mut QaObservationBudget,
+) -> Result<Vec<QaArtifactEvidence>> {
     let artifacts_complete = response
         .pointer("/workspace/artifacts_complete")
         .and_then(Value::as_bool)
@@ -433,22 +656,20 @@ fn parse_workspace_artifacts_response(response: &Value) -> Result<Vec<QaArtifact
     if artifact_count != artifacts.len() || artifact_count > MAX_WORKSPACE_ARTIFACTS {
         anyhow::bail!("qa.runner.workspace_artifacts_incomplete");
     }
-    artifacts
-        .iter()
-        .map(|artifact| {
-            Ok(QaArtifactEvidence {
-                path: required_string(artifact, "/path", "qa.runner.artifact_path_missing")?,
-                kind: artifact
-                    .get("change_kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("workspace")
-                    .to_owned(),
-                present: !artifact.get("deleted").and_then(Value::as_bool).unwrap_or(false),
-                sha256: artifact.get("content_sha256").and_then(Value::as_str).map(str::to_owned),
-                size_bytes: artifact.get("size_bytes").and_then(Value::as_u64),
-            })
-        })
-        .collect()
+    let mut projected = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        observation_budget.consume_serialized(artifact)?;
+        projected.push(QaArtifactEvidence {
+            path: required_string(artifact, "/path", "qa.runner.artifact_path_missing")?,
+            // `change_kind` describes the mutation operation; the artifact
+            // category remains workspace so manifest path+kind checks are exact.
+            kind: "workspace".to_owned(),
+            present: !artifact.get("deleted").and_then(Value::as_bool).unwrap_or(false),
+            sha256: artifact.get("content_sha256").and_then(Value::as_str).map(str::to_owned),
+            size_bytes: artifact.get("size_bytes").and_then(Value::as_u64),
+        });
+    }
+    Ok(projected)
 }
 
 fn scenario_user_prompt(manifest: &QaScenarioManifest) -> Result<&str> {
@@ -490,6 +711,10 @@ fn required_string(value: &Value, pointer: &str, code: &'static str) -> Result<S
         .ok_or_else(|| anyhow::anyhow!(code))
 }
 
+fn required_bool(value: &Value, pointer: &str, code: &'static str) -> Result<bool> {
+    value.pointer(pointer).and_then(Value::as_bool).ok_or_else(|| anyhow::anyhow!(code))
+}
+
 fn set_consistent_identity(
     slot: &mut Option<String>,
     value: String,
@@ -521,6 +746,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_deadline_caps_each_step_to_the_manifest_budget() {
+        let deadline =
+            QaRunDeadline::from_timeouts(Duration::from_secs(1), Duration::from_millis(50))
+                .expect("deadline should be constructible");
+
+        let budget = deadline.step_budget().expect("run should retain time");
+
+        assert!(budget > Duration::ZERO);
+        assert!(budget <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn exhausted_run_deadline_fails_before_starting_another_step() {
+        let deadline = QaRunDeadline::from_timeouts(Duration::ZERO, Duration::from_secs(1))
+            .expect("zero-duration deadline should still have a stable representation");
+
+        let error = deadline
+            .step_budget()
+            .expect_err("an exhausted run must reject another external operation");
+
+        assert_eq!(error.to_string(), "qa.runner.run_timeout");
+    }
+
+    #[tokio::test]
+    async fn step_deadline_cancels_a_pending_external_operation() {
+        let deadline =
+            QaRunDeadline::from_timeouts(Duration::from_secs(1), Duration::from_millis(10))
+                .expect("deadline should be constructible");
+        let started = Instant::now();
+
+        let error = deadline
+            .run_step(std::future::pending::<Result<()>>())
+            .await
+            .expect_err("a pending operation must consume only its step budget");
+
+        assert_eq!(error.to_string(), "qa.runner.step_timeout");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn observation_budget_rejects_before_the_count_limit_without_committing_bytes() {
+        let row = json!({"event": "x".repeat(64)});
+        let mut counter = SerializedByteCounter::default();
+        serde_json::to_writer(&mut counter, &row).expect("row should serialize compactly");
+        let mut budget = QaObservationBudget::new(counter.bytes.saturating_mul(2) - 1);
+
+        budget.consume_serialized(&row).expect("first retained row should fit");
+        let consumed_before_rejection = budget.consumed_bytes;
+        let error = budget
+            .consume_serialized(&row)
+            .expect_err("aggregate bytes must fail before a count cap is reached");
+
+        assert_eq!(error.to_string(), "qa.runner.evidence_byte_limit_exceeded");
+        assert_eq!(budget.consumed_bytes, consumed_before_rejection);
+    }
+
+    #[test]
     fn terminal_state_prefers_durable_run_snapshot() {
         let status = json!({"run": {"state": "completed"}});
 
@@ -542,8 +824,10 @@ mod tests {
             },
         ];
 
+        let mut budget = QaObservationBudget::default();
         assert_eq!(
-            transcript_from_tape(tape.as_slice()),
+            transcript_from_tape(tape.as_slice(), &mut budget)
+                .expect("bounded transcript should project"),
             vec![QaTranscriptMessage { role: "user".to_owned(), content: "hello".to_owned() }]
         );
     }
@@ -560,6 +844,74 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_success_must_be_an_explicit_boolean() {
+        for result in [json!({}), json!({"success": "false"}), json!({"success": null})] {
+            let error = required_bool(&result, "/success", "qa.runner.tool_result_success_missing")
+                .expect_err("missing and non-boolean outcomes must remain unknown");
+            assert_eq!(error.to_string(), "qa.runner.tool_result_success_missing");
+        }
+        assert!(!required_bool(
+            &json!({"success": false}),
+            "/success",
+            "qa.runner.tool_result_success_missing",
+        )
+        .expect("an explicit false result should be retained"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_payload_is_budgeted_before_projection_validation() {
+        let mut client =
+            ControlPlaneClient::new(ControlPlaneClientConfig::new("http://127.0.0.1:1"))
+                .expect("local control-plane client should construct without connecting");
+        let mut observed = StreamObservations::default();
+        observed.tool_names_by_proposal.insert("proposal-1".to_owned(), "tool.test".to_owned());
+        let mut budget = QaObservationBudget::new(1_024);
+        let deadline = QaRunDeadline::from_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+            .expect("deadline should be constructible");
+        let line = json!({
+            "event": {
+                "event_type": "tool_result",
+                "tool_result": {"proposal_id": "proposal-1"},
+            }
+        });
+
+        let error =
+            process_runtime_event(&mut client, &line, &[], &mut observed, &mut budget, deadline)
+                .await
+                .expect_err("missing success must fail after the payload is accounted");
+
+        assert_eq!(error.to_string(), "qa.runner.tool_result_success_missing");
+        assert!(budget.consumed_bytes > 0);
+        assert!(observed.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_result_requires_a_known_proposal_mapping() {
+        let mut client =
+            ControlPlaneClient::new(ControlPlaneClientConfig::new("http://127.0.0.1:1"))
+                .expect("local control-plane client should construct without connecting");
+        let mut observed = StreamObservations::default();
+        let mut budget = QaObservationBudget::new(1_024);
+        let deadline = QaRunDeadline::from_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+            .expect("deadline should be constructible");
+        let line = json!({
+            "event": {
+                "event_type": "tool_result",
+                "tool_result": {"proposal_id": "proposal-unknown", "success": false},
+            }
+        });
+
+        let error =
+            process_runtime_event(&mut client, &line, &[], &mut observed, &mut budget, deadline)
+                .await
+                .expect_err("an uncorrelated tool result must not acquire a synthetic tool name");
+
+        assert_eq!(error.to_string(), "qa.runner.tool_result_proposal_unknown");
+        assert!(budget.consumed_bytes > 0);
+        assert!(observed.tool_calls.is_empty());
+    }
+
+    #[test]
     fn workspace_artifact_projection_fails_closed_when_server_truncates() {
         let response = json!({
             "workspace": {
@@ -571,7 +923,8 @@ mod tests {
             }
         });
 
-        let error = parse_workspace_artifacts_response(&response)
+        let mut budget = QaObservationBudget::default();
+        let error = parse_workspace_artifacts_response(&response, &mut budget)
             .expect_err("a partial artifact set must never satisfy QA evidence");
 
         assert_eq!(error.to_string(), "qa.runner.workspace_artifacts_truncated");
@@ -593,7 +946,8 @@ mod tests {
             }
         });
 
-        let artifacts = parse_workspace_artifacts_response(&response)
+        let mut budget = QaObservationBudget::default();
+        let artifacts = parse_workspace_artifacts_response(&response, &mut budget)
             .expect("a complete bounded artifact set should parse");
 
         assert_eq!(artifacts.len(), 1);

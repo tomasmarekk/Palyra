@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 cedar-policy = "4.11.0"
 serde_json.workspace = true
+stacker = "0.1.24"
 thiserror.workspace = true
 
 [dev-dependencies]

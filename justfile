@@ -47,6 +47,15 @@ desktop-ui-ready:
 deterministic-core:
     bash scripts/test/run-deterministic-core.sh
 
+[unix]
+deterministic-fault-smoke:
+    bash scripts/test/run-deterministic-fault-smoke.sh
+
+[windows]
+deterministic-fault-smoke:
+    #!pwsh
+    & ./scripts/test/run-deterministic-fault-smoke.ps1
+
 retrieval-benchmark:
     bash scripts/test/run-retrieval-benchmark.sh
 

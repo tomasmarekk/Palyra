@@ -142,6 +142,43 @@ jobs:
       - name: Run deterministic core suite
         run: bash scripts/test/run-deterministic-core.sh
 
+  deterministic-fault-smoke:
+    name: Deterministic fault smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.95.0
+
+      - name: Run deterministic fault smoke (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        run: bash scripts/test/run-deterministic-fault-smoke.sh
+
+      - name: Run deterministic fault smoke (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: ./scripts/test/run-deterministic-fault-smoke.ps1
+
+      - name: Upload deterministic fault reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: deterministic-fault-smoke-${{ runner.os }}
+          path: artifacts/qa-lab/deterministic-fault-smoke/**
+          if-no-files-found: error
+
   runtime-contract-snapshots:
     name: Runtime contract snapshot gates
     runs-on: ubuntu-latest

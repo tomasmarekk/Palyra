@@ -1656,7 +1656,7 @@ fn schema_preview_evidence(manifest: &QaScenarioManifest) -> QaEvidenceBuildInpu
             (0..count).map(|_| QaToolCallEvidence {
                 name: tool.name.clone(),
                 proposal_id: None,
-                success: tool.success.unwrap_or(true),
+                success: tool.success,
             })
         })
         .collect::<Vec<_>>();
@@ -1703,6 +1703,7 @@ fn schema_preview_evidence(manifest: &QaScenarioManifest) -> QaEvidenceBuildInpu
         public_events,
         tool_calls,
         artifacts,
+        ..QaEvidenceBuildInput::default()
     }
 }
 
@@ -2200,6 +2201,7 @@ mod tests {
                 session_id: Some("session-opaque".to_owned()),
                 terminal_state: Some("completed".to_owned()),
                 evidence_artifacts: vec![execution_artifact("evidence")],
+                evidence_output_bindings: Vec::new(),
                 cleanup: QaScenarioCleanupResult {
                     run_terminal_observed: true,
                     session_cleaned: true,

@@ -51,6 +51,7 @@ fuzz/artifacts/
 fuzz/corpus/
 fuzz/coverage/
 security-artifacts/
+/artifacts/qa-lab/
 .palyra/
 .palyra-test-harness/
 data/

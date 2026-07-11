@@ -29,7 +29,9 @@ pub use storage::{
     ChannelIngressEnqueueOutcome, ChannelIngressRecord, ChannelIngressStatus, ConnectorEventRecord,
     ConnectorInstanceRecord, ConnectorQueueSnapshot, ConnectorStore, ConnectorStoreError,
     DeadLetterRecord, DeliveryIntentDraft, DeliveryIntentRecord, DeliveryIntentRetryOutcome,
-    DeliveryIntentStatus, IngressBlockedLaneSnapshot, OutboxEnqueueOutcome, OutboxEntryRecord,
+    DeliveryIntentStatus, IngressBlockedLaneSnapshot, OutboxEffectState, OutboxEnqueueOutcome,
+    OutboxEntryRecord, OutboxReconciliationEvidence, OutboxReconciliationOutcome,
+    OutboxUnknownRecord,
 };
 pub use supervisor::{
     ConnectorAdapter, ConnectorAdapterError, ConnectorAdapterSdkDescriptor,

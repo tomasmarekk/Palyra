@@ -14,20 +14,37 @@
     "security",
     "replay"
   ],
+  "artifact_fields": [
+    "path",
+    "kind",
+    "required",
+    "sha256"
+  ],
   "artifact_kinds": [
     "report",
     "transcript",
     "replay_bundle",
     "trajectory",
-    "evidence"
+    "evidence",
+    "workspace"
   ],
   "encoding": "yaml",
   "examples_root": "qa/scenarios",
+  "expected_fault_activation_fields": [
+    "activation_id",
+    "recovery_class"
+  ],
+  "expected_fault_injection_fields": [
+    "activations",
+    "daemon_restarts"
+  ],
   "expected_tool_call_fields": [
     "name",
     "min_count",
+    "max_count",
     "success"
   ],
+  "fault_injection_plan_schema_version": 1,
   "forbidden_fields": [
     "tool_calls",
     "events",
@@ -41,6 +58,9 @@
   "live_provider_kinds": [
     "openai_compatible",
     "anthropic"
+  ],
+  "optional_sections": [
+    "fault_injection"
   ],
   "path_convention": "jsonpath",
   "provider_modes": [
@@ -79,7 +99,7 @@
     "record_replay",
     "live"
   ],
-  "schema_version": 3,
+  "schema_version": 4,
   "step_actions": [
     "user_prompt",
     "tool_result",
@@ -89,7 +109,8 @@
   "supported_schema_versions": [
     1,
     2,
-    3
+    3,
+    4
   ],
   "terminal_states": [
     "completed",

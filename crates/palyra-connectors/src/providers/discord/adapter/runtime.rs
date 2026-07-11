@@ -771,6 +771,7 @@ impl DiscordConnectorAdapter {
             let reason = match outcome {
                 DeliveryOutcome::Delivered { .. } => None,
                 DeliveryOutcome::Retry { reason, .. }
+                | DeliveryOutcome::OutcomeUnknown { reason }
                 | DeliveryOutcome::PermanentFailure { reason } => Some(reason),
             };
             self.record_last_error(

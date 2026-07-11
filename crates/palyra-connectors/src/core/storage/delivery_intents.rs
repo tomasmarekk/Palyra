@@ -4,7 +4,7 @@
 //! outbox envelope ids but expose only hashes, previews, status, attempts, and
 //! receipt identifiers; raw outbound payloads stay in the outbox.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::records::parse_delivery_intent_row;
 use super::{
@@ -22,6 +22,47 @@ const DELIVERY_INTENT_SELECT: &str = r#"
 "#;
 
 impl ConnectorStore {
+    /// Records adapter-send intent for the currently claimed outbox row.
+    ///
+    /// Direct outbox entries have no delivery intent; they still pass claim
+    /// validation and return `Ok(0)`.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::OutboxNotFound`] when claim ownership was
+    /// lost, or a storage error when the transaction fails.
+    pub fn mark_outbox_delivery_intent_started(
+        &self,
+        outbox_id: i64,
+        claim_token: &str,
+        now_unix_ms: i64,
+    ) -> Result<usize, ConnectorStoreError> {
+        self.with_transaction(|transaction| {
+            let identity = transaction
+                .query_row(
+                    r#"
+                    SELECT connector_id, envelope_id
+                    FROM outbox
+                    WHERE outbox_id = ?1
+                      AND status = 'pending'
+                      AND effect_state = 'ready'
+                      AND claim_token = ?2
+                    "#,
+                    params![outbox_id, claim_token],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((connector_id, envelope_id)) = identity else {
+                return Err(ConnectorStoreError::OutboxNotFound(outbox_id));
+            };
+            mark_delivery_intents_send_started_in_transaction(
+                transaction,
+                connector_id.as_str(),
+                envelope_id.as_str(),
+                now_unix_ms,
+            )
+        })
+    }
+
     /// Inserts a delivery intent or returns the existing matching row.
     ///
     /// # Errors
@@ -83,20 +124,12 @@ impl ConnectorStore {
         now_unix_ms: i64,
     ) -> Result<usize, ConnectorStoreError> {
         self.with_transaction(|transaction| {
-            let changed = transaction.execute(
-                r#"
-                UPDATE delivery_intents
-                SET status = 'adapter_send_started',
-                    send_attempts = send_attempts + 1,
-                    last_reason_code = NULL,
-                    updated_at_unix_ms = ?3
-                WHERE connector_id = ?1
-                  AND outbox_envelope_id = ?2
-                  AND status IN ('queued', 'platform_outcome_unknown')
-                "#,
-                params![connector_id, outbox_envelope_id, now_unix_ms],
-            )?;
-            Ok(changed)
+            mark_delivery_intents_send_started_in_transaction(
+                transaction,
+                connector_id,
+                outbox_envelope_id,
+                now_unix_ms,
+            )
         })
     }
 
@@ -113,51 +146,79 @@ impl ConnectorStore {
         now_unix_ms: i64,
     ) -> Result<usize, ConnectorStoreError> {
         self.with_transaction(|transaction| {
-            let intents =
-                query_delivery_intents_by_outbox(transaction, connector_id, outbox_envelope_id)?;
-            let changed = transaction.execute(
-                r#"
-                UPDATE delivery_intents
-                SET status = 'delivered',
-                    native_message_id = ?3,
-                    last_reason_code = NULL,
-                    updated_at_unix_ms = ?4
-                WHERE connector_id = ?1
-                  AND outbox_envelope_id = ?2
-                  AND status <> 'suppressed'
-                "#,
-                params![connector_id, outbox_envelope_id, native_message_id, now_unix_ms],
-            )?;
-            for intent in intents {
-                transaction.execute(
-                    r#"
-                    INSERT INTO delivery_transcript_mirror (
-                        intent_id, connector_id, conversation_id, native_message_id,
-                        visible_text_hash, visible_text_preview, delivered_at_unix_ms
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                    ON CONFLICT(intent_id) DO UPDATE SET
-                        native_message_id = excluded.native_message_id,
-                        visible_text_hash = excluded.visible_text_hash,
-                        visible_text_preview = excluded.visible_text_preview,
-                        delivered_at_unix_ms = excluded.delivered_at_unix_ms
-                    "#,
-                    params![
-                        intent.intent_id,
-                        intent.connector_id,
-                        intent.conversation_id,
-                        native_message_id,
-                        intent.payload_hash,
-                        intent.visible_text_preview,
-                        now_unix_ms,
-                    ],
-                )?;
-            }
-            Ok(changed)
+            mark_delivery_intents_delivered_in_transaction(
+                transaction,
+                connector_id,
+                outbox_envelope_id,
+                native_message_id,
+                now_unix_ms,
+            )
         })
     }
 
-    /// Marks intents for an outbox envelope as platform-outcome unknown.
+    /// Atomically records the platform acknowledgement on both the outbox row
+    /// and every associated delivery intent.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::OutboxNotFound`] when claim ownership or
+    /// the effect-started fence was lost.
+    pub fn mark_outbox_and_delivery_intents_delivered(
+        &self,
+        outbox_id: i64,
+        claim_token: &str,
+        native_message_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), ConnectorStoreError> {
+        self.with_transaction(|transaction| {
+            let identity = transaction
+                .query_row(
+                    r#"
+                    SELECT connector_id, envelope_id
+                    FROM outbox
+                    WHERE outbox_id = ?1
+                      AND status = 'pending'
+                      AND effect_state = 'effect_started'
+                      AND claim_token = ?2
+                    "#,
+                    params![outbox_id, claim_token],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((connector_id, envelope_id)) = identity else {
+                return Err(ConnectorStoreError::OutboxNotFound(outbox_id));
+            };
+            transaction.execute(
+                r#"
+                UPDATE outbox
+                SET status = 'delivered',
+                    native_message_id = ?3,
+                    last_error = NULL,
+                    effect_state = 'ready',
+                    claim_token = NULL,
+                    claim_expires_unix_ms = 0,
+                    updated_at_unix_ms = ?4
+                WHERE outbox_id = ?1
+                  AND claim_token = ?2
+                  AND effect_state = 'effect_started'
+                "#,
+                params![outbox_id, claim_token, native_message_id, now_unix_ms],
+            )?;
+            mark_delivery_intents_delivered_in_transaction(
+                transaction,
+                connector_id.as_str(),
+                envelope_id.as_str(),
+                native_message_id,
+                now_unix_ms,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Marks intents for an already fenced outbox envelope outcome-unknown.
+    ///
+    /// The update is a no-op unless the matching outbox row is currently
+    /// parked `outcome_unknown`; callers cannot create an intent-only unknown
+    /// state while the physical message remains eligible for delivery.
     ///
     /// # Errors
     /// Returns a storage error when the update fails.
@@ -179,6 +240,46 @@ impl ConnectorStore {
                   AND outbox_envelope_id = ?2
                   AND status <> 'delivered'
                   AND status <> 'suppressed'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM outbox
+                      WHERE outbox.connector_id = delivery_intents.connector_id
+                        AND outbox.envelope_id = delivery_intents.outbox_envelope_id
+                        AND outbox.status = 'pending'
+                        AND outbox.effect_state = 'outcome_unknown'
+                  )
+                "#,
+                params![connector_id, outbox_envelope_id, reason_code, now_unix_ms],
+            )?;
+            Ok(changed)
+        })
+    }
+
+    /// Returns a queued or in-flight intent to the safe retry queue.
+    ///
+    /// This transition is only for adapter outcomes that prove no platform
+    /// effect occurred. Outcome-unknown attempts are fenced atomically through
+    /// [`Self::mark_outbox_outcome_unknown`] and cannot use this path.
+    ///
+    /// # Errors
+    /// Returns a storage error when the update fails.
+    pub fn mark_delivery_intent_retry_queued_for_outbox(
+        &self,
+        connector_id: &str,
+        outbox_envelope_id: &str,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> Result<usize, ConnectorStoreError> {
+        self.with_transaction(|transaction| {
+            let changed = transaction.execute(
+                r#"
+                UPDATE delivery_intents
+                SET status = 'queued',
+                    last_reason_code = ?3,
+                    updated_at_unix_ms = ?4
+                WHERE connector_id = ?1
+                  AND outbox_envelope_id = ?2
+                  AND status IN ('queued', 'adapter_send_started')
                 "#,
                 params![connector_id, outbox_envelope_id, reason_code, now_unix_ms],
             )?;
@@ -266,11 +367,13 @@ impl ConnectorStore {
         Ok(record)
     }
 
-    /// Requeues a delivery intent whose status is safe for operator retry.
+    /// Requeues a failed or dead-lettered delivery intent.
     ///
     /// # Errors
     /// Returns a typed error when the intent is missing or currently in an
-    /// unsafe state such as `delivered`, `queued`, or `adapter_send_started`.
+    /// unsafe state such as `platform_outcome_unknown`, `delivered`, `queued`,
+    /// or `adapter_send_started`. Unknown outcomes require explicit platform
+    /// evidence through [`Self::reconcile_outbox_unknown`].
     pub fn retry_delivery_intent(
         &self,
         intent_id: &str,
@@ -282,9 +385,7 @@ impl ConnectorStore {
                 .ok_or_else(|| ConnectorStoreError::DeliveryIntentNotFound(intent_id.to_owned()))?;
             if !matches!(
                 intent.status,
-                DeliveryIntentStatus::Failed
-                    | DeliveryIntentStatus::DeadLettered
-                    | DeliveryIntentStatus::PlatformOutcomeUnknown
+                DeliveryIntentStatus::Failed | DeliveryIntentStatus::DeadLettered
             ) {
                 return Err(ConnectorStoreError::InvalidDeliveryIntentRetry {
                     intent_id: intent.intent_id,
@@ -295,6 +396,7 @@ impl ConnectorStore {
                 r#"
                 UPDATE outbox
                 SET status = 'pending',
+                    effect_state = 'ready',
                     attempts = 0,
                     max_attempts = ?3,
                     next_attempt_unix_ms = ?4,
@@ -331,6 +433,77 @@ impl ConnectorStore {
             Ok(DeliveryIntentRetryOutcome { intent: updated, requeued: changed > 0 })
         })
     }
+}
+
+fn mark_delivery_intents_send_started_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    connector_id: &str,
+    outbox_envelope_id: &str,
+    now_unix_ms: i64,
+) -> Result<usize, ConnectorStoreError> {
+    let changed = transaction.execute(
+        r#"
+        UPDATE delivery_intents
+        SET status = 'adapter_send_started',
+            send_attempts = send_attempts + 1,
+            last_reason_code = NULL,
+            updated_at_unix_ms = ?3
+        WHERE connector_id = ?1
+          AND outbox_envelope_id = ?2
+          AND status = 'queued'
+        "#,
+        params![connector_id, outbox_envelope_id, now_unix_ms],
+    )?;
+    Ok(changed)
+}
+
+pub(super) fn mark_delivery_intents_delivered_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    connector_id: &str,
+    outbox_envelope_id: &str,
+    native_message_id: &str,
+    now_unix_ms: i64,
+) -> Result<usize, ConnectorStoreError> {
+    let intents = query_delivery_intents_by_outbox(transaction, connector_id, outbox_envelope_id)?;
+    let changed = transaction.execute(
+        r#"
+        UPDATE delivery_intents
+        SET status = 'delivered',
+            native_message_id = ?3,
+            last_reason_code = NULL,
+            updated_at_unix_ms = ?4
+        WHERE connector_id = ?1
+          AND outbox_envelope_id = ?2
+          AND status <> 'suppressed'
+        "#,
+        params![connector_id, outbox_envelope_id, native_message_id, now_unix_ms],
+    )?;
+    for intent in intents {
+        transaction.execute(
+            r#"
+            INSERT INTO delivery_transcript_mirror (
+                intent_id, connector_id, conversation_id, native_message_id,
+                visible_text_hash, visible_text_preview, delivered_at_unix_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(intent_id) DO UPDATE SET
+                native_message_id = excluded.native_message_id,
+                visible_text_hash = excluded.visible_text_hash,
+                visible_text_preview = excluded.visible_text_preview,
+                delivered_at_unix_ms = excluded.delivered_at_unix_ms
+            "#,
+            params![
+                intent.intent_id,
+                intent.connector_id,
+                intent.conversation_id,
+                native_message_id,
+                intent.payload_hash,
+                intent.visible_text_preview,
+                now_unix_ms,
+            ],
+        )?;
+    }
+    Ok(changed)
 }
 
 fn query_delivery_intent_by_id(

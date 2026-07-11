@@ -6,6 +6,7 @@
 //! `crate::providers`.
 
 use async_trait::async_trait;
+use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultProbeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -115,6 +116,7 @@ pub(super) enum DispatchResult {
     Delivered,
     Retried,
     DeadLettered,
+    OutcomeUnknown,
 }
 
 /// Counters summarizing one outbox drain pass.
@@ -124,6 +126,7 @@ pub struct DrainOutcome {
     pub delivered: usize,
     pub retried: usize,
     pub dead_lettered: usize,
+    pub outcome_unknown: usize,
 }
 
 /// Result of ingesting one inbound event, including routing and any
@@ -299,12 +302,19 @@ pub trait ConnectorAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Delivers one outbound request, classifying the result as delivered,
-    /// retryable, or permanently failed via [`DeliveryOutcome`].
+    /// Delivers one outbound request with explicit platform-effect certainty.
+    ///
+    /// `DeliveryOutcome::Retry` is valid only when the adapter proves that no
+    /// remote effect occurred. After dispatch, a timeout, disconnect, 5xx
+    /// response, or other ambiguity must return
+    /// `DeliveryOutcome::OutcomeUnknown` (or an adapter error), which the
+    /// supervisor parks for reconciliation.
     ///
     /// # Errors
-    /// Returns [`ConnectorAdapterError`] for transport-level failures; the
-    /// supervisor treats those as transient and schedules a retry.
+    /// Returns [`ConnectorAdapterError`] for failures without a more precise
+    /// outcome. The supervisor conservatively treats such errors as
+    /// outcome-unknown because the request may already have reached the
+    /// platform.
     async fn send_outbound(
         &self,
         instance: &ConnectorInstanceRecord,
@@ -419,6 +429,17 @@ pub enum ConnectorSupervisorError {
     Adapter(String),
     #[error("failed to read system clock: {0}")]
     Clock(String),
+    #[error(transparent)]
+    QaFaultProbe(#[from] QaFaultProbeError),
+    #[error(
+        "QA fault activation '{activation_id}' requested action {action:?} at '{point_id}' for actor '{actor}'"
+    )]
+    QaFaultActivated {
+        activation_id: String,
+        point_id: String,
+        actor: String,
+        action: QaFaultAction,
+    },
 }
 
 /// Maps a permanent-failure reason onto a readiness state.

@@ -17,7 +17,7 @@ use crate::{
     transport::grpc::proto::palyra::common::v1 as common_v1,
 };
 
-use super::tape::send_status_with_tape;
+use super::tape::send_final_status_with_tape;
 
 /// Transitions an in-flight run stream to the cancelled terminal state.
 ///
@@ -53,7 +53,7 @@ pub(crate) async fn transition_run_stream_to_cancelled(
     // The wire status is Failed (the proto has no dedicated cancelled kind);
     // the tape payload maps CANCELLED_REASON to the "cancelled" lifecycle so
     // replay can distinguish controlled cancellation from real failures.
-    if let Err(error) = send_status_with_tape(
+    if let Err(error) = send_final_status_with_tape(
         sender,
         runtime_state,
         run_id,

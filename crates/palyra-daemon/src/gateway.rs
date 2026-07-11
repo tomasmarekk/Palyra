@@ -1135,6 +1135,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
                 vault: Some(runtime_state.vault.as_ref()),
                 cancellation_requested: controls.cancellation_requested,
                 process_progress_sink: controls.process_progress_sink,
+                fault_injection: runtime_state.fault_injection.clone(),
             })
             .await;
         record_run_cleanup_resource_from_tool_outcome(

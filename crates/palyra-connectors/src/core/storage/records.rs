@@ -38,6 +38,39 @@ pub struct ConnectorInstanceRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Durable side-effect fence for one outbox delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxEffectState {
+    /// No external effect has started; an expired claim is safe to reclaim.
+    Ready,
+    /// The adapter call may be in flight; claim expiry must park the row unknown.
+    EffectStarted,
+    /// The platform outcome is uncertain and requires explicit reconciliation.
+    OutcomeUnknown,
+}
+
+impl OutboxEffectState {
+    /// Returns the stable storage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::EffectStarted => "effect_started",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self, ConnectorStoreError> {
+        match value {
+            "ready" => Ok(Self::Ready),
+            "effect_started" => Ok(Self::EffectStarted),
+            "outcome_unknown" => Ok(Self::OutcomeUnknown),
+            other => Err(ConnectorStoreError::UnknownOutboxEffectState(other.to_owned())),
+        }
+    }
+}
+
 /// One claimed outbox entry handed to the supervisor for delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntryRecord {
@@ -51,6 +84,7 @@ pub struct OutboxEntryRecord {
     pub attempts: u32,
     pub max_attempts: u32,
     pub next_attempt_unix_ms: i64,
+    pub effect_state: OutboxEffectState,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
 }
@@ -60,6 +94,38 @@ pub struct OutboxEntryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEnqueueOutcome {
     pub created: bool,
+}
+
+/// Operator-safe view of an outbox row whose platform outcome is uncertain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxUnknownRecord {
+    pub outbox_id: i64,
+    pub connector_id: String,
+    pub envelope_id: String,
+    pub attempts: u32,
+    pub last_reason_code: Option<String>,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Evidence supplied by a reconciler for an outcome-unknown outbox row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OutboxReconciliationEvidence {
+    /// The platform proves delivery and supplies its stable message identifier.
+    Delivered { native_message_id: String },
+    /// The platform proves no effect occurred, so a later claim may send safely.
+    ConfirmedAbsent,
+}
+
+/// Durable result of applying explicit outbox reconciliation evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxReconciliationOutcome {
+    pub outbox_id: i64,
+    pub connector_id: String,
+    pub envelope_id: String,
+    pub effect_state: OutboxEffectState,
+    pub delivered: bool,
+    pub requeued: bool,
 }
 
 /// Durable processing state for one inbound channel event.
@@ -444,6 +510,7 @@ pub(super) fn parse_outbox_row(row: &Row<'_>) -> Result<OutboxEntryRecord, Conne
         max_attempts: u32::try_from(max_attempts_i64)
             .map_err(|_| ConnectorStoreError::ValueOverflow { field: "max_attempts" })?,
         next_attempt_unix_ms: row.get(6)?,
+        effect_state: OutboxEffectState::parse(row.get::<_, String>(10)?.as_str())?,
         created_at_unix_ms: row.get(8)?,
         updated_at_unix_ms: row.get(9)?,
     })

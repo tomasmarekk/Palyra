@@ -18,6 +18,9 @@ use crate::transport::{fallback_error_message, urlencoding};
 
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SAFE_READ_RETRIES: usize = 1;
+const DEFAULT_MAX_JSON_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INITIAL_RESPONSE_CAPACITY: usize = 16 * 1024;
+const RESPONSE_BODY_LIMIT_ERROR: &str = "response body exceeds configured JSON limit";
 
 /// Configuration for constructing a [`ControlPlaneClient`].
 #[derive(Debug, Clone)]
@@ -29,16 +32,24 @@ pub struct ControlPlaneClientConfig {
     /// Extra attempts for GET requests after transport failures (HTTP errors are
     /// never retried).
     pub safe_read_retries: usize,
+    /// Maximum response bytes buffered before JSON deserialization.
+    ///
+    /// The limit applies to success and error bodies. A response that exceeds
+    /// it returns [`ControlPlaneClientError::Decode`] without extending the
+    /// response buffer past this bound.
+    pub max_json_response_bytes: usize,
 }
 
 impl ControlPlaneClientConfig {
-    /// Creates a config with the default timeout (10 s) and one safe-read retry.
+    /// Creates a config with a 10 s request timeout, one safe-read retry, and
+    /// an 8 MiB JSON response limit.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
             safe_read_retries: DEFAULT_SAFE_READ_RETRIES,
+            max_json_response_bytes: DEFAULT_MAX_JSON_RESPONSE_BYTES,
         }
     }
 }
@@ -61,6 +72,7 @@ pub struct ControlPlaneClient {
     client: Client,
     csrf_token: Option<String>,
     safe_read_retries: usize,
+    max_json_response_bytes: usize,
 }
 
 impl ControlPlaneClient {
@@ -97,7 +109,13 @@ impl ControlPlaneClient {
             let normalized = format!("{}/", base_url.path().trim_end_matches('/'));
             base_url.set_path(normalized.as_str());
         }
-        Ok(Self { base_url, client, csrf_token: None, safe_read_retries: config.safe_read_retries })
+        Ok(Self {
+            base_url,
+            client,
+            csrf_token: None,
+            safe_read_retries: config.safe_read_retries,
+            max_json_response_bytes: config.max_json_response_bytes,
+        })
     }
 
     /// Overrides the CSRF token sent with mutating requests (`None` clears it).
@@ -2735,25 +2753,24 @@ impl ControlPlaneClient {
                 .map_err(|error| ControlPlaneClientError::Transport(error.to_string()));
             match response {
                 Ok(response) => {
-                    if !response.status().is_success() {
-                        let status = response.status().as_u16();
-                        let body = response
-                            .text()
-                            .await
-                            .map_err(|error| ControlPlaneClientError::Decode(error.to_string()))?;
+                    let status = response.status().as_u16();
+                    let is_success = response.status().is_success();
+                    let body =
+                        read_bounded_response_body(response, self.max_json_response_bytes).await?;
+                    if !is_success {
                         // Prefer the daemon's structured envelope message; fall back
                         // to a bounded slice of the raw body only when the envelope
                         // shape is absent.
-                        let envelope = serde_json::from_str::<ErrorEnvelope>(body.as_str()).ok();
+                        let envelope =
+                            serde_json::from_slice::<ErrorEnvelope>(body.as_slice()).ok();
+                        let body = String::from_utf8_lossy(body.as_slice());
                         let message = envelope
                             .as_ref()
                             .map(|value| value.error.clone())
-                            .unwrap_or_else(|| fallback_error_message(status, body.as_str()));
+                            .unwrap_or_else(|| fallback_error_message(status, body.as_ref()));
                         return Err(ControlPlaneClientError::Http { status, message, envelope });
                     }
-                    return response
-                        .json::<T>()
-                        .await
+                    return serde_json::from_slice::<T>(body.as_slice())
                         .map_err(|error| ControlPlaneClientError::Decode(error.to_string()));
                 }
                 Err(error) => {
@@ -2765,6 +2782,42 @@ impl ControlPlaneClient {
             }
         }
     }
+}
+
+async fn read_bounded_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ControlPlaneClientError> {
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err(ControlPlaneClientError::Decode(RESPONSE_BODY_LIMIT_ERROR.to_owned()));
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(max_bytes)
+        .min(MAX_INITIAL_RESPONSE_CAPACITY);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| ControlPlaneClientError::Decode(error.to_string()))?
+    {
+        extend_bounded_response_body(&mut body, chunk.as_ref(), max_bytes)?;
+    }
+    Ok(body)
+}
+
+fn extend_bounded_response_body(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), ControlPlaneClientError> {
+    if chunk.len() > max_bytes.saturating_sub(body.len()) {
+        return Err(ControlPlaneClientError::Decode(RESPONSE_BODY_LIMIT_ERROR.to_owned()));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// Joins non-empty query pairs onto `path`, percent-encoding values and
@@ -2784,5 +2837,34 @@ fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
         path.to_owned()
     } else {
         format!("{path}?{query}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_response_body_accepts_the_exact_limit() {
+        let mut body = vec![1_u8, 2];
+
+        extend_bounded_response_body(&mut body, &[3, 4], 4)
+            .expect("the exact configured body limit should be accepted");
+
+        assert_eq!(body, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bounded_response_body_rejects_before_extending_past_the_limit() {
+        let mut body = vec![1_u8, 2];
+
+        let error = extend_bounded_response_body(&mut body, &[3, 4, 5], 4)
+            .expect_err("a body larger than the configured limit must be rejected");
+
+        assert_eq!(body, vec![1, 2]);
+        assert!(matches!(
+            error,
+            ControlPlaneClientError::Decode(message) if message == RESPONSE_BODY_LIMIT_ERROR
+        ));
     }
 }

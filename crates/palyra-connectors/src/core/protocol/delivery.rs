@@ -249,11 +249,21 @@ impl RetryClass {
 }
 
 /// Adapter verdict for one delivery attempt.
+///
+/// `Retry` is reserved for attempts where the adapter can prove that the
+/// platform performed no externally visible effect. Once a request may have
+/// reached the platform, an unconfirmed result must be `OutcomeUnknown` so the
+/// durable outbox requires explicit reconciliation instead of sending again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeliveryOutcome {
+    /// The platform acknowledged delivery with its stable message identifier.
     Delivered { native_message_id: String },
+    /// No platform effect occurred, so repeating the request is safe.
     Retry { class: RetryClass, reason: String, retry_after_ms: Option<u64> },
+    /// The request may have taken effect and must not be repeated blindly.
+    OutcomeUnknown { reason: String },
+    /// The platform definitively rejected the request without delivering it.
     PermanentFailure { reason: String },
 }
 
@@ -291,8 +301,9 @@ pub struct DeliveryReceipt {
 
 impl DeliveryReceipt {
     /// Builds the receipt for an outcome: `Delivered` maps to `Ack`,
-    /// `PermanentFailure` to `Nack`, and `Retry` to `Unknown` because the
-    /// message may still be delivered by a later attempt.
+    /// `PermanentFailure` to `Nack`, and both non-terminal outcomes to
+    /// `Unknown`. `Retry` is safe to repeat later; `OutcomeUnknown` requires
+    /// reconciliation before any repeat is allowed.
     #[must_use]
     pub fn from_outcome(request: &OutboundMessageRequest, outcome: &DeliveryOutcome) -> Self {
         match outcome {
@@ -309,6 +320,13 @@ impl DeliveryReceipt {
                 external_message_id: None,
                 retry_after_ms: *retry_after_ms,
                 reason: Some(format!("{}: {reason}", class.as_str())),
+            },
+            DeliveryOutcome::OutcomeUnknown { reason } => Self {
+                state: DeliveryReceiptState::Unknown,
+                idempotency_key: request.delivery_idempotency_key(),
+                external_message_id: None,
+                retry_after_ms: None,
+                reason: Some(reason.clone()),
             },
             DeliveryOutcome::PermanentFailure { reason } => Self {
                 state: DeliveryReceiptState::Nack,

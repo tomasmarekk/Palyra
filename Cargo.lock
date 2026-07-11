@@ -3233,6 +3233,7 @@ dependencies = [
  "cedar-policy",
  "criterion",
  "serde_json",
+ "stacker",
  "thiserror",
 ]
 

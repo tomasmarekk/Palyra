@@ -1036,6 +1036,50 @@ async fn send_outbound_returns_retry_on_429_with_retry_after() {
 }
 
 #[tokio::test]
+async fn send_outbound_reports_transport_loss_as_outcome_unknown() {
+    let transport = Arc::new(FakeTransport::default());
+    transport.push_get_response(Ok(ok_identity_response()));
+    transport.push_post_response(Err(ConnectorAdapterError::Backend(
+        "response lost after request dispatch".to_owned(),
+    )));
+    let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+
+    let outcome = adapter
+        .send_outbound(&sample_instance(), &sample_request("hello"))
+        .await
+        .expect("transport ambiguity should be represented as an outcome");
+
+    assert!(matches!(
+        outcome,
+        DeliveryOutcome::OutcomeUnknown { ref reason }
+            if reason.contains("response lost after request dispatch")
+    ));
+}
+
+#[tokio::test]
+async fn send_outbound_reports_server_error_as_outcome_unknown() {
+    let transport = Arc::new(FakeTransport::default());
+    transport.push_get_response(Ok(ok_identity_response()));
+    transport.push_post_response(Ok(DiscordTransportResponse {
+        status: 503,
+        headers: Default::default(),
+        body: "{\"message\":\"upstream failed after dispatch\"}".to_owned(),
+    }));
+    let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+
+    let outcome = adapter
+        .send_outbound(&sample_instance(), &sample_request("hello"))
+        .await
+        .expect("server ambiguity should be represented as an outcome");
+
+    assert!(matches!(
+        outcome,
+        DeliveryOutcome::OutcomeUnknown { ref reason }
+            if reason.contains("status=503")
+    ));
+}
+
+#[tokio::test]
 async fn send_outbound_preflight_respects_route_budget_without_explicit_retry_headers() {
     let transport = Arc::new(FakeTransport::default());
     transport.push_get_response(Ok(ok_identity_response()));

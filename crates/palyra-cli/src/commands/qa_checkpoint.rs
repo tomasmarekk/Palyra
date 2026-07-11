@@ -1179,6 +1179,7 @@ mod tests {
             session_id: passed.then_some("session-1".to_owned()),
             terminal_state: passed.then_some("completed".to_owned()),
             evidence_artifacts: vec![evidence_artifact],
+            evidence_output_bindings: Vec::new(),
             cleanup: QaScenarioCleanupResult {
                 run_terminal_observed: passed,
                 session_cleaned: true,

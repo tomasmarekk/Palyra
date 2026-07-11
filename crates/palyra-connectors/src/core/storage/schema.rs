@@ -5,14 +5,15 @@
 //! are the storage contract, so column or constraint changes need a matching
 //! migration for databases created by older builds.
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use super::{ConnectorStore, ConnectorStoreError};
 
 impl ConnectorStore {
     /// Creates all tables/indexes if missing and applies column migrations.
     pub(super) fn initialize_schema(&self) -> Result<(), ConnectorStoreError> {
-        let connection = self.connection.lock().map_err(|_| ConnectorStoreError::PoisonedLock)?;
+        let mut connection =
+            self.connection.lock().map_err(|_| ConnectorStoreError::PoisonedLock)?;
         connection.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -96,6 +97,9 @@ impl ConnectorStore {
                 last_error TEXT,
                 claim_token TEXT,
                 claim_expires_unix_ms INTEGER NOT NULL DEFAULT 0,
+                effect_state TEXT NOT NULL DEFAULT 'ready' CHECK(effect_state IN (
+                    'ready', 'effect_started', 'outcome_unknown'
+                )),
                 created_at_unix_ms INTEGER NOT NULL,
                 updated_at_unix_ms INTEGER NOT NULL,
                 UNIQUE(connector_id, envelope_id)
@@ -181,6 +185,7 @@ impl ConnectorStore {
         // The reclaim index can only be created after the claim columns exist
         // on databases that predate the claim-lease migration.
         ensure_outbox_claim_columns(&connection)?;
+        ensure_outbox_effect_state_column(&mut connection)?;
         connection.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_outbox_claim_reclaim
@@ -201,6 +206,59 @@ fn ensure_outbox_claim_columns(connection: &Connection) -> Result<(), ConnectorS
             "ALTER TABLE outbox ADD COLUMN claim_expires_unix_ms INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// Adds the side-effect fence while conservatively parking legacy claims.
+fn ensure_outbox_effect_state_column(
+    connection: &mut Connection,
+) -> Result<(), ConnectorStoreError> {
+    if !outbox_column_exists(connection, "effect_state")? {
+        const LEGACY_CLAIM_REASON: &str = "outbox.legacy_claim_outcome_unknown";
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            r#"
+            ALTER TABLE outbox ADD COLUMN effect_state TEXT NOT NULL DEFAULT 'ready'
+                CHECK(effect_state IN ('ready', 'effect_started', 'outcome_unknown'))
+            "#,
+            [],
+        )?;
+        // A legacy claim can be either pre-effect or post-effect. Without the
+        // old process there is no proof, so migration must prefer operator
+        // reconciliation over a potentially duplicated platform message.
+        transaction.execute(
+            r#"
+            UPDATE outbox
+            SET effect_state = 'outcome_unknown',
+                last_error = ?1,
+                claim_token = NULL,
+                claim_expires_unix_ms = 0
+            WHERE status = 'pending'
+              AND (claim_token IS NOT NULL OR claim_expires_unix_ms > 0)
+            "#,
+            params![LEGACY_CLAIM_REASON],
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE delivery_intents
+            SET status = 'platform_outcome_unknown',
+                last_reason_code = ?1
+            WHERE status <> 'delivered'
+              AND status <> 'suppressed'
+              AND EXISTS (
+                  SELECT 1
+                  FROM outbox
+                  WHERE outbox.connector_id = delivery_intents.connector_id
+                    AND outbox.envelope_id = delivery_intents.outbox_envelope_id
+                    AND outbox.status = 'pending'
+                    AND outbox.effect_state = 'outcome_unknown'
+                    AND outbox.last_error = ?1
+              )
+            "#,
+            params![LEGACY_CLAIM_REASON],
+        )?;
+        transaction.commit()?;
     }
     Ok(())
 }
