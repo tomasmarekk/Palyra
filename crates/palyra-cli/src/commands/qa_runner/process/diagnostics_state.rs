@@ -3,7 +3,7 @@ use std::{fs, io, path::Path};
 use anyhow::{Context, Result};
 use palyra_common::qa_fault_injection::QaFaultEvidenceSidecarRecord;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use super::open_file_link_count;
 #[cfg(any(
     target_os = "linux",
@@ -297,9 +297,40 @@ pub(super) fn open_directory_no_follow(_path: &Path) -> Result<fs::File> {
     anyhow::bail!("qa.runner.failure_diagnostics_directory_no_follow_unsupported")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn pinned_directory_removed(directory: &fs::File) -> Result<bool> {
     Ok(open_file_link_count(directory)? == 0)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn pinned_directory_removed(directory: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    const MACOS_F_GETPATH: i32 = 50;
+    const MACOS_MAX_PATH_BYTES: usize = 1024;
+
+    let mut path = [0_u8; MACOS_MAX_PATH_BYTES];
+    // APFS does not provide Linux-style zero-link evidence for an open removed directory. Darwin's
+    // F_GETPATH instead fails once the pinned vnode has no parent/name path, while a renamed vnode
+    // remains resolvable. This preserves the distinction between deletion and path substitution.
+    // SAFETY: `directory` owns a live descriptor and `path` satisfies F_GETPATH's MAXPATHLEN buffer
+    // contract for the duration of the variadic fcntl call.
+    let result = unsafe { macos_fcntl(directory.as_raw_fd(), MACOS_F_GETPATH, path.as_mut_ptr()) };
+    if result == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(true)
+    } else {
+        Err(error).context("qa.runner.failure_diagnostics_state_root_identity_failed")
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[link_name = "fcntl"]
+    fn macos_fcntl(file_descriptor: i32, command: i32, ...) -> i32;
 }
 
 #[cfg(windows)]
