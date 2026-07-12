@@ -23,7 +23,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v7";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v8";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,9 +125,50 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds the strict runtime error taxonomy and binding invariant registry while preserving the existing public error envelopes.",
+        "changelog_note": "Adds the always-on bounded metadata trace contract while preserving rich trace as a separate approval-gated export.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "runtime_error_contract": runtime_error_contract_snapshot(),
+        "metadata_trace": {
+            "snapshot_version": "runtime-contracts.metadata_trace.v1",
+            "changelog_note": "Introduces a bounded metadata-only run trace with append-only crash-safe segments and a separate approval-gated rich export.",
+            "schema_version": crate::metadata_trace::METADATA_TRACE_SCHEMA_VERSION,
+            "ordering": "segment_index_then_global_event_sequence",
+            "segment_statuses": ["complete", "interrupted", "corrupt_suffix_isolated"],
+            "event_kinds": [
+                "run_started",
+                "runtime_selected",
+                "context_assembled",
+                "provider_attempt",
+                "tool_gate",
+                "approval",
+                "tool_outcome",
+                "recovery",
+                "delivery_intent",
+                "terminalization",
+                "recovery_continuation",
+                "capacity_reached"
+            ],
+            "hard_limits": {
+                "segments_per_run": crate::metadata_trace::METADATA_TRACE_MAX_SEGMENTS,
+                "events_per_run": crate::metadata_trace::METADATA_TRACE_MAX_EVENTS,
+                "bytes_per_event": crate::metadata_trace::METADATA_TRACE_MAX_EVENT_BYTES,
+                "schema_hashes_per_selection": crate::metadata_trace::METADATA_TRACE_MAX_SCHEMA_HASHES,
+                "stage_duration_ms": crate::metadata_trace::METADATA_TRACE_MAX_STAGE_DURATION_MS,
+            },
+            "privacy": {
+                "raw_prompts": false,
+                "raw_secrets": false,
+                "raw_tool_arguments": false,
+                "raw_provider_payloads": false,
+                "raw_stderr": false,
+                "identity_projection": "domain_separated_sha256",
+            },
+            "rich_trace": {
+                "always_on": false,
+                "approval_required": true,
+                "separate_artifact": true,
+            },
+        },
         "public_runtime_events": public_runtime_event_taxonomy_snapshot(),
         "runtime_enums": [
             enum_contract_snapshot(

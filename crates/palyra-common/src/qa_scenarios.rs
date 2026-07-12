@@ -3122,7 +3122,7 @@ mod tests {
     daemon_restarts: 1
 "#;
     const RUNTIME_PATH_EXPECTATION_BLOCK: &str = r#"  runtime_path:
-    runtime_contract_version: runtime-contracts.v7
+    runtime_contract_version: runtime-contracts.v8
     provider_lane: fixture
     attempt_owner: embedded_run_stream
     harness_id: embedded_run_stream
@@ -3391,7 +3391,7 @@ timeout:
             .runtime_path
             .as_ref()
             .expect("schema-v5 runtime path should be retained");
-        assert_eq!(runtime_path.runtime_contract_version, "runtime-contracts.v7");
+        assert_eq!(runtime_path.runtime_contract_version, "runtime-contracts.v8");
         assert_eq!(runtime_path.provider_lane, "fixture");
         assert_eq!(runtime_path.attempt_owner, "embedded_run_stream");
         assert_eq!(runtime_path.harness_id, "embedded_run_stream");
@@ -3477,7 +3477,7 @@ timeout:
 
     #[test]
     fn schema_v5_rejects_unsafe_runtime_path_metadata() {
-        let scenario = schema_v5_scenario().replace("runtime-contracts.v7", "runtime contracts v7");
+        let scenario = schema_v5_scenario().replace("runtime-contracts.v8", "runtime contracts v8");
 
         assert_validation_issue(
             scenario.as_str(),

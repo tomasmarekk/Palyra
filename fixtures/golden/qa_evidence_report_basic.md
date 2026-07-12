@@ -14,6 +14,10 @@
 
 - Evidence: `not captured`
 
+## Metadata Trace
+
+- Evidence: `not captured`
+
 ## Checks
 
 | Check | Verdict | Issues |

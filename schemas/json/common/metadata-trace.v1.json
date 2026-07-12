@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/metadata-trace.v1.json",
+  "title": "Palyra metadata trace v1",
+  "description": "Strict, bounded, metadata-only projection of one production run's append-only runtime trace.",
+  "$comment": "This security boundary intentionally exposes only closed, typed, bounded machine metadata.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id_sha256", "session_id_sha256", "segments"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "run_id_sha256": { "$ref": "#/$defs/sha256" },
+    "session_id_sha256": { "$ref": "#/$defs/sha256" },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/segment" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "machine_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[a-z0-9][a-z0-9._-]*[a-z0-9]$"
+    },
+    "segment_status": {
+      "type": "string",
+      "enum": ["complete", "interrupted", "corrupt_suffix_isolated"]
+    },
+    "entrypoint": {
+      "type": "string",
+      "enum": ["new_run", "recovery"]
+    },
+    "route_class": {
+      "type": "string",
+      "enum": ["primary", "fallback", "fixture", "record_replay", "live"]
+    },
+    "provider_attempt_outcome": {
+      "type": "string",
+      "enum": ["started", "succeeded", "retryable_failure", "terminal_failure", "cancelled"]
+    },
+    "tool_gate_decision": {
+      "type": "string",
+      "enum": ["allowed", "denied", "approval_required"]
+    },
+    "approval_decision": {
+      "type": "string",
+      "enum": ["requested", "approved", "denied", "expired", "cancelled"]
+    },
+    "tool_outcome": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "unknown", "cancelled"]
+    },
+    "recovery_strategy": {
+      "type": "string",
+      "enum": ["retry_same_route", "provider_failover", "context_compaction", "idempotency_guard", "operator_review"]
+    },
+    "delivery_route": {
+      "type": "string",
+      "enum": ["direct", "channel", "connector", "background_queue"]
+    },
+    "delivery_state": {
+      "type": "string",
+      "enum": ["planned", "queued", "sent", "acknowledged", "failed", "unknown"]
+    },
+    "terminal_outcome": {
+      "type": "string",
+      "enum": ["done", "failed", "cancelled", "forced_abort"]
+    },
+    "capacity_limit": {
+      "type": "string",
+      "enum": ["event_count", "segment_count", "event_bytes", "schema_hash_count", "stage_duration"]
+    },
+    "schema_hash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "sha256"],
+      "properties": {
+        "schema_id": { "$ref": "#/$defs/machine_identifier" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "run_started_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entrypoint"],
+      "properties": {
+        "entrypoint": { "$ref": "#/$defs/entrypoint" }
+      }
+    },
+    "runtime_selected_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness_id", "harness_version", "runtime_id", "runtime_version", "route_class", "schema_hashes"],
+      "properties": {
+        "harness_id": { "$ref": "#/$defs/machine_identifier" },
+        "harness_version": { "$ref": "#/$defs/version" },
+        "runtime_id": { "$ref": "#/$defs/machine_identifier" },
+        "runtime_version": { "$ref": "#/$defs/version" },
+        "route_class": { "$ref": "#/$defs/route_class" },
+        "auth_profile_id_sha256": { "$ref": "#/$defs/sha256" },
+        "schema_hashes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/schema_hash" }
+        }
+      }
+    },
+    "context_assembled_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context_engine_id", "context_engine_version", "context_schema_sha256", "input_item_count", "retained_item_count"],
+      "properties": {
+        "context_engine_id": { "$ref": "#/$defs/machine_identifier" },
+        "context_engine_version": { "$ref": "#/$defs/version" },
+        "context_schema_sha256": { "$ref": "#/$defs/sha256" },
+        "input_item_count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "retained_item_count": { "type": "integer", "minimum": 0, "maximum": 100000 }
+      }
+    },
+    "provider_attempt_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id_sha256", "model_id_sha256", "route_class", "attempt", "outcome", "reason_code"],
+      "properties": {
+        "provider_id_sha256": { "$ref": "#/$defs/sha256" },
+        "model_id_sha256": { "$ref": "#/$defs/sha256" },
+        "route_class": { "$ref": "#/$defs/route_class" },
+        "auth_profile_id_sha256": { "$ref": "#/$defs/sha256" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "outcome": { "$ref": "#/$defs/provider_attempt_outcome" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "tool_gate_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id_sha256", "decision", "reason_code"],
+      "properties": {
+        "tool_id_sha256": { "$ref": "#/$defs/sha256" },
+        "decision": { "$ref": "#/$defs/tool_gate_decision" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "approval_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id_sha256", "decision", "reason_code"],
+      "properties": {
+        "approval_id_sha256": { "$ref": "#/$defs/sha256" },
+        "decision": { "$ref": "#/$defs/approval_decision" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "tool_outcome_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id_sha256", "attempt", "outcome", "reason_code"],
+      "properties": {
+        "tool_id_sha256": { "$ref": "#/$defs/sha256" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "outcome": { "$ref": "#/$defs/tool_outcome" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "recovery_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "attempt", "reason_code"],
+      "properties": {
+        "strategy": { "$ref": "#/$defs/recovery_strategy" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "delivery_intent_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_id_sha256", "route", "state", "reason_code"],
+      "properties": {
+        "delivery_id_sha256": { "$ref": "#/$defs/sha256" },
+        "route": { "$ref": "#/$defs/delivery_route" },
+        "state": { "$ref": "#/$defs/delivery_state" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "terminalization_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reason_code", "output_emitted", "side_effect_may_have_occurred"],
+      "properties": {
+        "outcome": { "$ref": "#/$defs/terminal_outcome" },
+        "reason_code": { "$ref": "#/$defs/reason_code" },
+        "output_emitted": { "type": "boolean" },
+        "side_effect_may_have_occurred": { "type": "boolean" }
+      }
+    },
+    "recovery_continuation_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["previous_segment_id_sha256", "reason_code"],
+      "properties": {
+        "previous_segment_id_sha256": { "$ref": "#/$defs/sha256" },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "capacity_reached_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit_kind", "observed", "limit", "reason_code"],
+      "properties": {
+        "limit_kind": { "$ref": "#/$defs/capacity_limit" },
+        "observed": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "reason_code": { "$ref": "#/$defs/reason_code" }
+      }
+    },
+    "event_data": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "run_started" },
+            "metadata": { "$ref": "#/$defs/run_started_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "runtime_selected" },
+            "metadata": { "$ref": "#/$defs/runtime_selected_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "context_assembled" },
+            "metadata": { "$ref": "#/$defs/context_assembled_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "provider_attempt" },
+            "metadata": { "$ref": "#/$defs/provider_attempt_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "tool_gate" },
+            "metadata": { "$ref": "#/$defs/tool_gate_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "approval" },
+            "metadata": { "$ref": "#/$defs/approval_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "tool_outcome" },
+            "metadata": { "$ref": "#/$defs/tool_outcome_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "recovery" },
+            "metadata": { "$ref": "#/$defs/recovery_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "delivery_intent" },
+            "metadata": { "$ref": "#/$defs/delivery_intent_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "terminalization" },
+            "metadata": { "$ref": "#/$defs/terminalization_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "recovery_continuation" },
+            "metadata": { "$ref": "#/$defs/recovery_continuation_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "capacity_reached" },
+            "metadata": { "$ref": "#/$defs/capacity_reached_metadata" }
+          }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "generation", "recorded_at_unix_ms", "event_id_sha256", "event"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 511 },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "recorded_at_unix_ms": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+        "event_id_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_parent_event_id_sha256": { "$ref": "#/$defs/sha256" },
+        "stage_duration_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+        "event": { "$ref": "#/$defs/event_data" }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["segment_id_sha256", "segment_index", "generation", "status", "events"],
+      "properties": {
+        "segment_id_sha256": { "$ref": "#/$defs/sha256" },
+        "segment_index": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "status": { "$ref": "#/$defs/segment_status" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/event" }
+        }
+      }
+    }
+  }
+}

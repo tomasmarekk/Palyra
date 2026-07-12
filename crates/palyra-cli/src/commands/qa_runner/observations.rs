@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use palyra_common::{
+    metadata_trace::MetadataTraceV1,
     qa_evidence::{
         QaArtifactEvidence, QaEvidenceBuildInput, QaPublicEventEvidence, QaRunTapeEvent,
         QaToolCallEvidence, QaTranscriptMessage,
@@ -257,6 +258,9 @@ pub(super) async fn collect_scenario_observations(
     let status = deadline.run_step(load_run_status(&client, run_id.as_str())).await?;
     let terminal_state = canonical_terminal_state(&status, observed.complete_status.as_deref());
     let terminal_observed = is_terminal_state(terminal_state.as_str());
+    let metadata_trace = deadline
+        .run_step(load_run_metadata_trace(&client, run_id.as_str(), &mut observation_budget))
+        .await?;
     let tape_events =
         deadline.run_step(load_run_tape(&client, run_id.as_str(), &mut observation_budget)).await?;
     let mut transcript = transcript_from_tape(tape_events.as_slice(), &mut observation_budget)?;
@@ -287,6 +291,7 @@ pub(super) async fn collect_scenario_observations(
         public_events: observed.public_events,
         tool_calls: observed.tool_calls,
         artifacts,
+        metadata_trace: Some(metadata_trace),
         ..QaEvidenceBuildInput::default()
     };
     Ok(QaScenarioObservations { run_id, session_id, terminal_state, terminal_observed, evidence })
@@ -308,6 +313,9 @@ pub(super) async fn collect_recovered_scenario_observations(
     if !terminal_observed {
         anyhow::bail!("qa.runner.recovery_run_not_terminal");
     }
+    let metadata_trace = deadline
+        .run_step(load_run_metadata_trace(&client, run_id.as_str(), &mut observation_budget))
+        .await?;
     let tape_events =
         deadline.run_step(load_run_tape(&client, run_id.as_str(), &mut observation_budget)).await?;
     let transcript = transcript_from_tape(tape_events.as_slice(), &mut observation_budget)?;
@@ -322,6 +330,7 @@ pub(super) async fn collect_recovered_scenario_observations(
         transcript,
         tape_events,
         artifacts,
+        metadata_trace: Some(metadata_trace),
         ..QaEvidenceBuildInput::default()
     };
     Ok(QaScenarioObservations { run_id, session_id, terminal_state, terminal_observed, evidence })
@@ -540,6 +549,24 @@ async fn load_run_status(client: &ControlPlaneClient, run_id: &str) -> Result<Va
         .get_json_value(format!("console/v1/chat/runs/{run_id}/status"))
         .await
         .context("qa.runner.run_status_failed")
+}
+
+async fn load_run_metadata_trace(
+    client: &ControlPlaneClient,
+    run_id: &str,
+    observation_budget: &mut QaObservationBudget,
+) -> Result<MetadataTraceV1> {
+    let response = client
+        .get_json_value(format!("console/v1/chat/runs/{run_id}/metadata-trace"))
+        .await
+        .context("qa.runner.metadata_trace_failed")?;
+    let trace = serde_json::from_value::<MetadataTraceV1>(
+        response.get("metadata_trace").cloned().context("qa.runner.metadata_trace_missing")?,
+    )
+    .context("qa.runner.metadata_trace_invalid")?;
+    trace.validate_shape().context("qa.runner.metadata_trace_invalid")?;
+    observation_budget.consume_serialized(&trace)?;
+    Ok(trace)
 }
 
 async fn load_run_tape(

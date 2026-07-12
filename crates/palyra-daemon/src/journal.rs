@@ -31,6 +31,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use palyra_a2ui::{apply_patch_document, parse_patch_document};
+use palyra_common::metadata_trace::MetadataTraceTerminalOutcomeV1;
 use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass};
 use palyra_common::runtime_contracts::{
     ArtifactReadResponse, ArtifactRetentionPolicy, FlowState, IdempotencyOperationState,
@@ -72,6 +73,7 @@ use crate::{
     retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
 };
 
+mod metadata_trace;
 mod retrieval_index_status;
 pub(crate) mod state_health;
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
@@ -1775,6 +1777,15 @@ pub struct OrchestratorCancelSnapshot {
 pub struct OrchestratorStartupRunRecoveryReport {
     pub terminalized_count: u64,
     pub terminalized_run_ids: Vec<String>,
+}
+
+/// Index and generation allocated to one durable metadata trace segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataTraceSegmentPosition {
+    /// Zero-based segment index within the run trace.
+    pub(crate) segment_index: u16,
+    /// One-based recovery generation owning the segment.
+    pub(crate) generation: u32,
 }
 
 /// Stored tape event of a run transcript.
@@ -4478,7 +4489,9 @@ pub enum JournalError {
     DuplicateCronJobId { job_id: String },
     #[error("cron run already exists: {run_id}")]
     DuplicateCronRunId { run_id: String },
-    #[error("cron job {job_id} already has active run {active_run_id}; cannot start run {requested_run_id}")]
+    #[error(
+        "cron job {job_id} already has active run {active_run_id}; cannot start run {requested_run_id}"
+    )]
     CronRunAlreadyActive { job_id: String, active_run_id: String, requested_run_id: String },
     #[error("memory item already exists: {memory_id}")]
     DuplicateMemoryId { memory_id: String },
@@ -4532,7 +4545,9 @@ pub enum JournalError {
     FlowNotFound { flow_id: String },
     #[error("flow step not found: {flow_id}/{step_id}")]
     FlowStepNotFound { flow_id: String, step_id: String },
-    #[error("flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}")]
+    #[error(
+        "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
+    )]
     FlowRevisionConflict { flow_id: String, expected_revision: i64, actual_revision: i64 },
     #[error("invalid flow dependencies for {flow_id}/{step_id}: {reason_code}")]
     InvalidFlowDependencies { flow_id: String, step_id: String, reason_code: String },
@@ -4564,11 +4579,28 @@ pub enum JournalError {
     CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
     RunNotFound { run_id: String },
+    #[error(
+        "metadata trace {resource} capacity reached for run {run_id} ({current} >= {maximum})"
+    )]
+    MetadataTraceCapacityExceeded {
+        run_id: String,
+        resource: &'static str,
+        current: usize,
+        maximum: usize,
+    },
+    #[error(
+        "metadata trace event sequence mismatch for run {run_id}: expected {expected}, found {actual}"
+    )]
+    MetadataTraceSequenceMismatch { run_id: String, expected: u32, actual: u32 },
+    #[error("metadata trace invariant failed for run {run_id}: {reason_code}")]
+    MetadataTraceInvariant { run_id: String, reason_code: &'static str },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
     SessionIdentityMismatch { session_id: String },
     #[error("orchestrator session not found for selector: {selector}")]
     SessionNotFound { selector: String },
-    #[error("orchestrator session write lease timed out for session {session_id}; held by {owner_label} (pid {owner_process_id}) until {expires_at_unix_ms} while acquiring {requested_reason}")]
+    #[error(
+        "orchestrator session write lease timed out for session {session_id}; held by {owner_label} (pid {owner_process_id}) until {expires_at_unix_ms} while acquiring {requested_reason}"
+    )]
     SessionWriteLeaseTimeout {
         session_id: String,
         lease_id: String,
@@ -4589,7 +4621,9 @@ pub enum JournalError {
     InvalidCanvasReplay { canvas_id: String, reason: String },
     #[error("invalid journal argument: {0}")]
     InvalidArgument(String),
-    #[error("journal writes blocked by hash-chain mismatch at event {event_id}: {reason_code}; {fix_hint}")]
+    #[error(
+        "journal writes blocked by hash-chain mismatch at event {event_id}: {reason_code}; {fix_hint}"
+    )]
     WriteBlockedByHashChainMismatch { event_id: String, reason_code: String, fix_hint: String },
     #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
     PayloadTooLarge { payload_kind: &'static str, actual_bytes: usize, max_bytes: usize },
@@ -6723,6 +6757,11 @@ const MIGRATIONS: &[Migration] = &[
                    );
         "#,
     },
+    Migration {
+        version: 44,
+        name: "metadata_trace_segments",
+        sql: metadata_trace::MIGRATION_44_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -8106,6 +8145,25 @@ fn origin_kind_updates_session_last_run(origin_kind: &str) -> bool {
     !matches!(normalized.as_str(), "background" | "delegation")
 }
 
+fn metadata_trace_terminal_outcome(
+    state: RunLifecycleState,
+) -> Option<(MetadataTraceTerminalOutcomeV1, &'static str)> {
+    match state {
+        RunLifecycleState::Done => {
+            Some((MetadataTraceTerminalOutcomeV1::Done, "run.terminal.done"))
+        }
+        RunLifecycleState::Failed => {
+            Some((MetadataTraceTerminalOutcomeV1::Failed, "run.terminal.failed"))
+        }
+        RunLifecycleState::Cancelled => {
+            Some((MetadataTraceTerminalOutcomeV1::Cancelled, "run.terminal.cancelled"))
+        }
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => None,
+    }
+}
+
 /// Returns the session's `last_run` id if that run is still active.
 fn active_session_last_run(
     connection: &Connection,
@@ -8472,13 +8530,13 @@ impl JournalStore {
         write: F,
     ) -> Result<T, JournalError>
     where
-        F: FnOnce(&Connection, i64) -> Result<T, JournalError>,
+        F: FnOnce(&mut Connection, i64) -> Result<T, JournalError>,
     {
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let request = internal_session_write_lease_request(session_id, reason, allow_reentrant);
         let lease = acquire_session_write_lease_tx(&guard, &request, now)?;
-        let write_result = write(&guard, now);
+        let write_result = write(&mut guard, now);
         let release_now = current_unix_ms().unwrap_or(now);
         let release_result = release_session_write_lease_record_tx(&guard, &lease, release_now);
         match (write_result, release_result) {
@@ -9976,11 +10034,12 @@ impl JournalStore {
             "start_orchestrator_run",
             false,
             |guard, now| {
+                let transaction = guard.transaction()?;
                 let updates_session_last_run =
                     origin_kind_updates_session_last_run(request.origin_kind.as_str());
                 if updates_session_last_run {
                     if let Some(active_run_id) =
-                        active_session_last_run(guard, request.session_id.as_str())?
+                        active_session_last_run(&transaction, request.session_id.as_str())?
                             .filter(|active_run_id| active_run_id != &request.run_id)
                     {
                         return Err(JournalError::SessionRunAlreadyActive {
@@ -9990,7 +10049,7 @@ impl JournalStore {
                         });
                     }
                 }
-                match guard.execute(
+                match transaction.execute(
                     r#"
                         INSERT INTO orchestrator_runs (
                             run_ulid,
@@ -10026,7 +10085,7 @@ impl JournalStore {
                     ],
                 ) {
                     Ok(_) => {
-                        guard.execute(
+                        transaction.execute(
                             r#"
                                 UPDATE orchestrator_sessions
                                 SET
@@ -10045,7 +10104,7 @@ impl JournalStore {
                             ],
                         )?;
                         append_run_lifecycle_event_tx(
-                            guard,
+                            &transaction,
                             &RunLifecycleEventAppendRequest {
                                 event_id: Ulid::new().to_string(),
                                 run_id: request.run_id.clone(),
@@ -10070,6 +10129,12 @@ impl JournalStore {
                             },
                             now,
                         )?;
+                        metadata_trace::create_root_metadata_trace_tx(
+                            &transaction,
+                            request,
+                            now,
+                        )?;
+                        transaction.commit()?;
                         Ok(())
                     }
                     Err(rusqlite::Error::SqliteFailure(error, message))
@@ -10185,9 +10250,18 @@ impl JournalStore {
         let Some((previous_state, session_id, parent_run_id)) = previous else {
             return Err(JournalError::RunNotFound { run_id: run_id.to_owned() });
         };
-        if RunLifecycleState::from_str(previous_state.as_str())
-            .is_some_and(RunLifecycleState::is_terminal)
+        if let Some(previous_terminal) =
+            RunLifecycleState::from_str(previous_state.as_str()).filter(|state| state.is_terminal())
         {
+            drop(guard);
+            if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(previous_terminal)
+            {
+                self.append_metadata_trace_terminalization_best_effort(
+                    run_id,
+                    outcome,
+                    reason_code,
+                );
+            }
             return Ok(());
         }
         let updated = guard.execute(
@@ -10228,6 +10302,10 @@ impl JournalStore {
             },
             now,
         )?;
+        drop(guard);
+        if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(state) {
+            self.append_metadata_trace_terminalization_best_effort(run_id, outcome, reason_code);
+        }
         Ok(())
     }
 
@@ -10375,6 +10453,30 @@ impl JournalStore {
             )?;
             terminalized_run_ids.push(candidate.run_id);
         }
+        drop(guard);
+        for run_id in &terminalized_run_ids {
+            if self
+                .start_metadata_trace_recovery_continuation(
+                    run_id.as_str(),
+                    "startup_recovery.orphaned_run",
+                )
+                .is_err()
+            {
+                let run_id_sha256 = crate::metadata_trace::hash_metadata_trace_run_id(run_id)
+                    .unwrap_or_else(|| "invalid".to_owned());
+                tracing::warn!(
+                    run_id_sha256,
+                    reason_code = "metadata_trace.recovery_continuation_write_failed",
+                    "metadata trace recovery continuation could not be persisted"
+                );
+                continue;
+            }
+            self.append_metadata_trace_terminalization_best_effort(
+                run_id.as_str(),
+                MetadataTraceTerminalOutcomeV1::ForcedAbort,
+                "run.terminal.forced_abort",
+            );
+        }
         Ok(OrchestratorStartupRunRecoveryReport {
             terminalized_count: terminalized_run_ids.len() as u64,
             terminalized_run_ids,
@@ -10488,6 +10590,16 @@ impl JournalStore {
         let previous_lifecycle = RunLifecycleState::from_str(previous_state.as_str());
         let should_cancel = !previous_lifecycle.is_some_and(RunLifecycleState::is_terminal);
         if !should_cancel {
+            drop(guard);
+            if let Some((outcome, reason_code)) =
+                previous_lifecycle.and_then(metadata_trace_terminal_outcome)
+            {
+                self.append_metadata_trace_terminalization_best_effort(
+                    request.run_id.as_str(),
+                    outcome,
+                    reason_code,
+                );
+            }
             return Ok(OrchestratorCancelSnapshot {
                 run_id: request.run_id.clone(),
                 state: previous_state.clone(),
@@ -10533,6 +10645,12 @@ impl JournalStore {
             },
             now,
         )?;
+        drop(guard);
+        self.append_metadata_trace_terminalization_best_effort(
+            request.run_id.as_str(),
+            MetadataTraceTerminalOutcomeV1::Cancelled,
+            "run.terminal.cancelled",
+        );
         Ok(OrchestratorCancelSnapshot {
             run_id: request.run_id.clone(),
             state: RunLifecycleState::Cancelled.as_str().to_owned(),
@@ -15649,7 +15767,7 @@ impl JournalStore {
                 Ok(_) => {
                     return Err(JournalError::InvalidArgument(
                         "dependency repair requires a currently invalid graph".to_owned(),
-                    ))
+                    ));
                 }
                 Err(report) => report,
             };
@@ -35866,9 +35984,7 @@ mod tests {
             })
             .expect("session search should succeed");
         assert!(
-            session_hits
-                .iter()
-                .all(|hit| hit.item.channel.as_deref() != Some("slack")),
+            session_hits.iter().all(|hit| hit.item.channel.as_deref() != Some("slack")),
             "session-scoped channel search must not return same-session memory from another channel"
         );
 

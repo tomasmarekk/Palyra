@@ -16,6 +16,7 @@ pub mod feature_rollouts;
 mod health;
 mod ids;
 pub mod local_runtime_ports;
+pub mod metadata_trace;
 mod net;
 pub mod netguard;
 pub mod process_risk;

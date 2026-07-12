@@ -988,6 +988,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::chat::console_chat_run_events_handler),
         )
         .route(
+            "/console/v1/chat/runs/{run_id}/metadata-trace",
+            get(console::metadata_trace::console_chat_run_metadata_trace_handler),
+        )
+        .route(
             "/console/v1/chat/runs/{run_id}/status",
             get(console::chat::console_chat_run_status_handler),
         )

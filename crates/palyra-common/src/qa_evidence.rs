@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
+    metadata_trace::{MetadataTraceEventDataV1, MetadataTraceSegmentStatusV1, MetadataTraceV1},
     qa_fault_injection::{
         qa_fault_point_descriptor, DeterministicQaFaultScheduler, QaFaultAction,
         QaFaultEvidenceSidecar, QaFaultEvidenceSidecarRecord, QaFaultInjectionPlan,
@@ -24,7 +25,7 @@ use crate::{
 };
 
 /// Current QA evidence bundle schema version.
-pub const QA_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 3;
+pub const QA_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 4;
 
 /// Stable format label embedded in generated evidence bundles.
 pub const QA_EVIDENCE_BUNDLE_FORMAT: &str = "palyra-qa-evidence-bundle";
@@ -166,6 +167,8 @@ pub struct QaEvidenceBuildInput {
     pub daemon_restart_count: u32,
     /// Metadata-only proof of the runtime path used by the real run.
     pub runtime_path: Option<RuntimePathEvidence>,
+    /// Always-on, validated metadata trace loaded from the real run.
+    pub metadata_trace: Option<MetadataTraceV1>,
 }
 
 /// Top-level QA evidence bundle produced per scenario run.
@@ -187,6 +190,9 @@ pub struct QaEvidenceBundle {
     /// Validated runtime-path evidence retained without removing allowed fallbacks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_path: Option<RuntimePathEvidence>,
+    /// Validated metadata-only trace retained as hot-path QA evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_trace: Option<MetadataTraceV1>,
     pub checks: Vec<QaEvidenceCheck>,
     pub summary: QaEvidenceSummary,
     pub redaction: QaEvidenceRedactionReport,
@@ -483,6 +489,8 @@ pub fn build_qa_evidence_bundle(
         .as_ref()
         .filter(|runtime_path| runtime_path.validate_shape().is_ok())
         .cloned();
+    let metadata_trace =
+        input.metadata_trace.as_ref().filter(|trace| trace.validate_shape().is_ok()).cloned();
     let check_count = checks.len();
     let issue_count = checks.iter().map(|check| check.issues.len()).sum::<usize>();
     let fake_progress_detected = checks.iter().any(|check| {
@@ -513,6 +521,7 @@ pub fn build_qa_evidence_bundle(
         fault_injections,
         daemon_restart_count: input.daemon_restart_count,
         runtime_path,
+        metadata_trace,
         checks,
         summary: QaEvidenceSummary {
             verdict,
@@ -543,6 +552,7 @@ pub fn qa_evidence_json_report(bundle: &QaEvidenceBundle) -> Value {
         "fault_injections": bundle.fault_injections,
         "daemon_restart_count": bundle.daemon_restart_count,
         "runtime_path": bundle.runtime_path,
+        "metadata_trace": bundle.metadata_trace,
         "redaction": bundle.redaction,
     })
 }
@@ -614,6 +624,19 @@ pub fn qa_evidence_markdown_report(bundle: &QaEvidenceBundle) -> String {
                 ));
             }
         }
+    } else {
+        lines.push("- Evidence: `not captured`".to_owned());
+    }
+    lines.push(String::new());
+    lines.push("## Metadata Trace".to_owned());
+    lines.push(String::new());
+    if let Some(trace) = bundle.metadata_trace.as_ref() {
+        let event_count = trace.segments.iter().map(|segment| segment.events.len()).sum::<usize>();
+        let final_status =
+            trace.segments.last().map_or("missing", |segment| segment.status.as_str());
+        lines.push(format!("- Segments: {}", trace.segments.len()));
+        lines.push(format!("- Events: {event_count}"));
+        lines.push(format!("- Final segment status: `{final_status}`"));
     } else {
         lines.push("- Evidence: `not captured`".to_owned());
     }
@@ -710,10 +733,88 @@ fn evaluate_checks(
         check_artifacts_and_fake_progress(manifest, observed),
         check_backend_attestation_manifests(input),
     ];
+    let mut supplemental_index = 1;
     if let Some(runtime_path) = check_runtime_path(manifest, input) {
-        checks.insert(1, runtime_path);
+        checks.insert(supplemental_index, runtime_path);
+        supplemental_index += 1;
+    }
+    if let Some(metadata_trace) = check_metadata_trace(manifest, input) {
+        checks.insert(supplemental_index, metadata_trace);
     }
     checks
+}
+
+fn check_metadata_trace(
+    manifest: &QaScenarioManifest,
+    input: &QaEvidenceBuildInput,
+) -> Option<QaEvidenceCheck> {
+    let required = manifest.expect.runtime_path.is_some();
+    let Some(trace) = input.metadata_trace.as_ref() else {
+        return required.then(|| {
+            check(
+                "metadata_trace",
+                vec![QaEvidenceIssue {
+                    code: "metadata_trace_evidence_missing".to_owned(),
+                    path: "$.metadata_trace".to_owned(),
+                    message: "scenario requires the real run's always-on metadata trace".to_owned(),
+                    expected: Some("valid complete metadata trace".to_owned()),
+                    actual: Some("missing".to_owned()),
+                }],
+            )
+        });
+    };
+
+    let mut issues = Vec::new();
+    if let Err(error) = trace.validate_shape() {
+        issues.push(QaEvidenceIssue {
+            code: error.code().to_owned(),
+            path: error.path().strip_prefix('$').map_or_else(
+                || "$.metadata_trace".to_owned(),
+                |suffix| format!("$.metadata_trace{suffix}"),
+            ),
+            message: "metadata trace failed strict contract validation".to_owned(),
+            expected: Some("valid bounded metadata trace".to_owned()),
+            actual: Some("invalid".to_owned()),
+        });
+    } else if required {
+        let observed_kinds = trace
+            .segments
+            .iter()
+            .flat_map(|segment| segment.events.iter().map(|event| event.kind()))
+            .collect::<BTreeSet<_>>();
+        for required_kind in [
+            "run_started",
+            "runtime_selected",
+            "context_assembled",
+            "provider_attempt",
+            "terminalization",
+        ] {
+            if !observed_kinds.contains(required_kind) {
+                issues.push(QaEvidenceIssue {
+                    code: "metadata_trace_hot_path_event_missing".to_owned(),
+                    path: "$.metadata_trace.segments".to_owned(),
+                    message: "metadata trace is missing a required hot-path event".to_owned(),
+                    expected: Some(required_kind.to_owned()),
+                    actual: Some("missing".to_owned()),
+                });
+            }
+        }
+        if !trace.segments.last().is_some_and(|segment| {
+            segment.status == MetadataTraceSegmentStatusV1::Complete
+                && segment.events.last().is_some_and(|event| {
+                    matches!(event.event, MetadataTraceEventDataV1::Terminalization(_))
+                })
+        }) {
+            issues.push(QaEvidenceIssue {
+                code: "metadata_trace_terminal_evidence_missing".to_owned(),
+                path: "$.metadata_trace.segments".to_owned(),
+                message: "terminal QA runs require a complete final trace segment".to_owned(),
+                expected: Some("complete segment ending in terminalization".to_owned()),
+                actual: Some("not complete".to_owned()),
+            });
+        }
+    }
+    Some(check("metadata_trace", issues))
 }
 
 fn check_runtime_path(
@@ -2252,6 +2353,15 @@ mod tests {
 
     use super::*;
     use crate::{
+        metadata_trace::{
+            metadata_trace_id_sha256, ContextAssembledMetadataV1, MetadataTraceEntrypointV1,
+            MetadataTraceEventDataV1, MetadataTraceEventV1, MetadataTraceIdDomainV1,
+            MetadataTraceProviderAttemptOutcomeV1, MetadataTraceRouteClassV1,
+            MetadataTraceSchemaHashV1, MetadataTraceSegmentStatusV1, MetadataTraceSegmentV1,
+            MetadataTraceTerminalOutcomeV1, MetadataTraceV1, ProviderAttemptMetadataV1,
+            RunStartedMetadataV1, RuntimeSelectedMetadataV1, TerminalizationMetadataV1,
+            METADATA_TRACE_SCHEMA_VERSION,
+        },
         qa_runtime_path::{
             RuntimeFallbackEvidence, RuntimePathComponentEvidence,
             QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION,
@@ -2265,7 +2375,7 @@ mod tests {
     const MARKDOWN_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_evidence_report_basic.md");
     const FAULT_JSON_GOLDEN: &str =
-        include_str!("../../../fixtures/golden/qa_evidence_fault_report_v3.json");
+        include_str!("../../../fixtures/golden/qa_evidence_fault_report_v4.json");
     const REQUIRED_TOOL_SCENARIO: &str = r#"
 schema_version: 1
 id: tool.required
@@ -2440,7 +2550,7 @@ timeout:
         assert!(run_alias.starts_with("<normalized:id:"));
         assert_eq!(bundle.redacted_tape[0].payload["run_id"], run_alias);
         assert_eq!(qa_evidence_json_report(&bundle)["verdict"], "passed");
-        assert_eq!(bundle.schema_version, 3);
+        assert_eq!(bundle.schema_version, 4);
     }
 
     #[test]
@@ -3568,7 +3678,120 @@ timeout:
         QaEvidenceBuildInput {
             terminal_state: Some("completed".to_owned()),
             runtime_path: Some(qualified_runtime_path()),
+            metadata_trace: Some(qualified_metadata_trace()),
             ..QaEvidenceBuildInput::default()
+        }
+    }
+
+    fn qualified_metadata_trace() -> MetadataTraceV1 {
+        let event = |sequence, event| MetadataTraceEventV1 {
+            sequence,
+            generation: 1,
+            recorded_at_unix_ms: 1,
+            event_id_sha256: metadata_trace_id_sha256(
+                MetadataTraceIdDomainV1::Event,
+                format!("event-{sequence}").as_str(),
+            )
+            .expect("event id should hash"),
+            causal_parent_event_id_sha256: sequence.checked_sub(1).map(|parent| {
+                metadata_trace_id_sha256(
+                    MetadataTraceIdDomainV1::Event,
+                    format!("event-{parent}").as_str(),
+                )
+                .expect("parent event id should hash")
+            }),
+            stage_duration_ms: None,
+            event,
+        };
+        MetadataTraceV1 {
+            schema_version: METADATA_TRACE_SCHEMA_VERSION,
+            run_id_sha256: metadata_trace_id_sha256(MetadataTraceIdDomainV1::Run, "test-run")
+                .expect("run id should hash"),
+            session_id_sha256: metadata_trace_id_sha256(
+                MetadataTraceIdDomainV1::Session,
+                "test-session",
+            )
+            .expect("session id should hash"),
+            segments: vec![MetadataTraceSegmentV1 {
+                segment_id_sha256: metadata_trace_id_sha256(
+                    MetadataTraceIdDomainV1::Segment,
+                    "test-segment",
+                )
+                .expect("segment id should hash"),
+                segment_index: 0,
+                generation: 1,
+                status: MetadataTraceSegmentStatusV1::Complete,
+                events: vec![
+                    event(
+                        0,
+                        MetadataTraceEventDataV1::RunStarted(RunStartedMetadataV1 {
+                            entrypoint: MetadataTraceEntrypointV1::NewRun,
+                        }),
+                    ),
+                    event(
+                        1,
+                        MetadataTraceEventDataV1::RuntimeSelected(RuntimeSelectedMetadataV1 {
+                            harness_id: "external_harness".to_owned(),
+                            harness_version: "harness.v1".to_owned(),
+                            runtime_id: "palyrad".to_owned(),
+                            runtime_version: "runtime.v1".to_owned(),
+                            route_class: MetadataTraceRouteClassV1::Fixture,
+                            auth_profile_id_sha256: None,
+                            schema_hashes: vec![MetadataTraceSchemaHashV1 {
+                                schema_id: "runtime".to_owned(),
+                                sha256: metadata_trace_id_sha256(
+                                    MetadataTraceIdDomainV1::Custom,
+                                    "runtime-schema",
+                                )
+                                .expect("schema id should hash"),
+                            }],
+                        }),
+                    ),
+                    event(
+                        2,
+                        MetadataTraceEventDataV1::ContextAssembled(ContextAssembledMetadataV1 {
+                            context_engine_id: "context_engine_v2".to_owned(),
+                            context_engine_version: "context.v2".to_owned(),
+                            context_schema_sha256: metadata_trace_id_sha256(
+                                MetadataTraceIdDomainV1::Custom,
+                                "context-schema",
+                            )
+                            .expect("context schema should hash"),
+                            input_item_count: 2,
+                            retained_item_count: 2,
+                        }),
+                    ),
+                    event(
+                        3,
+                        MetadataTraceEventDataV1::ProviderAttempt(ProviderAttemptMetadataV1 {
+                            provider_id_sha256: metadata_trace_id_sha256(
+                                MetadataTraceIdDomainV1::Provider,
+                                "fixture-provider",
+                            )
+                            .expect("provider id should hash"),
+                            model_id_sha256: metadata_trace_id_sha256(
+                                MetadataTraceIdDomainV1::Model,
+                                "fixture-model",
+                            )
+                            .expect("model id should hash"),
+                            route_class: MetadataTraceRouteClassV1::Fixture,
+                            auth_profile_id_sha256: None,
+                            attempt: 1,
+                            outcome: MetadataTraceProviderAttemptOutcomeV1::Succeeded,
+                            reason_code: "provider.attempt.succeeded".to_owned(),
+                        }),
+                    ),
+                    event(
+                        4,
+                        MetadataTraceEventDataV1::Terminalization(TerminalizationMetadataV1 {
+                            outcome: MetadataTraceTerminalOutcomeV1::Done,
+                            reason_code: "run.completed".to_owned(),
+                            output_emitted: true,
+                            side_effect_may_have_occurred: true,
+                        }),
+                    ),
+                ],
+            }],
         }
     }
 

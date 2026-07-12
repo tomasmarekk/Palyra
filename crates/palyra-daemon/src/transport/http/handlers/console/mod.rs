@@ -28,6 +28,7 @@ pub(crate) mod logs;
 pub(crate) mod maintenance;
 pub(crate) mod memory;
 pub(crate) mod memory_external_index;
+pub(crate) mod metadata_trace;
 pub(crate) mod mobile;
 pub(crate) mod models;
 pub(crate) mod nodes;

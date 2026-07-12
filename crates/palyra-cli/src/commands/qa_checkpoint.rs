@@ -1110,7 +1110,7 @@ mod tests {
             normalized_manifest_sha256: sha256_hex(format!("manifest:{seed}").as_bytes()),
             fixture_set_sha256: sha256_hex(format!("fixtures:{seed}").as_bytes()),
             runtime_version: "0.1.0-test".to_owned(),
-            runtime_contract_version: "runtime-contracts.v7".to_owned(),
+            runtime_contract_version: "runtime-contracts.v8".to_owned(),
             runner_version: TEST_RUNNER_VERSION.to_owned(),
             provider_lane: "fixture".to_owned(),
             provider_binding_sha256: sha256_hex(format!("binding:{seed}").as_bytes()),

@@ -8670,6 +8670,20 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/chat/runs/{run_id}/metadata-trace",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.chat.runs.by_run_id.metadata_trace",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.chat.runs.by_run_id.metadata_trace.request.method-registry.v1",
+        "request_schema_hash": "0024b358a40d326a221735a86f548e629c02dceb8fa7f23c08eb67a7c7075218",
+        "response_schema_id": "console.get.console.v1.chat.runs.by_run_id.metadata_trace.response.method-registry.v1",
+        "response_schema_hash": "62daa3a99ac13854bdf1c87bf84095937c55d5a847cd9297d9fc034fbccf680c",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/chat/runs/{run_id}/queue",
         "http_method": "POST",
         "method_name": "console.post.console.v1.chat.runs.by_run_id.queue",
@@ -13035,6 +13049,391 @@
         ]
       }
     ],
+    "invariant_contract": {
+      "schema_version": 1,
+      "authority": "host_runtime",
+      "journal_authoritative": true,
+      "diagnostics_authoritative": false,
+      "descriptors": [
+        {
+          "invariant": "exactly_one_terminal_event",
+          "violation_reason_code": "runtime.invariant.exactly_one_terminal_event",
+          "subsystem": "runtime_kernel",
+          "phase": "finalization",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::closed_generation_requires_exactly_one_terminal_event"
+        },
+        {
+          "invariant": "one_active_generation",
+          "violation_reason_code": "runtime.invariant.one_active_generation",
+          "subsystem": "runtime_kernel",
+          "phase": "admission",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::active_generation_is_single_owner"
+        },
+        {
+          "invariant": "no_automatic_duplicate_side_effect",
+          "violation_reason_code": "runtime.invariant.no_automatic_duplicate_side_effect",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::unresolved_side_effect_is_not_automatically_replayed"
+        },
+        {
+          "invariant": "durable_intent_before_effect",
+          "violation_reason_code": "runtime.invariant.durable_intent_before_effect",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::effect_requires_prior_durable_intent"
+        },
+        {
+          "invariant": "durable_delivery_intent_before_send",
+          "violation_reason_code": "runtime.invariant.durable_delivery_intent_before_send",
+          "subsystem": "delivery",
+          "phase": "delivery_send",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::delivery_send_requires_prior_durable_intent"
+        },
+        {
+          "invariant": "unknown_outcome_distinct",
+          "violation_reason_code": "runtime.invariant.unknown_outcome_distinct",
+          "subsystem": "recovery",
+          "phase": "recovery",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::unknown_outcome_is_not_success_or_failure"
+        }
+      ]
+    },
+    "error_taxonomy": {
+      "snapshot_version": "runtime-error-envelope.v1",
+      "changelog_note": "Adds a strict metadata-only runtime error taxonomy, binding invariant registry, and exact legacy compatibility map without changing frozen public error envelopes.",
+      "schema_version": 1,
+      "schema_path": "schemas/json/common/runtime-error-envelope.v1.json",
+      "deny_unknown_fields": true,
+      "raw_provider_payload_allowed": false,
+      "raw_stderr_allowed": false,
+      "reason_code_max_bytes": 128,
+      "safe_message_max_bytes": 2048,
+      "recovery_hint_max_bytes": 512,
+      "required_fields": [
+        "schema_version",
+        "class",
+        "reason_code",
+        "subsystem",
+        "phase",
+        "retryability",
+        "security_class",
+        "user_visibility",
+        "output_emitted",
+        "side_effect_may_have_occurred",
+        "safe_message",
+        "recovery_hint"
+      ],
+      "classes": [
+        "invalid_request",
+        "policy_denied",
+        "approval_required",
+        "auth_unavailable",
+        "provider_retryable",
+        "provider_terminal",
+        "tool_execution_unknown",
+        "plugin_contract_violation",
+        "recovery_blocked",
+        "delivery_unknown",
+        "cancelled",
+        "internal_invariant_violation"
+      ],
+      "subsystems": [
+        "runtime_kernel",
+        "run_stream",
+        "control_plane",
+        "auth",
+        "provider",
+        "policy",
+        "approval",
+        "tool",
+        "plugin",
+        "recovery",
+        "delivery",
+        "background_queue",
+        "session",
+        "worker",
+        "mcp",
+        "browser"
+      ],
+      "phases": [
+        "request_validation",
+        "admission",
+        "queueing",
+        "runtime_selection",
+        "context_assembly",
+        "provider_call",
+        "provider_recovery",
+        "provider_finalization",
+        "policy_evaluation",
+        "tool_validation",
+        "tool_gate",
+        "approval",
+        "tool_execution",
+        "result_projection",
+        "compaction",
+        "verification",
+        "recovery",
+        "delivery_intent",
+        "delivery_queue",
+        "delivery_send",
+        "delivery_acknowledgement",
+        "finalization",
+        "cancellation",
+        "plugin_negotiation",
+        "plugin_host_call_authorization",
+        "plugin_execution",
+        "internal"
+      ],
+      "retryability": [
+        "not_retryable",
+        "safe_same_request",
+        "safe_after_backoff",
+        "requires_credential_refresh",
+        "requires_request_transform",
+        "requires_context_compaction",
+        "requires_provider_failover",
+        "requires_approval",
+        "requires_idempotency_guard",
+        "requires_operator_review"
+      ],
+      "security_classes": [
+        "public",
+        "operator",
+        "internal",
+        "sensitive"
+      ],
+      "user_visibility": [
+        "silent",
+        "status_only",
+        "safe_message",
+        "action_required"
+      ],
+      "terminal_outcomes": [
+        {
+          "outcome": "completed",
+          "phase": "finalization",
+          "reason_code": "runtime.terminal.completed"
+        },
+        {
+          "outcome": "failed",
+          "phase": "finalization",
+          "reason_code": "runtime.terminal.failed"
+        },
+        {
+          "outcome": "cancelled",
+          "phase": "cancellation",
+          "reason_code": "runtime.terminal.cancelled"
+        },
+        {
+          "outcome": "timed_out",
+          "phase": "finalization",
+          "reason_code": "runtime.terminal.timed_out"
+        }
+      ],
+      "invariants": [
+        {
+          "invariant": "exactly_one_terminal_event",
+          "violation_reason_code": "runtime.invariant.exactly_one_terminal_event",
+          "subsystem": "runtime_kernel",
+          "phase": "finalization",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::closed_generation_requires_exactly_one_terminal_event"
+        },
+        {
+          "invariant": "one_active_generation",
+          "violation_reason_code": "runtime.invariant.one_active_generation",
+          "subsystem": "runtime_kernel",
+          "phase": "admission",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::active_generation_is_single_owner"
+        },
+        {
+          "invariant": "no_automatic_duplicate_side_effect",
+          "violation_reason_code": "runtime.invariant.no_automatic_duplicate_side_effect",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::unresolved_side_effect_is_not_automatically_replayed"
+        },
+        {
+          "invariant": "durable_intent_before_effect",
+          "violation_reason_code": "runtime.invariant.durable_intent_before_effect",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::effect_requires_prior_durable_intent"
+        },
+        {
+          "invariant": "durable_delivery_intent_before_send",
+          "violation_reason_code": "runtime.invariant.durable_delivery_intent_before_send",
+          "subsystem": "delivery",
+          "phase": "delivery_send",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::delivery_send_requires_prior_durable_intent"
+        },
+        {
+          "invariant": "unknown_outcome_distinct",
+          "violation_reason_code": "runtime.invariant.unknown_outcome_distinct",
+          "subsystem": "recovery",
+          "phase": "recovery",
+          "evidence_test": "runtime_contracts::error_taxonomy::tests::unknown_outcome_is_not_success_or_failure"
+        }
+      ],
+      "legacy_compatibility": [
+        {
+          "legacy_reason_code": "provider.recovery.retry_after",
+          "class": "provider_retryable",
+          "subsystem": "provider",
+          "phase": "provider_recovery",
+          "retryability": "safe_after_backoff",
+          "security_class": "sensitive",
+          "user_visibility": "status_only"
+        },
+        {
+          "legacy_reason_code": "provider.recovery.fail_closed",
+          "class": "provider_terminal",
+          "subsystem": "provider",
+          "phase": "provider_finalization",
+          "retryability": "not_retryable",
+          "security_class": "sensitive",
+          "user_visibility": "safe_message"
+        },
+        {
+          "legacy_reason_code": "provider.recovery.refresh_credential",
+          "class": "auth_unavailable",
+          "subsystem": "auth",
+          "phase": "provider_recovery",
+          "retryability": "requires_credential_refresh",
+          "security_class": "sensitive",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "tool_catalog.invalid_json",
+          "class": "invalid_request",
+          "subsystem": "tool",
+          "phase": "tool_validation",
+          "retryability": "not_retryable",
+          "security_class": "internal",
+          "user_visibility": "safe_message"
+        },
+        {
+          "legacy_reason_code": "tool_replay.mutating_timeout_requires_guard",
+          "class": "tool_execution_unknown",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "retryability": "requires_idempotency_guard",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "approval.pending",
+          "class": "approval_required",
+          "subsystem": "approval",
+          "phase": "approval",
+          "retryability": "requires_approval",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "approval.required",
+          "class": "approval_required",
+          "subsystem": "approval",
+          "phase": "approval",
+          "retryability": "requires_approval",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "approval.denied",
+          "class": "policy_denied",
+          "subsystem": "approval",
+          "phase": "approval",
+          "retryability": "not_retryable",
+          "security_class": "internal",
+          "user_visibility": "safe_message"
+        },
+        {
+          "legacy_reason_code": "platform_outcome_unknown",
+          "class": "delivery_unknown",
+          "subsystem": "delivery",
+          "phase": "delivery_acknowledgement",
+          "retryability": "requires_idempotency_guard",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "channel.delivery.deferred_retry.concurrency_limit",
+          "class": "recovery_blocked",
+          "subsystem": "delivery",
+          "phase": "delivery_queue",
+          "retryability": "safe_after_backoff",
+          "security_class": "internal",
+          "user_visibility": "status_only"
+        },
+        {
+          "legacy_reason_code": "agent_harness_plugin.contract_missing",
+          "class": "plugin_contract_violation",
+          "subsystem": "plugin",
+          "phase": "plugin_negotiation",
+          "retryability": "not_retryable",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "agent_harness_plugin.contract_rejected",
+          "class": "plugin_contract_violation",
+          "subsystem": "plugin",
+          "phase": "plugin_negotiation",
+          "retryability": "not_retryable",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "plugin.host_call.denied.service_grant_missing",
+          "class": "policy_denied",
+          "subsystem": "plugin",
+          "phase": "plugin_host_call_authorization",
+          "retryability": "not_retryable",
+          "security_class": "sensitive",
+          "user_visibility": "safe_message"
+        },
+        {
+          "legacy_reason_code": "workspace_patch.execution_failed",
+          "class": "recovery_blocked",
+          "subsystem": "tool",
+          "phase": "tool_execution",
+          "retryability": "requires_operator_review",
+          "security_class": "internal",
+          "user_visibility": "action_required"
+        },
+        {
+          "legacy_reason_code": "runtime.invariant.phase_mismatch",
+          "class": "internal_invariant_violation",
+          "subsystem": "runtime_kernel",
+          "phase": "internal",
+          "retryability": "not_retryable",
+          "security_class": "internal",
+          "user_visibility": "status_only"
+        }
+      ],
+      "legacy_projection": {
+        "new_to_palyra_error": "total",
+        "palyra_error_to_new": "fallible_typed_category_or_exact_reason_code",
+        "message_text_classification_allowed": false,
+        "mass_reason_code_rename_required": false
+      }
+    },
+    "runtime_error_metadata_trace": {
+      "schema_version": 1,
+      "status": "always_on",
+      "storage": "append_only_segments",
+      "segment_statuses": [
+        "complete",
+        "interrupted",
+        "corrupt_suffix_isolated"
+      ],
+      "redaction_level": "metadata_only",
+      "failure_signal": "counters.metadata_trace_failures",
+      "terminal_reason_source_event": "run.runtime_path_summary",
+      "rich_trace_approval_required": true,
+      "reason_code": "metadata_trace.always_on.ready"
+    },
     "host_authority": {
       "valid": true,
       "checklist": [
@@ -13913,7 +14312,7 @@
       "diagnostics_sections": 53,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
-      "method_registry_methods": 508,
+      "method_registry_methods": 509,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -13945,7 +14344,7 @@
         "admin": 52,
         "canvas": 5,
         "compat": 16,
-        "console": 432,
+        "console": 433,
         "public": 2,
         "realtime": 1
       }

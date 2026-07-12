@@ -157,6 +157,7 @@ use std::path::PathBuf;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 mod external_retrieval;
+mod metadata_trace;
 
 fn sign_canvas_hmac_sha256(secret: &[u8], domain: &str, parts: &[&[u8]]) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
@@ -903,6 +904,8 @@ pub(crate) struct RuntimeCounters {
     orchestrator_runs_cancelled: AtomicU64,
     orchestrator_cancel_requests: AtomicU64,
     orchestrator_tape_events: AtomicU64,
+    metadata_trace_events: AtomicU64,
+    metadata_trace_failures: AtomicU64,
     model_provider_requests: AtomicU64,
     model_provider_failures: AtomicU64,
     model_provider_retry_attempts: AtomicU64,
@@ -1050,6 +1053,8 @@ pub struct CountersSnapshot {
     pub orchestrator_runs_cancelled: u64,
     pub orchestrator_cancel_requests: u64,
     pub orchestrator_tape_events: u64,
+    pub metadata_trace_events: u64,
+    pub metadata_trace_failures: u64,
     pub model_provider_requests: u64,
     pub model_provider_failures: u64,
     pub model_provider_retry_attempts: u64,
@@ -1426,6 +1431,8 @@ impl RuntimeCounters {
             orchestrator_runs_cancelled: self.orchestrator_runs_cancelled.load(Ordering::Relaxed),
             orchestrator_cancel_requests: self.orchestrator_cancel_requests.load(Ordering::Relaxed),
             orchestrator_tape_events: self.orchestrator_tape_events.load(Ordering::Relaxed),
+            metadata_trace_events: self.metadata_trace_events.load(Ordering::Relaxed),
+            metadata_trace_failures: self.metadata_trace_failures.load(Ordering::Relaxed),
             model_provider_requests: self.model_provider_requests.load(Ordering::Relaxed),
             model_provider_failures: self.model_provider_failures.load(Ordering::Relaxed),
             model_provider_retry_attempts: self
@@ -1854,6 +1861,8 @@ impl GatewayRuntimeState {
                 orchestrator_runs_cancelled: AtomicU64::new(0),
                 orchestrator_cancel_requests: AtomicU64::new(0),
                 orchestrator_tape_events: AtomicU64::new(0),
+                metadata_trace_events: AtomicU64::new(0),
+                metadata_trace_failures: AtomicU64::new(0),
                 model_provider_requests: AtomicU64::new(0),
                 model_provider_failures: AtomicU64::new(0),
                 model_provider_retry_attempts: AtomicU64::new(0),
@@ -5858,9 +5867,37 @@ impl GatewayRuntimeState {
         &self,
         request: &OrchestratorTapeAppendRequest,
     ) -> Result<(), Status> {
-        self.journal_store
-            .append_orchestrator_tape_event(request)
-            .map_err(|error| map_orchestrator_store_error("append orchestrator tape event", error))
+        self.journal_store.append_orchestrator_tape_event(request).map_err(|error| {
+            map_orchestrator_store_error("append orchestrator tape event", error)
+        })?;
+        let record = crate::journal::OrchestratorTapeRecord {
+            seq: request.seq,
+            event_type: request.event_type.clone(),
+            payload_json: request.payload_json.clone(),
+        };
+        match self
+            .journal_store
+            .append_projected_metadata_trace_event(request.run_id.as_str(), &record)
+        {
+            Ok(true) => {
+                self.counters.metadata_trace_events.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.counters.metadata_trace_failures.fetch_add(1, Ordering::Relaxed);
+                let run_id_sha256 = palyra_common::metadata_trace::metadata_trace_id_sha256(
+                    palyra_common::metadata_trace::MetadataTraceIdDomainV1::Run,
+                    request.run_id.as_str(),
+                )
+                .unwrap_or_else(|_| "invalid".to_owned());
+                warn!(
+                    run_id_sha256 = %run_id_sha256,
+                    reason_code = "metadata_trace.projection_append_failed",
+                    "metadata trace projection failed after durable tape append"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]

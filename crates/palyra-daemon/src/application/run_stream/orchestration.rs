@@ -16,6 +16,7 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use palyra_common::{
+    metadata_trace::{metadata_trace_id_sha256, MetadataTraceIdDomainV1},
     qa_runtime_path::{
         ProviderRouteChangeEvent, PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_ROUTE_CHANGE_EVENT,
         PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION, PROVIDER_ROUTE_CHANGE_EVIDENCE_TRUNCATED_EVENT,
@@ -128,6 +129,12 @@ const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
 const PROVIDER_RETRY_STARTED_EVENT: &str = "provider.retry.started";
 const PROVIDER_RETRY_EVIDENCE_TRUNCATED_EVENT: &str = "provider.retry.evidence_truncated";
+const RUNTIME_SELECTED_METADATA_EVENT: &str = "metadata.runtime_selected";
+const CONTEXT_ASSEMBLED_METADATA_EVENT: &str = "context.assembled";
+const PROVIDER_ATTEMPT_COMPLETED_METADATA_EVENT: &str = "provider.attempt.completed";
+// Hash a fixed field contract rather than assembled content so this evidence
+// identifies the schema without becoming a prompt fingerprint.
+const CONTEXT_ASSEMBLED_METADATA_SCHEMA_V1: &[u8] = b"context.assembled.v1\0context_engine_id:string\0context_engine_version:string\0input_item_count:u32\0retained_item_count:u32";
 const MAX_PROVIDER_RETRY_EVIDENCE_EVENTS: usize = 16;
 const MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS: usize = 16;
 const BEFORE_FINALIZE_EVENT: &str = "run.before_finalize";
@@ -182,7 +189,7 @@ pub(crate) enum RunStreamPostProviderOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamProviderRequestOutcome {
     /// The provider answered within the deadline (boxed: the response is large).
-    Completed(Box<ProviderResponse>),
+    Completed { response: Box<ProviderResponse>, duration_ms: u64 },
     /// The deadline elapsed first; `message` is the operator-facing diagnosis.
     TimedOut { reason: ProviderRequestTimeoutReason, message: String },
     /// A cancel request was observed; the cancelled transition was applied.
@@ -314,6 +321,9 @@ const RUN_STREAM_HARNESS_RUNTIME_POLICY: &str = "run_stream_host_owned";
 const RUN_STREAM_HARNESS_SANDBOX_MODE: &str = "host_owned";
 const RUN_STREAM_HARNESS_TOOL_POLICY: &str = "run_stream_catalog_approval_execution_gate";
 const RUN_STREAM_MODEL_CAPABILITIES: [&str; 1] = ["text"];
+// This fixed byte contract fingerprints the exact allowlisted projection shape,
+// without deriving a digest from any run-specific or user-authored payload.
+const RUNTIME_SELECTED_METADATA_SCHEMA_V1: &[u8] = b"palyra.metadata_trace.runtime_selected.v1\0harness_id\0harness_version\0runtime_id\0runtime_version\0route_class\0auth_profile_id_sha256\0schema_hashes";
 
 #[derive(Debug, Clone)]
 struct RunStreamHarnessLifecycle {
@@ -1031,9 +1041,10 @@ async fn execute_run_stream_provider_request(
     loop {
         tokio::select! {
             provider_result = &mut provider_future => {
-                return provider_result
-                    .map(Box::new)
-                    .map(RunStreamProviderRequestOutcome::Completed);
+                return provider_result.map(|response| RunStreamProviderRequestOutcome::Completed {
+                    response: Box::new(response),
+                    duration_ms: duration_millis_u64(provider_started_at.elapsed()),
+                });
             }
             _ = &mut provider_deadline => {
                 return Ok(RunStreamProviderRequestOutcome::TimedOut {
@@ -1289,6 +1300,107 @@ async fn record_harness_tool_surface_projection(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ContextAssembledMetadataRecord<'a> {
+    context_engine_id: &'a str,
+    context_engine_version: &'a str,
+    context_schema_sha256: &'a str,
+    input_item_count: u32,
+    retained_item_count: u32,
+    stage_duration_ms: u64,
+}
+
+async fn record_context_assembled_metadata_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    metadata: ContextAssembledMetadataRecord<'_>,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: CONTEXT_ASSEMBLED_METADATA_EVENT.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "context_engine_id": metadata.context_engine_id,
+                "context_engine_version": metadata.context_engine_version,
+                "context_schema_sha256": metadata.context_schema_sha256,
+                "input_item_count": metadata.input_item_count,
+                "retained_item_count": metadata.retained_item_count,
+                "stage_duration_ms": metadata.stage_duration_ms,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
+}
+
+async fn record_provider_attempt_completed_metadata_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    response: &ProviderResponse,
+    stage_duration_ms: u64,
+) -> Result<(), Status> {
+    let last_attempt = response.attempts.last();
+    let auth_profile_id_sha256 =
+        last_attempt.and_then(|attempt| attempt.state.as_ref()).and_then(|state| {
+            metadata_trace_id_sha256(
+                MetadataTraceIdDomainV1::AuthProfile,
+                state.provider_profile_id.as_str(),
+            )
+            .ok()
+        });
+    let outcome = match last_attempt {
+        Some(attempt) if attempt.outcome == "error" && attempt.retryable => "retryable_failure",
+        Some(attempt) if attempt.outcome == "error" => "terminal_failure",
+        _ => "succeeded",
+    };
+    // Keep this always-on projection on a closed stable vocabulary. Provider
+    // diagnostics remain on the richer tape and never flow into metadata fields.
+    let reason_code = match outcome {
+        "retryable_failure" => "provider.attempt.retryable_failure",
+        "terminal_failure" => "provider.attempt.terminal_failure",
+        _ => "provider.attempt.succeeded",
+    };
+    let attempt = u16::try_from(response.attempts.len().max(1)).unwrap_or(u16::MAX);
+    let route_class = if response.failover_count > 0 {
+        "fallback"
+    } else {
+        response.qa_lane_attestation.as_ref().map_or("primary", |attestation| {
+            match attestation.provider_lane.as_str() {
+                "fixture" => "fixture",
+                "record_replay" => "record_replay",
+                "live" => "live",
+                _ => "primary",
+            }
+        })
+    };
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: PROVIDER_ATTEMPT_COMPLETED_METADATA_EVENT.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "provider_id": response.provider_id,
+                "model_id": response.model_id,
+                "route_class": route_class,
+                "auth_profile_id_sha256": auth_profile_id_sha256,
+                "attempt": attempt,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "stage_duration_ms": stage_duration_ms,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_and_record_run_stream_tool_catalog_snapshot(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1513,7 +1625,21 @@ async fn maybe_start_run_stream_harness_lifecycle(
     lifecycle: &mut Option<RunStreamHarnessLifecycle>,
     request: RunStreamHarnessStartRequest<'_>,
 ) -> Result<(), Status> {
-    if lifecycle.is_some() || !runtime_state.config.feature_rollouts.agent_harness_runtime.enabled {
+    if lifecycle.is_some() {
+        return Ok(());
+    }
+
+    if !runtime_state.config.feature_rollouts.agent_harness_runtime.enabled {
+        // Keep always-on metadata separate from the rollout-gated
+        // `harness.selection` event consumed by runtime-path qualification.
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            RUNTIME_SELECTED_METADATA_EVENT,
+            embedded_run_stream_runtime_selection_payload(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1677,10 +1803,12 @@ fn run_stream_harness_selection_payload(
     request: RunStreamHarnessStartRequest<'_>,
 ) -> String {
     let diagnostics = &lifecycle.diagnostics;
+    let metadata_schema_sha256 = crate::sha256_hex(RUNTIME_SELECTED_METADATA_SCHEMA_V1);
     json!({
         "schema_version": 1,
         "event": HARNESS_SELECTION_EVENT,
         "harness_id": diagnostics.harness_id,
+        "harness_version": env!("CARGO_PKG_VERSION"),
         "descriptor_hash": diagnostics.descriptor_hash,
         "selection_mode": diagnostics.selection_mode,
         "support_outcome": diagnostics.support_outcome,
@@ -1689,6 +1817,12 @@ fn run_stream_harness_selection_payload(
         "fallback_policy": diagnostics.fallback_policy,
         "embedded_default": diagnostics.embedded_default,
         "runtime_policy": RUN_STREAM_HARNESS_RUNTIME_POLICY,
+        "runtime_id": RUN_STREAM_HARNESS_RUNTIME_POLICY,
+        "runtime_version": env!("CARGO_PKG_VERSION"),
+        "schema_hashes": [{
+            "schema_id": "metadata_trace.runtime_selected.v1",
+            "sha256": metadata_schema_sha256,
+        }],
         "session_id": request.session_id,
         "provider_id": request.provider_id,
         "model_id": request.model_id,
@@ -1696,6 +1830,23 @@ fn run_stream_harness_selection_payload(
         "sandbox_mode": RUN_STREAM_HARNESS_SANDBOX_MODE,
         "tool_policy_summary": RUN_STREAM_HARNESS_TOOL_POLICY,
         "mutating": request.mutating,
+    })
+    .to_string()
+}
+
+fn embedded_run_stream_runtime_selection_payload() -> String {
+    json!({
+        "schema_version": 1,
+        "event": RUNTIME_SELECTED_METADATA_EVENT,
+        "harness_id": "embedded_run_stream",
+        "harness_version": env!("CARGO_PKG_VERSION"),
+        "runtime_id": RUN_STREAM_HARNESS_RUNTIME_POLICY,
+        "runtime_version": env!("CARGO_PKG_VERSION"),
+        "route_class": "primary",
+        "schema_hashes": [{
+            "schema_id": "metadata_trace.runtime_selected.v1",
+            "sha256": crate::sha256_hex(RUNTIME_SELECTED_METADATA_SCHEMA_V1),
+        }],
     })
     .to_string()
 }
@@ -2641,6 +2792,7 @@ async fn process_run_stream_message_inner(
         .await?,
     );
     let previous_run_id_for_context = previous_session_run_id.take();
+    let context_assembly_started_at = TokioInstant::now();
     let prepared_provider_input = prepare_model_provider_input(
         runtime_state,
         request_context,
@@ -2661,6 +2813,29 @@ async fn process_run_stream_message_inner(
             memory_ingest_reason: "run_stream_user_input",
             memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
             channel_for_log: request_context.channel.as_deref().unwrap_or("n/a"),
+        },
+    )
+    .await?;
+    let context_engine_enabled = runtime_state.config.feature_rollouts.context_engine.enabled;
+    let (context_engine_id, context_engine_version) = if context_engine_enabled {
+        ("default_context_engine", "context_engine.default.v1")
+    } else {
+        ("legacy_provider_input", "legacy_provider_input.v1")
+    };
+    let context_schema_sha256 = crate::sha256_hex(CONTEXT_ASSEMBLED_METADATA_SCHEMA_V1);
+    let retained_item_count =
+        u32::try_from(prepared_provider_input.prompt_segments.len().max(1)).unwrap_or(u32::MAX);
+    record_context_assembled_metadata_event(
+        runtime_state,
+        run_id.as_str(),
+        tape_seq,
+        ContextAssembledMetadataRecord {
+            context_engine_id,
+            context_engine_version,
+            context_schema_sha256: context_schema_sha256.as_str(),
+            input_item_count: retained_item_count,
+            retained_item_count,
+            stage_duration_ms: duration_millis_u64(context_assembly_started_at.elapsed()),
         },
     )
     .await?;
@@ -3100,7 +3275,17 @@ async fn process_run_stream_message_inner(
         )
         .await
         {
-            Ok(RunStreamProviderRequestOutcome::Completed(response)) => *response,
+            Ok(RunStreamProviderRequestOutcome::Completed { response, duration_ms }) => {
+                record_provider_attempt_completed_metadata_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    response.as_ref(),
+                    duration_ms,
+                )
+                .await?;
+                *response
+            }
             Ok(RunStreamProviderRequestOutcome::TimedOut { reason, message }) => {
                 append_agent_loop_tape_event(
                     runtime_state,
@@ -5819,32 +6004,34 @@ mod tests {
         bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
         browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
         configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
-        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
-        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
-        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-        incomplete_terminal_outcome_message, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
-        provider_error_partial_summary, provider_model_override_for_routing,
-        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
-        provider_request_timeout_message, provider_request_timeout_status,
-        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
-        provider_turn_anomaly_from_response_failure, provider_waiting_status_message,
-        repeated_tool_failure_signature, run_loop_phase_timeout_message,
-        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
-        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
-        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
-        run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
-        run_stream_harness_started_payload, run_stream_harness_terminal_event,
-        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
-        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        effective_provider_request_deadline, embedded_run_stream_runtime_selection_payload,
+        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
+        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
+        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
+        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        phase_heartbeat_interval, provider_error_partial_summary,
+        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
+        provider_request_deadline_timeout, provider_request_timeout_message,
+        provider_request_timeout_status, provider_status_recovery_decision_payload,
+        provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
+        provider_waiting_status_message, repeated_tool_failure_signature,
+        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
+        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
+        run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
+        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
+        run_stream_harness_selection_payload, run_stream_harness_started_payload,
+        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
+        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
-        MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
+        MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
+        RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
@@ -6114,6 +6301,19 @@ mod tests {
         assert_eq!(selection["fallback_used"], false);
         assert_eq!(started["event"], HARNESS_RUN_STARTED_EVENT);
         assert!(!serialized_started.contains("secret-token"));
+    }
+
+    #[test]
+    fn embedded_runtime_selection_metadata_is_distinct_from_harness_rollout_evidence() {
+        let selection: Value =
+            serde_json::from_str(embedded_run_stream_runtime_selection_payload().as_str())
+                .expect("metadata runtime selection payload should be JSON");
+
+        assert_eq!(selection["event"], RUNTIME_SELECTED_METADATA_EVENT);
+        assert_eq!(selection["harness_id"], "embedded_run_stream");
+        assert_eq!(selection["runtime_id"], RUN_STREAM_HARNESS_RUNTIME_POLICY);
+        assert_eq!(selection["route_class"], "primary");
+        assert_eq!(selection["schema_hashes"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

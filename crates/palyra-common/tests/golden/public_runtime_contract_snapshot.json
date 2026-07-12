@@ -1711,7 +1711,7 @@
     },
     "snapshot_version": "runtime-contracts.agent_hooks.v1"
   },
-  "changelog_note": "Adds the strict runtime error taxonomy and binding invariant registry while preserving the existing public error envelopes.",
+  "changelog_note": "Adds the always-on bounded metadata trace contract while preserving rich trace as a separate approval-gated export.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -1790,6 +1790,51 @@
       ]
     }
   ],
+  "metadata_trace": {
+    "changelog_note": "Introduces a bounded metadata-only run trace with append-only crash-safe segments and a separate approval-gated rich export.",
+    "event_kinds": [
+      "run_started",
+      "runtime_selected",
+      "context_assembled",
+      "provider_attempt",
+      "tool_gate",
+      "approval",
+      "tool_outcome",
+      "recovery",
+      "delivery_intent",
+      "terminalization",
+      "recovery_continuation",
+      "capacity_reached"
+    ],
+    "hard_limits": {
+      "bytes_per_event": 2048,
+      "events_per_run": 512,
+      "schema_hashes_per_selection": 8,
+      "segments_per_run": 16,
+      "stage_duration_ms": 86400000
+    },
+    "ordering": "segment_index_then_global_event_sequence",
+    "privacy": {
+      "identity_projection": "domain_separated_sha256",
+      "raw_prompts": false,
+      "raw_provider_payloads": false,
+      "raw_secrets": false,
+      "raw_stderr": false,
+      "raw_tool_arguments": false
+    },
+    "rich_trace": {
+      "always_on": false,
+      "approval_required": true,
+      "separate_artifact": true
+    },
+    "schema_version": 1,
+    "segment_statuses": [
+      "complete",
+      "interrupted",
+      "corrupt_suffix_isolated"
+    ],
+    "snapshot_version": "runtime-contracts.metadata_trace.v1"
+  },
   "public_error_envelopes": [
     {
       "categories": [
@@ -3195,7 +3240,7 @@
     ]
   },
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v7",
+  "snapshot_version": "runtime-contracts.v8",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

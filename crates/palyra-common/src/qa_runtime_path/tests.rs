@@ -17,7 +17,7 @@ fn evidence() -> RuntimePathEvidence {
         runtime_version:
             "palyrad-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_owned(),
-        runtime_contract_version: "runtime-contracts.v7".to_owned(),
+        runtime_contract_version: "runtime-contracts.v8".to_owned(),
         runner_version: "qa-runner.v4/0.1.0-git-test".to_owned(),
         provider_lane: "fixture".to_owned(),
         attempt_owner: "embedded_run_stream".to_owned(),
@@ -34,7 +34,7 @@ fn evidence() -> RuntimePathEvidence {
 
 fn expectation() -> NoHiddenFallbackExpectation {
     NoHiddenFallbackExpectation {
-        runtime_contract_version: "runtime-contracts.v7".to_owned(),
+        runtime_contract_version: "runtime-contracts.v8".to_owned(),
         provider_lane: "fixture".to_owned(),
         attempt_owner: "embedded_run_stream".to_owned(),
         harness_id: "embedded_run_stream".to_owned(),

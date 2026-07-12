@@ -42,6 +42,7 @@ pub mod output;
 /// Chat slash-command definitions shared between the web and TUI surfaces.
 pub mod shared_chat_commands;
 pub mod support;
+mod support_bundle_metadata_trace;
 pub mod transport;
 mod tui;
 /// Manifest model and helpers for the scripted workflow-regression suites.
@@ -3684,6 +3685,10 @@ fn build_support_bundle_journal_snapshot(
                 recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
                 channel_delivery: unavailable_support_bundle_channel_delivery(error.to_string()),
+                metadata_trace:
+                    support_bundle_metadata_trace::unavailable_support_bundle_metadata_trace(
+                        error.to_string(),
+                    ),
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
         }
@@ -3706,6 +3711,10 @@ fn build_support_bundle_journal_snapshot(
                 "journal database is unavailable",
             ),
             channel_delivery,
+            metadata_trace:
+                support_bundle_metadata_trace::unavailable_support_bundle_metadata_trace(
+                    "journal database is unavailable",
+                ),
             error: Some("journal database is unavailable".to_owned()),
         };
     }
@@ -3724,6 +3733,10 @@ fn build_support_bundle_journal_snapshot(
                 recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
                 channel_delivery,
+                metadata_trace:
+                    support_bundle_metadata_trace::unavailable_support_bundle_metadata_trace(
+                        error.to_string(),
+                    ),
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
         }
@@ -3737,6 +3750,8 @@ fn build_support_bundle_journal_snapshot(
     let queue_state = read_support_bundle_queue_state(&connection);
     let recall_artifacts = read_support_bundle_recall_artifacts(&connection);
     let flow_timeline = read_support_bundle_flow_timeline(&connection);
+    let metadata_trace =
+        support_bundle_metadata_trace::read_support_bundle_metadata_trace(&connection);
     SupportBundleJournalSnapshot {
         db_path,
         available: true,
@@ -3748,6 +3763,7 @@ fn build_support_bundle_journal_snapshot(
         recall_artifacts,
         flow_timeline,
         channel_delivery,
+        metadata_trace,
         error: None,
     }
 }
@@ -4554,6 +4570,19 @@ fn trim_support_bundle_journal_for_cap(bundle: &mut Value, max_bytes: usize) -> 
             if let Some(hashes) = journal.get_mut("recent_hashes").and_then(Value::as_array_mut) {
                 if !hashes.is_empty() {
                     hashes.pop();
+                    removed = true;
+                }
+            }
+        }
+        if !removed {
+            if let Some(runs) = journal
+                .get_mut("metadata_trace")
+                .and_then(Value::as_object_mut)
+                .and_then(|trace| trace.get_mut("recent_runs"))
+                .and_then(Value::as_array_mut)
+            {
+                if !runs.is_empty() {
+                    runs.pop();
                     removed = true;
                 }
             }
@@ -13206,8 +13235,32 @@ struct SupportBundleJournalSnapshot {
     recall_artifacts: SupportBundleRecallArtifactsSnapshot,
     flow_timeline: SupportBundleFlowTimelineSnapshot,
     channel_delivery: SupportBundleChannelDeliverySnapshot,
+    metadata_trace: SupportBundleMetadataTraceSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleMetadataTraceSnapshot {
+    available: bool,
+    schema_version: u32,
+    reason_code: String,
+    trace_count: u64,
+    recent_runs: Vec<SupportBundleMetadataTraceRunSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleMetadataTraceRunSnapshot {
+    run_id_sha256: String,
+    session_id_sha256: String,
+    segment_count: u16,
+    event_count: u32,
+    segment_statuses: BTreeMap<String, u16>,
+    event_kinds: Vec<String>,
+    terminal_event_present: bool,
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -15559,6 +15612,10 @@ mod diagnostics_bundle_tests {
                 channel_delivery: unavailable_support_bundle_channel_delivery(
                     "not loaded in test bundle",
                 ),
+                metadata_trace:
+                    crate::support_bundle_metadata_trace::unavailable_support_bundle_metadata_trace(
+                        "not loaded in test bundle",
+                    ),
                 error: None,
             },
             truncated: false,

@@ -315,6 +315,13 @@ pub(crate) fn qa_scenario_execution_result_schema_snapshot() -> Value {
             "fallback_count"
         ],
         "optional_runtime_path_fields": ["mcp_transport_mode"],
+        "evidence_bundle_schema_version": palyra_common::qa_evidence::QA_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "metadata_trace_fields": [
+            "schema_version",
+            "run_id_sha256",
+            "session_id_sha256",
+            "segments"
+        ],
         "optional_runtime_fields": ["run_id", "session_id", "terminal_state"],
         "optional_result_fields": ["evidence_output_bindings"],
         "evidence_output_binding": {
