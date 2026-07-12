@@ -338,9 +338,10 @@ fn attach_failure_returns_suspended_child_for_verified_cleanup() {
         Ok(_) => panic!("job creation failure should return process ownership"),
         Err(failure) => failure,
     };
-    assert!(failure.error.to_string().contains("qa.runner.daemon_job_create_failed"));
+    let AttachDaemonProcessFailure { error, process } = *failure;
+    assert!(error.to_string().contains("qa.runner.daemon_job_create_failed"));
     let mut ownership = StartupCleanupOwnership {
-        process: Some(failure.process),
+        process: Some(process),
         log_threads: Vec::new(),
         log_join_failed: false,
         state_root: Some(state_root),
@@ -440,6 +441,46 @@ fn stale_tracked_process_identity_is_never_signaled() {
 
     assert!(!signaled);
     assert!(!signal_sent.get());
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn marker_scan_excludes_processes_that_predate_the_owned_root() {
+    let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
+    let snapshot = |identity, owner_id| UnixProcessSnapshot {
+        identity,
+        parent_id: 1,
+        process_group_id: 1,
+        owner_id,
+    };
+    let older = snapshot(UnixProcessIdentity { start_token_low: 19, ..root }, 1000);
+    let same_start = snapshot(UnixProcessIdentity { process_id: 43, ..root }, 1000);
+    let newer = snapshot(
+        UnixProcessIdentity { process_id: 44, start_token_high: 11, start_token_low: 0 },
+        1000,
+    );
+    let other_owner = snapshot(UnixProcessIdentity { process_id: 45, ..root }, 1001);
+
+    assert!(!unix_process_can_inherit_marker(&older, &root, 1000));
+    assert!(unix_process_can_inherit_marker(&same_start, &root, 1000));
+    assert!(unix_process_can_inherit_marker(&newer, &root, 1000));
+    assert!(!unix_process_can_inherit_marker(&other_owner, &root, 1000));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn marker_scan_does_not_order_wall_clock_start_tokens() {
+    let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
+    let older_same_owner = UnixProcessSnapshot {
+        identity: UnixProcessIdentity { process_id: 43, start_token_low: 19, ..root },
+        parent_id: 1,
+        process_group_id: 1,
+        owner_id: 1000,
+    };
+    let older_other_owner = UnixProcessSnapshot { owner_id: 1001, ..older_same_owner };
+
+    assert!(unix_process_can_inherit_marker(&older_same_owner, &root, 1000));
+    assert!(!unix_process_can_inherit_marker(&older_other_owner, &root, 1000));
 }
 
 #[cfg(unix)]

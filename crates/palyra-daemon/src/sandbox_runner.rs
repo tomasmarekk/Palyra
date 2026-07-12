@@ -709,6 +709,7 @@ impl ManagedChildGuard {
         self.child.as_ref().expect("managed child guard must own a child").id()
     }
 
+    #[cfg(windows)]
     fn child(&self) -> &Child {
         self.child.as_ref().expect("managed child guard must own a child")
     }
@@ -1387,33 +1388,12 @@ pub fn run_constrained_process_with_cancellation(
     execution_timeout: Duration,
     cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
-    run_constrained_process_with_cancellation_and_progress(
-        policy,
-        input_json,
-        execution_timeout,
-        cancellation_requested,
-        None,
-    )
-}
-
-/// Validates and executes one `palyra.process.run` invocation with optional progress snapshots.
-///
-/// This follows the same execution contract as the test-only cancellation wrapper. When
-/// `progress_sink` is present, foreground process capture emits redacted, bounded progress events
-/// after the process has been running long enough to be user-visible.
-pub fn run_constrained_process_with_cancellation_and_progress(
-    policy: &SandboxProcessRunnerPolicy,
-    input_json: &[u8],
-    execution_timeout: Duration,
-    cancellation_requested: Option<Arc<AtomicBool>>,
-    progress_sink: Option<ProcessProgressSink>,
-) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     run_constrained_process_with_fault_injection(
         policy,
         input_json,
         execution_timeout,
         cancellation_requested,
-        progress_sink,
+        None,
         crate::qa_fault_injection::QaFaultRuntime::default(),
     )
 }
@@ -9747,7 +9727,7 @@ mod tests {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
             Arc, Mutex, OnceLock,
         },
         thread,
@@ -9780,8 +9760,7 @@ mod tests {
         resolve_host_working_directory, resolve_host_working_directory_with_roots,
         resolve_scoped_path, resolve_unrestricted_working_directory, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
-        rewrite_host_virtual_workspace_args, run_constrained_process,
-        run_constrained_process_with_cancellation, same_path_case_aware,
+        rewrite_host_virtual_workspace_args, run_constrained_process, same_path_case_aware,
         tier_c_plan_inner_path_index, user_owned_host_roots, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
         validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
@@ -9792,16 +9771,24 @@ mod tests {
         BackgroundLifetimeMode, EgressEnforcementMode, ManagedChildGuard, PathAccessMode,
         ProcessCompletionState, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
         ProcessSuccessOutputJsonInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
-        SandboxProcessRunnerTier, StreamCapture, BACKGROUND_MONITOR_POLL_MS,
-        BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS,
+        SandboxProcessRunnerTier, StreamCapture, MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS,
         NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV, PROCESS_PROGRESS_MIN_ELAPSED_MS,
+    };
+    #[cfg(not(target_os = "macos"))]
+    use super::{
+        run_constrained_process_with_cancellation, BACKGROUND_MONITOR_POLL_MS,
+        BACKGROUND_TERMINATION_WAIT_MS,
     };
     #[cfg(windows)]
     use super::{
         validate_allowed_executable, validate_host_command_path_scope, windows_program_files_path,
     };
+    #[cfg(not(target_os = "macos"))]
+    use std::sync::atomic::AtomicBool;
 
+    #[cfg(not(target_os = "macos"))]
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
+    #[cfg(not(target_os = "macos"))]
     const BACKGROUND_TEST_SCRIPT_SLEEP_SECS: u64 = 8;
     const MANAGED_CHILD_GUARD_TEST_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_CHILD";
     const MANAGED_CHILD_GUARD_MARKER_ENV: &str = "PALYRA_MANAGED_CHILD_GUARD_TEST_MARKER";
@@ -10381,6 +10368,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn background_test_execution_timeout() -> Duration {
         Duration::from_millis(BACKGROUND_TEST_EXECUTION_TIMEOUT_MS)
     }

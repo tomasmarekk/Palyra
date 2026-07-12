@@ -129,12 +129,12 @@ pub(super) fn configure_daemon_process_tree(
 pub(super) fn attach_daemon_process_tree(
     child: Child,
     preparation: DaemonProcessTreePreparation,
-) -> std::result::Result<OwnedDaemonProcess, AttachDaemonProcessFailure> {
+) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>> {
     drop(preparation.descendant_liveness_write);
     let process_group_id = match i32::try_from(child.id()) {
         Ok(process_group_id) => process_group_id,
         Err(error) => {
-            return Err(AttachDaemonProcessFailure {
+            return Err(Box::new(AttachDaemonProcessFailure {
                 error: anyhow::Error::new(error)
                     .context("qa.runner.daemon_process_group_id_invalid"),
                 process: OwnedDaemonProcess {
@@ -143,13 +143,13 @@ pub(super) fn attach_daemon_process_tree(
                     descendants_possible_without_tree: true,
                     cleanup_verified: false,
                 },
-            });
+            }));
         }
     };
     let root_identity = match unix_process_identity(process_group_id) {
         Ok(Some(identity)) => identity,
         Ok(None) => {
-            return Err(AttachDaemonProcessFailure {
+            return Err(Box::new(AttachDaemonProcessFailure {
                 error: anyhow::anyhow!("qa.runner.daemon_process_identity_unavailable"),
                 process: OwnedDaemonProcess {
                     child,
@@ -157,10 +157,10 @@ pub(super) fn attach_daemon_process_tree(
                     descendants_possible_without_tree: true,
                     cleanup_verified: false,
                 },
-            });
+            }));
         }
         Err(error) => {
-            return Err(AttachDaemonProcessFailure {
+            return Err(Box::new(AttachDaemonProcessFailure {
                 error: anyhow::Error::new(error)
                     .context("qa.runner.daemon_process_identity_unavailable"),
                 process: OwnedDaemonProcess {
@@ -169,7 +169,7 @@ pub(super) fn attach_daemon_process_tree(
                     descendants_possible_without_tree: true,
                     cleanup_verified: false,
                 },
-            });
+            }));
         }
     };
     Ok(OwnedDaemonProcess {
@@ -191,7 +191,7 @@ pub(super) fn attach_daemon_process_tree(
 pub(super) fn attach_daemon_process_tree(
     child: Child,
     _preparation: DaemonProcessTreePreparation,
-) -> std::result::Result<OwnedDaemonProcess, AttachDaemonProcessFailure> {
+) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>> {
     attach_windows_daemon_process_tree_with(child, WindowsJobHandle::new)
 }
 
@@ -199,7 +199,7 @@ pub(super) fn attach_daemon_process_tree(
 pub(super) fn attach_windows_daemon_process_tree_with<NewJob>(
     child: Child,
     new_job: NewJob,
-) -> std::result::Result<OwnedDaemonProcess, AttachDaemonProcessFailure>
+) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>>
 where
     NewJob: FnOnce() -> io::Result<WindowsJobHandle>,
 {
@@ -208,7 +208,7 @@ where
     let job = match new_job() {
         Ok(job) => job,
         Err(error) => {
-            return Err(AttachDaemonProcessFailure {
+            return Err(Box::new(AttachDaemonProcessFailure {
                 error: anyhow::Error::new(error).context("qa.runner.daemon_job_create_failed"),
                 process: OwnedDaemonProcess {
                     child,
@@ -216,7 +216,7 @@ where
                     descendants_possible_without_tree: false,
                     cleanup_verified: false,
                 },
-            });
+            }));
         }
     };
     // SAFETY: both handles are live and owned for the duration of this call.
@@ -224,7 +224,7 @@ where
         unsafe { windows_assign_process_to_job_object(job.handle.get(), child.as_raw_handle()) };
     if assigned == 0 {
         let error = io::Error::last_os_error();
-        return Err(AttachDaemonProcessFailure {
+        return Err(Box::new(AttachDaemonProcessFailure {
             error: anyhow::Error::new(error).context("qa.runner.daemon_job_assign_failed"),
             process: OwnedDaemonProcess {
                 child,
@@ -232,10 +232,10 @@ where
                 descendants_possible_without_tree: false,
                 cleanup_verified: false,
             },
-        });
+        }));
     }
     if let Err(error) = resume_suspended_windows_process(child.id()) {
-        return Err(AttachDaemonProcessFailure {
+        return Err(Box::new(AttachDaemonProcessFailure {
             error: anyhow::Error::new(error).context("qa.runner.daemon_resume_failed"),
             process: OwnedDaemonProcess {
                 child,
@@ -243,7 +243,7 @@ where
                 descendants_possible_without_tree: true,
                 cleanup_verified: false,
             },
-        });
+        }));
     }
     Ok(OwnedDaemonProcess {
         child,
@@ -257,8 +257,8 @@ where
 pub(super) fn attach_daemon_process_tree(
     child: Child,
     _preparation: DaemonProcessTreePreparation,
-) -> std::result::Result<OwnedDaemonProcess, AttachDaemonProcessFailure> {
-    Err(AttachDaemonProcessFailure {
+) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>> {
+    Err(Box::new(AttachDaemonProcessFailure {
         error: anyhow::anyhow!("qa.runner.daemon_process_tree_unsupported"),
         process: OwnedDaemonProcess {
             child,
@@ -266,7 +266,7 @@ pub(super) fn attach_daemon_process_tree(
             descendants_possible_without_tree: true,
             cleanup_verified: false,
         },
-    })
+    }))
 }
 
 #[cfg(unix)]
@@ -307,6 +307,7 @@ impl DaemonProcessTree {
             let process_table = unix_process_table(deadline)?;
             let marker_active = unix_marker_processes(
                 process_table.as_slice(),
+                &self.root_identity,
                 self.containment_marker.as_str(),
                 deadline,
             )?
@@ -350,6 +351,7 @@ impl DaemonProcessTree {
             let process_table = unix_process_table(deadline)?;
             let marker_processes = unix_marker_processes(
                 process_table.as_slice(),
+                &self.root_identity,
                 self.containment_marker.as_str(),
                 deadline,
             )?;
@@ -437,8 +439,8 @@ unsafe extern "C" {
     #[link_name = "setsid"]
     pub(super) fn unix_setsid() -> i32;
     #[cfg(test)]
-    #[link_name = "closefrom"]
-    pub(super) fn unix_closefrom(first_file_descriptor: i32);
+    #[link_name = "close"]
+    pub(super) fn unix_close(file_descriptor: i32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -824,6 +826,7 @@ fn unix_process_snapshot(_process_id: i32) -> io::Result<Option<UnixProcessSnaps
 #[cfg(unix)]
 fn unix_marker_processes(
     process_table: &[UnixProcessSnapshot],
+    root_identity: &UnixProcessIdentity,
     marker: &str,
     deadline: Instant,
 ) -> io::Result<Vec<UnixProcessIdentity>> {
@@ -834,7 +837,11 @@ fn unix_marker_processes(
     let current_owner_id = unsafe { unix_getuid() };
     let mut total_bytes = 0_usize;
     let mut marked = Vec::new();
-    for snapshot in process_table.iter().filter(|snapshot| snapshot.owner_id == current_owner_id) {
+    // Narrow the scan by owner and, where start tokens are monotonic, by the owned root's age.
+    // This avoids unrelated Linux processes failing the scan under ptrace environment controls.
+    for snapshot in process_table.iter().filter(|snapshot| {
+        unix_process_can_inherit_marker(snapshot, root_identity, current_owner_id)
+    }) {
         ensure_unix_cleanup_before_deadline(deadline)?;
         let (has_marker, bytes_read) =
             unix_process_has_marker(snapshot.identity.process_id, assignment.as_slice(), deadline)?;
@@ -851,6 +858,30 @@ fn unix_marker_processes(
         }
     }
     Ok(marked)
+}
+
+#[cfg(unix)]
+pub(super) fn unix_process_can_inherit_marker(
+    candidate: &UnixProcessSnapshot,
+    root: &UnixProcessIdentity,
+    current_owner_id: u32,
+) -> bool {
+    if candidate.owner_id != current_owner_id {
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Linux start ticks are monotonic, so an older process cannot have inherited the marker.
+        (candidate.identity.start_token_high, candidate.identity.start_token_low)
+            >= (root.start_token_high, root.start_token_low)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // macOS exposes wall-clock start timestamps, which can move backwards. Scanning every
+        // same-owner candidate preserves fail-closed cleanup if the system clock changes.
+        let _ = root;
+        true
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

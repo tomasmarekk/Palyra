@@ -1,1 +1,5 @@
 *.sh text eol=lf
+qa/**/*.json text eol=lf
+qa/**/*.md text eol=lf
+qa/**/*.txt text eol=lf
+qa/**/*.yaml text eol=lf

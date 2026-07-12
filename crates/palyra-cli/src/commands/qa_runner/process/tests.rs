@@ -69,25 +69,16 @@ fn long_running_test_process() -> OwnedDaemonProcess {
     }
 }
 
+const GRANDCHILD_HELPER_TEST: &str =
+    "commands::qa_runner::process::tests::process_tree_grandchild_helper";
+const GRANDCHILD_HELPER_MODE_ENV: &str = "PALYRA_QA_PROCESS_TREE_GRANDCHILD_HELPER_MODE";
+
 fn test_process_with_grandchild(pid_path: &Path) -> OwnedDaemonProcess {
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$grandchild = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru; [System.IO.File]::WriteAllText($env:PALYRA_QA_TEST_PID_PATH, [string]$grandchild.Id); Start-Sleep -Seconds 30",
-        ]);
-        command
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & printf '%s' \"$!\" > \"$PALYRA_QA_TEST_PID_PATH\"; wait"]);
-        command
-    };
-    command.env("PALYRA_QA_TEST_PID_PATH", pid_path);
+    let mut command = Command::new(std::env::current_exe().expect("test executable path"));
+    command
+        .args(["--exact", GRANDCHILD_HELPER_TEST, "--nocapture"])
+        .env(GRANDCHILD_HELPER_MODE_ENV, "launcher")
+        .env("PALYRA_QA_TEST_PID_PATH", pid_path);
     let preparation = configure_daemon_process_tree(&mut command)
         .expect("grandchild process tree should configure");
     let child = command
@@ -101,6 +92,32 @@ fn test_process_with_grandchild(pid_path: &Path) -> OwnedDaemonProcess {
             panic!("grandchild fixture should have tree ownership: {:#}", failure.error)
         }
     }
+}
+
+#[test]
+fn process_tree_grandchild_helper() {
+    let Ok(mode) = std::env::var(GRANDCHILD_HELPER_MODE_ENV) else {
+        return;
+    };
+    if mode == "sleep" {
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    assert_eq!(mode, "launcher");
+    let pid_path = PathBuf::from(
+        std::env::var_os("PALYRA_QA_TEST_PID_PATH")
+            .expect("grandchild helper pid path should be configured"),
+    );
+    let child = Command::new(std::env::current_exe().expect("test executable path"))
+        .args(["--exact", GRANDCHILD_HELPER_TEST, "--nocapture"])
+        .env(GRANDCHILD_HELPER_MODE_ENV, "sleep")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("grandchild helper should start");
+    fs::write(pid_path, child.id().to_string()).expect("grandchild pid should be recorded");
+    let _child = child;
+    thread::sleep(Duration::from_secs(30));
 }
 
 fn wait_for_recorded_process_id(path: &Path, timeout: Duration) -> u32 {
@@ -122,7 +139,12 @@ fn test_process_with_escaped_grandchild(pid_path: &Path, detached: bool) -> Owne
 }
 
 #[cfg(unix)]
+const PROCESS_TREE_LIVENESS_FD_ENV: &str = "PALYRA_QA_TEST_PROCESS_TREE_LIVENESS_FD";
+
+#[cfg(unix)]
 fn test_process_with_escape_mode(pid_path: &Path, mode: &str) -> OwnedDaemonProcess {
+    use std::os::fd::AsRawFd;
+
     const HELPER_TEST: &str = "commands::qa_runner::process::tests::unix_process_tree_helper";
 
     let mut command = Command::new(std::env::current_exe().expect("test executable path"));
@@ -134,6 +156,10 @@ fn test_process_with_escape_mode(pid_path: &Path, mode: &str) -> OwnedDaemonProc
         .stderr(Stdio::null());
     let preparation = configure_daemon_process_tree(&mut command)
         .expect("escaped-grandchild process tree should configure");
+    command.env(
+        PROCESS_TREE_LIVENESS_FD_ENV,
+        preparation.descendant_liveness_write.as_raw_fd().to_string(),
+    );
     let child = command.spawn().expect("escaped-grandchild fixture parent should start");
     match attach_daemon_process_tree(child, preparation) {
         Ok(process) => process,
@@ -177,11 +203,19 @@ fn unix_process_tree_helper() {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if mode == "intermediate_close_fds" {
-        // SAFETY: closefrom(2) performs no allocation or locking in the child process.
+        let liveness_file_descriptor = std::env::var(PROCESS_TREE_LIVENESS_FD_ENV)
+            .expect("process-tree liveness descriptor should be configured")
+            .parse::<i32>()
+            .expect("process-tree liveness descriptor should be an integer");
+        // SAFETY: the descriptor came from the live inherited pipe before spawn; close(2) is
+        // async-signal-safe, and the closure performs no allocation or locking.
         unsafe {
-            child.pre_exec(|| {
-                unix_closefrom(3);
-                Ok(())
+            child.pre_exec(move || {
+                if unix_close(liveness_file_descriptor) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
             });
         }
     } else {

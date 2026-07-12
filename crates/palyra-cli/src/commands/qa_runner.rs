@@ -2222,6 +2222,28 @@ mod tests {
     }
 
     #[test]
+    fn fault_campaign_fixture_digest_is_platform_stable() {
+        let repository_root = fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("QA fixtures should have a repository root"),
+        )
+        .expect("QA fixture repository root should canonicalize");
+
+        let digest = digest_repository_fixture_set(
+            repository_root.as_path(),
+            [
+                "qa/fixtures/fault_injection_runner.yaml",
+                "qa/fixtures/sandbox_workspaces/repo_basic",
+            ],
+        )
+        .expect("fault campaign fixture set should hash");
+
+        assert_eq!(digest, "ab13275c48c5ea1b098833a83d38ea93aa7e15bb854d61bf8d51fed7fbdb44ca");
+    }
+
+    #[test]
     fn cleanup_verification_is_independent_from_terminal_observation() {
         let cleanup = cleanup_result(
             false,

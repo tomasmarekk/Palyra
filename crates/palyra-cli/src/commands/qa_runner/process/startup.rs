@@ -66,9 +66,10 @@ pub(super) fn start_daemon(
     let mut process = match attach_daemon_process_tree(child, process_tree_preparation) {
         Ok(process) => process,
         Err(failure) => {
+            let AttachDaemonProcessFailure { error, process } = *failure;
             return Err(daemon_startup_error(
-                failure.error,
-                Some(failure.process),
+                error,
+                Some(process),
                 Vec::new(),
                 Arc::clone(&state_root),
                 cleanup_admission,
