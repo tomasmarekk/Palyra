@@ -123,6 +123,8 @@ use journal_snapshot::{
 };
 #[cfg(all(test, windows))]
 use process_tree::attach_windows_daemon_process_tree_with;
+#[cfg(all(test, target_os = "macos"))]
+use process_tree::mac_process_baseline_with;
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 use process_tree::parse_linux_process_stat;
 #[cfg(all(test, unix))]

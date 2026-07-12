@@ -511,6 +511,37 @@ fn marker_scan_does_not_order_wall_clock_start_tokens() {
     assert!(!requires_scan(&older_other_owner));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_baseline_leaves_protected_processes_unclassified() {
+    let owned = UnixProcessSnapshot {
+        identity: UnixProcessIdentity { process_id: 41, start_token_high: 10, start_token_low: 20 },
+        parent_id: 1,
+        process_group_id: 41,
+        owner_id: 1000,
+    };
+    let other_owner = UnixProcessSnapshot {
+        identity: UnixProcessIdentity { process_id: 42, ..owned.identity },
+        owner_id: 1001,
+        ..owned
+    };
+
+    let baseline = mac_process_baseline_with(&[41, 42, 43], 1000, |process_id| match process_id {
+        41 => Ok(Some(owned)),
+        42 => Ok(Some(other_owner)),
+        43 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "protected process")),
+        _ => Ok(None),
+    })
+    .expect("protected processes should remain outside the baseline");
+
+    assert_eq!(baseline, BTreeMap::from([(owned.identity.process_id, owned.identity)]));
+    let error = mac_process_baseline_with(&[44], 1000, |_| {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "invalid process metadata"))
+    })
+    .expect_err("non-permission lookup errors must remain fatal");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
 #[cfg(unix)]
 #[test]
 fn recycled_root_and_tracked_pids_do_not_seed_unrelated_descendants() {

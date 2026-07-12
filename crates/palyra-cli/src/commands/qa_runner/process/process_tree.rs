@@ -754,6 +754,19 @@ pub(super) fn parse_linux_process_stat(
 
 #[cfg(target_os = "macos")]
 pub(super) fn unix_process_table(deadline: Instant) -> io::Result<Vec<UnixProcessSnapshot>> {
+    let process_ids = mac_process_ids(deadline)?;
+    let mut snapshots = Vec::with_capacity(process_ids.len());
+    for process_id in process_ids {
+        ensure_unix_cleanup_before_deadline(deadline)?;
+        if let Some(snapshot) = mac_process_snapshot(process_id)? {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_ids(deadline: Instant) -> io::Result<Vec<i32>> {
     ensure_unix_cleanup_before_deadline(deadline)?;
     let mut process_ids = vec![0_i32; MAX_UNIX_PROCESS_COUNT];
     let buffer_size = i32::try_from(process_ids.len().saturating_mul(std::mem::size_of::<i32>()))
@@ -769,16 +782,8 @@ pub(super) fn unix_process_table(deadline: Instant) -> io::Result<Vec<UnixProces
         return Err(io::Error::other("bounded process-table capacity exceeded"));
     }
     process_ids.truncate(count);
-    let mut snapshots = Vec::with_capacity(count);
-    for process_id in process_ids {
-        ensure_unix_cleanup_before_deadline(deadline)?;
-        if process_id > 0 {
-            if let Some(snapshot) = mac_process_snapshot(process_id)? {
-                snapshots.push(snapshot);
-            }
-        }
-    }
-    Ok(snapshots)
+    process_ids.retain(|process_id| *process_id > 0);
+    Ok(process_ids)
 }
 
 #[cfg(target_os = "macos")]
@@ -944,7 +949,7 @@ pub(super) fn unix_process_requires_marker_scan(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_process_baseline(deadline: Instant) -> io::Result<BTreeMap<i32, UnixProcessIdentity>> {
     // SAFETY: getuid(2) has no arguments and cannot violate memory safety.
     let current_owner_id = unsafe { unix_getuid() };
@@ -953,6 +958,49 @@ fn unix_process_baseline(deadline: Instant) -> io::Result<BTreeMap<i32, UnixProc
         .filter(|snapshot| snapshot.owner_id == current_owner_id)
         .map(|snapshot| (snapshot.identity.process_id, snapshot.identity))
         .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn unix_process_baseline(deadline: Instant) -> io::Result<BTreeMap<i32, UnixProcessIdentity>> {
+    let process_ids = mac_process_ids(deadline)?;
+    // SAFETY: getuid(2) has no arguments and cannot violate memory safety.
+    let current_owner_id = unsafe { unix_getuid() };
+    mac_process_baseline_with(process_ids.as_slice(), current_owner_id, |process_id| {
+        ensure_unix_cleanup_before_deadline(deadline)?;
+        mac_process_snapshot(process_id)
+    })
+}
+
+/// Collects exact pre-launch identities while leaving protected macOS processes unclassified.
+///
+/// # Errors
+/// Returns a lookup error unless it represents a process that macOS does not permit inspecting.
+#[cfg(target_os = "macos")]
+pub(super) fn mac_process_baseline_with<Lookup>(
+    process_ids: &[i32],
+    current_owner_id: u32,
+    mut lookup: Lookup,
+) -> io::Result<BTreeMap<i32, UnixProcessIdentity>>
+where
+    Lookup: FnMut(i32) -> io::Result<Option<UnixProcessSnapshot>>,
+{
+    let mut baseline = BTreeMap::new();
+    for &process_id in process_ids {
+        let snapshot = match lookup(process_id) {
+            Ok(snapshot) => snapshot,
+            // Baseline entries only exempt exact identities from marker reads. Leaving a protected
+            // process unclassified keeps strict cleanup enumeration fail-closed if it persists.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(snapshot) = snapshot else {
+            continue;
+        };
+        if snapshot.owner_id == current_owner_id {
+            baseline.insert(snapshot.identity.process_id, snapshot.identity);
+        }
+    }
+    Ok(baseline)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
