@@ -987,19 +987,31 @@ scorecard:
 
 #[test]
 fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create release gate output root")?;
+    let report_path = temp_dir.path().join("qa-lab").join("release.json");
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .current_dir(repo_root())
-        .args(["qa", "gate", "--suite", "qa/suites/release.yaml", "--json"])
+        .args(["qa", "gate", "--suite", "qa/suites/release.yaml", "--output-json"])
+        .arg(report_path.as_os_str())
+        .arg("--json")
         .output()
         .context("failed to execute palyra qa gate release")?;
 
     assert!(
         output.status.success(),
-        "qa gate release should pass: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "qa gate release should pass: {}\nreport: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     let payload: Value = serde_json::from_slice(output.stdout.as_slice())
         .context("qa gate release JSON should parse")?;
+    let file_payload: Value = serde_json::from_slice(
+        fs::read(report_path.as_path())
+            .context("qa gate release should write an isolated JSON report")?
+            .as_slice(),
+    )
+    .context("written release gate JSON should parse")?;
+    assert_eq!(payload, file_payload, "release stdout and report file should match");
     assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(3));
     assert_eq!(payload.pointer("/summary/selected_count").and_then(Value::as_u64), Some(5));
     assert_eq!(payload.pointer("/summary/passed").and_then(Value::as_u64), Some(5));
