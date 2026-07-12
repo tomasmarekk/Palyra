@@ -90,6 +90,7 @@ pub(super) fn configure_daemon_process_tree(
 ) -> Result<DaemonProcessTreePreparation> {
     use std::os::unix::process::CommandExt;
 
+    let launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
     command.process_group(0);
     // SAFETY: the no-op closure performs no allocation, locking, or other non-async-signal-safe
     // work. Registering it forces the fork/exec path so Apple posix_spawn cannot apply a
@@ -111,6 +112,7 @@ pub(super) fn configure_daemon_process_tree(
         descendant_liveness_write,
         containment_marker,
         preexisting_processes,
+        launch_guard,
     })
 }
 
@@ -136,7 +138,14 @@ pub(super) fn attach_daemon_process_tree(
     child: Child,
     preparation: DaemonProcessTreePreparation,
 ) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>> {
-    drop(preparation.descendant_liveness_write);
+    let DaemonProcessTreePreparation {
+        descendant_liveness_read,
+        descendant_liveness_write,
+        containment_marker,
+        preexisting_processes,
+        launch_guard,
+    } = preparation;
+    drop(descendant_liveness_write);
     let process_group_id = match i32::try_from(child.id()) {
         Ok(process_group_id) => process_group_id,
         Err(error) => {
@@ -178,20 +187,23 @@ pub(super) fn attach_daemon_process_tree(
             }));
         }
     };
-    Ok(OwnedDaemonProcess {
+    unix_register_process_tree_identity(containment_marker.as_str(), root_identity);
+    let process = OwnedDaemonProcess {
         child,
         tree: Some(DaemonProcessTree {
             root_identity,
             process_group_id,
             tracked_descendants: Mutex::new(Default::default()),
             descendant_discovery_complete: Mutex::new(false),
-            descendant_liveness_read: Mutex::new(preparation.descendant_liveness_read),
-            containment_marker: preparation.containment_marker,
-            preexisting_processes: preparation.preexisting_processes,
+            descendant_liveness_read: Mutex::new(descendant_liveness_read),
+            containment_marker,
+            preexisting_processes,
         }),
         descendants_possible_without_tree: true,
         cleanup_verified: false,
-    })
+    };
+    drop(launch_guard);
+    Ok(process)
 }
 
 #[cfg(windows)]
@@ -384,6 +396,10 @@ impl DaemonProcessTree {
                     tracked.insert(identity.process_id, *identity);
                 }
             }
+            unix_register_process_tree_identities(
+                self.containment_marker.as_str(),
+                &known_descendants,
+            );
             // Stop identity-bound descendants before the environment scan so they cannot fork
             // across the scan. Their exact identities are checked directly and need no marker read.
             for identity in known_descendants.values() {
@@ -403,6 +419,7 @@ impl DaemonProcessTree {
                     tracked.insert(identity.process_id, identity);
                 }
             }
+            unix_register_process_tree_identities(self.containment_marker.as_str(), &tracked);
             for identity in tracked.values() {
                 unix_signal_process_identity(identity, UNIX_SIGSTOP)?;
             }
@@ -412,6 +429,13 @@ impl DaemonProcessTree {
             }
         }
         Err(io::Error::other("recursive descendant discovery did not converge"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DaemonProcessTree {
+    fn drop(&mut self) {
+        unix_unregister_process_tree(self.containment_marker.as_str());
     }
 }
 
@@ -472,30 +496,39 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
-pub(super) struct MacProcessBsdInfo {
-    _flags: u32,
+struct MacProcessShortBsdInfo {
+    process_id: u32,
+    parent_id: u32,
+    process_group_id: u32,
     _status: u32,
-    _xstatus: u32,
-    pub(super) process_id: u32,
-    pub(super) parent_id: u32,
-    pub(super) owner_id: u32,
+    _command: [u8; 16],
+    _flags: u32,
+    owner_id: u32,
     _group_owner_id: u32,
     _real_owner_id: u32,
     _real_group_owner_id: u32,
     _saved_owner_id: u32,
     _saved_group_owner_id: u32,
     _reserved: u32,
-    _command: [u8; 16],
-    _name: [u8; 32],
-    _open_file_count: u32,
-    pub(super) process_group_id: u32,
-    _job_control_count: u32,
-    _controlling_device: u32,
-    _foreground_group_id: u32,
-    _nice: i32,
-    start_seconds: u64,
-    start_microseconds: u64,
 }
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MacProcessUniqueInfo {
+    _executable_uuid: [u8; 16],
+    unique_id: u64,
+    _parent_unique_id: u64,
+    id_version: i32,
+    _original_parent_id_version: i32,
+    _reserved_2: u64,
+    _reserved_3: u64,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacProcessShortBsdInfo>() == 64);
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacProcessUniqueInfo>() == 56);
 
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
@@ -798,15 +831,92 @@ fn unix_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnapsh
 
 #[cfg(target_os = "macos")]
 fn mac_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnapshot>> {
-    const PROC_PIDTBSDINFO: i32 = 3;
-
-    let mut information = std::mem::MaybeUninit::<MacProcessBsdInfo>::zeroed();
-    let buffer_size = i32::try_from(std::mem::size_of::<MacProcessBsdInfo>())
-        .map_err(|_| io::Error::other("macOS process information buffer is too large"))?;
-    // SAFETY: `information` is a correctly sized writable buffer for PROC_PIDTBSDINFO.
-    let read = unsafe {
-        proc_pidinfo(process_id, PROC_PIDTBSDINFO, 0, information.as_mut_ptr().cast(), buffer_size)
+    let Some(identity_before) = mac_process_unique_info(process_id)? else {
+        return Ok(None);
     };
+    let Some(information) = mac_process_short_bsd_info(process_id)? else {
+        return Ok(None);
+    };
+    let Some(identity_after) = mac_process_unique_info(process_id)? else {
+        return Ok(None);
+    };
+    // The two unprivileged lookups make PID reuse across the metadata read observable.
+    if identity_before != identity_after
+        || information.process_id != u32::try_from(process_id).unwrap_or(u32::MAX)
+    {
+        return Ok(None);
+    }
+    Ok(Some(UnixProcessSnapshot {
+        identity: UnixProcessIdentity {
+            process_id,
+            start_token_high: identity_after.unique_id,
+            start_token_low: u64::from(u32::from_ne_bytes(identity_after.id_version.to_ne_bytes())),
+        },
+        parent_id: i32::try_from(information.parent_id)
+            .map_err(|_| io::Error::other("macOS parent pid is invalid"))?,
+        process_group_id: i32::try_from(information.process_group_id)
+            .map_err(|_| io::Error::other("macOS process group is invalid"))?,
+        owner_id: information.owner_id,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_short_bsd_info(process_id: i32) -> io::Result<Option<MacProcessShortBsdInfo>> {
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+
+    let mut information = std::mem::MaybeUninit::<MacProcessShortBsdInfo>::zeroed();
+    let buffer_size = i32::try_from(std::mem::size_of::<MacProcessShortBsdInfo>())
+        .map_err(|_| io::Error::other("macOS short process information buffer is too large"))?;
+    // SAFETY: the buffer matches the kernel's fixed PROC_PIDT_SHORTBSDINFO ABI.
+    let read = unsafe {
+        proc_pidinfo(
+            process_id,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            information.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    // SAFETY: MacProcessShortBsdInfo is a fixed C layout containing only integer and byte fields.
+    unsafe {
+        mac_process_info_result(read, buffer_size, information, "macOS short process information")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_unique_info(process_id: i32) -> io::Result<Option<MacProcessUniqueInfo>> {
+    const PROC_PIDUNIQIDENTIFIERINFO: i32 = 17;
+
+    let mut information = std::mem::MaybeUninit::<MacProcessUniqueInfo>::zeroed();
+    let buffer_size = i32::try_from(std::mem::size_of::<MacProcessUniqueInfo>())
+        .map_err(|_| io::Error::other("macOS unique process information buffer is too large"))?;
+    // SAFETY: the buffer matches the kernel's fixed PROC_PIDUNIQIDENTIFIERINFO ABI.
+    let read = unsafe {
+        proc_pidinfo(
+            process_id,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            information.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    // SAFETY: MacProcessUniqueInfo is a fixed C layout containing only integer and byte fields.
+    unsafe {
+        mac_process_info_result(read, buffer_size, information, "macOS unique process information")
+    }
+}
+
+/// Converts a complete `proc_pidinfo` write into its plain C-layout value.
+///
+/// # Safety
+/// `T` must match the requested flavor's fixed ABI and permit every returned byte pattern.
+#[cfg(target_os = "macos")]
+unsafe fn mac_process_info_result<T>(
+    read: i32,
+    expected_size: i32,
+    information: std::mem::MaybeUninit<T>,
+    description: &str,
+) -> io::Result<Option<T>> {
     if read == 0 {
         let error = io::Error::last_os_error();
         return if matches!(error.raw_os_error(), Some(UNIX_ESRCH) | Some(UNIX_ENOENT)) {
@@ -815,26 +925,11 @@ fn mac_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnapsho
             Err(error)
         };
     }
-    if read != buffer_size {
-        return Err(io::Error::other("macOS process information was truncated"));
+    if read != expected_size {
+        return Err(io::Error::other(format!("{description} was truncated")));
     }
     // SAFETY: proc_pidinfo reported a complete buffer of the requested structure size.
-    let information = unsafe { information.assume_init() };
-    if information.process_id != u32::try_from(process_id).unwrap_or(u32::MAX) {
-        return Ok(None);
-    }
-    Ok(Some(UnixProcessSnapshot {
-        identity: UnixProcessIdentity {
-            process_id,
-            start_token_high: information.start_seconds,
-            start_token_low: information.start_microseconds,
-        },
-        parent_id: i32::try_from(information.parent_id)
-            .map_err(|_| io::Error::other("macOS parent pid is invalid"))?,
-        process_group_id: i32::try_from(information.process_group_id)
-            .map_err(|_| io::Error::other("macOS process group is invalid"))?,
-        owner_id: information.owner_id,
-    }))
+    Ok(Some(unsafe { information.assume_init() }))
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
@@ -864,6 +959,10 @@ fn unix_marker_processes(
     marker: &str,
     deadline: Instant,
 ) -> io::Result<Vec<UnixProcessIdentity>> {
+    // A scan must not overlap the spawn-to-registration window of another marker tree.
+    let _launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
+    let mut classified_processes = known_descendants.clone();
+    classified_processes.extend(unix_other_tree_processes(process_table, marker));
     // The marker is non-secret, but scanning a process environment can encounter credentials.
     // Buffers are bounded, never formatted, and zeroed immediately after the exact match check.
     let assignment = format!("{QA_PROCESS_TREE_MARKER_ENV}={marker}").into_bytes();
@@ -879,7 +978,7 @@ fn unix_marker_processes(
             snapshot,
             root_identity,
             preexisting_processes,
-            known_descendants,
+            &classified_processes,
             current_owner_id,
         )
     }) {
@@ -917,6 +1016,79 @@ fn unix_marker_processes(
         }
     }
     Ok(marked)
+}
+
+#[cfg(unix)]
+fn unix_process_tree_registry() -> &'static Mutex<UnixProcessTreeRegistry> {
+    UNIX_PROCESS_TREE_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(unix)]
+fn unix_register_process_tree_identity(marker: &str, identity: UnixProcessIdentity) {
+    lock_unpoisoned(unix_process_tree_registry())
+        .entry(marker.to_owned())
+        .or_default()
+        .insert(identity.process_id, identity);
+}
+
+#[cfg(unix)]
+fn unix_register_process_tree_identities(
+    marker: &str,
+    identities: &BTreeMap<i32, UnixProcessIdentity>,
+) {
+    let mut registry = lock_unpoisoned(unix_process_tree_registry());
+    let registered = registry.entry(marker.to_owned()).or_default();
+    for identity in identities.values() {
+        registered.insert(identity.process_id, *identity);
+    }
+}
+
+#[cfg(unix)]
+fn unix_unregister_process_tree(marker: &str) {
+    lock_unpoisoned(unix_process_tree_registry()).remove(marker);
+}
+
+#[cfg(unix)]
+fn unix_other_tree_processes(
+    process_table: &[UnixProcessSnapshot],
+    current_marker: &str,
+) -> BTreeMap<i32, UnixProcessIdentity> {
+    let registry = lock_unpoisoned(unix_process_tree_registry());
+    unix_other_tree_processes_with_registry(process_table, current_marker, &registry)
+}
+
+/// Returns exact identities owned by another active marker tree or its live descendants.
+#[cfg(unix)]
+pub(super) fn unix_other_tree_processes_with_registry(
+    process_table: &[UnixProcessSnapshot],
+    current_marker: &str,
+    registry: &UnixProcessTreeRegistry,
+) -> BTreeMap<i32, UnixProcessIdentity> {
+    let snapshots_by_id = process_table
+        .iter()
+        .map(|snapshot| (snapshot.identity.process_id, snapshot))
+        .collect::<BTreeMap<_, _>>();
+    let mut roots = std::collections::BTreeSet::new();
+    for identities in registry
+        .iter()
+        .filter_map(|(marker, identities)| (marker != current_marker).then_some(identities))
+    {
+        for identity in identities.values() {
+            if snapshots_by_id
+                .get(&identity.process_id)
+                .is_some_and(|snapshot| snapshot.identity == *identity)
+            {
+                roots.insert(identity.process_id);
+            }
+        }
+    }
+    let mut owned_process_ids = unix_recursive_descendants(process_table, &roots);
+    owned_process_ids.extend(roots);
+    process_table
+        .iter()
+        .filter(|snapshot| owned_process_ids.contains(&snapshot.identity.process_id))
+        .map(|snapshot| (snapshot.identity.process_id, snapshot.identity))
+        .collect()
 }
 
 #[cfg(unix)]

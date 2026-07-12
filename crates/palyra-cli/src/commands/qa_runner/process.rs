@@ -132,8 +132,8 @@ use process_tree::wait_for_child_exit;
 #[cfg(all(test, unix))]
 use process_tree::{
     unix_close, unix_descendant_liveness_closed, unix_identity_matching_roots,
-    unix_process_requires_marker_scan, unix_process_table, unix_recursive_descendants, unix_setsid,
-    unix_signal_process_identity_with, UNIX_SIGKILL,
+    unix_other_tree_processes_with_registry, unix_process_requires_marker_scan, unix_process_table,
+    unix_recursive_descendants, unix_setsid, unix_signal_process_identity_with, UNIX_SIGKILL,
 };
 #[cfg(test)]
 use startup::{
@@ -349,6 +349,8 @@ struct DaemonProcessTreePreparation {
     // start token prevents a recycled PID from inheriting the exemption.
     #[cfg(unix)]
     preexisting_processes: BTreeMap<i32, UnixProcessIdentity>,
+    #[cfg(unix)]
+    launch_guard: MutexGuard<'static, ()>,
 }
 
 #[cfg(unix)]
@@ -367,6 +369,14 @@ struct UnixProcessSnapshot {
     process_group_id: i32,
     owner_id: u32,
 }
+
+#[cfg(unix)]
+type UnixProcessTreeRegistry = BTreeMap<String, BTreeMap<i32, UnixProcessIdentity>>;
+
+#[cfg(unix)]
+static UNIX_PROCESS_TREE_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
+static UNIX_PROCESS_TREE_REGISTRY: OnceLock<Mutex<UnixProcessTreeRegistry>> = OnceLock::new();
 
 /// Bounded, redaction-safe diagnostic snapshot captured after a failed QA observation.
 #[derive(Debug, Serialize)]

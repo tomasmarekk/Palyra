@@ -486,7 +486,7 @@ fn marker_scan_targets_only_unclassified_processes() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn marker_scan_does_not_order_wall_clock_start_tokens() {
+fn marker_scan_does_not_order_opaque_start_tokens() {
     let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
     let empty_baseline = BTreeMap::new();
     let empty_descendants = BTreeMap::new();
@@ -509,6 +509,58 @@ fn marker_scan_does_not_order_wall_clock_start_tokens() {
 
     assert!(requires_scan(&older_same_owner));
     assert!(!requires_scan(&older_other_owner));
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_scan_classifies_other_active_trees_by_identity_and_ancestry() {
+    let other_root =
+        UnixProcessIdentity { process_id: 100, start_token_high: 10, start_token_low: 1 };
+    let other_child =
+        UnixProcessIdentity { process_id: 101, start_token_high: 10, start_token_low: 2 };
+    let current_root =
+        UnixProcessIdentity { process_id: 200, start_token_high: 10, start_token_low: 3 };
+    let current_child =
+        UnixProcessIdentity { process_id: 201, start_token_high: 10, start_token_low: 4 };
+    let recycled_root =
+        UnixProcessIdentity { process_id: 300, start_token_high: 10, start_token_low: 6 };
+    let recycled_child =
+        UnixProcessIdentity { process_id: 301, start_token_high: 10, start_token_low: 7 };
+    let snapshot = |identity, parent_id| UnixProcessSnapshot {
+        identity,
+        parent_id,
+        process_group_id: identity.process_id,
+        owner_id: 1000,
+    };
+    let process_table = vec![
+        snapshot(other_root, 1),
+        snapshot(other_child, other_root.process_id),
+        snapshot(current_root, 1),
+        snapshot(current_child, current_root.process_id),
+        snapshot(recycled_root, 1),
+        snapshot(recycled_child, recycled_root.process_id),
+    ];
+    let registry = BTreeMap::from([
+        ("other".to_owned(), BTreeMap::from([(other_root.process_id, other_root)])),
+        ("current".to_owned(), BTreeMap::from([(current_root.process_id, current_root)])),
+        (
+            "stale".to_owned(),
+            BTreeMap::from([(
+                recycled_root.process_id,
+                UnixProcessIdentity { start_token_low: 5, ..recycled_root },
+            )]),
+        ),
+    ]);
+
+    let classified = unix_other_tree_processes_with_registry(&process_table, "current", &registry);
+
+    assert_eq!(
+        classified,
+        BTreeMap::from([
+            (other_root.process_id, other_root),
+            (other_child.process_id, other_child),
+        ])
+    );
 }
 
 #[cfg(target_os = "macos")]
