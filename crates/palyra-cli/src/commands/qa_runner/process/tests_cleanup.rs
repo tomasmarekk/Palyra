@@ -448,6 +448,7 @@ fn stale_tracked_process_identity_is_never_signaled() {
 fn marker_scan_targets_only_unclassified_processes() {
     let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
     let empty_baseline = BTreeMap::new();
+    let empty_groups = std::collections::BTreeSet::new();
     let empty_descendants = BTreeMap::new();
     let snapshot = |identity, owner_id| UnixProcessSnapshot {
         identity,
@@ -464,7 +465,14 @@ fn marker_scan_targets_only_unclassified_processes() {
     let root_snapshot = snapshot(root, 1000);
     let other_owner = snapshot(UnixProcessIdentity { process_id: 45, ..root }, 1001);
     let requires_scan = |candidate, baseline, descendants| {
-        unix_process_requires_marker_scan(candidate, &root, baseline, descendants, 1000)
+        unix_process_requires_marker_scan(
+            candidate,
+            &root,
+            baseline,
+            &empty_groups,
+            descendants,
+            1000,
+        )
     };
 
     assert!(!requires_scan(&older, &empty_baseline, &empty_descendants));
@@ -484,11 +492,54 @@ fn marker_scan_targets_only_unclassified_processes() {
     assert!(requires_scan(&reused_pid, &empty_baseline, &known_descendants));
 }
 
+#[cfg(unix)]
+#[test]
+fn marker_scan_exempts_only_live_exact_prelaunch_process_groups() {
+    let root = UnixProcessIdentity { process_id: 100, start_token_high: 10, start_token_low: 1 };
+    let preexisting =
+        UnixProcessIdentity { process_id: 200, start_token_high: 10, start_token_low: 2 };
+    let concurrent =
+        UnixProcessIdentity { process_id: 201, start_token_high: 10, start_token_low: 3 };
+    let recycled = UnixProcessIdentity { start_token_low: 4, ..preexisting };
+    let snapshot = |identity, process_group_id| UnixProcessSnapshot {
+        identity,
+        parent_id: 1,
+        process_group_id,
+        owner_id: 1000,
+    };
+    let baseline = BTreeMap::from([(preexisting.process_id, preexisting)]);
+    let live_table = vec![snapshot(preexisting, 50), snapshot(concurrent, 50)];
+    let stale_table = vec![snapshot(recycled, 50), snapshot(concurrent, 50)];
+
+    let live_groups = unix_preexisting_process_groups(&live_table, &baseline);
+    let stale_groups = unix_preexisting_process_groups(&stale_table, &baseline);
+
+    assert_eq!(live_groups, std::collections::BTreeSet::from([50]));
+    assert!(stale_groups.is_empty());
+    assert!(!unix_process_requires_marker_scan(
+        &live_table[1],
+        &root,
+        &baseline,
+        &live_groups,
+        &BTreeMap::new(),
+        1000,
+    ));
+    assert!(unix_process_requires_marker_scan(
+        &stale_table[1],
+        &root,
+        &baseline,
+        &stale_groups,
+        &BTreeMap::new(),
+        1000,
+    ));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn marker_scan_does_not_order_opaque_start_tokens() {
     let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
     let empty_baseline = BTreeMap::new();
+    let empty_groups = std::collections::BTreeSet::new();
     let empty_descendants = BTreeMap::new();
     let older_same_owner = UnixProcessSnapshot {
         identity: UnixProcessIdentity { process_id: 43, start_token_low: 19, ..root },
@@ -502,6 +553,7 @@ fn marker_scan_does_not_order_opaque_start_tokens() {
             candidate,
             &root,
             &empty_baseline,
+            &empty_groups,
             &empty_descendants,
             1000,
         )

@@ -91,12 +91,17 @@ pub(super) fn configure_daemon_process_tree(
     use std::os::unix::process::CommandExt;
 
     let launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
-    command.process_group(0);
-    // SAFETY: the no-op closure performs no allocation, locking, or other non-async-signal-safe
-    // work. Registering it forces the fork/exec path so Apple posix_spawn cannot apply a
-    // close-by-default policy to the liveness descriptor.
+    // A distinct session prevents descendants from joining a pre-launch process group. It also
+    // forces the fork/exec path so Apple posix_spawn cannot close the liveness descriptor.
+    // SAFETY: setsid(2) is async-signal-safe and the closure performs no allocation or locking.
     unsafe {
-        command.pre_exec(|| Ok(()));
+        command.pre_exec(|| {
+            if unix_setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
     }
     let (descendant_liveness_read, descendant_liveness_write) =
         unix_descendant_liveness_pipe().context("qa.runner.daemon_liveness_pipe_failed")?;
@@ -324,17 +329,25 @@ impl DaemonProcessTree {
                 descendants_active |= unix_process_identity_is_active(identity)?;
             }
             let root_active = unix_process_identity_is_active(&self.root_identity)?;
-            let process_table = unix_process_table(deadline)?;
-            let marker_active = unix_marker_processes(
+            let process_table = match unix_process_table(deadline) {
+                Ok(process_table) => process_table,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let marker_active = match unix_marker_processes(
                 process_table.as_slice(),
                 &self.root_identity,
                 &self.preexisting_processes,
                 &tracked_descendants,
                 self.containment_marker.as_str(),
                 deadline,
-            )?
-            .into_iter()
-            .any(|identity| identity != self.root_identity);
+            ) {
+                Ok(processes) => {
+                    processes.into_iter().any(|identity| identity != self.root_identity)
+                }
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
+                Err(error) => return Err(error),
+            };
             let anchored_group_active =
                 root_active && unix_process_group_is_active(self.process_group_id)?;
             if !root_active
@@ -486,7 +499,6 @@ unsafe extern "C" {
     fn unix_fcntl(file_descriptor: i32, command: i32, ...) -> i32;
     #[link_name = "getuid"]
     fn unix_getuid() -> u32;
-    #[cfg(test)]
     #[link_name = "setsid"]
     pub(super) fn unix_setsid() -> i32;
     #[cfg(test)]
@@ -496,6 +508,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct MacProcessShortBsdInfo {
     process_id: u32,
     parent_id: u32,
@@ -514,6 +527,33 @@ struct MacProcessShortBsdInfo {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
+struct MacProcessBsdInfo {
+    _flags: u32,
+    _status: u32,
+    _exit_status: u32,
+    process_id: u32,
+    parent_id: u32,
+    owner_id: u32,
+    _group_owner_id: u32,
+    _real_owner_id: u32,
+    _real_group_owner_id: u32,
+    _saved_owner_id: u32,
+    _saved_group_owner_id: u32,
+    _reserved: u32,
+    _command: [u8; 16],
+    _name: [u8; 32],
+    _open_file_count: u32,
+    process_group_id: u32,
+    _job_control_count: u32,
+    _controlling_device: u32,
+    _foreground_group_id: u32,
+    _nice: i32,
+    _start_seconds: u64,
+    _start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MacProcessUniqueInfo {
     _executable_uuid: [u8; 16],
@@ -526,9 +566,20 @@ struct MacProcessUniqueInfo {
 }
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacProcessBsdInfoWithUniqueId {
+    process: MacProcessBsdInfo,
+    identity: MacProcessUniqueInfo,
+}
+
+#[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::size_of::<MacProcessShortBsdInfo>() == 64);
 #[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacProcessBsdInfo>() == 136);
+#[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::size_of::<MacProcessUniqueInfo>() == 56);
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacProcessBsdInfoWithUniqueId>() == 192);
 
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
@@ -788,10 +839,12 @@ pub(super) fn parse_linux_process_stat(
 #[cfg(target_os = "macos")]
 pub(super) fn unix_process_table(deadline: Instant) -> io::Result<Vec<UnixProcessSnapshot>> {
     let process_ids = mac_process_ids(deadline)?;
+    // SAFETY: getuid(2) has no arguments and cannot violate memory safety.
+    let current_owner_id = unsafe { unix_getuid() };
     let mut snapshots = Vec::with_capacity(process_ids.len());
     for process_id in process_ids {
         ensure_unix_cleanup_before_deadline(deadline)?;
-        if let Some(snapshot) = mac_process_snapshot(process_id)? {
+        if let Some(snapshot) = mac_process_table_snapshot(process_id, current_owner_id)? {
             snapshots.push(snapshot);
         }
     }
@@ -821,7 +874,8 @@ fn mac_process_ids(deadline: Instant) -> io::Result<Vec<i32>> {
 
 #[cfg(target_os = "macos")]
 fn unix_process_identity(process_id: i32) -> io::Result<Option<UnixProcessIdentity>> {
-    Ok(unix_process_snapshot(process_id)?.map(|snapshot| snapshot.identity))
+    Ok(mac_process_unique_info(process_id)?
+        .map(|information| mac_process_identity(process_id, information)))
 }
 
 #[cfg(target_os = "macos")]
@@ -831,33 +885,141 @@ fn unix_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnapsh
 
 #[cfg(target_os = "macos")]
 fn mac_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnapshot>> {
-    let Some(identity_before) = mac_process_unique_info(process_id)? else {
+    match mac_process_bsd_with_unique_id(process_id) {
+        Ok(Some(information)) => mac_process_snapshot_from_metadata(
+            process_id,
+            information.process.process_id,
+            information.process.parent_id,
+            information.process.process_group_id,
+            information.process.owner_id,
+            information.identity,
+        ),
+        Ok(None) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let Some(information) = mac_process_short_bsd_info(process_id)? else {
+                return Ok(None);
+            };
+            mac_process_snapshot_unprivileged(process_id, information)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_table_snapshot(
+    process_id: i32,
+    current_owner_id: u32,
+) -> io::Result<Option<UnixProcessSnapshot>> {
+    let Some(prefilter) = mac_process_short_bsd_info(process_id)? else {
         return Ok(None);
     };
-    let Some(information) = mac_process_short_bsd_info(process_id)? else {
+    if prefilter.owner_id != current_owner_id {
+        return Ok(None);
+    }
+    match mac_process_bsd_with_unique_id(process_id) {
+        Ok(Some(information)) if information.process.owner_id == current_owner_id => {
+            mac_process_snapshot_from_metadata(
+                process_id,
+                information.process.process_id,
+                information.process.parent_id,
+                information.process.process_group_id,
+                information.process.owner_id,
+                information.identity,
+            )
+        }
+        Ok(Some(_)) | Ok(None) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let snapshot = mac_process_snapshot_unprivileged(process_id, prefilter)?;
+            Ok(snapshot.filter(|snapshot| snapshot.owner_id == current_owner_id))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_snapshot_unprivileged(
+    process_id: i32,
+    information_before: MacProcessShortBsdInfo,
+) -> io::Result<Option<UnixProcessSnapshot>> {
+    let Some(identity) = mac_process_unique_info(process_id)? else {
         return Ok(None);
     };
-    let Some(identity_after) = mac_process_unique_info(process_id)? else {
+    let Some(information_after) = mac_process_short_bsd_info(process_id)? else {
         return Ok(None);
     };
-    // The two unprivileged lookups make PID reuse across the metadata read observable.
-    if identity_before != identity_after
-        || information.process_id != u32::try_from(process_id).unwrap_or(u32::MAX)
-    {
+    // Stable metadata around the unique-ID read prevents a recycled PID from mixing identities.
+    if information_before != information_after {
+        return Ok(None);
+    }
+    mac_process_snapshot_from_metadata(
+        process_id,
+        information_after.process_id,
+        information_after.parent_id,
+        information_after.process_group_id,
+        information_after.owner_id,
+        identity,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_snapshot_from_metadata(
+    process_id: i32,
+    reported_process_id: u32,
+    parent_id: u32,
+    process_group_id: u32,
+    owner_id: u32,
+    identity: MacProcessUniqueInfo,
+) -> io::Result<Option<UnixProcessSnapshot>> {
+    if reported_process_id != u32::try_from(process_id).unwrap_or(u32::MAX) {
         return Ok(None);
     }
     Ok(Some(UnixProcessSnapshot {
-        identity: UnixProcessIdentity {
-            process_id,
-            start_token_high: identity_after.unique_id,
-            start_token_low: u64::from(u32::from_ne_bytes(identity_after.id_version.to_ne_bytes())),
-        },
-        parent_id: i32::try_from(information.parent_id)
+        identity: mac_process_identity(process_id, identity),
+        parent_id: i32::try_from(parent_id)
             .map_err(|_| io::Error::other("macOS parent pid is invalid"))?,
-        process_group_id: i32::try_from(information.process_group_id)
+        process_group_id: i32::try_from(process_group_id)
             .map_err(|_| io::Error::other("macOS process group is invalid"))?,
-        owner_id: information.owner_id,
+        owner_id,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_identity(process_id: i32, information: MacProcessUniqueInfo) -> UnixProcessIdentity {
+    UnixProcessIdentity {
+        process_id,
+        start_token_high: information.unique_id,
+        start_token_low: u64::from(u32::from_ne_bytes(information.id_version.to_ne_bytes())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_bsd_with_unique_id(
+    process_id: i32,
+) -> io::Result<Option<MacProcessBsdInfoWithUniqueId>> {
+    const PROC_PIDT_BSDINFOWITHUNIQID: i32 = 18;
+
+    let mut information = std::mem::MaybeUninit::<MacProcessBsdInfoWithUniqueId>::zeroed();
+    let buffer_size = i32::try_from(std::mem::size_of::<MacProcessBsdInfoWithUniqueId>())
+        .map_err(|_| io::Error::other("macOS combined process information buffer is too large"))?;
+    // SAFETY: the buffer matches the kernel's fixed PROC_PIDT_BSDINFOWITHUNIQID ABI.
+    let read = unsafe {
+        proc_pidinfo(
+            process_id,
+            PROC_PIDT_BSDINFOWITHUNIQID,
+            0,
+            information.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    // SAFETY: the combined C layout contains only integer and byte fields.
+    unsafe {
+        mac_process_info_result(
+            read,
+            buffer_size,
+            information,
+            "macOS combined process information",
+        )
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -963,6 +1125,10 @@ fn unix_marker_processes(
     let _launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
     let mut classified_processes = known_descendants.clone();
     classified_processes.extend(unix_other_tree_processes(process_table, marker));
+    // The root starts a new session, so its descendants cannot enter a group that still contains
+    // an exact pre-launch member. This proof avoids reading unrelated protected environments.
+    let preexisting_process_groups =
+        unix_preexisting_process_groups(process_table, preexisting_processes);
     // The marker is non-secret, but scanning a process environment can encounter credentials.
     // Buffers are bounded, never formatted, and zeroed immediately after the exact match check.
     let assignment = format!("{QA_PROCESS_TREE_MARKER_ENV}={marker}").into_bytes();
@@ -978,6 +1144,7 @@ fn unix_marker_processes(
             snapshot,
             root_identity,
             preexisting_processes,
+            &preexisting_process_groups,
             &classified_processes,
             current_owner_id,
         )
@@ -1091,17 +1258,34 @@ pub(super) fn unix_other_tree_processes_with_registry(
         .collect()
 }
 
+/// Returns groups that still contain an exact process observed before the isolated session launch.
+#[cfg(unix)]
+pub(super) fn unix_preexisting_process_groups(
+    process_table: &[UnixProcessSnapshot],
+    preexisting_processes: &BTreeMap<i32, UnixProcessIdentity>,
+) -> std::collections::BTreeSet<i32> {
+    process_table
+        .iter()
+        .filter_map(|snapshot| {
+            (preexisting_processes.get(&snapshot.identity.process_id) == Some(&snapshot.identity))
+                .then_some(snapshot.process_group_id)
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 pub(super) fn unix_process_requires_marker_scan(
     candidate: &UnixProcessSnapshot,
     root: &UnixProcessIdentity,
     preexisting_processes: &BTreeMap<i32, UnixProcessIdentity>,
+    preexisting_process_groups: &std::collections::BTreeSet<i32>,
     known_descendants: &BTreeMap<i32, UnixProcessIdentity>,
     current_owner_id: u32,
 ) -> bool {
     if candidate.owner_id != current_owner_id
         || candidate.identity == *root
         || preexisting_processes.get(&candidate.identity.process_id) == Some(&candidate.identity)
+        || preexisting_process_groups.contains(&candidate.process_group_id)
         || known_descendants.get(&candidate.identity.process_id) == Some(&candidate.identity)
     {
         return false;
@@ -1114,8 +1298,8 @@ pub(super) fn unix_process_requires_marker_scan(
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // macOS exposes wall-clock start timestamps, which can move backwards. Scanning every
-        // same-owner candidate preserves fail-closed cleanup if the system clock changes.
+        // macOS process identity tokens are opaque rather than ordered. Every unclassified
+        // same-owner candidate must therefore remain eligible for the containment-marker scan.
         let _ = root;
         true
     }
@@ -1139,7 +1323,7 @@ fn unix_process_baseline(deadline: Instant) -> io::Result<BTreeMap<i32, UnixProc
     let current_owner_id = unsafe { unix_getuid() };
     mac_process_baseline_with(process_ids.as_slice(), current_owner_id, |process_id| {
         ensure_unix_cleanup_before_deadline(deadline)?;
-        mac_process_snapshot(process_id)
+        mac_process_table_snapshot(process_id, current_owner_id)
     })
 }
 

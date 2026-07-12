@@ -132,8 +132,9 @@ use process_tree::wait_for_child_exit;
 #[cfg(all(test, unix))]
 use process_tree::{
     unix_close, unix_descendant_liveness_closed, unix_identity_matching_roots,
-    unix_other_tree_processes_with_registry, unix_process_requires_marker_scan, unix_process_table,
-    unix_recursive_descendants, unix_setsid, unix_signal_process_identity_with, UNIX_SIGKILL,
+    unix_other_tree_processes_with_registry, unix_preexisting_process_groups,
+    unix_process_requires_marker_scan, unix_process_table, unix_recursive_descendants, unix_setsid,
+    unix_signal_process_identity_with, UNIX_SIGKILL,
 };
 #[cfg(test)]
 use startup::{
