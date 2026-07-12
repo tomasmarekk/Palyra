@@ -99,12 +99,18 @@ pub(super) fn configure_daemon_process_tree(
     }
     let (descendant_liveness_read, descendant_liveness_write) =
         unix_descendant_liveness_pipe().context("qa.runner.daemon_liveness_pipe_failed")?;
+    let baseline_deadline = Instant::now()
+        .checked_add(DAEMON_TERMINATION_TIMEOUT)
+        .ok_or_else(|| anyhow::anyhow!("qa.runner.daemon_process_baseline_deadline_invalid"))?;
+    let preexisting_processes = unix_process_baseline(baseline_deadline)
+        .context("qa.runner.daemon_process_baseline_failed")?;
     let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
     command.env(QA_PROCESS_TREE_MARKER_ENV, containment_marker.as_str());
     Ok(DaemonProcessTreePreparation {
         descendant_liveness_read,
         descendant_liveness_write,
         containment_marker,
+        preexisting_processes,
     })
 }
 
@@ -181,6 +187,7 @@ pub(super) fn attach_daemon_process_tree(
             descendant_discovery_complete: Mutex::new(false),
             descendant_liveness_read: Mutex::new(preparation.descendant_liveness_read),
             containment_marker: preparation.containment_marker,
+            preexisting_processes: preparation.preexisting_processes,
         }),
         descendants_possible_without_tree: true,
         cleanup_verified: false,
@@ -299,8 +306,9 @@ impl DaemonProcessTree {
             return Ok(false);
         }
         loop {
+            let tracked_descendants = lock_unpoisoned(&self.tracked_descendants).clone();
             let mut descendants_active = false;
-            for identity in lock_unpoisoned(&self.tracked_descendants).values() {
+            for identity in tracked_descendants.values() {
                 descendants_active |= unix_process_identity_is_active(identity)?;
             }
             let root_active = unix_process_identity_is_active(&self.root_identity)?;
@@ -308,6 +316,8 @@ impl DaemonProcessTree {
             let marker_active = unix_marker_processes(
                 process_table.as_slice(),
                 &self.root_identity,
+                &self.preexisting_processes,
+                &tracked_descendants,
                 self.containment_marker.as_str(),
                 deadline,
             )?
@@ -349,28 +359,45 @@ impl DaemonProcessTree {
         for pass in 0..MAX_DISCOVERY_PASSES {
             ensure_unix_cleanup_before_deadline(deadline)?;
             let process_table = unix_process_table(deadline)?;
-            let marker_processes = unix_marker_processes(
-                process_table.as_slice(),
-                &self.root_identity,
-                self.containment_marker.as_str(),
-                deadline,
-            )?;
+            let tracked_before = lock_unpoisoned(&self.tracked_descendants).clone();
             let roots = unix_identity_matching_roots(
                 process_table.as_slice(),
                 &self.root_identity,
-                &lock_unpoisoned(&self.tracked_descendants),
+                &tracked_before,
             );
             let discovered = unix_recursive_descendants(process_table.as_slice(), &roots);
-            let mut tracked = lock_unpoisoned(&self.tracked_descendants);
-            let previous = tracked.clone();
+            let previous = tracked_before.clone();
+            let mut known_descendants = tracked_before;
             for snapshot in process_table
                 .iter()
                 .filter(|snapshot| discovered.contains(&snapshot.identity.process_id))
             {
                 if snapshot.identity != self.root_identity {
-                    tracked.insert(snapshot.identity.process_id, snapshot.identity);
+                    known_descendants.insert(snapshot.identity.process_id, snapshot.identity);
                 }
             }
+            // Persist exact identities before either fallible operation. terminate() can then kill
+            // them even if signaling or a protected process makes the marker scan fail.
+            {
+                let mut tracked = lock_unpoisoned(&self.tracked_descendants);
+                for identity in known_descendants.values() {
+                    tracked.insert(identity.process_id, *identity);
+                }
+            }
+            // Stop identity-bound descendants before the environment scan so they cannot fork
+            // across the scan. Their exact identities are checked directly and need no marker read.
+            for identity in known_descendants.values() {
+                unix_signal_process_identity(identity, UNIX_SIGSTOP)?;
+            }
+            let marker_processes = unix_marker_processes(
+                process_table.as_slice(),
+                &self.root_identity,
+                &self.preexisting_processes,
+                &known_descendants,
+                self.containment_marker.as_str(),
+                deadline,
+            )?;
+            let mut tracked = lock_unpoisoned(&self.tracked_descendants);
             for identity in marker_processes {
                 if identity != self.root_identity {
                     tracked.insert(identity.process_id, identity);
@@ -827,6 +854,8 @@ fn unix_process_snapshot(_process_id: i32) -> io::Result<Option<UnixProcessSnaps
 fn unix_marker_processes(
     process_table: &[UnixProcessSnapshot],
     root_identity: &UnixProcessIdentity,
+    preexisting_processes: &BTreeMap<i32, UnixProcessIdentity>,
+    known_descendants: &BTreeMap<i32, UnixProcessIdentity>,
     marker: &str,
     deadline: Instant,
 ) -> io::Result<Vec<UnixProcessIdentity>> {
@@ -837,14 +866,39 @@ fn unix_marker_processes(
     let current_owner_id = unsafe { unix_getuid() };
     let mut total_bytes = 0_usize;
     let mut marked = Vec::new();
-    // Narrow the scan by owner and, where start tokens are monotonic, by the owned root's age.
-    // This avoids unrelated Linux processes failing the scan under ptrace environment controls.
+    // Narrow the scan to processes whose ownership is not already proven another way. Exact
+    // pre-launch identities cannot carry the marker, while the root and known descendants have
+    // identity-bound liveness checks that do not expose unrelated process environments.
     for snapshot in process_table.iter().filter(|snapshot| {
-        unix_process_can_inherit_marker(snapshot, root_identity, current_owner_id)
+        unix_process_requires_marker_scan(
+            snapshot,
+            root_identity,
+            preexisting_processes,
+            known_descendants,
+            current_owner_id,
+        )
     }) {
         ensure_unix_cleanup_before_deadline(deadline)?;
-        let (has_marker, bytes_read) =
-            unix_process_has_marker(snapshot.identity.process_id, assignment.as_slice(), deadline)?;
+        let (has_marker, bytes_read) = unix_process_has_marker(
+            snapshot.identity.process_id,
+            assignment.as_slice(),
+            deadline,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "process marker scan failed for pid {} ppid {} pgrp {} start {}:{} (root {}:{}): {error}",
+                    snapshot.identity.process_id,
+                    snapshot.parent_id,
+                    snapshot.process_group_id,
+                    snapshot.identity.start_token_high,
+                    snapshot.identity.start_token_low,
+                    root_identity.start_token_high,
+                    root_identity.start_token_low,
+                ),
+            )
+        })?;
         total_bytes = total_bytes
             .checked_add(bytes_read)
             .ok_or_else(|| io::Error::other("process environment scan overflow"))?;
@@ -861,12 +915,18 @@ fn unix_marker_processes(
 }
 
 #[cfg(unix)]
-pub(super) fn unix_process_can_inherit_marker(
+pub(super) fn unix_process_requires_marker_scan(
     candidate: &UnixProcessSnapshot,
     root: &UnixProcessIdentity,
+    preexisting_processes: &BTreeMap<i32, UnixProcessIdentity>,
+    known_descendants: &BTreeMap<i32, UnixProcessIdentity>,
     current_owner_id: u32,
 ) -> bool {
-    if candidate.owner_id != current_owner_id {
+    if candidate.owner_id != current_owner_id
+        || candidate.identity == *root
+        || preexisting_processes.get(&candidate.identity.process_id) == Some(&candidate.identity)
+        || known_descendants.get(&candidate.identity.process_id) == Some(&candidate.identity)
+    {
         return false;
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -882,6 +942,17 @@ pub(super) fn unix_process_can_inherit_marker(
         let _ = root;
         true
     }
+}
+
+#[cfg(unix)]
+fn unix_process_baseline(deadline: Instant) -> io::Result<BTreeMap<i32, UnixProcessIdentity>> {
+    // SAFETY: getuid(2) has no arguments and cannot violate memory safety.
+    let current_owner_id = unsafe { unix_getuid() };
+    Ok(unix_process_table(deadline)?
+        .into_iter()
+        .filter(|snapshot| snapshot.owner_id == current_owner_id)
+        .map(|snapshot| (snapshot.identity.process_id, snapshot.identity))
+        .collect())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

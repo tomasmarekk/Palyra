@@ -130,7 +130,7 @@ use process_tree::wait_for_child_exit;
 #[cfg(all(test, unix))]
 use process_tree::{
     unix_close, unix_descendant_liveness_closed, unix_identity_matching_roots,
-    unix_process_can_inherit_marker, unix_process_table, unix_recursive_descendants, unix_setsid,
+    unix_process_requires_marker_scan, unix_process_table, unix_recursive_descendants, unix_setsid,
     unix_signal_process_identity_with, UNIX_SIGKILL,
 };
 #[cfg(test)]
@@ -328,6 +328,8 @@ struct DaemonProcessTree {
     descendant_liveness_read: Mutex<fs::File>,
     #[cfg(unix)]
     containment_marker: String,
+    #[cfg(unix)]
+    preexisting_processes: BTreeMap<i32, UnixProcessIdentity>,
     #[cfg(windows)]
     job: WindowsJobHandle,
 }
@@ -341,6 +343,10 @@ struct DaemonProcessTreePreparation {
     descendant_liveness_write: fs::File,
     #[cfg(unix)]
     containment_marker: String,
+    // Exact identities captured before marker injection cannot belong to this tree. Keeping the
+    // start token prevents a recycled PID from inheriting the exemption.
+    #[cfg(unix)]
+    preexisting_processes: BTreeMap<i32, UnixProcessIdentity>,
 }
 
 #[cfg(unix)]

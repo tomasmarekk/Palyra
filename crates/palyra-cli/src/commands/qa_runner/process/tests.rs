@@ -230,6 +230,10 @@ fn unix_process_tree_helper() {
             });
         }
     }
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the fixture intentionally orphans this child for process-tree cleanup discovery"
+    )]
     let _child = child.spawn().expect("escaped helper child should start");
     let _ = wait_for_recorded_process_id(pid_path.as_path(), Duration::from_secs(5));
     if mode == "launcher" {

@@ -445,8 +445,10 @@ fn stale_tracked_process_identity_is_never_signaled() {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
-fn marker_scan_excludes_processes_that_predate_the_owned_root() {
+fn marker_scan_targets_only_unclassified_processes() {
     let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
+    let empty_baseline = BTreeMap::new();
+    let empty_descendants = BTreeMap::new();
     let snapshot = |identity, owner_id| UnixProcessSnapshot {
         identity,
         parent_id: 1,
@@ -460,17 +462,33 @@ fn marker_scan_excludes_processes_that_predate_the_owned_root() {
         1000,
     );
     let other_owner = snapshot(UnixProcessIdentity { process_id: 45, ..root }, 1001);
+    let requires_scan = |candidate, baseline, descendants| {
+        unix_process_requires_marker_scan(candidate, &root, baseline, descendants, 1000)
+    };
 
-    assert!(!unix_process_can_inherit_marker(&older, &root, 1000));
-    assert!(unix_process_can_inherit_marker(&same_start, &root, 1000));
-    assert!(unix_process_can_inherit_marker(&newer, &root, 1000));
-    assert!(!unix_process_can_inherit_marker(&other_owner, &root, 1000));
+    assert!(!requires_scan(&older, &empty_baseline, &empty_descendants));
+    assert!(!requires_scan(&snapshot(root, 1000), &empty_baseline, &empty_descendants));
+    assert!(requires_scan(&same_start, &empty_baseline, &empty_descendants));
+    assert!(requires_scan(&newer, &empty_baseline, &empty_descendants));
+    assert!(!requires_scan(&other_owner, &empty_baseline, &empty_descendants));
+
+    let preexisting = BTreeMap::from([(same_start.identity.process_id, same_start.identity)]);
+    assert!(!requires_scan(&same_start, &preexisting, &empty_descendants));
+    let reused_pid =
+        snapshot(UnixProcessIdentity { start_token_low: 21, ..same_start.identity }, 1000);
+    assert!(requires_scan(&reused_pid, &preexisting, &empty_descendants));
+
+    let known_descendants = BTreeMap::from([(same_start.identity.process_id, same_start.identity)]);
+    assert!(!requires_scan(&same_start, &empty_baseline, &known_descendants));
+    assert!(requires_scan(&reused_pid, &empty_baseline, &known_descendants));
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn marker_scan_does_not_order_wall_clock_start_tokens() {
     let root = UnixProcessIdentity { process_id: 42, start_token_high: 10, start_token_low: 20 };
+    let empty_baseline = BTreeMap::new();
+    let empty_descendants = BTreeMap::new();
     let older_same_owner = UnixProcessSnapshot {
         identity: UnixProcessIdentity { process_id: 43, start_token_low: 19, ..root },
         parent_id: 1,
@@ -478,9 +496,18 @@ fn marker_scan_does_not_order_wall_clock_start_tokens() {
         owner_id: 1000,
     };
     let older_other_owner = UnixProcessSnapshot { owner_id: 1001, ..older_same_owner };
+    let requires_scan = |candidate| {
+        unix_process_requires_marker_scan(
+            candidate,
+            &root,
+            &empty_baseline,
+            &empty_descendants,
+            1000,
+        )
+    };
 
-    assert!(unix_process_can_inherit_marker(&older_same_owner, &root, 1000));
-    assert!(!unix_process_can_inherit_marker(&older_other_owner, &root, 1000));
+    assert!(requires_scan(&older_same_owner));
+    assert!(!requires_scan(&older_other_owner));
 }
 
 #[cfg(unix)]
