@@ -304,20 +304,32 @@ pub(super) fn pinned_directory_removed(directory: &fs::File) -> Result<bool> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn pinned_directory_removed(directory: &fs::File) -> Result<bool> {
-    use std::os::fd::AsRawFd;
+    use std::{
+        ffi::{CStr, OsStr},
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
 
     const MACOS_F_GETPATH: i32 = 50;
     const MACOS_MAX_PATH_BYTES: usize = 1024;
 
     let mut path = [0_u8; MACOS_MAX_PATH_BYTES];
-    // APFS does not provide Linux-style zero-link evidence for an open removed directory. Darwin's
-    // F_GETPATH instead fails once the pinned vnode has no parent/name path, while a renamed vnode
-    // remains resolvable. This preserves the distinction between deletion and path substitution.
+    // APFS does not provide Linux-style zero-link evidence for an open removed directory. Darwin
+    // can retain the vnode's last path after unlink, so verify that the returned path no longer
+    // names an entry. A renamed vnode remains resolvable at its new path and therefore fails closed.
     // SAFETY: `directory` owns a live descriptor and `path` satisfies F_GETPATH's MAXPATHLEN buffer
     // contract for the duration of the variadic fcntl call.
     let result = unsafe { macos_fcntl(directory.as_raw_fd(), MACOS_F_GETPATH, path.as_mut_ptr()) };
     if result == 0 {
-        return Ok(false);
+        let path = CStr::from_bytes_until_nul(path.as_slice())
+            .context("qa.runner.failure_diagnostics_state_root_identity_failed")?;
+        let path = Path::new(OsStr::from_bytes(path.to_bytes()));
+        return match fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => {
+                Err(error).context("qa.runner.failure_diagnostics_state_root_identity_failed")
+            }
+        };
     }
     let error = io::Error::last_os_error();
     if error.kind() == io::ErrorKind::NotFound {
