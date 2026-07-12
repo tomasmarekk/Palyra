@@ -123,6 +123,8 @@ const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
 const MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS: usize = 4_096;
 #[cfg(target_os = "macos")]
 const MAX_MACOS_PROCESS_GROUP_SNAPSHOT_ATTEMPTS: usize = 3;
+#[cfg(target_os = "macos")]
+const MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES: u64 = 1;
 const PROCESS_STDIN_INPUT_MAX_BYTES: usize = 8 * 1024;
 const PROCESS_STDIN_TOTAL_MAX_BYTES: usize = 64 * 1024;
 const PROCESS_STDIN_MAX_EVENTS: usize = 64;
@@ -8219,7 +8221,9 @@ fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
                 macos_proc_pidinfo(
                     process_id,
                     libc::PROC_PIDTBSDINFO,
-                    0,
+                    // Group enumeration includes zombproc; the nonzero argument tells Darwin's
+                    // BSDINFO lookup to search that list instead of reporting a stable ESRCH.
+                    MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
                     information.as_mut_ptr().cast(),
                     information_size,
                 )
