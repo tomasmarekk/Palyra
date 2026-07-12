@@ -90,7 +90,6 @@ pub(super) fn configure_daemon_process_tree(
 ) -> Result<DaemonProcessTreePreparation> {
     use std::os::unix::process::CommandExt;
 
-    let launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
     // A distinct session prevents descendants from joining a pre-launch process group. It also
     // forces the fork/exec path so Apple posix_spawn cannot close the liveness descriptor.
     // SAFETY: setsid(2) is async-signal-safe and the closure performs no allocation or locking.
@@ -111,6 +110,11 @@ pub(super) fn configure_daemon_process_tree(
     let preexisting_processes = unix_process_baseline(baseline_deadline)
         .context("qa.runner.daemon_process_baseline_failed")?;
     let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
+    // Only marker injection through root registration needs to exclude marker scans. Keeping the
+    // process-table baseline outside this section avoids charging unrelated cleanup deadlines for
+    // a potentially expensive system-wide enumeration.
+    let launch_guard =
+        UNIX_PROCESS_TREE_COORDINATION.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     command.env(QA_PROCESS_TREE_MARKER_ENV, containment_marker.as_str());
     Ok(DaemonProcessTreePreparation {
         descendant_liveness_read,
@@ -1172,8 +1176,8 @@ fn unix_marker_processes(
     marker: &str,
     deadline: Instant,
 ) -> io::Result<Vec<UnixProcessIdentity>> {
-    // A scan must not overlap the spawn-to-registration window of another marker tree.
-    let _launch_guard = lock_unpoisoned(&UNIX_PROCESS_TREE_LAUNCH_LOCK);
+    // Scans may overlap each other, but not the spawn-to-registration window of another tree.
+    let _scan_guard = acquire_unix_process_tree_marker_scan();
     let mut classified_processes = known_descendants.clone();
     classified_processes.extend(unix_other_tree_processes(process_table, marker));
     // The root starts a new session, so its descendants cannot enter a group that still contains
@@ -1234,6 +1238,11 @@ fn unix_marker_processes(
         }
     }
     Ok(marked)
+}
+
+#[cfg(unix)]
+pub(super) fn acquire_unix_process_tree_marker_scan() -> RwLockReadGuard<'static, ()> {
+    UNIX_PROCESS_TREE_COORDINATION.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(unix)]

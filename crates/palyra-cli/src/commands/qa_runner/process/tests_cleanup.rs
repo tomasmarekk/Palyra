@@ -406,6 +406,23 @@ fn unix_process_disappearance_only_accepts_absence_errors() {
     assert!(!unix_process_disappeared(&io::Error::from(io::ErrorKind::PermissionDenied)));
 }
 
+#[cfg(unix)]
+#[test]
+fn marker_scans_can_share_process_tree_coordination() {
+    let first_scan = acquire_unix_process_tree_marker_scan();
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let second_scan = thread::spawn(move || {
+        let _scan = acquire_unix_process_tree_marker_scan();
+        acquired_tx.send(()).expect("second marker scan result should remain observable");
+    });
+
+    acquired_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("independent marker scans must not consume each other's cleanup deadline");
+    drop(first_scan);
+    second_scan.join().expect("second marker scan should finish");
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn linux_process_identity_parser_handles_closing_parentheses_in_command_name() {

@@ -1,5 +1,7 @@
 //! Isolated daemon process and workspace lifecycle for the fixture runner.
 
+#[cfg(unix)]
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
@@ -131,11 +133,11 @@ use process_tree::parse_linux_process_stat;
 use process_tree::wait_for_child_exit;
 #[cfg(all(test, unix))]
 use process_tree::{
-    unix_close, unix_descendant_liveness_closed, unix_identity_matching_roots,
-    unix_other_tree_processes_with_registry, unix_preexisting_process_groups,
-    unix_process_disappeared, unix_process_identity_is_active, unix_process_requires_marker_scan,
-    unix_process_table, unix_recursive_descendants, unix_setsid, unix_signal_process_identity_with,
-    UNIX_ESRCH, UNIX_SIGKILL,
+    acquire_unix_process_tree_marker_scan, unix_close, unix_descendant_liveness_closed,
+    unix_identity_matching_roots, unix_other_tree_processes_with_registry,
+    unix_preexisting_process_groups, unix_process_disappeared, unix_process_identity_is_active,
+    unix_process_requires_marker_scan, unix_process_table, unix_recursive_descendants, unix_setsid,
+    unix_signal_process_identity_with, UNIX_ESRCH, UNIX_SIGKILL,
 };
 #[cfg(test)]
 use startup::{
@@ -352,7 +354,7 @@ struct DaemonProcessTreePreparation {
     #[cfg(unix)]
     preexisting_processes: BTreeMap<i32, UnixProcessIdentity>,
     #[cfg(unix)]
-    launch_guard: MutexGuard<'static, ()>,
+    launch_guard: RwLockWriteGuard<'static, ()>,
 }
 
 #[cfg(unix)]
@@ -376,7 +378,10 @@ struct UnixProcessSnapshot {
 type UnixProcessTreeRegistry = BTreeMap<String, BTreeMap<i32, UnixProcessIdentity>>;
 
 #[cfg(unix)]
-static UNIX_PROCESS_TREE_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
+// Marker scans share the read side, while a launch owns the write side until its root identity is
+// registered. This prevents a scan from inspecting an unregistered sibling without serializing
+// independent cleanup work.
+static UNIX_PROCESS_TREE_COORDINATION: RwLock<()> = RwLock::new(());
 #[cfg(unix)]
 static UNIX_PROCESS_TREE_REGISTRY: OnceLock<Mutex<UnixProcessTreeRegistry>> = OnceLock::new();
 
