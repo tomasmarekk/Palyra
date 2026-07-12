@@ -563,7 +563,7 @@ mod tests {
             capability_snapshot(&registry, FeatureUsageCapability::VerificationRuntime);
         assert_eq!(verification.dropped_observations, 3);
 
-        let max_length_utf8_id = "é".repeat(64);
+        let max_length_utf8_id = "\u{00E9}".repeat(64);
         registry.record(
             max_length_utf8_id.as_str(),
             FeatureUsageCapability::VerificationRuntime,

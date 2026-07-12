@@ -96,7 +96,7 @@ fn runtime_error_text_is_redacted_and_utf8_byte_bounded() {
     let mut input = base_input();
     input.safe_message = format!(
         "raw provider body token=secret-value stderr: C:\\Users\\demo\\secret.txt {}",
-        "ž".repeat(MAX_RUNTIME_ERROR_SAFE_MESSAGE_BYTES)
+        "\u{017E}".repeat(MAX_RUNTIME_ERROR_SAFE_MESSAGE_BYTES)
     );
     input.recovery_hint =
         "Authorization: Bearer sk-secret-token\nstack backtrace:\n at C:\\work\\main.rs".to_owned();
@@ -113,7 +113,7 @@ fn runtime_error_text_is_redacted_and_utf8_byte_bounded() {
     assert!(!encoded.contains("stack backtrace"));
 
     let mut long_benign_input = base_input();
-    long_benign_input.safe_message = "ž".repeat(MAX_RUNTIME_ERROR_SAFE_MESSAGE_BYTES);
+    long_benign_input.safe_message = "\u{017E}".repeat(MAX_RUNTIME_ERROR_SAFE_MESSAGE_BYTES);
     long_benign_input.recovery_hint = "inspect diagnostics ".repeat(64);
     let bounded = RuntimeErrorEnvelopeV1::try_new(long_benign_input)
         .expect("long benign text should truncate on a UTF-8 boundary");
