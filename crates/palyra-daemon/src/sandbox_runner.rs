@@ -119,6 +119,10 @@ const BACKGROUND_POST_OUTPUT_EXIT_CHECK_MS: u64 = 250;
 const BACKGROUND_METADATA_RETURN_RESERVE_MS: u64 = 100;
 const BACKGROUND_MONITOR_POLL_MS: u64 = 50;
 const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
+#[cfg(target_os = "macos")]
+const MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS: usize = 4_096;
+#[cfg(target_os = "macos")]
+const MAX_MACOS_PROCESS_GROUP_SNAPSHOT_ATTEMPTS: usize = 3;
 const PROCESS_STDIN_INPUT_MAX_BYTES: usize = 8 * 1024;
 const PROCESS_STDIN_TOTAL_MAX_BYTES: usize = 64 * 1024;
 const PROCESS_STDIN_MAX_EVENTS: usize = 64;
@@ -8151,7 +8155,7 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     let process_group_id = unix_pid_from_u32(pid)?;
     // Signal 0 probes the owned process group without changing it. A missing group is the only
@@ -8166,6 +8170,124 @@ fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
         return Ok(false);
     }
     Err(error)
+}
+
+#[cfg(target_os = "macos")]
+fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
+    let process_group_id = unix_pid_from_u32(pid)?;
+    let mut process_ids: Vec<libc::pid_t> = vec![0; MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS];
+    let buffer_size =
+        i32::try_from(process_ids.len().saturating_mul(std::mem::size_of::<libc::pid_t>()))
+            .map_err(|_| io::Error::other("macOS process-group buffer exceeds libproc limits"))?;
+
+    for _ in 0..MAX_MACOS_PROCESS_GROUP_SNAPSHOT_ATTEMPTS {
+        process_ids.fill(0);
+        // SAFETY: `process_ids` is a writable buffer of exactly `buffer_size` bytes and the
+        // positive group id was validated to fit Darwin pid_t.
+        let count = unsafe {
+            macos_proc_listpgrppids(process_group_id, process_ids.as_mut_ptr().cast(), buffer_size)
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| io::Error::other("macOS process-group count is invalid"))?;
+        if count >= process_ids.len() {
+            return Err(io::Error::other("bounded macOS process-group capacity exceeded"));
+        }
+        if count == 0 {
+            if !macos_process_group_signal_probe(process_group_id)? {
+                return Ok(false);
+            }
+            continue;
+        }
+
+        let mut snapshot_changed = false;
+        for process_id in process_ids.iter().copied().take(count) {
+            if process_id <= 0 {
+                snapshot_changed = true;
+                continue;
+            }
+            let expected_process_id = u32::try_from(process_id)
+                .map_err(|_| io::Error::other("macOS process id is invalid"))?;
+            let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+                .map_err(|_| io::Error::other("macOS process information buffer is invalid"))?;
+            // SAFETY: `information` is the exact writable PROC_PIDTBSDINFO ABI buffer and remains
+            // live for the duration of the call.
+            let read = unsafe {
+                macos_proc_pidinfo(
+                    process_id,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    information.as_mut_ptr().cast(),
+                    information_size,
+                )
+            };
+            if read <= 0 {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+                    snapshot_changed = true;
+                    continue;
+                }
+                return Err(error);
+            }
+            if read != information_size {
+                return Err(io::Error::other("macOS process information response was incomplete"));
+            }
+            // SAFETY: proc_pidinfo reported that it initialized the complete fixed-size structure.
+            let information = unsafe { information.assume_init() };
+            if information.pbi_pid != expected_process_id || information.pbi_pgid != pid {
+                snapshot_changed = true;
+                continue;
+            }
+            // Zombies have exited and released their descriptors, but Darwin may retain them in
+            // the process group until the parent reaps them.
+            if information.pbi_status != libc::SZOMB {
+                return Ok(true);
+            }
+        }
+        if !snapshot_changed {
+            return Ok(false);
+        }
+    }
+
+    Err(io::Error::other("macOS process-group liveness snapshot did not stabilize"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_signal_probe(process_group_id: libc::pid_t) -> io::Result<bool> {
+    // SAFETY: signal 0 does not affect the target group; the validated positive pid_t can be
+    // negated safely and all error returns are handled.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    #[link_name = "proc_listpgrppids"]
+    fn macos_proc_listpgrppids(
+        process_group_id: libc::pid_t,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: i32,
+    ) -> i32;
+    #[link_name = "proc_pidinfo"]
+    fn macos_proc_pidinfo(
+        process_id: libc::pid_t,
+        flavor: i32,
+        argument: u64,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: i32,
+    ) -> i32;
 }
 
 #[cfg(windows)]

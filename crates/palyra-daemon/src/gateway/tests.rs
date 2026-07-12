@@ -6135,6 +6135,9 @@ async fn configure_feature_usage_test_agent(
         .expect("feature usage test agent should be created");
 }
 
+// macOS deliberately rejects LocalSandbox before execution; that fail-closed contract is covered
+// by sandbox-runner tests, while these counters require a platform with an executable hot path.
+#[cfg(not(target_os = "macos"))]
 async fn exercise_process_verification_usage(
     rollout_enabled: bool,
 ) -> FeatureUsageCapabilitySnapshot {
@@ -6241,12 +6244,14 @@ async fn exercise_workspace_patch_verification_usage(
     feature_usage_capability_snapshot(&state, FeatureUsageCapability::VerificationRuntime)
 }
 
+#[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn process_verification_usage_records_direct_on_enabled_hot_path() {
     let usage = exercise_process_verification_usage(true).await;
     assert_terminal_feature_usage(&usage, ExpectedTerminalFeatureUsage::Direct);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn process_verification_usage_records_explicit_fallback_when_disabled() {
     let usage = exercise_process_verification_usage(false).await;
