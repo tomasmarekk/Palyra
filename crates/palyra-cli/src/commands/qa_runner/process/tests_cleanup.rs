@@ -398,6 +398,14 @@ fn unix_process_enumeration_rejects_an_expired_cleanup_deadline() {
     assert!(started.elapsed() < Duration::from_millis(250));
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_process_disappearance_only_accepts_absence_errors() {
+    assert!(unix_process_disappeared(&io::Error::from(io::ErrorKind::NotFound)));
+    assert!(unix_process_disappeared(&io::Error::from_raw_os_error(UNIX_ESRCH)));
+    assert!(!unix_process_disappeared(&io::Error::from(io::ErrorKind::PermissionDenied)));
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn linux_process_identity_parser_handles_closing_parentheses_in_command_name() {

@@ -464,9 +464,7 @@ const UNIX_SIGSTOP: i32 = 17;
 ))]
 const UNIX_SIGSTOP: i32 = 19;
 #[cfg(unix)]
-const UNIX_ESRCH: i32 = 3;
-#[cfg(target_os = "macos")]
-const UNIX_ENOENT: i32 = 2;
+pub(super) const UNIX_ESRCH: i32 = 3;
 #[cfg(unix)]
 const MAX_UNIX_PROCESS_COUNT: usize = 65_536;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -666,6 +664,11 @@ fn unix_signal_process(process_id: i32, signal: i32) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
+pub(super) fn unix_process_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(UNIX_ESRCH)
+}
+
+#[cfg(unix)]
 fn unix_signal_process_identity(identity: &UnixProcessIdentity, signal: i32) -> io::Result<bool> {
     unix_signal_process_identity_with(identity, signal, unix_process_identity, unix_signal_process)
 }
@@ -820,7 +823,8 @@ fn linux_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnaps
     let stat_path = PathBuf::from(format!("/proc/{process_id}/stat"));
     let stat = match read_bounded_process_file(stat_path.as_path(), MAX_LINUX_PROC_STAT_BYTES) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        // procfs can surface ESRCH instead of ENOENT when a listed process exits during read.
+        Err(error) if unix_process_disappeared(&error) => {
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -828,7 +832,7 @@ fn linux_process_snapshot(process_id: i32) -> io::Result<Option<UnixProcessSnaps
     let process_path = PathBuf::from(format!("/proc/{process_id}"));
     let owner_id = match fs::metadata(process_path.as_path()) {
         Ok(metadata) => metadata.uid(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if unix_process_disappeared(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     parse_linux_process_stat(process_id, stat.as_slice(), owner_id).map(Some)
@@ -1132,11 +1136,7 @@ unsafe fn mac_process_info_result<T>(
 ) -> io::Result<Option<T>> {
     if read == 0 {
         let error = io::Error::last_os_error();
-        return if matches!(error.raw_os_error(), Some(UNIX_ESRCH) | Some(UNIX_ENOENT)) {
-            Ok(None)
-        } else {
-            Err(error)
-        };
+        return if unix_process_disappeared(&error) { Ok(None) } else { Err(error) };
     }
     if read != expected_size {
         return Err(io::Error::other(format!("{description} was truncated")));
@@ -1420,7 +1420,7 @@ fn unix_process_has_marker(
     let path = PathBuf::from(format!("/proc/{process_id}/environ"));
     let mut bytes = match read_bounded_process_file(path.as_path(), MAX_UNIX_PROCESS_ENV_BYTES) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((false, 0)),
+        Err(error) if unix_process_disappeared(&error) => return Ok((false, 0)),
         Err(error) => return Err(error),
     };
     let bytes_read = bytes.len();
@@ -1456,11 +1456,7 @@ fn unix_process_has_marker(
     {
         bytes.fill(0);
         let error = io::Error::last_os_error();
-        return if matches!(error.raw_os_error(), Some(UNIX_ESRCH) | Some(UNIX_ENOENT)) {
-            Ok((false, 0))
-        } else {
-            Err(error)
-        };
+        return if unix_process_disappeared(&error) { Ok((false, 0)) } else { Err(error) };
     }
     if length > bytes.len() {
         bytes.fill(0);
