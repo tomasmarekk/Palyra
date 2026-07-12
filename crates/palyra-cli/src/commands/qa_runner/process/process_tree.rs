@@ -435,10 +435,10 @@ unsafe extern "C" {
     fn unix_getuid() -> u32;
     #[cfg(test)]
     #[link_name = "setsid"]
-    fn unix_setsid() -> i32;
+    pub(super) fn unix_setsid() -> i32;
     #[cfg(test)]
     #[link_name = "closefrom"]
-    fn unix_closefrom(first_file_descriptor: i32);
+    pub(super) fn unix_closefrom(first_file_descriptor: i32);
 }
 
 #[cfg(target_os = "macos")]
