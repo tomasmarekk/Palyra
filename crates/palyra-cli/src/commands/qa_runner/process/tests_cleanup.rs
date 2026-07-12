@@ -461,13 +461,14 @@ fn marker_scan_targets_only_unclassified_processes() {
         UnixProcessIdentity { process_id: 44, start_token_high: 11, start_token_low: 0 },
         1000,
     );
+    let root_snapshot = snapshot(root, 1000);
     let other_owner = snapshot(UnixProcessIdentity { process_id: 45, ..root }, 1001);
     let requires_scan = |candidate, baseline, descendants| {
         unix_process_requires_marker_scan(candidate, &root, baseline, descendants, 1000)
     };
 
     assert!(!requires_scan(&older, &empty_baseline, &empty_descendants));
-    assert!(!requires_scan(&snapshot(root, 1000), &empty_baseline, &empty_descendants));
+    assert!(!requires_scan(&root_snapshot, &empty_baseline, &empty_descendants));
     assert!(requires_scan(&same_start, &empty_baseline, &empty_descendants));
     assert!(requires_scan(&newer, &empty_baseline, &empty_descendants));
     assert!(!requires_scan(&other_owner, &empty_baseline, &empty_descendants));
