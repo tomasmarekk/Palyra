@@ -2507,6 +2507,10 @@ fn builtin_stop_process_success(
         })?;
         return Ok(SandboxProcessRunSuccess { output_json });
     }
+    #[cfg(windows)]
+    // The lifetime monitor may remove the registry entry as soon as termination is observed.
+    // Retain the job handle so this stop call can still report its verified final process count.
+    let retained_windows_job = windows_background_job(pid);
     let before_status =
         background_process_runtime_status(pid).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -2523,6 +2527,13 @@ fn builtin_stop_process_success(
     }
     let stopped = !was_running
         || wait_for_process_not_alive(pid, Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS));
+    #[cfg(windows)]
+    let after_status = match retained_windows_job.as_deref() {
+        Some(job) => background_process_runtime_status_from_windows_job(pid, job),
+        None => background_process_runtime_status(pid),
+    }
+    .ok();
+    #[cfg(not(windows))]
     let after_status = background_process_runtime_status(pid).ok();
     // When the post-stop probe fails, report alive=true: claiming a process is gone without
     // evidence would let callers skip cleanup.
@@ -3219,6 +3230,20 @@ pub(crate) fn background_process_runtime_status(
         direct_pid_alive,
         process_tree_alive,
         tracked_process_count,
+    })
+}
+
+#[cfg(windows)]
+fn background_process_runtime_status_from_windows_job(
+    pid: u32,
+    job: &WindowsBackgroundJob,
+) -> io::Result<BackgroundProcessRuntimeStatus> {
+    let direct_pid_alive = process_id_is_alive(pid)?;
+    let tracked_process_count = job.active_process_count()?;
+    Ok(BackgroundProcessRuntimeStatus {
+        direct_pid_alive,
+        process_tree_alive: tracked_process_count > 0,
+        tracked_process_count: Some(tracked_process_count),
     })
 }
 
