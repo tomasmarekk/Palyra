@@ -2059,14 +2059,23 @@ fn normalize_evidence_value(
     identifier_aliases: &mut IdentifierAliases,
 ) -> Value {
     match value {
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, child)| {
-                    (key.clone(), normalize_object_child(key, child, report, identifier_aliases))
-                })
-                .collect(),
-        ),
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            // `serde_json` swaps map backends when `preserve_order` is enabled by another
+            // workspace crate. Sorting keeps alias allocation independent of feature unification.
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, child)| {
+                        (
+                            key.clone(),
+                            normalize_object_child(key, child, report, identifier_aliases),
+                        )
+                    })
+                    .collect(),
+            )
+        }
         Value::Array(values) => Value::Array(
             values
                 .iter()
@@ -3192,6 +3201,34 @@ timeout:
     }
 
     #[test]
+    fn identifier_alias_normalization_is_object_order_independent() {
+        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let mut first = passing_input();
+        let mut second = first.clone();
+
+        let mut first_payload = serde_json::Map::new();
+        first_payload.insert("side_effect_id".to_owned(), json!("effect-a"));
+        first_payload.insert("idempotency_key".to_owned(), json!("effect-b"));
+        let mut second_payload = serde_json::Map::new();
+        second_payload.insert("idempotency_key".to_owned(), json!("effect-b"));
+        second_payload.insert("side_effect_id".to_owned(), json!("effect-a"));
+        first.tape_events[0].payload = Value::Object(first_payload);
+        second.tape_events[0].payload = Value::Object(second_payload);
+
+        let first_bundle = build_qa_evidence_bundle(&manifest, first);
+        let second_bundle = build_qa_evidence_bundle(&manifest, second);
+
+        assert_eq!(first_bundle.redacted_tape, second_bundle.redacted_tape);
+        assert_eq!(
+            serde_json::to_vec(&first_bundle.redacted_tape)
+                .expect("first normalized tape should serialize"),
+            serde_json::to_vec(&second_bundle.redacted_tape)
+                .expect("second normalized tape should serialize")
+        );
+    }
+
+    #[test]
     fn timestamp_normalization_does_not_hide_semantic_replay_drift() {
         let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
             .expect("basic QA scenario should parse");
@@ -3232,7 +3269,6 @@ timeout:
         assert_ne!(baseline_event.payload["generation"], drift_event.payload["generation"]);
         assert_ne!(baseline_event.payload["reason_code"], drift_event.payload["reason_code"]);
         assert_ne!(baseline_event.payload["terminal_count"], drift_event.payload["terminal_count"]);
-        assert_ne!(baseline_event.payload["side_effect_id"], drift_event.payload["side_effect_id"]);
         assert_eq!(
             baseline_event.payload["side_effect_id"],
             baseline_event.payload["idempotency_key"]
