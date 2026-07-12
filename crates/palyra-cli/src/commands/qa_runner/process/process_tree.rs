@@ -513,7 +513,7 @@ struct MacProcessShortBsdInfo {
     process_id: u32,
     parent_id: u32,
     process_group_id: u32,
-    _status: u32,
+    status: u32,
     _command: [u8; 16],
     _flags: u32,
     owner_id: u32,
@@ -529,7 +529,7 @@ struct MacProcessShortBsdInfo {
 #[repr(C)]
 struct MacProcessBsdInfo {
     _flags: u32,
-    _status: u32,
+    status: u32,
     _exit_status: u32,
     process_id: u32,
     parent_id: u32,
@@ -580,6 +580,9 @@ const _: () = assert!(std::mem::size_of::<MacProcessBsdInfo>() == 136);
 const _: () = assert!(std::mem::size_of::<MacProcessUniqueInfo>() == 56);
 #[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::size_of::<MacProcessBsdInfoWithUniqueId>() == 192);
+
+#[cfg(target_os = "macos")]
+const MAC_PROCESS_STATUS_ZOMBIE: u32 = 5;
 
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
@@ -701,9 +704,57 @@ fn unix_signal_process_group_if_anchored(
     }
 }
 
-#[cfg(unix)]
-fn unix_process_identity_is_active(identity: &UnixProcessIdentity) -> io::Result<bool> {
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn unix_process_identity_is_active(identity: &UnixProcessIdentity) -> io::Result<bool> {
     Ok(unix_process_identity(identity.process_id)?.is_some_and(|current| current == *identity))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn unix_process_identity_is_active(identity: &UnixProcessIdentity) -> io::Result<bool> {
+    match mac_process_bsd_with_unique_id(identity.process_id) {
+        Ok(Some(information)) => Ok(mac_process_metadata_matches_active_identity(
+            identity,
+            information.process.process_id,
+            information.process.status,
+            information.identity,
+        )),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let Some(information_before) = mac_process_short_bsd_info(identity.process_id)? else {
+                return Ok(false);
+            };
+            let Some(unique_information) = mac_process_unique_info(identity.process_id)? else {
+                return Ok(false);
+            };
+            let Some(information_after) = mac_process_short_bsd_info(identity.process_id)? else {
+                return Ok(false);
+            };
+            if information_before != information_after {
+                return Ok(false);
+            }
+            Ok(mac_process_metadata_matches_active_identity(
+                identity,
+                information_after.process_id,
+                information_after.status,
+                unique_information,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_metadata_matches_active_identity(
+    expected: &UnixProcessIdentity,
+    reported_process_id: u32,
+    status: u32,
+    information: MacProcessUniqueInfo,
+) -> bool {
+    // A killed orphan can remain visible as a zombie until its reaper collects it. It cannot
+    // execute or retain inherited resources, so counting it as active would manufacture a timeout.
+    reported_process_id == u32::try_from(expected.process_id).unwrap_or(u32::MAX)
+        && status != MAC_PROCESS_STATUS_ZOMBIE
+        && mac_process_identity(expected.process_id, information) == *expected
 }
 
 #[cfg(unix)]

@@ -407,9 +407,12 @@ where
             anyhow::bail!("qa.runner.failure_diagnostics_journal_snapshot_changed");
         }
         let has_wal = copied_files.wal.is_some();
+        // Preserve SQLite NOFOLLOW while avoiding ambient path aliases (such as macOS `/var`) by
+        // opening the canonical path already bound to the validated snapshot file identity.
+        let sqlite_database_path = copied_files.database.path.clone();
         drop(copied_files);
         if has_wal {
-            consolidate_failure_journal_snapshot(database_path.as_path())?;
+            consolidate_failure_journal_snapshot(sqlite_database_path.as_path())?;
         }
         let snapshot_files =
             validate_failure_journal_files_at(snapshot_root.path(), database_path.as_path())?;

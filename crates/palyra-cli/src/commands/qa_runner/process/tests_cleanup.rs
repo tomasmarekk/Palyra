@@ -717,11 +717,17 @@ fn liveness_eof_does_not_hide_a_marker_bound_double_fork() {
 
     tree.freeze_recursive_descendants(Instant::now() + Duration::from_secs(5))
         .expect("marker scan should discover the escaped leaf");
+    let orphan_process_id = i32::try_from(orphan_id).expect("orphan pid should fit Unix pid_t");
+    let orphan_identity = lock_unpoisoned(&tree.tracked_descendants)
+        .get(&orphan_process_id)
+        .copied()
+        .expect("marker scan should retain the escaped leaf identity");
     assert!(!tree
         .wait_until_inactive(Instant::now() + Duration::from_millis(100))
         .expect("live marker-bound leaf must not be reported inactive"));
     assert!(process.terminate_tree(Duration::from_secs(5)));
-    assert!(wait_for_process_exit(orphan_id, Duration::from_secs(5)));
+    assert!(!unix_process_identity_is_active(&orphan_identity)
+        .expect("terminated leaf identity should remain observable"));
 }
 
 #[cfg(unix)]
