@@ -13420,6 +13420,10 @@
       }
     },
     "runtime_error_metadata_trace": {
+      "event_name": "run.runtime_path_summary",
+      "terminal_reason_field": "terminal_reason",
+      "stable_reason_code_required": true,
+      "full_error_envelope_embedded": false,
       "schema_version": 1,
       "status": "always_on",
       "storage": "append_only_segments",
@@ -13432,7 +13436,8 @@
       "failure_signal": "counters.metadata_trace_failures",
       "terminal_reason_source_event": "run.runtime_path_summary",
       "rich_trace_approval_required": true,
-      "reason_code": "metadata_trace.always_on.ready"
+      "reason_code": "runtime.error_contract.trace_projection_ready",
+      "always_on_reason_code": "metadata_trace.always_on.ready"
     },
     "host_authority": {
       "valid": true,

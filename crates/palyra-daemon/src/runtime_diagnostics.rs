@@ -134,6 +134,10 @@ pub(crate) fn build_runtime_error_contract_diagnostics() -> Value {
         },
         "error_taxonomy": error_taxonomy,
         "metadata_trace": {
+            "event_name": RUN_RUNTIME_PATH_SUMMARY_EVENT,
+            "terminal_reason_field": "terminal_reason",
+            "stable_reason_code_required": true,
+            "full_error_envelope_embedded": false,
             "schema_version": palyra_common::metadata_trace::METADATA_TRACE_SCHEMA_VERSION,
             "status": "always_on",
             "storage": "append_only_segments",
@@ -142,7 +146,8 @@ pub(crate) fn build_runtime_error_contract_diagnostics() -> Value {
             "failure_signal": "counters.metadata_trace_failures",
             "terminal_reason_source_event": RUN_RUNTIME_PATH_SUMMARY_EVENT,
             "rich_trace_approval_required": true,
-            "reason_code": "metadata_trace.always_on.ready",
+            "reason_code": "runtime.error_contract.trace_projection_ready",
+            "always_on_reason_code": "metadata_trace.always_on.ready",
         },
     })
 }
@@ -2585,6 +2590,18 @@ mod tests {
         assert_eq!(payload["metadata_trace"]["storage"], "append_only_segments");
         assert_eq!(payload["metadata_trace"]["failure_signal"], "counters.metadata_trace_failures");
         assert_eq!(payload["metadata_trace"]["rich_trace_approval_required"], true);
+        assert_eq!(payload["metadata_trace"]["event_name"], RUN_RUNTIME_PATH_SUMMARY_EVENT);
+        assert_eq!(payload["metadata_trace"]["terminal_reason_field"], "terminal_reason");
+        assert_eq!(payload["metadata_trace"]["stable_reason_code_required"], true);
+        assert_eq!(payload["metadata_trace"]["full_error_envelope_embedded"], false);
+        assert_eq!(
+            payload["metadata_trace"]["reason_code"],
+            "runtime.error_contract.trace_projection_ready"
+        );
+        assert_eq!(
+            payload["metadata_trace"]["always_on_reason_code"],
+            "metadata_trace.always_on.ready"
+        );
         assert_eq!(payload["error_taxonomy"]["raw_provider_payload_allowed"], false);
         assert_eq!(payload["error_taxonomy"]["raw_stderr_allowed"], false);
     }
