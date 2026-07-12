@@ -4,11 +4,20 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{Mutex, MutexGuard},
 };
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+static REAL_RUNTIME_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn real_runtime_gate_test_guard() -> MutexGuard<'static, ()> {
+    // These tests validate daemon behavior, not how many debug daemons a shared CI runner can boot
+    // concurrently. Recover poisoning so one assertion still lets the remaining tests diagnose.
+    REAL_RUNTIME_GATE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -268,6 +277,7 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
 
 #[test]
 fn qa_gate_pr_smoke_writes_v3_reports_and_resumes_selectively() -> Result<()> {
+    let _runtime_guard = real_runtime_gate_test_guard();
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let json_path = temp_dir.path().join("qa-lab").join("pr-smoke.json");
     let markdown_path = temp_dir.path().join("qa-lab").join("pr-smoke.md");
@@ -606,6 +616,7 @@ fn qa_gate_rejects_reports_with_different_artifact_reference_directories() -> Re
 
 #[test]
 fn qa_gate_fails_a_real_runtime_answer_mismatch() -> Result<()> {
+    let _runtime_guard = real_runtime_gate_test_guard();
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let scenario_dir = temp_dir.path().join("scenarios");
     fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
@@ -737,6 +748,7 @@ scorecard:
 
 #[test]
 fn qa_gate_rejects_recovery_without_failed_attempt_evidence() -> Result<()> {
+    let _runtime_guard = real_runtime_gate_test_guard();
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let scenario_dir = temp_dir.path().join("scenarios");
     fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
@@ -845,6 +857,7 @@ scorecard:
 
 #[test]
 fn qa_gate_persists_verified_cleanup_after_runtime_timeout() -> Result<()> {
+    let _runtime_guard = real_runtime_gate_test_guard();
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let scenario_dir = temp_dir.path().join("scenarios");
     fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
@@ -987,6 +1000,7 @@ scorecard:
 
 #[test]
 fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
+    let _runtime_guard = real_runtime_gate_test_guard();
     let temp_dir = tempfile::tempdir().context("failed to create release gate output root")?;
     let report_path = temp_dir.path().join("qa-lab").join("release.json");
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
