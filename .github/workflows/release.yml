@@ -28,7 +28,7 @@ env:
 
 jobs:
   prepare-release:
-    name: Prepare release metadata
+    name: Release / Prepare metadata (ubuntu-latest)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -118,7 +118,7 @@ jobs:
           "publish=$publish" >> $env:GITHUB_OUTPUT
 
   desktop-portable-bundles:
-    name: Desktop portable bundle (${{ matrix.os }})
+    name: Release / Desktop portable bundle (${{ matrix.os }})
     needs: prepare-release
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -149,16 +149,7 @@ jobs:
 
       - name: Install desktop Linux system dependencies
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
+        uses: ./.github/actions/setup-desktop-linux
 
       - name: Build desktop UI
         shell: pwsh
@@ -246,7 +237,7 @@ jobs:
             --clobber
 
   headless-portable-package:
-    name: Headless portable package (ubuntu-latest)
+    name: Release / Headless portable package (ubuntu-latest)
     needs: prepare-release
     runs-on: ubuntu-latest
     steps:

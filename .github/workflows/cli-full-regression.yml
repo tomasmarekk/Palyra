@@ -21,7 +21,7 @@ env:
 
 jobs:
   workflow-regression:
-    name: Workflow regression matrix
+    name: CLI / Workflow regression (ubuntu-latest)
     runs-on: ubuntu-latest
     env:
       PALYRA_WORKFLOW_REGRESSION_PROFILE: full
@@ -52,7 +52,7 @@ jobs:
           if-no-files-found: error
 
   release-smoke:
-    name: Release packaging smoke (${{ matrix.os }})
+    name: Release / Packaging smoke (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -82,16 +82,7 @@ jobs:
 
       - name: Install desktop Linux system dependencies
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
+        uses: ./.github/actions/setup-desktop-linux
 
       - name: Run release packaging smoke
         shell: pwsh

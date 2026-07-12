@@ -9,13 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-test:
-    name: Build and test (${{ matrix.os }})
+    name: ${{ matrix.check }} (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_INCREMENTAL: "0"
@@ -24,13 +28,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux and macOS use isolated lanes to avoid deleting and recompiling one
+        # target tree; Windows stays combined to reuse build artifacts without duplication.
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
+            check: Workspace / Build
+            mode: build
           - os: macos-latest
             runner: macos-latest
+            check: Workspace / Build
+            mode: build
+          - os: ubuntu-latest
+            runner: ubuntu-latest
+            check: Workspace / Test
+            mode: test
+          - os: macos-latest
+            runner: macos-latest
+            check: Workspace / Test
+            mode: test
           - os: windows-latest
             runner: windows-2025-vs2026
+            check: Workspace / Build and test
+            mode: build-and-test
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -53,21 +73,19 @@ jobs:
         run: ./scripts/test/ensure-desktop-ui.ps1
 
       - name: Cargo build
+        if: matrix.mode != 'test'
         run: cargo build --workspace --locked
 
-      - name: Free Cargo build artifacts before workspace tests
-        if: runner.os != 'Windows'
-        run: cargo clean
-
-      - name: Rebuild QA daemon runtime for integration tests
-        if: runner.os != 'Windows'
+      - name: Build QA daemon runtime for integration tests
+        if: matrix.mode == 'test'
         run: cargo build -p palyra-daemon --bin palyrad --locked
 
       - name: Cargo test
+        if: matrix.mode != 'build'
         run: cargo test --workspace --locked
 
   desktop-linux-release-regression:
-    name: Desktop Linux release regression
+    name: Desktop / Release regression (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -86,16 +104,7 @@ jobs:
           run-install: true
 
       - name: Install desktop Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
+        uses: ./.github/actions/setup-desktop-linux
 
       - name: Build desktop UI
         shell: pwsh
@@ -105,7 +114,7 @@ jobs:
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
 
   deterministic-core:
-    name: Deterministic core suite
+    name: QA / Deterministic core (ubuntu-latest)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "0"
@@ -128,22 +137,13 @@ jobs:
           run-install: true
 
       - name: Install desktop Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
+        uses: ./.github/actions/setup-desktop-linux
 
       - name: Run deterministic core suite
         run: bash scripts/test/run-deterministic-core.sh
 
   deterministic-fault-smoke:
-    name: Deterministic fault smoke (${{ matrix.os }})
+    name: QA / Deterministic fault smoke (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -180,7 +180,7 @@ jobs:
           if-no-files-found: error
 
   runtime-contract-snapshots:
-    name: Runtime contract snapshot gates
+    name: Runtime / Contract snapshots (ubuntu-latest)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "0"
@@ -199,7 +199,7 @@ jobs:
         run: bash scripts/test/check-runtime-contract-snapshots.sh
 
   critical-attack-scenarios:
-    name: Critical attack scenarios
+    name: Security / Critical attack scenarios (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -214,7 +214,7 @@ jobs:
         run: bash scripts/test/run-critical-attack-scenarios.sh
 
   workflow-regression:
-    name: Workflow regression matrix
+    name: QA / Workflow regression (ubuntu-latest)
     runs-on: ubuntu-latest
     env:
       PALYRA_WORKFLOW_REGRESSION_PROFILE: fast
@@ -239,7 +239,7 @@ jobs:
           if-no-files-found: error
 
   performance-smoke:
-    name: Performance smoke
+    name: Performance / Smoke (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -258,22 +258,13 @@ jobs:
           run-install: true
 
       - name: Install desktop Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
+        uses: ./.github/actions/setup-desktop-linux
 
       - name: Run performance smoke suite
         run: bash scripts/test/run-performance-smoke.sh
 
   quality:
-    name: Formatting and lint
+    name: Quality / Static checks (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -322,7 +313,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   cli-parity:
-    name: CLI parity acceptance
+    name: CLI / Parity acceptance (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -347,7 +338,7 @@ jobs:
           path: artifacts/cli-parity-acceptance-matrix.md
 
   qa-lab:
-    name: QA Lab PR smoke
+    name: QA / Runtime smoke (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -388,7 +379,7 @@ jobs:
           if-no-files-found: error
 
   protocol-contracts:
-    name: Protocol contracts (Rust + Kotlin)
+    name: Protocol / Rust and Kotlin (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -434,7 +425,7 @@ jobs:
         run: bash scripts/protocol/check-generated-stubs.sh
 
   protocol-swift:
-    name: Protocol stubs (Swift)
+    name: Protocol / Swift (macos-latest)
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -456,7 +447,7 @@ jobs:
         run: bash scripts/protocol/check-generated-stubs.sh
 
   protocol-windows:
-    name: Protocol contracts (Windows)
+    name: Protocol / Windows (windows-latest)
     runs-on: windows-2025-vs2026
     steps:
       - name: Checkout
@@ -482,25 +473,8 @@ jobs:
       - name: Verify generated stubs are up to date
         run: ./scripts/protocol/check-generated-stubs.ps1
 
-  web-lint:
-    name: Web lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-
-      - name: Setup Vite+
-        uses: ./.github/actions/setup-vp-safe
-        with:
-          node-version-file: .node-version
-          cache: true
-          run-install: true
-
-      - name: Run web Vite+ CI task
-        run: vp run web:ci
-
   web-cleanroom:
-    name: Web clean-room (${{ matrix.os }})
+    name: Web / Clean install (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -523,20 +497,11 @@ jobs:
           cache: true
           run-install: true
 
-      - name: Reinstall root workspace from clean checkout
-        shell: pwsh
-        run: |
-          if (Test-Path node_modules) {
-            Remove-Item -LiteralPath node_modules -Recurse -Force
-          }
-          npm ci
-          vp install
-
       - name: Run clean-room web validation
         run: vp run web:ci
 
   security:
-    name: Security checks
+    name: Security
     uses: ./.github/workflows/security.yml
     permissions:
       contents: read

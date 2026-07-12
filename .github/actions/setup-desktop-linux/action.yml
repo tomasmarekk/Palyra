@@ -1,0 +1,20 @@
+# Installs the native Linux libraries required by the Tauri desktop build.
+# Shared by CI and release workflows so their package sets cannot drift.
+name: Setup desktop Linux dependencies
+description: Install the shared Ubuntu package set required to compile and test the desktop application.
+
+runs:
+  using: composite
+  steps:
+    - name: Install desktop Linux system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgtk-3-dev \
+          libwebkit2gtk-4.1-dev \
+          libsoup-3.0-dev \
+          libjavascriptcoregtk-4.1-dev \
+          libxdo-dev \
+          libayatana-appindicator3-dev \
+          librsvg2-dev
