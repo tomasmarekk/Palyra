@@ -11078,13 +11078,10 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
     );
 
     let expected_tape = load_golden_json("run_tape_basic.json")?;
-    assert_eq!(
-        run_snapshot
-            .get("tape_events")
-            .and_then(Value::as_u64)
-            .context("run snapshot missing tape_events")?,
-        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 8
-    );
+    let reported_tape_event_count = run_snapshot
+        .get("tape_events")
+        .and_then(Value::as_u64)
+        .context("run snapshot missing tape_events")?;
     assert!(
         run_snapshot.get("tape").is_none(),
         "run status endpoint should not include full tape payload"
@@ -11096,6 +11093,48 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         .get("events")
         .and_then(Value::as_array)
         .context("run tape snapshot missing events array")?;
+    assert_eq!(
+        reported_tape_event_count,
+        tape_events.len() as u64,
+        "run status and tape endpoints should agree on the durable event count"
+    );
+    let observed_event_types = tape_events
+        .iter()
+        .filter_map(|event| event.get("event_type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let runtime_evidence_event_types = [
+        "run.runtime_path_summary",
+        "metadata.runtime_selected",
+        "context.assembled",
+        "provider.attempt.completed",
+    ];
+    for expected_event_type in runtime_evidence_event_types {
+        let matching_events = tape_events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some(expected_event_type)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_events.len(),
+            1,
+            "basic run should persist exactly one {expected_event_type} evidence event: {observed_event_types:?}"
+        );
+        let payload = matching_events[0]
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+            .with_context(|| format!("{expected_event_type} payload_json should be valid JSON"))?;
+        assert_eq!(
+            payload.get("schema_version").and_then(Value::as_u64),
+            Some(1),
+            "{expected_event_type} should carry its stable schema version"
+        );
+        assert!(
+            payload.get("prompt").is_none(),
+            "{expected_event_type} must not persist raw prompt text"
+        );
+    }
     let context_pressure_event = tape_events
         .iter()
         .find(|event| {
@@ -11216,6 +11255,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             event_type != Some("tool_catalog_snapshot")
                 && event_type != Some("harness.tool_surface_projection")
                 && event_type != Some("provider.context_pressure")
+                && !event_type.is_some_and(|value| runtime_evidence_event_types.contains(&value))
                 && !event_type.map(|value| value.starts_with("agent_loop.")).unwrap_or(false)
         })
         .enumerate()
