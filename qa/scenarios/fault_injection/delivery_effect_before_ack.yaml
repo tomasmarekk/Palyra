@@ -1,0 +1,69 @@
+# Proves that uncertain user-facing delivery requires acknowledgement reconciliation.
+schema_version: 4
+id: fault_injection.delivery_effect_before_ack
+title: Delivery crash after effect and before acknowledgement
+area: tools
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/fault_injection_runner.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_fault_delivery
+fault_injection:
+  schema_version: 1
+  format: palyra-qa-fault-injection-plan
+  seed: 20260715
+  activations:
+    - id: delivery-effect-before-ack
+      point_id: tool.after_effect_before_ack
+      actor: qa-fault-delivery
+      occurrence: 1
+      action:
+        type: terminate_process
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - workspace_context
+    - fault_injection
+  tools:
+    - palyra.clarify.ask
+  fixtures:
+    - qa/fixtures/fault_injection_runner.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the deterministic delivery reconciliation fault."
+expect:
+  terminal_state: failed
+  tool_calls:
+    - name: palyra.clarify.ask
+      min_count: 1
+      max_count: 1
+  fault_injection:
+    activations:
+      - activation_id: delivery-effect-before-ack
+        recovery_class: outcome_unknown
+    daemon_restarts: 1
+forbidden:
+  tool_calls: []
+  events: []
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/fault_injection/delivery_effect_before_ack.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - deterministic
+    - fault_injection
+    - crash_recovery
+    - delivery
+timeout:
+  run_ms: 45000
+  step_ms: 15000

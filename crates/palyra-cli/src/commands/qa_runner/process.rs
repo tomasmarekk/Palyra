@@ -21,6 +21,8 @@ use anyhow::{Context, Result};
 use palyra_auth::{AuthCredential, AuthProfileRecord, AuthProfileScope};
 #[cfg(test)]
 use palyra_common::qa_fault_injection::QaFaultEvidenceSidecarRecord;
+#[cfg(test)]
+use palyra_common::qa_scenarios::QaScenarioStep;
 use palyra_common::{
     qa_fault_injection::{
         parse_qa_fault_evidence_sidecar_ndjson, QaFaultEvidenceSidecar, QaFaultInjectionPlan,
@@ -199,7 +201,22 @@ const QA_FAULT_LAUNCH_LIFETIME_MS: i64 = 60_000;
 const QA_PROCESS_TREE_MARKER_ENV: &str = "PALYRA_QA_PROCESS_TREE_MARKER";
 const QA_READ_ONLY_TOOLS: &[&str] =
     &["palyra.fs.read_file", "palyra.fs.list_dir", "palyra.fs.search"];
-const QA_MUTATION_TOOLS: &[&str] = &["palyra.fs.apply_patch"];
+const QA_APPROVAL_MUTATION_TOOLS: &[&str] = &["palyra.fs.apply_patch"];
+const QA_FAULT_MUTATION_TOOLS: &[&str] =
+    &["palyra.fs.apply_patch", "palyra.process.run", "palyra.http.fetch", "sessions_spawn"];
+const QA_FAULT_DELIVERY_TOOLS: &[&str] = &["palyra.clarify.ask"];
+const QA_BASE_DAEMON_CONFIG: &str = "version = 1\n";
+const QA_PROCESS_DAEMON_CONFIG: &str = r#"version = 1
+
+[tool_call.process_runner]
+enabled = true
+tier = "b"
+workspace_root = "."
+path_access_mode = "workspace_only"
+allowed_executables = ["echo"]
+allow_interpreters = false
+egress_enforcement_mode = "none"
+"#;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct QaDaemonRuntimeHealth {
@@ -571,7 +588,7 @@ impl QaDaemonSandbox {
             }
 
             let config_path = state_root_path.join("palyra.toml");
-            fs::write(config_path.as_path(), "version = 1\n")
+            fs::write(config_path.as_path(), isolated_daemon_config(manifest))
                 .context("failed to write isolated QA daemon config")?;
             let vault_dir = state_root_path.join("vault");
             fs::create_dir_all(vault_dir.as_path())
@@ -1100,6 +1117,15 @@ impl QaDaemonSandbox {
             self.cleanup_admission.take();
         }
         QaDaemonShutdown { daemon_terminated, workspace_removed }
+    }
+}
+
+/// Enables only the local runtimes explicitly required by the isolated scenario.
+fn isolated_daemon_config(manifest: &QaScenarioManifest) -> &'static str {
+    if manifest.requires.tools.iter().any(|tool| tool.starts_with("palyra.process.")) {
+        QA_PROCESS_DAEMON_CONFIG
+    } else {
+        QA_BASE_DAEMON_CONFIG
     }
 }
 

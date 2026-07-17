@@ -217,6 +217,20 @@ fn fault_mutation_profile_requires_a_plan_and_allow_only_steps() {
     let mut manifest = parse_scenario(FAULT_MUTATION_SCENARIO);
     assert!(validate_policy_profile(&manifest).is_ok());
 
+    for tool_name in QA_FAULT_MUTATION_TOOLS {
+        manifest.requires.tools = vec![(*tool_name).to_owned()];
+        assert!(
+            validate_policy_profile(&manifest).is_ok(),
+            "audited fault tool should be allowed: {tool_name}"
+        );
+    }
+    manifest.requires.tools =
+        vec!["palyra.fs.apply_patch".to_owned(), "palyra.process.run".to_owned()];
+    assert!(validate_policy_profile(&manifest).is_err());
+    manifest.requires.tools = vec!["palyra.browser.click".to_owned()];
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(FAULT_MUTATION_SCENARIO);
     manifest.fault_injection = None;
     assert!(validate_policy_profile(&manifest).is_err());
 
@@ -227,6 +241,27 @@ fn fault_mutation_profile_requires_a_plan_and_allow_only_steps() {
         .find(|step| step.action == QaScenarioStepAction::ApprovalDecision)
         .expect("fault scenario should contain a decision step");
     decision.decision = Some(QaScenarioApprovalDecision::Deny);
+    assert!(validate_policy_profile(&manifest).is_err());
+}
+
+#[test]
+fn fault_delivery_profile_rejects_synthetic_approval_steps() {
+    let mut manifest = parse_scenario(FAULT_DELIVERY_SCENARIO);
+    assert!(validate_policy_profile(&manifest).is_ok());
+
+    manifest.requires.tools = vec!["palyra.http.fetch".to_owned()];
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(FAULT_DELIVERY_SCENARIO);
+    manifest.steps.push(QaScenarioStep {
+        id: "unexpected-approval".to_owned(),
+        action: QaScenarioStepAction::ApprovalDecision,
+        prompt: None,
+        tool: None,
+        event: None,
+        proposal_id: Some("qa-fault-delivery".to_owned()),
+        decision: Some(QaScenarioApprovalDecision::Allow),
+    });
     assert!(validate_policy_profile(&manifest).is_err());
 }
 

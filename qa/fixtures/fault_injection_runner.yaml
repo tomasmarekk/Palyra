@@ -15,3 +15,89 @@ turns:
             patch: "*** Begin Patch\n*** Update File: src/app.txt\n@@\n-initial sandbox content\n+fault effect happened once\n*** End Patch\n"
       prompt_tokens: 8
       completion_tokens: 10
+  - id: process_before_ack_crash
+    match:
+      prompt_contains:
+        - run the deterministic process reconciliation fault
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-fault-process
+          tool_name: palyra.process.run
+          input_json:
+            command: echo
+            args:
+              - qa-process-reconciliation
+            background: false
+      prompt_tokens: 8
+      completion_tokens: 10
+  - id: keyed_http_before_ack_crash
+    match:
+      prompt_contains:
+        - run the deterministic keyed http reconciliation fault
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-fault-http-keyed
+          tool_name: palyra.http.fetch
+          input_json:
+            url: https://example.invalid/mutate
+            method: POST
+            body: '{"operation":"qa-keyed"}'
+            headers:
+              Content-Type: application/json
+              Idempotency-Key: qa-http-request-1
+      prompt_tokens: 8
+      completion_tokens: 10
+  - id: unkeyed_http_before_ack_crash
+    match:
+      prompt_contains:
+        - run the deterministic unkeyed http confirmation fault
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-fault-http-unkeyed
+          tool_name: palyra.http.fetch
+          input_json:
+            url: https://example.invalid/mutate
+            method: POST
+            body: '{"operation":"qa-unkeyed"}'
+            headers:
+              Content-Type: application/json
+      prompt_tokens: 8
+      completion_tokens: 10
+  - id: worker_before_ack_crash
+    match:
+      prompt_contains:
+        - run the deterministic worker reconciliation fault
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-fault-worker
+          tool_name: sessions_spawn
+          input_json:
+            task: Return the deterministic worker reconciliation marker.
+            label: qa-worker-reconciliation
+            return_mode: ids_only
+            allowed_tools: []
+      prompt_tokens: 8
+      completion_tokens: 10
+  - id: delivery_before_ack_crash
+    match:
+      prompt_contains:
+        - run the deterministic delivery reconciliation fault
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-fault-delivery
+          tool_name: palyra.clarify.ask
+          input_json:
+            question: Select the deterministic delivery marker.
+            choices:
+              - choice_id: qa-delivery
+                label: QA delivery
+            allow_free_text: false
+            default_choice_id: qa-delivery
+            timeout_ms: 1000
+      prompt_tokens: 8
+      completion_tokens: 10

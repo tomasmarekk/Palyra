@@ -511,6 +511,7 @@ pub static QA_FAULT_POINT_REGISTRY_V1: &[QaFaultPointDescriptor] = &[
         supported_recovery_classes: &[
             QaFaultRecoveryClass::Resumed,
             QaFaultRecoveryClass::DuplicateSuppressed,
+            QaFaultRecoveryClass::EffectConfirmed,
             QaFaultRecoveryClass::TransitionPending,
         ],
     },

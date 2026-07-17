@@ -9,6 +9,10 @@ const APPROVAL_DENIED_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/real_runtime/mutation_approval_denied.yaml");
 const FAULT_MUTATION_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/fault_injection/tool_effect_before_ack.yaml");
+const PROCESS_FAULT_MUTATION_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/fault_injection/process_effect_before_ack.yaml");
+const FAULT_DELIVERY_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/fault_injection/delivery_effect_before_ack.yaml");
 const PROVIDER_RECOVERY_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/real_runtime/malformed_stream_recovery.yaml");
 
@@ -34,6 +38,22 @@ fn parse_scenario_with_policy_profile(source: &str, profile: &str) -> QaScenario
         .join("\n");
     assert!(replaced, "scenario should declare a policy profile");
     parse_scenario(source.as_str())
+}
+
+#[test]
+fn isolated_daemon_config_enables_only_declared_process_runtime() {
+    let base_config = isolated_daemon_config(&parse_scenario(NO_TOOLS_SCENARIO));
+    assert_eq!(base_config, QA_BASE_DAEMON_CONFIG);
+    assert!(!base_config.contains("process_runner"));
+
+    let process_config = isolated_daemon_config(&parse_scenario(PROCESS_FAULT_MUTATION_SCENARIO));
+    assert!(process_config.contains("[tool_call.process_runner]"));
+    assert!(process_config.contains("enabled = true"));
+    assert!(process_config.contains(r#"tier = "b""#));
+    assert!(process_config.contains(r#"path_access_mode = "workspace_only""#));
+    assert!(process_config.contains(r#"allowed_executables = ["echo"]"#));
+    assert!(process_config.contains("allow_interpreters = false"));
+    assert!(process_config.contains(r#"egress_enforcement_mode = "none""#));
 }
 
 fn command_env<'a>(command: &'a Command, key: &str) -> Option<&'a OsStr> {

@@ -335,7 +335,7 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
             "qa.runner.policy_profile_mismatch: qa_read_only requires explicit workspace read tools"
         ),
         "qa_approval_denied"
-            if has_exact_tools(&manifest.requires.tools, QA_MUTATION_TOOLS)
+            if has_exact_tools(&manifest.requires.tools, QA_APPROVAL_MUTATION_TOOLS)
                 && approval_steps_deny_only(manifest) =>
         {
             Ok(())
@@ -345,13 +345,26 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
         ),
         "qa_fault_mutation"
             if manifest.fault_injection.is_some()
-                && has_exact_tools(&manifest.requires.tools, QA_MUTATION_TOOLS)
+                && has_single_allowed_tool(
+                    &manifest.requires.tools,
+                    QA_FAULT_MUTATION_TOOLS,
+                )
                 && approval_steps_allow_only(manifest) =>
         {
             Ok(())
         }
         "qa_fault_mutation" => anyhow::bail!(
-            "qa.runner.policy_profile_mismatch: qa_fault_mutation requires a fault plan, only the approved mutation tool, and explicit allow decisions"
+            "qa.runner.policy_profile_mismatch: qa_fault_mutation requires a fault plan, one audited mutation tool, and explicit allow decisions"
+        ),
+        "qa_fault_delivery"
+            if manifest.fault_injection.is_some()
+                && has_exact_tools(&manifest.requires.tools, QA_FAULT_DELIVERY_TOOLS)
+                && approval_steps_absent(manifest) =>
+        {
+            Ok(())
+        }
+        "qa_fault_delivery" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: qa_fault_delivery requires a fault plan, only the audited delivery tool, and no synthetic approval step"
         ),
         _ => anyhow::bail!(
             "qa.runner.unsupported_policy_profile: unsupported fixture policy profile"
@@ -368,6 +381,10 @@ fn has_exact_tool_subset(tools: &[String], allowed: &[&str]) -> bool {
 fn has_exact_tools(tools: &[String], expected: &[&str]) -> bool {
     tools.len() == expected.len()
         && tools.iter().zip(expected).all(|(actual, expected)| actual == expected)
+}
+
+fn has_single_allowed_tool(tools: &[String], allowed: &[&str]) -> bool {
+    matches!(tools, [tool] if allowed.contains(&tool.as_str()))
 }
 
 fn approval_steps_deny_only(manifest: &QaScenarioManifest) -> bool {
@@ -394,6 +411,10 @@ fn approval_steps_allow_only(manifest: &QaScenarioManifest) -> bool {
         saw_allow = true;
     }
     saw_allow
+}
+
+fn approval_steps_absent(manifest: &QaScenarioManifest) -> bool {
+    manifest.steps.iter().all(|step| step.action != QaScenarioStepAction::ApprovalDecision)
 }
 
 pub(super) async fn cleanup_session_with_timeout<F>(cleanup: F, timeout: Duration) -> bool

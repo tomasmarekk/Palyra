@@ -2240,7 +2240,7 @@ mod tests {
         )
         .expect("fault campaign fixture set should hash");
 
-        assert_eq!(digest, "ab13275c48c5ea1b098833a83d38ea93aa7e15bb854d61bf8d51fed7fbdb44ca");
+        assert_eq!(digest, "e54ce55161759748719b8fe30ca100f3b1b6e22072b585bc4fb3e7b37c6f3564");
     }
 
     #[test]
