@@ -12,20 +12,28 @@ use palyra_common::qa_fault_injection::{
     QaFaultProbe, QaFaultProbeError, QaFaultProbeHandle, QaFaultRecoveryClass,
     QA_FAULT_INJECTION_PLAN_FORMAT, QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
-    TrustedEndpointHealth, TrustedEndpointPolicy, TrustedEndpointRecord, TrustedEndpointRegistry,
-    TrustedEndpointTransport, TrustedEndpointTrustState, WorkerArtifactTransport,
-    WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
-    WorkerLeaseIdentity, WorkerLeaseRequest, WorkerLifecycleError, WorkerLifecycleState,
-    WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolContractError,
-    WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope,
-    WorkerRemoteWorkspaceTransfer, WorkerRunGrant, WorkerWorkspaceScope,
-    WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    networked_worker_lifecycle_event_id, TrustedEndpointHealth, TrustedEndpointPolicy,
+    TrustedEndpointRecord, TrustedEndpointRegistry, TrustedEndpointTransport,
+    TrustedEndpointTrustState, WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport,
+    WorkerFleetManager, WorkerFleetPolicy, WorkerLeaseIdentity, WorkerLeaseRequest,
+    WorkerLifecycleError, WorkerLifecycleEvent, WorkerLifecycleState, WorkerRemoteIdentity,
+    WorkerRemoteLeaseBinding, WorkerRemoteToolContractError, WorkerRemoteToolKind,
+    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer,
+    WorkerRunGrant, WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL,
+    WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 
 fn hex_digest(byte: &str) -> String {
     byte.repeat(64)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn attestation(worker_id: &str) -> WorkerAttestation {
@@ -202,6 +210,53 @@ fn policy_for(capability: &str) -> WorkerFleetPolicy {
     WorkerFleetPolicy { trusted_capabilities: vec![capability.into()], ..Default::default() }
 }
 
+#[test]
+fn lifecycle_event_ids_are_deterministic_and_transition_bound() {
+    let event = WorkerLifecycleEvent {
+        worker_id: "worker-lifecycle-id".to_owned(),
+        state: WorkerLifecycleState::Assigned,
+        run_id: Some("run-lifecycle-id".to_owned()),
+        lease_id: Some("lease-lifecycle-id".to_owned()),
+        reason_code: "worker.assigned".to_owned(),
+        timestamp_unix_ms: 1_730_000_000_000,
+    };
+
+    let first = networked_worker_lifecycle_event_id("transition-lifecycle-id", &event)
+        .expect("valid lifecycle evidence should derive an identity");
+    let replay = networked_worker_lifecycle_event_id("transition-lifecycle-id", &event)
+        .expect("the same lifecycle evidence should replay deterministically");
+    let distinct_transition =
+        networked_worker_lifecycle_event_id("transition-lifecycle-id-next", &event)
+            .expect("a second valid transition should derive an identity");
+
+    assert_eq!(first, replay);
+    assert_ne!(first, distinct_transition);
+    assert!(first.starts_with("worker-lifecycle:"));
+}
+
+#[test]
+fn lifecycle_event_ids_distinguish_optional_identity_boundaries() {
+    let event_without_run = WorkerLifecycleEvent {
+        worker_id: "worker-lifecycle-id".to_owned(),
+        state: WorkerLifecycleState::Registered,
+        run_id: None,
+        lease_id: None,
+        reason_code: "worker.registered".to_owned(),
+        timestamp_unix_ms: 1_730_000_000_000,
+    };
+    let mut event_with_run = event_without_run.clone();
+    event_with_run.run_id = Some(String::new());
+
+    let without_run =
+        networked_worker_lifecycle_event_id("transition-lifecycle-id", &event_without_run)
+            .expect("runless registration evidence should derive an identity");
+    let error = networked_worker_lifecycle_event_id("transition-lifecycle-id", &event_with_run)
+        .expect_err("an explicitly empty run identity must not alias a missing identity");
+
+    assert!(without_run.starts_with("worker-lifecycle:"));
+    assert_eq!(error, WorkerLifecycleError::InvalidLifecycleEvidence);
+}
+
 fn remote_identity(worker_id: &str) -> WorkerRemoteIdentity {
     WorkerRemoteIdentity {
         worker_id: worker_id.to_owned(),
@@ -217,6 +272,7 @@ fn remote_identity(worker_id: &str) -> WorkerRemoteIdentity {
 fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
     let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name)
         .expect("test tool should be remote-capable");
+    let input_json = r#"{"path":"src/lib.rs"}"#.to_owned();
     WorkerRemoteToolRequestEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -224,8 +280,8 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
         proposal_id: "proposal-01".to_owned(),
         tool_name: tool_name.to_owned(),
         tool_kind,
-        input_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
-        input_json_sha256: hex_digest("1"),
+        input_json_sha256: sha256_hex(input_json.as_bytes()),
+        input_json,
         lease: WorkerRemoteLeaseBinding {
             lease_id: "lease-01".to_owned(),
             worker_id: "worker-remote-01".to_owned(),
@@ -266,7 +322,7 @@ fn remote_result(
         lease_id: request.lease.lease_id.clone(),
         success: true,
         output_json: output_json.to_owned(),
-        output_json_sha256: hex_digest("5"),
+        output_json_sha256: sha256_hex(output_json.as_bytes()),
         error: None,
         output_manifest_sha256: hex_digest("6"),
         cleanup_report: WorkerCleanupReport {
@@ -339,6 +395,77 @@ fn remote_result_requires_cleanup_and_identity_stability() {
 }
 
 #[test]
+fn remote_result_rejects_post_expiry_host_observation_despite_worker_timestamp() {
+    let request = remote_request("palyra.fs.read_file");
+    let mut result = remote_result(&request, r#"{"content":"ok"}"#);
+    result.completed_at_unix_ms = request.lease.expires_at_unix_ms.saturating_sub(1);
+
+    let error = result
+        .validate_against_request(&request, request.lease.expires_at_unix_ms)
+        .expect_err("worker time must not authorize a result observed at lease expiry");
+
+    assert!(matches!(error, WorkerRemoteToolContractError::LeaseExpired { .. }));
+}
+
+#[test]
+fn remote_result_rejects_binding_identity_and_digest_mismatches() {
+    let request = remote_request("palyra.fs.read_file");
+    let result = remote_result(&request, r#"{"content":"ok"}"#);
+
+    let mut binding_mismatch = result.clone();
+    binding_mismatch.proposal_id = "proposal-other".to_owned();
+    let error = binding_mismatch
+        .validate_against_request(&request, 2_000)
+        .expect_err("settlement must reject request binding drift");
+    assert_eq!(error, WorkerRemoteToolContractError::ResultBindingMismatch);
+
+    let mut identity_mismatch = result.clone();
+    identity_mismatch.worker_identity.build_digest_sha256 = hex_digest("f");
+    let error = identity_mismatch
+        .validate_against_request(&request, 2_000)
+        .expect_err("settlement must reject worker identity drift");
+    assert!(matches!(error, WorkerRemoteToolContractError::WorkerIdentityMismatch { .. }));
+
+    let mut digest_mismatch = result;
+    digest_mismatch.output_json.push(' ');
+    let error = digest_mismatch
+        .validate_against_request(&request, 2_000)
+        .expect_err("settlement must verify the output payload digest");
+    assert_eq!(
+        error,
+        WorkerRemoteToolContractError::DigestMismatch { field: "output_json_sha256" }
+    );
+}
+
+#[test]
+fn remote_result_rejects_invalid_request_cleanup_and_timestamp_metadata() {
+    let request = remote_request("palyra.fs.apply_patch");
+    let result = remote_result(&request, r#"{"applied":true}"#);
+
+    let mut invalid_request = request.clone();
+    invalid_request.input_json.push(' ');
+    let error = result
+        .validate_against_request(&invalid_request, 2_000)
+        .expect_err("result validation must retain the original request digest binding");
+    assert_eq!(error, WorkerRemoteToolContractError::DigestMismatch { field: "input_json_sha256" });
+
+    let mut cleanup_gap = result.clone();
+    cleanup_gap.cleanup_report.removed_artifacts = false;
+    cleanup_gap.cleanup_report.failure_reason = Some("artifact cleanup failed".to_owned());
+    let error = cleanup_gap
+        .validate_against_request(&request, 2_000)
+        .expect_err("result validation must require verified cleanup");
+    assert!(matches!(error, WorkerRemoteToolContractError::CleanupGap { .. }));
+
+    let mut invalid_timestamp = result;
+    invalid_timestamp.completed_at_unix_ms = -1;
+    let error = invalid_timestamp
+        .validate_against_request(&request, 2_000)
+        .expect_err("negative worker timestamp metadata must fail closed");
+    assert_eq!(error, WorkerRemoteToolContractError::InvalidCompletionTimestamp);
+}
+
+#[test]
 fn worker_lifecycle_supports_successful_handshake_assignment_and_cleanup() {
     let mut manager = WorkerFleetManager::default();
     let policy = WorkerFleetPolicy::default();
@@ -364,7 +491,7 @@ fn worker_lifecycle_supports_successful_handshake_assignment_and_cleanup() {
                 removed_logs: true,
                 failure_reason: None,
             },
-            3_000,
+            lease.expires_at_unix_ms.saturating_sub(1),
         )
         .expect("cleanup should succeed");
     assert_eq!(complete.state, WorkerLifecycleState::Completed);
@@ -488,7 +615,7 @@ fn heartbeat_timeout_adapter_is_fail_loud_and_records_recovery() {
 
 #[cfg(feature = "qa-fault-injection")]
 #[test]
-fn stale_reclaim_adapter_advances_only_logical_time() {
+fn stale_reclaim_adapter_advances_eligibility_without_changing_expiry_evidence() {
     let controller = DeterministicQaFaultController::new(QaFaultInjectionPlan {
         schema_version: QA_FAULT_INJECTION_PLAN_SCHEMA_VERSION,
         format: QA_FAULT_INJECTION_PLAN_FORMAT.to_owned(),
@@ -506,13 +633,15 @@ fn stale_reclaim_adapter_advances_only_logical_time() {
     let mut manager = WorkerFleetManager::default().with_qa_fault_probe(probe.clone());
     let policy = WorkerFleetPolicy::default();
     manager.register_worker(attestation("worker-clock"), &policy, 2_000).unwrap();
-    manager.assign_work("worker-clock", lease_request("clock-run", 100), &policy, 2_100).unwrap();
+    let (lease, _) = manager
+        .assign_work("worker-clock", lease_request("clock-run", 100), &policy, 2_100)
+        .unwrap();
 
     let events = manager.reap_expired_workers(2_100).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].worker_id, "worker-clock");
     assert_eq!(events[0].run_id.as_deref(), Some("clock-run"));
-    assert_eq!(events[0].timestamp_unix_ms, 2_201);
+    assert_eq!(events[0].timestamp_unix_ms, lease.expires_at_unix_ms);
     assert_eq!(events[0].state, WorkerLifecycleState::Orphaned);
     let records = probe.records().unwrap();
     assert_eq!(records[0].actors, ["worker-clock"]);
@@ -752,6 +881,37 @@ fn stale_heartbeat_does_not_pre_attest_before_exact_state_transition() {
 }
 
 #[test]
+fn completion_at_or_after_lease_expiry_cannot_clear_active_authority() {
+    let policy = WorkerFleetPolicy::default();
+    let cleanup = WorkerCleanupReport {
+        removed_workspace_scope: true,
+        removed_artifacts: true,
+        removed_logs: true,
+        failure_reason: None,
+    };
+
+    for (worker_id, completion_offset_ms) in
+        [("worker-expiry-boundary", 0), ("worker-expiry-late", 1)]
+    {
+        let mut manager = WorkerFleetManager::default();
+        manager.register_worker(attestation(worker_id), &policy, 2_000).unwrap();
+        let (lease, _) = manager
+            .assign_work(worker_id, lease_request("run-expiry-boundary", 500), &policy, 2_100)
+            .unwrap();
+        let completion_time = lease.expires_at_unix_ms.saturating_add(completion_offset_ms);
+
+        let error = manager
+            .finalize_work(worker_id, &lease.identity(), cleanup.clone(), completion_time)
+            .expect_err("completion at or beyond the exact deadline must fail closed");
+
+        assert!(matches!(error, WorkerLifecycleError::StaleLeaseCompletion { .. }));
+        assert_eq!(manager.snapshot().active_leases, 1);
+        assert_eq!(manager.snapshot().orphaned_workers, 0);
+        assert_eq!(manager.recent_events()[0].state, WorkerLifecycleState::Assigned);
+    }
+}
+
+#[test]
 fn stale_completion_cannot_clear_a_newer_worker_lease() {
     let mut manager = WorkerFleetManager::default();
     let policy = WorkerFleetPolicy::default();
@@ -820,7 +980,7 @@ fn worker_cleanup_failure_stays_fail_closed() {
                 removed_logs: true,
                 failure_reason: Some("artifact cleanup failure".to_owned()),
             },
-            3_000,
+            lease.expires_at_unix_ms.saturating_sub(1),
         )
         .expect_err("cleanup failure should not be ignored");
     assert_eq!(error, WorkerLifecycleError::CleanupFailed);
@@ -831,12 +991,73 @@ fn worker_ttl_reap_marks_orphaned_instances() {
     let mut manager = WorkerFleetManager::default();
     let policy = WorkerFleetPolicy::default();
     manager.register_worker(attestation("worker-d"), &policy, 2_000).unwrap();
-    manager.assign_work("worker-d", lease_request("run-3", 250), &policy, 2_500).unwrap();
+    let (lease, _) =
+        manager.assign_work("worker-d", lease_request("run-3", 250), &policy, 2_500).unwrap();
 
     let events = manager.reap_expired_workers(2_751).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].state, WorkerLifecycleState::Orphaned);
+    assert_eq!(events[0].run_id.as_deref(), Some(lease.run_id.as_str()));
+    assert_eq!(events[0].lease_id.as_deref(), Some(lease.lease_id.as_str()));
     assert_eq!(manager.snapshot().orphaned_workers, 1);
+}
+
+#[test]
+fn bounded_worker_ttl_reap_preserves_remaining_leases() {
+    let mut manager = WorkerFleetManager::default();
+    let policy = WorkerFleetPolicy::default();
+    for index in 0..3 {
+        let worker_id = format!("worker-bounded-{index}");
+        manager.register_worker(attestation(worker_id.as_str()), &policy, 2_000).unwrap();
+        manager
+            .assign_work(
+                worker_id.as_str(),
+                lease_request(format!("run-bounded-{index}").as_str(), 250),
+                &policy,
+                2_500,
+            )
+            .unwrap();
+    }
+
+    let first = manager.reap_expired_workers_bounded(2_751, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(manager.snapshot().active_leases, 1);
+    assert_eq!(manager.snapshot().orphaned_workers, 2);
+
+    let second = manager.reap_expired_workers_bounded(2_751, 2).unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(manager.snapshot().active_leases, 0);
+    assert_eq!(manager.snapshot().orphaned_workers, 3);
+}
+
+#[test]
+fn worker_expiry_plan_rejects_superseded_lease_before_mutation() {
+    let mut manager = WorkerFleetManager::default();
+    let policy = WorkerFleetPolicy::default();
+    manager.register_worker(attestation("worker-plan"), &policy, 2_000).unwrap();
+    let (lease, _) =
+        manager.assign_work("worker-plan", lease_request("run-plan", 250), &policy, 2_500).unwrap();
+    let plan = manager.plan_expired_workers_bounded(2_751, 1).unwrap();
+    assert_eq!(plan.events()[0].lease_id.as_deref(), Some(lease.lease_id.as_str()));
+
+    manager
+        .finalize_work(
+            "worker-plan",
+            &lease.identity(),
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+            lease.expires_at_unix_ms.saturating_sub(1),
+        )
+        .unwrap();
+    let error = manager
+        .apply_expired_worker_plan(plan)
+        .expect_err("a superseded exact lease plan must fail before mutation");
+    assert!(matches!(error, WorkerLifecycleError::ExpiryPlanConflict { .. }));
+    assert_eq!(manager.snapshot().orphaned_workers, 0);
 }
 
 #[test]
@@ -891,7 +1112,7 @@ fn worker_cleanup_failure_records_failed_event_for_journal_surfaces() {
                 removed_logs: true,
                 failure_reason: Some("artifact cleanup failure".to_owned()),
             },
-            3_000,
+            lease.expires_at_unix_ms.saturating_sub(1),
         )
         .expect("cleanup outcome should be returned for journal emission");
 
@@ -957,6 +1178,25 @@ fn force_cleanup_promotes_only_verified_cleanup_reports() {
     let policy = WorkerFleetPolicy::default();
     manager.register_worker(attestation("worker-k"), &policy, 2_000).unwrap();
     manager.assign_work("worker-k", lease_request("run-10", 500), &policy, 2_500).unwrap();
+    let active_error = manager
+        .force_cleanup_worker(
+            "worker-k",
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+            2_600,
+        )
+        .expect_err("operator cleanup must not clear active lease authority");
+    assert_eq!(
+        active_error,
+        WorkerLifecycleError::CleanupRequiresLeaseRevocation("worker-k".to_owned())
+    );
+    manager
+        .quarantine_worker("worker-k", "worker.operator.quarantine", 2_650)
+        .expect("quarantine should revoke the active lease");
 
     let failed = manager
         .force_cleanup_worker(

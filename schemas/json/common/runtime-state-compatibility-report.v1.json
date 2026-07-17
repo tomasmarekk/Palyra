@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/runtime-state-compatibility-report.v1.json",
+  "title": "Palyra Runtime State Compatibility Report V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "admission", "findings", "preserve_unknown_evidence", "generated_at_unix_ms"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "admission": {
+      "enum": ["ready", "read_only", "blocked"],
+      "description": "Serving admission requires ready. read_only is limited to offline inspection and migration tooling that preserves incompatible evidence without mutation."
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["contract", "record_ref_sha256", "supported_schema_version", "outcome", "reason_code", "blocks_admission", "payload_bytes"],
+        "properties": {
+          "contract": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "record_ref_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+          "observed_schema_version": { "type": "integer", "minimum": 0 },
+          "supported_schema_version": { "type": "integer", "minimum": 1 },
+          "outcome": { "enum": ["migrated", "readable_legacy", "blocked_newer_schema", "quarantined_corrupt"] },
+          "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "blocks_admission": { "type": "boolean" },
+          "payload_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "preserve_unknown_evidence": { "const": true },
+    "generated_at_unix_ms": { "type": "integer", "minimum": 0 }
+  }
+}

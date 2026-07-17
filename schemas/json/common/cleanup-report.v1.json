@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/cleanup-report.v1.json",
+  "title": "Palyra Cleanup Report V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "report_id",
+    "instance_id",
+    "outcome",
+    "steps",
+    "reason_code",
+    "completed_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "report_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "instance_id": { "$ref": "#/$defs/id" },
+    "lease_id": { "$ref": "#/$defs/id" },
+    "outcome": { "enum": ["completed", "partial", "unknown"] },
+    "steps": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ordinal", "step", "disposition", "reason_code", "completed_at_unix_ms"],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 0, "maximum": 15 },
+          "step": { "enum": ["graceful_stop", "close_io", "kill_tree", "remove_temp", "unmount", "release_lease", "verify_absence"] },
+          "disposition": { "enum": ["completed", "skipped_not_required", "failed", "unknown"] },
+          "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "evidence_sha256": { "$ref": "#/$defs/sha256" },
+          "completed_at_unix_ms": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "completed_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$", "maxLength": 64 }
+  },
+  "x-palyra-limits": {
+    "steps_max": 16,
+    "reason_code_bytes": 128
+  }
+}

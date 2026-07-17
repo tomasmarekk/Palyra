@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/health-probe-result.v1.json",
+  "title": "Palyra Health Probe Result V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "component_id",
+    "disposition",
+    "reason_code",
+    "mutation_attempted",
+    "completed_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "component_id": { "$ref": "#/$defs/id" },
+    "disposition": {
+      "enum": ["passed", "failed", "inconclusive", "denied_mutating_probe"]
+    },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "mutation_attempted": { "type": "boolean" },
+    "completed_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "disposition": { "const": "denied_mutating_probe" } },
+        "required": ["disposition"]
+      },
+      "then": {
+        "properties": { "mutation_attempted": { "const": true } }
+      },
+      "else": {
+        "properties": { "mutation_attempted": { "const": false } }
+      }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "identity_bytes": 128,
+    "reason_code_bytes": 128
+  },
+  "x-palyra-prohibits": [
+    "raw_probe_request",
+    "raw_probe_response",
+    "raw_provider_error",
+    "raw_environment_values",
+    "raw_secrets"
+  ]
+}

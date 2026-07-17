@@ -14,8 +14,10 @@ qa-fault-injection = []
 
 [dependencies]
 chrono.workspace = true
+hex.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
 

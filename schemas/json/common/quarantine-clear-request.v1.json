@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/quarantine-clear-request.v1.json",
+  "title": "Palyra Quarantine Clear Request V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "component_id",
+    "expected_generation",
+    "actor_id",
+    "reason_code",
+    "authorization_evidence_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "component_id": { "$ref": "#/$defs/id" },
+    "expected_generation": { "type": "integer", "minimum": 1 },
+    "actor_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "authorization_evidence_sha256": { "$ref": "#/$defs/sha256" },
+    "probe_lease": { "$ref": "health-probe-lease.v1.json" },
+    "probe_evidence_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "dependentRequired": {
+    "probe_lease": ["probe_evidence_sha256"],
+    "probe_evidence_sha256": ["probe_lease"]
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "maxLength": 64 }
+  },
+  "x-palyra-prohibits": ["self_asserted_authorization_boolean", "raw_authorization_payload", "raw_principal_secret"]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/health-probe-settlement.v1.json",
+  "title": "Palyra Health Probe Settlement V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "lease_id", "expected_generation", "result"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lease_id": { "$ref": "#/$defs/id" },
+    "expected_generation": { "type": "integer", "minimum": 1 },
+    "result": { "$ref": "health-probe-result.v1.json" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "identity_bytes": 128,
+    "serialized_bytes": 4096
+  },
+  "x-palyra-prohibits": [
+    "raw_probe_request",
+    "raw_probe_response",
+    "raw_provider_error",
+    "raw_authorization_payload",
+    "raw_environment_values",
+    "raw_secrets"
+  ]
+}

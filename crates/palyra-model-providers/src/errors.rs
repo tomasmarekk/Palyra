@@ -13,7 +13,7 @@ use crate::{ProviderErrorEnvelope, ProviderRecoveryDecisionKind};
 /// Display strings are part of the operator-facing contract (tests and
 /// fixtures assert on them); change them only deliberately. Each error maps
 /// to a [`ProviderFailureClassification`] for recovery routing.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
     CircuitOpen { retry_after_ms: u64 },

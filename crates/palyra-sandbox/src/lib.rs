@@ -190,7 +190,6 @@ mod platform {
             let cwd = policy.cwd.to_string_lossy().into_owned();
             let mut args = vec![
                 "--die-with-parent".to_owned(),
-                "--new-session".to_owned(),
                 "--unshare-pid".to_owned(),
                 "--proc".to_owned(),
                 "/proc".to_owned(),
@@ -485,6 +484,8 @@ mod tests {
         current_backend_kind, TierCBackendError, TierCBackendKind, TierCCommandRequest,
         TierCPolicy,
     };
+    #[cfg(target_os = "linux")]
+    use super::{platform::LinuxBubblewrapBackend, TierCBackend};
 
     fn sample_policy() -> TierCPolicy {
         TierCPolicy {
@@ -522,6 +523,22 @@ mod tests {
                 "unsupported tier-c backends must report missing runtime host allowlist support"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_never_starts_a_new_session() {
+        let backend = LinuxBubblewrapBackend;
+        let policy = sample_policy();
+        let request = TierCCommandRequest { command: "uname".to_owned(), args: Vec::new() };
+        let plan = backend
+            .build_command_plan(&policy, &request)
+            .expect("direct Linux backend planning should not require bwrap to be installed");
+
+        assert!(
+            !plan.args.iter().any(|arg| arg == "--new-session"),
+            "linux tier-c commands must remain in the durable supervisor process group"
+        );
     }
 
     #[cfg(target_os = "linux")]

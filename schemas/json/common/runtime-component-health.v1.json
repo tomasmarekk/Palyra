@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/runtime-component-health.v1.json",
+  "title": "Palyra Runtime Component Health V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "component_id", "generation", "state", "authority_class", "strike_count", "reason_code", "security_quarantine", "policy", "updated_at_unix_ms"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "component_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "generation": { "type": "integer", "minimum": 1 },
+    "state": { "enum": ["healthy", "degraded", "cooldown", "quarantined", "disabled", "probing"] },
+    "authority_class": { "enum": ["observe_only", "read_only", "scoped_mutation", "privileged_mutation"] },
+    "strike_count": { "type": "integer", "minimum": 0 },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "first_failure_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "last_failure_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "expires_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "fallback_component_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "fallback_authority_class": { "enum": ["observe_only", "read_only", "scoped_mutation", "privileged_mutation"] },
+    "security_quarantine": { "type": "boolean" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strike_threshold", "cooldown_ms", "max_probe_concurrency", "security_quarantine_auto_clear"],
+      "properties": {
+        "strike_threshold": { "type": "integer", "minimum": 1 },
+        "cooldown_ms": { "type": "integer", "minimum": 1 },
+        "max_probe_concurrency": { "const": 1 },
+        "security_quarantine_auto_clear": { "const": false }
+      }
+    },
+    "updated_at_unix_ms": { "type": "integer", "minimum": 0 }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/runtime-identity-set.v1.json",
+  "title": "Palyra Runtime Identity Set V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace_id", "session_id", "run_id", "generation", "causal_links"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "trace_id": { "$ref": "#/$defs/id" },
+    "session_id": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "generation": { "type": "integer", "minimum": 1 },
+    "attempt_id": { "$ref": "#/$defs/id" },
+    "tool_proposal_id": { "$ref": "#/$defs/id" },
+    "tool_execution_id": { "$ref": "#/$defs/id" },
+    "approval_subject_id": { "$ref": "#/$defs/id" },
+    "delivery_intent_id": { "$ref": "#/$defs/id" },
+    "plugin_call_id": { "$ref": "#/$defs/id" },
+    "context_projection_id": { "$ref": "#/$defs/id" },
+    "recovery_action_id": { "$ref": "#/$defs/id" },
+    "operation_id": { "$ref": "#/$defs/id" },
+    "runtime_instance_id": { "$ref": "#/$defs/id" },
+    "causal_links": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["relation", "source", "target"],
+        "properties": {
+          "relation": { "enum": ["recovered_from", "child_of", "supersedes", "delivers_output"] },
+          "source": { "$ref": "#/$defs/ref" },
+          "target": { "$ref": "#/$defs/ref" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:/-]+$" },
+    "ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "enum": ["run", "attempt", "tool_proposal", "tool_execution", "approval_subject", "delivery_intent", "plugin_call", "context_projection", "recovery_action", "operation", "runtime_instance", "event"] },
+        "value": { "$ref": "#/$defs/id" }
+      }
+    }
+  }
+}

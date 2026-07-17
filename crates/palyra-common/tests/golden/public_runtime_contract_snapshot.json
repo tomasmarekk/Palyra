@@ -1711,7 +1711,7 @@
     },
     "snapshot_version": "runtime-contracts.agent_hooks.v1"
   },
-  "changelog_note": "Adds the always-on bounded metadata trace contract while preserving rich trace as a separate approval-gated export.",
+  "changelog_note": "Adds generation-scoped harness attempt lifecycle events and canonical V2-to-public ordering correlation.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -3240,7 +3240,1266 @@
     ]
   },
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v8",
+  "shared_runtime_primitives": {
+    "changelog_note": "Publishes the closed cancellation settlement vocabulary alongside ordinary/probe health authority separation, typed identities, host-owned sequencing, side-effect uncertainty, process provenance, cleanup evidence, and fail-closed startup compatibility.",
+    "compatibility": {
+      "admission_postures": [
+        {
+          "canonical": "ready",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "read_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "blocked",
+          "deprecated_aliases": []
+        }
+      ],
+      "corrupt_records_quarantined": true,
+      "outcomes": [
+        {
+          "canonical": "migrated",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "readable_legacy",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "blocked_newer_schema",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "quarantined_corrupt",
+          "deprecated_aliases": []
+        }
+      ],
+      "read_only_scope": "offline_inspection_and_migration",
+      "schema_version": 1,
+      "serving_admission_requires_ready": true,
+      "unknown_evidence_preserved": true,
+      "unknown_newer_schema_blocks": true
+    },
+    "event_envelope": {
+      "actor_kinds": [
+        {
+          "canonical": "host",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "plugin",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "worker",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "operator",
+          "deprecated_aliases": []
+        }
+      ],
+      "event_descriptors": [
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.generation.activated",
+          "phase": "admission",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.generation.superseded",
+          "phase": "recovery",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.stale_event.suppressed",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "run.queued",
+          "phase": "admission",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "run_stream",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "run.started",
+          "phase": "admission",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "run_stream",
+          "terminal": false
+        },
+        {
+          "actor_kind": "harness",
+          "generation_lane": "harness",
+          "name": "harness.attempt.started",
+          "phase": "runtime_selection",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "harness",
+          "generation_lane": "harness",
+          "name": "harness.attempt.completed",
+          "phase": "finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": true
+        },
+        {
+          "actor_kind": "harness",
+          "generation_lane": "harness",
+          "name": "harness.attempt.failed",
+          "phase": "finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": true
+        },
+        {
+          "actor_kind": "harness",
+          "generation_lane": "harness",
+          "name": "harness.attempt.cancelled",
+          "phase": "cancellation",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": true
+        },
+        {
+          "actor_kind": "harness",
+          "generation_lane": "harness",
+          "name": "harness.attempt.cleaned_up",
+          "phase": "recovery",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "provider",
+          "name": "provider.attempt.started",
+          "phase": "provider_call",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "provider",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "provider",
+          "name": "provider.attempt.completed",
+          "phase": "provider_finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "provider",
+          "terminal": false
+        },
+        {
+          "actor_kind": "provider",
+          "generation_lane": "run",
+          "name": "model.delta",
+          "phase": "provider_call",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "provider",
+          "terminal": false
+        },
+        {
+          "actor_kind": "provider",
+          "generation_lane": "run",
+          "name": "tool.proposed",
+          "phase": "tool_validation",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "tool.decision.recorded",
+          "phase": "tool_gate",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "policy",
+          "terminal": false
+        },
+        {
+          "actor_kind": "tool",
+          "generation_lane": "run",
+          "name": "tool.intent.recorded",
+          "phase": "tool_execution",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "tool",
+          "generation_lane": "run",
+          "name": "tool.effect.started",
+          "phase": "tool_execution",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "requires_idempotency_guard",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "tool",
+          "generation_lane": "run",
+          "name": "tool.effect.observed",
+          "phase": "tool_execution",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "tool",
+          "generation_lane": "run",
+          "name": "tool.effect.unknown",
+          "phase": "tool_execution",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "requires_operator_review",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "tool.effect.cleanup_reconciled",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "tool.effect.cleanup_unknown",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "requires_operator_review",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "tool.effect.receipt_reconciled",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "operator",
+          "generation_lane": "run",
+          "name": "tool.effect.reconciled",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "operator",
+          "generation_lane": "run",
+          "name": "tool.effect.abandoned",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "tool",
+          "generation_lane": "run",
+          "name": "tool.result.observed",
+          "phase": "result_projection",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id",
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "tool.attestation.observed",
+          "phase": "verification",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id",
+            "tool_execution_id",
+            "operation_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "tool",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "approval.required",
+          "phase": "approval",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id",
+            "approval_subject_id"
+          ],
+          "retryability": "requires_approval",
+          "subsystem": "approval",
+          "terminal": false
+        },
+        {
+          "actor_kind": "operator",
+          "generation_lane": "run",
+          "name": "approval.resolved",
+          "phase": "approval",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "tool_proposal_id",
+            "approval_subject_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "approval",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "delivery",
+          "name": "delivery.intent.recorded",
+          "phase": "delivery_intent",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [
+            "delivery_intent_id",
+            "operation_id"
+          ],
+          "retryability": "requires_idempotency_guard",
+          "subsystem": "delivery",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "process",
+          "name": "runtime.cleanup.completed",
+          "phase": "finalization",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "recovery",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "process",
+          "name": "runtime.cleanup.partial",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [],
+          "retryability": "requires_operator_review",
+          "subsystem": "recovery",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "process",
+          "name": "runtime.cleanup.unknown",
+          "phase": "recovery",
+          "redaction_class": "hash_only",
+          "required_identity_fields": [],
+          "retryability": "requires_operator_review",
+          "subsystem": "recovery",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "run.completed",
+          "phase": "finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "run_stream",
+          "terminal": true
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "run.failed",
+          "phase": "finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "run_stream",
+          "terminal": true
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "run.cancelled",
+          "phase": "cancellation",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "not_retryable",
+          "subsystem": "run_stream",
+          "terminal": true
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.backpressure.applied",
+          "phase": "queueing",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "safe_after_backoff",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.compatibility.blocked",
+          "phase": "admission",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [],
+          "retryability": "requires_operator_review",
+          "subsystem": "runtime_kernel",
+          "terminal": false
+        }
+      ],
+      "event_names": [
+        {
+          "canonical": "runtime.generation.activated",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.generation.superseded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.stale_event.suppressed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run.queued",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run.started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness.attempt.started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness.attempt.completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness.attempt.failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness.attempt.cancelled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness.attempt.cleaned_up",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider.attempt.started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider.attempt.completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model.delta",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.proposed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.decision.recorded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.intent.recorded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.observed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.unknown",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.cleanup_reconciled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.cleanup_unknown",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.receipt_reconciled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.reconciled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.effect.abandoned",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.result.observed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool.attestation.observed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval.required",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval.resolved",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivery.intent.recorded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.cleanup.completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.cleanup.partial",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.cleanup.unknown",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run.completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run.failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run.cancelled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.backpressure.applied",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.compatibility.blocked",
+          "deprecated_aliases": []
+        }
+      ],
+      "host_allocates_sequence": true,
+      "max_inline_metadata_bytes": 8192,
+      "one_terminal_per_generation": true,
+      "redaction_classes": [
+        {
+          "canonical": "metadata_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "hash_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redacted_text",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redacted_json",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "artifact_reference",
+          "deprecated_aliases": []
+        }
+      ],
+      "schema_version": 2
+    },
+    "flow_control": {
+      "cancellation_reasons": [
+        {
+          "canonical": "user_cancel",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "steer_supersede",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "daemon_drain",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "deadline_exceeded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "resource_eviction",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "generation_superseded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "parent_cancelled",
+          "deprecated_aliases": []
+        }
+      ],
+      "cancellation_scopes": [
+        {
+          "canonical": "run",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider_attempt",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_execution",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval_wait",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "child_task",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "process",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivery",
+          "deprecated_aliases": []
+        }
+      ],
+      "cancellation_settlement_outcomes": [
+        {
+          "canonical": "graceful",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "hard_aborted",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cleanup_unknown",
+          "deprecated_aliases": []
+        }
+      ],
+      "max_channel_capacity": 65536,
+      "overflow_actions": [
+        {
+          "canonical": "block_producer",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "coalesce_progress",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "spill_metadata_artifact",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reject_producer",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cancel_child",
+          "deprecated_aliases": []
+        }
+      ],
+      "schema_version": 1,
+      "terminal_and_approval_events_preserved": true
+    },
+    "generation": {
+      "lanes": [
+        {
+          "canonical": "run",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "plugin",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "worker",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "process",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "mcp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivery",
+          "deprecated_aliases": []
+        }
+      ],
+      "one_active_generation_per_lane": true,
+      "schema_version": 1,
+      "stale_dispositions": [
+        {
+          "canonical": "persisted_diagnostic",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "dropped_before_parse",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "rejected",
+          "deprecated_aliases": []
+        }
+      ],
+      "transition_kinds": [
+        {
+          "canonical": "activated",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "steer_superseded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model_switch_superseded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "crash_continuation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "recovery_superseded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cancelled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "released",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "handles_cleanup": {
+      "cleanup_outcomes": [
+        {
+          "canonical": "completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "partial",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "unknown",
+          "deprecated_aliases": []
+        }
+      ],
+      "cleanup_steps": [
+        {
+          "canonical": "graceful_stop",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "close_io",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "kill_tree",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "remove_temp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "unmount",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "release_lease",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "verify_absence",
+          "deprecated_aliases": []
+        }
+      ],
+      "handle_kinds": [
+        {
+          "canonical": "process",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "harness",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "acp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "mcp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "lsp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "pty",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "worker",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "plugin",
+          "deprecated_aliases": []
+        }
+      ],
+      "pid_alone_authoritative": false,
+      "process_ownership": [
+        {
+          "canonical": "unix_process_group",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "windows_job_object",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "remote_execution_instance",
+          "deprecated_aliases": []
+        }
+      ],
+      "schema_version": 1
+    },
+    "health": {
+      "authority_classes": [
+        {
+          "canonical": "observe_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "read_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "scoped_mutation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "privileged_mutation",
+          "deprecated_aliases": []
+        }
+      ],
+      "effective_max_probe_concurrency": 1,
+      "late_probe_success_allowed": false,
+      "legacy_quarantine_clear_schema_version": 1,
+      "ordinary_admission_decisions": [
+        {
+          "canonical": "allowed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cooldown_blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "probe_required",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "quarantined",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "disabled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "probe_in_progress",
+          "deprecated_aliases": []
+        }
+      ],
+      "ordinary_admission_uses_probe_lease": false,
+      "probe_admission_decisions": [
+        {
+          "canonical": "authorized_non_mutating",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "lease_required",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "lease_inactive",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "lease_mismatch",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "health_not_probing",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "quarantined",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "disabled",
+          "deprecated_aliases": []
+        }
+      ],
+      "probe_dispositions": [
+        {
+          "canonical": "passed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "inconclusive",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "denied_mutating_probe",
+          "deprecated_aliases": []
+        }
+      ],
+      "probe_lease_schema_version": 1,
+      "probe_leases_non_mutating": true,
+      "probe_result_schema_version": 1,
+      "probe_settlement_binds_exact_generation": true,
+      "probe_settlement_binds_exact_lease": true,
+      "probe_settlement_schema_version": 1,
+      "quarantine_requires_probe_or_operator": true,
+      "schema_version": 1,
+      "security_quarantine_auto_clear": false,
+      "states": [
+        {
+          "canonical": "healthy",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "degraded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cooldown",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "quarantined",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "disabled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "probing",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "identity_set": {
+      "causal_relations": [
+        {
+          "canonical": "recovered_from",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "child_of",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "supersedes",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivers_output",
+          "deprecated_aliases": []
+        }
+      ],
+      "diagnostics_projection": "domain_separated_sha256",
+      "legacy_adapter_reason_code": "runtime.identity.legacy_adapter_used",
+      "max_causal_links": 32,
+      "schema_version": 1
+    },
+    "side_effect_fence": {
+      "idempotency_classes": [
+        {
+          "canonical": "read_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "deterministic_idempotent",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "external_idempotency_key",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reconciliable_mutation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "non_idempotent",
+          "deprecated_aliases": []
+        }
+      ],
+      "reconciliation_strategies": [
+        {
+          "canonical": "none",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "workspace_digest",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "process_provenance",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "external_idempotency_receipt",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivery_acknowledgement",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "worker_lease_receipt",
+          "deprecated_aliases": []
+        }
+      ],
+      "restart_policies": [
+        {
+          "canonical": "safe_retry",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reconcile_before_retry",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "require_confirmation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "never_retry",
+          "deprecated_aliases": []
+        }
+      ],
+      "schema_version": 1,
+      "states": [
+        {
+          "canonical": "intent_recorded",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "effect_started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "effect_observed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "effect_unknown",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reconciled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "abandoned",
+          "deprecated_aliases": []
+        }
+      ],
+      "unknown_effect_auto_retry": false
+    },
+    "snapshot_version": "runtime-contracts.shared_runtime.v3"
+  },
+  "snapshot_version": "runtime-contracts.v13",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

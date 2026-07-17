@@ -12,28 +12,6 @@
 //! - Wire names, aliases, and serialized shapes are pinned by the runtime-contract
 //!   snapshot gate (`scripts/test/check-runtime-contract-snapshots.sh`): add aliases
 //!   instead of renaming canonical strings.
-mod error_taxonomy;
-
-pub use error_taxonomy::*;
-
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{collections::BTreeMap, fmt};
-
-/// Schema version for the public runtime contract snapshot emitted by this crate.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-/// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v8";
-
-/// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct RuntimeContractEnumValue {
-    /// Canonical value emitted by new payloads.
-    pub canonical: &'static str,
-    /// Previously public wire names still accepted on input.
-    pub deprecated_aliases: &'static [&'static str],
-}
-
 macro_rules! runtime_contract_enum {
     (
         $(#[$meta:meta])*
@@ -44,7 +22,18 @@ macro_rules! runtime_contract_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub enum $name {
             $(
                 #[serde(rename = $canonical $(, alias = $alias)*)]
@@ -64,9 +53,9 @@ macro_rules! runtime_contract_enum {
             }
 
             /// Stable enum values covered by the public runtime contract snapshot.
-            pub const WIRE_CONTRACT_VALUES: &'static [RuntimeContractEnumValue] = &[
+            pub const WIRE_CONTRACT_VALUES: &'static [$crate::runtime_contracts::RuntimeContractEnumValue] = &[
                 $(
-                    RuntimeContractEnumValue {
+                    $crate::runtime_contracts::RuntimeContractEnumValue {
                         canonical: $canonical,
                         deprecated_aliases: &[$($alias),*],
                     },
@@ -75,7 +64,7 @@ macro_rules! runtime_contract_enum {
 
             /// Returns canonical wire values and deprecated aliases for snapshot gates.
             #[must_use]
-            pub const fn wire_contract_values() -> &'static [RuntimeContractEnumValue] {
+            pub const fn wire_contract_values() -> &'static [$crate::runtime_contracts::RuntimeContractEnumValue] {
                 Self::WIRE_CONTRACT_VALUES
             }
 
@@ -110,12 +99,50 @@ macro_rules! runtime_contract_enum {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(self.as_str())
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
             }
         }
     };
+}
+
+mod compatibility;
+mod error_taxonomy;
+mod events;
+mod flow_control;
+mod generation;
+mod handles;
+mod health;
+mod identities;
+mod side_effects;
+
+pub use compatibility::*;
+pub use error_taxonomy::*;
+pub use events::*;
+pub use flow_control::*;
+pub use generation::*;
+pub use handles::*;
+pub use health::*;
+pub use identities::*;
+pub use side_effects::*;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, fmt};
+
+/// Schema version for the public runtime contract snapshot emitted by this crate.
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Version identifier for the current public runtime contract snapshot.
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v13";
+
+/// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RuntimeContractEnumValue {
+    /// Canonical value emitted by new payloads.
+    pub canonical: &'static str,
+    /// Previously public wire names still accepted on input.
+    pub deprecated_aliases: &'static [&'static str],
 }
 
 /// Builds a public snapshot covering runtime wire enums, hook vocabularies, tool result
@@ -125,9 +152,10 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds the always-on bounded metadata trace contract while preserving rich trace as a separate approval-gated export.",
+        "changelog_note": "Adds generation-scoped harness attempt lifecycle events and canonical V2-to-public ordering correlation.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "runtime_error_contract": runtime_error_contract_snapshot(),
+        "shared_runtime_primitives": shared_runtime_contract_snapshot(),
         "metadata_trace": {
             "snapshot_version": "runtime-contracts.metadata_trace.v1",
             "changelog_note": "Introduces a bounded metadata-only run trace with append-only crash-safe segments and a separate approval-gated rich export.",
@@ -426,6 +454,92 @@ pub fn validate_public_contract_snapshot(snapshot: &Value) -> Result<(), String>
     validate_snapshot_strings("$", snapshot)
 }
 
+fn shared_runtime_contract_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.shared_runtime.v3",
+        "changelog_note": "Publishes the closed cancellation settlement vocabulary alongside ordinary/probe health authority separation, typed identities, host-owned sequencing, side-effect uncertainty, process provenance, cleanup evidence, and fail-closed startup compatibility.",
+        "identity_set": {
+            "schema_version": RUNTIME_IDENTITY_SET_SCHEMA_VERSION,
+            "causal_relations": RuntimeCausalLinkKind::wire_contract_values(),
+            "diagnostics_projection": "domain_separated_sha256",
+            "legacy_adapter_reason_code": "runtime.identity.legacy_adapter_used",
+            "max_causal_links": MAX_RUNTIME_CAUSAL_LINKS,
+        },
+        "event_envelope": {
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event_names": RuntimeEventName::wire_contract_values(),
+            "event_descriptors": RUNTIME_EVENT_DESCRIPTORS,
+            "actor_kinds": RuntimeEventActorKind::wire_contract_values(),
+            "redaction_classes": RuntimeEventRedactionClass::wire_contract_values(),
+            "max_inline_metadata_bytes": RUNTIME_EVENT_MAX_INLINE_METADATA_BYTES,
+            "host_allocates_sequence": true,
+            "one_terminal_per_generation": true,
+        },
+        "generation": {
+            "schema_version": RUNTIME_GENERATION_SCHEMA_VERSION,
+            "lanes": RuntimeGenerationLane::wire_contract_values(),
+            "transition_kinds": RuntimeGenerationTransitionKind::wire_contract_values(),
+            "stale_dispositions": StaleEventDisposition::wire_contract_values(),
+            "one_active_generation_per_lane": true,
+        },
+        "side_effect_fence": {
+            "schema_version": SIDE_EFFECT_FENCE_SCHEMA_VERSION,
+            "states": SideEffectFenceState::wire_contract_values(),
+            "idempotency_classes": RuntimeIdempotencyClass::wire_contract_values(),
+            "restart_policies": SideEffectRestartPolicy::wire_contract_values(),
+            "reconciliation_strategies": ReconciliationStrategy::wire_contract_values(),
+            "unknown_effect_auto_retry": false,
+        },
+        "flow_control": {
+            "schema_version": RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
+            "cancellation_scopes": CancellationScopeKind::wire_contract_values(),
+            "cancellation_reasons": CancellationReason::wire_contract_values(),
+            "cancellation_settlement_outcomes": CancellationSettlementOutcome::wire_contract_values(),
+            "overflow_actions": BackpressureOverflowAction::wire_contract_values(),
+            "max_channel_capacity": MAX_RUNTIME_CHANNEL_CAPACITY,
+            "terminal_and_approval_events_preserved": true,
+        },
+        "health": {
+            "schema_version": RUNTIME_COMPONENT_HEALTH_SCHEMA_VERSION,
+            "probe_lease_schema_version": HEALTH_PROBE_LEASE_SCHEMA_VERSION,
+            "probe_result_schema_version": HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+            "probe_settlement_schema_version": HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
+            "legacy_quarantine_clear_schema_version": QUARANTINE_CLEAR_REQUEST_SCHEMA_VERSION,
+            "states": RuntimeHealthState::wire_contract_values(),
+            "authority_classes": RuntimeAuthorityClass::wire_contract_values(),
+            "ordinary_admission_decisions": RuntimeOrdinaryAdmissionDecision::wire_contract_values(),
+            "probe_admission_decisions": RuntimeProbeAdmissionDecision::wire_contract_values(),
+            "probe_dispositions": HealthProbeDisposition::wire_contract_values(),
+            "probe_leases_non_mutating": true,
+            "ordinary_admission_uses_probe_lease": false,
+            "probe_settlement_binds_exact_lease": true,
+            "probe_settlement_binds_exact_generation": true,
+            "late_probe_success_allowed": false,
+            "effective_max_probe_concurrency": 1,
+            "security_quarantine_auto_clear": false,
+            "quarantine_requires_probe_or_operator": true,
+        },
+        "handles_cleanup": {
+            "schema_version": RUNTIME_HANDLE_SCHEMA_VERSION,
+            "handle_kinds": RuntimeHandleKind::wire_contract_values(),
+            "process_ownership": ProcessOwnershipKind::wire_contract_values(),
+            "cleanup_steps": CleanupStepKind::wire_contract_values(),
+            "cleanup_outcomes": CleanupOutcome::wire_contract_values(),
+            "pid_alone_authoritative": false,
+        },
+        "compatibility": {
+            "schema_version": RUNTIME_STATE_COMPATIBILITY_SCHEMA_VERSION,
+            "outcomes": RuntimeStateCompatibilityOutcome::wire_contract_values(),
+            "admission_postures": RuntimeStateAdmissionPosture::wire_contract_values(),
+            "unknown_newer_schema_blocks": true,
+            "corrupt_records_quarantined": true,
+            "unknown_evidence_preserved": true,
+            "serving_admission_requires_ready": true,
+            "read_only_scope": "offline_inspection_and_migration",
+        },
+    })
+}
+
 fn compatibility_policy_snapshot() -> Value {
     json!({
         "snapshot_version": "runtime-contracts.compatibility_policy.v1",
@@ -693,6 +807,28 @@ impl PublicRuntimeEventName {
     #[must_use]
     pub const fn is_terminal_run_event(self) -> bool {
         matches!(self, Self::RunCompleted | Self::RunFailed | Self::RunCancelled)
+    }
+
+    /// Returns the generation-aware runtime event represented by this public projection.
+    ///
+    /// Heartbeats, run-creation notifications, and verification nudges remain public-only
+    /// compatibility events until the closed V2 registry assigns them durable semantics.
+    #[must_use]
+    pub const fn runtime_event_name(self) -> Option<RuntimeEventName> {
+        match self {
+            Self::RunQueued => Some(RuntimeEventName::RunQueued),
+            Self::RunStarted => Some(RuntimeEventName::RunStarted),
+            Self::ModelDelta => Some(RuntimeEventName::ModelDelta),
+            Self::ToolCallStarted => Some(RuntimeEventName::ToolProposed),
+            Self::ToolCallDelta => Some(RuntimeEventName::ToolDecisionRecorded),
+            Self::ToolCallCompleted => Some(RuntimeEventName::ToolResultObserved),
+            Self::ApprovalRequired => Some(RuntimeEventName::ApprovalRequired),
+            Self::ApprovalResolved => Some(RuntimeEventName::ApprovalResolved),
+            Self::RunCompleted => Some(RuntimeEventName::RunCompleted),
+            Self::RunFailed => Some(RuntimeEventName::RunFailed),
+            Self::RunCancelled => Some(RuntimeEventName::RunCancelled),
+            Self::RunCreated | Self::VerificationNudge | Self::Heartbeat => None,
+        }
     }
 }
 
@@ -1085,6 +1221,9 @@ const fn public_event_descriptor(
 /// Correlation identifiers carried by every public runtime event.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicRuntimeEventCorrelation {
+    /// End-to-end trace id from the shared runtime identity set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     /// Runtime run id for run-scoped events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -1100,6 +1239,24 @@ pub struct PublicRuntimeEventCorrelation {
     /// Approval prompt id for approval lifecycle events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+    /// Provider or harness attempt id when the event belongs to one attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// Stable tool execution id when distinct from the public tool-call id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_execution_id: Option<String>,
+    /// Stable side-effect operation id used for replay and reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Host-authoritative generation carried by the canonical V2 envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// Host-authoritative sequence within the generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// Causal parent event id when one was known at emission time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_parent_event_id: Option<String>,
     /// Transport request id when an adapter can correlate the event to an inbound request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
@@ -1114,8 +1271,146 @@ impl PublicRuntimeEventCorrelation {
             "tool_call_id" => has_nonempty_value(self.tool_call_id.as_deref()),
             "approval_id" => has_nonempty_value(self.approval_id.as_deref()),
             "request_id" => has_nonempty_value(self.request_id.as_deref()),
+            "trace_id" => has_nonempty_value(self.trace_id.as_deref()),
+            "attempt_id" => has_nonempty_value(self.attempt_id.as_deref()),
+            "tool_execution_id" => has_nonempty_value(self.tool_execution_id.as_deref()),
+            "operation_id" => has_nonempty_value(self.operation_id.as_deref()),
+            "causal_parent_event_id" => has_nonempty_value(self.causal_parent_event_id.as_deref()),
+            "generation" => self.generation.is_some(),
+            "sequence" => self.sequence.is_some(),
             _ => false,
         }
+    }
+}
+
+/// Non-V2 correlation fields retained while projecting a canonical event to a public API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicRuntimeEventProjectionContext {
+    /// Parent run id used by delegated-run compatibility surfaces.
+    pub parent_run_id: Option<String>,
+    /// Inbound transport request id, which is intentionally outside durable runtime identity.
+    pub request_id: Option<String>,
+}
+
+/// Failure to project one canonical V2 event to the older public event taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRuntimeEventProjectionError {
+    /// Stable machine-readable failure code.
+    pub code: &'static str,
+    /// Safe bounded diagnostic message.
+    pub message: String,
+}
+
+impl PublicRuntimeEventProjectionError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+impl fmt::Display for PublicRuntimeEventProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for PublicRuntimeEventProjectionError {}
+
+/// Projects one validated V2 event into the backward-compatible public envelope.
+///
+/// The caller supplies an already redacted public payload. Ordering and durable correlation
+/// always come from the host-owned V2 envelope rather than from external adapter metadata.
+///
+/// # Errors
+/// Returns a stable projection error when the V2 envelope is invalid, has no public mapping,
+/// or the supplied compatibility payload violates the public event schema.
+pub fn project_runtime_event_v2_to_public(
+    event: &RuntimeEventEnvelopeV2,
+    payload: Value,
+    context: PublicRuntimeEventProjectionContext,
+) -> Result<PublicRuntimeEventEnvelope, PublicRuntimeEventProjectionError> {
+    event.validate().map_err(|error| {
+        PublicRuntimeEventProjectionError::new(
+            "runtime.public_projection.invalid_v2_event",
+            error.to_string(),
+        )
+    })?;
+    let public_name = public_runtime_event_name_for_v2(event.event_name).ok_or_else(|| {
+        PublicRuntimeEventProjectionError::new(
+            "runtime.public_projection.unsupported_event",
+            format!("{} has no public compatibility projection", event.event_name.as_str()),
+        )
+    })?;
+    let descriptor = public_name.descriptor();
+    let public_event = PublicRuntimeEventEnvelope {
+        schema_version: descriptor.schema_version,
+        event: public_name,
+        event_id: event.event_id.as_str().to_owned(),
+        occurred_at_unix_ms: event.occurred_at_unix_ms,
+        correlation: PublicRuntimeEventCorrelation {
+            trace_id: Some(event.identities.trace_id.as_str().to_owned()),
+            run_id: Some(event.identities.run_id.as_str().to_owned()),
+            session_id: Some(event.identities.session_id.as_str().to_owned()),
+            parent_run_id: context.parent_run_id,
+            tool_call_id: event
+                .identities
+                .tool_proposal_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            approval_id: event
+                .identities
+                .approval_subject_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            attempt_id: event.identities.attempt_id.as_ref().map(|value| value.as_str().to_owned()),
+            tool_execution_id: event
+                .identities
+                .tool_execution_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            operation_id: event
+                .identities
+                .operation_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            generation: Some(event.identities.generation.get()),
+            sequence: Some(event.sequence),
+            causal_parent_event_id: event
+                .causal_parent_event_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            request_id: context.request_id,
+        },
+        visibility: descriptor.visibility,
+        redaction: descriptor.redaction,
+        journal_mapping: descriptor.journal_mapping,
+        payload,
+        extensions: BTreeMap::new(),
+    };
+    validate_public_runtime_event(&public_event).map_err(|error| {
+        PublicRuntimeEventProjectionError::new(
+            "runtime.public_projection.invalid_public_event",
+            error.to_string(),
+        )
+    })?;
+    Ok(public_event)
+}
+
+const fn public_runtime_event_name_for_v2(
+    event_name: RuntimeEventName,
+) -> Option<PublicRuntimeEventName> {
+    match event_name {
+        RuntimeEventName::RunQueued => Some(PublicRuntimeEventName::RunQueued),
+        RuntimeEventName::RunStarted => Some(PublicRuntimeEventName::RunStarted),
+        RuntimeEventName::ModelDelta => Some(PublicRuntimeEventName::ModelDelta),
+        RuntimeEventName::ToolProposed => Some(PublicRuntimeEventName::ToolCallStarted),
+        RuntimeEventName::ToolDecisionRecorded => Some(PublicRuntimeEventName::ToolCallDelta),
+        RuntimeEventName::ToolResultObserved => Some(PublicRuntimeEventName::ToolCallCompleted),
+        RuntimeEventName::ApprovalRequired => Some(PublicRuntimeEventName::ApprovalRequired),
+        RuntimeEventName::ApprovalResolved => Some(PublicRuntimeEventName::ApprovalResolved),
+        RuntimeEventName::RunCompleted => Some(PublicRuntimeEventName::RunCompleted),
+        RuntimeEventName::RunFailed => Some(PublicRuntimeEventName::RunFailed),
+        RuntimeEventName::RunCancelled => Some(PublicRuntimeEventName::RunCancelled),
+        _ => None,
     }
 }
 
@@ -3828,30 +4123,32 @@ runtime_contract_enum! {
 #[cfg(test)]
 mod tests {
     use super::{
-        public_runtime_contract_snapshot, validate_public_contract_snapshot,
-        validate_public_runtime_event, validate_public_runtime_event_name,
-        validate_public_runtime_event_sequence, AcpBindingConflictKind, AcpBindingRepairActionKind,
-        AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange,
-        AcpScope, AcpSessionBindingRecord, AcpSessionMode, AcpTransportKind,
-        AgentHarnessAttemptClassification, AgentHarnessAttemptErrorSummary,
-        AgentHarnessAttemptReplaySafety, AgentHarnessAttemptResult,
-        AgentHarnessAttemptTerminalStatus, AgentHarnessCallbackKind, AgentHarnessSelectionMode,
-        AgentHookCapabilityGrant, AgentHookDecisionAuthority, AgentHookDecisionKind, AgentHookKind,
-        AgentHookRedactionPosture, ArtifactReadRequest, ArtifactRetentionDisposition,
-        ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, DeliveryPolicy, FlowState,
-        FlowStepState, IdempotencyReplayDecision, PalyraErrorCategory, PalyraErrorEnvelope,
-        PalyraValidationIssue, PruningPolicyClass, PublicRuntimeEventCorrelation,
-        PublicRuntimeEventEnvelope, PublicRuntimeEventName, QueueDecision, QueueMode,
-        QueuedInputState, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
-        RealtimeEventSensitivity, RealtimeEventTopic, RealtimeHandshakeRequest,
-        RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope, RealtimeSubscription,
-        RunLifecycleHookDecision, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
-        RunLifecyclePhase, StableErrorEnvelope, ToolResultProjectionAuditRecord,
-        ToolResultProjectionDecisionKind, ToolResultProjectionPolicyKind, ToolResultSensitivity,
-        ToolResultVisibility, ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION,
-        ACP_PROTOCOL_MIN_VERSION, AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA,
-        PUBLIC_RUNTIME_EVENT_DESCRIPTORS, REALTIME_PROTOCOL_MAX_VERSION,
-        REALTIME_PROTOCOL_MIN_VERSION,
+        project_runtime_event_v2_to_public, public_runtime_contract_snapshot,
+        validate_public_contract_snapshot, validate_public_runtime_event,
+        validate_public_runtime_event_name, validate_public_runtime_event_sequence,
+        AcpBindingConflictKind, AcpBindingRepairActionKind, AcpCapability, AcpClientContext,
+        AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord,
+        AcpSessionMode, AcpTransportKind, AgentHarnessAttemptClassification,
+        AgentHarnessAttemptErrorSummary, AgentHarnessAttemptReplaySafety,
+        AgentHarnessAttemptResult, AgentHarnessAttemptTerminalStatus, AgentHarnessCallbackKind,
+        AgentHarnessSelectionMode, AgentHookCapabilityGrant, AgentHookDecisionAuthority,
+        AgentHookDecisionKind, AgentHookKind, AgentHookRedactionPosture, ArtifactReadRequest,
+        ArtifactRetentionDisposition, ArtifactRetentionPolicy, AuxiliaryTaskKind,
+        AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
+        PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, PruningPolicyClass,
+        PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope, PublicRuntimeEventName,
+        PublicRuntimeEventProjectionContext, QueueDecision, QueueMode, QueuedInputState,
+        RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope, RealtimeEventSensitivity,
+        RealtimeEventTopic, RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole,
+        RealtimeScope, RealtimeSubscription, RunLifecycleHookDecision,
+        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecyclePhase,
+        RuntimeEventEnvelopeV2, RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef,
+        RuntimeGeneration, RuntimeIdentitySetV1, RuntimeRunId, RuntimeSessionId, RuntimeTraceId,
+        StableErrorEnvelope, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
+        ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
+        AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA, PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
+        REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -4091,6 +4388,57 @@ mod tests {
 
         let encoded = serde_json::to_value(&event).expect("event should serialize");
         assert_eq!(encoded["future_event_field"]["preserved"], true);
+    }
+
+    #[test]
+    fn v2_public_projection_preserves_host_ordering_and_correlation() {
+        let event_name = RuntimeEventName::RunStarted;
+        let descriptor = event_name.descriptor();
+        let event = RuntimeEventEnvelopeV2 {
+            schema_version: 2,
+            event_id: RuntimeEventId::parse("event_01").expect("event id"),
+            identities: RuntimeIdentitySetV1::for_run(
+                RuntimeTraceId::parse("trace_01").expect("trace id"),
+                RuntimeSessionId::parse("session_01").expect("session id"),
+                RuntimeRunId::parse("run_01").expect("run id"),
+                RuntimeGeneration::new(7).expect("generation"),
+            ),
+            sequence: 19,
+            causal_parent_event_id: Some(
+                RuntimeEventId::parse("event_parent").expect("parent event id"),
+            ),
+            subsystem: descriptor.subsystem,
+            phase: descriptor.phase,
+            event_name,
+            reason_code: "runtime.event.run_started".to_owned(),
+            actor_kind: descriptor.actor_kind,
+            retryability: descriptor.retryability,
+            redaction_class: descriptor.redaction_class,
+            terminal: descriptor.terminal,
+            payload: RuntimeEventPayloadRef::Inline { metadata: json!({}) },
+            occurred_at_unix_ms: 42,
+            extensions: BTreeMap::new(),
+        };
+
+        let public = project_runtime_event_v2_to_public(
+            &event,
+            json!({ "status": "in_progress" }),
+            PublicRuntimeEventProjectionContext {
+                parent_run_id: Some("parent_run_01".to_owned()),
+                request_id: Some("request_01".to_owned()),
+            },
+        )
+        .expect("V2 event should project to public taxonomy");
+
+        assert_eq!(public.event, PublicRuntimeEventName::RunStarted);
+        assert_eq!(public.correlation.trace_id.as_deref(), Some("trace_01"));
+        assert_eq!(public.correlation.run_id.as_deref(), Some("run_01"));
+        assert_eq!(public.correlation.session_id.as_deref(), Some("session_01"));
+        assert_eq!(public.correlation.parent_run_id.as_deref(), Some("parent_run_01"));
+        assert_eq!(public.correlation.generation, Some(7));
+        assert_eq!(public.correlation.sequence, Some(19));
+        assert_eq!(public.correlation.causal_parent_event_id.as_deref(), Some("event_parent"));
+        assert_eq!(public.correlation.request_id.as_deref(), Some("request_01"));
     }
 
     #[test]

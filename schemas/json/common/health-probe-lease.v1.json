@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/health-probe-lease.v1.json",
+  "title": "Palyra Health Probe Lease V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lease_id",
+    "component_id",
+    "expected_generation",
+    "authority_class",
+    "issued_at_unix_ms",
+    "expires_at_unix_ms",
+    "non_mutating"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lease_id": { "$ref": "#/$defs/id" },
+    "component_id": { "$ref": "#/$defs/id" },
+    "expected_generation": { "type": "integer", "minimum": 1 },
+    "authority_class": { "enum": ["observe_only", "read_only", "scoped_mutation", "privileged_mutation"] },
+    "issued_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "expires_at_unix_ms": { "type": "integer", "minimum": 1 },
+    "non_mutating": { "const": true }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "identity_bytes": 128,
+    "probe_concurrency_max": 1
+  }
+}

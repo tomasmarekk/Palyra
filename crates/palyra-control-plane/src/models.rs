@@ -1163,6 +1163,7 @@ pub enum NodeCapabilityRequestState {
     Failed,
     TimedOut,
     Rejected,
+    Cancelled,
 }
 
 /// Node capability request with timing and outcome summaries.

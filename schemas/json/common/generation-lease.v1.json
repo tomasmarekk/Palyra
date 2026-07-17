@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/generation-lease.v1.json",
+  "title": "Palyra Generation Lease V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lease_id",
+    "session_id",
+    "lane",
+    "generation",
+    "owner",
+    "acquired_at_unix_ms",
+    "expires_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lease_id": { "$ref": "#/$defs/id" },
+    "session_id": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "lane": {
+      "enum": ["run", "harness", "provider", "tool", "plugin", "worker", "process", "mcp", "delivery"]
+    },
+    "generation": { "type": "integer", "minimum": 1 },
+    "owner": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "acquired_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "expires_at_unix_ms": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "owner_bytes": 128,
+    "identity_bytes": 128
+  }
+}

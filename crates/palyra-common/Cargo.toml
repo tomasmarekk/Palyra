@@ -29,4 +29,5 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 anyhow.workspace = true
+proptest.workspace = true
 tempfile.workspace = true

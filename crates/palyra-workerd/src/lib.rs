@@ -20,6 +20,8 @@ use ulid::Ulid;
 const MAX_WORKER_ID_BYTES: usize = 128;
 const MAX_GRANT_ID_BYTES: usize = 128;
 const MAX_RECENT_LIFECYCLE_EVENTS: usize = 64;
+const NETWORKED_WORKER_EXPIRY_EVENT_ID_PREFIX: &str = "worker-expiry:";
+const NETWORKED_WORKER_LIFECYCLE_EVENT_ID_PREFIX: &str = "worker-lifecycle:";
 const DEFAULT_WORKER_SDK_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_WORKER_WIT_ABI_VERSION: &str = "palyra-worker-abi/v1";
 
@@ -464,12 +466,29 @@ impl WorkerRemoteToolRequestEnvelope {
     /// Returns [`WorkerRemoteToolContractError`] when the envelope is malformed,
     /// expired, unsupported, or not bound to the requested worker lease.
     pub fn validate(&self, now_unix_ms: i64) -> Result<(), WorkerRemoteToolContractError> {
+        self.validate_contract()?;
+        if self.lease.expires_at_unix_ms <= now_unix_ms {
+            return Err(WorkerRemoteToolContractError::LeaseExpired {
+                lease_id: self.lease.lease_id.clone(),
+                expires_at_unix_ms: self.lease.expires_at_unix_ms,
+                observed_at_unix_ms: now_unix_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_contract(&self) -> Result<(), WorkerRemoteToolContractError> {
         validate_protocol(self.protocol.as_str(), self.schema_version)?;
         validate_required_string(self.request_id.as_str(), "request_id")?;
         validate_required_string(self.proposal_id.as_str(), "proposal_id")?;
         validate_required_string(self.tool_name.as_str(), "tool_name")?;
         validate_required_string(self.input_json.as_str(), "input_json")?;
         validate_sha256_hex(self.input_json_sha256.as_str(), "input_json_sha256")?;
+        if sha256_hex(self.input_json.as_bytes()) != self.input_json_sha256 {
+            return Err(WorkerRemoteToolContractError::DigestMismatch {
+                field: "input_json_sha256",
+            });
+        }
         validate_sha256_hex(
             self.workspace_transfer.workspace_manifest_sha256.as_str(),
             "workspace_manifest_sha256",
@@ -516,13 +535,6 @@ impl WorkerRemoteToolRequestEnvelope {
                 capability: required_capability,
             });
         }
-        if self.lease.expires_at_unix_ms <= now_unix_ms {
-            return Err(WorkerRemoteToolContractError::LeaseExpired {
-                lease_id: self.lease.lease_id.clone(),
-                expires_at_unix_ms: self.lease.expires_at_unix_ms,
-                observed_at_unix_ms: now_unix_ms,
-            });
-        }
         Ok(())
     }
 }
@@ -552,20 +564,36 @@ pub struct WorkerRemoteToolResultEnvelope {
 impl WorkerRemoteToolResultEnvelope {
     /// Validates a remote result against its original request envelope.
     ///
+    /// Host receipt time is the lease authority boundary. The worker-reported completion timestamp
+    /// remains audit metadata and cannot make a result observed after expiry settle successfully.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerRemoteToolContractError`] when the worker changed identity,
-    /// the lease expired, cleanup was incomplete, or result fields do not match
-    /// the request binding.
+    /// the lease expired before host observation, cleanup was incomplete, a digest
+    /// does not match its payload, or result fields do not match the request binding.
     pub fn validate_against_request(
         &self,
         request: &WorkerRemoteToolRequestEnvelope,
-        now_unix_ms: i64,
+        observed_at_unix_ms: i64,
     ) -> Result<(), WorkerRemoteToolContractError> {
-        request.validate(now_unix_ms)?;
+        request.validate(observed_at_unix_ms)?;
+        self.validate_result_contract(request)
+    }
+
+    fn validate_result_contract(
+        &self,
+        request: &WorkerRemoteToolRequestEnvelope,
+    ) -> Result<(), WorkerRemoteToolContractError> {
+        request.validate_contract()?;
         validate_protocol(self.protocol.as_str(), self.schema_version)?;
         validate_sha256_hex(self.output_json_sha256.as_str(), "output_json_sha256")?;
         validate_sha256_hex(self.output_manifest_sha256.as_str(), "output_manifest_sha256")?;
+        if sha256_hex(self.output_json.as_bytes()) != self.output_json_sha256 {
+            return Err(WorkerRemoteToolContractError::DigestMismatch {
+                field: "output_json_sha256",
+            });
+        }
         if self.request_id != request.request_id
             || self.proposal_id != request.proposal_id
             || self.tool_name != request.tool_name
@@ -582,12 +610,8 @@ impl WorkerRemoteToolResultEnvelope {
                 actual: self.worker_identity.worker_id.clone(),
             });
         }
-        if self.completed_at_unix_ms > request.lease.expires_at_unix_ms {
-            return Err(WorkerRemoteToolContractError::LeaseExpired {
-                lease_id: request.lease.lease_id.clone(),
-                expires_at_unix_ms: request.lease.expires_at_unix_ms,
-                observed_at_unix_ms: self.completed_at_unix_ms,
-            });
+        if self.completed_at_unix_ms < 0 {
+            return Err(WorkerRemoteToolContractError::InvalidCompletionTimestamp);
         }
         if !self.cleanup_report.is_verified() {
             return Err(WorkerRemoteToolContractError::CleanupGap {
@@ -614,6 +638,8 @@ pub enum WorkerRemoteToolContractError {
     MissingRequiredField { field: &'static str },
     #[error("worker remote tool envelope has invalid SHA-256 digest in '{field}'")]
     InvalidSha256Digest { field: &'static str },
+    #[error("worker remote tool envelope SHA-256 digest does not match '{field}' payload")]
+    DigestMismatch { field: &'static str },
     #[error("worker remote scoped bundle transfer requires scoped_bundle_sha256")]
     MissingScopedBundleDigest,
     #[error("worker remote tool kind mismatch for {tool_name}: expected {expected}, got {actual}")]
@@ -628,6 +654,8 @@ pub enum WorkerRemoteToolContractError {
     WorkerIdentityMismatch { expected: String, actual: String },
     #[error("worker remote result does not match the request binding")]
     ResultBindingMismatch,
+    #[error("worker remote result has an invalid completion timestamp")]
+    InvalidCompletionTimestamp,
     #[error("worker remote cleanup gap for lease '{lease_id}': {reason}")]
     CleanupGap { lease_id: String, reason: String },
 }
@@ -667,6 +695,14 @@ fn validate_sha256_hex(
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 /// Audit record of a single worker lifecycle transition.
 ///
 /// `reason_code` is a stable machine-readable code (for example `worker.registered`).
@@ -675,8 +711,105 @@ pub struct WorkerLifecycleEvent {
     pub worker_id: String,
     pub state: WorkerLifecycleState,
     pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
     pub reason_code: String,
     pub timestamp_unix_ms: i64,
+}
+
+/// Returns whether `event` is valid exact evidence for one TTL-expired worker lease.
+#[must_use]
+pub fn is_exact_networked_worker_expiry_event(event: &WorkerLifecycleEvent) -> bool {
+    event.state == WorkerLifecycleState::Orphaned
+        && event.reason_code == "worker.ttl_expired"
+        && event.timestamp_unix_ms >= 0
+        && is_bounded_worker_id(event.worker_id.as_str())
+        && event.run_id.as_deref().is_some_and(is_bounded_runtime_identity)
+        && event.lease_id.as_deref().is_some_and(is_bounded_runtime_identity)
+}
+
+/// Derives the deterministic journal/outbox identity for exact TTL-expiry evidence.
+///
+/// # Errors
+/// Returns [`WorkerLifecycleError::InvalidExpiryEvidence`] when the event does not carry an exact
+/// bounded worker, run, and lease identity for a TTL-expiry transition.
+pub fn networked_worker_expiry_event_id(
+    event: &WorkerLifecycleEvent,
+) -> Result<String, WorkerLifecycleError> {
+    if !is_exact_networked_worker_expiry_event(event) {
+        return Err(WorkerLifecycleError::InvalidExpiryEvidence);
+    }
+    let run_id = event.run_id.as_deref().ok_or(WorkerLifecycleError::InvalidExpiryEvidence)?;
+    let lease_id = event.lease_id.as_deref().ok_or(WorkerLifecycleError::InvalidExpiryEvidence)?;
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest as _;
+    hasher.update(b"palyra.networked_worker.expiry_event.v2\0");
+    hasher.update(event.worker_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(run_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(lease_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event.reason_code.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(event.timestamp_unix_ms.to_be_bytes());
+    let digest = hex::encode(hasher.finalize());
+    Ok(format!("{NETWORKED_WORKER_EXPIRY_EVENT_ID_PREFIX}{}", &digest[..32]))
+}
+
+/// Derives a transition-bound identity for non-expiry worker lifecycle evidence.
+///
+/// # Errors
+/// Returns [`WorkerLifecycleError::InvalidLifecycleEvidence`] when the transition or event
+/// contains an invalid bounded identity, reason code, or timestamp.
+pub fn networked_worker_lifecycle_event_id(
+    transition_id: &str,
+    event: &WorkerLifecycleEvent,
+) -> Result<String, WorkerLifecycleError> {
+    if !is_bounded_runtime_identity(transition_id)
+        || !is_bounded_worker_id(event.worker_id.as_str())
+        || event.reason_code.is_empty()
+        || event.reason_code.len() > 128
+        || !event
+            .reason_code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+        || event.timestamp_unix_ms < 0
+        || event.run_id.as_deref().is_some_and(|value| !is_bounded_runtime_identity(value))
+        || event.lease_id.as_deref().is_some_and(|value| !is_bounded_runtime_identity(value))
+    {
+        return Err(WorkerLifecycleError::InvalidLifecycleEvidence);
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest as _;
+    hasher.update(b"palyra.networked_worker.lifecycle_event.v1\0");
+    update_length_prefixed(&mut hasher, transition_id.as_bytes());
+    update_length_prefixed(&mut hasher, event.worker_id.as_bytes());
+    update_length_prefixed(&mut hasher, event.state.as_str().as_bytes());
+    update_optional_length_prefixed(&mut hasher, event.run_id.as_deref());
+    update_optional_length_prefixed(&mut hasher, event.lease_id.as_deref());
+    update_length_prefixed(&mut hasher, event.reason_code.as_bytes());
+    hasher.update(event.timestamp_unix_ms.to_be_bytes());
+    let digest = hex::encode(hasher.finalize());
+    Ok(format!("{NETWORKED_WORKER_LIFECYCLE_EVENT_ID_PREFIX}{}", &digest[..32]))
+}
+
+fn update_length_prefixed(hasher: &mut sha2::Sha256, value: &[u8]) {
+    use sha2::Digest as _;
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
+}
+
+fn update_optional_length_prefixed(hasher: &mut sha2::Sha256, value: Option<&str>) {
+    use sha2::Digest as _;
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            update_length_prefixed(hasher, value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
 }
 
 /// Outcome of finalizing a run: the lifecycle event plus the cleanup verification verdict.
@@ -1012,8 +1145,16 @@ pub enum WorkerLifecycleError {
     TtlExceeded,
     #[error("worker '{0}' already has an active lease")]
     LeaseAlreadyActive(String),
+    #[error("worker '{0}' cleanup requires the active lease to be revoked first")]
+    CleanupRequiresLeaseRevocation(String),
     #[error("worker '{worker_id}' completion does not match its active lease")]
     StaleLeaseCompletion { worker_id: String, completed_lease_id: String, completed_run_id: String },
+    #[error("worker '{worker_id}' expiry plan no longer matches lease '{lease_id}'")]
+    ExpiryPlanConflict { worker_id: String, lease_id: String },
+    #[error("networked worker expiry evidence is invalid")]
+    InvalidExpiryEvidence,
+    #[error("networked worker lifecycle evidence is invalid")]
+    InvalidLifecycleEvidence,
     #[error("worker '{0}' is fail-closed and cannot accept work")]
     WorkerFailClosed(String),
     #[error("worker '{0}' is draining and cannot accept new work")]
@@ -1041,12 +1182,14 @@ pub enum WorkerLifecycleError {
     },
 }
 
-#[derive(Debug, Clone)]
-struct WorkerRecord {
-    attestation: WorkerAttestation,
-    state: WorkerLifecycleState,
-    lease: Option<WorkerLease>,
-    last_heartbeat_unix_ms: i64,
+/// Durable worker record used to reconstruct active lease authority after restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerFleetRecord {
+    pub attestation: WorkerAttestation,
+    pub state: WorkerLifecycleState,
+    pub lease: Option<WorkerLease>,
+    pub last_heartbeat_unix_ms: i64,
 }
 
 #[derive(Debug)]
@@ -1063,14 +1206,31 @@ struct StaleReclaimScan {
     reclaimed_activation_ids: Vec<String>,
 }
 
+/// Opaque two-phase lease-expiry plan whose events can be durably fenced before revocation.
+#[derive(Debug)]
+pub struct WorkerLeaseExpiryPlan {
+    events: Vec<WorkerLifecycleEvent>,
+    recovery_activation_ids: Vec<Option<String>>,
+    failed_closed_activation_ids: Vec<String>,
+    reclaimed_activation_ids: Vec<String>,
+}
+
+impl WorkerLeaseExpiryPlan {
+    /// Returns the exact lease-bound lifecycle evidence that applying this plan will emit.
+    #[must_use]
+    pub fn events(&self) -> &[WorkerLifecycleEvent] {
+        self.events.as_slice()
+    }
+}
+
 /// In-memory fleet ledger enforcing fail-closed worker lifecycle transitions.
 ///
 /// Every mutating operation revalidates attestation and policy compatibility before
 /// granting work, and emits a [`WorkerLifecycleEvent`] into a bounded recent-event
 /// buffer for audit surfaces. `Default` starts an empty fleet.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct WorkerFleetManager {
-    workers: BTreeMap<String, WorkerRecord>,
+    workers: BTreeMap<String, WorkerFleetRecord>,
     recent_events: VecDeque<WorkerLifecycleEvent>,
     qa_fault_probe: QaFaultProbeHandle,
 }
@@ -1099,6 +1259,51 @@ impl WorkerFleetManager {
         recovery_class: QaFaultRecoveryClass,
     ) -> Result<(), WorkerLifecycleError> {
         self.qa_fault_probe.record_recovery(activation_id, recovery_class)?;
+        Ok(())
+    }
+
+    /// Reconstructs a fleet from durable worker records.
+    ///
+    /// # Errors
+    /// Returns a lifecycle error when a record key disagrees with its attestation, a lease is
+    /// bound to another worker, or the record contains a state/lease combination that cannot own
+    /// runtime authority.
+    pub fn from_durable_records(
+        records: BTreeMap<String, WorkerFleetRecord>,
+    ) -> Result<Self, WorkerLifecycleError> {
+        for (worker_id, record) in &records {
+            validate_durable_worker_record(worker_id, record)?;
+        }
+        Ok(Self {
+            workers: records,
+            recent_events: VecDeque::new(),
+            qa_fault_probe: QaFaultProbeHandle::default(),
+        })
+    }
+
+    /// Returns exact worker records for durable crash recovery.
+    #[must_use]
+    pub fn durable_records(&self) -> BTreeMap<String, WorkerFleetRecord> {
+        self.workers.clone()
+    }
+
+    /// Restores the bounded recent-event ring after a caller commits durable evidence.
+    pub fn retain_recent_event(&mut self, event: WorkerLifecycleEvent) {
+        self.push_recent_event(event);
+    }
+
+    /// Restores an exact durable snapshot while preserving process-local diagnostics.
+    ///
+    /// # Errors
+    /// Returns a lifecycle error when the supplied records do not form a valid durable fleet.
+    pub fn restore_durable_records(
+        &mut self,
+        records: BTreeMap<String, WorkerFleetRecord>,
+    ) -> Result<(), WorkerLifecycleError> {
+        for (worker_id, record) in &records {
+            validate_durable_worker_record(worker_id, record)?;
+        }
+        self.workers = records;
         Ok(())
     }
 
@@ -1227,7 +1432,7 @@ impl WorkerFleetManager {
         };
         self.workers.insert(
             worker_id.clone(),
-            WorkerRecord {
+            WorkerFleetRecord {
                 attestation,
                 state: WorkerLifecycleState::Registered,
                 lease: None,
@@ -1238,6 +1443,7 @@ impl WorkerFleetManager {
             worker_id,
             state: WorkerLifecycleState::Registered,
             run_id: None,
+            lease_id: None,
             reason_code: "worker.registered".to_owned(),
             timestamp_unix_ms: now_unix_ms,
         };
@@ -1362,7 +1568,7 @@ impl WorkerFleetManager {
                 .workers
                 .get_mut(worker_id)
                 .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
-            validate_completion_identity(worker_id, worker, lease_identity)?;
+            validate_completion_identity(worker_id, worker, lease_identity, now_unix_ms)?;
             finalize_worker_cleanup(worker_id, worker, cleanup, now_unix_ms)
         };
         self.push_recent_event(outcome.event.clone());
@@ -1386,13 +1592,18 @@ impl WorkerFleetManager {
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
-        let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+        let (run_id, lease_id) = worker
+            .lease
+            .as_ref()
+            .map(|lease| (Some(lease.run_id.clone()), Some(lease.lease_id.clone())))
+            .unwrap_or((None, None));
         worker.state = WorkerLifecycleState::Failed;
         worker.lease = None;
         let event = WorkerLifecycleEvent {
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Failed,
             run_id,
+            lease_id,
             reason_code: normalize_operator_reason_code(
                 reason_code,
                 "worker.quarantined_by_operator",
@@ -1418,13 +1629,18 @@ impl WorkerFleetManager {
             if matches!(worker.state, WorkerLifecycleState::Failed) && worker.lease.is_none() {
                 continue;
             }
-            let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+            let (run_id, lease_id) = worker
+                .lease
+                .as_ref()
+                .map(|lease| (Some(lease.run_id.clone()), Some(lease.lease_id.clone())))
+                .unwrap_or((None, None));
             worker.state = WorkerLifecycleState::Failed;
             worker.lease = None;
             events.push(WorkerLifecycleEvent {
                 worker_id: worker_id.clone(),
                 state: WorkerLifecycleState::Failed,
                 run_id,
+                lease_id,
                 reason_code: reason_code.clone(),
                 timestamp_unix_ms: now_unix_ms,
             });
@@ -1468,6 +1684,7 @@ impl WorkerFleetManager {
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Registered,
             run_id: None,
+            lease_id: None,
             reason_code: "worker.reverified_by_operator".to_owned(),
             timestamp_unix_ms: now_unix_ms,
         };
@@ -1505,6 +1722,7 @@ impl WorkerFleetManager {
             worker_id: worker_id.to_owned(),
             state: worker.state,
             run_id: worker.lease.as_ref().map(|lease| lease.run_id.clone()),
+            lease_id: worker.lease.as_ref().map(|lease| lease.lease_id.clone()),
             reason_code: "worker.heartbeat".to_owned(),
             timestamp_unix_ms: now_unix_ms,
         };
@@ -1534,6 +1752,7 @@ impl WorkerFleetManager {
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Draining,
             run_id: worker.lease.as_ref().map(|lease| lease.run_id.clone()),
+            lease_id: worker.lease.as_ref().map(|lease| lease.lease_id.clone()),
             reason_code: normalize_operator_reason_code(reason_code, "worker.draining"),
             timestamp_unix_ms: now_unix_ms,
         };
@@ -1559,13 +1778,18 @@ impl WorkerFleetManager {
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
-        let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+        let (run_id, lease_id) = worker
+            .lease
+            .as_ref()
+            .map(|lease| (Some(lease.run_id.clone()), Some(lease.lease_id.clone())))
+            .unwrap_or((None, None));
         worker.lease = None;
         worker.state = WorkerLifecycleState::Orphaned;
         let event = WorkerLifecycleEvent {
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Orphaned,
             run_id,
+            lease_id,
             reason_code: normalize_operator_reason_code(reason_code, "worker.lease_revoked"),
             timestamp_unix_ms: now_unix_ms,
         };
@@ -1575,9 +1799,9 @@ impl WorkerFleetManager {
 
     /// Operator entry point for recording a cleanup report during remediation.
     ///
-    /// Unlike runtime completion, this privileged path intentionally accepts a
-    /// worker without an active lease so an orphaned or failed worker can be
-    /// cleaned after its lease identity is no longer available.
+    /// Unlike runtime completion, this privileged path does not require a lease identity, but it
+    /// accepts only a worker whose active lease has already been revoked. This prevents operator
+    /// cleanup from clearing dispatch authority that still belongs to an exact lease.
     ///
     /// # Errors
     ///
@@ -1593,6 +1817,11 @@ impl WorkerFleetManager {
                 .workers
                 .get_mut(worker_id)
                 .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
+            if worker.lease.is_some() {
+                return Err(WorkerLifecycleError::CleanupRequiresLeaseRevocation(
+                    worker_id.to_owned(),
+                ));
+            }
             finalize_worker_cleanup(worker_id, worker, cleanup, now_unix_ms)
         };
         self.push_recent_event(outcome.event.clone());
@@ -1602,56 +1831,140 @@ impl WorkerFleetManager {
     /// Orphans every worker whose lease ttl has elapsed, returning the emitted events.
     ///
     /// # Errors
-    /// Returns a checkpoint error before any candidate worker is mutated. If
-    /// recovery evidence cannot be recorded, the affected worker has already
-    /// been orphaned, its lease revoked, and its lifecycle event retained.
+    /// Returns a checkpoint or exact-plan validation error before an unrelated lease is mutated.
     pub fn reap_expired_workers(
         &mut self,
         now_unix_ms: i64,
     ) -> Result<Vec<WorkerLifecycleEvent>, WorkerLifecycleError> {
-        let reclaim_scan = self.stale_reclaim_candidates(
+        self.reap_expired_workers_bounded(now_unix_ms, usize::MAX)
+    }
+
+    /// Orphans at most `limit` workers whose lease ttl has elapsed.
+    ///
+    /// # Errors
+    /// Returns a checkpoint or exact-plan validation error before an unrelated lease is mutated.
+    pub fn reap_expired_workers_bounded(
+        &mut self,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<WorkerLifecycleEvent>, WorkerLifecycleError> {
+        let plan = self.plan_expired_workers_bounded(now_unix_ms, limit)?;
+        self.apply_expired_worker_plan(plan)
+    }
+
+    /// Plans at most `limit` exact lease expiries without mutating worker state.
+    ///
+    /// Callers that require crash-safe evidence can persist [`WorkerLeaseExpiryPlan::events`]
+    /// before applying the returned plan.
+    ///
+    /// # Errors
+    /// Returns a checkpoint error before any candidate worker is mutated.
+    pub fn plan_expired_workers_bounded(
+        &self,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<WorkerLeaseExpiryPlan, WorkerLifecycleError> {
+        if limit == 0 {
+            return Ok(WorkerLeaseExpiryPlan {
+                events: Vec::new(),
+                recovery_activation_ids: Vec::new(),
+                failed_closed_activation_ids: Vec::new(),
+                reclaimed_activation_ids: Vec::new(),
+            });
+        }
+        let mut reclaim_scan = self.stale_reclaim_candidates(
             now_unix_ms,
             |worker, effective_now| {
                 worker.lease.as_ref().is_some_and(|lease| lease.expires_at_unix_ms <= effective_now)
             },
             |worker| worker.state == WorkerLifecycleState::Orphaned && worker.lease.is_none(),
         )?;
-        let mut events = Vec::new();
+        reclaim_scan.candidates.truncate(limit);
+        let mut events = Vec::with_capacity(reclaim_scan.candidates.len());
+        let mut recovery_activation_ids = Vec::with_capacity(reclaim_scan.candidates.len());
         for candidate in reclaim_scan.candidates {
-            let event = {
-                let worker =
-                    self.workers.get_mut(candidate.worker_id.as_str()).ok_or_else(|| {
-                        WorkerLifecycleError::UnknownWorker(candidate.worker_id.clone())
-                    })?;
-                let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
-                worker.state = WorkerLifecycleState::Orphaned;
-                worker.lease = None;
-                WorkerLifecycleEvent {
-                    worker_id: candidate.worker_id,
-                    state: WorkerLifecycleState::Orphaned,
-                    run_id,
-                    reason_code: "worker.ttl_expired".to_owned(),
-                    timestamp_unix_ms: candidate.effective_now_unix_ms,
-                }
-            };
+            let worker = self
+                .workers
+                .get(candidate.worker_id.as_str())
+                .ok_or_else(|| WorkerLifecycleError::UnknownWorker(candidate.worker_id.clone()))?;
+            let lease = worker.lease.as_ref().ok_or_else(|| {
+                WorkerLifecycleError::InvalidLeaseRequest(format!(
+                    "worker '{}' lost its expiry lease while planning",
+                    candidate.worker_id
+                ))
+            })?;
+            events.push(WorkerLifecycleEvent {
+                worker_id: candidate.worker_id,
+                state: WorkerLifecycleState::Orphaned,
+                run_id: Some(lease.run_id.clone()),
+                lease_id: Some(lease.lease_id.clone()),
+                reason_code: "worker.ttl_expired".to_owned(),
+                timestamp_unix_ms: lease.expires_at_unix_ms,
+            });
+            recovery_activation_ids.push(candidate.recovery_activation_id);
+        }
+        Ok(WorkerLeaseExpiryPlan {
+            events,
+            recovery_activation_ids,
+            failed_closed_activation_ids: reclaim_scan.failed_closed_activation_ids,
+            reclaimed_activation_ids: reclaim_scan.reclaimed_activation_ids,
+        })
+    }
+
+    /// Applies a previously planned exact set of lease expiries.
+    ///
+    /// # Errors
+    /// Returns [`WorkerLifecycleError::ExpiryPlanConflict`] if any worker no longer holds the
+    /// lease captured by the plan. Validation completes before the first mutation.
+    pub fn apply_expired_worker_plan(
+        &mut self,
+        plan: WorkerLeaseExpiryPlan,
+    ) -> Result<Vec<WorkerLifecycleEvent>, WorkerLifecycleError> {
+        for event in &plan.events {
+            let worker = self
+                .workers
+                .get(event.worker_id.as_str())
+                .ok_or_else(|| WorkerLifecycleError::UnknownWorker(event.worker_id.clone()))?;
+            let expected_lease_id = event.lease_id.as_deref().unwrap_or_default();
+            let expected_run_id = event.run_id.as_deref().unwrap_or_default();
+            let exact_lease = worker.lease.as_ref().is_some_and(|lease| {
+                lease.lease_id == expected_lease_id && lease.run_id == expected_run_id
+            });
+            if !exact_lease {
+                return Err(WorkerLifecycleError::ExpiryPlanConflict {
+                    worker_id: event.worker_id.clone(),
+                    lease_id: expected_lease_id.to_owned(),
+                });
+            }
+        }
+
+        let mut applied_events = Vec::with_capacity(plan.events.len());
+        for (event, recovery_activation_id) in
+            plan.events.into_iter().zip(plan.recovery_activation_ids)
+        {
+            let worker = self
+                .workers
+                .get_mut(event.worker_id.as_str())
+                .ok_or_else(|| WorkerLifecycleError::UnknownWorker(event.worker_id.clone()))?;
+            worker.state = WorkerLifecycleState::Orphaned;
+            worker.lease = None;
             self.push_recent_event(event.clone());
-            if let Some(activation_id) = candidate.recovery_activation_id {
-                // `Reclaimed` is proof of a completed lease revocation. Recording it
-                // earlier would allow a failed mutation to produce false-green evidence.
+            if let Some(activation_id) = recovery_activation_id {
+                // `Reclaimed` is proof of the completed exact lease revocation.
                 self.qa_fault_probe
                     .record_recovery(activation_id.as_str(), QaFaultRecoveryClass::Reclaimed)?;
             }
-            events.push(event);
+            applied_events.push(event);
         }
-        for activation_id in reclaim_scan.failed_closed_activation_ids {
+        for activation_id in plan.failed_closed_activation_ids {
             self.qa_fault_probe
                 .record_recovery(activation_id.as_str(), QaFaultRecoveryClass::FailedClosed)?;
         }
-        for activation_id in reclaim_scan.reclaimed_activation_ids {
+        for activation_id in plan.reclaimed_activation_ids {
             self.qa_fault_probe
                 .record_recovery(activation_id.as_str(), QaFaultRecoveryClass::Reclaimed)?;
         }
-        Ok(events)
+        Ok(applied_events)
     }
 
     /// Transitions workers with stale heartbeats, returning the emitted events.
@@ -1693,7 +2006,11 @@ impl WorkerFleetManager {
                     self.workers.get_mut(candidate.worker_id.as_str()).ok_or_else(|| {
                         WorkerLifecycleError::UnknownWorker(candidate.worker_id.clone())
                     })?;
-                let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+                let (run_id, lease_id) = worker
+                    .lease
+                    .as_ref()
+                    .map(|lease| (Some(lease.run_id.clone()), Some(lease.lease_id.clone())))
+                    .unwrap_or((None, None));
                 let next_state = if worker.lease.is_some() {
                     WorkerLifecycleState::Orphaned
                 } else {
@@ -1705,6 +2022,7 @@ impl WorkerFleetManager {
                     worker_id: candidate.worker_id,
                     state: next_state,
                     run_id,
+                    lease_id,
                     reason_code: "worker.heartbeat_stale".to_owned(),
                     timestamp_unix_ms: candidate.effective_now_unix_ms,
                 }
@@ -1744,8 +2062,8 @@ impl WorkerFleetManager {
     fn stale_reclaim_candidates(
         &self,
         now_unix_ms: i64,
-        is_stale: impl Fn(&WorkerRecord, i64) -> bool,
-        is_reclaimed: impl Fn(&WorkerRecord) -> bool,
+        is_stale: impl Fn(&WorkerFleetRecord, i64) -> bool,
+        is_reclaimed: impl Fn(&WorkerFleetRecord) -> bool,
     ) -> Result<StaleReclaimScan, WorkerLifecycleError> {
         const POINT_ID: &str = "worker.stale_reclaim.before_effect";
         let mut candidates = Vec::new();
@@ -1944,6 +2262,63 @@ fn normalize_operator_reason_code(raw: &str, fallback: &str) -> String {
     }
 }
 
+fn is_bounded_worker_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && trimmed.len() <= MAX_WORKER_ID_BYTES
+        && trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
+fn is_bounded_runtime_identity(value: &str) -> bool {
+    palyra_common::runtime_contracts::RuntimeOperationId::parse(value).is_ok()
+}
+
+fn validate_durable_worker_record(
+    worker_id: &str,
+    record: &WorkerFleetRecord,
+) -> Result<(), WorkerLifecycleError> {
+    if record.attestation.worker_id != worker_id {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "durable worker key does not match attestation identity".to_owned(),
+        ));
+    }
+    if record.last_heartbeat_unix_ms < 0 {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "durable worker heartbeat timestamp is invalid".to_owned(),
+        ));
+    }
+    if let Some(lease) = record.lease.as_ref() {
+        if lease.worker_id != worker_id
+            || lease.lease_id.trim().is_empty()
+            || lease.run_id.trim().is_empty()
+            || lease.expires_at_unix_ms < 0
+        {
+            return Err(WorkerLifecycleError::InvalidLeaseRequest(
+                "durable worker lease identity is invalid".to_owned(),
+            ));
+        }
+        if !matches!(
+            record.state,
+            WorkerLifecycleState::Assigned
+                | WorkerLifecycleState::Busy
+                | WorkerLifecycleState::Degraded
+                | WorkerLifecycleState::Draining
+        ) {
+            return Err(WorkerLifecycleError::InvalidLeaseRequest(
+                "durable worker lease is incompatible with lifecycle state".to_owned(),
+            ));
+        }
+    } else if matches!(record.state, WorkerLifecycleState::Assigned | WorkerLifecycleState::Busy) {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "durable active worker state is missing its lease".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Rejects malformed lease requests before any worker state is touched.
 fn validate_lease_request(
     request: &WorkerLeaseRequest,
@@ -2017,7 +2392,7 @@ fn validate_worker_compatibility(
 }
 
 fn worker_heartbeat_is_fresh(
-    worker: &WorkerRecord,
+    worker: &WorkerFleetRecord,
     policy: &WorkerFleetPolicy,
     now_unix_ms: i64,
 ) -> bool {
@@ -2042,11 +2417,14 @@ fn qa_fault_activation_error(activation: QaFaultActivationDirective) -> WorkerLi
 /// Rejects missing or superseded leases before completion mutates worker state.
 fn validate_completion_identity(
     worker_id: &str,
-    worker: &WorkerRecord,
+    worker: &WorkerFleetRecord,
     completed: &WorkerLeaseIdentity,
+    now_unix_ms: i64,
 ) -> Result<(), WorkerLifecycleError> {
     let matches_active_lease = worker.lease.as_ref().is_some_and(|active| {
-        active.lease_id == completed.lease_id && active.run_id == completed.run_id
+        active.lease_id == completed.lease_id
+            && active.run_id == completed.run_id
+            && now_unix_ms < active.expires_at_unix_ms
     });
     if matches_active_lease {
         return Ok(());
@@ -2061,11 +2439,15 @@ fn validate_completion_identity(
 /// Applies cleanup state transitions after the caller authorizes the operation.
 fn finalize_worker_cleanup(
     worker_id: &str,
-    worker: &mut WorkerRecord,
+    worker: &mut WorkerFleetRecord,
     cleanup: WorkerCleanupReport,
     now_unix_ms: i64,
 ) -> WorkerCleanupOutcome {
-    let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+    let (run_id, lease_id) = worker
+        .lease
+        .as_ref()
+        .map(|lease| (Some(lease.run_id.clone()), Some(lease.lease_id.clone())))
+        .unwrap_or((None, None));
     let cleanup_succeeded = cleanup.is_verified();
     let event = if cleanup_succeeded {
         // Verified cleanup must not lift a fail-closed (failed/orphaned) worker
@@ -2082,6 +2464,7 @@ fn finalize_worker_cleanup(
             worker_id: worker_id.to_owned(),
             state: worker.state,
             run_id,
+            lease_id: lease_id.clone(),
             reason_code: if requires_fresh_attestation {
                 "worker.cleanup_verified_requires_reattestation".to_owned()
             } else {
@@ -2096,6 +2479,7 @@ fn finalize_worker_cleanup(
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Failed,
             run_id,
+            lease_id,
             reason_code: "worker.cleanup_failed".to_owned(),
             timestamp_unix_ms: now_unix_ms,
         }
@@ -2106,7 +2490,7 @@ fn finalize_worker_cleanup(
 /// Issues a lease on `worker` after revalidating every fail-closed assignment gate.
 fn assign_worker_record(
     worker_id: &str,
-    worker: &mut WorkerRecord,
+    worker: &mut WorkerFleetRecord,
     request: WorkerLeaseRequest,
     policy: &WorkerFleetPolicy,
     now_unix_ms: i64,
@@ -2147,6 +2531,7 @@ fn assign_worker_record(
         worker_id: worker_id.to_owned(),
         state: WorkerLifecycleState::Assigned,
         run_id: Some(lease.run_id.clone()),
+        lease_id: Some(lease.lease_id.clone()),
         reason_code: "worker.assigned".to_owned(),
         timestamp_unix_ms: now_unix_ms,
     };
@@ -2158,7 +2543,7 @@ fn assign_worker_record(
 /// Read-only mirror of the gates enforced by `assign_worker_record`, used to pick an
 /// assignment candidate without mutating worker state.
 fn worker_record_can_accept(
-    worker: &WorkerRecord,
+    worker: &WorkerFleetRecord,
     request: &WorkerLeaseRequest,
     policy: &WorkerFleetPolicy,
     now_unix_ms: i64,
@@ -2176,7 +2561,7 @@ fn worker_record_can_accept(
 /// self-reports it (both compared ASCII case-insensitively); neither side alone may
 /// widen access.
 fn worker_supports_capabilities(
-    worker: &WorkerRecord,
+    worker: &WorkerFleetRecord,
     required_capabilities: &[String],
     policy: &WorkerFleetPolicy,
 ) -> bool {

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/side-effect-fence.v1.json",
+  "title": "Palyra Side Effect Fence V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation_id", "tool_execution_id", "intent_generation", "observed_generation", "intent_sha256", "state", "semantics", "reason_code", "updated_at_unix_ms"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "operation_id": { "$ref": "#/$defs/id" },
+    "tool_execution_id": { "$ref": "#/$defs/id" },
+    "intent_generation": { "type": "integer", "minimum": 1 },
+    "observed_generation": { "type": "integer", "minimum": 1 },
+    "intent_sha256": { "$ref": "#/$defs/sha256" },
+    "state": { "enum": ["intent_recorded", "effect_started", "effect_observed", "effect_unknown", "reconciled", "abandoned"] },
+    "semantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "tool_name", "idempotency_class", "restart_policy", "reconciliation_strategy", "external_idempotency_key_required"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "tool_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "idempotency_class": { "enum": ["read_only", "deterministic_idempotent", "external_idempotency_key", "reconciliable_mutation", "non_idempotent"] },
+        "restart_policy": { "enum": ["safe_retry", "reconcile_before_retry", "require_confirmation", "never_retry"] },
+        "reconciliation_strategy": { "enum": ["none", "workspace_digest", "process_provenance", "external_idempotency_receipt", "delivery_acknowledgement", "worker_lease_receipt"] },
+        "external_idempotency_key_required": { "type": "boolean" }
+      }
+    },
+    "external_idempotency_key_sha256": { "$ref": "#/$defs/sha256" },
+    "evidence_sha256": { "$ref": "#/$defs/sha256" },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "updated_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/generation-transition.v1.json",
+  "title": "Palyra Generation Transition V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "lane",
+    "kind",
+    "reason_code",
+    "occurred_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "session_id": { "$ref": "#/$defs/id" },
+    "lane": {
+      "enum": ["run", "harness", "provider", "tool", "plugin", "worker", "process", "mcp", "delivery"]
+    },
+    "from_generation": { "type": "integer", "minimum": 1 },
+    "to_generation": { "type": "integer", "minimum": 1 },
+    "kind": {
+      "enum": [
+        "activated",
+        "steer_superseded",
+        "model_switch_superseded",
+        "crash_continuation",
+        "recovery_superseded",
+        "cancelled",
+        "released"
+      ]
+    },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "occurred_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "reason_code_bytes": 128,
+    "identity_bytes": 128
+  }
+}

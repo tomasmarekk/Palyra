@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/process-lease.v1.json",
+  "title": "Palyra Process Lease V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lease_id",
+    "instance_id",
+    "generation",
+    "pid",
+    "provenance",
+    "issued_at_unix_ms",
+    "expires_at_unix_ms",
+    "verified_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lease_id": { "$ref": "#/$defs/id" },
+    "instance_id": { "$ref": "#/$defs/id" },
+    "generation": { "type": "integer", "minimum": 1 },
+    "pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ownership_kind",
+        "start_token",
+        "executable_sha256",
+        "owner_nonce",
+        "ownership_identity_sha256"
+      ],
+      "properties": {
+        "ownership_kind": { "enum": ["unix_process_group", "windows_job_object", "remote_execution_instance"] },
+        "start_token": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "executable_sha256": { "$ref": "#/$defs/sha256" },
+        "owner_nonce": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "ownership_identity_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "issued_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "expires_at_unix_ms": { "type": "integer", "minimum": 1 },
+    "verified_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$", "maxLength": 64 }
+  },
+  "x-palyra-prohibits": ["pid_only_authority", "serialized_live_os_handles", "raw_environment_values", "serialized_pointers"]
+}

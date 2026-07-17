@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/runtime-event-envelope.v2.json",
+  "title": "Palyra Runtime Event Envelope V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "identities", "sequence", "subsystem", "phase", "event_name", "reason_code", "actor_kind", "retryability", "redaction_class", "terminal", "payload", "occurred_at_unix_ms"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "identities": { "$ref": "runtime-identity-set.v1.json" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "causal_parent_event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "subsystem": {
+      "enum": [
+        "runtime_kernel",
+        "run_stream",
+        "control_plane",
+        "auth",
+        "provider",
+        "policy",
+        "approval",
+        "tool",
+        "plugin",
+        "recovery",
+        "delivery",
+        "background_queue",
+        "session",
+        "worker",
+        "mcp",
+        "browser"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "request_validation",
+        "admission",
+        "queueing",
+        "runtime_selection",
+        "context_assembly",
+        "provider_call",
+        "provider_recovery",
+        "provider_finalization",
+        "policy_evaluation",
+        "tool_validation",
+        "tool_gate",
+        "approval",
+        "tool_execution",
+        "result_projection",
+        "compaction",
+        "verification",
+        "recovery",
+        "delivery_intent",
+        "delivery_queue",
+        "delivery_send",
+        "delivery_acknowledgement",
+        "finalization",
+        "cancellation",
+        "plugin_negotiation",
+        "plugin_host_call_authorization",
+        "plugin_execution",
+        "internal"
+      ]
+    },
+    "event_name": {
+      "enum": [
+        "runtime.generation.activated",
+        "runtime.generation.superseded",
+        "runtime.stale_event.suppressed",
+        "run.queued",
+        "run.started",
+        "harness.attempt.started",
+        "harness.attempt.completed",
+        "harness.attempt.failed",
+        "harness.attempt.cancelled",
+        "harness.attempt.cleaned_up",
+        "provider.attempt.started",
+        "provider.attempt.completed",
+        "model.delta",
+        "tool.proposed",
+        "tool.decision.recorded",
+        "tool.intent.recorded",
+        "tool.effect.started",
+        "tool.effect.observed",
+        "tool.effect.unknown",
+        "tool.effect.cleanup_reconciled",
+        "tool.effect.cleanup_unknown",
+        "tool.effect.receipt_reconciled",
+        "tool.effect.reconciled",
+        "tool.effect.abandoned",
+        "tool.result.observed",
+        "tool.attestation.observed",
+        "approval.required",
+        "approval.resolved",
+        "delivery.intent.recorded",
+        "runtime.cleanup.completed",
+        "runtime.cleanup.partial",
+        "runtime.cleanup.unknown",
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+        "runtime.backpressure.applied",
+        "runtime.compatibility.blocked"
+      ]
+    },
+    "reason_code": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9_.-]+$" },
+    "actor_kind": { "enum": ["host", "harness", "provider", "tool", "plugin", "worker", "operator"] },
+    "retryability": {
+      "enum": [
+        "not_retryable",
+        "safe_same_request",
+        "safe_after_backoff",
+        "requires_credential_refresh",
+        "requires_request_transform",
+        "requires_context_compaction",
+        "requires_provider_failover",
+        "requires_approval",
+        "requires_idempotency_guard",
+        "requires_operator_review"
+      ]
+    },
+    "redaction_class": { "enum": ["metadata_only", "hash_only", "redacted_text", "redacted_json", "artifact_reference"] },
+    "terminal": { "type": "boolean" },
+    "payload": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "metadata"], "properties": { "kind": { "const": "inline" }, "metadata": { "type": ["object", "array", "string", "number", "boolean", "null"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "artifact_id", "digest_sha256", "size_bytes"], "properties": { "kind": { "const": "artifact" }, "artifact_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "digest_sha256": { "$ref": "#/$defs/sha256" }, "size_bytes": { "type": "integer", "minimum": 1 } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "reason_code", "size_bytes"], "properties": { "kind": { "const": "omitted" }, "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 }, "digest_sha256": { "$ref": "#/$defs/sha256" }, "size_bytes": { "type": "integer", "minimum": 0 } } }
+      ]
+    },
+    "occurred_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "extensions": {
+      "type": "object",
+      "maxProperties": 16,
+      "properties": {
+        "legacy_identity_adapter": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "reason_code", "missing_fields"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "reason_code": {
+              "const": "runtime.identity.legacy_adapter_used"
+            },
+            "missing_fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z0-9_.-]+$"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "harness.attempt.started",
+              "harness.attempt.completed",
+              "harness.attempt.failed",
+              "harness.attempt.cancelled",
+              "harness.attempt.cleaned_up",
+              "provider.attempt.started",
+              "provider.attempt.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["attempt_id"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "tool.proposed",
+              "tool.decision.recorded"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["tool_proposal_id"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "approval.required",
+              "approval.resolved"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["tool_proposal_id", "approval_subject_id"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "tool.intent.recorded",
+              "tool.effect.started",
+              "tool.effect.observed",
+              "tool.effect.unknown",
+              "tool.effect.cleanup_reconciled",
+              "tool.effect.cleanup_unknown",
+              "tool.effect.receipt_reconciled",
+              "tool.effect.reconciled",
+              "tool.effect.abandoned"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["tool_execution_id", "operation_id"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "tool.result.observed",
+              "tool.attestation.observed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["tool_proposal_id", "tool_execution_id", "operation_id"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["event_name"],
+        "properties": {
+          "event_name": {
+            "enum": [
+              "delivery.intent.recorded"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identities": {
+            "required": ["delivery_intent_id", "operation_id"]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": { "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" } },
+  "x-palyra-limits": { "max_inline_metadata_bytes": 8192, "max_extension_fields": 16 }
+}

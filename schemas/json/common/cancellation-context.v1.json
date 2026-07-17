@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/cancellation-context.v1.json",
+  "title": "Palyra Cancellation Context V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scope_id",
+    "scope",
+    "generation",
+    "graceful_settle_ms",
+    "hard_abort_after_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "scope_id": { "$ref": "#/$defs/id" },
+    "scope": {
+      "enum": ["run", "provider_attempt", "tool_execution", "approval_wait", "child_task", "process", "delivery"]
+    },
+    "generation": { "type": "integer", "minimum": 1 },
+    "parent_scope_id": { "$ref": "#/$defs/id" },
+    "reason": {
+      "enum": [
+        "user_cancel",
+        "steer_supersede",
+        "daemon_drain",
+        "deadline_exceeded",
+        "resource_eviction",
+        "generation_superseded",
+        "parent_cancelled"
+      ]
+    },
+    "deadline_unix_ms": { "type": "integer", "minimum": 0 },
+    "graceful_settle_ms": { "type": "integer", "minimum": 0 },
+    "hard_abort_after_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+  },
+  "x-palyra-limits": {
+    "identity_bytes": 128,
+    "channel_capacity_max": 65536
+  }
+}
