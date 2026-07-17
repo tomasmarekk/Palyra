@@ -17,6 +17,7 @@
 //! stream regardless of whether the upstream transport is streaming or
 //! response-body based.
 use std::{
+    any::Any,
     collections::{hash_map::DefaultHasher, HashMap},
     fs,
     future::Future,
@@ -28,11 +29,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use palyra_common::qa_runtime_path::{
-    qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256, qa_provider_binding_sha256,
-    ProviderLaneAttestationEvent, ProviderLiveBindingMetadata, PROVIDER_LANE_ATTESTATION_EVENT,
-    PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION, QA_PROVIDER_FIXTURE_MATERIALIZATION,
-    QA_PROVIDER_LIVE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+use palyra_common::{
+    qa_runtime_path::{
+        qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
+        qa_provider_binding_sha256, ProviderLaneAttestationEvent, ProviderLiveBindingMetadata,
+        PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION,
+        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_LIVE_MATERIALIZATION,
+        QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+    },
+    runtime_contracts::{RuntimeAttemptId, RuntimeGeneration, RuntimeInstanceId},
 };
 use reqwest::{header::RETRY_AFTER, Client, Response};
 use serde::{Deserialize, Serialize};
@@ -522,6 +527,351 @@ fn provider_route_reason(
     }
 }
 
+/// Provider/model/credential identity for one concrete registry candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAttemptBinding {
+    pub attempt_id: RuntimeAttemptId,
+    pub provider_id: String,
+    pub credential_id: String,
+    pub model_id: String,
+    pub health_authority: ProviderAttemptHealthAuthority,
+}
+
+/// Opaque generation authority held from provider effect start through completion.
+pub trait ProviderAttemptRuntimeAuthority: Send {
+    /// Exposes the concrete host authority to the admission implementation that created it.
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Send + Any> ProviderAttemptRuntimeAuthority for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Future returned while persisting exact provider-attempt start authority.
+pub type ProviderAttemptStartFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Box<dyn ProviderAttemptRuntimeAuthority>,
+                    ProviderAttemptAdmissionError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Result of settling canonical completion evidence for one exact attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAttemptCompletionDisposition {
+    /// Canonical completion evidence was appended by this call.
+    Appended,
+    /// Matching canonical completion evidence already existed.
+    AlreadyAppended,
+    /// The attempt no longer owns current runtime authority.
+    StaleSuppressed,
+}
+
+/// Future returned while settling exact provider-attempt completion evidence.
+pub type ProviderAttemptCompletionFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    ProviderAttemptCompletionDisposition,
+                    ProviderAttemptAdmissionError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Exact durable health authority assigned to one provider candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAttemptHealthAuthority {
+    pub component_id: RuntimeInstanceId,
+    pub generation: RuntimeGeneration,
+}
+
+/// Exact host-selected provider candidate for a non-mutating health probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHealthProbeTarget {
+    pub provider_id: String,
+    pub credential_id: String,
+    pub model_id: String,
+    pub role: ProviderModelRole,
+}
+
+/// Host admission failure for one concrete provider candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAttemptAdmissionError {
+    RuntimeAuthority {
+        safe_message: String,
+        reason_code: String,
+        retryable: bool,
+    },
+    Deferred {
+        safe_message: String,
+        retry_after_ms: Option<u64>,
+    },
+    TimedOut {
+        safe_message: String,
+        waited_ms: u64,
+        retry_after_ms: Option<u64>,
+    },
+    HealthBlocked {
+        safe_message: String,
+        reason_code: String,
+        retry_after_ms: Option<u64>,
+        operator_action_required: bool,
+    },
+}
+
+impl ProviderAttemptAdmissionError {
+    fn reason_code(&self) -> &str {
+        match self {
+            Self::RuntimeAuthority { reason_code, .. } => reason_code.as_str(),
+            Self::Deferred { .. } => "provider_attempt_admission_deferred",
+            Self::TimedOut { .. } => "provider_attempt_admission_timed_out",
+            Self::HealthBlocked { reason_code, .. } => reason_code.as_str(),
+        }
+    }
+
+    fn safe_message(&self) -> &str {
+        match self {
+            Self::RuntimeAuthority { safe_message, .. }
+            | Self::Deferred { safe_message, .. }
+            | Self::TimedOut { safe_message, .. }
+            | Self::HealthBlocked { safe_message, .. } => safe_message,
+        }
+    }
+
+    fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            Self::RuntimeAuthority { .. } => None,
+            Self::Deferred { retry_after_ms, .. }
+            | Self::TimedOut { retry_after_ms, .. }
+            | Self::HealthBlocked { retry_after_ms, .. } => *retry_after_ms,
+        }
+    }
+
+    fn final_disposition(&self) -> &'static str {
+        match self {
+            Self::RuntimeAuthority { .. } => "runtime_authority_unavailable",
+            Self::Deferred { .. } => "lease_deferred",
+            Self::TimedOut { .. } => "lease_timed_out",
+            Self::HealthBlocked { operator_action_required: true, .. } => {
+                "health_operator_action_required"
+            }
+            Self::HealthBlocked { .. } => "health_blocked",
+        }
+    }
+
+    fn error_class(&self) -> &'static str {
+        match self {
+            Self::RuntimeAuthority { .. } => "runtime_authority",
+            Self::Deferred { .. } | Self::TimedOut { .. } => "provider_capacity",
+            Self::HealthBlocked { .. } => "provider_health",
+        }
+    }
+
+    fn repair_hint(&self) -> String {
+        match self {
+            Self::RuntimeAuthority { .. } => {
+                "provider runtime authority is unavailable; retry under the current run generation"
+                    .to_owned()
+            }
+            Self::TimedOut { waited_ms, .. } => format!(
+                "provider capacity remained unavailable for {waited_ms} ms; wait or select another admitted candidate"
+            ),
+            Self::Deferred { .. } => {
+                "provider capacity deferred this candidate; wait or select another admitted candidate"
+                    .to_owned()
+            }
+            Self::HealthBlocked { operator_action_required: true, .. } => {
+                "provider candidate health requires an authorized operator probe or clear; select another admitted candidate"
+                    .to_owned()
+            }
+            Self::HealthBlocked { .. } => {
+                "provider candidate is not health-admitted; wait for a bounded non-mutating probe or select another admitted candidate"
+                    .to_owned()
+            }
+        }
+    }
+
+    fn retryable(&self) -> bool {
+        match self {
+            Self::RuntimeAuthority { retryable, .. } => *retryable,
+            Self::HealthBlocked {
+                operator_action_required: true, retry_after_ms: None, ..
+            } => false,
+            Self::Deferred { .. } | Self::TimedOut { .. } | Self::HealthBlocked { .. } => true,
+        }
+    }
+}
+
+/// Opaque RAII permit held while one concrete provider candidate executes.
+pub trait ProviderAttemptPermit: Send {}
+
+impl<T: Send> ProviderAttemptPermit for T {}
+
+pub type ProviderAttemptPermitFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Box<dyn ProviderAttemptPermit>, ProviderAttemptAdmissionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Host-owned admission and feedback boundary around registry candidate calls.
+pub trait ProviderAttemptAdmission: Send + Sync {
+    /// Binds one candidate to the exact health authority captured for this provider swap.
+    fn bind_attempt(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        model_id: &str,
+    ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError>;
+
+    /// Checks candidate eligibility before consulting the response cache.
+    ///
+    /// This gate must not acquire scarce capacity or begin an external effect. It
+    /// exists so quarantine, disablement, cooldown, and probe requirements also
+    /// apply to cached responses.
+    fn check_eligibility(
+        &self,
+        binding: &ProviderAttemptBinding,
+    ) -> Result<(), ProviderAttemptAdmissionError>;
+
+    /// Acquires effect authority for one concrete provider/credential candidate.
+    fn acquire<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+    ) -> ProviderAttemptPermitFuture<'a>;
+
+    /// Persists exact generation authority immediately before the external effect.
+    fn record_started<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+    ) -> ProviderAttemptStartFuture<'a>;
+
+    /// Settles a successful provider call before any cache, metric, or feedback mutation.
+    fn record_success<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+        authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+    ) -> ProviderAttemptCompletionFuture<'a>;
+
+    /// Settles a failed provider call before registry failover selects another candidate.
+    fn record_failure<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+        authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+        error: &'a ProviderError,
+    ) -> ProviderAttemptCompletionFuture<'a>;
+}
+
+/// Read-only host admission exposed to one fixed provider health probe.
+///
+/// This capability intentionally omits capacity acquisition and completion
+/// feedback, so a probe implementation cannot mutate ordinary provider health,
+/// credential cooldown, or auth-profile state.
+pub trait ProviderProbeAdmission: Send + Sync {
+    /// Binds the fixed probe target to the exact captured provider health authority.
+    fn bind_probe(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        model_id: &str,
+    ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError>;
+
+    /// Checks the exact host-issued non-mutating probe lease before the effect.
+    fn check_probe_eligibility(
+        &self,
+        binding: &ProviderAttemptBinding,
+    ) -> Result<(), ProviderAttemptAdmissionError>;
+}
+
+struct UnrestrictedProviderAttemptAdmission;
+
+impl ProviderAttemptAdmission for UnrestrictedProviderAttemptAdmission {
+    fn bind_attempt(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        model_id: &str,
+    ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
+        let component_id = RuntimeInstanceId::parse(
+            format!("provider:{}", provider_id.trim().to_ascii_lowercase()).as_str(),
+        )
+        .map_err(|_| ProviderAttemptAdmissionError::HealthBlocked {
+            safe_message: "provider candidate health identity is invalid".to_owned(),
+            reason_code: "provider_attempt_admission_health_invalid".to_owned(),
+            retry_after_ms: None,
+            operator_action_required: true,
+        })?;
+        let generation = RuntimeGeneration::new(1).map_err(|_| {
+            ProviderAttemptAdmissionError::HealthBlocked {
+                safe_message: "provider candidate health generation is invalid".to_owned(),
+                reason_code: "provider_attempt_admission_health_generation_invalid".to_owned(),
+                retry_after_ms: None,
+                operator_action_required: true,
+            }
+        })?;
+        Ok(ProviderAttemptBinding {
+            attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str()).map_err(
+                |_| ProviderAttemptAdmissionError::RuntimeAuthority {
+                    safe_message: "provider attempt identity is invalid".to_owned(),
+                    reason_code: "provider_attempt_identity_invalid".to_owned(),
+                    retryable: false,
+                },
+            )?,
+            provider_id: provider_id.to_owned(),
+            credential_id: credential_id.to_owned(),
+            model_id: model_id.to_owned(),
+            health_authority: ProviderAttemptHealthAuthority { component_id, generation },
+        })
+    }
+
+    fn check_eligibility(
+        &self,
+        _binding: &ProviderAttemptBinding,
+    ) -> Result<(), ProviderAttemptAdmissionError> {
+        Ok(())
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+    ) -> ProviderAttemptPermitFuture<'a> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptPermit>) })
+    }
+
+    fn record_started<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+    ) -> ProviderAttemptStartFuture<'a> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptRuntimeAuthority>) })
+    }
+
+    fn record_success<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+        _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+    ) -> ProviderAttemptCompletionFuture<'a> {
+        Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+    }
+
+    fn record_failure<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+        _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+        _error: &'a ProviderError,
+    ) -> ProviderAttemptCompletionFuture<'a> {
+        Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+    }
+}
+
 /// Runtime contract every chat-capable model backend implements.
 ///
 /// Implementations own their retry, circuit-breaker, and metrics policies;
@@ -540,6 +890,83 @@ pub trait ModelProvider: Send + Sync {
         &'a self,
         request: ProviderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>;
+
+    /// Whether this provider can acquire authority independently for every
+    /// internal registry candidate, including failover candidates.
+    fn uses_candidate_attempt_admission(&self) -> bool {
+        false
+    }
+
+    /// Completes a request with host-owned admission around each concrete
+    /// registry candidate. Providers without internal candidate routing use
+    /// the default implementation and remain guarded by the caller's outer lease.
+    fn complete_with_attempt_admission<'a>(
+        &'a self,
+        request: ProviderRequest,
+        _admission: Arc<dyn ProviderAttemptAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        self.complete(request)
+    }
+
+    /// Executes exactly one chat request for a host-owned probe.
+    ///
+    /// Registry HTTP backends override this to bypass ordinary retry and circuit
+    /// mutation. Other providers fail closed unless their probe path handles the
+    /// backend explicitly.
+    fn probe_chat_once<'a>(
+        &'a self,
+        _request: ProviderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async {
+            Err(ProviderError::RequestFailed {
+                message: "model provider does not expose a single-attempt chat probe".to_owned(),
+                retryable: false,
+                retry_count: 0,
+                classification: fail_closed_provider_classification(
+                    "provider_health_probe_chat_unsupported",
+                ),
+            })
+        })
+    }
+
+    /// Executes exactly one audio request for a host-owned probe.
+    fn probe_audio_once<'a>(
+        &'a self,
+        _request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async {
+            Err(ProviderError::RequestFailed {
+                message: "model provider does not expose a single-attempt audio probe".to_owned(),
+                retryable: false,
+                retry_count: 0,
+                classification: fail_closed_provider_classification(
+                    "provider_health_probe_audio_unsupported",
+                ),
+            })
+        })
+    }
+
+    /// Executes one fixed host-owned non-mutating readiness probe.
+    ///
+    /// The request contains no caller prompt, model override, or tool catalog. Registry
+    /// providers override this method so the probe targets exactly one bound candidate.
+    fn probe_with_attempt_admission<'a>(
+        &'a self,
+        _target: ProviderHealthProbeTarget,
+        _admission: Arc<dyn ProviderProbeAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async {
+            Err(ProviderError::RequestFailed {
+                message: "model provider does not expose a host-owned health probe".to_owned(),
+                retryable: false,
+                retry_count: 0,
+                classification: fail_closed_provider_classification(
+                    "provider_health_probe_unsupported",
+                ),
+            })
+        })
+    }
+
     /// Transcribes an audio payload with the provider's transcription model.
     ///
     /// # Errors
@@ -549,6 +976,19 @@ pub trait ModelProvider: Send + Sync {
         &'a self,
         request: AudioTranscriptionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>;
+
+    /// Transcribes audio with host-owned admission around the exact registry candidate.
+    ///
+    /// Providers without internal registry routing use the default implementation;
+    /// their caller must enforce an outer provider health and capacity gate.
+    fn transcribe_audio_with_attempt_admission<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+        _admission: Arc<dyn ProviderAttemptAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        self.transcribe_audio(request)
+    }
     /// Returns the current status snapshot for console/diagnostics surfaces.
     fn status_snapshot(&self) -> ProviderStatusSnapshot;
 }
@@ -878,6 +1318,66 @@ fn provider_attempt_skipped_state(
     }
 }
 
+fn provider_attempt_admission_state(
+    attempt_index: usize,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+    error: &ProviderAttemptAdmissionError,
+    observed_at_unix_ms: i64,
+) -> ProviderAttemptState {
+    let retry_after_ms = error.retry_after_ms();
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: runtime.entry.provider_id.clone(),
+        credential_id: registry_provider_credential_id(&runtime.entry),
+        model_id: model.model_id.clone(),
+        error_class: Some(error.error_class().to_owned()),
+        retry_after_ms,
+        cooldown_until_unix_ms: retry_after_ms.map(|value| {
+            observed_at_unix_ms.saturating_add(i64::try_from(value).unwrap_or(i64::MAX))
+        }),
+        prompt_tokens: 0,
+        output_tokens: 0,
+        cache_tokens: 0,
+        estimated_cost_microusd: None,
+        final_disposition: error.final_disposition().to_owned(),
+        repair_hint: Some(error.repair_hint()),
+    }
+}
+
+/// Maps a host admission denial into the provider-neutral failure contract.
+pub(crate) fn provider_attempt_admission_provider_error(
+    error: ProviderAttemptAdmissionError,
+) -> ProviderError {
+    let classification = if error.retryable() {
+        retry_provider_classification(error.reason_code())
+    } else {
+        fail_closed_provider_classification(error.reason_code())
+    }
+    .with_retry_after_ms(error.retry_after_ms());
+    ProviderError::RequestFailed {
+        message: error.safe_message().to_owned(),
+        retryable: error.retryable(),
+        retry_count: 0,
+        classification,
+    }
+}
+
+/// Builds the internal retry signal used when durable attempt authority becomes stale.
+pub(crate) fn provider_attempt_superseded_error() -> ProviderError {
+    ProviderError::RequestFailed {
+        message: "provider attempt completion was suppressed after runtime supersession".to_owned(),
+        retryable: true,
+        retry_count: 0,
+        classification: retry_provider_classification("provider_attempt_runtime_superseded"),
+    }
+}
+
+/// Returns whether a provider error is the host-only stale-attempt retry signal.
+pub(crate) fn is_provider_attempt_superseded_error(error: &ProviderError) -> bool {
+    error.classification().provider_detail.as_deref() == Some("provider_attempt_runtime_superseded")
+}
+
 fn rebind_provider_attempts(
     attempts: &mut [ProviderAttemptSummary],
     attempt_offset: usize,
@@ -924,6 +1424,27 @@ fn provider_failure_blocks_credential(failure: &ProviderFailureSnapshot) -> bool
     matches!(failure.recovery.category.as_str(), "auth" | "rate_limit" | "quota")
 }
 
+fn silent_wav_probe_bytes() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8_000;
+    const DATA_BYTES: u32 = 160;
+    const WAV_BYTES: usize = 204;
+    let mut bytes = Vec::with_capacity(WAV_BYTES);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + DATA_BYTES).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&DATA_BYTES.to_le_bytes());
+    bytes.resize(WAV_BYTES, 0);
+    bytes
+}
+
 #[derive(Debug, Clone)]
 struct CachedProviderResponse {
     inserted_seq: u64,
@@ -955,12 +1476,24 @@ impl RegistryBackedModelProvider {
     fn new(config: ModelProviderConfig) -> Result<Self> {
         let registry = config.normalized_registry()?;
         let mut providers = HashMap::new();
-        let mut default_models_by_provider = HashMap::<String, String>::new();
+        let mut default_chat_models_by_provider = HashMap::<String, String>::new();
+        let mut audio_models_by_provider = HashMap::<String, String>::new();
         for model in &registry.models {
-            if model.role == ProviderModelRole::Chat && model.enabled {
-                default_models_by_provider
-                    .entry(model.provider_id.clone())
-                    .or_insert_with(|| model.model_id.clone());
+            if !model.enabled {
+                continue;
+            }
+            match model.role {
+                ProviderModelRole::Chat => {
+                    default_chat_models_by_provider
+                        .entry(model.provider_id.clone())
+                        .or_insert_with(|| model.model_id.clone());
+                }
+                ProviderModelRole::AudioTranscription => {
+                    audio_models_by_provider
+                        .entry(model.provider_id.clone())
+                        .or_insert_with(|| model.model_id.clone());
+                }
+                ProviderModelRole::Embeddings => {}
             }
         }
         for entry in &registry.providers {
@@ -968,7 +1501,8 @@ impl RegistryBackedModelProvider {
                 &config,
                 &registry,
                 entry,
-                default_models_by_provider.get(entry.provider_id.as_str()).cloned(),
+                default_chat_models_by_provider.get(entry.provider_id.as_str()).cloned(),
+                audio_models_by_provider.get(entry.provider_id.as_str()).cloned(),
             )?;
             providers.insert(
                 entry.provider_id.clone(),
@@ -1414,6 +1948,21 @@ impl ModelProvider for RegistryBackedModelProvider {
         &'a self,
         request: ProviderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        self.complete_with_attempt_admission(
+            request,
+            Arc::new(UnrestrictedProviderAttemptAdmission),
+        )
+    }
+
+    fn uses_candidate_attempt_admission(&self) -> bool {
+        true
+    }
+
+    fn complete_with_attempt_admission<'a>(
+        &'a self,
+        request: ProviderRequest,
+        admission: Arc<dyn ProviderAttemptAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             let started_at = Instant::now();
             let candidates = match self.candidate_order(&request) {
@@ -1460,6 +2009,63 @@ impl ModelProvider for RegistryBackedModelProvider {
                     }
                     break;
                 }
+                let binding = match admission.bind_attempt(
+                    model.provider_id.as_str(),
+                    credential_id.as_str(),
+                    model.model_id.as_str(),
+                ) {
+                    Ok(binding) => binding,
+                    Err(admission_error) => {
+                        let state = provider_attempt_admission_state(
+                            index,
+                            model,
+                            runtime,
+                            &admission_error,
+                            current_unix_ms().unwrap_or_default(),
+                        );
+                        attempts.push(provider_attempt_summary(
+                            model.provider_id.clone(),
+                            model.model_id.clone(),
+                            "skipped",
+                            true,
+                            false,
+                            Some(admission_error.reason_code().to_owned()),
+                            Some(state),
+                        ));
+                        last_error =
+                            Some(provider_attempt_admission_provider_error(admission_error));
+                        if index + 1 < candidates.len() {
+                            failover_count = failover_count.saturating_add(1);
+                            continue;
+                        }
+                        break;
+                    }
+                };
+                if let Err(admission_error) = admission.check_eligibility(&binding) {
+                    let state = provider_attempt_admission_state(
+                        index,
+                        model,
+                        runtime,
+                        &admission_error,
+                        current_unix_ms().unwrap_or_default(),
+                    );
+                    attempts.push(provider_attempt_summary(
+                        model.provider_id.clone(),
+                        model.model_id.clone(),
+                        "skipped",
+                        true,
+                        false,
+                        Some(admission_error.reason_code().to_owned()),
+                        Some(state),
+                    ));
+                    last_error = Some(provider_attempt_admission_provider_error(admission_error));
+                    if index + 1 < candidates.len() {
+                        failover_count = failover_count.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+
                 let cache_key = self.response_cache_key(&request, model);
                 if let Some(mut cached) =
                     self.lookup_cached_response(cache_key.as_str(), model, runtime)
@@ -1485,10 +2091,51 @@ impl ModelProvider for RegistryBackedModelProvider {
                     return Ok(cached);
                 }
 
+                let _permit = match admission.acquire(&binding).await {
+                    Ok(permit) => permit,
+                    Err(admission_error) => {
+                        let state = provider_attempt_admission_state(
+                            index,
+                            model,
+                            runtime,
+                            &admission_error,
+                            current_unix_ms().unwrap_or_default(),
+                        );
+                        attempts.push(provider_attempt_summary(
+                            model.provider_id.clone(),
+                            model.model_id.clone(),
+                            "skipped",
+                            true,
+                            false,
+                            Some(admission_error.reason_code().to_owned()),
+                            Some(state),
+                        ));
+                        last_error =
+                            Some(provider_attempt_admission_provider_error(admission_error));
+                        if index + 1 < candidates.len() {
+                            failover_count = failover_count.saturating_add(1);
+                            continue;
+                        }
+                        break;
+                    }
+                };
+
+                let runtime_authority = admission
+                    .record_started(&binding)
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
                 let mut provider_request = request.clone();
                 provider_request.model_override = Some(model.model_id.clone());
                 match runtime.provider.complete(provider_request).await {
                     Ok(mut response) => {
+                        if admission
+                            .record_success(&binding, runtime_authority)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
                         response.provider_id = model.provider_id.clone();
                         response.model_id = model.model_id.clone();
                         response.qa_lane_attestation = qa_registry_provider_lane_attestation(
@@ -1550,6 +2197,14 @@ impl ModelProvider for RegistryBackedModelProvider {
                         return Ok(response);
                     }
                     Err(error) => {
+                        if admission
+                            .record_failure(&binding, runtime_authority, &error)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
                         // Missing-credential errors count as retryable in the
                         // attempt record: the failure is provider-local and a
                         // failover candidate with its own credential can still
@@ -1561,6 +2216,12 @@ impl ModelProvider for RegistryBackedModelProvider {
                                 | ProviderError::MissingApiKey
                                 | ProviderError::MissingAnthropicApiKey
                         );
+                        let failover_allowed = retryable
+                            || matches!(
+                                error.classification().recommended_action,
+                                ProviderFailureAction::ProviderFailover
+                                    | ProviderFailureAction::RotateCredential
+                            );
                         let failure = error.failure_snapshot();
                         let state = provider_attempt_error_state(
                             index,
@@ -1585,10 +2246,11 @@ impl ModelProvider for RegistryBackedModelProvider {
                             blocked_credentials.insert(state.credential_id.clone(), state);
                         }
                         last_error = Some(error);
-                        if index + 1 < candidates.len() {
+                        if failover_allowed && index + 1 < candidates.len() {
                             failover_count = failover_count.saturating_add(1);
                             continue;
                         }
+                        break;
                     }
                 }
             }
@@ -1606,9 +2268,123 @@ impl ModelProvider for RegistryBackedModelProvider {
         })
     }
 
+    fn probe_with_attempt_admission<'a>(
+        &'a self,
+        target: ProviderHealthProbeTarget,
+        admission: Arc<dyn ProviderProbeAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let model = self
+                .models
+                .get(target.model_id.as_str())
+                .filter(|model| {
+                    model.enabled
+                        && model.provider_id == target.provider_id
+                        && model.role == target.role
+                })
+                .ok_or_else(|| ProviderError::RequestFailed {
+                    message: "provider health probe target is unavailable".to_owned(),
+                    retryable: false,
+                    retry_count: 0,
+                    classification: fail_closed_provider_classification(
+                        "provider_health_probe_target_unavailable",
+                    ),
+                })?;
+            let runtime = self
+                .providers
+                .get(model.provider_id.as_str())
+                .filter(|runtime| runtime.entry.enabled)
+                .ok_or_else(|| ProviderError::RequestFailed {
+                    message: "provider health probe target is disabled".to_owned(),
+                    retryable: false,
+                    retry_count: 0,
+                    classification: fail_closed_provider_classification(
+                        "provider_health_probe_target_disabled",
+                    ),
+                })?;
+            let credential_id = registry_provider_credential_id(&runtime.entry);
+            if credential_id != target.credential_id {
+                return Err(ProviderError::RequestFailed {
+                    message: "provider health probe credential binding is stale".to_owned(),
+                    retryable: false,
+                    retry_count: 0,
+                    classification: fail_closed_provider_classification(
+                        "provider_health_probe_credential_mismatch",
+                    ),
+                });
+            }
+            let binding = admission
+                .bind_probe(
+                    model.provider_id.as_str(),
+                    credential_id.as_str(),
+                    model.model_id.as_str(),
+                )
+                .map_err(provider_attempt_admission_provider_error)?;
+            admission
+                .check_probe_eligibility(&binding)
+                .map_err(provider_attempt_admission_provider_error)?;
+            match target.role {
+                ProviderModelRole::Chat => {
+                    let mut request = ProviderRequest::from_input_text(
+                        "Respond with OK.".to_owned(),
+                        false,
+                        Vec::new(),
+                        Some(model.model_id.clone()),
+                    );
+                    request.max_output_tokens = Some(8);
+                    match runtime.entry.kind {
+                        ModelProviderKind::OpenAiCompatible | ModelProviderKind::Anthropic => {
+                            runtime.provider.probe_chat_once(request).await
+                        }
+                        ModelProviderKind::Deterministic => {
+                            runtime.provider.complete(request).await.map(|_| ())
+                        }
+                    }
+                }
+                ProviderModelRole::AudioTranscription => {
+                    let request = AudioTranscriptionRequest {
+                        file_name: "probe.wav".to_owned(),
+                        content_type: "audio/wav".to_owned(),
+                        bytes: silent_wav_probe_bytes(),
+                        prompt: None,
+                        language: None,
+                    };
+                    match runtime.entry.kind {
+                        ModelProviderKind::OpenAiCompatible => {
+                            runtime.provider.probe_audio_once(request).await
+                        }
+                        ModelProviderKind::Anthropic | ModelProviderKind::Deterministic => {
+                            runtime.provider.transcribe_audio(request).await.map(|_| ())
+                        }
+                    }
+                }
+                ProviderModelRole::Embeddings => Err(ProviderError::RequestFailed {
+                    message: "provider health probe target role is unsupported".to_owned(),
+                    retryable: false,
+                    retry_count: 0,
+                    classification: fail_closed_provider_classification(
+                        "provider_health_probe_role_unsupported",
+                    ),
+                }),
+            }
+        })
+    }
+
     fn transcribe_audio<'a>(
         &'a self,
         request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        self.transcribe_audio_with_attempt_admission(
+            request,
+            Arc::new(UnrestrictedProviderAttemptAdmission),
+        )
+    }
+
+    fn transcribe_audio_with_attempt_admission<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+        admission: Arc<dyn ProviderAttemptAdmission>,
     ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -1629,7 +2405,49 @@ impl ModelProvider for RegistryBackedModelProvider {
                 .providers
                 .get(model.provider_id.as_str())
                 .ok_or(ProviderError::StatePoisoned)?;
-            runtime.provider.transcribe_audio(request).await
+            let credential_id = registry_provider_credential_id(&runtime.entry);
+            let binding = admission
+                .bind_attempt(
+                    model.provider_id.as_str(),
+                    credential_id.as_str(),
+                    model.model_id.as_str(),
+                )
+                .map_err(provider_attempt_admission_provider_error)?;
+            admission
+                .check_eligibility(&binding)
+                .map_err(provider_attempt_admission_provider_error)?;
+            let _permit = admission
+                .acquire(&binding)
+                .await
+                .map_err(provider_attempt_admission_provider_error)?;
+            let runtime_authority = admission
+                .record_started(&binding)
+                .await
+                .map_err(provider_attempt_admission_provider_error)?;
+            match runtime.provider.transcribe_audio(request).await {
+                Ok(response) => {
+                    if admission
+                        .record_success(&binding, runtime_authority)
+                        .await
+                        .map_err(provider_attempt_admission_provider_error)?
+                        == ProviderAttemptCompletionDisposition::StaleSuppressed
+                    {
+                        return Err(provider_attempt_superseded_error());
+                    }
+                    Ok(response)
+                }
+                Err(error) => {
+                    if admission
+                        .record_failure(&binding, runtime_authority, &error)
+                        .await
+                        .map_err(provider_attempt_admission_provider_error)?
+                        == ProviderAttemptCompletionDisposition::StaleSuppressed
+                    {
+                        return Err(provider_attempt_superseded_error());
+                    }
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -1986,6 +2804,7 @@ fn build_registry_provider_runtime(
     registry: &ModelProviderRegistryConfig,
     entry: &ProviderRegistryEntryConfig,
     default_chat_model_id: Option<String>,
+    audio_transcription_model_id: Option<String>,
 ) -> Result<Arc<dyn ModelProvider>> {
     let mut config = ModelProviderConfig {
         kind: entry.kind,
@@ -2000,6 +2819,7 @@ fn build_registry_provider_runtime(
         allow_private_base_url: entry.allow_private_base_url,
         openai_model: default_chat_model_id
             .clone()
+            .or_else(|| audio_transcription_model_id.clone())
             .unwrap_or_else(|| base_config.openai_model.clone()),
         anthropic_model: default_chat_model_id
             .clone()
@@ -2067,7 +2887,10 @@ fn build_registry_provider_runtime(
                     None
                 }
             });
-            Ok(Arc::new(OpenAiCompatibleProvider::new(&config)?) as Arc<dyn ModelProvider>)
+            Ok(Arc::new(OpenAiCompatibleProvider::new_with_audio_transcription_model(
+                &config,
+                audio_transcription_model_id,
+            )?) as Arc<dyn ModelProvider>)
         }
         ModelProviderKind::Anthropic => {
             config.anthropic_api_key = entry.api_key.clone().or_else(|| {
@@ -2989,6 +3812,7 @@ impl EmbeddingsProvider for DeterministicEmbeddingsProvider {
 #[derive(Debug)]
 struct OpenAiCompatibleProvider {
     config: ModelProviderConfig,
+    audio_transcription_model_id: Option<String>,
     client: Client,
     circuit_state: Mutex<CircuitBreakerState>,
     runtime_metrics: Mutex<ProviderRuntimeMetrics>,
@@ -3018,6 +3842,23 @@ impl AttemptError {
         classification: ProviderFailureClassification,
     ) -> Self {
         Self { message, retryable, invalid_response: false, classification }
+    }
+
+    fn into_provider_error(self, retry_count: u32) -> ProviderError {
+        if self.invalid_response {
+            ProviderError::InvalidResponse {
+                message: self.message,
+                retry_count,
+                classification: self.classification,
+            }
+        } else {
+            ProviderError::RequestFailed {
+                message: self.message,
+                retryable: self.retryable,
+                retry_count,
+                classification: self.classification,
+            }
+        }
     }
 
     fn invalid_response(message: String, provider_detail: &str) -> Self {
@@ -3525,13 +4366,22 @@ impl EmbeddingsProvider for OpenAiCompatibleEmbeddingsProvider {
 }
 
 impl OpenAiCompatibleProvider {
+    #[cfg(test)]
     fn new(config: &ModelProviderConfig) -> Result<Self> {
+        Self::new_with_audio_transcription_model(config, None)
+    }
+
+    fn new_with_audio_transcription_model(
+        config: &ModelProviderConfig,
+        audio_transcription_model_id: Option<String>,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_millis(config.request_timeout_ms))
             .build()
             .context("failed to build openai-compatible provider HTTP client")?;
         Ok(Self {
             config: config.clone(),
+            audio_transcription_model_id,
             client,
             circuit_state: Mutex::new(CircuitBreakerState {
                 consecutive_failures: 0,
@@ -3539,6 +4389,25 @@ impl OpenAiCompatibleProvider {
             }),
             runtime_metrics: Mutex::new(ProviderRuntimeMetrics::default()),
         })
+    }
+
+    async fn complete_probe_once(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        let api_key = self.config.openai_api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
+        self.request_once(api_key.as_str(), request)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.into_provider_error(0))
+    }
+
+    async fn transcribe_probe_once(
+        &self,
+        request: &AudioTranscriptionRequest,
+    ) -> Result<(), ProviderError> {
+        let api_key = self.config.openai_api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
+        self.transcribe_audio_once(api_key.as_str(), request)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.into_provider_error(0))
     }
 
     fn record_runtime_metrics(
@@ -3630,8 +4499,12 @@ impl OpenAiCompatibleProvider {
     }
 
     fn transcription_model_name(&self) -> Option<&str> {
-        configured_model_id(self.config.openai_model.as_str())
-            .filter(|model_id| model_id.contains("transcribe"))
+        self.audio_transcription_model_id.as_deref().and_then(configured_model_id).or_else(|| {
+            configured_model_id(self.config.openai_model.as_str()).filter(|model_id| {
+                let normalized = model_id.to_ascii_lowercase();
+                normalized.contains("transcribe") || normalized.contains("whisper")
+            })
+        })
     }
 
     fn request_with_config_overrides(
@@ -4565,6 +5438,20 @@ fn finish_reason_from_openai_responses_status(status: Option<&str>) -> ProviderF
 }
 
 impl ModelProvider for OpenAiCompatibleProvider {
+    fn probe_chat_once<'a>(
+        &'a self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async move { self.complete_probe_once(&request).await })
+    }
+
+    fn probe_audio_once<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async move { self.transcribe_probe_once(&request).await })
+    }
+
     fn complete<'a>(
         &'a self,
         request: ProviderRequest,
@@ -4904,6 +5791,15 @@ impl AnthropicProvider {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
     }
 
+    async fn complete_probe_once(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        let api_key =
+            self.config.anthropic_api_key.as_ref().ok_or(ProviderError::MissingAnthropicApiKey)?;
+        self.request_once(api_key.as_str(), request)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.into_provider_error(0))
+    }
+
     // Once the cooldown elapses the breaker closes fully and the failure
     // count resets; there is no half-open probe state.
     fn ensure_circuit_closed(&self) -> Result<(), ProviderError> {
@@ -5165,6 +6061,13 @@ impl AnthropicProvider {
 }
 
 impl ModelProvider for AnthropicProvider {
+    fn probe_chat_once<'a>(
+        &'a self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
+        Box::pin(async move { self.complete_probe_once(&request).await })
+    }
+
     fn complete<'a>(
         &'a self,
         request: ProviderRequest,
@@ -5657,26 +6560,35 @@ mod tests {
         run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
-        AnthropicProvider, EmbeddingsRequest, ModelProvider, ModelProviderAuthProviderKind,
-        ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
-        ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, OpenAiCompatibleProvider,
+        AnthropicProvider, AudioTranscriptionRequest, EmbeddingsRequest, ModelProvider,
+        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+        ModelProviderKind, ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter,
+        OpenAiCompatibleProvider, ProviderAttemptAdmission, ProviderAttemptAdmissionError,
+        ProviderAttemptBinding, ProviderAttemptCompletionDisposition,
+        ProviderAttemptCompletionFuture, ProviderAttemptHealthAuthority, ProviderAttemptPermit,
+        ProviderAttemptPermitFuture, ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture,
         ProviderCapabilitiesSnapshot, ProviderChatAdapter, ProviderError, ProviderEvent,
-        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
-        ProviderLiveBindingMetadata, ProviderMessage, ProviderMessageContentPart,
-        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
-        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
-        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
-        ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator, ProviderStreamEvent,
-        ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext,
-        RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
-        FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID,
-        FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID, OPENAI_RETRYABLE_STATUS_CODES,
-        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
+        ProviderHealthProbeTarget, ProviderImageInput, ProviderLiveBindingMetadata,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
+        ProviderOutputContentPart, ProviderProbeAdmission, ProviderRawProviderRefs,
+        ProviderRegistryEntryConfig, ProviderRequest, ProviderRetryability, ProviderServiceTier,
+        ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput, ProviderUsage,
+        QaProviderAttestationContext, RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER,
+        ANTHROPIC_OAUTH_USER_AGENT, FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID,
+        FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID, FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID,
+        OPENAI_RETRYABLE_STATUS_CODES, QA_PROVIDER_FIXTURE_MATERIALIZATION,
+        QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use palyra_common::runtime_contracts::{
+        RuntimeAttemptId, RuntimeGeneration, RuntimeInstanceId,
+    };
     use palyra_model_providers::{
         classify_transport_provider_failure, parse_qa_mock_provider_fixture_yaml,
     };
+    use ulid::Ulid;
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -6170,6 +7082,72 @@ mod tests {
             circuit_breaker_cooldown_ms: 120_000,
             ..ModelProviderConfig::default()
         }
+    }
+
+    fn openai_audio_test_config(base_url: String) -> ModelProviderConfig {
+        let mut config = openai_test_config(base_url);
+        config.max_retries = 0;
+        config.registry = ModelProviderRegistryConfig {
+            providers: vec![ProviderRegistryEntryConfig {
+                provider_id: "openai-primary".to_owned(),
+                display_name: Some("OpenAI".to_owned()),
+                kind: ModelProviderKind::OpenAiCompatible,
+                base_url: Some(config.openai_base_url.clone()),
+                allow_private_base_url: true,
+                enabled: true,
+                auth_profile_id: None,
+                auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openai),
+                api_key: Some("sk-test-secret".to_owned()),
+                api_key_secret_ref: None,
+                api_key_vault_ref: None,
+                credential_source: None,
+                request_timeout_ms: 5_000,
+                max_retries: 0,
+                retry_backoff_ms: 1,
+                circuit_breaker_failure_threshold: 2,
+                circuit_breaker_cooldown_ms: 120_000,
+            }],
+            models: vec![ProviderModelEntryConfig {
+                model_id: "whisper-1".to_owned(),
+                provider_id: "openai-primary".to_owned(),
+                role: ProviderModelRole::AudioTranscription,
+                enabled: true,
+                metadata_source: ProviderMetadataSource::Static,
+                operator_override: false,
+                capabilities: capability_defaults_for_kind(
+                    ModelProviderKind::OpenAiCompatible,
+                    ProviderModelRole::AudioTranscription,
+                ),
+            }],
+            default_chat_model_id: None,
+            default_embeddings_model_id: None,
+            default_audio_transcription_model_id: Some("whisper-1".to_owned()),
+            failover_enabled: false,
+            response_cache_enabled: false,
+            ..ModelProviderRegistryConfig::default()
+        };
+        config
+    }
+
+    fn openai_chat_and_audio_test_config(base_url: String) -> ModelProviderConfig {
+        let mut config = openai_audio_test_config(base_url);
+        config.registry.models.insert(
+            0,
+            ProviderModelEntryConfig {
+                model_id: "gpt-4o-mini".to_owned(),
+                provider_id: "openai-primary".to_owned(),
+                role: ProviderModelRole::Chat,
+                enabled: true,
+                metadata_source: ProviderMetadataSource::Static,
+                operator_override: false,
+                capabilities: capability_defaults_for_kind(
+                    ModelProviderKind::OpenAiCompatible,
+                    ProviderModelRole::Chat,
+                ),
+            },
+        );
+        config.registry.default_chat_model_id = Some("gpt-4o-mini".to_owned());
+        config
     }
 
     fn anthropic_test_config(base_url: String) -> ModelProviderConfig {
@@ -7560,6 +8538,417 @@ turns:
         assert_eq!(super::openai_codex_runtime_model_id("openai/provider-model"), "provider-model");
     }
 
+    #[derive(Default)]
+    struct RecordingProviderAttemptAdmission {
+        eligible: Mutex<Vec<ProviderAttemptBinding>>,
+        acquired: Mutex<Vec<ProviderAttemptBinding>>,
+        started: Mutex<Vec<ProviderAttemptBinding>>,
+        succeeded: Mutex<Vec<ProviderAttemptBinding>>,
+        failed: Mutex<Vec<ProviderAttemptBinding>>,
+    }
+
+    impl ProviderAttemptAdmission for RecordingProviderAttemptAdmission {
+        fn bind_attempt(
+            &self,
+            provider_id: &str,
+            credential_id: &str,
+            model_id: &str,
+        ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
+            Ok(ProviderAttemptBinding {
+                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                    .expect("test provider attempt identity should be valid"),
+                provider_id: provider_id.to_owned(),
+                credential_id: credential_id.to_owned(),
+                model_id: model_id.to_owned(),
+                health_authority: ProviderAttemptHealthAuthority {
+                    component_id: RuntimeInstanceId::parse(
+                        format!("provider:{provider_id}").as_str(),
+                    )
+                    .expect("test provider health identity should be valid"),
+                    generation: RuntimeGeneration::new(1)
+                        .expect("test provider health generation should be valid"),
+                },
+            })
+        }
+
+        fn check_eligibility(
+            &self,
+            binding: &ProviderAttemptBinding,
+        ) -> Result<(), ProviderAttemptAdmissionError> {
+            self.eligible
+                .lock()
+                .expect("attempt eligibility lock should not be poisoned")
+                .push(binding.clone());
+            Ok(())
+        }
+
+        fn acquire<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptPermitFuture<'a> {
+            self.acquired
+                .lock()
+                .expect("attempt admission lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptPermit>) })
+        }
+
+        fn record_started<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptStartFuture<'a> {
+            self.started
+                .lock()
+                .expect("attempt start lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptRuntimeAuthority>) })
+        }
+
+        fn record_success<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            self.succeeded
+                .lock()
+                .expect("attempt success lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+
+        fn record_failure<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+            _error: &'a ProviderError,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            self.failed
+                .lock()
+                .expect("attempt failure lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+    }
+
+    impl ProviderProbeAdmission for RecordingProviderAttemptAdmission {
+        fn bind_probe(
+            &self,
+            provider_id: &str,
+            credential_id: &str,
+            model_id: &str,
+        ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
+            ProviderAttemptAdmission::bind_attempt(self, provider_id, credential_id, model_id)
+        }
+
+        fn check_probe_eligibility(
+            &self,
+            binding: &ProviderAttemptBinding,
+        ) -> Result<(), ProviderAttemptAdmissionError> {
+            ProviderAttemptAdmission::check_eligibility(self, binding)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_probe_executes_one_attempt_without_retrying() {
+        let response_body = r#"{"error":{"message":"temporary upstream error"}}"#.to_owned();
+        let (base_url, request_count, handle) =
+            spawn_scripted_server(vec![(503_u16, response_body)]);
+        let mut config = openai_chat_and_audio_test_config(base_url);
+        config.max_retries = 3;
+        config.registry.providers[0].max_retries = 3;
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
+        let snapshot = provider.status_snapshot();
+        let target = ProviderHealthProbeTarget {
+            provider_id: "openai-primary".to_owned(),
+            credential_id: snapshot.registry.providers[0].credential_id.clone(),
+            model_id: "gpt-4o-mini".to_owned(),
+            role: ProviderModelRole::Chat,
+        };
+
+        let error = provider
+            .probe_with_attempt_admission(
+                target,
+                Arc::new(RecordingProviderAttemptAdmission::default()),
+            )
+            .await
+            .expect_err("single-attempt probe should expose the first upstream failure");
+
+        assert_eq!(error.retry_count(), 0);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_audio_probe_executes_one_attempt_without_retrying() {
+        let response_body = r#"{"error":{"message":"temporary upstream error"}}"#.to_owned();
+        let (base_url, request_count, handle) =
+            spawn_scripted_server(vec![(503_u16, response_body)]);
+        let mut config = openai_audio_test_config(base_url);
+        config.max_retries = 3;
+        config.registry.providers[0].max_retries = 3;
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
+        let snapshot = provider.status_snapshot();
+        let target = ProviderHealthProbeTarget {
+            provider_id: "openai-primary".to_owned(),
+            credential_id: snapshot.registry.providers[0].credential_id.clone(),
+            model_id: "whisper-1".to_owned(),
+            role: ProviderModelRole::AudioTranscription,
+        };
+
+        let error = provider
+            .probe_with_attempt_admission(
+                target,
+                Arc::new(RecordingProviderAttemptAdmission::default()),
+            )
+            .await
+            .expect_err("single-attempt audio probe should expose the first upstream failure");
+
+        assert_eq!(error.retry_count(), 0);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_audio_transcription_binds_exact_candidate_authority() {
+        let response_body = serde_json::json!({
+            "text": "hello from audio",
+            "language": "en",
+            "duration": 1.25,
+            "segments": []
+        })
+        .to_string();
+        let (base_url, request_count, handle) =
+            spawn_scripted_server(vec![(200_u16, response_body)]);
+        let config = openai_audio_test_config(base_url);
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
+        let snapshot = provider.status_snapshot();
+        let expected_model_id = snapshot
+            .registry
+            .default_audio_transcription_model_id
+            .clone()
+            .expect("audio transcription model should be configured");
+        let expected_provider_id = snapshot
+            .registry
+            .models
+            .iter()
+            .find(|model| model.model_id == expected_model_id)
+            .map(|model| model.provider_id.clone())
+            .expect("audio model should identify its provider");
+        let expected_credential_id = snapshot
+            .registry
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == expected_provider_id)
+            .map(|provider| provider.credential_id.clone())
+            .expect("audio provider should identify its credential");
+        let admission = Arc::new(RecordingProviderAttemptAdmission::default());
+
+        let response = provider
+            .transcribe_audio_with_attempt_admission(
+                AudioTranscriptionRequest {
+                    file_name: "voice.wav".to_owned(),
+                    content_type: "audio/wav".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    prompt: None,
+                    language: Some("en".to_owned()),
+                },
+                admission.clone(),
+            )
+            .await
+            .expect("audio transcription should succeed");
+
+        assert_eq!(response.text, "hello from audio");
+        let acquired = admission
+            .acquired
+            .lock()
+            .expect("attempt admission lock should not be poisoned")
+            .clone();
+        assert_eq!(acquired.len(), 1);
+        assert_eq!(acquired[0].provider_id, expected_provider_id);
+        assert_eq!(acquired[0].credential_id, expected_credential_id);
+        assert_eq!(acquired[0].model_id, expected_model_id);
+        assert_eq!(
+            admission
+                .eligible
+                .lock()
+                .expect("attempt eligibility lock should not be poisoned")
+                .as_slice(),
+            acquired.as_slice()
+        );
+        assert_eq!(
+            admission
+                .succeeded
+                .lock()
+                .expect("attempt success lock should not be poisoned")
+                .as_slice(),
+            acquired.as_slice()
+        );
+        assert!(admission
+            .failed
+            .lock()
+            .expect("attempt failure lock should not be poisoned")
+            .is_empty());
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_audio_transcription_uses_audio_model_when_provider_also_serves_chat() {
+        let response_body = serde_json::json!({
+            "text": "hello from combined provider",
+            "language": "en",
+            "duration": 1.0,
+            "segments": []
+        })
+        .to_string();
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![(200_u16, response_body)]);
+        let provider = build_model_provider(&openai_chat_and_audio_test_config(base_url))
+            .expect("combined registry provider should build");
+        let admission = Arc::new(RecordingProviderAttemptAdmission::default());
+
+        let response = provider
+            .transcribe_audio_with_attempt_admission(
+                AudioTranscriptionRequest {
+                    file_name: "voice.wav".to_owned(),
+                    content_type: "audio/wav".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    prompt: None,
+                    language: None,
+                },
+                admission.clone(),
+            )
+            .await
+            .expect("combined registry audio transcription should succeed");
+
+        assert_eq!(response.model_name, "whisper-1");
+        let acquired =
+            admission.acquired.lock().expect("attempt admission lock should not be poisoned");
+        assert_eq!(acquired.len(), 1);
+        assert_eq!(acquired[0].model_id, "whisper-1");
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        let captured = requests.first().expect("audio server should capture one request");
+        assert_eq!(captured.path, "/v1/audio/transcriptions");
+        assert!(captured.body.contains("whisper-1"));
+        assert!(!captured.body.contains("gpt-4o-mini"));
+        drop(requests);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_audio_transcription_admission_denial_prevents_effect() {
+        let (base_url, _request_count, handle) = spawn_scripted_server(Vec::new());
+        let provider = build_model_provider(&openai_audio_test_config(base_url))
+            .expect("registry-backed provider should build");
+        let admission = Arc::new(ToggleProviderAttemptAdmission::default());
+        admission.blocked.store(true, Ordering::Relaxed);
+
+        let error = provider
+            .transcribe_audio_with_attempt_admission(
+                AudioTranscriptionRequest {
+                    file_name: "voice.wav".to_owned(),
+                    content_type: "audio/wav".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    prompt: None,
+                    language: None,
+                },
+                admission,
+            )
+            .await
+            .expect_err("health denial should block the audio request");
+
+        let failure = error.failure_snapshot();
+        assert_eq!(failure.class, "permanent_upstream");
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("provider_attempt_admission_health_quarantined")
+        );
+        handle.join().expect("unused scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_acquires_authority_for_each_failover_candidate() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            503_u16,
+            r#"{"error":{"message":"temporary upstream error"}}"#.to_owned(),
+        )]);
+        let (anthropic_base_url, anthropic_request_count, anthropic_handle) =
+            spawn_scripted_server(vec![(
+                200_u16,
+                r#"{"content":[{"type":"text","text":"fallback from anthropic"}],"stop_reason":"end_turn"}"#
+                    .to_owned(),
+            )]);
+        let provider =
+            build_model_provider(&multi_provider_test_config(openai_base_url, anthropic_base_url))
+                .expect("registry-backed provider should build");
+        let admission = Arc::new(RecordingProviderAttemptAdmission::default());
+
+        let response = provider
+            .complete_with_attempt_admission(
+                ProviderRequest::from_input_text(
+                    "lease every candidate".to_owned(),
+                    false,
+                    Vec::new(),
+                    None,
+                ),
+                admission.clone(),
+            )
+            .await
+            .expect("fallback provider should succeed");
+
+        assert_eq!(response.provider_id, "anthropic-primary");
+        let acquired = admission
+            .acquired
+            .lock()
+            .expect("attempt admission lock should not be poisoned")
+            .clone();
+        assert_eq!(acquired.len(), 2);
+        assert_eq!(acquired[0].provider_id, "openai-primary");
+        assert_eq!(acquired[0].credential_id, "config:openai-primary:unbound");
+        assert_eq!(acquired[0].model_id, "gpt-4o-mini");
+        assert_eq!(acquired[1].provider_id, "anthropic-primary");
+        assert_eq!(acquired[1].credential_id, "config:anthropic-primary:unbound");
+        assert_eq!(acquired[1].model_id, "claude-3-5-sonnet-latest");
+        assert_ne!(acquired[0].attempt_id, acquired[1].attempt_id);
+        assert_eq!(
+            admission.started.lock().expect("attempt start lock should not be poisoned").as_slice(),
+            acquired.as_slice()
+        );
+        assert_eq!(
+            admission
+                .eligible
+                .lock()
+                .expect("attempt eligibility lock should not be poisoned")
+                .as_slice(),
+            acquired.as_slice()
+        );
+        assert_eq!(
+            admission
+                .failed
+                .lock()
+                .expect("attempt failure lock should not be poisoned")
+                .as_slice(),
+            &acquired[..1]
+        );
+        assert_eq!(
+            admission
+                .succeeded
+                .lock()
+                .expect("attempt success lock should not be poisoned")
+                .as_slice(),
+            &acquired[1..]
+        );
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(anthropic_request_count.load(Ordering::Relaxed), 1);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
+        anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_provider_fails_over_to_anthropic_when_primary_openai_fails() {
         let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
@@ -7614,6 +9003,36 @@ turns:
 
         openai_handle.join().expect("openai scripted server thread should exit");
         anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_stops_after_fail_closed_primary_error() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            400_u16,
+            r#"{"error":{"message":"unsupported json_schema response_format"}}"#.to_owned(),
+        )]);
+        let provider =
+            build_model_provider(&deterministic_fixture_failover_config(openai_base_url))
+                .expect("fixture failover provider should build");
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text(
+                "do not bypass a rejected schema".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect_err("fail-closed provider errors must stop candidate iteration");
+
+        assert_eq!(error.classification().class, ProviderFailureClass::SchemaRejected);
+        assert_eq!(
+            error.classification().recommended_action,
+            ProviderFailureAction::FailClosedNoRetry
+        );
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7773,6 +9192,157 @@ turns:
         assert_eq!(report.attempts[0].reason_code.as_deref(), Some("missing_api_key"));
         assert_eq!(report.attempts[1].provider_id, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID);
         assert_eq!(report.attempts[1].outcome, "failover_success");
+    }
+
+    #[derive(Default)]
+    struct ToggleProviderAttemptAdmission {
+        eligible: Mutex<Vec<ProviderAttemptBinding>>,
+        acquired: Mutex<Vec<ProviderAttemptBinding>>,
+        started: Mutex<Vec<ProviderAttemptBinding>>,
+        blocked: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProviderAttemptAdmission for ToggleProviderAttemptAdmission {
+        fn bind_attempt(
+            &self,
+            provider_id: &str,
+            credential_id: &str,
+            model_id: &str,
+        ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
+            Ok(ProviderAttemptBinding {
+                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                    .expect("test provider attempt identity should be valid"),
+                provider_id: provider_id.to_owned(),
+                credential_id: credential_id.to_owned(),
+                model_id: model_id.to_owned(),
+                health_authority: ProviderAttemptHealthAuthority {
+                    component_id: RuntimeInstanceId::parse(
+                        format!("provider:{provider_id}").as_str(),
+                    )
+                    .expect("test provider health identity should be valid"),
+                    generation: RuntimeGeneration::new(1)
+                        .expect("test provider health generation should be valid"),
+                },
+            })
+        }
+
+        fn check_eligibility(
+            &self,
+            binding: &ProviderAttemptBinding,
+        ) -> Result<(), ProviderAttemptAdmissionError> {
+            self.eligible
+                .lock()
+                .expect("attempt eligibility lock should not be poisoned")
+                .push(binding.clone());
+            if self.blocked.load(Ordering::Relaxed) {
+                return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                    safe_message: "provider candidate is quarantined".to_owned(),
+                    reason_code: "provider_attempt_admission_health_quarantined".to_owned(),
+                    retry_after_ms: None,
+                    operator_action_required: true,
+                });
+            }
+            Ok(())
+        }
+
+        fn acquire<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptPermitFuture<'a> {
+            self.acquired
+                .lock()
+                .expect("attempt admission lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptPermit>) })
+        }
+
+        fn record_started<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptStartFuture<'a> {
+            self.started
+                .lock()
+                .expect("attempt start lock should not be poisoned")
+                .push(binding.clone());
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptRuntimeAuthority>) })
+        }
+
+        fn record_success<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+
+        fn record_failure<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+            _error: &'a ProviderError,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_rechecks_health_before_serving_cached_response() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            200_u16,
+            r#"{"choices":[{"message":{"content":"cached health response"}}]}"#.to_owned(),
+        )]);
+        let mut config =
+            multi_provider_test_config(openai_base_url, "http://127.0.0.1:9".to_owned());
+        config.registry.failover_enabled = false;
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
+        let admission = Arc::new(ToggleProviderAttemptAdmission::default());
+        let request = ProviderRequest::from_input_text(
+            "cache health gate".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+
+        let first = provider
+            .complete_with_attempt_admission(request.clone(), admission.clone())
+            .await
+            .expect("first upstream request should succeed");
+        assert!(!first.served_from_cache);
+        admission.blocked.store(true, Ordering::Relaxed);
+
+        let error = provider
+            .complete_with_attempt_admission(request, admission.clone())
+            .await
+            .expect_err("quarantine must block a response cache hit");
+
+        let failure = error.failure_snapshot();
+        assert_eq!(failure.class, "permanent_upstream");
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("provider_attempt_admission_health_quarantined")
+        );
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            admission
+                .eligible
+                .lock()
+                .expect("attempt eligibility lock should not be poisoned")
+                .len(),
+            2
+        );
+        assert_eq!(
+            admission.acquired.lock().expect("attempt admission lock should not be poisoned").len(),
+            1,
+            "cached responses must not acquire provider capacity"
+        );
+        assert_eq!(
+            admission.started.lock().expect("attempt start lock should not be poisoned").len(),
+            1,
+            "cached responses must not emit provider effect-start evidence"
+        );
+
+        openai_handle.join().expect("openai scripted server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]

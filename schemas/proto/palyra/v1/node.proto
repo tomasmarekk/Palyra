@@ -12,6 +12,10 @@ service NodeService {
   rpc RevokeDevicePairing(RevokeDevicePairingRequest) returns (RevokeDevicePairingResponse);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc StreamNodeEvents(stream NodeEventRequest) returns (stream NodeEventResponse);
+  rpc FetchNetworkedWorkerPayload(FetchNetworkedWorkerPayloadRequest)
+      returns (FetchNetworkedWorkerPayloadResponse);
+  rpc AcknowledgeNetworkedWorkerPayload(AcknowledgeNetworkedWorkerPayloadRequest)
+      returns (AcknowledgeNetworkedWorkerPayloadResponse);
   rpc ExecuteCapability(ExecuteCapabilityRequest) returns (ExecuteCapabilityResponse);
 }
 
@@ -183,8 +187,64 @@ message NodeCapabilityDispatch {
   string capability = 2;
   bytes input_json = 3;
   uint64 max_payload_bytes = 4;
+  NetworkedWorkerDeliveryReservation networked_worker_reservation = 5;
 
-  reserved 5 to 12;
+  reserved 6 to 12;
+}
+
+message NetworkedWorkerDeliveryReservation {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId request_id = 2;
+  palyra.common.v1.CanonicalId delivery_attempt_id = 3;
+  string protocol = 4;
+  string fetch_token = 5;
+  string request_sha256 = 6;
+  string worker_id = 7;
+  palyra.common.v1.CanonicalId lease_id = 8;
+  palyra.common.v1.CanonicalId run_id = 9;
+  uint64 fleet_generation = 10;
+  uint64 expires_at_unix_ms = 11;
+
+  reserved 12 to 20;
+}
+
+message FetchNetworkedWorkerPayloadRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  palyra.common.v1.CanonicalId request_id = 3;
+  palyra.common.v1.CanonicalId delivery_attempt_id = 4;
+  string fetch_token = 5;
+
+  reserved 6 to 12;
+}
+
+message FetchNetworkedWorkerPayloadResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId request_id = 2;
+  palyra.common.v1.CanonicalId delivery_attempt_id = 3;
+  bytes input_json = 4;
+  uint64 max_payload_bytes = 5;
+  string request_sha256 = 6;
+
+  reserved 7 to 12;
+}
+
+message AcknowledgeNetworkedWorkerPayloadRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  palyra.common.v1.CanonicalId request_id = 3;
+  palyra.common.v1.CanonicalId delivery_attempt_id = 4;
+  string fetch_token = 5;
+
+  reserved 6 to 12;
+}
+
+message AcknowledgeNetworkedWorkerPayloadResponse {
+  uint32 v = 1;
+  bool acknowledged = 2;
+  string reason = 3;
+
+  reserved 4 to 12;
 }
 
 message ExecuteCapabilityRequest {

@@ -474,10 +474,24 @@ pub(crate) async fn console_chat_message_stream_handler(
             }
         };
 
+        // The stream task creates its generation after this HTTP task starts, so resolve it
+        // lazily instead of permanently losing public projection to the startup race.
+        let mut public_event_generation = None;
         let mut public_event_sequence = 0_u64;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(event) => {
+                    if public_event_generation.is_none() {
+                        public_event_generation = state_for_task
+                            .runtime
+                            .persisted_runtime_generation_for_run(run_id_for_task.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|(generation_session_id, generation)| {
+                                (generation_session_id == session_id_for_task).then_some(generation)
+                            });
+                    }
                     // Track approval_id -> proposal_id so a later console
                     // approval decision can be translated back into the
                     // ToolApprovalResponse this gRPC stream expects.
@@ -505,16 +519,21 @@ pub(crate) async fn console_chat_message_stream_handler(
                             run_id_for_task.as_str(),
                             public_event_sequence,
                         );
-                    let public_event = crate::application::run_stream::public_events::
-                        public_runtime_event_json_from_run_stream_event(
+                    let public_event = public_event_generation.and_then(|generation| {
+                        crate::application::run_stream::public_events::
+                            public_runtime_event_json_from_run_stream_event(
                             &event,
                             crate::application::run_stream::public_events::PublicRunStreamEventContext {
                                 event_id: public_event_id.as_str(),
                                 session_id: session_id_for_task.as_str(),
+                                generation,
+                                sequence: public_event_sequence,
                                 occurred_at_unix_ms: unix_ms_now().unwrap_or_default(),
+                                causal_parent_event_id: None,
                                 request_id: None,
                             },
-                        );
+                        )
+                    });
                     let mut event_json = console_run_stream_event_to_json(&event);
                     if let (Some(object), Some(public_event)) =
                         (event_json.as_object_mut(), public_event)
@@ -725,8 +744,10 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             task_id: Ulid::new().to_string(),
             task_kind: AuxiliaryTaskKind::AttachmentDerivation.as_str().to_owned(),
             session_id: session_id.clone(),
+            child_session_id: None,
             parent_run_id: None,
             target_run_id: None,
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
@@ -736,6 +757,7 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             max_attempts: 1,
             budget_tokens: estimate_console_chat_attachment_tokens(&artifact),
             delegation: None,
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -756,13 +778,12 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    state
+    let claimed_task = state
         .runtime
-        .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
+        .claim_orchestrator_background_task(journal::OrchestratorBackgroundTaskClaimRequest {
             task_id: task.task_id.clone(),
-            state: Some(AuxiliaryTaskState::Running.as_str().to_owned()),
-            started_at_unix_ms: Some(Some(task_started_at)),
-            ..Default::default()
+            expected_revision: task.revision,
+            started_at_unix_ms: task_started_at,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -783,11 +804,13 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             })?;
             state
                 .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
+                .update_orchestrator_background_task_from_worker(
+                    journal::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                        task_id: claimed_task.task_id.clone(),
+                        execution_generation: claimed_task.execution_generation,
                         state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
-                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        target_run_id: None,
+                        last_error: Some(None),
                         result_json: Some(Some(
                             json!({
                                 "derived_count": records.len(),
@@ -795,7 +818,8 @@ pub(crate) async fn console_chat_attachment_upload_handler(
                             })
                             .to_string(),
                         )),
-                        ..Default::default()
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
                     },
                 )
                 .await
@@ -810,14 +834,16 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             })?;
             state
                 .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
+                .update_orchestrator_background_task_from_worker(
+                    journal::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                        task_id: claimed_task.task_id.clone(),
+                        execution_generation: claimed_task.execution_generation,
                         state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                        increment_attempt_count: true,
-                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        target_run_id: None,
                         last_error: Some(Some(error.to_string())),
-                        ..Default::default()
+                        result_json: None,
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
                     },
                 )
                 .await
@@ -828,7 +854,7 @@ pub(crate) async fn console_chat_attachment_upload_handler(
     Ok(Json(json!({
         "attachment": console_chat_attachment_payload_to_json(&artifact),
         "derived_artifacts": derived_artifacts,
-        "task": task,
+        "task": claimed_task,
         "contract": contract_descriptor(),
     })))
 }
@@ -1056,8 +1082,10 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             task_id: Ulid::new().to_string(),
             task_kind: AuxiliaryTaskKind::AttachmentRecompute.as_str().to_owned(),
             session_id: session_id.clone(),
+            child_session_id: None,
             parent_run_id: None,
             target_run_id: None,
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
@@ -1067,6 +1095,7 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             max_attempts: 1,
             budget_tokens: estimate_console_chat_attachment_tokens(&source_attachment),
             delegation: None,
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -1087,13 +1116,12 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    state
+    let claimed_task = state
         .runtime
-        .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
+        .claim_orchestrator_background_task(journal::OrchestratorBackgroundTaskClaimRequest {
             task_id: task.task_id.clone(),
-            state: Some(AuxiliaryTaskState::Running.as_str().to_owned()),
-            started_at_unix_ms: Some(Some(started_at_unix_ms)),
-            ..Default::default()
+            expected_revision: task.revision,
+            started_at_unix_ms,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1114,11 +1142,13 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             })?;
             state
                 .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
+                .update_orchestrator_background_task_from_worker(
+                    journal::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                        task_id: claimed_task.task_id.clone(),
+                        execution_generation: claimed_task.execution_generation,
                         state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
-                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        target_run_id: None,
+                        last_error: Some(None),
                         result_json: Some(Some(
                             json!({
                                 "source_artifact_id": existing.source_artifact_id,
@@ -1126,7 +1156,8 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
                             })
                             .to_string(),
                         )),
-                        ..Default::default()
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
                     },
                 )
                 .await
@@ -1141,14 +1172,16 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             })?;
             state
                 .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
+                .update_orchestrator_background_task_from_worker(
+                    journal::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                        task_id: claimed_task.task_id.clone(),
+                        execution_generation: claimed_task.execution_generation,
                         state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                        increment_attempt_count: true,
-                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        target_run_id: None,
                         last_error: Some(Some(error.to_string())),
-                        ..Default::default()
+                        result_json: None,
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
                     },
                 )
                 .await
@@ -1164,7 +1197,7 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
         load_console_derived_artifact(&state, &session.context, derived_artifact_id.as_str(), true)
             .map_err(|response| *response)?;
     Ok(Json(json!({
-        "task": task,
+        "task": claimed_task,
         "derived_artifact": derived_artifact,
         "derived_artifacts": derived_artifacts,
         "action": "recompute",
@@ -2457,13 +2490,13 @@ pub(crate) async fn console_chat_workspace_checkpoint_restore_handler(
 // --- Background tasks ---
 
 /// `POST /console/v1/chat/sessions/{session_id}/background-tasks` - enqueues
-/// an auxiliary background task (plain prompt or delegation) for the session
-/// and records a runtime-preview lifecycle event.
+/// an auxiliary background task for the session and records a runtime-preview
+/// lifecycle event.
 ///
 /// # Errors
-/// Returns an error `Response` when authorization fails, text is empty, a
-/// delegation is requested without a parent run, the task kind is reserved or
-/// inconsistent with delegation, or persistence fails.
+/// Returns an error `Response` when authorization fails, text is empty,
+/// delegation is requested outside an admitted run, the task kind is reserved
+/// or inconsistent with delegation, or persistence fails.
 pub(crate) async fn console_chat_background_task_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2479,66 +2512,28 @@ pub(crate) async fn console_chat_background_task_create_handler(
     let requested_budget_tokens =
         console_background_task_budget_tokens(payload.budget_tokens, text.as_str());
     let requested_max_attempts = payload.max_attempts.unwrap_or(3).clamp(1, 16);
-    let delegation = if let Some(request) = payload.delegation.as_ref() {
-        let parent_run_id = session_record.last_run_id.clone().ok_or_else(|| {
-            runtime_status_response(tonic::Status::failed_precondition(
-                "delegation requires a parent run in the current session",
-            ))
-        })?;
-        let resolved_agent = state
-            .runtime
-            .resolve_agent_for_context(crate::agents::AgentResolveRequest {
-                principal: session.context.principal.clone(),
-                channel: session.context.channel.clone(),
-                session_id: Some(session_record.session_id.clone()),
-                preferred_agent_id: None,
-                persist_session_binding: false,
-            })
-            .await
-            .map_err(runtime_status_response)?;
-        Some(
-            crate::delegation::resolve_delegation_request(
-                request,
-                &crate::delegation::DelegationParentContext {
-                    parent_run_id: Some(parent_run_id),
-                    agent_id: Some(resolved_agent.agent.agent_id),
-                    parent_model_profile: trim_to_option(
-                        resolved_agent.agent.default_model_profile,
-                    ),
-                    parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist,
-                    parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist,
-                    parent_budget_tokens: Some(requested_budget_tokens),
-                },
-            )
-            .map_err(runtime_status_response)?,
-        )
-    } else {
-        None
-    };
+    if payload.delegation.is_some() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "console background delegation requires admitted Run-root cancellation authority",
+        )));
+    }
     let requested_task_kind = payload.task_kind.clone().and_then(trim_to_option);
-    let task_kind = if delegation.is_some() {
-        resolve_console_delegation_task_kind(requested_task_kind.as_deref())
-            .map_err(runtime_status_response)?
-    } else {
-        resolve_console_background_task_kind(requested_task_kind.as_deref())
-            .map_err(runtime_status_response)?
-    };
-    let task_budget_tokens =
-        delegation.as_ref().map(|value| value.budget_tokens).unwrap_or(requested_budget_tokens);
-    let task_max_attempts =
-        delegation.as_ref().map(|value| value.max_attempts).unwrap_or(requested_max_attempts);
-    let payload_json = build_console_background_task_payload_json(
-        payload.parameter_delta.as_ref(),
-        delegation.as_ref(),
-    )?;
+    let task_kind = resolve_console_background_task_kind(requested_task_kind.as_deref())
+        .map_err(runtime_status_response)?;
+    let task_budget_tokens = requested_budget_tokens;
+    let task_max_attempts = requested_max_attempts;
+    let payload_json =
+        build_console_background_task_payload_json(payload.parameter_delta.as_ref(), None)?;
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
             task_id: Ulid::new().to_string(),
             task_kind,
             session_id: session_record.session_id.clone(),
+            child_session_id: None,
             parent_run_id: session_record.last_run_id.clone(),
             target_run_id: None,
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
@@ -2547,7 +2542,8 @@ pub(crate) async fn console_chat_background_task_create_handler(
             priority: payload.priority.unwrap_or(0).clamp(-10, 10),
             max_attempts: task_max_attempts,
             budget_tokens: task_budget_tokens,
-            delegation,
+            delegation: None,
+            cancellation_context: None,
             not_before_unix_ms: payload.not_before_unix_ms,
             expires_at_unix_ms: payload.expires_at_unix_ms,
             notification_target_json: payload
@@ -2600,25 +2596,6 @@ fn background_task_live_steering_status(
             "background-enqueue creates an independent follow-up task for the session"
         },
     })
-}
-
-/// Validates the task kind for a delegated background task; only
-/// `delegation_prompt` (or omitted) is accepted.
-fn resolve_console_delegation_task_kind(value: Option<&str>) -> Result<String, tonic::Status> {
-    match value {
-        None => Ok(AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned()),
-        Some(raw) => match AuxiliaryTaskKind::from_str(raw) {
-            Some(AuxiliaryTaskKind::DelegationPrompt) => {
-                Ok(AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned())
-            }
-            Some(_) => Err(tonic::Status::invalid_argument(
-                "delegated background tasks must use task_kind=delegation_prompt",
-            )),
-            None => Err(tonic::Status::invalid_argument(format!(
-                "unsupported auxiliary task_kind: {raw}"
-            ))),
-        },
-    }
 }
 
 /// Validates the task kind for a non-delegated background task, rejecting
@@ -2736,6 +2713,7 @@ pub(crate) async fn console_chat_background_task_pause_handler(
         .runtime
         .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: Some(AuxiliaryTaskState::Paused.as_str().to_owned()),
             ..Default::default()
         })
@@ -2781,6 +2759,7 @@ pub(crate) async fn console_chat_background_task_resume_handler(
         .runtime
         .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: Some(AuxiliaryTaskState::Queued.as_str().to_owned()),
             completed_at_unix_ms: Some(None),
             ..Default::default()
@@ -2830,17 +2809,43 @@ pub(crate) async fn console_chat_background_task_retry_handler(
             "only failed, cancelled, or expired background tasks can be retried",
         )));
     }
+    // max_attempts == 0 means unlimited retries, matching the queue scheduler.
+    if task.max_attempts > 0 && task.attempt_count >= task.max_attempts {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "background task retry budget is exhausted",
+        )));
+    }
+    if let Some(reconciled) = state
+        .runtime
+        .reconcile_background_task_before_retry(task.task_id.clone(), task.state.clone())
+        .await
+        .map_err(runtime_status_response)?
+    {
+        record_background_task_runtime_preview(
+            &state,
+            &session.context,
+            &reconciled,
+            "background_task_existing_child_reconciled",
+            None,
+        )
+        .await?;
+        return Ok(Json(json!({
+            "task": reconciled,
+            "action": "reconciled_existing_child",
+            "contract": contract_descriptor(),
+        })));
+    }
     state
         .runtime
         .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: Some(AuxiliaryTaskState::Queued.as_str().to_owned()),
             target_run_id: Some(None),
             last_error: Some(None),
             result_json: Some(None),
             started_at_unix_ms: Some(None),
             completed_at_unix_ms: Some(None),
-            ..Default::default()
         })
         .await
         .map_err(runtime_status_response)?;
@@ -2893,6 +2898,7 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
                 .runtime
                 .update_orchestrator_background_task(build_background_task_cancel_requested_update(
                     task.task_id.as_str(),
+                    task.revision,
                 ))
                 .await
                 .map_err(runtime_status_response)?;
@@ -2903,7 +2909,10 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
                 state
                     .runtime
                     .update_orchestrator_background_task(
-                        build_background_task_cancel_requested_update(task.task_id.as_str()),
+                        build_background_task_cancel_requested_update(
+                            task.task_id.as_str(),
+                            task.revision,
+                        ),
                     )
                     .await
                     .map_err(runtime_status_response)?;
@@ -2912,6 +2921,7 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
                     .runtime
                     .update_orchestrator_background_task(build_background_task_cancelled_update(
                         task.task_id.as_str(),
+                        task.revision,
                     ))
                     .await
                     .map_err(runtime_status_response)?;
@@ -2922,6 +2932,7 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
             .runtime
             .update_orchestrator_background_task(build_background_task_cancelled_update(
                 task.task_id.as_str(),
+                task.revision,
             ))
             .await
             .map_err(runtime_status_response)?;
@@ -2945,9 +2956,11 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
 
 fn build_background_task_cancel_requested_update(
     task_id: &str,
+    expected_revision: u64,
 ) -> journal::OrchestratorBackgroundTaskUpdateRequest {
     journal::OrchestratorBackgroundTaskUpdateRequest {
         task_id: task_id.to_owned(),
+        expected_revision,
         state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
         result_json: Some(Some(build_background_task_cancel_requested_result_json(task_id))),
         ..Default::default()
@@ -2956,9 +2969,11 @@ fn build_background_task_cancel_requested_update(
 
 fn build_background_task_cancelled_update(
     task_id: &str,
+    expected_revision: u64,
 ) -> journal::OrchestratorBackgroundTaskUpdateRequest {
     journal::OrchestratorBackgroundTaskUpdateRequest {
         task_id: task_id.to_owned(),
+        expected_revision,
         state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
         completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
         last_error: Some(Some("cancelled_by_operator".to_owned())),
@@ -6571,11 +6586,11 @@ mod tests {
         build_background_task_cancelled_update, console_attachment_workspace_path,
         console_background_task_budget_tokens, derive_canvas_transcript_reference,
         derived_artifact_index_content, derived_artifact_matches_console_context,
-        extract_canvas_id_from_frame_reference, retry_parameter_delta_from_payload_or_run,
-        run_matches_console_context,
+        extract_canvas_id_from_frame_reference, resolve_console_background_task_kind,
+        retry_parameter_delta_from_payload_or_run, run_matches_console_context,
     };
     use crate::{domain::workspace::normalize_workspace_path, gateway, journal, media};
-    use palyra_common::runtime_contracts::AuxiliaryTaskState;
+    use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
 
     #[test]
     fn run_matches_console_context_rejects_mismatched_principal() {
@@ -6674,6 +6689,21 @@ mod tests {
                 .expect("path should be accepted")
                 .normalized_path,
             path
+        );
+    }
+
+    #[test]
+    fn console_background_task_kind_rejects_delegation_without_run_authority() {
+        assert_eq!(
+            resolve_console_background_task_kind(Some("delegation_prompt"))
+                .expect_err("console delegation must not bypass admitted Run-root authority")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            resolve_console_background_task_kind(Some("auxiliary_summary"))
+                .expect("recognized aliases should canonicalize"),
+            AuxiliaryTaskKind::Summary.as_str()
         );
     }
 
@@ -6821,13 +6851,13 @@ mod tests {
 
     #[test]
     fn background_task_cancel_updates_keep_pending_and_terminal_states_distinct() {
-        let pending = build_background_task_cancel_requested_update("task-1");
+        let pending = build_background_task_cancel_requested_update("task-1", 7);
         assert_eq!(pending.task_id, "task-1");
         assert_eq!(pending.state.as_deref(), Some(AuxiliaryTaskState::CancelRequested.as_str()));
         assert_eq!(pending.completed_at_unix_ms, None);
         assert_eq!(pending.last_error, None);
 
-        let cancelled = build_background_task_cancelled_update("task-1");
+        let cancelled = build_background_task_cancelled_update("task-1", 7);
         assert_eq!(cancelled.task_id, "task-1");
         assert_eq!(cancelled.state.as_deref(), Some(AuxiliaryTaskState::Cancelled.as_str()));
         assert!(cancelled.completed_at_unix_ms.is_some());

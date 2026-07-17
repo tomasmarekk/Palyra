@@ -1060,7 +1060,8 @@ fn redacted_http_headers(headers: &[(String, String)]) -> Vec<serde_json::Value>
                 || name.contains("cookie")
                 || name.contains("token")
                 || name.contains("api-key")
-                || name.contains("apikey");
+                || name.contains("apikey")
+                || name == "idempotency-key";
             json!({
                 "name": name,
                 "value": if sensitive { "<redacted>" } else { value.as_str() }
@@ -1432,7 +1433,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{export_http_fetch_body, http_fetch_model_body_text, parse_credential_bindings};
+    use super::{
+        export_http_fetch_body, http_fetch_model_body_text, parse_credential_bindings,
+        redacted_http_headers,
+    };
 
     #[test]
     fn http_fetch_export_redacts_sensitive_body_text() {
@@ -1507,6 +1511,22 @@ mod tests {
 
         assert_eq!(model_body.format, "plain_text");
         assert_eq!(model_body.body_text, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn http_fetch_output_never_echoes_raw_idempotency_keys() {
+        let headers = vec![
+            ("idempotency-key".to_owned(), "restart-secret".to_owned()),
+            ("accept".to_owned(), "application/json".to_owned()),
+        ];
+
+        let exported = redacted_http_headers(headers.as_slice());
+
+        assert_eq!(exported[0]["value"], "<redacted>");
+        assert_eq!(exported[1]["value"], "application/json");
+        assert!(!serde_json::to_string(&exported)
+            .expect("redacted headers should serialize")
+            .contains("restart-secret"));
     }
 
     #[test]

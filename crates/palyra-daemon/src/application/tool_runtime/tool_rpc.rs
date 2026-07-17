@@ -15,7 +15,10 @@ use std::{
     time::Duration,
 };
 
-use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
+use palyra_common::{
+    redaction::{redact_auth_error, redact_url_segments_in_text},
+    runtime_contracts::CancellationContextV1,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -28,8 +31,9 @@ use crate::{
         },
     },
     gateway::{
-        execute_tool_with_runtime_dispatch, GatewayRuntimeState, SharedToolBudget,
-        ToolRuntimeExecutionContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, HTTP_FETCH_TOOL_NAME,
+        execute_tool_with_runtime_dispatch_with_cancellation_and_progress, GatewayRuntimeState,
+        SharedToolBudget, ToolRuntimeDispatchControls, ToolRuntimeExecutionContext,
+        APPROVAL_CHANNEL_UNAVAILABLE_REASON, HTTP_FETCH_TOOL_NAME,
     },
     tool_protocol::{self, ToolAttestation},
     transport::grpc::auth::RequestContext,
@@ -281,6 +285,7 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     grants: &BTreeSet<String>,
     remaining_tool_budget: Option<SharedToolBudget>,
     request: ToolRpcRequest,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> (ToolRpcResponse, u32) {
     if let Err(error) = validate_tool_rpc_request(&request) {
         return (denied_response(request, error, false), 0);
@@ -427,13 +432,19 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     };
     // Box::pin breaks the otherwise infinitely sized recursive future:
     // dispatch can re-enter tool programs, which re-enter this function.
-    let execution = Box::pin(execute_tool_with_runtime_dispatch(
+    let execution = Box::pin(execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
         runtime_state,
         child_context,
         child_proposal_id.as_str(),
         request.tool_name.as_str(),
         input_bytes.as_slice(),
-        remaining_tool_budget.clone(),
+        ToolRuntimeDispatchControls {
+            remaining_tool_budget: remaining_tool_budget.clone(),
+            cancellation_requested: None,
+            process_progress_sink: None,
+            cancellation_context: None,
+            child_task_parent_context: child_task_parent_context.cloned(),
+        },
     ));
     let outcome = match timeout {
         Some(timeout) => match tokio::time::timeout(timeout, execution).await {
@@ -497,6 +508,7 @@ pub(crate) async fn process_tool_rpc_file_transport_once(
     grants: &BTreeSet<String>,
     remaining_tool_budget: Option<SharedToolBudget>,
     config: &ToolRpcFileTransportConfig,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<ToolRpcFileTransportSweep, String> {
     let request_dir = canonicalize_rpc_dir(config.request_dir.as_path(), "request_dir")?;
     fs::create_dir_all(config.response_dir.as_path())
@@ -556,6 +568,7 @@ pub(crate) async fn process_tool_rpc_file_transport_once(
             grants,
             remaining_tool_budget.clone(),
             request,
+            child_task_parent_context,
         )
         .await;
         let status = response.status;

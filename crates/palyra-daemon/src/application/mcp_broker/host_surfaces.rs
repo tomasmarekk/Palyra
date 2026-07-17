@@ -491,11 +491,11 @@ impl McpBroker {
             request.requested_model_capability.as_deref(),
         ) {
             return Ok(denied_sampling_outcome(
-            &request,
-            host_policy,
-            "mcp.sampling_denied",
-            "MCP sampling requires a manifest allowlist entry for the requested model capability",
-        ));
+                &request,
+                host_policy,
+                "mcp.sampling_denied",
+                "MCP sampling requires a manifest allowlist entry for the requested model capability",
+            ));
         }
         if let Some(provider_id) = request.requested_provider_id.as_deref() {
             if provider_id != host_policy.provider_id {

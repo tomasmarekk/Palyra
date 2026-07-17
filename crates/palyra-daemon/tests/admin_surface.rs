@@ -9,8 +9,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStderr, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -115,6 +115,393 @@ fn admin_status_requires_token_and_context() -> Result<()> {
         .context("failed to read admin metrics response body")?;
     assert!(metrics.contains("# HELP palyra_agent_runs_started_total"));
     assert!(metrics.contains("palyra_tool_job_state{state=\"queued\"}"));
+    Ok(())
+}
+
+#[test]
+fn admin_runtime_health_probe_requires_auth_and_rejects_unsupported_components() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!("http://127.0.0.1:{admin_port}/admin/v1/runtime-health/plugin:test/probe");
+    let payload = json!({"reason_code": "runtime.health.operator_probe"});
+
+    let missing_auth = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .context("failed to call runtime health probe without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401);
+
+    let malformed = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/admin/v1/runtime-health/provider:deterministic/probe"
+        ))
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&json!({"reason_code": "contains spaces"}))
+        .send()
+        .context("failed to call runtime health probe with malformed reason")?;
+    assert_eq!(malformed.status().as_u16(), 400);
+
+    let unsupported = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&payload)
+        .send()
+        .context("failed to call unsupported runtime health probe")?;
+    assert_eq!(unsupported.status().as_u16(), 412);
+    let body = unsupported
+        .json::<Value>()
+        .context("failed to parse unsupported runtime health probe response")?;
+    assert_eq!(body.get("code").and_then(Value::as_str), Some("failed_precondition"));
+    Ok(())
+}
+
+#[test]
+fn admin_runtime_health_provider_probe_settles_real_provider_success() -> Result<()> {
+    let api_key = "provider-probe-secret-success";
+    let response_body =
+        r#"{"choices":[{"message":{"content":"provider response must stay private"}}]}"#;
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                400,
+                r#"{"error":{"message":"setup failure must stay private"}}"#.to_owned(),
+            ),
+            ScriptedOpenAiResponse::immediate(200, response_body.to_owned()),
+        ])?;
+    let config = provider_health_probe_test_config(openai_base_url.as_str(), api_key);
+    let (child, admin_port) = spawn_palyrad_with_config_and_env(
+        config.as_str(),
+        &[
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL),
+            ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true"),
+        ],
+    )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build provider probe HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let before = console_shared_runtime_diagnostics(&client, admin_port, cookie.as_str())?;
+    let initial_healthy = shared_runtime_health_state_count(&before, "healthy");
+
+    expire_provider_health_cooldown(
+        &client,
+        admin_port,
+        "openai-primary",
+        cookie.as_str(),
+        csrf_token.as_str(),
+    )?;
+    let degraded = console_shared_runtime_diagnostics(&client, admin_port, cookie.as_str())?;
+    assert_eq!(shared_runtime_health_state_count(&degraded, "cooldown"), 1);
+
+    let probe = post_admin_runtime_health_probe(&client, admin_port, "openai-primary")?;
+    assert_eq!(probe.get("disposition").and_then(Value::as_str), Some("passed"));
+    assert_eq!(probe.get("resulting_state").and_then(Value::as_str), Some("healthy"));
+    assert_eq!(
+        probe.get("reason_code").and_then(Value::as_str),
+        Some("runtime.health.provider_probe_passed")
+    );
+    assert_eq!(probe.get("replayed").and_then(Value::as_bool), Some(false));
+    assert!(probe.get("generation").and_then(Value::as_u64).is_some());
+    assert!(probe.get("completed_at_unix_ms").and_then(Value::as_i64).is_some());
+    let probe_text = probe.to_string();
+    assert!(!probe_text.contains("provider response must stay private"));
+    assert!(!probe_text.contains(api_key));
+
+    let after = console_shared_runtime_diagnostics(&client, admin_port, cookie.as_str())?;
+    assert_eq!(shared_runtime_health_state_count(&after, "healthy"), initial_healthy);
+    assert_eq!(shared_runtime_health_state_count(&after, "cooldown"), 0);
+    assert_eq!(shared_runtime_probe_settlement_count(&after, "passed"), 1);
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 2);
+    let captured = request_bodies
+        .lock()
+        .map_err(|_| anyhow::anyhow!("captured provider probe requests lock was poisoned"))?
+        .clone();
+    assert_eq!(captured.len(), 2);
+    assert!(captured[0].contains("caller text must not become the host probe"));
+    let request: Value = serde_json::from_str(captured[1].as_str())
+        .context("provider probe request was not JSON")?;
+    assert_eq!(request.get("model").and_then(Value::as_str), Some("probe-model"));
+    assert_eq!(request.get("max_tokens").and_then(Value::as_u64), Some(8));
+    assert!(request.get("tools").is_none(), "host probe must not send a tool catalog");
+    assert_eq!(request.pointer("/messages/0/role").and_then(Value::as_str), Some("user"));
+    assert_eq!(
+        request.pointer("/messages/0/content").and_then(Value::as_str),
+        Some("Respond with OK."),
+    );
+    assert!(!captured[1].contains("caller text must not become the host probe"));
+    assert!(captured.iter().all(|body| !body.contains(api_key)));
+
+    drop(daemon);
+    server_handle.join().expect("provider probe success server thread should exit");
+    Ok(())
+}
+
+#[test]
+fn admin_runtime_health_provider_probe_quarantines_real_provider_failure() -> Result<()> {
+    let api_key = "provider-probe-secret-failure";
+    let upstream_body = r#"{"error":{"message":"raw upstream failure must stay private"}}"#;
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                400,
+                r#"{"error":{"message":"setup failure must stay private"}}"#.to_owned(),
+            ),
+            ScriptedOpenAiResponse::immediate(400, upstream_body.to_owned()),
+        ])?;
+    let config = provider_health_probe_test_config(openai_base_url.as_str(), api_key);
+    let (child, admin_port) = spawn_palyrad_with_config_and_env(
+        config.as_str(),
+        &[
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL),
+            ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true"),
+        ],
+    )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build provider probe HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    expire_provider_health_cooldown(
+        &client,
+        admin_port,
+        "openai-primary",
+        cookie.as_str(),
+        csrf_token.as_str(),
+    )?;
+
+    let probe = post_admin_runtime_health_probe(&client, admin_port, "openai-primary")?;
+    assert_eq!(probe.get("disposition").and_then(Value::as_str), Some("failed"));
+    assert_eq!(probe.get("resulting_state").and_then(Value::as_str), Some("quarantined"));
+    assert_eq!(
+        probe.get("reason_code").and_then(Value::as_str),
+        Some("runtime.health.provider_probe_failed")
+    );
+    assert_eq!(probe.get("replayed").and_then(Value::as_bool), Some(false));
+    let probe_text = probe.to_string();
+    assert!(!probe_text.contains("raw upstream failure must stay private"));
+    assert!(!probe_text.contains(api_key));
+
+    let after = console_shared_runtime_diagnostics(&client, admin_port, cookie.as_str())?;
+    assert_eq!(shared_runtime_health_state_count(&after, "quarantined"), 1);
+    assert_eq!(shared_runtime_health_state_count(&after, "cooldown"), 0);
+    assert_eq!(shared_runtime_probe_settlement_count(&after, "failed"), 1);
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 2);
+    let captured = request_bodies
+        .lock()
+        .map_err(|_| anyhow::anyhow!("captured provider probe requests lock was poisoned"))?
+        .clone();
+    assert_eq!(captured.len(), 2);
+    assert!(captured[0].contains("caller text must not become the host probe"));
+    assert!(captured[1].contains("Respond with OK."));
+    assert!(!captured[1].contains("caller text must not become the host probe"));
+    assert!(captured.iter().all(|body| !body.contains(api_key)));
+
+    drop(daemon);
+    server_handle.join().expect("provider probe failure server thread should exit");
+    Ok(())
+}
+
+#[test]
+fn legacy_runtime_health_probe_lease_routes_are_gone_without_mutation() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    for path in [
+        "/admin/v1/runtime-health/provider:test/probe-lease",
+        "/admin/v1/runtime-health/provider:test/probe-lease/release",
+    ] {
+        let url = format!("http://127.0.0.1:{admin_port}{path}");
+        let missing_auth = client
+            .post(&url)
+            .json(&json!({}))
+            .send()
+            .context("failed to call legacy health route without auth")?;
+        assert_eq!(missing_auth.status().as_u16(), 401);
+
+        let retired = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .header("x-palyra-principal", "user:ops")
+            .header("x-palyra-device-id", DEVICE_ID)
+            .json(&json!({}))
+            .send()
+            .context("failed to call retired health route")?;
+        assert_eq!(retired.status().as_u16(), 410);
+        let payload =
+            retired.json::<Value>().context("failed to parse retired health route response")?;
+        assert_eq!(
+            payload.get("code").and_then(Value::as_str),
+            Some("runtime_health_legacy_endpoint_retired")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn admin_runtime_health_quarantine_clear_rejects_unauthorized_and_invalid_requests_without_audit(
+) -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!(
+        "http://127.0.0.1:{admin_port}/admin/v1/runtime-health/provider:deterministic/quarantine/clear"
+    );
+    // Every spawned fixture owns a fresh journal, so startup activates the
+    // deterministic provider under component generation one.
+    let valid_payload = json!({
+        "expected_generation": 1,
+        "reason_code": "runtime.health.operator_clear",
+    });
+
+    let missing_auth = client
+        .post(&url)
+        .json(&valid_payload)
+        .send()
+        .context("failed to call quarantine clear without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401);
+
+    let incorrect_bound_principal = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "admin:not-bound")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&valid_payload)
+        .send()
+        .context("failed to call quarantine clear with an incorrect bound principal")?;
+    assert_eq!(incorrect_bound_principal.status().as_u16(), 401);
+
+    let caller_supplied_authorization_evidence = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&json!({
+            "expected_generation": 1,
+            "reason_code": "runtime.health.operator_clear",
+            "authorization_evidence_sha256": "a".repeat(64),
+        }))
+        .send()
+        .context("failed to call quarantine clear with caller-supplied authorization evidence")?;
+    assert!(
+        matches!(caller_supplied_authorization_evidence.status().as_u16(), 400 | 422),
+        "unknown authorization evidence must be rejected before quarantine clear"
+    );
+
+    let stale_generation = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&json!({
+            "expected_generation": 2,
+            "reason_code": "runtime.health.operator_clear",
+        }))
+        .send()
+        .context("failed to call quarantine clear with a stale generation")?;
+    assert_eq!(stale_generation.status().as_u16(), 412);
+    assert!(
+        !admin_journal_contains_event(&client, admin_port, "runtime.health.quarantine_cleared")?,
+        "stale generation rejection must not append a clear audit event"
+    );
+
+    let invalid_state = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&valid_payload)
+        .send()
+        .context("failed to call quarantine clear for a healthy component")?;
+    assert_eq!(invalid_state.status().as_u16(), 412);
+    assert!(
+        !admin_journal_contains_event(&client, admin_port, "runtime.health.quarantine_cleared")?,
+        "invalid state rejection must not append a clear audit event"
+    );
+    Ok(())
+}
+
+#[test]
+fn admin_side_effect_resolution_requires_auth_and_validates_requests() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!(
+        "http://127.0.0.1:{admin_port}/admin/v1/side-effect-fences/operation-missing/resolve"
+    );
+    let payload = json!({
+        "expected_intent_sha256": "a".repeat(64),
+        "action": "reconciled",
+        "reason_code": "tool.effect.operator_reconciled",
+        "evidence_sha256": "b".repeat(64),
+    });
+
+    let missing_auth = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .context("failed to call side-effect resolution without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401);
+    assert_admin_console_security_headers(missing_auth.headers())?;
+
+    let malformed = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&json!({
+            "expected_intent_sha256": "not-a-digest",
+            "action": "reconciled",
+            "reason_code": "tool.effect.operator_reconciled",
+            "evidence_sha256": "b".repeat(64),
+        }))
+        .send()
+        .context("failed to call side-effect resolution with malformed digest")?;
+    assert_eq!(malformed.status().as_u16(), 400);
+
+    let missing = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&payload)
+        .send()
+        .context("failed to call side-effect resolution for unknown operation")?;
+    assert_eq!(missing.status().as_u16(), 404);
     Ok(())
 }
 
@@ -3381,6 +3768,37 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
         Some(0),
         "diagnostics should expose active session write lease count"
     );
+    assert!(
+        diagnostics_response
+            .pointer("/shared_runtime/networked_worker_dispatch_active_by_state")
+            .and_then(Value::as_object)
+            .is_some(),
+        "diagnostics should expose aggregate active networked-worker claim states"
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/shared_runtime/networked_worker_dispatch_delivery_by_disposition")
+            .and_then(Value::as_object)
+            .is_some(),
+        "diagnostics should expose aggregate networked-worker delivery dispositions"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/shared_runtime/networked_worker_dispatch_unresolved")
+            .and_then(Value::as_u64),
+        Some(0),
+        "fresh diagnostics should report no unresolved networked-worker claims"
+    );
+    assert_eq!(
+        diagnostics_response.pointer("/shared_runtime/delivery_attempt_id"),
+        None,
+        "shared runtime diagnostics must not expose delivery-attempt identities"
+    );
+    assert_eq!(
+        diagnostics_response.pointer("/shared_runtime/delivery_token"),
+        None,
+        "shared runtime diagnostics must not expose delivery tokens"
+    );
     assert_eq!(
         diagnostics_response
             .pointer("/feature_rollouts/session_queue_policy/config_path")
@@ -5829,6 +6247,222 @@ fn console_support_bundle_job_lifecycle_publishes_deterministic_completion_state
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ScriptedOpenAiResponse {
+    status_code: u16,
+    body: String,
+}
+
+impl ScriptedOpenAiResponse {
+    fn immediate(status_code: u16, body: String) -> Self {
+        Self { status_code, body }
+    }
+}
+
+type ScriptedOpenAiServerWithCapture =
+    (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>, thread::JoinHandle<()>);
+
+fn provider_health_probe_test_config(base_url: &str, api_key: &str) -> String {
+    format!(
+        r#"version = 1
+
+[model_provider]
+kind = "openai_compatible"
+openai_base_url = {base_url:?}
+allow_private_base_url = true
+openai_model = "probe-model"
+openai_api_key = {api_key:?}
+request_timeout_ms = 5000
+max_retries = 0
+circuit_breaker_failure_threshold = 1
+circuit_breaker_cooldown_ms = 1
+response_cache_enabled = false
+"#,
+    )
+}
+
+fn spawn_scripted_openai_server_with_request_capture(
+    responses: Vec<ScriptedOpenAiResponse>,
+) -> Result<ScriptedOpenAiServerWithCapture> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind scripted openai listener")?;
+    let address = listener.local_addr().context("failed to resolve scripted listener address")?;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_thread = Arc::clone(&request_count);
+    let captured_request_bodies = Arc::new(Mutex::new(Vec::new()));
+    let captured_request_bodies_for_thread = Arc::clone(&captured_request_bodies);
+    let handle = thread::spawn(move || {
+        for response_spec in responses {
+            let (mut stream, _) =
+                listener.accept().expect("scripted openai listener should accept connection");
+            request_count_for_thread.fetch_add(1, Ordering::Relaxed);
+            let request_body = read_http_request_body_for_scripted_server(&mut stream)
+                .unwrap_or_else(|error| {
+                    panic!("scripted openai request should be readable: {error:#}")
+                });
+            let request_body = String::from_utf8(request_body)
+                .expect("scripted openai request body should be UTF-8 JSON");
+            captured_request_bodies_for_thread
+                .lock()
+                .expect("captured request bodies lock should not poison")
+                .push(request_body);
+            let reason = match response_spec.status_code {
+                200 => "OK",
+                400 => "Bad Request",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_spec.status_code,
+                response_spec.body.len(),
+                response_spec.body
+            );
+            use std::io::Write as _;
+            stream.write_all(response.as_bytes()).expect("scripted response should write");
+            stream.flush().expect("scripted response should flush");
+        }
+    });
+    Ok((format!("http://{address}/v1"), captured_request_bodies, request_count, handle))
+}
+
+fn read_http_request_body_for_scripted_server(stream: &mut std::net::TcpStream) -> Result<Vec<u8>> {
+    use std::io::{BufRead as _, BufReader};
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure scripted server read timeout")?;
+    let mut reader = BufReader::new(stream);
+    let mut content_length = 0_usize;
+    loop {
+        let mut line = String::new();
+        let bytes_read =
+            reader.read_line(&mut line).context("failed to read scripted request line")?;
+        if bytes_read == 0 || line == "\r\n" {
+            break;
+        }
+        let line_trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some((name, value)) = line_trimmed.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length =
+                    value.trim().parse::<usize>().context("invalid Content-Length in request")?;
+            }
+        }
+    }
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body).context("failed to read scripted request body")?;
+    Ok(body)
+}
+
+fn expire_provider_health_cooldown(
+    client: &Client,
+    admin_port: u16,
+    provider_id: &str,
+    cookie: &str,
+    csrf_token: &str,
+) -> Result<()> {
+    let created = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&json!({"session_label": "provider-health-probe-admission"}))
+        .send()
+        .context("failed to create chat session before provider health failure")?
+        .error_for_status()
+        .context("chat session create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse chat session create response")?;
+    let session_id = created
+        .pointer("/session/session_id")
+        .and_then(Value::as_str)
+        .context("created chat session response missing session_id")?;
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/messages/stream"
+        ))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&json!({"text": "caller text must not become the host probe"}))
+        .send()
+        .context("failed to dispatch provider call before health probe")?
+        .error_for_status()
+        .context("provider failure stream returned non-success HTTP status")?;
+    let stream_body = response.text().context("failed to read provider failure stream body")?;
+    assert!(stream_body.contains("\"type\":\"complete\""));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let diagnostics = console_shared_runtime_diagnostics(client, admin_port, cookie)?;
+        if shared_runtime_health_state_count(&diagnostics, "cooldown") == 1 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "provider {provider_id} did not enter cooldown before probe; diagnostics={diagnostics}"
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn post_admin_runtime_health_probe(
+    client: &Client,
+    admin_port: u16,
+    provider_id: &str,
+) -> Result<Value> {
+    client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/admin/v1/runtime-health/provider:{provider_id}/probe"
+        ))
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&json!({"reason_code": "runtime.health.operator_probe"}))
+        .send()
+        .context("failed to call provider runtime health probe")?
+        .error_for_status()
+        .context("provider runtime health probe returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse provider runtime health probe response")
+}
+
+fn console_shared_runtime_diagnostics(
+    client: &Client,
+    admin_port: u16,
+    cookie: &str,
+) -> Result<Value> {
+    client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/diagnostics"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to load shared runtime diagnostics")?
+        .error_for_status()
+        .context("shared runtime diagnostics returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse shared runtime diagnostics")
+}
+
+fn shared_runtime_health_state_count(diagnostics: &Value, state: &str) -> u64 {
+    diagnostics
+        .pointer(format!("/shared_runtime/component_health_by_state/{state}").as_str())
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn shared_runtime_probe_settlement_count(diagnostics: &Value, disposition: &str) -> u64 {
+    diagnostics
+        .pointer(
+            format!("/shared_runtime/health_probe_settlements_by_disposition/{disposition}")
+                .as_str(),
+        )
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     spawn_palyrad_with_dynamic_ports_with_env(&[])
 }
@@ -6142,6 +6776,36 @@ fn wait_for_admin_journal_event(
         thread::sleep(Duration::from_millis(250));
     }
     anyhow::bail!("timed out waiting for journal event {event_name}");
+}
+
+fn admin_journal_contains_event(
+    client: &Client,
+    admin_port: u16,
+    event_name: &str,
+) -> Result<bool> {
+    let response = client
+        .get(format!("http://127.0.0.1:{admin_port}/admin/v1/journal/recent?limit=64"))
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to load admin journal recent for audit assertion")?
+        .error_for_status()
+        .context("admin journal recent returned non-success status for audit assertion")?
+        .json::<Value>()
+        .context("failed to parse admin journal recent for audit assertion")?;
+    Ok(response.get("events").and_then(Value::as_array).is_some_and(|events| {
+        events.iter().any(|event| {
+            event
+                .get("payload_json")
+                .and_then(Value::as_str)
+                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                .is_some_and(|payload| {
+                    payload.get("event").and_then(Value::as_str) == Some(event_name)
+                })
+        })
+    }))
 }
 
 fn unique_temp_journal_db_path() -> PathBuf {

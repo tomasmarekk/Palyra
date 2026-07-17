@@ -31,7 +31,7 @@ use crate::{
 };
 use crate::{
     config::FeatureRolloutsConfig,
-    gateway::GatewayStatusSnapshot,
+    gateway::{GatewayStatusSnapshot, ManagedRuntimeHealthSnapshot},
     journal::{ToolJobRecord, ToolJobState},
     model_provider::ProviderRuntimeMetricsSnapshot,
     routines::{
@@ -110,8 +110,18 @@ const RUN_STAGE_NAMES: &[&str] = &[
 ];
 const FORBIDDEN_METRIC_LABEL_KEYS: &[&str] =
     &["run_id", "session_id", "tool_call_id", "path", "principal", "raw_user", "prompt"];
-const BOUNDED_METRIC_LABEL_KEYS: &[&str] =
-    &["component", "provider_kind", "state", "stat", "status", "token_type"];
+const BOUNDED_METRIC_LABEL_KEYS: &[&str] = &[
+    "action",
+    "boundary",
+    "component",
+    "phase",
+    "provider_kind",
+    "scope",
+    "state",
+    "stat",
+    "status",
+    "token_type",
+];
 
 /// Builds the metadata-only runtime invariant and error-taxonomy diagnostics contract.
 ///
@@ -951,6 +961,14 @@ pub(crate) fn build_metrics_catalog_snapshot() -> Value {
             {"name": "palyra_tool_execution_attempts_total", "type": "counter", "labels": []},
             {"name": "palyra_tool_execution_failures_total", "type": "counter", "labels": []},
             {"name": "palyra_tool_execution_timeouts_total", "type": "counter", "labels": []},
+            {"name": "palyra_run_stream_backpressure_coalesced_total", "type": "counter", "labels": ["boundary", "action"]},
+            {"name": "palyra_run_stream_deadline_exceeded_total", "type": "counter", "labels": ["scope"]},
+            {"name": "palyra_run_stream_approval_cancelled_total", "type": "counter", "labels": []},
+            {"name": "palyra_run_stream_terminal_delivery_timeouts_total", "type": "counter", "labels": []},
+            {"name": "palyra_run_interrupt_latency_observations_total", "type": "counter", "labels": ["phase"], "reason_code": "runtime.interrupt_latency.observed"},
+            {"name": "palyra_run_interrupt_latency_ms_total", "type": "counter", "labels": ["phase"], "reason_code": "runtime.interrupt_latency.observed"},
+            {"name": "palyra_run_interrupt_latency_ms_max", "type": "gauge", "labels": ["phase"], "reason_code": "runtime.interrupt_latency.observed"},
+            {"name": "palyra_run_interrupt_latency_clamped_total", "type": "counter", "labels": ["phase"], "reason_code": "runtime.interrupt_latency.clamped"},
             {"name": "palyra_tool_job_state", "type": "gauge", "labels": ["state"]},
             {"name": "palyra_memory_recall_requests_total", "type": "counter", "labels": []},
             {"name": "palyra_channel_delivery_events_total", "type": "counter", "labels": ["status"]},
@@ -1251,6 +1269,7 @@ fn classify_stage_timeout(
 pub(crate) fn render_prometheus_metrics(
     status: &GatewayStatusSnapshot,
     tool_jobs: &[ToolJobRecord],
+    managed_runtime_health: &ManagedRuntimeHealthSnapshot,
 ) -> String {
     let mut output = String::new();
     push_help(
@@ -1411,6 +1430,105 @@ pub(crate) fn render_prometheus_metrics(
     );
     push_help(
         &mut output,
+        "palyra_run_stream_backpressure_coalesced_total",
+        "Process progress snapshots coalesced by the bounded run-stream mailbox.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_run_stream_backpressure_coalesced_total",
+        &[("boundary", "process_progress"), ("action", "coalesce_progress")],
+        status.counters.run_stream_progress_coalesced,
+    );
+    push_help(
+        &mut output,
+        "palyra_run_stream_deadline_exceeded_total",
+        "Run-stream child operations stopped by inherited deadlines.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_run_stream_deadline_exceeded_total",
+        &[("scope", "tool_execution")],
+        status.counters.run_stream_tool_deadline_exceeded,
+    );
+    push_help(
+        &mut output,
+        "palyra_run_stream_approval_cancelled_total",
+        "Pending tool approvals resolved fail-closed after run cancellation.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_run_stream_approval_cancelled_total",
+        &[],
+        status.counters.run_stream_approval_cancelled,
+    );
+    push_help(
+        &mut output,
+        "palyra_run_stream_terminal_delivery_timeouts_total",
+        "Terminal client deliveries that exceeded their bounded delivery scope after settlement.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_run_stream_terminal_delivery_timeouts_total",
+        &[],
+        status.counters.run_stream_terminal_delivery_timeouts,
+    );
+    push_help(
+        &mut output,
+        "palyra_run_interrupt_latency_observations_total",
+        "Observed run interrupts by bounded active phase.",
+        "counter",
+    );
+    push_help(
+        &mut output,
+        "palyra_run_interrupt_latency_ms_total",
+        "Cumulative request-to-observation interrupt latency by bounded active phase.",
+        "counter",
+    );
+    push_help(
+        &mut output,
+        "palyra_run_interrupt_latency_ms_max",
+        "Maximum bounded request-to-observation interrupt latency by active phase.",
+        "gauge",
+    );
+    push_help(
+        &mut output,
+        "palyra_run_interrupt_latency_clamped_total",
+        "Interrupt latency samples clamped for clock skew or the diagnostics bound.",
+        "counter",
+    );
+    for phase in &status.counters.run_interrupt_latency.phases {
+        let labels = [("phase", phase.phase.as_str())];
+        push_sample(
+            &mut output,
+            "palyra_run_interrupt_latency_observations_total",
+            &labels,
+            phase.observations,
+        );
+        push_sample(
+            &mut output,
+            "palyra_run_interrupt_latency_ms_total",
+            &labels,
+            phase.total_latency_ms,
+        );
+        push_sample(
+            &mut output,
+            "palyra_run_interrupt_latency_ms_max",
+            &labels,
+            phase.max_latency_ms,
+        );
+        push_sample(
+            &mut output,
+            "palyra_run_interrupt_latency_clamped_total",
+            &labels,
+            phase.clamped_observations,
+        );
+    }
+    push_help(
+        &mut output,
         "palyra_tool_job_state",
         "Current durable tool jobs by bounded lifecycle state.",
         "gauge",
@@ -1455,6 +1573,46 @@ pub(crate) fn render_prometheus_metrics(
         "palyra_channel_delivery_events_total",
         &[("status", "failed")],
         status.counters.channel_reply_failures,
+    );
+    push_help(
+        &mut output,
+        "palyra_runtime_health_components",
+        "Current shared-health components by bounded runtime family.",
+        "gauge",
+    );
+    for (family, count) in &managed_runtime_health.components_by_family {
+        push_sample(
+            &mut output,
+            "palyra_runtime_health_components",
+            &[("family", family.as_str())],
+            *count,
+        );
+    }
+    push_help(
+        &mut output,
+        "palyra_runtime_health_state",
+        "Current shared-health components by bounded health state.",
+        "gauge",
+    );
+    for (state, count) in &managed_runtime_health.components_by_state {
+        push_sample(
+            &mut output,
+            "palyra_runtime_health_state",
+            &[("state", state.as_str())],
+            *count,
+        );
+    }
+    push_help(
+        &mut output,
+        "palyra_runtime_health_stale_suppressions_total",
+        "Managed runtime callbacks suppressed after their exact generation was superseded.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_runtime_health_stale_suppressions_total",
+        &[],
+        managed_runtime_health.stale_suppressions_total,
     );
     push_help(
         &mut output,
@@ -2823,10 +2981,35 @@ mod tests {
             &[("provider_kind", "deterministic_provider")],
             2,
         );
+        push_sample(
+            &mut rendered,
+            "palyra_run_stream_backpressure_coalesced_total",
+            &[("boundary", "process_progress"), ("action", "coalesce_progress")],
+            3,
+        );
+        push_sample(
+            &mut rendered,
+            "palyra_run_stream_deadline_exceeded_total",
+            &[("scope", "tool_execution")],
+            5,
+        );
+        push_sample(
+            &mut rendered,
+            "palyra_run_interrupt_latency_observations_total",
+            &[("phase", "approval")],
+            1,
+        );
 
         assert!(rendered.contains(
             "palyra_model_provider_requests_total{provider_kind=\"deterministic_provider\"} 2"
         ));
+        assert!(rendered.contains(
+            "palyra_run_stream_backpressure_coalesced_total{boundary=\"process_progress\",action=\"coalesce_progress\"} 3"
+        ));
+        assert!(rendered
+            .contains("palyra_run_stream_deadline_exceeded_total{scope=\"tool_execution\"} 5"));
+        assert!(rendered
+            .contains("palyra_run_interrupt_latency_observations_total{phase=\"approval\"} 1"));
         assert!(!rendered.contains("principal"));
         assert!(!rendered.contains("session_id"));
     }
@@ -2862,11 +3045,26 @@ mod tests {
     #[test]
     fn metrics_label_validator_rejects_high_cardinality_and_secret_values() {
         assert!(validate_metric_labels(&[("provider_kind", "openai-compatible")]).is_ok());
+        assert!(validate_metric_labels(&[
+            ("boundary", "process_progress"),
+            ("action", "coalesce_progress"),
+            ("scope", "tool_execution"),
+            ("phase", "delivery_terminal"),
+        ])
+        .is_ok());
         assert!(validate_metric_labels(&[("principal", "user:alice")]).is_err());
         assert!(validate_metric_labels(&[("provider_kind", "01ARZ3NDEKTSV4RRFFQ69G5FB0")]).is_err());
         assert!(validate_metric_labels(&[("provider_kind", "C:\\Users\\Palo\\secret")]).is_err());
         assert!(validate_metric_labels(&[("provider_kind", "Bearer raw")]).is_err());
-        assert_eq!(build_metrics_catalog_snapshot()["series_cap"], PROMETHEUS_SERIES_CAP);
+        let catalog = build_metrics_catalog_snapshot();
+        assert_eq!(catalog["series_cap"], PROMETHEUS_SERIES_CAP);
+        assert!(catalog["metrics"].as_array().is_some_and(|metrics| {
+            metrics.iter().any(|metric| {
+                metric["name"] == "palyra_run_interrupt_latency_observations_total"
+                    && metric["reason_code"] == "runtime.interrupt_latency.observed"
+                    && metric["labels"] == json!(["phase"])
+            })
+        }));
     }
 
     #[test]

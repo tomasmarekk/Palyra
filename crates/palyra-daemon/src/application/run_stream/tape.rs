@@ -3,13 +3,14 @@
 //! Every observable run-stream event (status, model token, tool proposal,
 //! approval request/response, decision, result, attestation) is sent to the
 //! client and appended to the orchestrator tape so deterministic replay can
-//! reconstruct the run. The `send_*_with_tape` helpers enforce the ordering
-//! invariant: the wire event is delivered first, then the tape row is
-//! appended, and `tape_seq` only advances after a successful append. All
+//! reconstruct the run. Status events become durable before wire delivery;
+//! other paired event helpers retain their local ordering contract while the
+//! shared runtime generation guard is authoritative before tape mutation. All
 //! model- and client-visible text passes redaction before either sink.
 
 use std::sync::Arc;
 
+use palyra_common::runtime_contracts::CancellationContextV1;
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
 use palyra_common::{
     qa_fault_injection::{QaFaultAction, QaFaultDirective},
@@ -22,8 +23,11 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use crate::{
-    application::session_compaction::{
-        apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
+    application::{
+        run_stream::flow_control::RunStreamFlowControl,
+        session_compaction::{
+            apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
+        },
     },
     gateway::{
         approval_prompt_message, approval_scope_to_proto, status_kind_name, GatewayRuntimeState,
@@ -186,7 +190,7 @@ fn redact_run_stream_json_value(value: &mut Value) -> bool {
     }
 }
 
-fn redacted_run_stream_output_json(output_json: &[u8]) -> Vec<u8> {
+pub(crate) fn redacted_run_stream_output_json(output_json: &[u8]) -> Vec<u8> {
     let mut value = serde_json::from_slice::<Value>(output_json).unwrap_or_else(|_| {
         json!({
             "raw": redact_run_stream_text(String::from_utf8_lossy(output_json).as_ref()),
@@ -296,7 +300,7 @@ fn tool_decision_event(
     }
 }
 
-fn tool_result_event(
+pub(crate) fn tool_result_event(
     run_id: String,
     proposal_id: impl Into<String>,
     success: bool,
@@ -315,7 +319,7 @@ fn tool_result_event(
     }
 }
 
-fn tool_attestation_event(
+pub(crate) fn tool_attestation_event(
     run_id: String,
     proposal_id: impl Into<String>,
     attestation_id: impl Into<String>,
@@ -378,14 +382,13 @@ pub(crate) async fn append_runtime_decision_tape_event(
     Ok(())
 }
 
-/// Sends a status event to the client and appends the matching tape row.
+/// Appends a status event to the durable tape, then sends the matching wire event.
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` with
-/// [`RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE`] when the client stream has
-/// dropped, or the journal error when the tape append fails (the wire event
-/// has already been delivered in that case).
+/// Returns the journal error before delivery when persistence fails, or
+/// `Status::cancelled` with [`RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE`] when
+/// the client stream has dropped after the event became durable.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn send_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -399,19 +402,43 @@ pub(crate) async fn send_status_with_tape(
         .await
 }
 
-/// Sends a terminal status and exposes the wire-before-tape uncertainty gap
-/// to the authenticated fault adapter.
+/// Sends a terminal status that the journal settlement already persisted.
+///
+/// The caller supplies the next tape sequence after settlement so subsequent
+/// diagnostic events cannot reuse the terminal row's sequence. Only the wire
+/// send is deadline-bounded; durable settlement remains authoritative.
+///
+/// # Errors
+/// Returns `cancelled` when the client stream is closed, `deadline_exceeded`
+/// when the protected delivery scope expires, or a fault-injection error.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn send_final_status_with_tape(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_settled_final_status(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
+    settled_tape_sequence: i64,
     kind: common_v1::stream_status::StatusKind,
     message: &str,
+    delivery: &CancellationContextV1,
 ) -> Result<(), Status> {
-    send_status_with_tape_boundary(sender, runtime_state, run_id, tape_seq, kind, message, true)
-        .await
+    *tape_seq = (*tape_seq).max(settled_tape_sequence.saturating_add(1));
+    apply_final_delivery_fault(runtime_state, run_id)?;
+    let delivery_timeout = RunStreamFlowControl::remaining_for_new_work(delivery)?;
+    match tokio::time::timeout(
+        delivery_timeout,
+        sender.send(Ok(status_event(run_id.to_owned(), kind, message.to_owned()))),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
+        Err(_) => {
+            runtime_state.record_run_stream_terminal_delivery_timeout();
+            Err(Status::deadline_exceeded("run stream terminal delivery timed out"))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,13 +452,6 @@ async fn send_status_with_tape_boundary(
     final_status: bool,
 ) -> Result<(), Status> {
     let event = status_event(run_id.to_owned(), kind, message.to_owned());
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
-    if final_status {
-        apply_final_delivery_fault(runtime_state, run_id)?;
-    }
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -441,6 +461,13 @@ async fn send_status_with_tape_boundary(
         })
         .await?;
     *tape_seq += 1;
+    if final_status {
+        apply_final_delivery_fault(runtime_state, run_id)?;
+    }
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     Ok(())
 }
 
@@ -1091,6 +1118,41 @@ pub(crate) async fn send_tool_decision_with_tape(
     .await
 }
 
+/// Appends one redacted tool-result tape event without wire delivery.
+///
+/// # Errors
+/// Returns the journal error when persistence fails.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_tool_result_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    success: bool,
+    output_json: &[u8],
+    error: &str,
+) -> Result<(), Status> {
+    let safe_output_json = redacted_run_stream_output_json(output_json);
+    let safe_error = redact_run_stream_text(error);
+    let payload_json = tool_result_tape_payload(
+        proposal_id,
+        success,
+        safe_output_json.as_slice(),
+        safe_error.as_str(),
+    );
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_result".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
 /// Sends a redacted tool-result event to the client and appends the tape row.
 ///
 /// The raw output and error are redacted once and the same redacted bytes
@@ -1140,6 +1202,46 @@ pub(crate) async fn send_tool_result_with_tape(
             seq: *tape_seq,
             event_type: "tool_result".to_owned(),
             payload_json,
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+/// Appends one tool-attestation tape event without wire delivery.
+///
+/// # Errors
+/// Returns the journal error when persistence fails.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_tool_attestation_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    attestation_id: &str,
+    execution_sha256: &str,
+    executed_at_unix_ms: i64,
+    timed_out: bool,
+    executor: &str,
+    sandbox_enforcement: &str,
+    execution_manifest: Option<&ExecutionAttestationManifest>,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_attestation".to_owned(),
+            payload_json: tool_attestation_tape_payload(ToolAttestationTapePayload {
+                proposal_id,
+                attestation_id,
+                execution_sha256,
+                executed_at_unix_ms,
+                timed_out,
+                executor,
+                sandbox_enforcement,
+                execution_manifest,
+            }),
         })
         .await?;
     *tape_seq += 1;
@@ -1206,7 +1308,10 @@ pub(crate) async fn send_tool_attestation_with_tape(
 // budget exhaustion, so the tape payload re-derives the real lifecycle kind
 // from the message. These payload shapes are pinned by replay fixtures; keep
 // field names and values stable.
-fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
+pub(crate) fn status_tape_payload(
+    kind: common_v1::stream_status::StatusKind,
+    message: &str,
+) -> String {
     if kind == common_v1::stream_status::StatusKind::Failed && message == CANCELLED_REASON {
         return json!({
             "kind": "cancelled",
@@ -1229,6 +1334,14 @@ fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str
             "reason_code": needs_continuation_reason_code(message),
             "partial": true,
             "continuation_required": true,
+        })
+        .to_string();
+    }
+    if kind == common_v1::stream_status::StatusKind::InProgress && message == "streaming" {
+        return json!({
+            "kind": status_kind_name(kind),
+            "message": message,
+            "lifecycle_state": "in_progress",
         })
         .to_string();
     }
@@ -1380,7 +1493,7 @@ fn tool_decision_tape_payload(
     .to_string()
 }
 
-fn tool_result_tape_payload(
+pub(crate) fn tool_result_tape_payload(
     proposal_id: &str,
     success: bool,
     output_json: &[u8],
@@ -1429,18 +1542,18 @@ fn tool_result_error_kind(error: &str) -> &'static str {
     }
 }
 
-struct ToolAttestationTapePayload<'a> {
-    proposal_id: &'a str,
-    attestation_id: &'a str,
-    execution_sha256: &'a str,
-    executed_at_unix_ms: i64,
-    timed_out: bool,
-    executor: &'a str,
-    sandbox_enforcement: &'a str,
-    execution_manifest: Option<&'a ExecutionAttestationManifest>,
+pub(crate) struct ToolAttestationTapePayload<'a> {
+    pub(crate) proposal_id: &'a str,
+    pub(crate) attestation_id: &'a str,
+    pub(crate) execution_sha256: &'a str,
+    pub(crate) executed_at_unix_ms: i64,
+    pub(crate) timed_out: bool,
+    pub(crate) executor: &'a str,
+    pub(crate) sandbox_enforcement: &'a str,
+    pub(crate) execution_manifest: Option<&'a ExecutionAttestationManifest>,
 }
 
-fn tool_attestation_tape_payload(input: ToolAttestationTapePayload<'_>) -> String {
+pub(crate) fn tool_attestation_tape_payload(input: ToolAttestationTapePayload<'_>) -> String {
     let mut payload = json!({
         "proposal_id": input.proposal_id,
         "attestation_id": input.attestation_id,
@@ -1535,6 +1648,23 @@ mod tests {
         assert_eq!(value["output_json"], serde_json::json!({}));
         assert_eq!(value["diagnostic"]["error_kind"], "validation_error");
         assert_eq!(value["diagnostic"]["message"], "at timestamp must be in the future");
+    }
+
+    #[test]
+    fn only_streaming_status_marks_run_lifecycle_start() {
+        let started =
+            status_tape_payload(common_v1::stream_status::StatusKind::InProgress, "streaming");
+        let progress = status_tape_payload(
+            common_v1::stream_status::StatusKind::InProgress,
+            "progress:agent_loop.turn_started",
+        );
+        let started: Value =
+            serde_json::from_str(started.as_str()).expect("started payload should be json");
+        let progress: Value =
+            serde_json::from_str(progress.as_str()).expect("progress payload should be json");
+
+        assert_eq!(started["lifecycle_state"], "in_progress");
+        assert!(progress["lifecycle_state"].is_null());
     }
 
     #[test]

@@ -43,8 +43,20 @@ pub(crate) struct RouteMessageStructuredOutput {
     pub(crate) a2ui_update: Option<common_v1::A2uiUpdate>,
 }
 
-/// Final result of provider-response processing: the assembled reply text,
-/// structured output, and token usage to account against the run.
+/// Final result of provider-response processing.
+#[derive(Debug, Clone)]
+pub(crate) enum RouteProviderResponseProcessingOutcome {
+    /// The response was fully processed into deliverable output.
+    Completed(RouteProviderResponseOutcome),
+    /// A sticky terminal outcome won while provider events were being processed.
+    Terminal {
+        state: crate::orchestrator::RunLifecycleState,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+}
+
+/// Assembled reply text, structured output, and token usage for one completed response.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteProviderResponseOutcome {
     pub(crate) reply_text: String,
@@ -156,8 +168,8 @@ fn build_route_message_first_structured_json(template: &RouteMessageOutputTempla
 ///
 /// # Errors
 /// Returns a status when event processing, tool execution bookkeeping, or
-/// the tape append of the provider turn output fails, or when the shared
-/// surface reports a cancelled outcome (impossible on this surface).
+/// the tape append of the provider turn output fails. Sticky terminal outcomes
+/// are returned explicitly and must suppress reply assembly and delivery.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_route_provider_response(
@@ -169,14 +181,29 @@ pub(crate) async fn process_route_provider_response(
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     json_mode_requested: bool,
     response_prefix: Option<&str>,
+    flow_control: &crate::application::run_stream::flow_control::RunStreamFlowControl,
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
-) -> Result<RouteProviderResponseOutcome, Status> {
+) -> Result<RouteProviderResponseProcessingOutcome, Status> {
     let provider_output = bounded_provider_turn_output_for_persistence(&provider_response.output);
     let mut reply_text = String::new();
     let mut summary_tokens = Vec::new();
     let mut ignored_tool_results = Vec::new();
+    if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
+        return Ok(RouteProviderResponseProcessingOutcome::Terminal {
+            state: crate::orchestrator::RunLifecycleState::Cancelled,
+            prompt_tokens: provider_response.prompt_tokens,
+            completion_tokens: provider_response.completion_tokens,
+        });
+    }
     for event in provider_response.events {
+        if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
+            return Ok(RouteProviderResponseProcessingOutcome::Terminal {
+                state: crate::orchestrator::RunLifecycleState::Cancelled,
+                prompt_tokens: provider_response.prompt_tokens,
+                completion_tokens: provider_response.completion_tokens,
+            });
+        }
         match process_provider_event_for_surface(
             runtime_state,
             session_id,
@@ -189,21 +216,28 @@ pub(crate) async fn process_route_provider_response(
             tape_seq,
             ProviderEventSurface::RouteMessage(RouteMessageProviderEventSurface {
                 request_context: route_request_context,
+                flow_control,
                 reply_text: &mut reply_text,
             }),
         )
         .await?
         {
             RunStreamProviderEventOutcome::Continue => {}
-            RunStreamProviderEventOutcome::Cancelled => {
-                // The route surface has no cancellation source, so a
-                // cancelled outcome can only mean a bug in the shared
-                // provider-event machinery.
-                return Err(Status::internal(
-                    "route provider event processing unexpectedly returned cancelled outcome",
-                ));
+            RunStreamProviderEventOutcome::Terminal(state) => {
+                return Ok(RouteProviderResponseProcessingOutcome::Terminal {
+                    state,
+                    prompt_tokens: provider_response.prompt_tokens,
+                    completion_tokens: provider_response.completion_tokens,
+                });
             }
         }
+    }
+    if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
+        return Ok(RouteProviderResponseProcessingOutcome::Terminal {
+            state: crate::orchestrator::RunLifecycleState::Cancelled,
+            prompt_tokens: provider_response.prompt_tokens,
+            completion_tokens: provider_response.completion_tokens,
+        });
     }
     persist_route_provider_turn_output(runtime_state, run_id, tape_seq, &provider_output).await?;
     // Reply precedence: the turn's consolidated full text leads, any text
@@ -231,12 +265,12 @@ pub(crate) async fn process_route_provider_response(
         reply_text = format!("{prefix}{reply_text}");
     }
 
-    Ok(RouteProviderResponseOutcome {
+    Ok(RouteProviderResponseProcessingOutcome::Completed(RouteProviderResponseOutcome {
         reply_text,
         structured_output,
         prompt_tokens: provider_response.prompt_tokens,
         completion_tokens: provider_response.completion_tokens,
-    })
+    }))
 }
 
 /// Appends the size-bounded, redacted provider turn output to the tape.

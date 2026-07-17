@@ -39,6 +39,12 @@ use palyra_common::{
     build_metadata,
     process_runner_input::{parse_process_runner_tool_input, ProcessRunnerFacadeMapping},
     redaction::redact_diagnostic_text,
+    runtime_contracts::{
+        CleanupOutcome, CleanupReportV1, CleanupStepDisposition, CleanupStepKind,
+        CleanupStepRecord, ProcessLeaseV1, ProcessOwnershipKind, ProcessProvenance,
+        RuntimeHandleDescriptorV1, RuntimeHandleKind, RuntimeHandleState, RuntimeInstanceId,
+        RuntimeLeaseId, RuntimeRunId, RuntimeSessionId, RUNTIME_HANDLE_SCHEMA_VERSION,
+    },
     validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
@@ -101,17 +107,21 @@ use crate::{
         MemoryMaintenanceRequest, MemoryMaintenanceStatus, MemoryPurgeRequest,
         MemoryRetentionPolicy, MemorySearchHit, MemorySearchRequest, MemorySource,
         OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
-        OrchestratorSessionRecord, OrchestratorSessionResolveOutcome,
-        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
-        OrchestratorUsageDelta, SkillStatusRecord, SkillStatusUpsertRequest,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionRecord,
+        OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
+        OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
+        SkillStatusRecord, SkillStatusUpsertRequest,
     },
     media::MediaRuntimeConfig,
     model_provider::{
         AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
         ProviderRequest, ProviderStatusSnapshot,
     },
-    orchestrator::{RunLifecycleState, RunStateMachine, RunTransition},
-    sandbox_runner::ProcessProgressSink,
+    orchestrator::{RunLifecycleState, RunStateMachine},
+    sandbox_runner::{
+        BackgroundProcessRegistrationFence, BackgroundProcessRegistrationRequest,
+        ProcessProgressSink, SandboxProcessRunError, SandboxProcessRunErrorKind,
+    },
     tool_protocol::{
         build_tool_execution_outcome, execute_tool_call, tool_policy_snapshot, ToolCallConfig,
         ToolCallPolicySnapshot, ToolExecutionOutcome,
@@ -313,7 +323,7 @@ mod canvas;
 mod common;
 mod cron_support;
 mod messages;
-mod runtime;
+pub(crate) mod runtime;
 mod util;
 mod vault;
 
@@ -533,6 +543,12 @@ pub(crate) async fn await_tool_approval_response(
                 }
             }
             () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL) => {
+                if runtime_state
+                    .is_orchestrator_cancel_requested(expected_run_id.to_owned())
+                    .await?
+                {
+                    return Err(Status::cancelled(CANCELLED_REASON));
+                }
                 if let Some(outcome) =
                     resolved_tool_approval_record_outcome(runtime_state, approval_id).await?
                 {
@@ -655,6 +671,18 @@ async fn resolved_tool_approval_record_outcome(
     }))
 }
 
+pub(crate) const PROVIDER_RECONFIGURED_STATUS_MESSAGE: &str =
+    "model provider response was suppressed after provider reconfiguration";
+
+pub(crate) fn provider_reconfigured_status() -> Status {
+    Status::aborted(PROVIDER_RECONFIGURED_STATUS_MESSAGE)
+}
+
+pub(crate) fn is_provider_reconfigured_status(status: &Status) -> bool {
+    status.code() == tonic::Code::Aborted
+        && status.message() == PROVIDER_RECONFIGURED_STATUS_MESSAGE
+}
+
 /// Maps a model-provider failure onto the closest gRPC status so clients can
 /// distinguish retryable outages from auth, quota, and request-shape errors.
 pub(crate) fn map_provider_error(error: ProviderError) -> Status {
@@ -688,7 +716,13 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
                 classification.class.as_str(),
                 classification.recommended_action.as_str(),
             );
-            if retryable {
+            if classification
+                .provider_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("provider_attempt_admission_"))
+            {
+                Status::resource_exhausted(status_message)
+            } else if retryable {
                 Status::unavailable(status_message)
             } else if classification.class.as_str() == "auth_invalid"
                 || classification.class.as_str() == "auth_expired"
@@ -696,7 +730,7 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
                 Status::unauthenticated(status_message)
             } else if classification.class.as_str() == "permission_denied" {
                 Status::permission_denied(status_message)
-            } else if classification.class.as_str() == "quota_exceeded" {
+            } else if matches!(classification.class.as_str(), "quota" | "quota_exceeded") {
                 Status::resource_exhausted(status_message)
             } else if classification.class.as_str() == "context_window_exceeded" {
                 Status::invalid_argument(status_message)
@@ -756,6 +790,30 @@ pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) backend_reason_code: &'a str,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedBackgroundProcessRegistration {
+    run_id: String,
+    session_id: RuntimeSessionId,
+    run_identity: RuntimeRunId,
+    generation: palyra_common::runtime_contracts::RuntimeGeneration,
+    instance_id: RuntimeInstanceId,
+    lease_id: RuntimeLeaseId,
+    state: Arc<Mutex<BackgroundProcessRegistrationState>>,
+}
+
+#[derive(Debug, Clone)]
+enum BackgroundProcessRegistrationState {
+    Pending,
+    Committed {
+        request: BackgroundProcessRegistrationRequest,
+        process: Box<RunOwnedBackgroundProcess>,
+    },
+    Failed {
+        request: BackgroundProcessRegistrationRequest,
+        error: SandboxProcessRunError,
+    },
+}
+
 /// Legacy tool-call counter shared between a run loop and nested tool
 /// programs.
 ///
@@ -768,6 +826,12 @@ pub(crate) struct ToolRuntimeDispatchControls {
     pub(crate) remaining_tool_budget: Option<SharedToolBudget>,
     pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
     pub(crate) process_progress_sink: Option<ProcessProgressSink>,
+    pub(crate) cancellation_context:
+        Option<palyra_common::runtime_contracts::CancellationContextV1>,
+    /// Direct Run-root authority for asynchronous children that may outlive the
+    /// ToolExecution scope which scheduled them.
+    pub(crate) child_task_parent_context:
+        Option<palyra_common::runtime_contracts::CancellationContextV1>,
 }
 
 /// Wraps an initial legacy counter in the shared handle.
@@ -793,6 +857,7 @@ pub(crate) struct ToolExecutionTraceContext<'a> {
 /// Convenience wrapper over
 /// [`execute_tool_with_runtime_dispatch_with_cancellation`] for call sites
 /// without a cancellation flag.
+#[cfg(test)]
 pub(crate) async fn execute_tool_with_runtime_dispatch(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -824,6 +889,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
 /// their resources (browser sessions, background PIDs) for terminal-run
 /// cleanup. Failures are reported inside [`ToolExecutionOutcome`], never as
 /// a panic or transport error.
+#[cfg(test)]
 pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -843,6 +909,8 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
             remaining_tool_budget,
             cancellation_requested,
             process_progress_sink: None,
+            cancellation_context: None,
+            child_task_parent_context: None,
         },
     )
     .await
@@ -863,6 +931,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             proposal_id,
             tool_name,
             input_json,
+            controls.cancellation_requested.clone(),
         )
         .await
     } else if context.execution_backend == ExecutionBackendPreference::Docker
@@ -889,6 +958,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             proposal_id,
             input_json,
             remaining_tool_budget,
+            controls.child_task_parent_context.as_ref(),
         )
         .await
     } else if tool_name == MEMORY_STATUS_TOOL_NAME {
@@ -981,6 +1051,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             tool_name,
             proposal_id,
             input_json,
+            controls.child_task_parent_context.as_ref(),
         )
         .await
     } else if tool_name == PLAN_MANAGE_TOOL_NAME {
@@ -1056,13 +1127,21 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await;
-        record_run_cleanup_resource_from_tool_outcome(
+        if let Err(error) = record_run_cleanup_resource_from_tool_outcome(
             runtime_state,
             context,
             tool_name,
             input_json,
             &outcome,
-        );
+            None,
+        ) {
+            warn!(
+                tool_name,
+                run_id = context.run_id,
+                error = %error,
+                "failed to register browser cleanup resource"
+            );
+        }
         outcome
     } else if tool_name == WORKSPACE_PATCH_TOOL_NAME {
         crate::application::tool_runtime::workspace_patch::execute_workspace_patch_tool(
@@ -1085,18 +1164,75 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if is_process_runner_run_tool(tool_name) {
         let facade_input_json = process_runner_input_with_facade_mapping(tool_name, input_json)
             .unwrap_or_else(|| input_json.to_vec());
-        let config = process_runner_tool_config_for_session(
+        let mut config = process_runner_tool_config_for_session(
             runtime_state,
             context,
             facade_input_json.as_slice(),
         )
         .await;
+        if let Some(cancellation) = controls.cancellation_context.as_ref() {
+            let remaining_ms = cancellation
+                .deadline_unix_ms
+                .map(|deadline| deadline.saturating_sub(current_unix_ms()))
+                .unwrap_or_else(|| i64::try_from(config.execution_timeout_ms).unwrap_or(i64::MAX));
+            if cancellation.reason.is_some() || remaining_ms <= 0 {
+                return build_tool_execution_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "process cancellation context no longer permits execution".to_owned(),
+                    true,
+                    crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+                    "none".to_owned(),
+                );
+            }
+            config.execution_timeout_ms =
+                config.execution_timeout_ms.min(u64::try_from(remaining_ms).unwrap_or(1));
+        }
         let execution_input_json = process_runner_input_with_launch_context_env(
             runtime_state,
             context,
             facade_input_json.as_slice(),
         )
         .await;
+        let ssh_health_authority = if context.execution_backend
+            == ExecutionBackendPreference::SshTunnel
+        {
+            let enabled_profiles = runtime_state
+                .config
+                .execution_backend_profiles
+                .profiles
+                .iter()
+                .filter(|profile| profile.enabled && profile.kind == "ssh_worker")
+                .collect::<Vec<_>>();
+            let [profile] = enabled_profiles.as_slice() else {
+                return execution_backend_target_config_error_outcome(
+                    context.execution_backend,
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    "SSH execution requires exactly one enabled ssh_worker profile".to_owned(),
+                );
+            };
+            match runtime_state
+                .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Ssh, profile.id.as_str())
+            {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    return execution_backend_health_blocked_outcome(
+                        context.execution_backend,
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        error.message(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let runner_registry = if matches!(
             context.execution_backend,
             ExecutionBackendPreference::Docker | ExecutionBackendPreference::SshTunnel
@@ -1106,6 +1242,13 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             ) {
                 Ok(registry) => registry,
                 Err(error) => {
+                    if let Some(authority) = ssh_health_authority.as_ref() {
+                        runtime_state.record_managed_runtime_health_observation(
+                            authority,
+                            false,
+                            "runtime.health.ssh_runner_configuration_failed",
+                        );
+                    }
                     return execution_backend_target_config_error_outcome(
                         context.execution_backend,
                         proposal_id,
@@ -1123,9 +1266,40 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         {
             Ok(runner) => runner,
             Err(error) => {
+                if let Some(authority) = ssh_health_authority.as_ref() {
+                    runtime_state.record_managed_runtime_health_observation(
+                        authority,
+                        false,
+                        "runtime.health.ssh_runner_selection_failed",
+                    );
+                }
                 return error.to_tool_execution_outcome(proposal_id, tool_name, input_json);
             }
         };
+        let prepared_background_registration =
+            if context.execution_backend == ExecutionBackendPreference::LocalSandbox {
+                match prepare_background_process_registration(
+                    runtime_state,
+                    context,
+                    execution_input_json.as_slice(),
+                ) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        return process_registration_precondition_failure_outcome(
+                            &config,
+                            proposal_id,
+                            tool_name,
+                            input_json,
+                            error,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+        let background_registration_fence = prepared_background_registration
+            .as_ref()
+            .map(|registration| background_process_registration_fence(runtime_state, registration));
         let outcome = runner
             .run_process(ExecutionBackendProcessRunRequest {
                 config: &config,
@@ -1135,16 +1309,59 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
                 vault: Some(runtime_state.vault.as_ref()),
                 cancellation_requested: controls.cancellation_requested,
                 process_progress_sink: controls.process_progress_sink,
+                background_registration_fence,
                 fault_injection: runtime_state.fault_injection.clone(),
             })
             .await;
-        record_run_cleanup_resource_from_tool_outcome(
+        if let Some(authority) = ssh_health_authority.as_ref() {
+            let error = outcome.error.to_ascii_lowercase();
+            let infrastructure_failure = !outcome.success
+                && (outcome.attestation.sandbox_enforcement == "ssh_worker_rpc_unavailable"
+                    || error.contains("tunnel")
+                    || error.contains("transport")
+                    || error.contains("disconnect")
+                    || error.contains("timeout"));
+            runtime_state.record_managed_runtime_health_observation(
+                authority,
+                !infrastructure_failure,
+                if infrastructure_failure {
+                    "runtime.health.ssh_transport_failed"
+                } else {
+                    "runtime.health.ssh_transport_observed"
+                },
+            );
+        }
+        if let Some(registration) = prepared_background_registration.as_ref() {
+            if let Err(error) =
+                settle_background_process_registration(runtime_state, registration, &outcome)
+            {
+                return background_process_registration_failure_outcome(
+                    &config,
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    &outcome,
+                    error,
+                );
+            }
+        }
+        if let Err(error) = record_run_cleanup_resource_from_tool_outcome(
             runtime_state,
             context,
             tool_name,
             input_json,
             &outcome,
-        );
+            prepared_background_registration.as_ref(),
+        ) {
+            return background_process_registration_failure_outcome(
+                &config,
+                proposal_id,
+                tool_name,
+                input_json,
+                &outcome,
+                error,
+            );
+        }
         record_process_run_verification_classification(
             runtime_state,
             context,
@@ -1246,12 +1463,22 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             }
         }
         let outcome = execute_tool_call(&config, proposal_id, tool_name, input_json).await;
-        if tool_name == PROCESS_STOP_TOOL_NAME
-            && outcome.success
-            && process_stop_outcome_verifies_tree_stopped(outcome.output_json.as_slice())
-        {
+        if tool_name == PROCESS_STOP_TOOL_NAME && outcome.success {
             if let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) {
-                runtime_state.forget_run_background_process(context.run_id, pid);
+                if let Err(error) = finalize_explicit_process_stop(
+                    runtime_state,
+                    context.run_id,
+                    pid,
+                    outcome.output_json.as_slice(),
+                ) {
+                    return process_stop_cleanup_persistence_failure_outcome(
+                        &config,
+                        proposal_id,
+                        input_json,
+                        &outcome,
+                        error,
+                    );
+                }
             }
         }
         outcome
@@ -1262,17 +1489,19 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     }
 }
 
-// Tracks run-owned resources (background PIDs, browser sessions) so
-// cleanup_run_resources can reap them when the run reaches a terminal state.
+// Tracks run-owned resources so cleanup_run_resources can reap them when the run reaches a
+// terminal state. Process handles are persisted before their result is acknowledged.
+#[allow(clippy::result_large_err)]
 fn record_run_cleanup_resource_from_tool_outcome(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     tool_name: &str,
     input_json: &[u8],
     outcome: &ToolExecutionOutcome,
-) {
+    prepared_background_registration: Option<&PreparedBackgroundProcessRegistration>,
+) -> Result<(), Status> {
     if !outcome.success {
-        return;
+        return Ok(());
     }
 
     match tool_name {
@@ -1281,12 +1510,20 @@ fn record_run_cleanup_resource_from_tool_outcome(
                 detached_background_process_from_tool_output(outcome.output_json.as_slice())
             {
                 runtime_state.record_run_detached_background_process(context.run_id, resource);
-                return;
+                return Ok(());
             }
-            if let Some(pid) =
-                background_process_pid_from_tool_output(outcome.output_json.as_slice())
-            {
-                runtime_state.record_run_background_process(context.run_id, pid);
+            if let Some(process) = run_owned_background_process_from_tool_output(
+                runtime_state,
+                context,
+                outcome.output_json.as_slice(),
+                prepared_background_registration,
+            )? {
+                if runtime_state
+                    .run_background_process(context.run_id, process.ownership_root_pid())
+                    .is_none()
+                {
+                    runtime_state.record_run_background_process(context.run_id, process)?;
+                }
             }
         }
         BROWSER_SESSION_CREATE_TOOL_NAME => {
@@ -1304,6 +1541,7 @@ fn record_run_cleanup_resource_from_tool_outcome(
         }
         _ => {}
     }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1650,19 +1888,705 @@ fn process_run_output_artifact_refs(payload: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::result_large_err)]
+fn run_owned_background_process_from_tool_output(
+    runtime_state: &GatewayRuntimeState,
+    context: ToolRuntimeExecutionContext<'_>,
+    output_json: &[u8],
+    prepared_background_registration: Option<&PreparedBackgroundProcessRegistration>,
+) -> Result<Option<RunOwnedBackgroundProcess>, Status> {
+    let payload = serde_json::from_slice::<Value>(output_json)
+        .map_err(|error| Status::failed_precondition(format!("invalid process output: {error}")))?;
+    if payload.get("background").and_then(Value::as_bool) != Some(true)
+        || payload.get("run_owned_lifetime").and_then(Value::as_bool) == Some(false)
+    {
+        return Ok(None);
+    }
+    let ownership_root_pid =
+        process_ownership_root_pid_from_tool_output(&payload)?.ok_or_else(|| {
+            Status::failed_precondition(
+                "background process output omitted a valid ownership-root pid",
+            )
+        })?;
+    let provenance: palyra_common::runtime_contracts::ProcessProvenance = serde_json::from_value(
+        payload.pointer("/process_handle/provenance").cloned().ok_or_else(|| {
+            Status::failed_precondition("background process output omitted provenance evidence")
+        })?,
+    )
+    .map_err(|error| Status::failed_precondition(format!("invalid process provenance: {error}")))?;
+    provenance.validate().map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let live = crate::sandbox_runner::background_process_provenance_snapshot(ownership_root_pid)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "background process is missing live provenance registration",
+            )
+        })?;
+    if live.pid != ownership_root_pid || live.provenance != provenance {
+        return Err(Status::failed_precondition(
+            "background process output provenance does not match the live process registration",
+        ));
+    }
+    let Some((generation_session_id, generation)) =
+        runtime_state.runtime_generation_for_tool_blocking(context.run_id)?
+    else {
+        return Err(Status::failed_precondition(
+            "background process handle requires an active runtime generation",
+        ));
+    };
+    if generation_session_id != context.session_id {
+        return Err(Status::failed_precondition(
+            "background process handle session does not own the active runtime generation",
+        ));
+    }
+    if let Some(prepared) = prepared_background_registration {
+        let (request, committed_process) = committed_background_process_registration(prepared)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "local background process output has no committed durable registration",
+                )
+            })?;
+        if prepared.run_id != context.run_id
+            || prepared.session_id.as_str() != context.session_id
+            || prepared.generation != generation
+            || request.pid != ownership_root_pid
+            || request.provenance != provenance
+        {
+            return Err(Status::failed_precondition(
+                "local background process output conflicts with the exact committed ownership root",
+            ));
+        }
+        let process = exact_committed_background_process(
+            runtime_state,
+            prepared,
+            &request,
+            &committed_process,
+        )?;
+        if process.descriptor.generation != generation {
+            return Err(Status::aborted(
+                "durably registered background process belongs to a stale runtime generation",
+            ));
+        }
+        return Ok(Some(process));
+    }
+    if let Some(process) = runtime_state.run_background_process(context.run_id, ownership_root_pid)
+    {
+        if process.lease.provenance != provenance {
+            return Err(Status::failed_precondition(
+                "durably registered background process provenance does not match tool output",
+            ));
+        }
+        if process.descriptor.generation != generation {
+            return Err(Status::aborted(
+                "durably registered background process belongs to a stale runtime generation",
+            ));
+        }
+        return Ok(Some(process));
+    }
+    let now = current_unix_ms();
+    let lifetime_ms =
+        payload.get("lifetime_ms").and_then(Value::as_u64).unwrap_or(120_000).min(30 * 60_000);
+    let expires_at_unix_ms = now.saturating_add(i64::try_from(lifetime_ms).unwrap_or(i64::MAX));
+    let instance_id = RuntimeInstanceId::parse(format!("process:{}", Ulid::new()).as_str())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let lease_id = RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::new()).as_str())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let descriptor = RuntimeHandleDescriptorV1 {
+        schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+        instance_id: instance_id.clone(),
+        kind: RuntimeHandleKind::Process,
+        session_id: Some(
+            RuntimeSessionId::parse(context.session_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        ),
+        run_id: Some(
+            RuntimeRunId::parse(context.run_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        ),
+        generation,
+        owner: "palyra.process.run".to_owned(),
+        state: RuntimeHandleState::Running,
+        resume_metadata_json: Some(
+            json!({
+                "schema_version": 1,
+                "pid": ownership_root_pid,
+                "ownership_role": "ownership_root",
+                "lifetime_mode": payload.get("lifetime_mode").and_then(Value::as_str),
+            })
+            .to_string(),
+        ),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    let lease = ProcessLeaseV1 {
+        schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+        lease_id,
+        instance_id,
+        generation,
+        pid: ownership_root_pid,
+        provenance,
+        issued_at_unix_ms: now,
+        expires_at_unix_ms,
+        verified_at_unix_ms: now,
+    };
+    descriptor.validate().map_err(|error| Status::failed_precondition(error.to_string()))?;
+    lease.validate().map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(Some(RunOwnedBackgroundProcess { descriptor, lease }))
+}
+
+fn process_ownership_root_pid_from_tool_output(payload: &Value) -> Result<Option<u32>, Status> {
+    if let Some(value) = payload.pointer("/process_handle/ownership_root_pid") {
+        return parse_process_ownership_root_pid(value, "process_handle.ownership_root_pid")
+            .map(Some);
+    }
+    if let Some(value) = payload.pointer("/process_handle/direct_process_pid") {
+        return parse_process_ownership_root_pid(value, "process_handle.direct_process_pid")
+            .map(Some);
+    }
+    if let Some(value) = payload.get("pid") {
+        return parse_process_ownership_root_pid(value, "pid").map(Some);
+    }
+    Ok(None)
+}
+
+fn parse_process_ownership_root_pid(value: &Value, field: &str) -> Result<u32, Status> {
+    value.as_u64().and_then(|pid| u32::try_from(pid).ok()).filter(|pid| *pid > 0).ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "background process output {field} is not a valid ownership-root pid"
+        ))
+    })
+}
+
+const fn local_background_process_ownership_role() -> &'static str {
+    if cfg!(unix) {
+        "unix_process_supervisor"
+    } else {
+        "direct_process"
+    }
+}
+
+#[cfg(test)]
 fn background_process_pid_from_tool_output(output_json: &[u8]) -> Option<u32> {
     let payload = serde_json::from_slice::<Value>(output_json).ok()?;
-    if payload.get("background").and_then(Value::as_bool) != Some(true) {
+    if payload.get("background").and_then(Value::as_bool) != Some(true)
+        || payload.get("run_owned_lifetime").and_then(Value::as_bool) == Some(false)
+    {
         return None;
+    }
+    process_ownership_root_pid_from_tool_output(&payload).ok().flatten()
+}
+
+fn prepare_background_process_registration(
+    runtime_state: &GatewayRuntimeState,
+    context: ToolRuntimeExecutionContext<'_>,
+    input_json: &[u8],
+) -> Result<Option<PreparedBackgroundProcessRegistration>, Status> {
+    let input = parse_process_runner_tool_input(input_json).map_err(|error| {
+        Status::invalid_argument(format!("invalid local process registration input: {error}"))
+    })?;
+    if !input.background {
+        return Ok(None);
+    }
+    if input.effective_lifetime_mode().is_detached_handoff() {
+        return Err(Status::failed_precondition(format!(
+            "local background lifetime_mode='{}' is unavailable until durable detached process handoff is implemented",
+            input.effective_lifetime_mode().as_str()
+        )));
+    }
+    let Some((generation_session_id, generation)) =
+        runtime_state.runtime_generation_for_tool_blocking(context.run_id)?
+    else {
+        return Err(Status::failed_precondition(
+            "background process registration requires an active runtime generation",
+        ));
+    };
+    if generation_session_id != context.session_id {
+        return Err(Status::failed_precondition(
+            "background process registration session does not own the active runtime generation",
+        ));
+    }
+    Ok(Some(PreparedBackgroundProcessRegistration {
+        run_id: context.run_id.to_owned(),
+        session_id: RuntimeSessionId::parse(context.session_id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        run_identity: RuntimeRunId::parse(context.run_id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        generation,
+        instance_id: RuntimeInstanceId::parse(format!("process:{}", Ulid::new()).as_str())
+            .map_err(|error| Status::internal(error.to_string()))?,
+        lease_id: RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::new()).as_str())
+            .map_err(|error| Status::internal(error.to_string()))?,
+        state: Arc::new(Mutex::new(BackgroundProcessRegistrationState::Pending)),
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn committed_background_process_registration(
+    prepared: &PreparedBackgroundProcessRegistration,
+) -> Result<Option<(BackgroundProcessRegistrationRequest, RunOwnedBackgroundProcess)>, Status> {
+    let state = prepared.state.lock().map_err(|error| {
+        Status::internal(format!("background process registration state lock poisoned: {error}"))
+    })?;
+    match &*state {
+        BackgroundProcessRegistrationState::Committed { request, process } => {
+            Ok(Some((request.clone(), process.as_ref().clone())))
+        }
+        BackgroundProcessRegistrationState::Pending
+        | BackgroundProcessRegistrationState::Failed { .. } => Ok(None),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn exact_committed_background_process(
+    runtime_state: &GatewayRuntimeState,
+    prepared: &PreparedBackgroundProcessRegistration,
+    request: &BackgroundProcessRegistrationRequest,
+    committed_process: &RunOwnedBackgroundProcess,
+) -> Result<RunOwnedBackgroundProcess, Status> {
+    if committed_process.ownership_root_pid() != request.pid
+        || committed_process.descriptor.instance_id != prepared.instance_id
+        || committed_process.descriptor.session_id.as_ref() != Some(&prepared.session_id)
+        || committed_process.descriptor.run_id.as_ref() != Some(&prepared.run_identity)
+        || committed_process.descriptor.generation != prepared.generation
+        || committed_process.lease.instance_id != prepared.instance_id
+        || committed_process.lease.lease_id != prepared.lease_id
+        || committed_process.lease.generation != prepared.generation
+        || committed_process.lease.provenance != request.provenance
+    {
+        return Err(Status::failed_precondition(
+            "stored background process commitment conflicts with the exact registration",
+        ));
+    }
+    let process = runtime_state
+        .run_background_process(prepared.run_id.as_str(), request.pid)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "durably registered background process is missing from run cleanup ownership",
+            )
+        })?;
+    if process != *committed_process {
+        return Err(Status::failed_precondition(
+            "durably registered background process cleanup ownership conflicts with the exact registration",
+        ));
+    }
+    Ok(process)
+}
+
+fn background_process_registration_fence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    prepared: &PreparedBackgroundProcessRegistration,
+) -> BackgroundProcessRegistrationFence {
+    let runtime_state = Arc::clone(runtime_state);
+    let prepared = prepared.clone();
+    Arc::new(move |request| {
+        commit_background_process_registration(&runtime_state, &prepared, request)
+    })
+}
+
+fn commit_background_process_registration(
+    runtime_state: &GatewayRuntimeState,
+    prepared: &PreparedBackgroundProcessRegistration,
+    request: BackgroundProcessRegistrationRequest,
+) -> Result<(), SandboxProcessRunError> {
+    let mut state = prepared.state.lock().map_err(|error| {
+        process_registration_error(format!("registration state lock poisoned: {error}"))
+    })?;
+    match &*state {
+        BackgroundProcessRegistrationState::Pending => {}
+        BackgroundProcessRegistrationState::Committed { request: existing, .. }
+            if existing == &request =>
+        {
+            return Ok(());
+        }
+        BackgroundProcessRegistrationState::Committed { .. } => {
+            return Err(process_registration_error(
+                "registration fence replay conflicts with different exact process evidence",
+            ));
+        }
+        BackgroundProcessRegistrationState::Failed { request: existing, error }
+            if existing == &request =>
+        {
+            return Err(error.clone());
+        }
+        BackgroundProcessRegistrationState::Failed { .. } => {
+            return Err(process_registration_error(
+                "registration fence retry conflicts with prior failed process evidence",
+            ));
+        }
+    }
+
+    // This private mutex remains held through the durable transaction so concurrent exact replays
+    // cannot race one success against one conflicting failure and corrupt the callback state.
+    let result = (|| {
+        let active = runtime_state
+            .runtime_generation_for_tool_blocking(prepared.run_id.as_str())
+            .map_err(process_registration_status_error)?;
+        let Some((active_session_id, active_generation)) = active else {
+            return Err(process_registration_error(
+                "background process registration rejected because the runtime generation is no longer active",
+            ));
+        };
+        if active_session_id != prepared.session_id.as_str()
+            || active_generation != prepared.generation
+            || request.lifetime_mode.is_detached_handoff()
+        {
+            return Err(process_registration_error(
+                "background process registration rejected for a stale generation or unsupported lifetime",
+            ));
+        }
+        let now = current_unix_ms();
+        let expires_at_unix_ms =
+            now.saturating_add(i64::try_from(request.lifetime_ms).unwrap_or(i64::MAX));
+        let process = RunOwnedBackgroundProcess {
+            descriptor: RuntimeHandleDescriptorV1 {
+                schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+                instance_id: prepared.instance_id.clone(),
+                kind: RuntimeHandleKind::Process,
+                session_id: Some(prepared.session_id.clone()),
+                run_id: Some(prepared.run_identity.clone()),
+                generation: prepared.generation,
+                owner: "palyra.process.run".to_owned(),
+                state: RuntimeHandleState::Running,
+                resume_metadata_json: Some(
+                    json!({
+                        "schema_version": 1,
+                        "pid": request.pid,
+                        "ownership_role": local_background_process_ownership_role(),
+                        "lifetime_mode": request.lifetime_mode.as_str(),
+                    })
+                    .to_string(),
+                ),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            },
+            lease: ProcessLeaseV1 {
+                schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+                lease_id: prepared.lease_id.clone(),
+                instance_id: prepared.instance_id.clone(),
+                generation: prepared.generation,
+                pid: request.pid,
+                provenance: request.provenance.clone(),
+                issued_at_unix_ms: now,
+                expires_at_unix_ms,
+                verified_at_unix_ms: now,
+            },
+        };
+        process
+            .descriptor
+            .validate()
+            .map_err(|error| process_registration_error(error.to_string()))?;
+        process.lease.validate().map_err(|error| process_registration_error(error.to_string()))?;
+        runtime_state
+            .record_run_background_process_for_active_generation(
+                prepared.run_id.as_str(),
+                process.clone(),
+            )
+            .map_err(process_registration_status_error)?;
+        Ok(process)
+    })();
+    match result {
+        Ok(process) => {
+            *state = BackgroundProcessRegistrationState::Committed {
+                request,
+                process: Box::new(process),
+            };
+            Ok(())
+        }
+        Err(error) => {
+            *state = BackgroundProcessRegistrationState::Failed { request, error: error.clone() };
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn committed_background_process_outcome_matches(
+    prepared: &PreparedBackgroundProcessRegistration,
+    request: &BackgroundProcessRegistrationRequest,
+    process: &RunOwnedBackgroundProcess,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    if !outcome.success {
+        return Err(Status::failed_precondition(
+            "background process runner failed after durable ownership registration",
+        ));
+    }
+    let payload = serde_json::from_slice::<Value>(outcome.output_json.as_slice()).map_err(|error| {
+        Status::failed_precondition(format!(
+            "background process runner returned invalid JSON after durable ownership registration: {error}"
+        ))
+    })?;
+    if payload.get("background").and_then(Value::as_bool) != Some(true) {
+        return Err(Status::failed_precondition(
+            "background process runner did not acknowledge an active background process",
+        ));
     }
     if payload.get("run_owned_lifetime").and_then(Value::as_bool) == Some(false) {
-        return None;
+        return Err(Status::failed_precondition(
+            "background process runner returned a non-run-owned lifetime after durable ownership registration",
+        ));
     }
-    let pid = payload
-        .pointer("/process_handle/direct_process_pid")
-        .and_then(Value::as_u64)
-        .or_else(|| payload.get("pid").and_then(Value::as_u64))?;
-    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+    let output_root = process_ownership_root_pid_from_tool_output(&payload)?.ok_or_else(|| {
+        Status::failed_precondition(
+            "background process runner omitted the committed ownership-root pid",
+        )
+    })?;
+    if output_root != request.pid {
+        return Err(Status::failed_precondition(format!(
+            "background process runner ownership-root pid {output_root} does not match committed ownership-root pid {}",
+            request.pid
+        )));
+    }
+    let output_provenance: palyra_common::runtime_contracts::ProcessProvenance =
+        serde_json::from_value(payload.pointer("/process_handle/provenance").cloned().ok_or_else(
+            || {
+                Status::failed_precondition(
+                    "background process runner omitted committed provenance evidence",
+                )
+            },
+        )?)
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "background process runner returned invalid committed provenance evidence: {error}"
+            ))
+        })?;
+    output_provenance.validate().map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if output_provenance != request.provenance
+        || process.ownership_root_pid() != request.pid
+        || process.descriptor.instance_id != prepared.instance_id
+        || process.descriptor.generation != prepared.generation
+        || process.lease.lease_id != prepared.lease_id
+        || process.lease.generation != prepared.generation
+        || process.lease.provenance != request.provenance
+    {
+        return Err(Status::failed_precondition(
+            "background process runner result conflicts with the exact committed process authority",
+        ));
+    }
+    let disposition = crate::sandbox_runner::verify_background_process_provenance(
+        request.pid,
+        &request.provenance,
+    );
+    if !process.lease.authorizes(disposition, current_unix_ms()) {
+        return Err(Status::failed_precondition(format!(
+            "background process committed ownership root is not live and authorized: {}",
+            disposition.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn settle_background_process_registration(
+    runtime_state: &GatewayRuntimeState,
+    prepared: &PreparedBackgroundProcessRegistration,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    let Some((request, process)) = committed_background_process_registration(prepared)? else {
+        return Ok(());
+    };
+    if runtime_state.runtime_generation_for_tool_blocking(prepared.run_id.as_str())?.is_none() {
+        // Terminal cleanup owns any committed lease once generation invalidation
+        // wins. Re-running reconciliation here would duplicate exact cleanup and
+        // can only manufacture lease-mismatch uncertainty.
+        return Ok(());
+    }
+    let reconciliation_error =
+        match exact_committed_background_process(runtime_state, prepared, &request, &process) {
+            Ok(registered_process) => match committed_background_process_outcome_matches(
+                prepared,
+                &request,
+                &registered_process,
+                outcome,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+    let status = match crate::sandbox_runner::terminate_retained_background_process(
+        request.pid,
+        &request.provenance,
+    ) {
+        Ok(status) if !status.alive() => status,
+        Ok(_) => {
+            let reconciliation_message = reconciliation_error.message().to_owned();
+            transfer_unsettled_background_process_registration(
+                runtime_state,
+                prepared,
+                process,
+                None,
+                "post-registration reconciliation cleanup did not establish exact ownership-root absence",
+            )?;
+            return Err(Status::internal(format!(
+                "{reconciliation_message}; exact authority transferred to the retry supervisor"
+            )));
+        }
+        Err(error) => {
+            let reconciliation_message = reconciliation_error.message().to_owned();
+            transfer_unsettled_background_process_registration(
+                runtime_state,
+                prepared,
+                process,
+                None,
+                "post-registration reconciliation cleanup failed",
+            )?;
+            return Err(Status::internal(format!(
+                "{reconciliation_message}; exact cleanup failed and exact authority transferred to the retry supervisor: {error}"
+            )));
+        }
+    };
+    debug_assert!(!status.alive());
+    let report = process_cleanup_report(
+        &process,
+        CleanupOutcome::Completed,
+        vec![
+            process_cleanup_step(
+                0,
+                CleanupStepKind::KillTree,
+                CleanupStepDisposition::Completed,
+                "runtime.cleanup.post_registration_reconciliation_kill_tree",
+                None,
+            ),
+            process_cleanup_step(
+                1,
+                CleanupStepKind::VerifyAbsence,
+                CleanupStepDisposition::Completed,
+                "runtime.cleanup.post_registration_reconciliation_absence_verified",
+                None,
+            ),
+        ],
+        "runtime.cleanup.post_registration_reconciliation",
+    );
+    if let Err(error) =
+        runtime_state.finalize_process_cleanup(&process, &report, RuntimeHandleState::Closed)
+    {
+        transfer_unsettled_background_process_registration(
+            runtime_state,
+            prepared,
+            process,
+            Some(report),
+            "post-registration process cleanup verified absence but durable finalization failed",
+        )?;
+        return Err(Status::internal(format!(
+            "{}; process cleanup verified absence but durable finalization failed; exact authority transferred to the retry supervisor: {}",
+            reconciliation_error.message(),
+            error.message()
+        )));
+    }
+    runtime_state.forget_run_background_process(prepared.run_id.as_str(), request.pid);
+    crate::sandbox_runner::release_background_process_cleanup_authority(
+        request.pid,
+        &request.provenance,
+    );
+    Err(Status::failed_precondition(format!(
+        "{}; the committed ownership root was terminated and durably finalized",
+        reconciliation_error.message()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn transfer_unsettled_background_process_registration(
+    runtime_state: &GatewayRuntimeState,
+    prepared: &PreparedBackgroundProcessRegistration,
+    process: RunOwnedBackgroundProcess,
+    report: Option<CleanupReportV1>,
+    context: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .enqueue_pending_process_cleanup(PendingProcessCleanup {
+            run_id: prepared.run_id.clone(),
+            process,
+            report,
+            final_state: RuntimeHandleState::Closed,
+        })
+        .map_err(|transfer_error| {
+            Status::resource_exhausted(format!(
+                "{context}; retry supervisor transfer failed while exact authority remains retained: {}",
+                transfer_error.message()
+            ))
+        })
+}
+
+fn process_registration_status_error(error: Status) -> SandboxProcessRunError {
+    process_registration_error(error.message())
+}
+
+fn process_registration_error(message: impl Into<String>) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "background process durable ownership registration failed: {}",
+            message.into()
+        ),
+    }
+}
+
+fn process_registration_precondition_failure_outcome(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    error: Status,
+) -> ToolExecutionOutcome {
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        b"{}".to_vec(),
+        error.message().to_owned(),
+        false,
+        crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+    )
+}
+
+fn background_process_registration_failure_outcome(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    outcome: &ToolExecutionOutcome,
+    error: Status,
+) -> ToolExecutionOutcome {
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        b"{}".to_vec(),
+        format!(
+            "background process lifecycle reconciliation failed; execution evidence {}; {}",
+            outcome.attestation.execution_sha256,
+            error.message()
+        ),
+        false,
+        crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+    )
+}
+
+fn process_stop_cleanup_persistence_failure_outcome(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    input_json: &[u8],
+    outcome: &ToolExecutionOutcome,
+    error: Status,
+) -> ToolExecutionOutcome {
+    build_tool_execution_outcome(
+        proposal_id,
+        PROCESS_STOP_TOOL_NAME,
+        input_json,
+        false,
+        b"{}".to_vec(),
+        format!(
+            "process stop completed but durable cleanup finalization failed; execution evidence {} requires cleanup reconciliation: {}",
+            outcome.attestation.execution_sha256,
+            error.message()
+        ),
+        false,
+        crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+    )
 }
 
 fn detached_background_process_from_tool_output(
@@ -1789,6 +2713,37 @@ fn execution_backend_target_config_error_outcome(
     )
 }
 
+fn execution_backend_health_blocked_outcome(
+    backend: ExecutionBackendPreference,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    reason: &str,
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "execution_target": backend.as_str(),
+        "status": "blocked",
+        "reason_code": "runtime.health.backend_admission_blocked",
+        "repair_hint": "Inspect shared runtime health and use the authenticated operator recovery workflow.",
+    });
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        format!(
+            "{} execution is blocked by shared runtime health: {}",
+            backend.label(),
+            redact_diagnostic_text(reason)
+        ),
+        false,
+        backend.as_str().to_owned(),
+        "shared_runtime_health_admission".to_owned(),
+    )
+}
+
 fn local_tool_runtime_runner_unavailable_outcome(
     context: ToolRuntimeExecutionContext<'_>,
     proposal_id: &str,
@@ -1826,12 +2781,24 @@ fn execute_process_list_tool(
             "none".to_owned(),
         );
     }
-    let pids = runtime_state.list_run_background_processes(context.run_id);
-    let processes = pids
+    let processes = runtime_state
+        .list_run_background_processes(context.run_id)
         .into_iter()
-        .map(|pid| {
-            let status = crate::sandbox_runner::background_process_runtime_status(pid)
-                .map_err(|error| error.to_string());
+        .map(|process| {
+            let pid = process.ownership_root_pid();
+            let disposition = crate::sandbox_runner::verify_background_process_provenance(
+                pid,
+                &process.lease.provenance,
+            );
+            let status = if process.lease.authorizes(disposition, current_unix_ms()) {
+                crate::sandbox_runner::background_process_runtime_status(pid)
+                    .map_err(|error| error.to_string())
+            } else {
+                Err(format!(
+                    "runtime process lease did not authorize status: {}",
+                    disposition.as_str()
+                ))
+            };
             background_process_list_entry(pid, status)
         })
         .collect::<Vec<_>>();
@@ -2146,7 +3113,17 @@ fn process_lifecycle_pid_is_run_owned(
     run_id: &str,
     pid: u32,
 ) -> bool {
-    runtime_state.list_run_background_processes(run_id).contains(&pid)
+    runtime_state
+        .list_run_background_processes(run_id)
+        .into_iter()
+        .find(|process| process.ownership_root_pid() == pid)
+        .is_some_and(|process| {
+            let disposition = crate::sandbox_runner::verify_background_process_provenance(
+                pid,
+                &process.lease.provenance,
+            );
+            process.lease.authorizes(disposition, current_unix_ms())
+        })
 }
 
 fn process_lifecycle_unowned_pid_outcome(
@@ -2162,29 +3139,160 @@ fn process_lifecycle_unowned_pid_outcome(
         input_json,
         false,
         b"{}".to_vec(),
-        format!("{tool_name} pid {pid} is not registered as a run-owned background process"),
+        format!("{tool_name} pid {pid} is not authorized by a matching run-owned process lease"),
         false,
         crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
         crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
     )
 }
 
-fn process_stop_outcome_verifies_tree_stopped(output_json: &[u8]) -> bool {
+const PROCESS_STOP_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 1;
+const PROCESS_STOP_ACKNOWLEDGEMENT_MAX_AGE_MS: i64 = 60_000;
+const PROCESS_STOP_ACKNOWLEDGEMENT_FUTURE_SKEW_MS: i64 = 5_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStopAcknowledgementV1 {
+    schema_version: u16,
+    pid: u32,
+    ownership_kind: ProcessOwnershipKind,
+    ownership_identity_sha256: String,
+    observed_at_unix_ms: i64,
+    proof: ProcessStopProofV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProcessStopProofV1 {
+    UnixSupervisorCleanupAcknowledged,
+    WindowsJobObjectEmpty { active_process_count: u32 },
+}
+
+fn process_stop_outcome_verifies_tree_stopped(
+    output_json: &[u8],
+    process: &RunOwnedBackgroundProcess,
+    now_unix_ms: i64,
+) -> bool {
     let Ok(payload) = serde_json::from_slice::<Value>(output_json) else {
         return false;
     };
-    if payload.get("alive").and_then(Value::as_bool) != Some(false) {
+    if payload.get("pid").and_then(Value::as_u64) != Some(u64::from(process.ownership_root_pid()))
+        || payload.get("alive").and_then(Value::as_bool) != Some(false)
+        || payload.get("process_tree_alive").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    let Ok(acknowledgement) = serde_json::from_value::<ProcessStopAcknowledgementV1>(
+        payload.get("stop_acknowledgement").cloned().unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    if acknowledgement.schema_version != PROCESS_STOP_ACKNOWLEDGEMENT_SCHEMA_VERSION
+        || acknowledgement.pid != process.ownership_root_pid()
+        || acknowledgement.ownership_kind != process.lease.provenance.ownership_kind
+        || acknowledgement.ownership_identity_sha256
+            != process.lease.provenance.ownership_identity_sha256
+        || acknowledgement.observed_at_unix_ms
+            < now_unix_ms.saturating_sub(PROCESS_STOP_ACKNOWLEDGEMENT_MAX_AGE_MS)
+        || acknowledgement.observed_at_unix_ms
+            > now_unix_ms.saturating_add(PROCESS_STOP_ACKNOWLEDGEMENT_FUTURE_SKEW_MS)
+    {
         return false;
     }
 
-    let tracked_count_before =
-        payload.get("tracked_process_count_before_stop").and_then(Value::as_u64);
-    if tracked_count_before.is_some() {
-        return payload.get("process_tree_alive").and_then(Value::as_bool) == Some(false)
-            && payload.get("tracked_process_count").and_then(Value::as_u64) == Some(0);
+    match (acknowledgement.proof, acknowledgement.ownership_kind) {
+        (
+            ProcessStopProofV1::WindowsJobObjectEmpty { active_process_count: 0 },
+            ProcessOwnershipKind::WindowsJobObject,
+        ) => payload.get("tracked_process_count").and_then(Value::as_u64) == Some(0),
+        (
+            ProcessStopProofV1::UnixSupervisorCleanupAcknowledged,
+            ProcessOwnershipKind::UnixProcessGroup,
+        ) => true,
+        _ => false,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn finalize_explicit_process_stop(
+    runtime_state: &GatewayRuntimeState,
+    run_id: &str,
+    pid: u32,
+    output_json: &[u8],
+) -> Result<(), Status> {
+    let Some(process) = runtime_state.run_background_process(run_id, pid) else {
+        return Err(Status::failed_precondition(format!(
+            "process stop result for pid {pid} has no matching run-owned process lease"
+        )));
+    };
+    if !process_stop_outcome_verifies_tree_stopped(output_json, &process, current_unix_ms()) {
+        let report = process_cleanup_report(
+            &process,
+            CleanupOutcome::Unknown,
+            vec![
+                process_cleanup_step(
+                    0,
+                    CleanupStepKind::KillTree,
+                    CleanupStepDisposition::Unknown,
+                    "runtime.cleanup.explicit_stop_unverified",
+                    None,
+                ),
+                process_cleanup_step(
+                    1,
+                    CleanupStepKind::VerifyAbsence,
+                    CleanupStepDisposition::Unknown,
+                    "runtime.cleanup.explicit_stop_absence_unverified",
+                    None,
+                ),
+            ],
+            "runtime.cleanup.explicit_stop_unverified",
+        );
+        runtime_state.finalize_process_cleanup(&process, &report, RuntimeHandleState::Orphaned)?;
+        return Ok(());
     }
 
-    true
+    let evidence_sha256 = sha256_hex(output_json);
+    let report = process_cleanup_report(
+        &process,
+        CleanupOutcome::Completed,
+        vec![
+            process_cleanup_step(
+                0,
+                CleanupStepKind::KillTree,
+                CleanupStepDisposition::Completed,
+                "runtime.cleanup.explicit_stop_completed",
+                Some(evidence_sha256.clone()),
+            ),
+            process_cleanup_step(
+                1,
+                CleanupStepKind::VerifyAbsence,
+                CleanupStepDisposition::Completed,
+                "runtime.cleanup.explicit_stop_absence_verified",
+                Some(evidence_sha256),
+            ),
+        ],
+        "runtime.cleanup.explicit_stop_completed",
+    );
+    if let Err(error) =
+        runtime_state.finalize_process_cleanup(&process, &report, RuntimeHandleState::Closed)
+    {
+        runtime_state.enqueue_pending_process_cleanup(PendingProcessCleanup {
+            run_id: run_id.to_owned(),
+            process,
+            report: Some(report),
+            final_state: RuntimeHandleState::Closed,
+        })?;
+        return Err(Status::internal(format!(
+            "explicit process stop verified absence but durable finalization failed; exact authority transferred to the retry supervisor: {}",
+            error.message()
+        )));
+    }
+    runtime_state.forget_run_background_process(run_id, pid);
+    crate::sandbox_runner::release_background_process_cleanup_authority(
+        pid,
+        &process.lease.provenance,
+    );
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2687,6 +3795,8 @@ pub(crate) struct RunFailureFinalization<'a> {
     pub(crate) active_session_id: Option<&'a str>,
     pub(crate) run_state: &'a mut RunStateMachine,
     pub(crate) active_run_id: Option<&'a str>,
+    pub(crate) flow_control:
+        Option<&'a crate::application::run_stream::flow_control::RunStreamFlowControl>,
     pub(crate) tape_seq: &'a mut i64,
     pub(crate) reason: &'a str,
 }
@@ -2705,26 +3815,83 @@ pub(crate) async fn finalize_run_failure(input: RunFailureFinalization<'_>) {
     if input.run_state.state().is_terminal() {
         return;
     }
-    if input.run_state.transition(RunTransition::Fail).is_err() {
+    let Ok(settlement) = input
+        .runtime_state
+        .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+            run_id: run_id.to_owned(),
+            requested_state: RunLifecycleState::Failed,
+            reason_code: "run_stream.gateway_failure".to_owned(),
+            status_message: input.reason.to_owned(),
+            actor: palyra_common::runtime_contracts::RuntimeActorRef {
+                kind: palyra_common::runtime_contracts::RuntimeActorKind::System,
+                id: "gateway.failure".to_owned(),
+            },
+            terminal_summary_payload_json: None,
+            terminal_tape_events: Vec::new(),
+            terminal_status_payload_json: crate::application::run_stream::tape::status_tape_payload(
+                common_v1::stream_status::StatusKind::Failed,
+                input.reason,
+            ),
+        })
+        .await
+    else {
+        return;
+    };
+    let terminal_message = match settlement.effective_state {
+        RunLifecycleState::Done => "completed",
+        RunLifecycleState::Failed => input.reason,
+        RunLifecycleState::Cancelled => CANCELLED_REASON,
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => return,
+    };
+    let Some(transition) = settlement.effective_state.terminal_transition() else {
+        return;
+    };
+    if input.run_state.transition(transition).is_err() {
         return;
     }
-    let _ = input
-        .runtime_state
-        .update_orchestrator_run_state(
-            run_id.to_owned(),
-            RunLifecycleState::Failed,
-            Some(input.reason.to_owned()),
-        )
-        .await;
-    let _ = crate::application::run_stream::tape::send_status_with_tape(
-        input.sender,
-        input.runtime_state,
-        run_id,
-        input.tape_seq,
-        common_v1::stream_status::StatusKind::Failed,
-        input.reason,
-    )
-    .await;
+    if !settlement.changed {
+        return;
+    }
+    if let Some(settled_tape_sequence) = settlement.tape_sequence {
+        let status_kind = if settlement.effective_state == RunLifecycleState::Done {
+            common_v1::stream_status::StatusKind::Done
+        } else {
+            common_v1::stream_status::StatusKind::Failed
+        };
+        let delivery_result = input
+            .flow_control
+            .ok_or_else(|| {
+                Status::aborted(
+                    "run failure delivery requires retained host flow-control authority",
+                )
+            })
+            .and_then(crate::application::run_stream::flow_control::RunStreamFlowControl::delivery);
+        match delivery_result {
+            Ok(delivery) => {
+                let _ = crate::application::run_stream::tape::send_settled_final_status(
+                    input.sender,
+                    input.runtime_state,
+                    run_id,
+                    input.tape_seq,
+                    settled_tape_sequence,
+                    status_kind,
+                    terminal_message,
+                    &delivery,
+                )
+                .await;
+            }
+            Err(error) => {
+                warn!(
+                    run_id,
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "skipping terminal failure wire delivery without a valid delivery scope"
+                );
+            }
+        }
+    }
     record_run_failure_journal_event(
         input.runtime_state,
         input.request_context,
@@ -2733,7 +3900,7 @@ pub(crate) async fn finalize_run_failure(input: RunFailureFinalization<'_>) {
         input.reason,
     )
     .await;
-    cleanup_run_resources(input.runtime_state, run_id, input.reason).await;
+    cleanup_run_resources(input.runtime_state, run_id, terminal_message).await;
 }
 
 /// Reaps resources a terminal run left behind: closes its browser sessions,
@@ -2745,14 +3912,25 @@ pub(crate) async fn cleanup_run_resources(
     run_id: &str,
     reason: &str,
 ) -> RunCleanupSummary {
-    let resources = runtime_state.take_run_cleanup_resources(run_id);
+    let browser_session_ids = runtime_state.take_run_browser_sessions(run_id);
+    let background_processes = runtime_state.list_run_background_processes(run_id);
     let detached_resources = runtime_state.take_run_detached_resources(run_id);
-    if resources.is_empty() && detached_resources.is_empty() {
+    if browser_session_ids.is_empty()
+        && background_processes.is_empty()
+        && detached_resources.is_empty()
+    {
+        if let Err(error) = runtime_state.finalize_orchestrator_run_metadata_trace(run_id) {
+            warn!(
+                run_id,
+                error = %error,
+                "failed to finalize metadata trace after empty run cleanup"
+            );
+        }
         return RunCleanupSummary::default();
     }
 
-    let browser_session_count = resources.browser_session_ids.len();
-    let background_process_count = resources.background_process_pids.len();
+    let browser_session_count = browser_session_ids.len();
+    let background_process_count = background_processes.len();
     let mut browser_outcomes = Vec::new();
     let mut background_process_outcomes = Vec::new();
     let detached_background_process_outcomes = detached_resources
@@ -2764,7 +3942,7 @@ pub(crate) async fn cleanup_run_resources(
             DetachedBackgroundProcessHandoffOutcome { resource, alive, status }
         })
         .collect::<Vec<_>>();
-    for session_id in resources.browser_session_ids {
+    for session_id in browser_session_ids {
         match crate::application::tool_runtime::browser::close_browser_session_for_run_cleanup(
             runtime_state,
             session_id.as_str(),
@@ -2807,15 +3985,66 @@ pub(crate) async fn cleanup_run_resources(
         }
     }
 
-    for pid in resources.background_process_pids {
+    for process in background_processes {
+        let pid = process.ownership_root_pid();
+        let disposition = crate::sandbox_runner::verify_background_process_provenance(
+            pid,
+            &process.lease.provenance,
+        );
+        if !process.lease.authorizes(disposition, current_unix_ms()) {
+            let status_after = background_process_cleanup_status(pid);
+            let alive_after = status_after.as_ref().map(|status| status.alive);
+            let report = process_cleanup_report(
+                &process,
+                CleanupOutcome::Unknown,
+                vec![process_cleanup_step(
+                    0,
+                    CleanupStepKind::VerifyAbsence,
+                    CleanupStepDisposition::Unknown,
+                    "runtime.cleanup.provenance_unverified",
+                    None,
+                )],
+                "runtime.cleanup.provenance_unverified",
+            );
+            let handle_state = if matches!(
+                disposition,
+                palyra_common::runtime_contracts::ProcessProvenanceDisposition::Mismatch
+            ) {
+                RuntimeHandleState::Quarantined
+            } else {
+                RuntimeHandleState::Orphaned
+            };
+            if let Err(error) =
+                runtime_state.finalize_process_cleanup(&process, &report, handle_state)
+            {
+                warn!(run_id, pid, error = %error, "failed to finalize unverified process cleanup");
+            }
+            warn!(
+                run_id,
+                pid,
+                reason,
+                provenance_disposition = disposition.as_str(),
+                "refused terminal cleanup for an unverifiable background process"
+            );
+            background_process_outcomes.push(BackgroundProcessCleanupOutcome {
+                pid,
+                termination_attempted: false,
+                alive_after,
+                status_before: status_after.clone(),
+                status_after,
+                pid_artifact_outcomes: Vec::new(),
+                error: Some(format!(
+                    "runtime process lease did not authorize cleanup: {}",
+                    disposition.as_str()
+                )),
+            });
+            continue;
+        }
         let status_before = background_process_cleanup_status(pid);
-        match terminate_run_background_process(pid).await {
+        match terminate_run_background_process(pid, process.lease.provenance.clone()).await {
             Ok(()) => {
                 let status_after = wait_for_background_process_cleanup_status(pid).await;
                 let alive_after = status_after.as_ref().map(|status| status.alive);
-                if alive_after == Some(false) {
-                    crate::sandbox_runner::release_background_process_tracking_if_stopped(pid);
-                }
                 let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
                     runtime_state,
                     run_id,
@@ -2823,6 +4052,81 @@ pub(crate) async fn cleanup_run_resources(
                     status_after.as_ref(),
                 )
                 .await;
+                let (cleanup_outcome, verify_disposition, report_reason) =
+                    if alive_after == Some(false) {
+                        (
+                            CleanupOutcome::Completed,
+                            CleanupStepDisposition::Completed,
+                            "runtime.cleanup.completed",
+                        )
+                    } else {
+                        (
+                            CleanupOutcome::Unknown,
+                            CleanupStepDisposition::Unknown,
+                            "runtime.cleanup.absence_unverified",
+                        )
+                    };
+                let report = process_cleanup_report(
+                    &process,
+                    cleanup_outcome,
+                    vec![
+                        process_cleanup_step(
+                            0,
+                            CleanupStepKind::KillTree,
+                            CleanupStepDisposition::Completed,
+                            "runtime.cleanup.kill_tree_requested",
+                            None,
+                        ),
+                        process_cleanup_step(
+                            1,
+                            CleanupStepKind::VerifyAbsence,
+                            verify_disposition,
+                            report_reason,
+                            None,
+                        ),
+                    ],
+                    report_reason,
+                );
+                let handle_state = if cleanup_outcome == CleanupOutcome::Completed {
+                    RuntimeHandleState::Closed
+                } else {
+                    RuntimeHandleState::Orphaned
+                };
+                let finalization_error = runtime_state
+                    .finalize_process_cleanup(&process, &report, handle_state)
+                    .err()
+                    .map(|error| {
+                        warn!(run_id, pid, error = %error, "failed to finalize process cleanup");
+                        if cleanup_outcome != CleanupOutcome::Completed {
+                            return format!(
+                                "process cleanup remained unverifiable and durable finalization failed: {}",
+                                error.message()
+                            );
+                        }
+                        match runtime_state.enqueue_pending_process_cleanup(PendingProcessCleanup {
+                            run_id: run_id.to_owned(),
+                            process: process.clone(),
+                            report: Some(report.clone()),
+                            final_state: handle_state,
+                        }) {
+                            Ok(()) => format!(
+                                "process tree cleanup completed but durable finalization failed; exact authority transferred to the retry supervisor: {}",
+                                error.message()
+                            ),
+                            Err(transfer_error) => format!(
+                                "process tree cleanup completed but durable finalization failed: {}; retry supervisor transfer also failed: {}",
+                                error.message(),
+                                transfer_error.message()
+                            ),
+                        }
+                    });
+                if finalization_error.is_none() && cleanup_outcome == CleanupOutcome::Completed {
+                    runtime_state.forget_run_background_process(run_id, pid);
+                    crate::sandbox_runner::release_background_process_cleanup_authority(
+                        pid,
+                        &process.lease.provenance,
+                    );
+                }
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
@@ -2830,7 +4134,7 @@ pub(crate) async fn cleanup_run_resources(
                     status_before,
                     status_after,
                     pid_artifact_outcomes,
-                    error: None,
+                    error: finalization_error,
                 });
             }
             Err(error) => {
@@ -2843,9 +4147,6 @@ pub(crate) async fn cleanup_run_resources(
                 );
                 let status_after = background_process_cleanup_status(pid);
                 let alive_after = status_after.as_ref().map(|status| status.alive);
-                if alive_after == Some(false) {
-                    crate::sandbox_runner::release_background_process_tracking_if_stopped(pid);
-                }
                 let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
                     runtime_state,
                     run_id,
@@ -2853,6 +4154,47 @@ pub(crate) async fn cleanup_run_resources(
                     status_after.as_ref(),
                 )
                 .await;
+                let verify_disposition = if alive_after == Some(false) {
+                    CleanupStepDisposition::Completed
+                } else {
+                    CleanupStepDisposition::Unknown
+                };
+                let report = process_cleanup_report(
+                    &process,
+                    CleanupOutcome::Partial,
+                    vec![
+                        process_cleanup_step(
+                            0,
+                            CleanupStepKind::KillTree,
+                            CleanupStepDisposition::Failed,
+                            "runtime.cleanup.kill_tree_failed",
+                            None,
+                        ),
+                        process_cleanup_step(
+                            1,
+                            CleanupStepKind::VerifyAbsence,
+                            verify_disposition,
+                            if alive_after == Some(false) {
+                                "runtime.cleanup.absence_verified"
+                            } else {
+                                "runtime.cleanup.absence_unverified"
+                            },
+                            None,
+                        ),
+                    ],
+                    "runtime.cleanup.partial",
+                );
+                let report_error = runtime_state
+                    .finalize_process_cleanup(
+                        &process,
+                        &report,
+                        RuntimeHandleState::Orphaned,
+                    )
+                    .err()
+                    .map(|report_error| {
+                        warn!(run_id, pid, error = %report_error, "failed to finalize failed process cleanup");
+                        report_error.message().to_owned()
+                    });
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
@@ -2860,7 +4202,12 @@ pub(crate) async fn cleanup_run_resources(
                     status_before,
                     status_after,
                     pid_artifact_outcomes,
-                    error: Some(error),
+                    error: Some(match report_error {
+                        Some(report_error) => format!(
+                            "{error}; durable cleanup finalization also failed: {report_error}"
+                        ),
+                        None => error,
+                    }),
                 });
             }
         }
@@ -2880,6 +4227,14 @@ pub(crate) async fn cleanup_run_resources(
     )
     .await;
 
+    if let Err(error) = runtime_state.finalize_orchestrator_run_metadata_trace(run_id) {
+        warn!(
+            run_id,
+            error = %error,
+            "failed to finalize metadata trace after run cleanup"
+        );
+    }
+
     info!(
         run_id,
         reason,
@@ -2893,6 +4248,64 @@ pub(crate) async fn cleanup_run_resources(
         cleanup_warning: detached_background_cleanup_warning(
             detached_background_process_outcomes.as_slice(),
         ),
+    }
+}
+
+fn process_cleanup_step(
+    ordinal: u32,
+    step: CleanupStepKind,
+    disposition: CleanupStepDisposition,
+    reason_code: &str,
+    evidence_sha256: Option<String>,
+) -> CleanupStepRecord {
+    CleanupStepRecord {
+        ordinal,
+        step,
+        disposition,
+        reason_code: reason_code.to_owned(),
+        evidence_sha256,
+        completed_at_unix_ms: current_unix_ms(),
+    }
+}
+
+fn process_cleanup_report(
+    process: &RunOwnedBackgroundProcess,
+    outcome: CleanupOutcome,
+    steps: Vec<CleanupStepRecord>,
+    reason_code: &str,
+) -> CleanupReportV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.process_cleanup_report.v1\0");
+    hasher.update(process.descriptor.instance_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(process.lease.lease_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(outcome.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(reason_code.as_bytes());
+    for step in &steps {
+        hasher.update(b"\0");
+        hasher.update(step.ordinal.to_le_bytes());
+        hasher.update(step.step.as_str().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(step.disposition.as_str().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(step.reason_code.as_bytes());
+        hasher.update(b"\0");
+        if let Some(evidence_sha256) = step.evidence_sha256.as_deref() {
+            hasher.update(evidence_sha256.as_bytes());
+        }
+    }
+    let digest = hex::encode(hasher.finalize());
+    CleanupReportV1 {
+        schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+        report_id: format!("process-cleanup:{}", &digest[..32]),
+        instance_id: process.descriptor.instance_id.clone(),
+        lease_id: Some(process.lease.lease_id.clone()),
+        outcome,
+        steps,
+        reason_code: reason_code.to_owned(),
+        completed_at_unix_ms: current_unix_ms(),
     }
 }
 
@@ -3191,14 +4604,16 @@ async fn append_run_cleanup_tape_event(
         event.background_process_outcomes,
         event.detached_background_process_outcomes,
     );
-    if let Err(error) = runtime_state
-        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+    // Terminal settlement closes the run generation before resource cleanup finishes.
+    // This host-owned compatibility evidence is intentionally appended through the
+    // journal instead of reopening a closed generation.
+    if let Err(error) =
+        runtime_state.journal_store.append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
             run_id: event.run_id.to_owned(),
             seq: next_seq,
             event_type: "run.cleanup".to_owned(),
             payload_json,
         })
-        .await
     {
         warn!(
             run_id = event.run_id,
@@ -3416,16 +4831,22 @@ fn start_command_context_label(value: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| truncate_with_ellipsis(parts.join("; "), 420))
 }
 
-async fn terminate_run_background_process(pid: u32) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || terminate_run_background_process_blocking(pid))
+async fn terminate_run_background_process(
+    pid: u32,
+    provenance: ProcessProvenance,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || terminate_run_background_process_blocking(pid, &provenance))
         .await
         .map_err(|error| format!("background process cleanup task failed: {error}"))?
 }
 
-fn terminate_run_background_process_blocking(pid: u32) -> Result<(), String> {
-    crate::sandbox_runner::terminate_background_process_tree(pid).map_err(|error| {
-        format!("failed to terminate background process tree for pid {pid}: {error}")
-    })
+fn terminate_run_background_process_blocking(
+    pid: u32,
+    provenance: &ProcessProvenance,
+) -> Result<(), String> {
+    crate::sandbox_runner::terminate_background_process_tree_exact(pid, provenance).map_err(
+        |error| format!("failed to terminate background process tree for pid {pid}: {error}"),
+    )
 }
 
 async fn record_run_failure_journal_event(
@@ -4262,4 +5683,4 @@ pub(crate) fn build_test_vault() -> Arc<Vault> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

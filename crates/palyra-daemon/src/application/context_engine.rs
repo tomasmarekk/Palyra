@@ -1162,6 +1162,7 @@ async fn prepare_model_provider_input_with_default_context_engine(
     // developer message embeds a trust summary of the actually selected
     // blocks. They are then prepended so the stable instruction prefix leads
     // the prompt, which is what makes provider prompt caching effective.
+    let instruction_trust_summary = instruction_trust_summary(segments.as_slice());
     let compiled_instructions = InstructionCompiler.compile(InstructionCompilerInput {
         provider_kind: provider_budget.profile.provider_kind.as_str(),
         model_family: provider_budget.profile.model_id.as_str(),
@@ -1170,7 +1171,7 @@ async fn prepare_model_provider_input_with_default_context_engine(
             .unwrap_or(ToolExposureSurface::RunStream),
         tool_catalog: tool_catalog_snapshot,
         approval_mode: "policy_gate",
-        trust_summary: instruction_trust_summary(segments.as_slice()),
+        trust_summary: instruction_trust_summary.clone(),
     });
     let mut ordered_segments = instruction_segments(&compiled_instructions);
     ordered_segments.append(&mut segments);
@@ -1250,6 +1251,7 @@ async fn prepare_model_provider_input_with_default_context_engine(
         provider_messages,
         vision_inputs,
         instruction_hash: Some(compiled_instructions.hash),
+        instruction_trust_summary: Some(instruction_trust_summary),
         context_trace_id: Some(assembled.explain.trace_id),
         budget_profile: Some(assembled.explain.budget.profile_id),
         max_output_tokens: Some(assembled.explain.budget.reserved_completion_tokens),
@@ -1259,6 +1261,83 @@ async fn prepare_model_provider_input_with_default_context_engine(
         prompt_cache_policy,
         prompt_cache_report,
     })
+}
+
+pub(crate) fn rematerialize_prepared_model_provider_input(
+    prepared: &PreparedModelProviderInput,
+    provider_snapshot: &crate::model_provider::ProviderStatusSnapshot,
+    provider_kind: &str,
+    provider_model_id: &str,
+    user_visible_input_text: &str,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> PreparedModelProviderInput {
+    let instruction_trust_summary =
+        prepared.instruction_trust_summary.clone().unwrap_or_else(InstructionTrustSummary::trusted);
+    let compiled_instructions = InstructionCompiler.compile(InstructionCompilerInput {
+        provider_kind,
+        model_family: provider_model_id,
+        surface: tool_catalog_snapshot.surface,
+        tool_catalog: Some(tool_catalog_snapshot),
+        approval_mode: "policy_gate",
+        trust_summary: instruction_trust_summary.clone(),
+    });
+    let mut provider_messages = compiled_instructions.provider_messages();
+    provider_messages.extend(
+        prepared
+            .provider_messages
+            .iter()
+            .filter(|message| {
+                !matches!(
+                    message.role,
+                    ProviderMessageRole::System | ProviderMessageRole::Developer
+                )
+            })
+            .cloned(),
+    );
+    let provider_budget = resolve_provider_context_budget(
+        provider_snapshot,
+        Some(provider_kind),
+        Some(provider_model_id),
+        Some(tool_catalog_snapshot),
+    );
+    let prompt_cache_session_metadata =
+        crate::application::provider_input::rematerialized_prompt_cache_session_metadata(
+            prepared.prompt_cache_report.as_ref(),
+            provider_kind,
+            tool_catalog_snapshot,
+        );
+    let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
+        crate::application::provider_input::build_prompt_cache_metadata(
+            prepared.provider_input_text.as_str(),
+            provider_messages.as_slice(),
+            Some(user_visible_input_text),
+            Some(tool_catalog_snapshot),
+            Some(&prompt_cache_session_metadata),
+        );
+    let handover_trace_hash = stable_sha256_json(&json!({
+        "schema_version": 1,
+        "previous_trace_id": prepared.context_trace_id.as_deref(),
+        "provider_kind": provider_kind,
+        "provider_model_id": provider_model_id,
+        "instruction_hash": compiled_instructions.hash.as_str(),
+        "budget_profile": provider_budget.profile.profile_id.as_str(),
+        "tool_catalog_hash": tool_catalog_snapshot.catalog_hash.as_str(),
+    }));
+    PreparedModelProviderInput {
+        provider_input_text: prepared.provider_input_text.clone(),
+        provider_messages,
+        vision_inputs: prepared.vision_inputs.clone(),
+        instruction_hash: Some(compiled_instructions.hash),
+        instruction_trust_summary: Some(instruction_trust_summary),
+        context_trace_id: Some(format!("ctx_handover_{}", &handover_trace_hash[..16])),
+        budget_profile: Some(provider_budget.profile.profile_id),
+        max_output_tokens: Some(provider_budget.reserved_completion_tokens),
+        reasoning_effort: prepared.reasoning_effort,
+        service_tier: prepared.service_tier,
+        prompt_segments,
+        prompt_cache_policy,
+        prompt_cache_report,
+    }
 }
 
 /// Final budgeted prompt text plus the trace explaining how it was built.

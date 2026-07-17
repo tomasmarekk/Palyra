@@ -1560,11 +1560,7 @@ fn entry(
         approval_posture,
         projection_policy,
         parallelism_policy,
-        replay_safety_class: replay_safety_class_for_tool(
-            name,
-            parallelism_policy,
-            approval_posture,
-        ),
+        replay_safety_class: replay_safety_class_for_tool(name, parallelism_policy),
         target_surfaces: vec![ToolExposureSurface::RunStream, ToolExposureSurface::RouteMessage],
     }
 }
@@ -1572,11 +1568,7 @@ fn entry(
 fn replay_safety_class_for_tool(
     name: &str,
     parallelism_policy: ToolParallelismPolicy,
-    approval_posture: ToolApprovalPosture,
 ) -> ToolReplaySafetyClass {
-    if approval_posture == ToolApprovalPosture::ApprovalRequired {
-        return ToolReplaySafetyClass::RequiresHumanConfirmation;
-    }
     if has_external_side_effect_family(name) {
         return ToolReplaySafetyClass::ExternalSideEffect;
     }
@@ -1590,7 +1582,9 @@ fn replay_safety_class_for_tool(
 fn has_external_side_effect_family(name: &str) -> bool {
     matches!(
         name,
-        "palyra.browser.navigate"
+        "palyra.fs.apply_patch"
+            | "palyra.http.fetch"
+            | "palyra.browser.navigate"
             | "palyra.browser.reload"
             | "palyra.browser.click"
             | "palyra.browser.type"

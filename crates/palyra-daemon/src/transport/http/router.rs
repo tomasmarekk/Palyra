@@ -31,6 +31,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/admin/v1/state/doctor", get(admin::core::admin_state_doctor_handler))
         .route("/admin/v1/state/repair", post(admin::core::admin_state_repair_handler))
         .route("/admin/v1/state/checkpoint", post(admin::core::admin_state_checkpoint_handler))
+        .route(
+            "/admin/v1/side-effect-fences/{operation_id}/resolve",
+            post(admin::core::admin_side_effect_fence_resolution_handler),
+        )
+        .route(
+            "/admin/v1/runtime-health/{component_id}/probe",
+            post(admin::core::admin_runtime_health_probe_handler),
+        )
+        .route(
+            "/admin/v1/runtime-health/{component_id}/probe-lease",
+            post(admin::core::admin_runtime_health_legacy_mutation_handler),
+        )
+        .route(
+            "/admin/v1/runtime-health/{component_id}/probe-lease/release",
+            post(admin::core::admin_runtime_health_legacy_mutation_handler),
+        )
+        .route(
+            "/admin/v1/runtime-health/{component_id}/quarantine/clear",
+            post(admin::core::admin_runtime_health_quarantine_clear_handler),
+        )
         .route("/admin/v1/state/hash-chain", get(admin::core::admin_state_hash_chain_handler))
         .route(
             "/admin/v1/state/sidecars/prepare",

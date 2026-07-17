@@ -368,6 +368,8 @@ object PalyraMemoryV1 {
 }
 
 object PalyraNodeV1 {
+    data class AcknowledgeNetworkedWorkerPayloadRequest(val placeholder: Int = 0)
+    data class AcknowledgeNetworkedWorkerPayloadResponse(val placeholder: Int = 0)
     data class BeginPairingSessionRequest(val placeholder: Int = 0)
     data class BeginPairingSessionResponse(val placeholder: Int = 0)
     data class CompletePairingSessionRequest(val placeholder: Int = 0)
@@ -375,8 +377,11 @@ object PalyraNodeV1 {
     data class DeviceCapability(val placeholder: Int = 0)
     data class ExecuteCapabilityRequest(val placeholder: Int = 0)
     data class ExecuteCapabilityResponse(val placeholder: Int = 0)
+    data class FetchNetworkedWorkerPayloadRequest(val placeholder: Int = 0)
+    data class FetchNetworkedWorkerPayloadResponse(val placeholder: Int = 0)
     data class GetPairingRequestStatusRequest(val placeholder: Int = 0)
     data class GetPairingRequestStatusResponse(val placeholder: Int = 0)
+    data class NetworkedWorkerDeliveryReservation(val placeholder: Int = 0)
     data class NodeCapabilityDispatch(val placeholder: Int = 0)
     data class NodeEventRequest(val placeholder: Int = 0)
     data class NodeEventResponse(val placeholder: Int = 0)
@@ -388,9 +393,11 @@ object PalyraNodeV1 {
     data class RotateDeviceCertificateRequest(val placeholder: Int = 0)
     data class RotateDeviceCertificateResponse(val placeholder: Int = 0)
     interface NodeServiceClient {
+        fun acknowledgeNetworkedWorkerPayload()
         fun beginPairingSession()
         fun completePairingSession()
         fun executeCapability()
+        fun fetchNetworkedWorkerPayload()
         fun getPairingRequestStatus()
         fun registerNode()
         fun revokeDevicePairing()

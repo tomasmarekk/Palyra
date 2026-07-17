@@ -381,6 +381,7 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
         evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
     upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    refresh_plugin_runtime_health(&state, &index)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
         "schema_version": index.schema_version,
@@ -452,6 +453,7 @@ pub(crate) async fn console_plugin_enable_handler(
         evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
     upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    refresh_plugin_runtime_health(&state, &index)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
         "schema_version": index.schema_version,
@@ -487,6 +489,7 @@ pub(crate) async fn console_plugin_disable_handler(
         evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
     upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    refresh_plugin_runtime_health(&state, &index)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
         "schema_version": index.schema_version,
@@ -526,11 +529,23 @@ pub(crate) async fn console_plugin_delete_handler(
     remove_plugin_config_instance(plugins_root.as_path(), binding.plugin_id.as_str())
         .map_err(internal_console_error)?;
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    refresh_plugin_runtime_health(&state, &index)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
         "deleted": true,
         "binding": binding,
     })))
+}
+
+fn refresh_plugin_runtime_health(
+    state: &AppState,
+    index: &crate::plugins::PluginBindingsIndex,
+) -> Result<(), Response> {
+    let enabled_plugin_ids =
+        index.entries.iter().filter(|entry| entry.enabled).map(|entry| entry.plugin_id.clone());
+    state.runtime.try_configure_plugin_runtime_health(enabled_plugin_ids).map_err(|error| {
+        internal_console_error(anyhow!("failed to activate plugin runtime health: {error}"))
+    })
 }
 
 async fn evaluate_plugin_binding(

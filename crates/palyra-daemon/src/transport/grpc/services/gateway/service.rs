@@ -41,9 +41,12 @@ use crate::{
         },
         conversation_bindings::ConversationBindingResolveRequest,
         route_message::orchestration::handle_routed_route_message,
-        run_stream::orchestration::{
-            finalize_run_stream_after_provider_response, process_run_stream_message,
-            RunStreamMessageProcessingOutcome, RunStreamPostProviderOutcome,
+        run_stream::{
+            flow_control::run_stream_response_backpressure_policy,
+            orchestration::{
+                finalize_run_stream_after_provider_response, process_run_stream_message,
+                RunStreamMessageProcessingOutcome, RunStreamPostProviderOutcome,
+            },
         },
         service_authorization::{authorize_agent_management_action, authorize_message_action},
     },
@@ -2088,7 +2091,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         self.state.counters.run_stream_requests.fetch_add(1, Ordering::Relaxed);
 
         let mut stream = request.into_inner();
-        let (sender, receiver) = mpsc::channel(16);
+        let response_backpressure = run_stream_response_backpressure_policy()?;
+        let (sender, receiver) = mpsc::channel(response_backpressure.capacity);
         let context_for_stream = context.clone();
         let state_for_stream = self.state.clone();
 
@@ -2105,7 +2109,9 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut previous_session_run_id = None::<String>;
             let mut background_budget_tokens = None::<u64>;
             let mut active_approval_cache_generation = None::<u64>;
+            let mut active_flow_control = None;
             let mut active_attempt_owner = None::<String>;
+            let mut active_terminal_tape_events = Vec::new();
 
             let mut pending_item = None::<Result<common_v1::RunStreamRequest, Status>>;
             loop {
@@ -2129,6 +2135,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             active_session_id: active_session_id.as_deref(),
                             run_state: &mut run_state,
                             active_run_id: active_run_id.as_deref(),
+                            flow_control: active_flow_control.as_ref(),
                             tape_seq: &mut tape_seq,
                             reason: status.message(),
                         })
@@ -2146,6 +2153,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         active_session_id: active_session_id.as_deref(),
                         run_state: &mut run_state,
                         active_run_id: active_run_id.as_deref(),
+                        flow_control: active_flow_control.as_ref(),
                         tape_seq: &mut tape_seq,
                         reason: status.message(),
                     })
@@ -2170,7 +2178,9 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &mut previous_session_run_id,
                     &mut background_budget_tokens,
                     &mut active_approval_cache_generation,
+                    &mut active_flow_control,
                     &mut active_attempt_owner,
+                    &mut active_terminal_tape_events,
                     message,
                 )
                 .await
@@ -2184,6 +2194,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             active_session_id: active_session_id.as_deref(),
                             run_state: &mut run_state,
                             active_run_id: active_run_id.as_deref(),
+                            flow_control: active_flow_control.as_ref(),
                             tape_seq: &mut tape_seq,
                             reason: error.message(),
                         })
@@ -2206,17 +2217,39 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             }
 
             if let Some(run_id) = active_run_id {
+                let Some(flow_control) = active_flow_control.as_ref() else {
+                    let error =
+                        Status::internal("run finalization requires an active flow-control scope");
+                    finalize_run_failure(RunFailureFinalization {
+                        sender: &sender,
+                        runtime_state: &state_for_stream,
+                        request_context: Some(&context_for_stream),
+                        active_session_id: active_session_id.as_deref(),
+                        run_state: &mut run_state,
+                        active_run_id: Some(run_id.as_str()),
+                        flow_control: active_flow_control.as_ref(),
+                        tape_seq: &mut tape_seq,
+                        reason: error.message(),
+                    })
+                    .await;
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                };
                 match finalize_run_stream_after_provider_response(
                     &sender,
                     &state_for_stream,
                     &mut run_state,
                     run_id.as_str(),
                     active_attempt_owner.as_deref(),
+                    flow_control,
                     &mut tape_seq,
+                    std::mem::take(&mut active_terminal_tape_events),
                 )
                 .await
                 {
                     Ok(RunStreamPostProviderOutcome::Completed) => {}
+                    Ok(RunStreamPostProviderOutcome::CompletedDeliveryFailed) => {}
+                    Ok(RunStreamPostProviderOutcome::Failed) => {}
                     Ok(RunStreamPostProviderOutcome::Cancelled) => {}
                     Err(error) => {
                         finalize_run_failure(RunFailureFinalization {
@@ -2226,6 +2259,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             active_session_id: active_session_id.as_deref(),
                             run_state: &mut run_state,
                             active_run_id: Some(run_id.as_str()),
+                            flow_control: active_flow_control.as_ref(),
                             tape_seq: &mut tape_seq,
                             reason: error.message(),
                         })

@@ -9,6 +9,7 @@
 
 pub(crate) mod agent_loop;
 pub(crate) mod cancellation;
+pub(crate) mod flow_control;
 pub(crate) mod orchestration;
 pub(crate) mod public_events;
 pub(crate) mod tape;

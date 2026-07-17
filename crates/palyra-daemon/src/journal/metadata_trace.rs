@@ -8,11 +8,12 @@ use std::collections::BTreeSet;
 use palyra_common::metadata_trace::{
     metadata_trace_id_sha256, MetadataTraceEntrypointV1, MetadataTraceEventDataV1,
     MetadataTraceEventV1, MetadataTraceIdDomainV1, MetadataTraceSegmentStatusV1,
-    MetadataTraceSegmentV1, MetadataTraceTerminalOutcomeV1, MetadataTraceV1,
-    RecoveryContinuationMetadataV1, RunStartedMetadataV1, TerminalizationMetadataV1,
-    METADATA_TRACE_MAX_EVENTS, METADATA_TRACE_MAX_EVENT_BYTES, METADATA_TRACE_MAX_SEGMENTS,
-    METADATA_TRACE_SCHEMA_VERSION,
+    MetadataTraceSegmentV1, MetadataTraceTerminalOutcomeV1, MetadataTraceToolOutcomeV1,
+    MetadataTraceV1, RecoveryContinuationMetadataV1, RecoveryMetadataV1, RunStartedMetadataV1,
+    TerminalizationMetadataV1, ToolOutcomeMetadataV1, METADATA_TRACE_MAX_EVENTS,
+    METADATA_TRACE_MAX_EVENT_BYTES, METADATA_TRACE_MAX_SEGMENTS, METADATA_TRACE_SCHEMA_VERSION,
 };
+use palyra_common::runtime_contracts::{RuntimeEventEnvelopeV2, RuntimeEventName};
 use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
@@ -35,7 +36,7 @@ pub(super) const MIGRATION_44_SQL: &str = migration::SQL;
 use model::{event_kind, event_uses_terminal_reserve, parse_status, status_name};
 use types::SegmentRow;
 
-fn hash_identifier(
+pub(super) fn hash_identifier(
     run_id: &str,
     domain: MetadataTraceIdDomainV1,
     raw: &str,
@@ -455,6 +456,179 @@ fn validate_event_append_tx(
     serialize_event(run_id, event)
 }
 
+fn runtime_event_metadata_trace_data(
+    envelope: &RuntimeEventEnvelopeV2,
+) -> Result<Option<MetadataTraceEventDataV1>, JournalError> {
+    let tool_outcome = match envelope.event_name {
+        RuntimeEventName::ToolEffectObserved
+        | RuntimeEventName::ToolEffectCleanupReconciled
+        | RuntimeEventName::ToolEffectReceiptReconciled
+        | RuntimeEventName::ToolEffectReconciled => Some(MetadataTraceToolOutcomeV1::Succeeded),
+        RuntimeEventName::ToolEffectUnknown | RuntimeEventName::ToolEffectCleanupUnknown => {
+            Some(MetadataTraceToolOutcomeV1::Unknown)
+        }
+        RuntimeEventName::ToolEffectAbandoned => Some(MetadataTraceToolOutcomeV1::Cancelled),
+        RuntimeEventName::ToolIntentRecorded | RuntimeEventName::ToolEffectStarted => {
+            return Ok(Some(MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+                strategy:
+                    palyra_common::metadata_trace::MetadataTraceRecoveryStrategyV1::IdempotencyGuard,
+                attempt: 1,
+                reason_code: envelope.reason_code.clone(),
+            })));
+        }
+        RuntimeEventName::CleanupCompleted => {
+            return Ok(Some(MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+                // Exact report/event replay guards make completed cleanup safe
+                // to project without inventing a separate trace vocabulary.
+                strategy:
+                    palyra_common::metadata_trace::MetadataTraceRecoveryStrategyV1::IdempotencyGuard,
+                attempt: 1,
+                reason_code: envelope.reason_code.clone(),
+            })));
+        }
+        RuntimeEventName::CleanupPartial
+        | RuntimeEventName::CleanupUnknown
+        | RuntimeEventName::CompatibilityBlocked => {
+            return Ok(Some(MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+                strategy:
+                    palyra_common::metadata_trace::MetadataTraceRecoveryStrategyV1::OperatorReview,
+                attempt: 1,
+                reason_code: envelope.reason_code.clone(),
+            })));
+        }
+        _ => None,
+    };
+    let Some(outcome) = tool_outcome else {
+        return Ok(None);
+    };
+    let tool_execution_id = envelope.identities.tool_execution_id.as_ref().ok_or_else(|| {
+        JournalError::MetadataTraceInvariant {
+            run_id: envelope.identities.run_id.as_str().to_owned(),
+            reason_code: "metadata_trace.tool_execution_identity_missing",
+        }
+    })?;
+    Ok(Some(MetadataTraceEventDataV1::ToolOutcome(ToolOutcomeMetadataV1 {
+        tool_id_sha256: hash_identifier(
+            envelope.identities.run_id.as_str(),
+            MetadataTraceIdDomainV1::Tool,
+            tool_execution_id.as_str(),
+        )?,
+        attempt: 1,
+        outcome,
+        reason_code: envelope.reason_code.clone(),
+    })))
+}
+
+fn append_runtime_metadata_trace_data_tx(
+    connection: &Connection,
+    run_id: &str,
+    event_identity: &str,
+    event: MetadataTraceEventDataV1,
+    now_unix_ms: i64,
+) -> Result<bool, JournalError> {
+    let Some(segment) = latest_segment_optional_tx(connection, run_id)? else {
+        return Ok(false);
+    };
+    if !segment_statuses_tx(connection, run_id, segment.segment_id.as_str())?.is_empty() {
+        return Ok(false);
+    }
+    let event_count = run_event_count_tx(connection, run_id)?;
+    if event_count >= METADATA_TRACE_MAX_EVENTS.saturating_sub(RESERVED_TERMINAL_EVENTS) {
+        return Ok(false);
+    }
+    let sequence =
+        u32::try_from(event_count).map_err(|_| JournalError::MetadataTraceInvariant {
+            run_id: run_id.to_owned(),
+            reason_code: "metadata_trace.event_sequence_out_of_range",
+        })?;
+    let generation =
+        u32::try_from(segment.generation).map_err(|_| JournalError::MetadataTraceInvariant {
+            run_id: run_id.to_owned(),
+            reason_code: "metadata_trace.generation_out_of_range",
+        })?;
+    let parent_event_id = connection
+        .query_row(
+            r#"
+                SELECT event_id_sha256
+                FROM metadata_trace_events
+                WHERE run_ulid = ?1
+                ORDER BY sequence DESC
+                LIMIT 1
+            "#,
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| JournalError::MetadataTraceInvariant {
+            run_id: run_id.to_owned(),
+            reason_code: "metadata_trace.root_event_missing",
+        })?;
+    let recorded_at_unix_ms =
+        u64::try_from(now_unix_ms).map_err(|_| JournalError::MetadataTraceInvariant {
+            run_id: run_id.to_owned(),
+            reason_code: "metadata_trace.timestamp_out_of_range",
+        })?;
+    let projected = MetadataTraceEventV1 {
+        sequence,
+        generation,
+        recorded_at_unix_ms,
+        event_id_sha256: hash_identifier(run_id, MetadataTraceIdDomainV1::Event, event_identity)?,
+        causal_parent_event_id_sha256: Some(parent_event_id),
+        stage_duration_ms: None,
+        event,
+    };
+    let event_json = validate_event_append_tx(connection, run_id, &segment, &projected)?;
+    insert_event_tx(
+        connection,
+        run_id,
+        segment.segment_id.as_str(),
+        &projected,
+        event_json.as_str(),
+        now_unix_ms,
+    )?;
+    Ok(true)
+}
+
+/// Projects one supported shared-runtime event into the existing metadata-only trace.
+pub(super) fn append_runtime_event_metadata_trace_tx(
+    connection: &Connection,
+    envelope: &RuntimeEventEnvelopeV2,
+    now_unix_ms: i64,
+) -> Result<bool, JournalError> {
+    let Some(event) = runtime_event_metadata_trace_data(envelope)? else {
+        return Ok(false);
+    };
+    append_runtime_metadata_trace_data_tx(
+        connection,
+        envelope.identities.run_id.as_str(),
+        envelope.event_id.as_str(),
+        event,
+        now_unix_ms,
+    )
+}
+
+/// Projects metadata-only evidence for a generation callback that was suppressed.
+pub(super) fn append_stale_suppression_metadata_trace_tx(
+    connection: &Connection,
+    run_id: &str,
+    diagnostic_id: &str,
+    reason_code: &str,
+    now_unix_ms: i64,
+) -> Result<bool, JournalError> {
+    append_runtime_metadata_trace_data_tx(
+        connection,
+        run_id,
+        diagnostic_id,
+        MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+            strategy:
+                palyra_common::metadata_trace::MetadataTraceRecoveryStrategyV1::IdempotencyGuard,
+            attempt: 1,
+            reason_code: reason_code.to_owned(),
+        }),
+        now_unix_ms,
+    )
+}
+
 impl JournalStore {
     #[cfg(test)]
     /// Appends one already-redacted, typed event to the active trace segment.
@@ -716,6 +890,7 @@ impl JournalStore {
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+            delegated_admission: None,
         };
         let Some(previous) = latest_segment_optional_tx(&transaction, run_id)? else {
             let position = create_root_metadata_trace_for_entrypoint_tx(

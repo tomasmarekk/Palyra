@@ -1,8 +1,9 @@
 //! Catalog building, schema sanitization, and tool-call intake tests for the
 //! model-visible tool registry.
 
-use super::builtin::registry_entry;
+use super::builtin::{registry_entries, registry_entry};
 use super::catalog::clear_availability_probe_cache_for_tests;
+use super::reconciliation::builtin_has_explicit_execution_semantics;
 use super::schema::sanitize_schema_for_provider_with_audit;
 use super::types::{
     ModelVisibleToolCatalogSnapshot, ToolApprovalPosture, ToolCallRejectionKind,
@@ -11,8 +12,9 @@ use super::types::{
 use super::{
     build_model_visible_tool_catalog_snapshot, describe_catalog_tool,
     effective_tool_surface_report, projection_policy_for_tool,
-    provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
-    snapshot_to_provider_request_value, stable_hash_value,
+    provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target,
+    resolve_tool_execution_semantics, search_tool_catalog_index,
+    snapshot_to_provider_request_value, stable_hash_value, tool_execution_semantics,
     validate_tool_call_against_catalog_snapshot, ToolCatalogBuildRequest,
     ToolCatalogPolicySnapshot, ToolExposureSurface, ToolResultProjectionPolicy, ToolSchemaDialect,
     TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
@@ -22,7 +24,14 @@ use crate::{
     tool_protocol::{ToolCallConfig, ToolRequestContext},
     wasm_plugin_runner::WasmPluginRunnerPolicy,
 };
-use palyra_common::tool_catalog::ToolCatalogExposureMode;
+use palyra_common::{
+    runtime_contracts::{
+        ReconciliationStrategy, RuntimeGeneration, RuntimeIdempotencyClass, RuntimeOperationId,
+        RuntimeToolExecutionId, SideEffectFenceState, SideEffectFenceV1, SideEffectRestartPolicy,
+        SideEffectRetryDecision,
+    },
+    tool_catalog::ToolCatalogExposureMode,
+};
 use std::sync::{Mutex, OnceLock};
 
 static AVAILABILITY_PROBE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -115,10 +124,308 @@ fn registry_entries_classify_replay_safety() {
     let process_run = registry_entry("palyra.process.run").expect("process run entry exists");
     let browser_type = registry_entry("palyra.browser.type").expect("browser type entry exists");
 
+    let apply_patch = registry_entry("palyra.fs.apply_patch").expect("patch entry exists");
+    let http_fetch = registry_entry("palyra.http.fetch").expect("http entry exists");
+
     assert_eq!(echo.replay_safety_class, ToolReplaySafetyClass::ReadOnly);
     assert_eq!(sleep.replay_safety_class, ToolReplaySafetyClass::IdempotentWrite);
-    assert!(process_run.replay_safety_class.requires_replay_evidence());
-    assert!(browser_type.replay_safety_class.requires_replay_evidence());
+    assert_eq!(process_run.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(browser_type.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(apply_patch.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(http_fetch.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(process_run.approval_posture, ToolApprovalPosture::ApprovalRequired);
+    assert_eq!(apply_patch.approval_posture, ToolApprovalPosture::ApprovalRequired);
+}
+
+#[test]
+fn replay_safety_projects_to_shared_side_effect_semantics() {
+    let read_only = tool_execution_semantics("palyra.echo", ToolReplaySafetyClass::ReadOnly);
+    assert_eq!(read_only.idempotency_class, RuntimeIdempotencyClass::ReadOnly);
+    assert_eq!(read_only.restart_policy, SideEffectRestartPolicy::SafeRetry);
+    assert_eq!(read_only.reconciliation_strategy, ReconciliationStrategy::None);
+
+    let workspace = tool_execution_semantics(
+        "palyra.fs.apply_patch",
+        ToolReplaySafetyClass::ExternalSideEffect,
+    );
+    assert_eq!(workspace.reconciliation_strategy, ReconciliationStrategy::WorkspaceDigest);
+
+    let process =
+        tool_execution_semantics("palyra.process.run", ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(process.reconciliation_strategy, ReconciliationStrategy::ProcessProvenance);
+
+    let confirmation =
+        tool_execution_semantics("palyra.browser.type", ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(confirmation.idempotency_class, RuntimeIdempotencyClass::NonIdempotent);
+    assert_eq!(confirmation.restart_policy, SideEffectRestartPolicy::RequireConfirmation);
+    assert_eq!(confirmation.reconciliation_strategy, ReconciliationStrategy::None);
+
+    let plugin_confirmation = tool_execution_semantics(
+        "palyra.plugin.run",
+        ToolReplaySafetyClass::RequiresHumanConfirmation,
+    );
+    assert_eq!(plugin_confirmation.idempotency_class, RuntimeIdempotencyClass::NonIdempotent);
+    assert_eq!(plugin_confirmation.restart_policy, SideEffectRestartPolicy::RequireConfirmation);
+}
+
+#[test]
+fn every_builtin_has_an_explicit_execution_semantics_audit_entry() {
+    let missing = registry_entries()
+        .into_iter()
+        .filter(|entry| !builtin_has_explicit_execution_semantics(entry.name.as_str()))
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    assert!(missing.is_empty(), "builtins missing execution semantics: {missing:?}");
+}
+
+#[test]
+fn input_aware_reconciler_registry_covers_major_mutation_classes() {
+    let cases = [
+        (
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch\n*** End Patch\n"}"#.as_slice(),
+            ToolReplaySafetyClass::ExternalSideEffect,
+            RuntimeIdempotencyClass::ReconciliableMutation,
+            ReconciliationStrategy::WorkspaceDigest,
+            false,
+        ),
+        (
+            "palyra.process.run",
+            br#"{"command":"echo"}"#.as_slice(),
+            ToolReplaySafetyClass::ExternalSideEffect,
+            RuntimeIdempotencyClass::ReconciliableMutation,
+            ReconciliationStrategy::ProcessProvenance,
+            false,
+        ),
+        (
+            "palyra.http.fetch",
+            br#"{"url":"https://example.test","method":"POST","headers":{"Idempotency-Key":"request-1"}}"#
+                .as_slice(),
+            ToolReplaySafetyClass::ExternalSideEffect,
+            RuntimeIdempotencyClass::ExternalIdempotencyKey,
+            ReconciliationStrategy::ExternalIdempotencyReceipt,
+            true,
+        ),
+        (
+            "palyra.http.fetch",
+            br#"{"url":"https://example.test","method":"POST"}"#.as_slice(),
+            ToolReplaySafetyClass::ExternalSideEffect,
+            RuntimeIdempotencyClass::NonIdempotent,
+            ReconciliationStrategy::None,
+            false,
+        ),
+        (
+            "palyra.clarify.ask",
+            br#"{"question":"Continue?"}"#.as_slice(),
+            ToolReplaySafetyClass::NonIdempotentWrite,
+            RuntimeIdempotencyClass::ReconciliableMutation,
+            ReconciliationStrategy::DeliveryAcknowledgement,
+            false,
+        ),
+        (
+            "sessions_spawn",
+            br#"{"task":"inspect the workspace"}"#.as_slice(),
+            ToolReplaySafetyClass::NonIdempotentWrite,
+            RuntimeIdempotencyClass::ReconciliableMutation,
+            ReconciliationStrategy::WorkerLeaseReceipt,
+            false,
+        ),
+    ];
+
+    for (tool_name, input, replay_class, idempotency, strategy, key_required) in cases {
+        let resolved = resolve_tool_execution_semantics(tool_name, replay_class, input);
+        resolved.semantics.validate().expect("registered semantics should validate");
+        assert_eq!(resolved.semantics.idempotency_class, idempotency, "{tool_name}");
+        assert_eq!(
+            resolved.semantics.restart_policy,
+            if idempotency == RuntimeIdempotencyClass::NonIdempotent {
+                SideEffectRestartPolicy::RequireConfirmation
+            } else {
+                SideEffectRestartPolicy::ReconcileBeforeRetry
+            },
+            "{tool_name}"
+        );
+        assert_eq!(resolved.semantics.reconciliation_strategy, strategy, "{tool_name}");
+        assert_eq!(
+            resolved.semantics.external_idempotency_key_required, key_required,
+            "{tool_name}"
+        );
+        assert_eq!(resolved.external_idempotency_key_sha256.is_some(), key_required, "{tool_name}");
+    }
+}
+
+#[test]
+fn mixed_operation_builtins_fence_only_mutating_inputs() {
+    let read_cases = [
+        ("palyra.http.fetch", br#"{"url":"https://example.test","method":"HEAD"}"#.as_slice()),
+        ("palyra.fs.apply_patch", br#"{"patch":"x","dry_run":true}"#.as_slice()),
+        ("palyra.fs.os_file", br#"{"operation":"read","path":"C:\\tmp\\a"}"#.as_slice()),
+        (
+            "palyra.fs.os_file",
+            br#"{"operation":"delete_file","path":"C:\\tmp\\a","dry_run":true}"#.as_slice(),
+        ),
+        ("palyra.plan.manage", br#"{"operation":"read"}"#.as_slice()),
+        ("palyra.browser.dialog", br#"{"session_id":"s","action":"inspect"}"#.as_slice()),
+        ("palyra.browser.screenshot", br#"{"session_id":"s"}"#.as_slice()),
+    ];
+    for (tool_name, input) in read_cases {
+        let resolved = resolve_tool_execution_semantics(
+            tool_name,
+            ToolReplaySafetyClass::ExternalSideEffect,
+            input,
+        );
+        assert_eq!(
+            resolved.semantics.idempotency_class,
+            RuntimeIdempotencyClass::ReadOnly,
+            "{tool_name}"
+        );
+        assert!(resolved.external_idempotency_key_sha256.is_none(), "{tool_name}");
+    }
+
+    let mutation_cases = [
+        ("palyra.fs.os_file", br#"{"operation":"delete_file","path":"C:\\tmp\\a"}"#.as_slice()),
+        ("palyra.plan.manage", br#"{"operation":"complete","item_id":"i"}"#.as_slice()),
+        ("palyra.browser.dialog", br#"{"session_id":"s","action":"accept"}"#.as_slice()),
+        (
+            "palyra.browser.screenshot",
+            br#"{"session_id":"s","output_path":"capture.png"}"#.as_slice(),
+        ),
+    ];
+    for (tool_name, input) in mutation_cases {
+        let resolved = resolve_tool_execution_semantics(
+            tool_name,
+            ToolReplaySafetyClass::ExternalSideEffect,
+            input,
+        );
+        assert_eq!(
+            resolved.semantics.idempotency_class,
+            RuntimeIdempotencyClass::NonIdempotent,
+            "{tool_name}"
+        );
+        assert_eq!(
+            resolved.semantics.restart_policy,
+            SideEffectRestartPolicy::RequireConfirmation,
+            "{tool_name}"
+        );
+    }
+}
+
+#[test]
+fn ambiguous_http_idempotency_keys_fail_closed_to_confirmation() {
+    let input = br#"{
+        "url":"https://example.test",
+        "method":"POST",
+        "headers":{"Idempotency-Key":"first","idempotency-key":"second"}
+    }"#;
+
+    let resolved = resolve_tool_execution_semantics(
+        "palyra.http.fetch",
+        ToolReplaySafetyClass::ExternalSideEffect,
+        input,
+    );
+
+    assert_eq!(resolved.semantics.idempotency_class, RuntimeIdempotencyClass::NonIdempotent);
+    assert_eq!(resolved.semantics.restart_policy, SideEffectRestartPolicy::RequireConfirmation);
+    assert!(resolved.external_idempotency_key_sha256.is_none());
+}
+
+#[test]
+fn effect_unknown_never_blindly_retries_a_registered_mutation() {
+    let cases = [
+        (
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch\n*** End Patch\n"}"#.as_slice(),
+            SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "palyra.process.run",
+            br#"{"command":"echo"}"#.as_slice(),
+            SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "palyra.http.fetch",
+            br#"{"url":"https://example.test","method":"POST","headers":{"idempotency-key":"request-1"}}"#
+                .as_slice(),
+            SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "palyra.http.fetch",
+            br#"{"url":"https://example.test","method":"POST"}"#.as_slice(),
+            SideEffectRetryDecision::ConfirmationRequired,
+        ),
+        (
+            "palyra.clarify.ask",
+            br#"{"question":"Continue?"}"#.as_slice(),
+            SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "sessions_spawn",
+            br#"{"task":"inspect"}"#.as_slice(),
+            SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "palyra.browser.click",
+            br#"{"session_id":"s","selector":"button"}"#.as_slice(),
+            SideEffectRetryDecision::ConfirmationRequired,
+        ),
+    ];
+
+    for (tool_name, input, expected) in cases {
+        let resolved = resolve_tool_execution_semantics(
+            tool_name,
+            ToolReplaySafetyClass::ExternalSideEffect,
+            input,
+        );
+        let fence = SideEffectFenceV1 {
+            schema_version: 1,
+            operation_id: RuntimeOperationId::parse("operation_01").expect("operation id"),
+            tool_execution_id: RuntimeToolExecutionId::parse("execution_01").expect("execution id"),
+            intent_generation: RuntimeGeneration::new(1).expect("generation"),
+            observed_generation: RuntimeGeneration::new(1).expect("generation"),
+            intent_sha256: "a".repeat(64),
+            state: SideEffectFenceState::EffectUnknown,
+            semantics: resolved.semantics,
+            external_idempotency_key_sha256: resolved.external_idempotency_key_sha256,
+            evidence_sha256: None,
+            reason_code: "tool.effect.ack_unknown".to_owned(),
+            updated_at_unix_ms: 1,
+        };
+        fence.validate().expect("uncertain fence should validate");
+        assert_eq!(fence.retry_decision(), expected, "{tool_name}");
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn keyed_http_semantics_persist_only_a_deterministic_key_digest(
+        key in "[A-Za-z0-9_-]{1,64}"
+    ) {
+        let input = serde_json::json!({
+            "url": "https://example.test",
+            "method": "POST",
+            "headers": {"IDEMPOTENCY-KEY": key.clone()}
+        });
+        let input = serde_json::to_vec(&input).expect("input should serialize");
+
+        let resolved = resolve_tool_execution_semantics(
+            "palyra.http.fetch",
+            ToolReplaySafetyClass::ExternalSideEffect,
+            input.as_slice(),
+        );
+
+        let digest = resolved
+            .external_idempotency_key_sha256
+            .expect("keyed mutation should bind a digest");
+        let expected_digest = crate::sha256_hex(key.as_bytes());
+        proptest::prop_assert_eq!(digest.as_str(), expected_digest.as_str());
+        proptest::prop_assert_ne!(digest.as_str(), key.as_str());
+        proptest::prop_assert!(resolved.semantics.external_idempotency_key_required);
+        proptest::prop_assert_eq!(
+            resolved.semantics.reconciliation_strategy,
+            ReconciliationStrategy::ExternalIdempotencyReceipt
+        );
+    }
 }
 
 #[test]

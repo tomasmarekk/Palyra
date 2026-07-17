@@ -878,6 +878,8 @@ mod tests {
                     json!({ "user_input": { "text": "call https://example.test?token=secret" } })
                         .to_string(),
                 ),
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -1120,6 +1122,8 @@ mod tests {
                 parameter_delta_json: Some(
                     json!({ "user_input": { "text": "diagnose failed tool run" } }).to_string(),
                 ),
+
+                delegated_admission: None,
             })
             .expect("run should start");
         for (seq, (event_type, payload)) in events.into_iter().enumerate() {

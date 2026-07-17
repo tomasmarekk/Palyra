@@ -221,6 +221,9 @@ pub(crate) struct ProviderLeaseExecutionContext {
     pub max_wait_ms: u64,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Optional metadata-only correlation for provider-generation diagnostics
+    /// when the execution is not attached to an orchestrator run.
+    pub diagnostic_scope_id: Option<String>,
 }
 
 /// Borrowed parameters for [`ProviderLeaseManager::preview`].

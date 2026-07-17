@@ -195,6 +195,8 @@ pub(crate) async fn console_diagnostics_handler(
         state.runtime.list_session_write_leases().await.map_err(runtime_status_response)?;
     let session_write_leases_payload =
         build_session_write_leases_diagnostics(session_write_leases.as_slice());
+    let shared_runtime =
+        state.runtime.shared_runtime_diagnostics().await.map_err(runtime_status_response)?;
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -366,6 +368,7 @@ pub(crate) async fn console_diagnostics_handler(
         "cron_routine_preview_audit": cron_routine_preview_audit_payload,
         "turn_control": turn_control_payload,
         "session_write_leases": session_write_leases_payload,
+        "shared_runtime": shared_runtime,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,

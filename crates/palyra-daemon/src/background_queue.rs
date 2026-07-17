@@ -17,7 +17,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use palyra_common::{
-    runtime_contracts::AuxiliaryTaskState,
+    runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
+        RuntimeGeneration, RuntimeGenerationLane, RuntimeSubsystem, StaleEventDisposition,
+    },
     runtime_preview::{
         RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
         RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability,
@@ -60,8 +63,11 @@ use crate::{
         HEADER_PRINCIPAL,
     },
     journal::{
+        BackgroundTaskChildResolution, OrchestratorBackgroundTaskClaimRequest,
         OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
+        OrchestratorBackgroundTaskWorkerUpdateRequest, OrchestratorParentGenerationGuard,
         OrchestratorRunMetadataUpdateRequest, OrchestratorTapeAppendRequest,
+        RuntimeStaleEventDiagnosticRequest,
     },
     objective_judge::{
         build_objective_judge_prompt_from_payload, invalid_objective_judge_input_result,
@@ -144,9 +150,9 @@ async fn poll_background_queue(
             let _ = runtime
                 .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                     task_id: task.task_id.clone(),
+                    expected_revision: task.revision,
                     state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
                     target_run_id: None,
-                    increment_attempt_count: false,
                     last_error: Some(Some(error.message().to_owned())),
                     result_json: Some(Some(
                         json!({
@@ -198,42 +204,78 @@ async fn process_background_task(
         return Ok(());
     }
 
-    runtime.record_self_healing_heartbeat(WorkHeartbeatUpdate {
-        kind: WorkHeartbeatKind::BackgroundTask,
-        object_id: task.task_id.clone(),
-        summary: format!("background task {} ({})", task.task_id, task.task_kind),
-    });
+    runtime.record_self_healing_heartbeat(background_task_heartbeat_update(task));
 
     let now = crate::gateway::current_unix_ms();
     if let Some(expires_at_unix_ms) = task.expires_at_unix_ms {
         if expires_at_unix_ms <= now {
-            runtime
-                .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
-                    task_id: task.task_id.clone(),
-                    state: Some(AuxiliaryTaskState::Expired.as_str().to_owned()),
-                    target_run_id: None,
-                    increment_attempt_count: false,
-                    last_error: Some(Some("background task expired before dispatch".to_owned())),
-                    result_json: Some(Some(
-                        json!({
-                            "status": "expired",
-                            "task_id": task.task_id,
-                            "expired_at_unix_ms": expires_at_unix_ms,
-                        })
-                        .to_string(),
-                    )),
-                    started_at_unix_ms: None,
-                    completed_at_unix_ms: Some(Some(now)),
-                })
+            if let Some(target_run_id) = task.target_run_id.as_deref() {
+                request_attached_child_expiry_cancel(
+                    runtime,
+                    task,
+                    target_run_id,
+                    "background_task_expired",
+                    "background task expired while its child run was active",
+                    now,
+                )
                 .await?;
-            runtime.clear_self_healing_heartbeat(
-                WorkHeartbeatKind::BackgroundTask,
-                task.task_id.as_str(),
-            );
+            } else {
+                runtime
+                    .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        expected_revision: task.revision,
+                        state: Some(AuxiliaryTaskState::Expired.as_str().to_owned()),
+                        target_run_id: None,
+                        last_error: Some(Some(
+                            "background task expired before dispatch".to_owned(),
+                        )),
+                        result_json: Some(Some(
+                            json!({
+                                "status": "expired",
+                                "task_id": task.task_id,
+                                "expired_at_unix_ms": expires_at_unix_ms,
+                            })
+                            .to_string(),
+                        )),
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: Some(Some(now)),
+                    })
+                    .await?;
+                runtime.clear_self_healing_heartbeat(
+                    WorkHeartbeatKind::BackgroundTask,
+                    task.task_id.as_str(),
+                );
+            }
             return Ok(());
         }
     }
     if task.not_before_unix_ms.is_some_and(|not_before| not_before > now) {
+        return Ok(());
+    }
+    let child_task_contract = validate_child_task_cancellation_contract(task);
+    if let Err(error) = child_task_contract.as_ref() {
+        if task_has_attached_child(task) {
+            reconcile_attached_child_with_invalid_contract(runtime, task, error, now).await?;
+        } else {
+            fail_child_task_cancellation_contract(
+                runtime,
+                task,
+                error.message,
+                error.reason_code,
+                now,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if expire_child_task_cancellation_context(
+        runtime,
+        task,
+        child_task_contract.expect("validated child-task contract is available"),
+        now,
+    )
+    .await?
+    {
         return Ok(());
     }
     if sync_parent_run_cancellation(runtime, task).await? {
@@ -257,9 +299,9 @@ async fn process_background_task(
             runtime
                 .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                     task_id: task.task_id.clone(),
+                    expected_revision: task.revision,
                     state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
                     target_run_id: None,
-                    increment_attempt_count: false,
                     last_error: Some(Some("cancelled before dispatch".to_owned())),
                     result_json: Some(Some(
                         json!({
@@ -304,9 +346,9 @@ async fn process_background_task(
         runtime
             .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                 task_id: task.task_id.clone(),
+                expected_revision: task.revision,
                 state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
                 target_run_id: None,
-                increment_attempt_count: false,
                 last_error: Some(Some("background task exhausted retry budget".to_owned())),
                 result_json: Some(Some(
                     json!({
@@ -353,6 +395,270 @@ async fn process_background_task(
     dispatch_background_task(runtime, auth, grpc_url, task).await
 }
 
+fn task_has_attached_child(task: &OrchestratorBackgroundTaskRecord) -> bool {
+    task.target_run_id.is_some()
+        && matches!(
+            AuxiliaryTaskState::from_str(task.state.as_str()),
+            Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested)
+        )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildTaskContractError {
+    message: &'static str,
+    reason_code: &'static str,
+}
+
+fn validate_child_task_cancellation_contract(
+    task: &OrchestratorBackgroundTaskRecord,
+) -> Result<Option<&CancellationContextV1>, ChildTaskContractError> {
+    let Some(task_kind) = AuxiliaryTaskKind::from_str(task.task_kind.as_str()) else {
+        return Err(ChildTaskContractError {
+            message: "background task has an unknown task kind",
+            reason_code: "unknown_task_kind",
+        });
+    };
+    let is_delegation_task = task_kind == AuxiliaryTaskKind::DelegationPrompt;
+    if is_delegation_task != task.delegation.is_some() {
+        return Err(ChildTaskContractError {
+            message: "delegation task kind and delegation payload do not agree",
+            reason_code: "invalid_delegation_payload",
+        });
+    }
+    let Some(cancellation) = task.cancellation_context.as_ref() else {
+        return if is_delegation_task {
+            Err(ChildTaskContractError {
+                message: "delegation task is missing durable ChildTask cancellation authority",
+                reason_code: "missing_child_task_context",
+            })
+        } else {
+            Ok(None)
+        };
+    };
+    if !is_delegation_task {
+        return Err(ChildTaskContractError {
+            message: "non-delegation task carries durable ChildTask cancellation authority",
+            reason_code: "unexpected_child_task_context",
+        });
+    }
+    if cancellation.scope != CancellationScopeKind::ChildTask
+        || cancellation.parent_scope_id.is_none()
+        || cancellation.validate().is_err()
+    {
+        return Err(ChildTaskContractError {
+            message: "delegation task has invalid durable ChildTask cancellation authority",
+            reason_code: "invalid_child_task_context",
+        });
+    }
+    if task.parent_run_id.is_none() {
+        return Err(ChildTaskContractError {
+            message: "delegation task is missing its parent run identity",
+            reason_code: "missing_parent_run",
+        });
+    }
+    Ok(Some(cancellation))
+}
+
+async fn reconcile_attached_child_with_invalid_contract(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    error: &ChildTaskContractError,
+    now_unix_ms: i64,
+) -> Result<(), Status> {
+    let target_run_id =
+        task.target_run_id.as_deref().expect("attached child validation requires a target run");
+    let snapshot = runtime.orchestrator_run_status_snapshot(target_run_id.to_owned()).await?;
+    if let Some(run) = snapshot.as_ref() {
+        if is_terminal_run_state(run.state.as_str()) {
+            finalize_task_from_run(runtime, task, Some(run), "failed").await?;
+            return Ok(());
+        }
+    }
+    request_background_child_cancel(runtime, target_run_id, "invalid_child_task_contract").await?;
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+            target_run_id: None,
+            last_error: Some(Some(error.message.to_owned())),
+            result_json: Some(Some(
+                json!({
+                    "status": AuxiliaryTaskState::CancelRequested.as_str(),
+                    "task_id": task.task_id,
+                    "run_id": target_run_id,
+                    "reason": error.reason_code,
+                    "reconciliation": "attached_child_cancel_requested",
+                    "observed_at_unix_ms": now_unix_ms,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn expire_child_task_cancellation_context(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    cancellation: Option<&CancellationContextV1>,
+    now_unix_ms: i64,
+) -> Result<bool, Status> {
+    let Some(cancellation) = cancellation else {
+        return Ok(false);
+    };
+    if cancellation.permits_new_work(now_unix_ms) {
+        let parent_run_id =
+            task.parent_run_id.as_ref().expect("validated delegation contract has a parent run");
+        let persisted_generation =
+            runtime.persisted_runtime_generation_for_run(parent_run_id.clone()).await?;
+        if matches!(
+            persisted_generation,
+            Some((ref session_id, generation))
+                if session_id == &task.session_id && generation == cancellation.generation
+        ) {
+            return Ok(false);
+        }
+        if let Some(target_run_id) = task.target_run_id.as_deref() {
+            suppress_stale_child_completion(
+                runtime,
+                task,
+                target_run_id,
+                persisted_generation.map(|(_, generation)| generation),
+            )
+            .await?;
+            return Ok(true);
+        }
+        return fail_child_task_cancellation_contract(
+            runtime,
+            task,
+            "delegation ChildTask cancellation generation is no longer active",
+            "stale_child_task_generation",
+            now_unix_ms,
+        )
+        .await;
+    }
+    let (state, reason_code, message) = if cancellation.reason.is_some() {
+        (
+            AuxiliaryTaskState::Cancelled,
+            "child_task_parent_cancelled",
+            "delegation ChildTask cancellation authority was cancelled before dispatch",
+        )
+    } else {
+        (
+            AuxiliaryTaskState::Expired,
+            "child_task_deadline_exceeded",
+            "delegation ChildTask cancellation deadline elapsed before dispatch",
+        )
+    };
+    if let Some(target_run_id) = task.target_run_id.as_deref() {
+        request_attached_child_expiry_cancel(
+            runtime,
+            task,
+            target_run_id,
+            reason_code,
+            message,
+            now_unix_ms,
+        )
+        .await?;
+        return Ok(true);
+    }
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            state: Some(state.as_str().to_owned()),
+            target_run_id: Some(None),
+            last_error: Some(Some(message.to_owned())),
+            result_json: Some(Some(
+                json!({
+                    "status": state.as_str(),
+                    "task_id": task.task_id,
+                    "reason": reason_code,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: Some(Some(now_unix_ms)),
+        })
+        .await?;
+    runtime.clear_self_healing_heartbeat(WorkHeartbeatKind::BackgroundTask, task.task_id.as_str());
+    Ok(true)
+}
+
+async fn request_attached_child_expiry_cancel(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    target_run_id: &str,
+    reason_code: &str,
+    message: &str,
+    now_unix_ms: i64,
+) -> Result<(), Status> {
+    let snapshot = runtime.orchestrator_run_status_snapshot(target_run_id.to_owned()).await?;
+    if let Some(run) = snapshot.as_ref() {
+        if is_terminal_run_state(run.state.as_str()) {
+            finalize_task_from_run(runtime, task, Some(run), run.state.as_str()).await?;
+            return Ok(());
+        }
+    }
+    request_background_child_cancel(runtime, target_run_id, reason_code).await?;
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+            target_run_id: None,
+            last_error: Some(Some(message.to_owned())),
+            result_json: Some(Some(
+                json!({
+                    "status": AuxiliaryTaskState::CancelRequested.as_str(),
+                    "task_id": task.task_id,
+                    "run_id": target_run_id,
+                    "reason": reason_code,
+                    "reconciliation": "attached_child_cancel_requested",
+                    "observed_at_unix_ms": now_unix_ms,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn fail_child_task_cancellation_contract(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    message: &str,
+    reason_code: &str,
+    now_unix_ms: i64,
+) -> Result<bool, Status> {
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+            target_run_id: Some(None),
+            last_error: Some(Some(message.to_owned())),
+            result_json: Some(Some(
+                json!({
+                    "status": "failed",
+                    "task_id": task.task_id,
+                    "reason": reason_code,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: Some(Some(now_unix_ms)),
+        })
+        .await?;
+    runtime.clear_self_healing_heartbeat(WorkHeartbeatKind::BackgroundTask, task.task_id.as_str());
+    Ok(true)
+}
+
 /// Re-reads one task from the journal into the local poll snapshot.
 async fn refresh_background_task_snapshot(
     runtime: &Arc<GatewayRuntimeState>,
@@ -388,35 +694,26 @@ async fn dispatch_background_task(
 ) -> Result<(), Status> {
     let started_at_unix_ms = crate::gateway::current_unix_ms();
     if task.task_kind == REFLECTION_TASK_KIND {
-        runtime
-            .update_orchestrator_background_task(build_background_task_running_update(
-                task.task_id.as_str(),
-                started_at_unix_ms,
-            ))
-            .await?;
+        let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
         let runtime = Arc::clone(runtime);
-        let task = task.clone();
         tokio::spawn(async move {
             match process_post_run_reflection_task(&runtime, &task).await {
                 Ok(result) => {
-                    let _ = runtime
-                        .update_orchestrator_background_task(
-                            OrchestratorBackgroundTaskUpdateRequest {
-                                task_id: task.task_id.clone(),
-                                state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
-                                target_run_id: Some(None),
-                                increment_attempt_count: false,
-                                last_error: Some(None),
-                                result_json: Some(Some(result.to_string())),
-                                started_at_unix_ms: None,
-                                completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                            },
-                        )
-                        .await;
-                    runtime.clear_self_healing_heartbeat(
-                        WorkHeartbeatKind::BackgroundTask,
+                    persist_auxiliary_task_terminal_update(
+                        &runtime,
                         task.task_id.as_str(),
-                    );
+                        OrchestratorBackgroundTaskWorkerUpdateRequest {
+                            task_id: task.task_id.clone(),
+                            execution_generation: task.execution_generation,
+                            state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
+                            target_run_id: Some(None),
+                            last_error: Some(None),
+                            result_json: Some(Some(result.to_string())),
+                            started_at_unix_ms: None,
+                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                        },
+                    )
+                    .await;
                 }
                 Err(error) => {
                     warn!(
@@ -425,31 +722,28 @@ async fn dispatch_background_task(
                         status_message = %error.message(),
                         "post-run reflection task failed"
                     );
-                    let _ = runtime
-                        .update_orchestrator_background_task(
-                            OrchestratorBackgroundTaskUpdateRequest {
-                                task_id: task.task_id.clone(),
-                                state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                                target_run_id: Some(None),
-                                increment_attempt_count: false,
-                                last_error: Some(Some(error.message().to_owned())),
-                                result_json: Some(Some(
-                                    json!({
-                                        "status": "failed",
-                                        "task_id": task.task_id,
-                                        "error": error.message(),
-                                    })
-                                    .to_string(),
-                                )),
-                                started_at_unix_ms: None,
-                                completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                            },
-                        )
-                        .await;
-                    runtime.clear_self_healing_heartbeat(
-                        WorkHeartbeatKind::BackgroundTask,
+                    persist_auxiliary_task_terminal_update(
+                        &runtime,
                         task.task_id.as_str(),
-                    );
+                        OrchestratorBackgroundTaskWorkerUpdateRequest {
+                            task_id: task.task_id.clone(),
+                            execution_generation: task.execution_generation,
+                            state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                            target_run_id: Some(None),
+                            last_error: Some(Some(error.message().to_owned())),
+                            result_json: Some(Some(
+                                json!({
+                                    "status": "failed",
+                                    "task_id": task.task_id,
+                                    "error": error.message(),
+                                })
+                                .to_string(),
+                            )),
+                            started_at_unix_ms: None,
+                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                        },
+                    )
+                    .await;
                 }
             }
         });
@@ -461,17 +755,15 @@ async fn dispatch_background_task(
         return Ok(());
     }
 
-    let run_id = task.target_run_id.clone().unwrap_or_else(|| Ulid::new().to_string());
-    runtime
-        .update_orchestrator_background_task(build_background_task_running_update(
-            task.task_id.as_str(),
-            started_at_unix_ms,
-        ))
-        .await?;
+    let run_id = task
+        .target_run_id
+        .clone()
+        .or_else(|| task.planned_child_run_id.clone())
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
     let runtime = Arc::clone(runtime);
     let auth = auth.clone();
     let grpc_url = grpc_url.to_owned();
-    let task = task.clone();
     tokio::spawn(async move {
         if let Err(error) =
             run_background_task_stream(&runtime, &auth, grpc_url.as_str(), &task, run_id.as_str())
@@ -484,12 +776,17 @@ async fn dispatch_background_task(
                 status_message = %error.message(),
                 "background task stream failed"
             );
-            let _ = runtime
-                .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            persist_auxiliary_task_terminal_update(
+                &runtime,
+                task.task_id.as_str(),
+                OrchestratorBackgroundTaskWorkerUpdateRequest {
                     task_id: task.task_id.clone(),
+                    execution_generation: task.execution_generation,
                     state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                    target_run_id: Some(None),
-                    increment_attempt_count: false,
+                    // Preserve a target that may already have been attached before a later
+                    // progress, cancellation, or binding write failed. If attachment never
+                    // succeeded the field is already NULL from the Running transition.
+                    target_run_id: None,
                     last_error: Some(Some(error.message().to_owned())),
                     result_json: Some(Some(
                         json!({
@@ -502,12 +799,9 @@ async fn dispatch_background_task(
                     )),
                     started_at_unix_ms: None,
                     completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                })
-                .await;
-            runtime.clear_self_healing_heartbeat(
-                WorkHeartbeatKind::BackgroundTask,
-                task.task_id.as_str(),
-            );
+                },
+            )
+            .await;
         }
     });
     Ok(())
@@ -521,15 +815,9 @@ async fn dispatch_auxiliary_executor_task(
     task_type: AuxiliaryTaskType,
     started_at_unix_ms: i64,
 ) -> Result<(), Status> {
-    runtime
-        .update_orchestrator_background_task(build_background_task_running_update(
-            task.task_id.as_str(),
-            started_at_unix_ms,
-        ))
-        .await?;
+    let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
 
     let runtime = Arc::clone(runtime);
-    let task = task.clone();
     tokio::spawn(async move {
         let parameter_delta_json = if task_type == AuxiliaryTaskType::ObjectiveJudge {
             None
@@ -562,24 +850,21 @@ async fn dispatch_auxiliary_executor_task(
                             "error": error,
                         }),
                     );
-                    let _ = runtime
-                        .update_orchestrator_background_task(
-                            OrchestratorBackgroundTaskUpdateRequest {
-                                task_id: task.task_id.clone(),
-                                state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                                target_run_id: Some(None),
-                                increment_attempt_count: false,
-                                last_error: Some(materialized.last_error.clone()),
-                                result_json: Some(Some(materialized.result_json.to_string())),
-                                started_at_unix_ms: None,
-                                completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                            },
-                        )
-                        .await;
-                    runtime.clear_self_healing_heartbeat(
-                        WorkHeartbeatKind::BackgroundTask,
+                    persist_auxiliary_task_terminal_update(
+                        &runtime,
                         task.task_id.as_str(),
-                    );
+                        OrchestratorBackgroundTaskWorkerUpdateRequest {
+                            task_id: task.task_id.clone(),
+                            execution_generation: task.execution_generation,
+                            state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                            target_run_id: Some(None),
+                            last_error: Some(materialized.last_error.clone()),
+                            result_json: Some(Some(materialized.result_json.to_string())),
+                            started_at_unix_ms: None,
+                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                        },
+                    )
+                    .await;
                     return;
                 }
             }
@@ -621,22 +906,21 @@ async fn dispatch_auxiliary_executor_task(
                 let result_json = materialized
                     .map(|entry| entry.result_json)
                     .unwrap_or_else(|| result.to_result_json());
-                let _ = runtime
-                    .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                persist_auxiliary_task_terminal_update(
+                    &runtime,
+                    task.task_id.as_str(),
+                    OrchestratorBackgroundTaskWorkerUpdateRequest {
                         task_id: task.task_id.clone(),
+                        execution_generation: task.execution_generation,
                         state: Some(task_state.as_str().to_owned()),
                         target_run_id: Some(None),
-                        increment_attempt_count: false,
                         last_error: Some(last_error),
                         result_json: Some(Some(result_json.to_string())),
                         started_at_unix_ms: None,
                         completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                    })
-                    .await;
-                runtime.clear_self_healing_heartbeat(
-                    WorkHeartbeatKind::BackgroundTask,
-                    task.task_id.as_str(),
-                );
+                    },
+                )
+                .await;
             }
             Err(error) => {
                 warn!(
@@ -645,12 +929,14 @@ async fn dispatch_auxiliary_executor_task(
                     status_message = %error.message(),
                     "auxiliary executor task failed"
                 );
-                let _ = runtime
-                    .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                persist_auxiliary_task_terminal_update(
+                    &runtime,
+                    task.task_id.as_str(),
+                    OrchestratorBackgroundTaskWorkerUpdateRequest {
                         task_id: task.task_id.clone(),
+                        execution_generation: task.execution_generation,
                         state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
                         target_run_id: Some(None),
-                        increment_attempt_count: false,
                         last_error: Some(Some(error.message().to_owned())),
                         result_json: Some(Some(
                             json!({
@@ -663,16 +949,34 @@ async fn dispatch_auxiliary_executor_task(
                         )),
                         started_at_unix_ms: None,
                         completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                    })
-                    .await;
-                runtime.clear_self_healing_heartbeat(
-                    WorkHeartbeatKind::BackgroundTask,
-                    task.task_id.as_str(),
-                );
+                    },
+                )
+                .await;
             }
         }
     });
     Ok(())
+}
+
+async fn persist_auxiliary_task_terminal_update(
+    runtime: &Arc<GatewayRuntimeState>,
+    task_id: &str,
+    update: OrchestratorBackgroundTaskWorkerUpdateRequest,
+) {
+    let execution_generation = update.execution_generation;
+    match runtime.update_orchestrator_background_task_from_worker(update).await {
+        Ok(_) => runtime.clear_self_healing_heartbeat_if_generation(
+            WorkHeartbeatKind::BackgroundTask,
+            task_id,
+            execution_generation,
+        ),
+        Err(error) => warn!(
+            task_id,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "auxiliary task terminal state persistence failed; retaining heartbeat for watchdog recovery"
+        ),
+    }
 }
 
 /// Scheduler verdict for a delegated child: `Defer` keeps it queued
@@ -855,7 +1159,9 @@ fn delegated_task_for_child_run<'a>(
     child_run_id: &str,
 ) -> Option<&'a OrchestratorBackgroundTaskRecord> {
     all_tasks.iter().find(|candidate| {
-        candidate.delegation.is_some() && candidate.target_run_id.as_deref() == Some(child_run_id)
+        candidate.delegation.is_some()
+            && candidate.target_run_id.as_deref().or(candidate.planned_child_run_id.as_deref())
+                == Some(child_run_id)
     })
 }
 
@@ -976,9 +1282,9 @@ async fn mark_delegation_task_waiting(
     runtime
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: None,
             target_run_id: None,
-            increment_attempt_count: false,
             last_error: Some(Some(message.clone())),
             result_json: Some(Some(
                 json!({
@@ -1021,9 +1327,9 @@ async fn fail_delegation_task(
     runtime
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
             target_run_id: Some(None),
-            increment_attempt_count: false,
             last_error: Some(Some(message.clone())),
             result_json: Some(Some(
                 json!({
@@ -1086,9 +1392,9 @@ async fn request_delegated_child_timeout_cancel(
     runtime
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
+            expected_revision: task.revision,
             state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
             target_run_id: None,
-            increment_attempt_count: false,
             last_error: Some(Some(message.clone())),
             result_json: Some(Some(
                 json!({
@@ -1119,6 +1425,185 @@ async fn request_delegated_child_timeout_cancel(
     .await
 }
 
+async fn ensure_child_task_context_permits_dispatch(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    now_unix_ms: i64,
+) -> Result<(), Status> {
+    let task_kind = AuxiliaryTaskKind::from_str(task.task_kind.as_str())
+        .ok_or_else(|| Status::failed_precondition("background task has an unknown task kind"))?;
+    let is_delegation_task = task_kind == AuxiliaryTaskKind::DelegationPrompt;
+    if is_delegation_task != task.delegation.is_some() {
+        return Err(Status::failed_precondition(
+            "delegation task kind and delegation payload do not agree",
+        ));
+    }
+    let Some(cancellation) = task.cancellation_context.as_ref() else {
+        if is_delegation_task {
+            return Err(Status::failed_precondition(
+                "delegation task is missing durable ChildTask cancellation authority",
+            ));
+        }
+        return Ok(());
+    };
+    if !is_delegation_task {
+        return Err(Status::failed_precondition(
+            "non-delegation task carries durable ChildTask cancellation authority",
+        ));
+    }
+    cancellation.validate().map_err(|error| {
+        Status::failed_precondition(format!(
+            "delegation ChildTask cancellation authority is invalid: {error}"
+        ))
+    })?;
+    if cancellation.scope != CancellationScopeKind::ChildTask
+        || cancellation.parent_scope_id.is_none()
+    {
+        return Err(Status::failed_precondition(
+            "delegation task requires a parented ChildTask cancellation scope",
+        ));
+    }
+    if !cancellation.permits_new_work(now_unix_ms) {
+        return Err(Status::deadline_exceeded(
+            "delegation ChildTask cancellation scope no longer permits dispatch",
+        ));
+    }
+    let parent_run_id = task.parent_run_id.as_ref().ok_or_else(|| {
+        Status::failed_precondition("delegation task is missing its parent run identity")
+    })?;
+    let active_generation = runtime.runtime_generation_for_run(parent_run_id.clone()).await?;
+    if !matches!(
+        active_generation,
+        Some((ref session_id, generation))
+            if session_id == &task.session_id && generation == cancellation.generation
+    ) {
+        return Err(Status::failed_precondition(
+            "delegation ChildTask cancellation generation is no longer active",
+        ));
+    }
+    Ok(())
+}
+
+async fn child_completion_matches_parent_generation(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+) -> Result<(bool, Option<RuntimeGeneration>), Status> {
+    let cancellation = validate_child_task_cancellation_contract(task)
+        .map_err(|error| Status::failed_precondition(error.message))?;
+    let Some(cancellation) = cancellation else {
+        return Ok((true, None));
+    };
+    let parent_run_id = task.parent_run_id.as_ref().ok_or_else(|| {
+        Status::failed_precondition("delegation task is missing its parent run identity")
+    })?;
+    let persisted_generation =
+        runtime.persisted_runtime_generation_for_run(parent_run_id.clone()).await?;
+    let matches = matches!(
+        persisted_generation,
+        Some((ref session_id, generation))
+            if session_id == &task.session_id && generation == cancellation.generation
+    );
+    Ok((matches, persisted_generation.map(|(_, generation)| generation)))
+}
+
+fn child_completion_parent_generation_guard(
+    task: &OrchestratorBackgroundTaskRecord,
+) -> Result<Option<OrchestratorParentGenerationGuard>, Status> {
+    let cancellation = validate_child_task_cancellation_contract(task)
+        .map_err(|error| Status::failed_precondition(error.message))?;
+    let Some(cancellation) = cancellation else {
+        return Ok(None);
+    };
+    let parent_run_id = task.parent_run_id.clone().ok_or_else(|| {
+        Status::failed_precondition("delegation task is missing its parent run identity")
+    })?;
+    Ok(Some(OrchestratorParentGenerationGuard {
+        session_id: task.session_id.clone(),
+        run_id: parent_run_id,
+        expected_generation: cancellation.generation,
+    }))
+}
+
+async fn suppress_stale_child_completion(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    child_run_id: &str,
+    expected_generation: Option<RuntimeGeneration>,
+) -> Result<(), Status> {
+    // This is host-owned containment, not an effect accepted from the stale
+    // callback: bounded diagnostic evidence is recorded, the exact child is
+    // cancelled, and the controller prevents any later worker settlement.
+    let cancellation = task.cancellation_context.as_ref().ok_or_else(|| {
+        Status::failed_precondition(
+            "stale delegated child completion is missing cancellation authority",
+        )
+    })?;
+    runtime
+        .persist_runtime_stale_event_diagnostic(RuntimeStaleEventDiagnosticRequest {
+            session_id: task.session_id.clone(),
+            run_id: task.parent_run_id.clone(),
+            lane: RuntimeGenerationLane::Run,
+            expected_generation,
+            observed_generation: cancellation.generation,
+            subsystem: RuntimeSubsystem::BackgroundQueue,
+            disposition: StaleEventDisposition::PersistedDiagnostic,
+            reason_code: "runtime.generation.stale_child_completion_suppressed".to_owned(),
+        })
+        .await?;
+    request_background_child_cancel(runtime, child_run_id, "stale_child_task_generation").await?;
+    if AuxiliaryTaskState::from_str(task.state.as_str())
+        == Some(AuxiliaryTaskState::CancelRequested)
+    {
+        return Ok(());
+    }
+    runtime
+        .update_orchestrator_background_task_from_worker(
+            OrchestratorBackgroundTaskWorkerUpdateRequest {
+                task_id: task.task_id.clone(),
+                execution_generation: task.execution_generation,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                target_run_id: None,
+                last_error: Some(Some(
+                    "late child completion was suppressed after parent generation supersession"
+                        .to_owned(),
+                )),
+                result_json: Some(Some(
+                    json!({
+                        "status": AuxiliaryTaskState::CancelRequested.as_str(),
+                        "task_id": task.task_id,
+                        "run_id": child_run_id,
+                        "reason": "stale_child_task_generation",
+                        "reconciliation": "late_completion_suppressed",
+                    })
+                    .to_string(),
+                )),
+                started_at_unix_ms: None,
+                completed_at_unix_ms: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Advisory fast-path check used to avoid expensive merge construction.
+///
+/// This read is not mutation authority: steer can commit immediately after
+/// it returns. Every durable metadata, tape, and finalization write therefore
+/// repeats the comparison inside its own journal transaction.
+async fn precheck_child_completion_parent_generation(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    child_run_id: &str,
+) -> Result<bool, Status> {
+    let (matches, expected_generation) =
+        child_completion_matches_parent_generation(runtime, task).await?;
+    if matches {
+        return Ok(true);
+    }
+    suppress_stale_child_completion(runtime, task, child_run_id, expected_generation).await?;
+    Ok(false)
+}
+
 async fn request_background_child_cancel(
     runtime: &Arc<GatewayRuntimeState>,
     target_run_id: &str,
@@ -1144,6 +1629,8 @@ async fn run_background_task_stream(
     task: &OrchestratorBackgroundTaskRecord,
     run_id: &str,
 ) -> Result<(), Status> {
+    ensure_child_task_context_permits_dispatch(runtime, task, crate::gateway::current_unix_ms())
+        .await?;
     let mut client =
         gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url.to_owned())
             .await
@@ -1155,9 +1642,18 @@ async fn run_background_task_stream(
         .clone()
         .unwrap_or_else(|| format!("Background task {} ({})", task.task_id, task.task_kind));
     let origin_kind = if task.delegation.is_some() { "delegation" } else { "background" };
+    let run_session_id = if task.delegation.is_some() {
+        task.child_session_id.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "delegation task is missing its dedicated child session identity",
+            )
+        })?
+    } else {
+        &task.session_id
+    };
     let mut run_request = Request::new(tokio_stream::iter(vec![common_v1::RunStreamRequest {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-        session_id: Some(common_v1::CanonicalId { ulid: task.session_id.clone() }),
+        session_id: Some(common_v1::CanonicalId { ulid: run_session_id.clone() }),
         run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
         input: Some(common_v1::MessageEnvelope {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
@@ -1169,7 +1665,7 @@ async fn run_background_task_stream(
                     .channel
                     .clone()
                     .unwrap_or_else(|| DEFAULT_BACKGROUND_CHANNEL.to_owned()),
-                conversation_id: task.session_id.clone(),
+                conversation_id: run_session_id.clone(),
                 sender_display: "palyra-background".to_owned(),
                 sender_handle: "background".to_owned(),
                 sender_verified: true,
@@ -1209,7 +1705,17 @@ async fn run_background_task_stream(
         .map_err(|error| Status::internal(format!("background RunStream failed: {error}")))?
         .into_inner();
 
-    attach_background_task_child_run(runtime, task, run_id).await?;
+    if let Err(attach_error) = attach_background_task_child_run(runtime, task, run_id).await {
+        if let Err(cancel_error) =
+            request_background_child_cancel(runtime, run_id, "background_child_attachment_failed")
+                .await
+        {
+            return Err(Status::internal(format!(
+                "{attach_error}; admitted background child {run_id} could not be cancelled after attachment failure: {cancel_error}"
+            )));
+        }
+        return Err(attach_error);
+    }
 
     let delivery_policy = resolve_delivery_policy(
         &runtime.config.delivery_arbitration,
@@ -1368,24 +1874,66 @@ async fn run_background_task_stream(
     // only when no snapshot exists at all.
     let run_snapshot = runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?;
     if let Some(run) = run_snapshot.as_ref() {
+        let durable_task = load_current_background_task_execution(runtime, task).await?;
+        if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
+            return Ok(());
+        }
         let run_with_merge = if let Some(delegation) = task.delegation.as_ref() {
             let merge_result = build_merge_result(runtime, run, delegation).await?;
-            runtime
-                .update_orchestrator_run_metadata(OrchestratorRunMetadataUpdateRequest {
-                    run_id: run_id.to_owned(),
-                    parent_run_id: Some(task.parent_run_id.clone()),
-                    delegation: Some(Some(delegation.clone())),
-                    merge_result: Some(Some(merge_result.clone())),
-                })
-                .await?;
+            let durable_task = load_current_background_task_execution(runtime, task).await?;
+            if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
+                return Ok(());
+            }
+            let metadata_update = OrchestratorRunMetadataUpdateRequest {
+                run_id: run_id.to_owned(),
+                parent_run_id: Some(task.parent_run_id.clone()),
+                delegation: Some(Some(delegation.clone())),
+                merge_result: Some(Some(merge_result.clone())),
+            };
+            let metadata_applied = match child_completion_parent_generation_guard(&durable_task)? {
+                Some(parent_guard) => {
+                    runtime
+                        .update_orchestrator_run_metadata_if_parent_generation(
+                            metadata_update,
+                            parent_guard,
+                        )
+                        .await?
+                }
+                None => {
+                    runtime.update_orchestrator_run_metadata(metadata_update).await?;
+                    true
+                }
+            };
+            if !metadata_applied {
+                suppress_stale_child_completion(runtime, &durable_task, run_id, None).await?;
+                return Ok(());
+            }
             let refreshed = runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?;
-            append_parent_merge_event(runtime, task, run, &merge_result).await?;
+            let durable_task = load_current_background_task_execution(runtime, task).await?;
+            if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
+                return Ok(());
+            }
+            if !append_parent_merge_event(runtime, &durable_task, run, &merge_result).await? {
+                suppress_stale_child_completion(runtime, &durable_task, run_id, None).await?;
+                return Ok(());
+            }
             refreshed.unwrap_or_else(|| run.clone())
         } else {
             run.clone()
         };
-        finalize_task_from_run(runtime, task, Some(&run_with_merge), run_with_merge.state.as_str())
-            .await?;
+        // The claimed worker snapshot stays `running`; cancellation can advance the durable host
+        // state while the child stream is open, so terminal mapping must reload that state.
+        let durable_task = load_current_background_task_execution(runtime, task).await?;
+        if !finalize_task_from_run_if_parent_generation_current(
+            runtime,
+            &durable_task,
+            Some(&run_with_merge),
+            run_with_merge.state.as_str(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
         if let Some(error_message) = stream_error {
             warn!(
                 task_id = %task.task_id,
@@ -1405,35 +1953,49 @@ async fn run_background_task_stream(
     Err(Status::internal(format!("background run {run_id} finished without a persisted snapshot")))
 }
 
-/// Update that marks a task Running and counts the attempt; `target_run_id`
-/// is reset because the child run does not exist yet (see attach below).
-fn build_background_task_running_update(
-    task_id: &str,
+/// Atomically claims queued work and returns the durable record workers must retain.
+async fn claim_background_task(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
     started_at_unix_ms: i64,
-) -> OrchestratorBackgroundTaskUpdateRequest {
-    OrchestratorBackgroundTaskUpdateRequest {
-        task_id: task_id.to_owned(),
-        state: Some(AuxiliaryTaskState::Running.as_str().to_owned()),
-        target_run_id: Some(None),
-        increment_attempt_count: true,
-        last_error: Some(None),
-        result_json: Some(None),
-        started_at_unix_ms: Some(Some(started_at_unix_ms)),
-        completed_at_unix_ms: Some(None),
+) -> Result<OrchestratorBackgroundTaskRecord, Status> {
+    let claimed = runtime
+        .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            started_at_unix_ms,
+        })
+        .await?;
+    runtime.record_self_healing_heartbeat(background_task_heartbeat_update(&claimed));
+    Ok(claimed)
+}
+
+fn background_task_heartbeat_update(
+    task: &OrchestratorBackgroundTaskRecord,
+) -> WorkHeartbeatUpdate {
+    WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::BackgroundTask,
+        object_id: task.task_id.clone(),
+        execution_generation: (task.execution_generation > 0).then_some(task.execution_generation),
+        summary: format!("background task {} ({})", task.task_id, task.task_kind),
     }
 }
 
-/// Update that attaches the persisted child run id to the task, leaving all
-/// other fields untouched.
-fn build_background_task_child_run_attach_update(
-    task_id: &str,
-    run_id: &str,
-) -> OrchestratorBackgroundTaskUpdateRequest {
-    OrchestratorBackgroundTaskUpdateRequest {
-        task_id: task_id.to_owned(),
-        target_run_id: Some(Some(run_id.to_owned())),
-        ..Default::default()
+async fn load_current_background_task_execution(
+    runtime: &Arc<GatewayRuntimeState>,
+    claimed: &OrchestratorBackgroundTaskRecord,
+) -> Result<OrchestratorBackgroundTaskRecord, Status> {
+    let current = runtime
+        .get_orchestrator_background_task(claimed.task_id.clone())
+        .await?
+        .ok_or_else(|| Status::not_found("background task disappeared during execution"))?;
+    if current.execution_generation != claimed.execution_generation {
+        return Err(Status::aborted(format!(
+            "background task execution generation changed: expected {}, actual {}",
+            claimed.execution_generation, current.execution_generation
+        )));
     }
+    Ok(current)
 }
 
 /// Waits for the child run row, attaches it to the task, and emits the spawn
@@ -1444,12 +2006,37 @@ async fn attach_background_task_child_run(
     run_id: &str,
 ) -> Result<(), Status> {
     wait_for_background_child_run(runtime, run_id).await?;
-    runtime
-        .update_orchestrator_background_task(build_background_task_child_run_attach_update(
-            task.task_id.as_str(),
-            run_id,
-        ))
-        .await?;
+    match runtime
+        .attach_background_task_child(
+            task.task_id.clone(),
+            run_id.to_owned(),
+            task.execution_generation,
+        )
+        .await?
+    {
+        BackgroundTaskChildResolution::Resolved { run, .. } if run.run_id == run_id => {}
+        BackgroundTaskChildResolution::Resolved { run, .. } => {
+            return Err(Status::failed_precondition(format!(
+                "background task resolved unexpected child {} while attaching {run_id}",
+                run.run_id
+            )));
+        }
+        BackgroundTaskChildResolution::NoChild { .. } => {
+            return Err(Status::failed_precondition(format!(
+                "background child run {run_id} disappeared before exact attachment"
+            )));
+        }
+        BackgroundTaskChildResolution::Mismatched { .. } => {
+            return Err(Status::failed_precondition(format!(
+                "background child run {run_id} does not match task metadata"
+            )));
+        }
+        BackgroundTaskChildResolution::Ambiguous { .. } => {
+            return Err(Status::failed_precondition(
+                "background task has ambiguous child evidence during attachment",
+            ));
+        }
+    }
     deliver_pending_child_cancel_after_attach(runtime, task.task_id.as_str(), run_id).await?;
     append_parent_spawned_event(runtime, task, run_id).await?;
     create_delegated_child_binding(runtime, task, run_id).await
@@ -1582,9 +2169,9 @@ async fn sync_parent_run_cancellation(
         runtime
             .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                 task_id: task.task_id.clone(),
+                expected_revision: task.revision,
                 state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
                 target_run_id: None,
-                increment_attempt_count: false,
                 last_error: Some(Some(cancellation_reason.clone())),
                 result_json: None,
                 started_at_unix_ms: None,
@@ -1604,9 +2191,9 @@ async fn sync_parent_run_cancellation(
         runtime
             .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                 task_id: task.task_id.clone(),
+                expected_revision: task.revision,
                 state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
                 target_run_id: None,
-                increment_attempt_count: false,
                 last_error: Some(Some(cancellation_reason)),
                 result_json: None,
                 started_at_unix_ms: None,
@@ -1617,9 +2204,9 @@ async fn sync_parent_run_cancellation(
         runtime
             .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                 task_id: task.task_id.clone(),
+                expected_revision: task.revision,
                 state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
                 target_run_id: Some(None),
-                increment_attempt_count: false,
                 last_error: Some(Some(cancellation_reason.clone())),
                 result_json: Some(Some(
                     json!({
@@ -1696,6 +2283,59 @@ fn task_precedes_in_serial_group(
             && sibling.task_id < current.task_id)
 }
 
+fn background_task_terminal_state_from_run(
+    task_state: &str,
+    run_state: &str,
+) -> AuxiliaryTaskState {
+    let cancellation_requested =
+        AuxiliaryTaskState::from_str(task_state) == Some(AuxiliaryTaskState::CancelRequested);
+    match run_state {
+        "done" | "failed" if cancellation_requested => AuxiliaryTaskState::Cancelled,
+        "done" => AuxiliaryTaskState::Succeeded,
+        "cancelled" => AuxiliaryTaskState::Cancelled,
+        "failed" => AuxiliaryTaskState::Failed,
+        "running" | "accepted" | "in_progress" => AuxiliaryTaskState::Running,
+        "expired" => AuxiliaryTaskState::Expired,
+        other => AuxiliaryTaskState::from_str(other).unwrap_or(AuxiliaryTaskState::Failed),
+    }
+}
+
+async fn finalize_task_from_run_if_parent_generation_current(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+    fallback_state: &str,
+) -> Result<bool, Status> {
+    let child_run_id = run
+        .map(|snapshot| snapshot.run_id.as_str())
+        .or(task.target_run_id.as_deref())
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "guarded child completion requires an attached child run identity",
+            )
+        })?;
+    let Some(parent_guard) = child_completion_parent_generation_guard(task)? else {
+        finalize_task_from_run(runtime, task, run, fallback_state).await?;
+        return Ok(true);
+    };
+    let Some(update) = background_task_worker_completion_update(task, run, fallback_state) else {
+        return Ok(true);
+    };
+    let updated = runtime
+        .update_orchestrator_background_task_from_worker_if_parent_generation(update, parent_guard)
+        .await?;
+    if updated.is_none() {
+        suppress_stale_child_completion(runtime, task, child_run_id, None).await?;
+        return Ok(false);
+    }
+    runtime.clear_self_healing_heartbeat_if_generation(
+        WorkHeartbeatKind::BackgroundTask,
+        task.task_id.as_str(),
+        task.execution_generation,
+    );
+    Ok(true)
+}
+
 /// Folds a child run's terminal state into the task record and clears the
 /// heartbeat; non-terminal states are a no-op so supervision continues.
 async fn finalize_task_from_run(
@@ -1704,43 +2344,52 @@ async fn finalize_task_from_run(
     run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
     fallback_state: &str,
 ) -> Result<(), Status> {
-    let normalized_state = match run.map(|value| value.state.as_str()).unwrap_or(fallback_state) {
-        "done" => AuxiliaryTaskState::Succeeded,
-        "cancelled" => AuxiliaryTaskState::Cancelled,
-        "failed" => AuxiliaryTaskState::Failed,
-        "running" | "accepted" | "in_progress" => AuxiliaryTaskState::Running,
-        "expired" => AuxiliaryTaskState::Expired,
-        other => AuxiliaryTaskState::from_str(other).unwrap_or(AuxiliaryTaskState::Failed),
-    };
-    if normalized_state == AuxiliaryTaskState::Running {
+    let Some(update) = background_task_worker_completion_update(task, run, fallback_state) else {
         return Ok(());
+    };
+    runtime.update_orchestrator_background_task_from_worker(update).await?;
+    runtime.clear_self_healing_heartbeat_if_generation(
+        WorkHeartbeatKind::BackgroundTask,
+        task.task_id.as_str(),
+        task.execution_generation,
+    );
+    Ok(())
+}
+
+fn background_task_worker_completion_update(
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+    fallback_state: &str,
+) -> Option<OrchestratorBackgroundTaskWorkerUpdateRequest> {
+    let normalized_state = background_task_terminal_state_from_run(
+        task.state.as_str(),
+        run.map(|value| value.state.as_str()).unwrap_or(fallback_state),
+    );
+    if normalized_state == AuxiliaryTaskState::Running {
+        return None;
     }
     let completed_at_unix_ms = run
         .and_then(|value| value.completed_at_unix_ms)
         .unwrap_or_else(crate::gateway::current_unix_ms);
-    runtime
-        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
-            task_id: task.task_id.clone(),
-            state: Some(normalized_state.as_str().to_owned()),
-            target_run_id: None,
-            increment_attempt_count: false,
-            last_error: Some(run.and_then(|value| value.last_error.clone())),
-            result_json: Some(Some(
-                json!({
-                    "status": normalized_state.as_str(),
-                    "task_id": task.task_id,
-                    "run": run.map(run_status_to_json).unwrap_or_else(|| json!({
-                        "state": fallback_state,
-                    })),
-                })
-                .to_string(),
-            )),
-            started_at_unix_ms: None,
-            completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
-        })
-        .await?;
-    runtime.clear_self_healing_heartbeat(WorkHeartbeatKind::BackgroundTask, task.task_id.as_str());
-    Ok(())
+    Some(OrchestratorBackgroundTaskWorkerUpdateRequest {
+        task_id: task.task_id.clone(),
+        execution_generation: task.execution_generation,
+        state: Some(normalized_state.as_str().to_owned()),
+        target_run_id: None,
+        last_error: Some(run.and_then(|value| value.last_error.clone())),
+        result_json: Some(Some(
+            json!({
+                "status": normalized_state.as_str(),
+                "task_id": task.task_id,
+                "run": run.map(run_status_to_json).unwrap_or_else(|| json!({
+                    "state": fallback_state,
+                })),
+            })
+            .to_string(),
+        )),
+        started_at_unix_ms: None,
+        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+    })
 }
 
 /// Extracts the raw `parameter_delta` object from a task payload as bytes;
@@ -1774,15 +2423,28 @@ fn build_parameter_delta_bytes(task: &OrchestratorBackgroundTaskRecord) -> Resul
         None => json!({}),
     };
     if let Some(root) = merged.as_object_mut() {
-        root.insert(
-            "background_task".to_owned(),
-            json!({
-                "task_id": task.task_id,
-                "task_kind": task.task_kind,
-                "parent_run_id": task.parent_run_id,
-                "budget_tokens": task.budget_tokens,
-            }),
-        );
+        let mut background_task = json!({
+            "schema_version": 1,
+            "task_id": task.task_id,
+            "task_kind": task.task_kind,
+            "parent_session_id": task.session_id,
+            "child_session_id": task.child_session_id,
+            "parent_run_id": task.parent_run_id,
+            "budget_tokens": task.budget_tokens,
+        });
+        if let (Some(background_task), Some(cancellation)) =
+            (background_task.as_object_mut(), task.cancellation_context.as_ref())
+        {
+            background_task.insert(
+                "cancellation_context".to_owned(),
+                serde_json::to_value(cancellation).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to encode background cancellation parameter_delta: {error}"
+                    ))
+                })?,
+            );
+        }
+        root.insert("background_task".to_owned(), background_task);
         if let Some(delegation) = task.delegation.as_ref() {
             root.insert(
                 "delegation".to_owned(),
@@ -2636,9 +3298,9 @@ async fn append_parent_merge_event(
     task: &OrchestratorBackgroundTaskRecord,
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     merge_result: &DelegationMergeResult,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let Some(parent_run_id) = task.parent_run_id.as_deref() else {
-        return Ok(());
+        return Ok(true);
     };
     let event_type = match run.state.as_str() {
         "done" => "child_run_merged",
@@ -2691,13 +3353,18 @@ async fn append_parent_merge_event(
         delivery_decision: &delivery_decision,
     };
     let parent_event_type = if hold_for_review { "child_run_delivery_held" } else { event_type };
-    append_parent_tape_event(
+    let parent_guard = child_completion_parent_generation_guard(task)?;
+    let appended = append_parent_tape_event_if_parent_generation(
         runtime,
         parent_run_id,
         parent_event_type,
         parent_merge_event_payload(&payload_context),
+        parent_guard.as_ref(),
     )
     .await?;
+    if !appended {
+        return Ok(false);
+    }
     emit_delivery_arbitration_audit(runtime, task, run, &delivery_policy, &delivery_decision)
         .await?;
     let (child_event_type, child_state) = if hold_for_review {
@@ -2719,7 +3386,8 @@ async fn append_parent_merge_event(
         true,
         child_merge_lifecycle_details(&payload_context),
     )
-    .await
+    .await?;
+    Ok(true)
 }
 
 fn delivery_holds_merge_result(decision: &DeliveryDecision) -> bool {
@@ -3070,6 +3738,54 @@ async fn append_parent_tape_event(
     Err(Status::aborted(format!("failed to append parent tape event '{event_type}' after retries")))
 }
 
+/// Appends a parent tape event with the generation fence evaluated in the
+/// journal transaction that inserts the row.
+///
+/// `false` is returned only when a supplied parent authority was superseded;
+/// sequence conflicts retain the same bounded retry behavior as legacy
+/// background tape writes.
+async fn append_parent_tape_event_if_parent_generation(
+    runtime: &Arc<GatewayRuntimeState>,
+    parent_run_id: &str,
+    event_type: &str,
+    payload: Value,
+    parent_guard: Option<&OrchestratorParentGenerationGuard>,
+) -> Result<bool, Status> {
+    let Some(parent_guard) = parent_guard else {
+        append_parent_tape_event(runtime, parent_run_id, event_type, payload).await?;
+        return Ok(true);
+    };
+    for _ in 0..3 {
+        let Some(run) = runtime.orchestrator_run_status_snapshot(parent_run_id.to_owned()).await?
+        else {
+            return Ok(true);
+        };
+        if !parent_tape_accepts_background_event(run.state.as_str()) {
+            return Ok(true);
+        }
+        let seq = i64::try_from(run.tape_events).unwrap_or(i64::MAX);
+        match runtime
+            .append_orchestrator_tape_event_if_parent_generation(
+                OrchestratorTapeAppendRequest {
+                    run_id: parent_run_id.to_owned(),
+                    seq,
+                    event_type: event_type.to_owned(),
+                    payload_json: payload.to_string(),
+                },
+                parent_guard.clone(),
+            )
+            .await
+        {
+            Ok(appended) => return Ok(appended),
+            Err(error) if error.code() == Code::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Status::aborted(format!(
+        "failed to append guarded parent tape event '{event_type}' after retries"
+    )))
+}
+
 /// Background events may only land on a parent tape after the parent run is
 /// terminal; appending earlier would race the orchestrator's own writes for
 /// the same sequence numbers (pinned by tests).
@@ -3221,15 +3937,20 @@ fn is_terminal_run_state(state: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_tape_cursor, append_artifact_references,
-        build_background_task_child_run_attach_update, build_background_task_running_update,
+        advance_tape_cursor, append_artifact_references, attach_background_task_child_run,
+        background_task_heartbeat_update, background_task_terminal_state_from_run,
         build_optional_delegated_run_context, build_parameter_delta_bytes,
         categorize_child_failure, child_merge_lifecycle_details, delegated_child_timeout_message,
-        evaluate_delegation_scheduler_limits, inject_background_metadata,
-        parent_merge_event_payload, parent_tape_accepts_background_event,
-        pending_child_cancel_reason, replace_background_task_snapshot,
+        dispatch_auxiliary_executor_task, ensure_child_task_context_permits_dispatch,
+        evaluate_delegation_scheduler_limits, expire_child_task_cancellation_context,
+        finalize_task_from_run, finalize_task_from_run_if_parent_generation_current,
+        inject_background_metadata, parent_merge_event_payload,
+        parent_tape_accepts_background_event, pending_child_cancel_reason, process_background_task,
+        reconcile_attached_child_with_invalid_contract, replace_background_task_snapshot,
+        request_attached_child_expiry_cancel, run_background_task_stream,
         running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
-        should_emit_child_stream_progress, task_has_in_flight_work_without_target,
+        should_emit_child_stream_progress, task_has_attached_child,
+        task_has_in_flight_work_without_target, validate_child_task_cancellation_contract,
         ChildLifecycleTapeBudget, ChildLifecycleTapeDecision, ChildStreamProgress,
         DelegationSchedulerDecision, MergeDeliveryPayloadContext,
     };
@@ -3242,12 +3963,227 @@ mod tests {
             DelegationMergeStrategy, DelegationMergeUsageSummary, DelegationRole,
             DelegationRuntimeLimits, DelegationSnapshot,
         },
-        gateway::{GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL},
-        journal::{OrchestratorBackgroundTaskRecord, OrchestratorRunStatusSnapshot},
+        gateway::{
+            runtime::tests::{provider_status_snapshot, SuccessfulModelProvider},
+            tests::build_test_runtime_state,
+            GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+        },
+        journal::{
+            DelegatedRunAdmissionV1, OrchestratorBackgroundTaskClaimRequest,
+            OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
+            OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
+            OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
+            OrchestratorSessionUpsertRequest,
+        },
+        model_provider::{
+            AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
+            ProviderRequest, ProviderResponse, ProviderStatusSnapshot,
+        },
+        node_runtime::NodeRuntimeState,
+        transport::grpc::services::gateway::GatewayServiceImpl,
     };
-    use palyra_common::runtime_contracts::AuxiliaryTaskState;
+    use palyra_common::runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
+        RuntimeOperationId,
+    };
     use serde_json::{json, Value};
-    use tonic::{metadata::MetadataMap, Code};
+    use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot, Notify},
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{metadata::MetadataMap, transport::Server as TonicServer, Code};
+    use ulid::Ulid;
+
+    async fn start_delegated_child_fixture(
+        state: &Arc<crate::gateway::GatewayRuntimeState>,
+        task: &OrchestratorBackgroundTaskRecord,
+        run_id: &str,
+    ) {
+        let child_session_id =
+            task.child_session_id.clone().expect("delegated task should own a child session");
+        let parent_run_id =
+            task.parent_run_id.clone().expect("delegated task should retain its parent run");
+        let cancellation_context = task
+            .cancellation_context
+            .clone()
+            .expect("delegated task should retain ChildTask authority");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: child_session_id.clone(),
+                origin_kind: "delegation".to_owned(),
+                origin_run_id: Some(parent_run_id.clone()),
+                triggered_by_principal: Some(task.owner_principal.clone()),
+                parameter_delta_json: Some(
+                    String::from_utf8(
+                        build_parameter_delta_bytes(task)
+                            .expect("delegated parameter delta should encode"),
+                    )
+                    .expect("delegated parameter delta should be UTF-8"),
+                ),
+                delegated_admission: Some(DelegatedRunAdmissionV1 {
+                    task_id: task.task_id.clone(),
+                    task_kind: task.task_kind.clone(),
+                    parent_session_id: task.session_id.clone(),
+                    child_session_id,
+                    parent_run_id,
+                    cancellation_context,
+                }),
+            })
+            .await
+            .expect("delegated child fixture should start");
+    }
+
+    struct BlockingBackgroundAuxiliaryProvider {
+        started: mpsc::Sender<()>,
+        release: Arc<Notify>,
+        status: ProviderStatusSnapshot,
+    }
+
+    impl ModelProvider for BlockingBackgroundAuxiliaryProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: ProviderRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.started
+                    .send(())
+                    .await
+                    .expect("background auxiliary receiver should remain open");
+                self.release.notified().await;
+                Err(ProviderError::StatePoisoned)
+            })
+        }
+
+        fn transcribe_audio<'a>(
+            &'a self,
+            _request: AudioTranscriptionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(ProviderError::MissingApiKey) })
+        }
+
+        fn status_snapshot(&self) -> ProviderStatusSnapshot {
+            self.status.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn background_auxiliary_provider_handover_succeeds_with_single_task_attempt() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::new().to_string();
+        let task_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("background-auxiliary:{session_id}"),
+                session_label: Some("Background auxiliary supersession".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("background auxiliary session should be created");
+        let task = state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::Summary.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: None,
+                parent_run_id: None,
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 1,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("summarize after provider replacement".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("background auxiliary task should be created");
+
+        let (started_tx, mut started_rx) = mpsc::channel(1);
+        let release = Arc::new(Notify::new());
+        let _ = state.configure_model_provider(Arc::new(BlockingBackgroundAuxiliaryProvider {
+            started: started_tx,
+            release: Arc::clone(&release),
+            status: state.model_provider_status_snapshot(),
+        }));
+        dispatch_auxiliary_executor_task(
+            &state,
+            &task,
+            crate::auxiliary_executor::AuxiliaryTaskType::Summary,
+            crate::gateway::current_unix_ms(),
+        )
+        .await
+        .expect("background auxiliary task should dispatch");
+
+        started_rx.recv().await.expect("initial background provider call should start");
+        let (requests_tx, mut requests_rx) = mpsc::channel(1);
+        let _ = state.configure_model_provider(Arc::new(SuccessfulModelProvider {
+            requests: requests_tx,
+            response_text: "replacement background auxiliary response",
+            status: provider_status_snapshot(false),
+        }));
+        release.notify_one();
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state
+                    .get_orchestrator_background_task(task_id.clone())
+                    .await
+                    .expect("background auxiliary task snapshot should load")
+                    .expect("background auxiliary task should exist");
+                if snapshot.state == AuxiliaryTaskState::Succeeded.as_str() {
+                    break snapshot;
+                }
+                assert_ne!(
+                    snapshot.state,
+                    AuxiliaryTaskState::Failed.as_str(),
+                    "first provider supersession must not terminalize the task as failed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background auxiliary task should settle");
+        assert_eq!(completed.attempt_count, 1);
+        assert_eq!(completed.max_attempts, 1);
+        assert_eq!(completed.state, AuxiliaryTaskState::Succeeded.as_str());
+        let result_json =
+            completed.result_json.expect("successful task should persist result json");
+        assert!(result_json.contains("replacement background auxiliary response"));
+        assert!(!result_json.contains("stale"));
+        let replacement_request =
+            requests_rx.recv().await.expect("replacement background provider should run once");
+        assert_eq!(replacement_request.model_override.as_deref(), Some("gpt-4o-mini"));
+        assert!(requests_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .journal_store
+                .runtime_stale_event_diagnostic_count_for_scope(
+                    session_id.as_str(),
+                    task_id.as_str(),
+                    "runtime.generation.provider_reconfigured",
+                )
+                .expect("background auxiliary stale diagnostic count should load"),
+            1
+        );
+    }
 
     fn unauthenticated_gateway_auth() -> GatewayAuthConfig {
         GatewayAuthConfig {
@@ -3256,6 +4192,86 @@ mod tests {
             connector_token: None,
             bound_principal: None,
         }
+    }
+
+    #[test]
+    fn cancel_requested_child_completion_settles_cancelled() {
+        assert_eq!(
+            background_task_terminal_state_from_run("cancel_requested", "done"),
+            AuxiliaryTaskState::Cancelled
+        );
+        assert_eq!(
+            background_task_terminal_state_from_run("cancel_requested", "failed"),
+            AuxiliaryTaskState::Cancelled
+        );
+        assert_eq!(
+            background_task_terminal_state_from_run("running", "done"),
+            AuxiliaryTaskState::Succeeded
+        );
+    }
+
+    #[test]
+    fn claimed_task_heartbeat_uses_allocated_execution_generation() {
+        let mut queued = sample_task(
+            "heartbeat-claim-generation",
+            AuxiliaryTaskState::Queued.as_str(),
+            1,
+            "group-a",
+            DelegationRuntimeLimits::default(),
+        );
+        queued.execution_generation = 4;
+        let queued_heartbeat = background_task_heartbeat_update(&queued);
+        assert_eq!(queued_heartbeat.execution_generation, Some(4));
+
+        let mut claimed = queued;
+        claimed.state = AuxiliaryTaskState::Running.as_str().to_owned();
+        claimed.execution_generation = 5;
+        let claimed_heartbeat = background_task_heartbeat_update(&claimed);
+        assert_eq!(claimed_heartbeat.execution_generation, Some(5));
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_request_overrides_stale_claimed_child_completion() {
+        let state = build_test_runtime_state(false);
+        let (running, child_run_id, _) =
+            create_attached_child_task_fixture(&state, "stale-claimed-child-cancel", i64::MAX)
+                .await;
+        let claimed = running.clone();
+        state
+            .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                task_id: running.task_id.clone(),
+                expected_revision: running.revision,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                last_error: Some(Some("cancelled while child stream was open".to_owned())),
+                ..Default::default()
+            })
+            .await
+            .expect("host cancellation should persist");
+        let durable = state
+            .get_orchestrator_background_task(running.task_id.clone())
+            .await
+            .expect("cancelled task lookup should succeed")
+            .expect("cancelled task should exist");
+        assert_eq!(durable.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(durable.execution_generation, claimed.execution_generation);
+
+        let mut completed_run = state
+            .orchestrator_run_status_snapshot(child_run_id)
+            .await
+            .expect("child snapshot lookup should succeed")
+            .expect("child snapshot should exist");
+        completed_run.state = "done".to_owned();
+        completed_run.completed_at_unix_ms = Some(crate::gateway::current_unix_ms());
+        finalize_task_from_run(&state, &durable, Some(&completed_run), "done")
+            .await
+            .expect("durable cancellation should settle the worker as cancelled");
+
+        let settled = state
+            .get_orchestrator_background_task(running.task_id)
+            .await
+            .expect("settled task lookup should succeed")
+            .expect("settled task should exist");
+        assert_eq!(settled.state, AuxiliaryTaskState::Cancelled.as_str());
     }
 
     #[test]
@@ -3479,7 +4495,7 @@ mod tests {
 
     #[test]
     fn background_run_parameter_delta_includes_task_budget() {
-        let task = sample_task(
+        let mut task = sample_task(
             "task-budget",
             AuxiliaryTaskState::Queued.as_str(),
             100,
@@ -3489,6 +4505,20 @@ mod tests {
                 ..DelegationRuntimeLimits::default()
             },
         );
+        task.cancellation_context = Some(CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("child_task:task-budget").expect("child scope id"),
+            scope: CancellationScopeKind::ChildTask,
+            generation: palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                .expect("generation"),
+            parent_scope_id: Some(
+                RuntimeOperationId::parse("run:task-budget").expect("parent scope id"),
+            ),
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        });
 
         let bytes =
             build_parameter_delta_bytes(&task).expect("background parameter delta should encode");
@@ -3499,6 +4529,19 @@ mod tests {
             parsed.pointer("/background_task/budget_tokens").and_then(Value::as_u64),
             Some(1_234)
         );
+        assert_eq!(
+            parsed.pointer("/background_task/schema_version").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            parsed.pointer("/background_task/parent_session_id").and_then(Value::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            parsed.pointer("/background_task/child_session_id").and_then(Value::as_str),
+            Some("child-session-task-budget")
+        );
+        assert!(parsed.pointer("/background_task/cancellation_context").is_some());
     }
 
     #[test]
@@ -3941,19 +4984,6 @@ mod tests {
     }
 
     #[test]
-    fn running_update_does_not_attach_child_run_before_it_exists() {
-        let update = build_background_task_running_update("task-1", 1234);
-
-        assert_eq!(update.task_id, "task-1");
-        assert_eq!(update.state.as_deref(), Some(AuxiliaryTaskState::Running.as_str()));
-        assert_eq!(update.target_run_id, Some(None));
-        assert!(update.increment_attempt_count);
-        assert_eq!(update.result_json, Some(None));
-        assert_eq!(update.started_at_unix_ms, Some(Some(1234)));
-        assert_eq!(update.completed_at_unix_ms, Some(None));
-    }
-
-    #[test]
     fn in_flight_work_without_target_requires_started_running_or_cancel_requested_task() {
         let limits = DelegationRuntimeLimits {
             max_concurrent_children: 1,
@@ -3986,6 +5016,814 @@ mod tests {
         let mut queued = running;
         queued.state = AuxiliaryTaskState::Queued.as_str().to_owned();
         assert!(!task_has_in_flight_work_without_target(&queued));
+    }
+
+    #[tokio::test]
+    async fn child_attachment_delivers_cancellation_requested_during_attach_window() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::new().to_string();
+        let task_id = Ulid::new().to_string();
+        let child_run_id = Ulid::new().to_string();
+        let unrelated_run_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("attach-window:{session_id}"),
+                session_label: Some("Attach-window cancellation".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("attach-window session should upsert");
+        let parent_run_id = Ulid::new().to_string();
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: parent_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .await
+            .expect("attach-window parent run should start");
+        let (_, generation) = state
+            .runtime_generation_for_run(parent_run_id.clone())
+            .await
+            .expect("attach-window generation lookup should succeed")
+            .expect("attach-window generation should be active");
+        let cancellation_context = CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("child_task:attach_window")
+                .expect("attach-window child scope id"),
+            scope: CancellationScopeKind::ChildTask,
+            generation,
+            parent_scope_id: Some(
+                RuntimeOperationId::parse("run:attach_window")
+                    .expect("attach-window parent scope id"),
+            ),
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        };
+        state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: Some(format!("child-session-{task_id}")),
+                parent_run_id: Some(parent_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: Some(child_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: Some(
+                    sample_task(
+                        "delegation-template",
+                        AuxiliaryTaskState::Queued.as_str(),
+                        1,
+                        "group-a",
+                        DelegationRuntimeLimits::default(),
+                    )
+                    .delegation
+                    .expect("sample delegation should exist"),
+                ),
+                cancellation_context: Some(cancellation_context),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("exercise attach-window cancellation".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("attach-window task should be created");
+        let task = state
+            .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.clone(),
+                expected_revision: 0,
+                started_at_unix_ms: crate::gateway::current_unix_ms(),
+            })
+            .await
+            .expect("attach-window task should start");
+        state
+            .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.clone(),
+                expected_revision: task.revision,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                last_error: Some(Some("interrupt during child attachment".to_owned())),
+                ..Default::default()
+            })
+            .await
+            .expect("attach-window cancellation should persist");
+        let task = state
+            .get_orchestrator_background_task(task_id.clone())
+            .await
+            .expect("attach-window task lookup should succeed")
+            .expect("attach-window task should exist");
+        start_delegated_child_fixture(&state, &task, child_run_id.as_str()).await;
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: unrelated_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: Some(parent_run_id.clone()),
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .await
+            .expect("unrelated child fixture should start");
+
+        attach_background_task_child_run(&state, &task, child_run_id.as_str())
+            .await
+            .expect("pending-cancel child should attach and receive cancellation");
+
+        let attached = state
+            .get_orchestrator_background_task(task_id)
+            .await
+            .expect("attached task lookup should succeed")
+            .expect("attached task should exist");
+        assert_eq!(attached.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(attached.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id)
+            .await
+            .expect("attached child cancel flag should load"));
+        assert!(
+            !state
+                .is_orchestrator_cancel_requested(unrelated_run_id)
+                .await
+                .expect("unrelated child cancel flag should load"),
+            "attach-window cancellation must not signal an unrelated run"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_task_context_blocks_missing_invalid_and_expired_dispatch() {
+        let state = build_test_runtime_state(false);
+        let mut task = sample_task(
+            "child-context-gate",
+            AuxiliaryTaskState::Queued.as_str(),
+            1,
+            "group-a",
+            DelegationRuntimeLimits::default(),
+        );
+        task.cancellation_context = None;
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(&state, &task, 10)
+                .await
+                .expect_err("delegation without child authority must fail closed")
+                .code(),
+            Code::FailedPrecondition
+        );
+
+        task.delegation = None;
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(&state, &task, 10)
+                .await
+                .expect_err("typed delegation without payload authority must fail closed")
+                .code(),
+            Code::FailedPrecondition
+        );
+        task.delegation = sample_task(
+            "child-context-template",
+            AuxiliaryTaskState::Queued.as_str(),
+            1,
+            "group-a",
+            DelegationRuntimeLimits::default(),
+        )
+        .delegation;
+
+        let mut invalid = CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("run:invalid_child_context")
+                .expect("invalid fixture scope id"),
+            scope: CancellationScopeKind::Run,
+            generation: palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                .expect("fixture generation"),
+            parent_scope_id: None,
+            reason: None,
+            deadline_unix_ms: Some(100),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        };
+        task.cancellation_context = Some(invalid.clone());
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(&state, &task, 10)
+                .await
+                .expect_err("non-child authority must fail closed")
+                .code(),
+            Code::FailedPrecondition
+        );
+
+        invalid.scope_id =
+            RuntimeOperationId::parse("child_task:expired").expect("expired fixture scope id");
+        invalid.scope = CancellationScopeKind::ChildTask;
+        invalid.parent_scope_id = Some(
+            RuntimeOperationId::parse("run:expired_parent")
+                .expect("expired fixture parent scope id"),
+        );
+        invalid.deadline_unix_ms = Some(10);
+        task.cancellation_context = Some(invalid);
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(&state, &task, 10)
+                .await
+                .expect_err("expired child authority must block dispatch")
+                .code(),
+            Code::DeadlineExceeded
+        );
+
+        task.task_kind = AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned();
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(&state, &task, 10)
+                .await
+                .expect_err("non-delegation task must reject ChildTask authority")
+                .code(),
+            Code::FailedPrecondition
+        );
+
+        task.task_kind = AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned();
+        task.parent_run_id = Some("missing-parent-generation".to_owned());
+        task.cancellation_context = Some(CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("child_task:stale")
+                .expect("stale fixture scope id"),
+            scope: CancellationScopeKind::ChildTask,
+            generation: palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                .expect("fixture generation"),
+            parent_scope_id: Some(
+                RuntimeOperationId::parse("run:stale_parent")
+                    .expect("stale fixture parent scope id"),
+            ),
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        });
+        assert_eq!(
+            ensure_child_task_context_permits_dispatch(
+                &state,
+                &task,
+                crate::gateway::current_unix_ms(),
+            )
+            .await
+            .expect_err("inactive parent generation must block dispatch")
+            .code(),
+            Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_child_with_invalid_contract_is_cancelled_without_detaching() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::new().to_string();
+        let parent_run_id = Ulid::new().to_string();
+        let child_run_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("invalid-attached-child:{session_id}"),
+                session_label: Some("Invalid attached child contract".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("invalid-contract session should upsert");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: parent_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .await
+            .expect("invalid-contract parent run should start");
+        let task_id = Ulid::new().to_string();
+        let (_, generation) = state
+            .runtime_generation_for_run(parent_run_id.clone())
+            .await
+            .expect("parent generation lookup should succeed")
+            .expect("parent generation should be active");
+        let delegation = sample_task(
+            "invalid-contract-template",
+            AuxiliaryTaskState::Queued.as_str(),
+            10,
+            "group-a",
+            DelegationRuntimeLimits::default(),
+        )
+        .delegation
+        .expect("sample delegation should exist");
+        state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: Some(format!("child-session-{task_id}")),
+                parent_run_id: Some(parent_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: Some(child_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: Some(delegation),
+                cancellation_context: Some(CancellationContextV1 {
+                    schema_version: 1,
+                    scope_id: RuntimeOperationId::parse("child_task:attached_invalid")
+                        .expect("child scope id should validate"),
+                    scope: CancellationScopeKind::ChildTask,
+                    generation,
+                    parent_scope_id: Some(
+                        RuntimeOperationId::parse("run:attached_invalid")
+                            .expect("parent scope id should validate"),
+                    ),
+                    reason: None,
+                    deadline_unix_ms: Some(i64::MAX),
+                    graceful_settle_ms: 500,
+                    hard_abort_after_ms: 2_000,
+                }),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("invalid attached child contract".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("invalid-contract task should be created");
+        let task = state
+            .get_orchestrator_background_task(task_id.clone())
+            .await
+            .expect("invalid-contract task lookup should succeed")
+            .expect("invalid-contract task should exist");
+        start_delegated_child_fixture(&state, &task, child_run_id.as_str()).await;
+        let claimed = state
+            .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.clone(),
+                expected_revision: task.revision,
+                started_at_unix_ms: crate::gateway::current_unix_ms(),
+            })
+            .await
+            .expect("invalid-contract task should start");
+        state
+            .update_orchestrator_background_task_from_worker(
+                OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.clone(),
+                    execution_generation: claimed.execution_generation,
+                    state: None,
+                    target_run_id: Some(Some(child_run_id.clone())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("invalid-contract task should attach");
+        state
+            .journal_store
+            .clear_background_task_cancellation_context_for_test(task_id.as_str())
+            .expect("test should remove attached ChildTask authority");
+        let task = state
+            .get_orchestrator_background_task(task_id.clone())
+            .await
+            .expect("invalid-contract task lookup should succeed")
+            .expect("invalid-contract task should exist");
+        assert!(task_has_attached_child(&task));
+        let error = validate_child_task_cancellation_contract(&task)
+            .expect_err("missing attached ChildTask authority must fail closed");
+
+        reconcile_attached_child_with_invalid_contract(
+            &state,
+            &task,
+            &error,
+            crate::gateway::current_unix_ms(),
+        )
+        .await
+        .expect("invalid attached child should enter cancellation reconciliation");
+
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("invalid child cancel flag should load"));
+        let reconciled = state
+            .get_orchestrator_background_task(task_id)
+            .await
+            .expect("reconciled task lookup should succeed")
+            .expect("reconciled task should exist");
+        assert_eq!(reconciled.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(reconciled.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        assert_eq!(
+            reconciled.last_error.as_deref(),
+            Some("delegation task is missing durable ChildTask cancellation authority")
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_task_expiry_requests_exact_child_cancel_without_detaching() {
+        let state = build_test_runtime_state(false);
+        let (task, child_run_id, unrelated_run_id) =
+            create_attached_child_task_fixture(&state, "attached-task-expiry", i64::MAX).await;
+        let mut expired = task.clone();
+        expired.expires_at_unix_ms = Some(crate::gateway::current_unix_ms());
+
+        process_background_task(
+            &state,
+            &unauthenticated_gateway_auth(),
+            "http://127.0.0.1:1",
+            &expired,
+            &[],
+        )
+        .await
+        .expect("attached task expiry should enter cancellation reconciliation");
+
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("attached child cancel flag should load"));
+        assert!(!state
+            .is_orchestrator_cancel_requested(unrelated_run_id)
+            .await
+            .expect("unrelated child cancel flag should load"));
+        let reconciled = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("expired task lookup should succeed")
+            .expect("expired task should exist");
+        assert_eq!(reconciled.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(reconciled.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        assert!(reconciled.completed_at_unix_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn attached_absolute_child_deadline_requests_cancel_before_relative_timeout() {
+        let state = build_test_runtime_state(false);
+        let now = crate::gateway::current_unix_ms();
+        let (task, child_run_id, _) =
+            create_attached_child_task_fixture(&state, "attached-child-deadline", i64::MAX).await;
+        let mut expired_context = task
+            .cancellation_context
+            .clone()
+            .expect("attached child should carry cancellation context");
+        expired_context.deadline_unix_ms = Some(now - 1);
+        state
+            .journal_store
+            .set_background_task_cancellation_context_for_test(
+                task.task_id.as_str(),
+                &expired_context,
+            )
+            .expect("test should persist expired ChildTask deadline");
+        let task = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("deadline task lookup should succeed")
+            .expect("deadline task should exist");
+        assert!(delegated_child_timeout_message(&task, now).is_none());
+
+        let cancellation = task
+            .cancellation_context
+            .as_ref()
+            .expect("attached child should carry cancellation context");
+        assert!(expire_child_task_cancellation_context(&state, &task, Some(cancellation), now)
+            .await
+            .expect("expired attached ChildTask context should reconcile"));
+
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("deadline child cancel flag should load"));
+        let reconciled = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("deadline task lookup should succeed")
+            .expect("deadline task should exist");
+        assert_eq!(reconciled.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(reconciled.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        assert_eq!(
+            reconciled.last_error.as_deref(),
+            Some("delegation ChildTask cancellation deadline elapsed before dispatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_parent_generation_requests_exact_attached_child_cancel() {
+        let state = build_test_runtime_state(false);
+        let (task, child_run_id, _) =
+            create_attached_child_task_fixture(&state, "attached-stale-generation", i64::MAX).await;
+        let mut stale_context = task
+            .cancellation_context
+            .clone()
+            .expect("attached child should carry cancellation context");
+        stale_context.generation = palyra_common::runtime_contracts::RuntimeGeneration::new(
+            stale_context.generation.get().saturating_add(1),
+        )
+        .expect("next fixture generation should validate");
+        state
+            .journal_store
+            .set_background_task_cancellation_context_for_test(
+                task.task_id.as_str(),
+                &stale_context,
+            )
+            .expect("test should persist stale ChildTask generation");
+        let stale_task = state
+            .get_orchestrator_background_task(task.task_id.clone())
+            .await
+            .expect("stale task lookup should succeed")
+            .expect("stale task should exist");
+
+        assert!(expire_child_task_cancellation_context(
+            &state,
+            &stale_task,
+            stale_task.cancellation_context.as_ref(),
+            crate::gateway::current_unix_ms(),
+        )
+        .await
+        .expect("stale attached generation should reconcile"));
+
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("stale child cancel flag should load"));
+        let reconciled = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("stale task lookup should succeed")
+            .expect("stale task should exist");
+        assert_eq!(reconciled.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(reconciled.target_run_id.as_deref(), Some(child_run_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn late_child_completion_after_steer_cannot_merge_or_finalize_old_generation() {
+        let state = build_test_runtime_state(false);
+        let (task, child_run_id, _) =
+            create_attached_child_task_fixture(&state, "late-child-after-steer", i64::MAX).await;
+        let parent_run_id =
+            task.parent_run_id.clone().expect("attached child should retain parent run");
+        let observed_generation = task
+            .cancellation_context
+            .as_ref()
+            .expect("attached child should retain cancellation authority")
+            .generation;
+        let replacement_generation = state
+            .supersede_run_generation_for_steer(task.session_id.clone(), parent_run_id.clone())
+            .await
+            .expect("production steering transition should succeed");
+        assert_eq!(
+            replacement_generation,
+            observed_generation.next().expect("replacement generation should exist")
+        );
+        let mut late_terminal = state
+            .orchestrator_run_status_snapshot(child_run_id.clone())
+            .await
+            .expect("child snapshot lookup should succeed")
+            .expect("child run should exist");
+        late_terminal.state = "done".to_owned();
+        late_terminal.completed_at_unix_ms = Some(crate::gateway::current_unix_ms());
+
+        let finalized = finalize_task_from_run_if_parent_generation_current(
+            &state,
+            &task,
+            Some(&late_terminal),
+            "done",
+        )
+        .await
+        .expect("stale child completion guard should settle suppression");
+
+        assert!(!finalized);
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("child cancel flag should load"));
+        let suppressed = state
+            .get_orchestrator_background_task(task.task_id.clone())
+            .await
+            .expect("suppressed task lookup should succeed")
+            .expect("suppressed task should exist");
+        assert_eq!(suppressed.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert!(suppressed.completed_at_unix_ms.is_none());
+        assert!(suppressed
+            .result_json
+            .as_deref()
+            .is_some_and(|result| result.contains("late_completion_suppressed")));
+        let child = state
+            .orchestrator_run_status_snapshot(child_run_id)
+            .await
+            .expect("child snapshot should remain readable")
+            .expect("child run should remain present");
+        assert!(child.merge_result.is_none());
+        assert!(state
+            .journal_store
+            .orchestrator_tape(parent_run_id.as_str())
+            .expect("parent tape should load")
+            .iter()
+            .all(|event| !event.event_type.starts_with("child_run_")));
+        assert_eq!(
+            state
+                .journal_store
+                .runtime_stale_event_diagnostic_count_for_scope(
+                    task.session_id.as_str(),
+                    parent_run_id.as_str(),
+                    "runtime.generation.stale_child_completion_suppressed",
+                )
+                .expect("stale completion diagnostic count should load"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_child_is_cancelled_when_durable_attachment_fails() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::new().to_string();
+        let parent_run_id = Ulid::new().to_string();
+        let child_run_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("attachment-failure:{session_id}"),
+                session_label: Some("Attachment failure cancellation".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("attachment-failure session should upsert");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: parent_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .await
+            .expect("attachment-failure parent should start");
+        let (_, generation) = state
+            .runtime_generation_for_run(parent_run_id.clone())
+            .await
+            .expect("attachment-failure generation lookup should succeed")
+            .expect("attachment-failure parent generation should be active");
+        let task_id = Ulid::new().to_string();
+        let task = state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: Some(format!("child-session-{task_id}")),
+                parent_run_id: Some(parent_run_id),
+                target_run_id: None,
+                planned_child_run_id: Some(child_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: sample_task(
+                    "attachment-failure-template",
+                    AuxiliaryTaskState::Queued.as_str(),
+                    1,
+                    "group-a",
+                    DelegationRuntimeLimits::default(),
+                )
+                .delegation,
+                cancellation_context: Some(CancellationContextV1 {
+                    schema_version: 1,
+                    scope_id: RuntimeOperationId::parse("child_task:attachment_failure")
+                        .expect("attachment-failure child scope id should validate"),
+                    scope: CancellationScopeKind::ChildTask,
+                    generation,
+                    parent_scope_id: Some(
+                        RuntimeOperationId::parse("run:attachment_failure")
+                            .expect("attachment-failure parent scope id should validate"),
+                    ),
+                    reason: None,
+                    deadline_unix_ms: Some(i64::MAX),
+                    graceful_settle_ms: 500,
+                    hard_abort_after_ms: 2_000,
+                }),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("exercise admitted-child attachment failure".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("attachment-failure task should be created");
+        let node_runtime_root = unique_background_queue_test_root("attachment-failure-node");
+        let node_runtime = Arc::new(
+            NodeRuntimeState::load(node_runtime_root.as_path())
+                .expect("attachment-failure node runtime should initialize"),
+        );
+        let service = GatewayServiceImpl::new(
+            Arc::clone(&state),
+            unauthenticated_gateway_auth(),
+            node_runtime,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("attachment-failure listener should bind");
+        let address =
+            listener.local_addr().expect("attachment-failure listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            TonicServer::builder()
+                .add_service(super::gateway_v1::gateway_service_server::GatewayServiceServer::new(
+                    service,
+                ))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("attachment-failure gateway should shut down cleanly");
+        });
+        state.fail_next_background_task_child_attachment_for_test();
+
+        let error = run_background_task_stream(
+            &state,
+            &unauthenticated_gateway_auth(),
+            format!("http://{address}").as_str(),
+            &task,
+            child_run_id.as_str(),
+        )
+        .await
+        .expect_err("injected attachment failure should fail the child stream");
+        assert_eq!(error.code(), Code::Internal);
+        let snapshot = state
+            .orchestrator_run_status_snapshot(child_run_id.clone())
+            .await
+            .expect("admitted child snapshot should load");
+        if let Some(snapshot) = snapshot {
+            assert!(snapshot.cancel_requested);
+            assert_eq!(
+                snapshot.cancel_reason.as_deref(),
+                Some("background_child_attachment_failed")
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("attachment-failure gateway task should join");
+        let _ = std::fs::remove_dir_all(node_runtime_root);
+    }
+
+    #[tokio::test]
+    async fn terminal_child_settlement_wins_over_stale_expiry_snapshot() {
+        let state = build_test_runtime_state(false);
+        let (task, child_run_id, _) =
+            create_attached_child_task_fixture(&state, "terminal-child-expiry-race", i64::MAX)
+                .await;
+        state
+            .update_orchestrator_run_state(
+                child_run_id.clone(),
+                crate::orchestrator::RunLifecycleState::Done,
+                None,
+            )
+            .await
+            .expect("child run should settle before stale expiry processing");
+
+        request_attached_child_expiry_cancel(
+            &state,
+            &task,
+            child_run_id.as_str(),
+            "background_task_expired",
+            "background task expired while its child run was active",
+            crate::gateway::current_unix_ms(),
+        )
+        .await
+        .expect("terminal child should fold into task settlement");
+
+        assert!(!state
+            .is_orchestrator_cancel_requested(child_run_id.clone())
+            .await
+            .expect("terminal child cancel flag should load"));
+        let settled = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("settled task lookup should succeed")
+            .expect("settled task should exist");
+        assert_eq!(settled.state, AuxiliaryTaskState::Succeeded.as_str());
+        assert_eq!(settled.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        assert!(settled.completed_at_unix_ms.is_some());
     }
 
     #[test]
@@ -4044,15 +5882,154 @@ mod tests {
         );
     }
 
-    #[test]
-    fn child_run_attach_update_sets_target_after_run_exists() {
-        let update = build_background_task_child_run_attach_update("task-1", "run-1");
+    fn unique_background_queue_test_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "palyra-background-queue-{prefix}-{}-{}",
+            std::process::id(),
+            Ulid::new()
+        ))
+    }
 
-        assert_eq!(update.task_id, "task-1");
-        assert_eq!(update.state, None);
-        assert_eq!(update.target_run_id, Some(Some("run-1".to_owned())));
-        assert!(!update.increment_attempt_count);
-        assert_eq!(update.result_json, None);
+    async fn create_attached_child_task_fixture(
+        state: &Arc<crate::gateway::runtime::GatewayRuntimeState>,
+        fixture_name: &str,
+        deadline_unix_ms: i64,
+    ) -> (OrchestratorBackgroundTaskRecord, String, String) {
+        let session_id = Ulid::new().to_string();
+        let parent_run_id = Ulid::new().to_string();
+        let child_run_id = Ulid::new().to_string();
+        let unrelated_run_id = Ulid::new().to_string();
+        let task_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("{fixture_name}:{session_id}"),
+                session_label: Some(fixture_name.to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("attached-child fixture session should upsert");
+        // Keep the unrelated same-session run as a cancellation decoy without
+        // superseding the parent generation used by attached-child assertions.
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: unrelated_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .await
+            .expect("unrelated attached-child fixture run should start");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: parent_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .await
+            .expect("attached-child fixture parent should start");
+        let (_, generation) = state
+            .runtime_generation_for_run(parent_run_id.clone())
+            .await
+            .expect("attached-child generation lookup should succeed")
+            .expect("attached-child parent generation should be active");
+        let delegation = sample_task(
+            "attached-child-template",
+            AuxiliaryTaskState::Queued.as_str(),
+            1,
+            "group-a",
+            DelegationRuntimeLimits {
+                child_timeout_ms: 60_000,
+                ..DelegationRuntimeLimits::default()
+            },
+        )
+        .delegation
+        .expect("attached-child fixture delegation should exist");
+        state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: Some(format!("child-session-{task_id}")),
+                parent_run_id: Some(parent_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: Some(child_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: Some(delegation),
+                cancellation_context: Some(CancellationContextV1 {
+                    schema_version: 1,
+                    scope_id: RuntimeOperationId::parse(
+                        format!("child_task:{fixture_name}").as_str(),
+                    )
+                    .expect("attached-child scope id should validate"),
+                    scope: CancellationScopeKind::ChildTask,
+                    generation,
+                    parent_scope_id: Some(
+                        RuntimeOperationId::parse(format!("run:{fixture_name}").as_str())
+                            .expect("attached-child parent scope id should validate"),
+                    ),
+                    reason: None,
+                    deadline_unix_ms: Some(deadline_unix_ms),
+                    graceful_settle_ms: 500,
+                    hard_abort_after_ms: 2_000,
+                }),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("exercise attached-child supervision".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("attached-child fixture task should be created");
+        let task = state
+            .get_orchestrator_background_task(task_id.clone())
+            .await
+            .expect("attached-child fixture pre-attach lookup should succeed")
+            .expect("attached-child fixture task should exist");
+        start_delegated_child_fixture(state, &task, child_run_id.as_str()).await;
+        let claimed = state
+            .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.clone(),
+                expected_revision: task.revision,
+                started_at_unix_ms: crate::gateway::current_unix_ms(),
+            })
+            .await
+            .expect("attached-child fixture should start");
+        state
+            .update_orchestrator_background_task_from_worker(
+                OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.clone(),
+                    execution_generation: claimed.execution_generation,
+                    state: None,
+                    target_run_id: Some(Some(child_run_id.clone())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("attached-child fixture should attach");
+        let task = state
+            .get_orchestrator_background_task(task_id)
+            .await
+            .expect("attached-child fixture lookup should succeed")
+            .expect("attached-child fixture should exist");
+        (task, child_run_id, unrelated_run_id)
     }
 
     fn sample_run(state: &str, last_error: Option<&str>) -> OrchestratorRunStatusSnapshot {
@@ -4124,15 +6101,19 @@ mod tests {
             task_id: task_id.to_owned(),
             task_kind: "delegation_prompt".to_owned(),
             session_id: "session".to_owned(),
+            child_session_id: Some(format!("child-session-{task_id}")),
             parent_run_id: Some("parent-run".to_owned()),
             target_run_id: (state == AuxiliaryTaskState::Running.as_str())
                 .then(|| format!("run-{task_id}")),
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: "principal".to_owned(),
             device_id: "device".to_owned(),
             channel: Some("web".to_owned()),
             state: state.to_owned(),
             priority: 0,
+            revision: 0,
+            execution_generation: 0,
             attempt_count: 0,
             max_attempts: 3,
             budget_tokens: runtime_limits.child_budget_override.unwrap_or(1_000),
@@ -4157,6 +6138,7 @@ mod tests {
                 runtime_limits,
                 agent_id: Some("main".to_owned()),
             }),
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,

@@ -38,10 +38,10 @@ use crate::{
     },
     config::CodeIntelConfig,
     gateway::{
-        GatewayRuntimeState, ToolRuntimeExecutionContext, CODE_DEFINITION_TOOL_NAME,
-        CODE_DIAGNOSTICS_TOOL_NAME, CODE_HEALTH_TOOL_NAME, CODE_HOVER_TOOL_NAME,
-        CODE_OUTLINE_TOOL_NAME, CODE_REFERENCES_TOOL_NAME, CODE_SYMBOLS_TOOL_NAME,
-        CODE_WORKSPACE_SYMBOLS_TOOL_NAME,
+        GatewayRuntimeState, ManagedRuntimeHealthAuthority, ManagedRuntimeHealthFamily,
+        ToolRuntimeExecutionContext, CODE_DEFINITION_TOOL_NAME, CODE_DIAGNOSTICS_TOOL_NAME,
+        CODE_HEALTH_TOOL_NAME, CODE_HOVER_TOOL_NAME, CODE_OUTLINE_TOOL_NAME,
+        CODE_REFERENCES_TOOL_NAME, CODE_SYMBOLS_TOOL_NAME, CODE_WORKSPACE_SYMBOLS_TOOL_NAME,
     },
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -278,6 +278,31 @@ impl LspProcessManager {
     }
 }
 
+/// Probes one registered language provider without starting a process or
+/// opening a workspace. The result is limited to configuration and executable
+/// discovery, preserving the observe-only rollout boundary.
+pub(crate) fn probe_code_intel_provider(
+    config: &CodeIntelConfig,
+    language_id: &str,
+) -> Option<CodeIntelProviderStatus> {
+    let language_id = language_id.trim().to_ascii_lowercase();
+    let language = CodeIntelLanguage::ALL
+        .iter()
+        .copied()
+        .find(|language| language.as_str() == language_id.as_str())?;
+    if !config.enabled {
+        return LspProcessManager::from_config(config)
+            .disabled_provider_statuses()
+            .into_iter()
+            .find(|status| status.language == language);
+    }
+    let touched_languages = [language].into_iter().collect::<BTreeSet<_>>();
+    LspProcessManager::from_config(config)
+        .provider_statuses(&touched_languages)
+        .into_iter()
+        .find(|status| status.language == language)
+}
+
 /// Result of resolving the workspace root used by diagnostics providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WorkspaceRootResolution {
@@ -503,14 +528,92 @@ pub(crate) fn capture_diagnostic_snapshot(
 
 /// Captures diagnostics and invokes enabled language providers behind the
 /// conservative code-intelligence rollout flag.
+#[cfg(test)]
 pub(crate) async fn capture_diagnostic_snapshot_with_providers(
     config: &CodeIntelConfig,
     workspace_roots: &[PathBuf],
     files_touched: &[WorkspacePatchFileAttestation],
 ) -> DiagnosticSnapshot {
+    capture_diagnostic_snapshot_with_health_blocks(
+        config,
+        workspace_roots,
+        files_touched,
+        &BTreeSet::new(),
+    )
+    .await
+}
+
+/// Captures diagnostics under exact shared-health authority for each touched
+/// language. Blocked providers remain metadata-only degraded observations,
+/// and late results are suppressed by the captured generation.
+pub(crate) async fn capture_diagnostic_snapshot_with_managed_health(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    config: &CodeIntelConfig,
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+) -> DiagnosticSnapshot {
+    let touched_languages = files_touched
+        .iter()
+        .filter_map(|file| CodeIntelLanguage::from_path(file.path.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut authorities = BTreeMap::<CodeIntelLanguage, ManagedRuntimeHealthAuthority>::new();
+    let mut blocked_languages = BTreeSet::new();
+    for language in touched_languages {
+        match runtime_state
+            .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Lsp, language.as_str())
+        {
+            Ok(authority) => {
+                authorities.insert(language, authority);
+            }
+            Err(_) => {
+                blocked_languages.insert(language);
+            }
+        }
+    }
+    let snapshot = capture_diagnostic_snapshot_with_health_blocks(
+        config,
+        workspace_roots,
+        files_touched,
+        &blocked_languages,
+    )
+    .await;
+    for (language, authority) in authorities {
+        let status = snapshot.provider_status.iter().find(|status| status.language == language);
+        let succeeded = status.is_some_and(|status| {
+            status.status == "ready"
+                || status.status == "skipped"
+                || status.reason_code.starts_with("code_intel.provider_registry_only.")
+        });
+        runtime_state.record_managed_runtime_health_observation(
+            &authority,
+            succeeded,
+            if succeeded {
+                "runtime.health.lsp_observation_succeeded"
+            } else {
+                "runtime.health.lsp_observation_failed"
+            },
+        );
+    }
+    snapshot
+}
+
+async fn capture_diagnostic_snapshot_with_health_blocks(
+    config: &CodeIntelConfig,
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+    blocked_languages: &BTreeSet<CodeIntelLanguage>,
+) -> DiagnosticSnapshot {
     let mut snapshot = capture_diagnostic_snapshot(config, workspace_roots, files_touched);
     if !snapshot.enabled {
         return snapshot;
+    }
+    for language in blocked_languages {
+        mark_provider_degraded(
+            &mut snapshot,
+            *language,
+            "runtime.health.lsp_admission_blocked",
+            "Shared runtime health blocked this exact language-provider generation.",
+        );
     }
     let workspace_root = configured_workspace_root(config, workspace_roots);
     let rust_files = snapshot
@@ -1273,7 +1376,8 @@ async fn code_intel_diagnostics_output(
     } else {
         Vec::new()
     };
-    let snapshot = capture_diagnostic_snapshot_with_providers(
+    let snapshot = capture_diagnostic_snapshot_with_managed_health(
+        runtime_state,
         &runtime_state.config.code_intel,
         std::slice::from_ref(&workspace.primary_root),
         touched_files.as_slice(),

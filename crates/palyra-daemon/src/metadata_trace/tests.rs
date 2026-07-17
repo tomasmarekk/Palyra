@@ -55,7 +55,7 @@ fn identifier_hashes_reject_empty_or_oversized_values() {
 }
 
 #[test]
-fn event_identity_changes_across_generation_sequence_and_source_event() {
+fn event_identity_changes_across_generation_source_sequence_and_event_type() {
     let record = OrchestratorTapeRecord {
         seq: 7,
         event_type: "context.engine.plan".to_owned(),
@@ -79,13 +79,19 @@ fn event_identity_changes_across_generation_sequence_and_source_event() {
         )
         .expect("alternate generation should hash")
     );
-    assert_ne!(
+    assert_eq!(
         baseline,
         projected_event_id_sha256(
             MetadataTraceProjectionContext { sequence: 5, ..context },
             &record,
         )
-        .expect("alternate sequence should hash")
+        .expect("trace-local sequence must not change source identity")
+    );
+    let alternate_sequence_record = OrchestratorTapeRecord { seq: 8, ..record.clone() };
+    assert_ne!(
+        baseline,
+        projected_event_id_sha256(context, &alternate_sequence_record)
+            .expect("alternate source sequence should hash")
     );
     let alternate_record =
         OrchestratorTapeRecord { event_type: "tool.before_decision".to_owned(), ..record };

@@ -25,10 +25,12 @@ use palyra_common::{
     runtime_contracts::{
         classify_agent_harness_terminal, AgentHarnessAttemptClassification,
         AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
-        AgentHarnessSelectionMode, QueuedInputState, RuntimeTerminalOutcome,
+        AgentHarnessSelectionMode, CancellationContextV1, CancellationReason, QueuedInputState,
+        RuntimeTerminalOutcome,
     },
     runtime_preview::RuntimePreviewMode,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{
     sync::mpsc,
@@ -71,15 +73,18 @@ use crate::{
     },
     delegation::DelegationSnapshot,
     gateway::{
-        canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort, non_empty,
-        record_message_router_journal_event, security_requests_json_mode, truncate_with_ellipsis,
-        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, CANCELLED_REASON,
+        canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort,
+        is_provider_reconfigured_status, non_empty, record_message_router_journal_event,
+        security_requests_json_mode, truncate_with_ellipsis, GatewayRuntimeConfigSnapshot,
+        GatewayRuntimeState, ManagedRuntimeHealthFamily, CANCELLED_REASON,
     },
     journal::{
-        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputRecord,
-        OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
+        DelegatedRunAdmissionV1, MemorySource, OrchestratorCancelRequest,
+        OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
+        OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
+        OrchestratorRunTerminalSettlement, OrchestratorRunTerminalSettlementRequest,
+        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest,
+        OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
     },
     model_provider::{
         assemble_canonical_tool_calls, bounded_provider_turn_output_for_persistence,
@@ -117,10 +122,14 @@ use super::{
         TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
         VERIFICATION_FINALIZER_NUDGE_EVENT, VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
     },
-    cancellation::{transition_run_stream_state_to_cancelled, transition_run_stream_to_cancelled},
+    cancellation::{
+        record_run_interrupt_observation, request_persisted_run_interrupt,
+        transition_run_stream_to_cancelled,
+    },
+    flow_control::{LiveCancellationScope, RunInterruptPhase, RunStreamFlowControl},
     tape::{
-        maybe_compact_context_after_tool_results, send_final_status_with_tape,
-        send_model_token_with_tape, send_status_with_tape,
+        maybe_compact_context_after_tool_results, send_model_token_with_tape,
+        send_settled_final_status, send_status_with_tape, status_tape_payload,
         RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
@@ -179,8 +188,12 @@ impl BackgroundBudgetGuardDecision {
 /// Outcome of finalizing a run after the provider produced a final answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamPostProviderOutcome {
-    /// The run reached the done state (or was already terminal).
+    /// The run reached the done state and the terminal wire status was delivered.
     Completed,
+    /// The run reached the done state, but terminal delivery failed after settlement.
+    CompletedDeliveryFailed,
+    /// Another terminal failure committed before completion finalization.
+    Failed,
     /// A cancel request won the race; the cancelled transition was applied.
     Cancelled,
 }
@@ -192,8 +205,10 @@ pub(crate) enum RunStreamProviderRequestOutcome {
     Completed { response: Box<ProviderResponse>, duration_ms: u64 },
     /// The deadline elapsed first; `message` is the operator-facing diagnosis.
     TimedOut { reason: ProviderRequestTimeoutReason, message: String },
-    /// A cancel request was observed; the cancelled transition was applied.
-    Cancelled,
+    /// The configured provider changed while this request was in flight.
+    Superseded,
+    /// Cancellation was observed and durable settlement selected this state.
+    Terminal(RunLifecycleState),
 }
 
 /// Which deadline expired for a provider request; selects the recovery path.
@@ -284,7 +299,7 @@ impl RunLoopPhase {
 enum RunLoopPhaseOutcome<T> {
     Completed(T),
     TimedOut { phase: RunLoopPhase, elapsed_ms: u64, timeout_ms: u64, message: String },
-    Cancelled,
+    Terminal(RunLifecycleState),
 }
 
 struct RunLoopPhaseDeadlineContext<'a> {
@@ -292,7 +307,9 @@ struct RunLoopPhaseDeadlineContext<'a> {
     runtime_state: &'a Arc<GatewayRuntimeState>,
     run_state: &'a mut RunStateMachine,
     run_id: &'a str,
+    flow_control: &'a RunStreamFlowControl,
     tape_seq: &'a mut i64,
+    harness_lifecycle: Option<&'a RunStreamHarnessLifecycle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +321,9 @@ struct ProviderRequestDeadlineOverride {
 struct RunStreamProviderRequestExecution {
     provider_request: ProviderRequest,
     lease_context: ProviderLeaseExecutionContext,
+    cancellation: LiveCancellationScope,
     deadline_override: Option<ProviderRequestDeadlineOverride>,
+    harness_lifecycle: Option<RunStreamHarnessLifecycle>,
 }
 
 /// Whether the gateway should keep reading client messages after this one.
@@ -326,7 +345,7 @@ const RUN_STREAM_MODEL_CAPABILITIES: [&str; 1] = ["text"];
 const RUNTIME_SELECTED_METADATA_SCHEMA_V1: &[u8] = b"palyra.metadata_trace.runtime_selected.v1\0harness_id\0harness_version\0runtime_id\0runtime_version\0route_class\0auth_profile_id_sha256\0schema_hashes";
 
 #[derive(Debug, Clone)]
-struct RunStreamHarnessLifecycle {
+pub(crate) struct RunStreamHarnessLifecycle {
     diagnostics: AgentHarnessSelectionDiagnostics,
     trace_context: String,
 }
@@ -377,8 +396,8 @@ pub(crate) enum RunStreamProviderResponseOutcome {
         provider_trace_ref: Option<String>,
         reason: AgentLoopTerminationReason,
     },
-    /// A cancel request was observed while processing provider events.
-    Cancelled,
+    /// Cancellation was observed and durable settlement selected this state.
+    Terminal(RunLifecycleState),
 }
 
 fn run_stream_attachment_metadata(attachments: &[common_v1::MessageAttachment]) -> Vec<Value> {
@@ -597,6 +616,7 @@ fn record_run_progress_heartbeat(
     runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
         kind: WorkHeartbeatKind::Run,
         object_id: run_id.to_owned(),
+        execution_generation: None,
         summary: format!("run {run_id} {summary}"),
     });
 }
@@ -693,6 +713,91 @@ fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<u6
         .pointer("/background_task/budget_tokens")
         .and_then(Value::as_u64)
         .filter(|value| *value > 0)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegatedBackgroundTaskAuthorityV1 {
+    schema_version: u32,
+    task_id: String,
+    task_kind: String,
+    parent_session_id: String,
+    child_session_id: String,
+    parent_run_id: String,
+    budget_tokens: u64,
+    cancellation_context: CancellationContextV1,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelegatedParameterDeltaV1 {
+    background_task: DelegatedBackgroundTaskAuthorityV1,
+}
+
+fn delegated_run_admission(
+    origin_kind: &str,
+    session_id: &str,
+    origin_run_id: Option<&str>,
+    parameter_delta_json: Option<&str>,
+) -> Result<Option<DelegatedRunAdmissionV1>, Status> {
+    let is_delegation = origin_kind.trim().eq_ignore_ascii_case("delegation");
+    if !is_delegation {
+        if let Some(raw) = parameter_delta_json {
+            if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                if parsed.pointer("/background_task/cancellation_context").is_some() {
+                    return Err(Status::invalid_argument(
+                        "non-delegation run cannot carry ChildTask cancellation authority",
+                    ));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    let raw = parameter_delta_json.ok_or_else(|| {
+        Status::invalid_argument("delegated run requires exact background-task authority")
+    })?;
+    let parsed = serde_json::from_str::<DelegatedParameterDeltaV1>(raw).map_err(|error| {
+        Status::invalid_argument(format!("delegated run authority is malformed: {error}"))
+    })?;
+    let authority = parsed.background_task;
+    if authority.schema_version != 1 {
+        return Err(Status::failed_precondition("delegated run authority schema is unsupported"));
+    }
+    if authority.task_id.trim().is_empty()
+        || authority.task_kind
+            != palyra_common::runtime_contracts::AuxiliaryTaskKind::DelegationPrompt.as_str()
+        || authority.parent_session_id.trim().is_empty()
+        || authority.child_session_id != session_id
+        || authority.parent_run_id.trim().is_empty()
+        || origin_run_id != Some(authority.parent_run_id.as_str())
+        || authority.budget_tokens == 0
+    {
+        return Err(Status::invalid_argument(
+            "delegated run identity does not match background-task authority",
+        ));
+    }
+    authority.cancellation_context.validate().map_err(|error| {
+        Status::failed_precondition(format!(
+            "delegated ChildTask cancellation authority is invalid: {error}"
+        ))
+    })?;
+    if authority.cancellation_context.scope
+        != palyra_common::runtime_contracts::CancellationScopeKind::ChildTask
+        || authority.cancellation_context.parent_scope_id.is_none()
+        || authority.cancellation_context.reason.is_some()
+        || !authority.cancellation_context.permits_new_work(current_unix_ms())
+    {
+        return Err(Status::failed_precondition(
+            "delegated ChildTask cancellation authority no longer permits admission",
+        ));
+    }
+    Ok(Some(DelegatedRunAdmissionV1 {
+        task_id: authority.task_id,
+        task_kind: authority.task_kind,
+        parent_session_id: authority.parent_session_id,
+        child_session_id: authority.child_session_id,
+        parent_run_id: authority.parent_run_id,
+        cancellation_context: authority.cancellation_context,
+    }))
 }
 
 fn apply_background_budget_guard(
@@ -885,33 +990,86 @@ async fn finalize_late_cancelled_run(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     attempt_owner: Option<&str>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
-) -> Result<(), Status> {
+    terminal_tape_events: Vec<OrchestratorTerminalTapeEvent>,
+) -> Result<OrchestratorRunTerminalSettlement, Status> {
+    request_persisted_run_interrupt(runtime_state, run_id, flow_control).await?;
+    record_run_interrupt_observation(runtime_state, flow_control);
     let cancelled_outcome = Ok(RunStreamMessageProcessingOutcome::Terminate);
-    let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+    let summary_payload = run_runtime_path_summary_payload(
         runtime_state,
-        Some(run_id),
         RunLifecycleState::Cancelled,
-        tape_seq,
         &cancelled_outcome,
         attempt_owner,
-    )
-    .await;
-    if let Err(error) = send_final_status_with_tape(
-        sender,
-        runtime_state,
-        run_id,
-        tape_seq,
-        common_v1::stream_status::StatusKind::Failed,
-        CANCELLED_REASON,
-    )
-    .await
-    {
-        let _ = sender.send(Err(error)).await;
+    )?;
+    let settlement_result = runtime_state
+        .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+            run_id: run_id.to_owned(),
+            requested_state: RunLifecycleState::Cancelled,
+            reason_code: RuntimeTerminalOutcome::Cancelled.reason_code().to_owned(),
+            status_message: CANCELLED_REASON.to_owned(),
+            actor: palyra_common::runtime_contracts::RuntimeActorRef {
+                kind: palyra_common::runtime_contracts::RuntimeActorKind::System,
+                id: attempt_owner.unwrap_or("run_stream.cancel").to_owned(),
+            },
+            terminal_summary_payload_json: Some(summary_payload),
+            terminal_tape_events,
+            terminal_status_payload_json: status_tape_payload(
+                common_v1::stream_status::StatusKind::Failed,
+                CANCELLED_REASON,
+            ),
+        })
+        .await;
+    let settlement = match settlement_result {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            // Generation invalidation is part of the same terminal transaction.
+            // Retain the heartbeat and exact cleanup authority when it rolls back.
+            return Err(error);
+        }
+    };
+    if settlement.changed {
+        cleanup_run_resources(runtime_state, run_id, CANCELLED_REASON).await;
+        runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
+        if let Some(settled_tape_sequence) = settlement.tape_sequence {
+            let delivery = flow_control.delivery()?;
+            if let Err(error) = send_settled_final_status(
+                sender,
+                runtime_state,
+                run_id,
+                tape_seq,
+                settled_tape_sequence,
+                common_v1::stream_status::StatusKind::Failed,
+                CANCELLED_REASON,
+                &delivery,
+            )
+            .await
+            {
+                let _ = sender.try_send(Err(error));
+            }
+        }
     }
-    cleanup_run_resources(runtime_state, run_id, CANCELLED_REASON).await;
-    runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
-    summary_result
+    Ok(settlement)
+}
+
+fn run_stream_post_provider_outcome(
+    effective_state: RunLifecycleState,
+    delivery_failed: bool,
+) -> RunStreamPostProviderOutcome {
+    match effective_state {
+        RunLifecycleState::Done if delivery_failed => {
+            RunStreamPostProviderOutcome::CompletedDeliveryFailed
+        }
+        RunLifecycleState::Done => RunStreamPostProviderOutcome::Completed,
+        RunLifecycleState::Failed => RunStreamPostProviderOutcome::Failed,
+        RunLifecycleState::Cancelled => RunStreamPostProviderOutcome::Cancelled,
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => {
+            unreachable!("terminal settlement returned a nonterminal run state")
+        }
+    }
 }
 
 /// Completes a run after its final provider response, honoring late cancels.
@@ -925,67 +1083,120 @@ async fn finalize_late_cancelled_run(
 /// Returns `Status::internal` when the state machine rejects the `Complete`
 /// transition, `Status::cancelled` when the client stream drops during the
 /// terminal status, or journal errors from state persistence.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(crate) async fn finalize_run_stream_after_provider_response(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
     run_state: &mut RunStateMachine,
     run_id: &str,
     attempt_owner: Option<&str>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
+    terminal_tape_events: Vec<OrchestratorTerminalTapeEvent>,
 ) -> Result<RunStreamPostProviderOutcome, Status> {
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::DeliveryTerminal);
     match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
         Ok(true) => {
-            transition_run_stream_state_to_cancelled(runtime_state, run_state, run_id).await?;
-            finalize_late_cancelled_run(sender, runtime_state, run_id, attempt_owner, tape_seq)
-                .await?;
-            return Ok(RunStreamPostProviderOutcome::Cancelled);
+            let settlement = finalize_late_cancelled_run(
+                sender,
+                runtime_state,
+                run_id,
+                attempt_owner,
+                flow_control,
+                tape_seq,
+                terminal_tape_events,
+            )
+            .await?;
+            let transition = settlement.effective_state.terminal_transition().ok_or_else(|| {
+                Status::internal("terminal settlement returned a nonterminal run state")
+            })?;
+            run_state
+                .transition(transition)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            return Ok(run_stream_post_provider_outcome(settlement.effective_state, false));
         }
         Ok(false) => {}
         Err(error) => return Err(error),
     }
 
     if run_state.state() == RunLifecycleState::InProgress {
-        run_state
-            .transition(RunTransition::Complete)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        runtime_state
-            .update_orchestrator_run_state(run_id.to_owned(), RunLifecycleState::Done, None)
-            .await?;
-        // Re-read the persisted state: a concurrent cancel may have landed
-        // between the cancel check above and the Done write. Cancelled wins,
-        // so the client must not see a spurious Done status.
-        if matches!(
-            runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await,
-            Ok(Some(snapshot)) if snapshot.state == RunLifecycleState::Cancelled.as_str()
-        ) {
-            finalize_late_cancelled_run(sender, runtime_state, run_id, attempt_owner, tape_seq)
-                .await?;
-            return Ok(RunStreamPostProviderOutcome::Cancelled);
-        }
         let completed_outcome = Ok(RunStreamMessageProcessingOutcome::Continue);
-        let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+        let summary_payload = run_runtime_path_summary_payload(
             runtime_state,
-            Some(run_id),
-            run_state.state(),
-            tape_seq,
+            RunLifecycleState::Done,
             &completed_outcome,
             attempt_owner,
-        )
-        .await;
-        let status_result = send_final_status_with_tape(
-            sender,
-            runtime_state,
-            run_id,
-            tape_seq,
-            common_v1::stream_status::StatusKind::Done,
-            "completed",
-        )
-        .await;
-        cleanup_run_resources(runtime_state, run_id, "completed").await;
+        )?;
+        let settlement_result = runtime_state
+            .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: RuntimeTerminalOutcome::Completed.reason_code().to_owned(),
+                status_message: "completed".to_owned(),
+                actor: palyra_common::runtime_contracts::RuntimeActorRef {
+                    kind: palyra_common::runtime_contracts::RuntimeActorKind::System,
+                    id: attempt_owner.unwrap_or("run_stream.finalize").to_owned(),
+                },
+                terminal_summary_payload_json: Some(summary_payload),
+                terminal_tape_events,
+                terminal_status_payload_json: status_tape_payload(
+                    common_v1::stream_status::StatusKind::Done,
+                    "completed",
+                ),
+            })
+            .await;
+        let settlement = match settlement_result {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                // A failed terminal transaction leaves the generation active;
+                // recovery must keep owning its heartbeat and cleanup handles.
+                return Err(error);
+            }
+        };
+        let transition = settlement.effective_state.terminal_transition().ok_or_else(|| {
+            Status::internal("terminal settlement returned a nonterminal run state")
+        })?;
+        run_state.transition(transition).map_err(|error| Status::internal(error.to_string()))?;
+        if !settlement.changed {
+            return Ok(run_stream_post_provider_outcome(settlement.effective_state, false));
+        }
+        let (status_kind, terminal_message) = match settlement.effective_state {
+            RunLifecycleState::Done => (common_v1::stream_status::StatusKind::Done, "completed"),
+            RunLifecycleState::Failed => (
+                common_v1::stream_status::StatusKind::Failed,
+                "run failed before completion finalization",
+            ),
+            RunLifecycleState::Cancelled => {
+                (common_v1::stream_status::StatusKind::Failed, CANCELLED_REASON)
+            }
+            RunLifecycleState::Pending
+            | RunLifecycleState::Accepted
+            | RunLifecycleState::InProgress => {
+                unreachable!("terminal settlement returned a nonterminal run state")
+            }
+        };
+        let status_result = if let Some(settled_tape_sequence) = settlement.tape_sequence {
+            let delivery = flow_control.delivery()?;
+            send_settled_final_status(
+                sender,
+                runtime_state,
+                run_id,
+                tape_seq,
+                settled_tape_sequence,
+                status_kind,
+                terminal_message,
+                &delivery,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        cleanup_run_resources(runtime_state, run_id, terminal_message).await;
         runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
-        status_result?;
-        summary_result?;
+        return Ok(run_stream_post_provider_outcome(
+            settlement.effective_state,
+            status_result.is_err(),
+        ));
     }
 
     Ok(RunStreamPostProviderOutcome::Completed)
@@ -1002,18 +1213,56 @@ async fn execute_run_stream_provider_request(
     run_state: &mut RunStateMachine,
     run_id: &str,
     execution: RunStreamProviderRequestExecution,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<RunStreamProviderRequestOutcome, Status> {
-    let RunStreamProviderRequestExecution { provider_request, lease_context, deadline_override } =
-        execution;
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::Provider);
+    let RunStreamProviderRequestExecution {
+        provider_request,
+        lease_context,
+        mut cancellation,
+        deadline_override,
+        harness_lifecycle,
+    } = execution;
+    if let Some(reason) = cancellation.current_reason() {
+        flow_control.request_cancel(reason);
+        let effective_state = transition_run_stream_to_cancelled(
+            sender,
+            runtime_state,
+            run_state,
+            run_id,
+            flow_control,
+            tape_seq,
+            harness_lifecycle.as_ref(),
+        )
+        .await?;
+        return Ok(RunStreamProviderRequestOutcome::Terminal(effective_state));
+    }
     let provider_timeout = provider_request_timeout(&runtime_state.config);
+    let now_unix_ms = current_unix_ms();
+    if !cancellation.permits_new_work(now_unix_ms) {
+        return Ok(RunStreamProviderRequestOutcome::TimedOut {
+            reason: ProviderRequestTimeoutReason::Provider,
+            message: provider_request_timeout_message(
+                run_id,
+                Duration::ZERO,
+                ProviderRequestTimeoutReason::Provider,
+            ),
+        });
+    }
     let provider_status = runtime_state.model_provider_status_snapshot();
-    let (provider_deadline_timeout, timeout_reason) = effective_provider_request_deadline(
+    let (mut provider_deadline_timeout, timeout_reason) = effective_provider_request_deadline(
         provider_timeout,
         &provider_status.route_selection,
         &provider_request,
         deadline_override,
     );
+    if let Some(deadline_unix_ms) = cancellation.context().deadline_unix_ms {
+        let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+        debug_assert!(remaining_ms > 0, "permits_new_work rejected expired provider scope");
+        provider_deadline_timeout = provider_deadline_timeout
+            .min(Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(1)));
+    }
     let provider_span = tracing::info_span!(
         "provider.call",
         run_id = %run_id,
@@ -1040,11 +1289,32 @@ async fn execute_run_stream_provider_request(
 
     loop {
         tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                flow_control.request_cancel(reason);
+                let effective_state = transition_run_stream_to_cancelled(
+                    sender,
+                    runtime_state,
+                    run_state,
+                    run_id,
+                    flow_control,
+                    tape_seq,
+                    harness_lifecycle.as_ref(),
+                )
+                .await?;
+                return Ok(RunStreamProviderRequestOutcome::Terminal(effective_state));
+            }
             provider_result = &mut provider_future => {
-                return provider_result.map(|response| RunStreamProviderRequestOutcome::Completed {
-                    response: Box::new(response),
-                    duration_ms: duration_millis_u64(provider_started_at.elapsed()),
-                });
+                return match provider_result {
+                    Ok(response) => Ok(RunStreamProviderRequestOutcome::Completed {
+                        response: Box::new(response),
+                        duration_ms: duration_millis_u64(provider_started_at.elapsed()),
+                    }),
+                    Err(error) if is_provider_reconfigured_status(&error) => {
+                        Ok(RunStreamProviderRequestOutcome::Superseded)
+                    }
+                    Err(error) => Err(error),
+                };
             }
             _ = &mut provider_deadline => {
                 return Ok(RunStreamProviderRequestOutcome::TimedOut {
@@ -1055,15 +1325,7 @@ async fn execute_run_stream_provider_request(
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
                     Ok(true) => {
-                        transition_run_stream_to_cancelled(
-                            sender,
-                            runtime_state,
-                            run_state,
-                            run_id,
-                            tape_seq,
-                        )
-                        .await?;
-                        return Ok(RunStreamProviderRequestOutcome::Cancelled);
+                        request_persisted_run_interrupt(runtime_state, run_id, flow_control).await?;
                     }
                     Ok(false) => {}
                     Err(error) => return Err(error),
@@ -1109,10 +1371,19 @@ async fn run_with_phase_deadline<T, F>(
 where
     F: Future<Output = Result<T, Status>>,
 {
-    let RunLoopPhaseDeadlineContext { sender, runtime_state, run_state, run_id, tape_seq } =
-        context;
+    let RunLoopPhaseDeadlineContext {
+        sender,
+        runtime_state,
+        run_state,
+        run_id,
+        flow_control,
+        tape_seq,
+        harness_lifecycle,
+    } = context;
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::PreProvider);
     let timeout = timeout.max(Duration::from_millis(1));
     let mut operation = Box::pin(operation);
+    let mut cancellation = flow_control.live_root();
     let started_at = TokioInstant::now();
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -1125,6 +1396,21 @@ where
 
     loop {
         tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                flow_control.request_cancel(reason);
+                let effective_state = transition_run_stream_to_cancelled(
+                    sender,
+                    runtime_state,
+                    run_state,
+                    run_id,
+                    flow_control,
+                    tape_seq,
+                    harness_lifecycle,
+                )
+                .await?;
+                return Ok(RunLoopPhaseOutcome::Terminal(effective_state));
+            }
             result = &mut operation => {
                 return result.map(RunLoopPhaseOutcome::Completed);
             }
@@ -1142,15 +1428,7 @@ where
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
                     Ok(true) => {
-                        transition_run_stream_to_cancelled(
-                            sender,
-                            runtime_state,
-                            run_state,
-                            run_id,
-                            tape_seq,
-                        )
-                        .await?;
-                        return Ok(RunLoopPhaseOutcome::Cancelled);
+                        request_persisted_run_interrupt(runtime_state, run_id, flow_control).await?;
                     }
                     Ok(false) => {}
                     Err(error) => return Err(error),
@@ -1474,6 +1752,7 @@ async fn drain_active_run_steering_before_provider_call(
     run_id: &str,
     tape_seq: &mut i64,
     loop_state: &mut AgentRunLoopState,
+    active_flow_control: &mut Option<RunStreamFlowControl>,
 ) -> Result<(), Status> {
     let mut targeted_inputs = runtime_state
         .list_orchestrator_queued_inputs(session_id.to_owned())
@@ -1490,6 +1769,16 @@ async fn drain_active_run_steering_before_provider_call(
             .cmp(&queued_input_sort_key(right))
             .then_with(|| left.queued_input_id.cmp(&right.queued_input_id))
     });
+    let replacement_generation = runtime_state
+        .supersede_run_generation_for_steer(session_id.to_owned(), run_id.to_owned())
+        .await?;
+    let superseded_flow_control = active_flow_control.as_ref().ok_or_else(|| {
+        Status::internal("active run steering requires an initialized flow-control scope")
+    })?;
+    let replacement_flow_control =
+        superseded_flow_control.supersede_generation(replacement_generation)?;
+    superseded_flow_control.request_cancel(CancellationReason::SteerSupersede);
+    *active_flow_control = Some(replacement_flow_control);
     append_agent_loop_tape_event(
         runtime_state,
         run_id,
@@ -1651,40 +1940,107 @@ async fn maybe_start_run_stream_harness_lifecycle(
     let selection_mode =
         run_stream_agent_harness_selection_mode(runtime_state.config.agent_harness_registry.mode);
     if let Some(plugin_id) = configured_plugin_id {
-        let plugins_root = resolve_plugins_root().map_err(|error| {
-            Status::failed_precondition(format!(
-                "failed to resolve plugins root for agent harness activation: {error:#}"
-            ))
-        })?;
-        let bindings = load_plugin_bindings_index(plugins_root.as_path()).map_err(|error| {
-            Status::failed_precondition(format!(
-                "failed to load plugin bindings for agent harness activation: {error:#}"
-            ))
-        })?;
-        let activation_report = activate_agent_harness_plugins_before_selection(
-            &bindings,
-            &mut registry,
-            AgentHarnessPluginActivationRequest {
-                requested_plugin_id: Some(plugin_id),
-                explicit: selection_mode == AgentHarnessSelectionMode::ExplicitPlugin,
-            },
-        )
-        .map_err(|error| {
-            Status::failed_precondition(format!("agent harness plugin activation failed: {error}"))
-        })?;
-        let activation_payload = serde_json::to_string(&activation_report).map_err(|error| {
-            Status::internal(format!(
-                "failed to serialize agent harness activation report: {error}"
-            ))
-        })?;
-        append_agent_loop_tape_event(
-            runtime_state,
-            run_id,
-            tape_seq,
-            "harness.plugin_activation",
-            activation_payload,
-        )
-        .await?;
+        let explicit = selection_mode == AgentHarnessSelectionMode::ExplicitPlugin;
+        match runtime_state
+            .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Plugin, plugin_id)
+        {
+            Err(error) if explicit => return Err(error),
+            Err(error) => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id,
+                    tape_seq,
+                    "harness.plugin_activation",
+                    json!({
+                        "ready": false,
+                        "records": [],
+                        "reason_code": "runtime.health.plugin_admission_blocked",
+                        "error": palyra_common::redaction::redact_diagnostic_text(error.message()),
+                    })
+                    .to_string(),
+                )
+                .await?;
+            }
+            Ok(authority) => {
+                let activation = (|| {
+                    let plugins_root = resolve_plugins_root().map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "failed to resolve plugins root for agent harness activation: {error:#}"
+                        ))
+                    })?;
+                    let bindings =
+                        load_plugin_bindings_index(plugins_root.as_path()).map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "failed to load plugin bindings for agent harness activation: {error:#}"
+                            ))
+                        })?;
+                    activate_agent_harness_plugins_before_selection(
+                        &bindings,
+                        &mut registry,
+                        AgentHarnessPluginActivationRequest {
+                            requested_plugin_id: Some(plugin_id),
+                            explicit,
+                        },
+                    )
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "agent harness plugin activation failed: {error}"
+                        ))
+                    })
+                })();
+                match activation {
+                    Ok(activation_report) => {
+                        runtime_state.record_managed_runtime_health_observation(
+                            &authority,
+                            activation_report.ready,
+                            if activation_report.ready {
+                                "runtime.health.plugin_activation_succeeded"
+                            } else {
+                                "runtime.health.plugin_activation_rejected"
+                            },
+                        );
+                        let activation_payload = serde_json::to_string(&activation_report)
+                            .map_err(|error| {
+                                Status::internal(format!(
+                                    "failed to serialize agent harness activation report: {error}"
+                                ))
+                            })?;
+                        append_agent_loop_tape_event(
+                            runtime_state,
+                            run_id,
+                            tape_seq,
+                            "harness.plugin_activation",
+                            activation_payload,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        runtime_state.record_managed_runtime_health_observation(
+                            &authority,
+                            false,
+                            "runtime.health.plugin_activation_failed",
+                        );
+                        if explicit {
+                            return Err(error);
+                        }
+                        append_agent_loop_tape_event(
+                            runtime_state,
+                            run_id,
+                            tape_seq,
+                            "harness.plugin_activation",
+                            json!({
+                                "ready": false,
+                                "records": [],
+                                "reason_code": "runtime.health.plugin_activation_failed",
+                                "error": palyra_common::redaction::redact_diagnostic_text(error.message()),
+                            })
+                            .to_string(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
     }
     let support_request = AgentHarnessSupportRequest {
         selection_mode,
@@ -1740,33 +2096,36 @@ async fn maybe_start_run_stream_harness_lifecycle(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-async fn finish_run_stream_harness_lifecycle(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    run_id: &str,
-    tape_seq: &mut i64,
-    lifecycle: &mut Option<RunStreamHarnessLifecycle>,
+fn run_stream_harness_terminal_tape_events(
+    lifecycle: Option<&RunStreamHarnessLifecycle>,
     terminal: RunStreamHarnessTerminal,
-) -> Result<(), Status> {
-    let Some(lifecycle_state) = lifecycle.take() else {
-        return Ok(());
+) -> Vec<(String, String)> {
+    let Some(lifecycle) = lifecycle else {
+        return Vec::new();
     };
-    append_agent_loop_tape_event(
-        runtime_state,
-        run_id,
-        tape_seq,
-        run_stream_harness_terminal_event(terminal.status),
-        run_stream_harness_terminal_payload(&lifecycle_state, terminal),
+    vec![
+        (
+            run_stream_harness_terminal_event(terminal.status).to_owned(),
+            run_stream_harness_terminal_payload(lifecycle, terminal),
+        ),
+        (
+            HARNESS_RUN_CLEANED_UP_EVENT.to_owned(),
+            run_stream_harness_cleanup_payload(lifecycle, terminal),
+        ),
+    ]
+}
+
+pub(crate) fn run_stream_harness_cancelled_tape_events(
+    lifecycle: Option<&RunStreamHarnessLifecycle>,
+) -> Vec<OrchestratorTerminalTapeEvent> {
+    let cancelled_outcome = Err(Status::cancelled(CANCELLED_REASON));
+    run_stream_harness_terminal_tape_events(
+        lifecycle,
+        run_stream_harness_terminal_from_outcome(&cancelled_outcome),
     )
-    .await?;
-    append_agent_loop_tape_event(
-        runtime_state,
-        run_id,
-        tape_seq,
-        HARNESS_RUN_CLEANED_UP_EVENT,
-        run_stream_harness_cleanup_payload(&lifecycle_state, terminal),
-    )
-    .await
+    .into_iter()
+    .map(|(event_type, payload_json)| OrchestratorTerminalTapeEvent { event_type, payload_json })
+    .collect()
 }
 
 fn configured_run_stream_agent_harness_plugin_id(
@@ -1930,6 +2289,7 @@ const fn run_stream_harness_terminal_event(
     }
 }
 
+#[cfg(test)]
 fn run_stream_harness_terminal_from_state(
     run_state: RunLifecycleState,
     outcome: &Result<RunStreamMessageProcessingOutcome, Status>,
@@ -2066,11 +2426,27 @@ async fn terminate_run_stream_with_agent_loop_reason(
     run_id: &str,
     tape_seq: &mut i64,
     loop_state: &AgentRunLoopState,
+    flow_control: &RunStreamFlowControl,
     reason: AgentLoopTerminationReason,
     message: &str,
     provider_trace_ref: Option<String>,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<(), Status> {
     let message = agent_loop_terminal_status_message(reason, loop_state, run_id, message);
+    let terminal_outcome = Ok(RunStreamMessageProcessingOutcome::Terminate);
+    let terminal_summary_payload_json = Some(run_runtime_path_summary_payload(
+        runtime_state,
+        RunLifecycleState::Failed,
+        &terminal_outcome,
+        Some("run_stream.agent_loop"),
+    )?);
+    let terminal_tape_events = run_stream_harness_terminal_tape_events(
+        harness_lifecycle,
+        run_stream_harness_terminal_from_outcome(&terminal_outcome),
+    )
+    .into_iter()
+    .map(|(event_type, payload_json)| OrchestratorTerminalTapeEvent { event_type, payload_json })
+    .collect();
     append_agent_loop_tape_event(
         runtime_state,
         run_id,
@@ -2087,27 +2463,65 @@ async fn terminate_run_stream_with_agent_loop_reason(
         "agent_loop.terminated",
     )
     .await?;
-    run_state
-        .transition(RunTransition::Fail)
-        .map_err(|error| Status::internal(error.to_string()))?;
-    runtime_state
-        .update_orchestrator_run_state(
-            run_id.to_owned(),
-            RunLifecycleState::Failed,
-            Some(message.clone()),
-        )
+    let settlement = runtime_state
+        .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+            run_id: run_id.to_owned(),
+            requested_state: RunLifecycleState::Failed,
+            reason_code: format!("run_stream.agent_loop.{}", reason.as_str()),
+            status_message: message.clone(),
+            actor: palyra_common::runtime_contracts::RuntimeActorRef {
+                kind: palyra_common::runtime_contracts::RuntimeActorKind::System,
+                id: "run_stream.agent_loop".to_owned(),
+            },
+            terminal_summary_payload_json,
+            terminal_tape_events,
+            terminal_status_payload_json: status_tape_payload(
+                common_v1::stream_status::StatusKind::Failed,
+                message.as_str(),
+            ),
+        })
         .await?;
+    let transition = settlement
+        .effective_state
+        .terminal_transition()
+        .ok_or_else(|| Status::internal("terminal settlement returned a nonterminal run state"))?;
+    let terminal_message = match settlement.effective_state {
+        RunLifecycleState::Done => "completed",
+        RunLifecycleState::Failed => message.as_str(),
+        RunLifecycleState::Cancelled => CANCELLED_REASON,
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => {
+            unreachable!("terminal settlement returned a nonterminal run state")
+        }
+    };
+    run_state.transition(transition).map_err(|error| Status::internal(error.to_string()))?;
+    if !settlement.changed {
+        return Ok(());
+    }
     runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
-    let status_result = send_final_status_with_tape(
-        sender,
-        runtime_state,
-        run_id,
-        tape_seq,
-        common_v1::stream_status::StatusKind::Failed,
-        message.as_str(),
-    )
-    .await;
-    cleanup_run_resources(runtime_state, run_id, message.as_str()).await;
+    let terminal_status_kind = if settlement.effective_state == RunLifecycleState::Done {
+        common_v1::stream_status::StatusKind::Done
+    } else {
+        common_v1::stream_status::StatusKind::Failed
+    };
+    let status_result = if let Some(settled_tape_sequence) = settlement.tape_sequence {
+        let delivery = flow_control.delivery()?;
+        send_settled_final_status(
+            sender,
+            runtime_state,
+            run_id,
+            tape_seq,
+            settled_tape_sequence,
+            terminal_status_kind,
+            terminal_message,
+            &delivery,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    cleanup_run_resources(runtime_state, run_id, terminal_message).await;
     status_result
 }
 
@@ -2320,53 +2734,12 @@ pub(crate) async fn process_run_stream_message(
     previous_session_run_id: &mut Option<String>,
     active_background_budget_tokens: &mut Option<u64>,
     active_approval_cache_generation: &mut Option<u64>,
+    active_flow_control: &mut Option<RunStreamFlowControl>,
     active_attempt_owner: &mut Option<String>,
+    active_terminal_tape_events: &mut Vec<OrchestratorTerminalTapeEvent>,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
-    if !runtime_state.config.feature_rollouts.agent_harness_runtime.enabled {
-        let mut lifecycle = None;
-        let outcome = process_run_stream_message_inner(
-            sender,
-            stream,
-            runtime_state,
-            request_context,
-            active_session_id,
-            active_run_id,
-            run_state,
-            tape_seq,
-            model_token_tape_events,
-            model_token_compaction_emitted,
-            tool_result_compaction_emitted,
-            in_progress_emitted,
-            remaining_tool_budget,
-            previous_session_run_id,
-            active_background_budget_tokens,
-            active_approval_cache_generation,
-            &mut lifecycle,
-            message,
-        )
-        .await;
-        *active_attempt_owner = Some("embedded_run_stream".to_owned());
-        let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
-            runtime_state,
-            active_run_id.as_deref(),
-            run_state.state(),
-            tape_seq,
-            &outcome,
-            Some("embedded_run_stream"),
-        )
-        .await;
-        let run_id_for_summary = active_run_id.as_deref().unwrap_or("unaccepted_run");
-        return merge_run_stream_audit_result(
-            outcome,
-            summary_result,
-            run_id_for_summary,
-            "runtime path summary",
-        );
-    }
-
-    let run_id_for_harness = canonical_id(message.run_id.clone(), "run_id")?;
-    let run_id_for_summary = run_id_for_harness.clone();
+    let harness_enabled = runtime_state.config.feature_rollouts.agent_harness_runtime.enabled;
     let mut lifecycle = None;
     let outcome = process_run_stream_message_inner(
         sender,
@@ -2385,105 +2758,40 @@ pub(crate) async fn process_run_stream_message(
         previous_session_run_id,
         active_background_budget_tokens,
         active_approval_cache_generation,
+        active_flow_control,
         &mut lifecycle,
         message,
     )
     .await;
-    let attempt_owner = lifecycle
-        .as_ref()
-        .map(|state| state.diagnostics.harness_id.clone())
-        .unwrap_or_else(|| "harness_runtime_v1".to_owned());
-    *active_attempt_owner = Some(attempt_owner.clone());
-    let terminal = run_stream_harness_terminal_from_state(run_state.state(), &outcome);
-    let finish_result = finish_run_stream_harness_lifecycle(
-        runtime_state,
-        run_id_for_harness.as_str(),
-        tape_seq,
-        &mut lifecycle,
-        terminal,
-    )
-    .await;
-    match finish_result {
-        Ok(()) => {
-            let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
-                runtime_state,
-                active_run_id.as_deref(),
-                run_state.state(),
-                tape_seq,
-                &outcome,
-                Some(attempt_owner.as_str()),
-            )
-            .await;
-            merge_run_stream_audit_result(
-                outcome,
-                summary_result,
-                run_id_for_summary.as_str(),
-                "runtime path summary",
-            )
-        }
-        Err(error) if outcome.is_err() => {
-            warn!(
-                run_id = run_id_for_harness,
-                error = %error,
-                "failed to append terminal harness lifecycle event after run-stream error"
-            );
-            let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
-                runtime_state,
-                active_run_id.as_deref(),
-                run_state.state(),
-                tape_seq,
-                &outcome,
-                Some(attempt_owner.as_str()),
-            )
-            .await;
-            merge_run_stream_audit_result(
-                outcome,
-                summary_result,
-                run_id_for_summary.as_str(),
-                "runtime path summary",
-            )
-        }
-        Err(error) => Err(error),
+    let attempt_owner = if harness_enabled {
+        lifecycle
+            .as_ref()
+            .map(|state| state.diagnostics.harness_id.clone())
+            .unwrap_or_else(|| "harness_runtime_v1".to_owned())
+    } else {
+        "embedded_run_stream".to_owned()
+    };
+    *active_attempt_owner = Some(attempt_owner);
+    if harness_enabled && !run_state.state().is_terminal() {
+        let terminal = run_stream_harness_terminal_from_outcome(&outcome);
+        *active_terminal_tape_events =
+            run_stream_harness_terminal_tape_events(lifecycle.as_ref(), terminal)
+                .into_iter()
+                .map(|(event_type, payload_json)| OrchestratorTerminalTapeEvent {
+                    event_type,
+                    payload_json,
+                })
+                .collect();
     }
+    outcome
 }
 
-#[allow(clippy::result_large_err)]
-fn merge_run_stream_audit_result(
-    outcome: Result<RunStreamMessageProcessingOutcome, Status>,
-    audit_result: Result<(), Status>,
-    run_id: &str,
-    event_label: &str,
-) -> Result<RunStreamMessageProcessingOutcome, Status> {
-    match (outcome, audit_result) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(audit_error)) => {
-            warn!(
-                run_id = %run_id,
-                error = %audit_error,
-                "failed to append {event_label} after run-stream error"
-            );
-            Err(error)
-        }
-    }
-}
-
-#[allow(clippy::result_large_err)]
-async fn append_run_runtime_path_summary_tape_event_if_terminal(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    run_id: Option<&str>,
+pub(crate) fn run_runtime_path_summary_payload(
+    runtime_state: &GatewayRuntimeState,
     terminal_state: RunLifecycleState,
-    tape_seq: &mut i64,
     outcome: &Result<RunStreamMessageProcessingOutcome, Status>,
     attempt_owner: Option<&str>,
-) -> Result<(), Status> {
-    if !terminal_state.is_terminal() && outcome.is_ok() {
-        return Ok(());
-    }
-    let Some(run_id) = run_id else {
-        return Ok(());
-    };
+) -> Result<String, Status> {
     let terminal_reason = run_runtime_path_terminal_reason(terminal_state, outcome);
     let summary = crate::runtime_diagnostics::build_run_runtime_path_summary(
         &runtime_state.config.feature_rollouts,
@@ -2491,20 +2799,9 @@ async fn append_run_runtime_path_summary_tape_event_if_terminal(
         Some(terminal_reason),
         attempt_owner,
     );
-    let payload_json = serde_json::to_string(&summary).map_err(|error| {
+    serde_json::to_string(&summary).map_err(|error| {
         Status::internal(format!("failed to serialize run runtime path summary: {error}"))
-    })?;
-
-    runtime_state
-        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-            run_id: run_id.to_owned(),
-            seq: *tape_seq,
-            event_type: crate::runtime_diagnostics::RUN_RUNTIME_PATH_SUMMARY_EVENT.to_owned(),
-            payload_json,
-        })
-        .await?;
-    *tape_seq = tape_seq.saturating_add(1);
-    Ok(())
+    })
 }
 
 fn run_runtime_path_terminal_reason(
@@ -2579,6 +2876,7 @@ async fn process_run_stream_message_inner(
     previous_session_run_id: &mut Option<String>,
     active_background_budget_tokens: &mut Option<u64>,
     active_approval_cache_generation: &mut Option<u64>,
+    active_flow_control: &mut Option<RunStreamFlowControl>,
     harness_lifecycle: &mut Option<RunStreamHarnessLifecycle>,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
@@ -2596,8 +2894,21 @@ async fn process_run_stream_message_inner(
         }
     }
 
-    let parameter_delta_json = (!message.parameter_delta_json.is_empty())
-        .then(|| String::from_utf8_lossy(message.parameter_delta_json.as_slice()).into_owned());
+    let parameter_delta_json =
+        if message.parameter_delta_json.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(message.parameter_delta_json.clone()).map_err(|_| {
+                Status::invalid_argument("parameter_delta_json must be valid UTF-8")
+            })?)
+        };
+    let origin_kind = non_empty(message.origin_kind.clone()).unwrap_or_else(|| "manual".to_owned());
+    let delegated_admission = delegated_run_admission(
+        origin_kind.as_str(),
+        session_id.as_str(),
+        message.origin_run_id.as_ref().map(|value| value.ulid.as_str()),
+        parameter_delta_json.as_deref(),
+    )?;
     if let Some(budget_tokens) = background_run_budget_tokens(parameter_delta_json.as_deref()) {
         *active_background_budget_tokens = Some(budget_tokens);
     }
@@ -2636,13 +2947,29 @@ async fn process_run_stream_message_inner(
             .start_orchestrator_run(OrchestratorRunStartRequest {
                 run_id: run_id.clone(),
                 session_id: session_id.clone(),
-                origin_kind: non_empty(message.origin_kind.clone())
-                    .unwrap_or_else(|| "manual".to_owned()),
+                origin_kind: origin_kind.clone(),
                 origin_run_id: message.origin_run_id.as_ref().map(|value| value.ulid.clone()),
                 triggered_by_principal: Some(request_context.principal.clone()),
                 parameter_delta_json: parameter_delta_json.clone(),
+                delegated_admission: delegated_admission.clone(),
             })
             .await?;
+        let (_, generation) =
+            runtime_state.runtime_generation_for_run(run_id.clone()).await?.ok_or_else(|| {
+                Status::aborted("run cancellation scope requires an active host generation")
+            })?;
+        *active_flow_control = Some(if let Some(admission) = delegated_admission.as_ref() {
+            RunStreamFlowControl::from_delegated_child(
+                generation,
+                Duration::from_millis(DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS),
+                &admission.cancellation_context,
+            )?
+        } else {
+            RunStreamFlowControl::new(
+                generation,
+                Duration::from_millis(DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS),
+            )?
+        });
         persist_run_stream_delegation_metadata(
             runtime_state,
             run_id.as_str(),
@@ -2660,6 +2987,7 @@ async fn process_run_stream_message_inner(
         runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
             kind: WorkHeartbeatKind::Run,
             object_id: run_id.clone(),
+            execution_generation: None,
             summary: format!("run {run_id} for session {session_id}"),
         });
 
@@ -2691,6 +3019,7 @@ async fn process_run_stream_message_inner(
     runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
         kind: WorkHeartbeatKind::Run,
         object_id: run_id.clone(),
+        execution_generation: None,
         summary: format!("run {run_id} for session {session_id_for_message}"),
     });
 
@@ -2705,12 +3034,24 @@ async fn process_run_stream_message_inner(
 
     match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
         Ok(true) => {
+            request_persisted_run_interrupt(
+                runtime_state,
+                run_id.as_str(),
+                active_flow_control.as_ref().ok_or_else(|| {
+                    Status::internal("run cancellation requires an active flow-control scope")
+                })?,
+            )
+            .await?;
             transition_run_stream_to_cancelled(
                 sender,
                 runtime_state,
                 run_state,
                 run_id.as_str(),
+                active_flow_control.as_ref().ok_or_else(|| {
+                    Status::internal("run cancellation requires an active flow-control scope")
+                })?,
                 tape_seq,
+                harness_lifecycle.as_ref(),
             )
             .await?;
             return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -2770,14 +3111,14 @@ async fn process_run_stream_message_inner(
     })
     .await?;
 
-    let provider_model_override = provider_model_override_for_routing(
+    let mut provider_model_override = provider_model_override_for_routing(
         routing_decision.mode.as_str(),
         routing_decision.actual_model_id.as_str(),
         routing_decision.reason_codes.as_slice(),
     );
-    let lease_provider_id = routing_decision.provider_id.clone();
-    let lease_provider_kind = routing_decision.provider_kind.clone();
-    let lease_credential_id = routing_decision.credential_id.clone();
+    let mut lease_provider_id = routing_decision.provider_id.clone();
+    let mut lease_provider_kind = routing_decision.provider_kind.clone();
+    let mut lease_credential_id = routing_decision.credential_id.clone();
     let mut first_turn_tool_catalog_snapshot = Some(
         build_and_record_run_stream_tool_catalog_snapshot(
             runtime_state,
@@ -2922,6 +3263,16 @@ async fn process_run_stream_message_inner(
     loop {
         match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
             Ok(true) => {
+                request_persisted_run_interrupt(
+                    runtime_state,
+                    run_id.as_str(),
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal(
+                            "agent loop cancellation requires an active flow-control scope",
+                        )
+                    })?,
+                )
+                .await?;
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
@@ -2937,7 +3288,13 @@ async fn process_run_stream_message_inner(
                     runtime_state,
                     run_state,
                     run_id.as_str(),
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal(
+                            "agent loop cancellation requires an active flow-control scope",
+                        )
+                    })?,
                     tape_seq,
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -2971,9 +3328,13 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
                     reason,
                     message.as_str(),
                     None,
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3014,7 +3375,11 @@ async fn process_run_stream_message_inner(
                     runtime_state,
                     run_state,
                     run_id: run_id.as_str(),
+                    flow_control: active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run phase deadline requires an active flow-control scope")
+                    })?,
                     tape_seq,
+                    harness_lifecycle: harness_lifecycle.as_ref(),
                 },
                 RunLoopPhase::ToolCatalogSnapshot,
                 tool_catalog_snapshot_phase_timeout(),
@@ -3104,8 +3469,14 @@ async fn process_run_stream_message_inner(
                             run_id.as_str(),
                             tape_seq,
                             &loop_state,
+                            active_flow_control.as_ref().ok_or_else(|| {
+                                Status::internal(
+                                    "run termination requires an active flow-control scope",
+                                )
+                            })?,
                             AgentLoopTerminationReason::RunLoopPhaseTimeout,
                             fallback_summary.as_str(),
+                            None,
                             None,
                         )
                         .await?;
@@ -3118,14 +3489,21 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         AgentLoopTerminationReason::RunLoopPhaseTimeout,
                         message.as_str(),
                         None,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Err(Status::deadline_exceeded(message));
                 }
-                RunLoopPhaseOutcome::Cancelled => {
+                RunLoopPhaseOutcome::Terminal(state) => {
+                    debug_assert_eq!(run_state.state(), state);
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
                 }
             }
@@ -3152,6 +3530,7 @@ async fn process_run_stream_message_inner(
             run_id.as_str(),
             tape_seq,
             &mut loop_state,
+            active_flow_control,
         )
         .await?;
         let mut provider_request = ProviderRequest::from_input_text(
@@ -3203,9 +3582,15 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         AgentLoopTerminationReason::ContextBudgetExhausted,
                         message.as_str(),
                         None,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3253,13 +3638,24 @@ async fn process_run_stream_message_inner(
         .await?;
         pending_browser_followup_deadline = false;
         pending_tool_followup_deadline = false;
+        let provider_cancellation = active_flow_control
+            .as_ref()
+            .ok_or_else(|| {
+                Status::internal("run provider attempt requires an active cancellation scope")
+            })?
+            .live_child(
+                palyra_common::runtime_contracts::CancellationScopeKind::ProviderAttempt,
+                provider_request_timeout(&runtime_state.config),
+            )?;
+        let provider_diagnostic_scope_id =
+            provider_cancellation.context().scope_id.as_str().to_owned();
         let provider_response = match execute_run_stream_provider_request(
             sender,
             runtime_state,
             run_state,
             run_id.as_str(),
             RunStreamProviderRequestExecution {
-                provider_request,
+                provider_request: provider_request.clone(),
                 lease_context: ProviderLeaseExecutionContext {
                     provider_id: lease_provider_id.clone(),
                     credential_id: lease_credential_id.clone(),
@@ -3268,9 +3664,15 @@ async fn process_run_stream_message_inner(
                     max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
                     session_id: Some(session_id_for_message.clone()),
                     run_id: Some(run_id.clone()),
+                    diagnostic_scope_id: Some(provider_diagnostic_scope_id),
                 },
+                cancellation: provider_cancellation,
                 deadline_override,
+                harness_lifecycle: harness_lifecycle.clone(),
             },
+            active_flow_control.as_ref().ok_or_else(|| {
+                Status::internal("provider execution requires an active flow-control scope")
+            })?,
             tape_seq,
         )
         .await
@@ -3387,9 +3789,15 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         provider_timeout_termination_reason(reason),
                         fallback_summary.as_str(),
                         None,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3401,14 +3809,68 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
                     provider_timeout_termination_reason(reason),
                     message.as_str(),
                     None,
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Err(Status::deadline_exceeded(message));
             }
-            Ok(RunStreamProviderRequestOutcome::Cancelled) => {
+            Ok(RunStreamProviderRequestOutcome::Superseded) => {
+                let provider_snapshot = runtime_state.model_provider_status_snapshot();
+                let replacement_model_id = provider_request
+                    .model_override
+                    .as_deref()
+                    .filter(|model_id| {
+                        provider_snapshot
+                            .registry
+                            .models
+                            .iter()
+                            .any(|model| model.model_id == *model_id && model.enabled)
+                    })
+                    .map(ToOwned::to_owned)
+                    .or_else(|| provider_snapshot.route_selection.selected_model_id.clone())
+                    .or_else(|| provider_snapshot.registry.default_chat_model_id.clone())
+                    .or_else(|| provider_snapshot.model_id.clone());
+                base_provider_request.model_override = replacement_model_id.clone();
+                provider_model_override = replacement_model_id;
+                let binding_model_id = provider_model_override.as_deref().unwrap_or("default");
+                (lease_provider_id, lease_provider_kind, lease_credential_id) =
+                    crate::usage_governance::resolve_provider_binding_for_model(
+                        &provider_snapshot,
+                        binding_model_id,
+                    );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    "agent_loop.provider_request_superseded",
+                    json!({
+                        "schema_version": 1,
+                        "event": "agent_loop.provider_request_superseded",
+                        "reason_code": "runtime.generation.provider_reconfigured",
+                        "replacement_provider_id": lease_provider_id,
+                        "replacement_model_id": provider_model_override,
+                    })
+                    .to_string(),
+                )
+                .await?;
+                send_agent_loop_progress_status(
+                    sender,
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    "agent_loop.provider_request_superseded",
+                )
+                .await?;
+                continue;
+            }
+            Ok(RunStreamProviderRequestOutcome::Terminal(state)) => {
+                debug_assert_eq!(run_state.state(), state);
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
@@ -3463,9 +3925,15 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         AgentLoopTerminationReason::ProviderError,
                         fallback_summary.as_str(),
                         None,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3477,9 +3945,13 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
                     AgentLoopTerminationReason::ProviderError,
                     error.message(),
                     None,
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Err(error);
@@ -3503,9 +3975,13 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
                     AgentLoopTerminationReason::ContextBudgetExhausted,
                     message.as_str(),
                     provider_response.output.raw_provider_refs.provider_trace_ref.clone(),
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3529,6 +4005,9 @@ async fn process_run_stream_message_inner(
             );
         }
 
+        let flow_control = active_flow_control.as_ref().ok_or_else(|| {
+            Status::internal("provider response requires an active flow-control scope")
+        })?;
         let response_outcome = process_run_stream_provider_response(
             sender,
             stream,
@@ -3543,9 +4022,11 @@ async fn process_run_stream_message_inner(
             remaining_tool_budget,
             message.allow_sensitive_tools,
             *active_approval_cache_generation,
+            flow_control,
             tape_seq,
             model_token_tape_events,
             model_token_compaction_emitted,
+            harness_lifecycle.as_ref(),
         )
         .await?;
         loop_state.sync_remaining_tool_calls(*remaining_tool_budget);
@@ -3690,9 +4171,15 @@ async fn process_run_stream_message_inner(
                             run_id.as_str(),
                             tape_seq,
                             &loop_state,
+                            active_flow_control.as_ref().ok_or_else(|| {
+                                Status::internal(
+                                    "run termination requires an active flow-control scope",
+                                )
+                            })?,
                             AgentLoopTerminationReason::IncompleteFinalAnswer,
                             message.as_str(),
                             provider_trace_ref,
+                            None,
                         )
                         .await?;
                         return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3766,10 +4253,16 @@ async fn process_run_stream_message_inner(
                                 run_id.as_str(),
                                 tape_seq,
                                 &loop_state,
+                                active_flow_control.as_ref().ok_or_else(|| {
+                                    Status::internal(
+                                        "run termination requires an active flow-control scope",
+                                    )
+                                })?,
                                 AgentLoopTerminationReason::IncompleteFinalAnswer,
                                 "before-finalize revise budget exhausted before final answer delivery",
                                 provider_trace_ref,
-                            )
+                                                        None,
+)
                             .await?;
                             return Ok(RunStreamMessageProcessingOutcome::Terminate);
                         }
@@ -3867,9 +4360,15 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         AgentLoopTerminationReason::RepeatedToolFailure,
                         failure.message.as_str(),
                         provider_trace_ref,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -3910,9 +4409,15 @@ async fn process_run_stream_message_inner(
                             run_id.as_str(),
                             tape_seq,
                             &loop_state,
+                            active_flow_control.as_ref().ok_or_else(|| {
+                                Status::internal(
+                                    "run termination requires an active flow-control scope",
+                                )
+                            })?,
                             AgentLoopTerminationReason::RepeatedToolFailure,
                             intervention.guidance.as_str(),
                             provider_trace_ref,
+                            None,
                         )
                         .await?;
                         return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -4012,9 +4517,15 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         &loop_state,
+                        active_flow_control.as_ref().ok_or_else(|| {
+                            Status::internal(
+                                "run termination requires an active flow-control scope",
+                            )
+                        })?,
                         reason,
                         fallback_summary.as_str(),
                         provider_trace_ref,
+                        harness_lifecycle.as_ref(),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
@@ -4058,14 +4569,18 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
                     reason,
                     message.as_str(),
                     provider_trace_ref,
+                    harness_lifecycle.as_ref(),
                 )
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
-            RunStreamProviderResponseOutcome::Cancelled => {
+            RunStreamProviderResponseOutcome::Terminal(_) => {
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
@@ -4098,10 +4613,13 @@ async fn process_run_stream_provider_response(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::Provider);
     if let Some(attestation) = provider_response.qa_lane_attestation.as_ref() {
         attestation.validate_shape().map_err(|error| {
             Status::internal(format!("invalid provider lane attestation: {error}"))
@@ -4169,18 +4687,20 @@ async fn process_run_stream_provider_response(
         remaining_tool_budget,
         allow_sensitive_tools,
         approval_cache_generation,
+        flow_control,
         tape_seq,
         model_token_tape_events,
         model_token_compaction_emitted,
         stream_model_tokens_immediately,
+        harness_lifecycle,
     )
     .await?
     {
         RunStreamProviderEventsOutcome::Completed { summary_tokens, tool_results } => {
             (summary_tokens, tool_results)
         }
-        RunStreamProviderEventsOutcome::Cancelled => {
-            return Ok(RunStreamProviderResponseOutcome::Cancelled);
+        RunStreamProviderEventsOutcome::Terminal(state) => {
+            return Ok(RunStreamProviderResponseOutcome::Terminal(state));
         }
     };
     if stream_model_tokens_immediately {
@@ -6004,21 +6524,23 @@ mod tests {
         bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
         browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
         configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
+        delegated_run_admission, drain_active_run_steering_before_provider_call,
         effective_provider_request_deadline, embedded_run_stream_runtime_selection_payload,
-        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
-        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
-        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
-        phase_heartbeat_interval, provider_error_partial_summary,
-        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
-        provider_request_deadline_timeout, provider_request_timeout_message,
-        provider_request_timeout_status, provider_status_recovery_decision_payload,
-        provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
-        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
+        execute_run_stream_provider_request, final_answer_recovery_fallback_summary,
+        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
+        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
+        incomplete_terminal_outcome_message, is_browser_tool_name,
+        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
+        provider_error_partial_summary, provider_model_override_for_routing,
+        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
+        provider_request_timeout_message, provider_request_timeout_status,
+        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
+        provider_turn_anomaly_from_response_failure, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
+        run_stream_harness_cancelled_tape_events, run_stream_harness_cleanup_payload,
         run_stream_harness_selection_payload, run_stream_harness_started_payload,
         run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
         run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
@@ -6028,7 +6550,8 @@ mod tests {
         truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
         ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
         RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+        RunStreamProviderRequestOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
         RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
@@ -6043,23 +6566,105 @@ mod tests {
         HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     };
     use crate::application::provider_turn_recovery::ProviderTurnAnomaly;
-    use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
-    use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
-    use crate::journal::OrchestratorQueuedInputRecord;
-    use crate::model_provider::{
-        ProviderAttemptState, ProviderAttemptSummary, ProviderFinishReason, ProviderMessage,
-        ProviderMessageContentPart, ProviderOutputContentPart, ProviderRawProviderRefs,
-        ProviderRequest, ProviderRouteCandidateTrace, ProviderRouteSelectionTrace,
-        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+    use crate::application::run_stream::{
+        cancellation::transition_run_stream_to_cancelled, flow_control::RunStreamFlowControl,
+        tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     };
+    use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
+    use crate::gateway::tests::build_test_runtime_state;
+    use crate::journal::{
+        OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
+        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+    };
+    use crate::model_provider::{
+        AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderAttemptState,
+        ProviderAttemptSummary, ProviderError, ProviderFinishReason, ProviderMessage,
+        ProviderMessageContentPart, ProviderOutputContentPart, ProviderRawProviderRefs,
+        ProviderRequest, ProviderResponse, ProviderRouteCandidateTrace,
+        ProviderRouteSelectionTrace, ProviderStatusSnapshot, ProviderTurnOutput, ProviderUsage,
+        TerminalOutcomeClass, TerminalOutcomeClassification,
+    };
+    use crate::orchestrator::{RunLifecycleState, RunStateMachine, RunTransition};
+    use crate::provider_leases::{LeasePriority, ProviderLeaseExecutionContext};
     use palyra_common::runtime_contracts::{
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
         AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
+        CancellationContextV1, CancellationReason, CancellationScopeKind, QueuedInputState,
+        RuntimeGeneration, RuntimeGenerationLane, RuntimeGenerationTransitionKind,
+        RuntimeOperationId, RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
     };
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use serde_json::{json, Value};
-    use std::time::Duration;
+    use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+    use tokio::sync::{mpsc, Notify};
     use tonic::{Code, Status};
+
+    struct BlockingProvider {
+        started: mpsc::Sender<()>,
+        release: Arc<Notify>,
+        status: ProviderStatusSnapshot,
+    }
+
+    impl ModelProvider for BlockingProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: ProviderRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.started
+                    .send(())
+                    .await
+                    .expect("provider supersession test receiver should remain open");
+                self.release.notified().await;
+                Err(ProviderError::MissingApiKey)
+            })
+        }
+
+        fn transcribe_audio<'a>(
+            &'a self,
+            _request: AudioTranscriptionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(ProviderError::MissingApiKey) })
+        }
+
+        fn status_snapshot(&self) -> ProviderStatusSnapshot {
+            self.status.clone()
+        }
+    }
+
+    fn start_test_run(state: &crate::gateway::GatewayRuntimeState, session_id: &str, run_id: &str) {
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.to_owned(),
+                session_key: session_id.to_owned(),
+                session_label: None,
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("test session should be created");
+        state
+            .journal_store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                origin_kind: "test".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .expect("test run should be created");
+        state
+            .journal_store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("test run should enter in-progress state");
+    }
 
     fn loop_state_after_tool(prompt: &str, tool_name: &str) -> AgentRunLoopState {
         let mut state =
@@ -6112,6 +6717,106 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn provider_request_supersession_keeps_run_active() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-provider-supersession";
+        let run_id = "run-provider-supersession";
+        start_test_run(&state, session_id, run_id);
+
+        let (started_tx, mut started_rx) = mpsc::channel(1);
+        let release = Arc::new(Notify::new());
+        let blocking_status = state.model_provider_status_snapshot();
+        let _ = state.configure_model_provider(Arc::new(BlockingProvider {
+            started: started_tx,
+            release: Arc::clone(&release),
+            status: blocking_status,
+        }));
+        let request_state = Arc::clone(&state);
+        let (sender, _receiver) = mpsc::channel(8);
+        let request_sender = sender.clone();
+        let request = tokio::spawn(async move {
+            let mut run_state = RunStateMachine::default();
+            run_state.transition(RunTransition::Accept).expect("run should accept");
+            run_state.transition(RunTransition::StartStreaming).expect("run should start");
+            let mut tape_seq = 0;
+            let generation = request_state
+                .runtime_generation_for_tool(run_id.to_owned())
+                .await
+                .expect("generation lookup")
+                .expect("active generation")
+                .1;
+            let flow_control = RunStreamFlowControl::new(generation, Duration::from_secs(60))
+                .expect("run flow control");
+            execute_run_stream_provider_request(
+                &request_sender,
+                &request_state,
+                &mut run_state,
+                run_id,
+                RunStreamProviderRequestExecution {
+                    provider_request: ProviderRequest::from_input_text(
+                        "blocked provider request".to_owned(),
+                        false,
+                        Vec::new(),
+                        None,
+                    ),
+                    lease_context: ProviderLeaseExecutionContext {
+                        provider_id: "blocking-provider".to_owned(),
+                        credential_id: "blocking-credential".to_owned(),
+                        priority: LeasePriority::Foreground,
+                        task_label: "provider_supersession_test".to_owned(),
+                        max_wait_ms: 30_000,
+                        session_id: Some(session_id.to_owned()),
+                        run_id: Some(run_id.to_owned()),
+                        diagnostic_scope_id: None,
+                    },
+                    cancellation: flow_control
+                    .live_child(
+                        palyra_common::runtime_contracts::CancellationScopeKind::ProviderAttempt,
+                        Duration::from_secs(30),
+                    )
+                    .expect("provider child scope"),
+                    deadline_override: None,
+                    harness_lifecycle: None,
+                },
+                &flow_control,
+                &mut tape_seq,
+            )
+            .await
+        });
+
+        started_rx.recv().await.expect("blocked provider should start");
+        let _ = state.configure_model_provider(
+            crate::model_provider::build_model_provider(
+                &crate::model_provider::ModelProviderConfig::default(),
+            )
+            .expect("replacement provider should build"),
+        );
+        release.notify_one();
+
+        let outcome = request
+            .await
+            .expect("provider request task should join")
+            .expect("supersession should be an orchestrator outcome");
+        assert!(matches!(outcome, RunStreamProviderRequestOutcome::Superseded));
+        let run = state
+            .journal_store
+            .orchestrator_run_status_snapshot(run_id)
+            .expect("run snapshot should load")
+            .expect("run should exist");
+        assert_eq!(run.state, RunLifecycleState::InProgress.as_str());
+        assert_eq!(run.tape_events, 0);
+        assert_eq!(
+            state
+                .journal_store
+                .shared_runtime_diagnostics()
+                .expect("diagnostics should load")
+                .stale_events_by_subsystem
+                .get("provider"),
+            Some(&1)
+        );
+    }
+
     #[test]
     fn response_failure_classifies_unsupported_multimodal_errors() {
         let explicit = provider_turn_anomaly_from_response_failure(
@@ -6140,6 +6845,95 @@ mod tests {
         assert!(guidance.contains("1. first correction"));
         assert!(guidance.contains("2. second correction"));
         assert!(guidance.ends_with("</operator_steering>"));
+    }
+
+    #[tokio::test]
+    async fn active_run_steering_supersedes_generation_and_replaces_flow_control() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-active-steer-generation";
+        let run_id = "run-active-steer-generation";
+        start_test_run(&state, session_id, run_id);
+        state
+            .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
+                queued_input_id: "queued-active-steer-generation".to_owned(),
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                state: QueuedInputState::Pending.as_str().to_owned(),
+                text: "use the corrected target".to_owned(),
+                origin_run_id: Some(run_id.to_owned()),
+                queue_mode: "interrupt".to_owned(),
+                priority_lane: "normal".to_owned(),
+                coalescing_group: Some("active-steer-generation".to_owned()),
+                overflow_summary_ref: None,
+                safe_boundary_flags_json: "{}".to_owned(),
+                decision_reason: "test.active_steer".to_owned(),
+                accepted_at_unix_ms: Some(crate::gateway::current_unix_ms()),
+                policy_snapshot_json: "{}".to_owned(),
+                explain_json: "{}".to_owned(),
+            })
+            .await
+            .expect("steering input should persist");
+        let (_, initial_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("initial generation lookup should succeed")
+            .expect("run should have an active generation");
+        let initial_flow_control =
+            RunStreamFlowControl::new(initial_generation, Duration::from_secs(60))
+                .expect("initial flow control should initialize");
+        let superseded_observer = initial_flow_control.clone();
+        let original_root = initial_flow_control.root_context().clone();
+        let mut active_flow_control = Some(initial_flow_control);
+        let mut loop_state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
+        let mut tape_seq = 0;
+
+        drain_active_run_steering_before_provider_call(
+            &state,
+            session_id,
+            run_id,
+            &mut tape_seq,
+            &mut loop_state,
+            &mut active_flow_control,
+        )
+        .await
+        .expect("active steering should drain");
+
+        let (_, replacement_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("replacement generation lookup should succeed")
+            .expect("replacement generation should stay active");
+        assert_eq!(
+            replacement_generation,
+            initial_generation.next().expect("next generation should exist")
+        );
+        let replacement = active_flow_control.expect("replacement flow control should exist");
+        assert_eq!(replacement.root_context().generation, replacement_generation);
+        assert_ne!(replacement.root_context().scope_id, original_root.scope_id);
+        assert_eq!(replacement.root_context().deadline_unix_ms, original_root.deadline_unix_ms);
+        assert_eq!(
+            superseded_observer.current_cancellation_reason(),
+            Some(CancellationReason::SteerSupersede)
+        );
+        assert_eq!(replacement.current_cancellation_reason(), None);
+        assert_eq!(tape_seq, 2);
+        let queued = state
+            .list_orchestrator_queued_inputs(session_id.to_owned())
+            .await
+            .expect("queued inputs should load");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].state, QueuedInputState::Forwarded.as_str());
+        let transition_count = state
+            .journal_store
+            .runtime_generation_transition_count_for_test(
+                session_id,
+                run_id,
+                RuntimeGenerationLane::Run,
+                RuntimeGenerationTransitionKind::SteerSuperseded,
+            )
+            .expect("steer transition count should query");
+        assert_eq!(transition_count, 1);
     }
 
     #[test]
@@ -6316,6 +7110,58 @@ mod tests {
         assert_eq!(selection["schema_hashes"].as_array().map(Vec::len), Some(1));
     }
 
+    #[tokio::test]
+    async fn cancelled_settlement_commits_harness_terminal_evidence() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-harness-cancelled";
+        let run_id = "run-harness-cancelled";
+        start_test_run(&state, session_id, run_id);
+        let (_, generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("generation lookup should succeed")
+            .expect("run generation should remain active");
+        let flow_control = RunStreamFlowControl::new(generation, Duration::from_secs(60))
+            .expect("run flow control should initialize");
+        let (sender, _receiver) = mpsc::channel(4);
+        let mut run_state = RunStateMachine::default();
+        run_state.transition(RunTransition::Accept).expect("run should accept");
+        run_state.transition(RunTransition::StartStreaming).expect("run should start");
+        let mut tape_seq = 0;
+        let lifecycle = harness_lifecycle();
+
+        let effective_state = transition_run_stream_to_cancelled(
+            &sender,
+            &state,
+            &mut run_state,
+            run_id,
+            &flow_control,
+            &mut tape_seq,
+            Some(&lifecycle),
+        )
+        .await
+        .expect("cancelled run should settle atomically");
+
+        assert_eq!(effective_state, RunLifecycleState::Cancelled);
+        let tape = state.journal_store.orchestrator_tape(run_id).expect("tape should load");
+        assert_eq!(
+            tape.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+            [
+                "run.runtime_path_summary",
+                HARNESS_RUN_CANCELLED_EVENT,
+                HARNESS_RUN_CLEANED_UP_EVENT,
+                "status",
+            ]
+        );
+        let terminal: Value = serde_json::from_str(tape[1].payload_json.as_str())
+            .expect("harness cancellation payload should decode");
+        let cleanup: Value = serde_json::from_str(tape[2].payload_json.as_str())
+            .expect("harness cleanup payload should decode");
+        assert_eq!(terminal["terminal_status"], "cancelled");
+        assert_eq!(cleanup["terminal_status"], "cancelled");
+        assert_eq!(cleanup["cleanup_completed"], true);
+    }
+
     #[test]
     fn run_stream_harness_terminal_payload_classifies_outcomes() {
         let lifecycle = harness_lifecycle();
@@ -6343,6 +7189,7 @@ mod tests {
             run_stream_harness_cleanup_payload(&lifecycle, cancelled).as_str(),
         )
         .expect("cleanup payload should be JSON");
+        let cancelled_events = run_stream_harness_cancelled_tape_events(Some(&lifecycle));
 
         assert_eq!(completed.status, AgentHarnessAttemptTerminalStatus::Completed);
         assert_eq!(completed.classification, AgentHarnessAttemptClassification::Ok);
@@ -6369,6 +7216,10 @@ mod tests {
         assert_eq!(cleanup["terminal_status"], "cancelled");
         assert_eq!(cleanup["terminal_classification"], "cancelled");
         assert_eq!(cleanup["cleanup_completed"], true);
+        assert_eq!(cancelled_events.len(), 2);
+        assert_eq!(cancelled_events[0].event_type, HARNESS_RUN_CANCELLED_EVENT);
+        assert_eq!(cancelled_events[1].event_type, HARNESS_RUN_CLEANED_UP_EVENT);
+        assert!(run_stream_harness_cancelled_tape_events(None).is_empty());
     }
 
     #[test]
@@ -6747,6 +7598,65 @@ mod tests {
         assert_eq!(background_run_budget_tokens(Some(parameter_delta.as_str())), Some(1_000));
         assert_eq!(background_run_budget_tokens(Some("{}")), None);
         assert_eq!(background_run_budget_tokens(Some("not-json")), None);
+    }
+
+    #[test]
+    fn delegated_run_admission_requires_exact_child_authority() {
+        let cancellation_context = CancellationContextV1 {
+            schema_version: RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
+            scope_id: RuntimeOperationId::parse("child_task:admission").expect("scope id"),
+            scope: CancellationScopeKind::ChildTask,
+            generation: RuntimeGeneration::new(4).expect("generation"),
+            parent_scope_id: Some(
+                RuntimeOperationId::parse("run:admission-parent").expect("parent scope id"),
+            ),
+            reason: None,
+            deadline_unix_ms: Some(crate::gateway::current_unix_ms().saturating_add(60_000)),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        };
+        let parameter_delta = json!({
+            "background_task": {
+                "schema_version": 1,
+                "task_id": "task-01",
+                "task_kind": "delegation_prompt",
+                "parent_session_id": "parent-session",
+                "child_session_id": "child-session",
+                "parent_run_id": "parent-run",
+                "budget_tokens": 1_000,
+                "cancellation_context": cancellation_context,
+            }
+        })
+        .to_string();
+
+        let admission = delegated_run_admission(
+            "delegation",
+            "child-session",
+            Some("parent-run"),
+            Some(parameter_delta.as_str()),
+        )
+        .expect("delegated authority should parse")
+        .expect("delegated authority should be present");
+        assert_eq!(admission.task_id, "task-01");
+        assert_eq!(admission.parent_session_id, "parent-session");
+        assert_eq!(admission.child_session_id, "child-session");
+
+        assert!(delegated_run_admission(
+            "delegation",
+            "wrong-child-session",
+            Some("parent-run"),
+            Some(parameter_delta.as_str()),
+        )
+        .is_err());
+        assert!(delegated_run_admission("delegation", "child-session", Some("parent-run"), None)
+            .is_err());
+        assert!(delegated_run_admission(
+            "manual",
+            "child-session",
+            Some("parent-run"),
+            Some(parameter_delta.as_str()),
+        )
+        .is_err());
     }
 
     #[test]

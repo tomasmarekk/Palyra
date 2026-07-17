@@ -3023,8 +3023,10 @@ mod tests {
                 .as_str()
                 .to_owned(),
             session_id: "session-1".to_owned(),
+            child_session_id: None,
             parent_run_id: Some("parent-run".to_owned()),
             target_run_id: Some("child-run".to_owned()),
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: "user:test".to_owned(),
             device_id: "device-test".to_owned(),
@@ -3033,6 +3035,8 @@ mod tests {
                 .as_str()
                 .to_owned(),
             priority: 0,
+            revision: 2,
+            execution_generation: 1,
             attempt_count: 1,
             max_attempts: 3,
             budget_tokens: 1_000,
@@ -3057,6 +3061,7 @@ mod tests {
                 runtime_limits: crate::delegation::DelegationRuntimeLimits::default(),
                 agent_id: Some("agent-default".to_owned()),
             }),
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,

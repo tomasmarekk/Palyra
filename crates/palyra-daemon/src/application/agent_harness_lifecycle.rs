@@ -2,9 +2,14 @@
 
 use palyra_common::runtime_contracts::{
     AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety, AgentHarnessAttemptResult,
-    AgentHarnessAttemptTerminalStatus,
+    AgentHarnessAttemptTerminalStatus, RuntimeEventEnvelopeV2, RuntimeEventId, RuntimeEventName,
+    RuntimeEventPayloadRef, RuntimeEventSequenceValidator, RuntimeIdentitySetV1,
+    RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use super::agent_harness::{
     AgentHarnessRegistry, AgentHarnessRegistryError, AgentHarnessSelectionError,
@@ -43,6 +48,149 @@ pub struct AgentHarnessLifecycleTrace {
     pub fallback_used: bool,
     pub events: Vec<AgentHarnessLifecycleEvent>,
     pub result: AgentHarnessAttemptResult,
+}
+
+/// Host-issued authority required to project a harness trace into canonical V2 events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentHarnessLifecycleRuntimeAuthority {
+    /// Exact typed identities for the harness generation and attempt.
+    pub identities: RuntimeIdentitySetV1,
+    /// First host-allocated sequence reserved for this lifecycle trace.
+    pub first_sequence: u64,
+    /// Host timestamp applied to the bounded lifecycle projection.
+    pub occurred_at_unix_ms: i64,
+}
+
+/// Failure to project a harness lifecycle trace into canonical V2 events.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AgentHarnessLifecycleProjectionError {
+    /// The supplied typed identity set is malformed or has no attempt identity.
+    #[error("harness lifecycle runtime authority is invalid: {0}")]
+    InvalidAuthority(String),
+    /// The custom compatibility event has no canonical V2 mapping.
+    #[error("unsupported harness lifecycle event: {0}")]
+    UnsupportedEvent(String),
+    /// The host sequence range cannot represent the full lifecycle trace.
+    #[error("harness lifecycle event sequence overflowed")]
+    SequenceOverflow,
+    /// One projected V2 event violated the shared event contract.
+    #[error("projected harness lifecycle event is invalid: {0}")]
+    InvalidEvent(String),
+}
+
+impl AgentHarnessLifecycleTrace {
+    /// Projects this compatibility trace into the shared generation-aware event envelope.
+    ///
+    /// Raw trace context and harness identifiers are reduced to domain-separated hashes before
+    /// entering the inline metadata boundary.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessLifecycleProjectionError`] when host authority, sequence allocation,
+    /// event mapping, or the resulting V2 event stream is invalid.
+    pub fn to_runtime_events_v2(
+        &self,
+        authority: &AgentHarnessLifecycleRuntimeAuthority,
+    ) -> Result<Vec<RuntimeEventEnvelopeV2>, AgentHarnessLifecycleProjectionError> {
+        authority.identities.validate().map_err(|error| {
+            AgentHarnessLifecycleProjectionError::InvalidAuthority(error.to_string())
+        })?;
+        let attempt_id = authority.identities.attempt_id.as_ref().ok_or_else(|| {
+            AgentHarnessLifecycleProjectionError::InvalidAuthority(
+                "attempt_id is required".to_owned(),
+            )
+        })?;
+        if authority.occurred_at_unix_ms < 0 {
+            return Err(AgentHarnessLifecycleProjectionError::InvalidAuthority(
+                "occurred_at_unix_ms must be non-negative".to_owned(),
+            ));
+        }
+
+        let mut projected = Vec::with_capacity(self.events.len());
+        let mut previous_event_id = None;
+        let mut validator = RuntimeEventSequenceValidator::default();
+        for (offset, lifecycle) in self.events.iter().enumerate() {
+            let sequence = authority
+                .first_sequence
+                .checked_add(
+                    u64::try_from(offset)
+                        .map_err(|_| AgentHarnessLifecycleProjectionError::SequenceOverflow)?,
+                )
+                .ok_or(AgentHarnessLifecycleProjectionError::SequenceOverflow)?;
+            let event_name =
+                harness_runtime_event_name(lifecycle.event_name.as_str()).ok_or_else(|| {
+                    AgentHarnessLifecycleProjectionError::UnsupportedEvent(
+                        lifecycle.event_name.clone(),
+                    )
+                })?;
+            let descriptor = event_name.descriptor();
+            let event_id = RuntimeEventId::parse(
+                format!("harness:{}:{sequence}", attempt_id.as_str()).as_str(),
+            )
+            .map_err(|error| {
+                AgentHarnessLifecycleProjectionError::InvalidEvent(error.to_string())
+            })?;
+            let event = RuntimeEventEnvelopeV2 {
+                schema_version: RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+                event_id: event_id.clone(),
+                identities: authority.identities.clone(),
+                sequence,
+                causal_parent_event_id: previous_event_id,
+                subsystem: descriptor.subsystem,
+                phase: descriptor.phase,
+                event_name,
+                reason_code: lifecycle.reason_code.clone(),
+                actor_kind: descriptor.actor_kind,
+                retryability: descriptor.retryability,
+                redaction_class: descriptor.redaction_class,
+                terminal: descriptor.terminal,
+                payload: RuntimeEventPayloadRef::Inline {
+                    metadata: json!({
+                        "harness_id_sha256": lifecycle_field_sha256(
+                            "harness_id",
+                            lifecycle.harness_id.as_str(),
+                        ),
+                        "descriptor_sha256": lifecycle_field_sha256(
+                            "descriptor",
+                            lifecycle.descriptor_hash.as_str(),
+                        ),
+                        "trace_context_sha256": lifecycle_field_sha256(
+                            "trace_context",
+                            lifecycle.trace_context.as_str(),
+                        ),
+                    }),
+                },
+                occurred_at_unix_ms: authority.occurred_at_unix_ms,
+                extensions: Default::default(),
+            };
+            validator.observe(&event).map_err(|error| {
+                AgentHarnessLifecycleProjectionError::InvalidEvent(error.to_string())
+            })?;
+            previous_event_id = Some(event_id);
+            projected.push(event);
+        }
+        Ok(projected)
+    }
+}
+
+fn harness_runtime_event_name(event_name: &str) -> Option<RuntimeEventName> {
+    match event_name {
+        HARNESS_RUN_STARTED_EVENT => Some(RuntimeEventName::HarnessAttemptStarted),
+        HARNESS_RUN_COMPLETED_EVENT => Some(RuntimeEventName::HarnessAttemptCompleted),
+        HARNESS_RUN_FAILED_EVENT => Some(RuntimeEventName::HarnessAttemptFailed),
+        HARNESS_RUN_CANCELLED_EVENT => Some(RuntimeEventName::HarnessAttemptCancelled),
+        HARNESS_RUN_CLEANED_UP_EVENT => Some(RuntimeEventName::HarnessAttemptCleanedUp),
+        _ => None,
+    }
+}
+
+fn lifecycle_field_sha256(domain: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.harness_lifecycle.v1");
+    hasher.update(b"\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Versioned runtime owner for selecting and executing a prepared harness attempt.
@@ -169,6 +317,7 @@ const fn terminal_reason_code(status: AgentHarnessAttemptTerminalStatus) -> &'st
 mod tests {
     use palyra_common::runtime_contracts::{
         AgentHarnessCallbackKind, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
+        RuntimeAttemptId, RuntimeGeneration, RuntimeRunId, RuntimeSessionId, RuntimeTraceId,
     };
     use serde_json::json;
 
@@ -260,6 +409,42 @@ mod tests {
         assert_eq!(trace.events[2].event_name, HARNESS_RUN_CLEANED_UP_EVENT);
         assert_eq!(trace.result.terminal_status, AgentHarnessAttemptTerminalStatus::Completed);
         assert!(!serialized.contains("secret"));
+
+        let mut identities = RuntimeIdentitySetV1::for_run(
+            RuntimeTraceId::parse("trace_01").expect("trace id"),
+            RuntimeSessionId::parse("session_01").expect("session id"),
+            RuntimeRunId::parse("run_01").expect("run id"),
+            RuntimeGeneration::new(3).expect("generation"),
+        );
+        identities.attempt_id = Some(RuntimeAttemptId::parse("attempt_01").expect("attempt id"));
+        let projected = trace
+            .to_runtime_events_v2(&AgentHarnessLifecycleRuntimeAuthority {
+                identities,
+                first_sequence: 11,
+                occurred_at_unix_ms: 42,
+            })
+            .expect("harness lifecycle should project through V2");
+        assert_eq!(
+            projected.iter().map(|event| event.event_name).collect::<Vec<_>>(),
+            vec![
+                RuntimeEventName::HarnessAttemptStarted,
+                RuntimeEventName::HarnessAttemptCompleted,
+                RuntimeEventName::HarnessAttemptCleanedUp,
+            ]
+        );
+        assert_eq!(projected[0].sequence, 11);
+        assert_eq!(projected[1].causal_parent_event_id.as_ref(), Some(&projected[0].event_id));
+        assert_eq!(projected[2].causal_parent_event_id.as_ref(), Some(&projected[1].event_id));
+        assert_eq!(
+            projected.iter().filter(|event| event.terminal).count(),
+            1,
+            "one harness generation must have exactly one terminal outcome"
+        );
+        let projected_json =
+            serde_json::to_string(&projected).expect("projected events should serialize");
+        assert!(!projected_json.contains(trace.harness_id.as_str()));
+        assert!(!projected_json.contains(trace.descriptor_hash.as_str()));
+        assert!(!projected_json.contains("trace?"));
     }
 
     #[test]

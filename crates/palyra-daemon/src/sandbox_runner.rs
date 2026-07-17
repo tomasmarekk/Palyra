@@ -17,7 +17,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -32,15 +32,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[cfg(windows)]
-use std::os::windows::{io::AsRawHandle, process::CommandExt};
+use std::os::windows::{ffi::OsStringExt, io::AsRawHandle, process::CommandExt};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+        ERROR_NO_MORE_FILES, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -51,7 +56,10 @@ use windows_sys::Win32::{
             TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
-        Threading::{OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME},
+        Threading::{
+            GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
+            CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+        },
     },
 };
 
@@ -67,6 +75,7 @@ use palyra_common::{
     },
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
+    runtime_contracts::{ProcessOwnershipKind, ProcessProvenance, ProcessProvenanceDisposition},
 };
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
@@ -75,10 +84,15 @@ use palyra_sandbox::{
     build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
     current_backend_kind, TierCBackendError, TierCCommandPlan, TierCCommandRequest, TierCPolicy,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tracing::warn;
+
+#[cfg(unix)]
+use crate::unix_process_supervisor::{
+    UnixProcessSupervisorControl, UnixSupervisorLaunchSpec, UnixSupervisorLimits,
+};
 
 // Input-shape caps applied before any spawn. They bound attacker-controlled argv/env size and
 // the allocations derived from it; raising any of them is a security-review change.
@@ -133,6 +147,11 @@ const PROCESS_SEND_KEYS_MAX_REPEAT: u8 = 16;
 const PROCESS_SEND_KEYS_TEXT_MAX_BYTES: usize = 1024;
 const PROCESS_TERMINAL_FRAME_TEXT_BYTES: usize = 1024;
 const MAX_PROCESS_PORT_HINTS: usize = 16;
+const MAX_PROCESS_EXECUTABLE_HASH_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_LINUX_PROC_STAT_BYTES: usize = 4 * 1024;
+#[cfg(windows)]
+const MAX_WINDOWS_PROCESS_IMAGE_CHARS: usize = 32_768;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
 // Background lifetimes have a floor (short timeouts would kill dev servers mid-verification)
 // and a hard ceiling (no background process may outlive operator expectations unsupervised).
@@ -659,6 +678,23 @@ type ProcessRunnerInput = ProcessRunnerToolInput;
 /// Callback used by run-stream execution to publish foreground process progress.
 pub type ProcessProgressSink = Arc<dyn Fn(ProcessProgressEvent) + Send + Sync + 'static>;
 
+/// Exact durable-registration input captured before a local background process is acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundProcessRegistrationRequest {
+    pub(crate) pid: u32,
+    pub(crate) provenance: ProcessProvenance,
+    pub(crate) lifetime_ms: u64,
+    pub(crate) lifetime_mode: BackgroundLifetimeMode,
+}
+
+/// Local-only callback that must commit process ownership before launch is acknowledged.
+pub(crate) type BackgroundProcessRegistrationFence = Arc<
+    dyn Fn(BackgroundProcessRegistrationRequest) -> Result<(), SandboxProcessRunError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 /// Bounded foreground-process progress snapshot emitted before the process exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessProgressEvent {
@@ -686,16 +722,36 @@ struct ManagedChildGuard {
     child: Option<Child>,
     exit_status: Option<ExitStatus>,
     termination_requested: bool,
+    termination_strategy: ManagedChildTerminationStrategy,
     #[cfg(test)]
     termination_probe: Option<Arc<AtomicUsize>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedChildTerminationStrategy {
+    OwnedProcessTree,
+    ReapOnly,
+}
+
 impl ManagedChildGuard {
     fn new(child: Child) -> Self {
+        Self::with_termination_strategy(child, ManagedChildTerminationStrategy::OwnedProcessTree)
+    }
+
+    #[cfg(unix)]
+    fn new_reap_only(child: Child) -> Self {
+        Self::with_termination_strategy(child, ManagedChildTerminationStrategy::ReapOnly)
+    }
+
+    fn with_termination_strategy(
+        child: Child,
+        termination_strategy: ManagedChildTerminationStrategy,
+    ) -> Self {
         Self {
             child: Some(child),
             exit_status: None,
             termination_requested: false,
+            termination_strategy,
             #[cfg(test)]
             termination_probe: None,
         }
@@ -707,6 +763,7 @@ impl ManagedChildGuard {
             child: Some(child),
             exit_status: None,
             termination_requested: false,
+            termination_strategy: ManagedChildTerminationStrategy::OwnedProcessTree,
             termination_probe: Some(termination_probe),
         }
     }
@@ -746,6 +803,12 @@ impl ManagedChildGuard {
         if self.termination_requested {
             return Ok(());
         }
+        if self.termination_strategy == ManagedChildTerminationStrategy::ReapOnly {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reap-only child requires its exact external cleanup authority",
+            ));
+        }
         #[cfg(test)]
         if let Some(probe) = self.termination_probe.as_ref() {
             probe.fetch_add(1, Ordering::SeqCst);
@@ -784,6 +847,21 @@ impl ManagedChildGuard {
 impl Drop for ManagedChildGuard {
     fn drop(&mut self) {
         if self.child.is_none() || self.exit_status.is_some() {
+            return;
+        }
+        if self.termination_strategy == ManagedChildTerminationStrategy::ReapOnly {
+            match self.wait_for_exit(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    pid = self.id(),
+                    "reap-only managed child remained live after exact authority was released"
+                ),
+                Err(error) => warn!(
+                    error = ?error,
+                    pid = self.id(),
+                    "reap-only managed child reap verification failed"
+                ),
+            }
             return;
         }
         match self.terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
@@ -852,6 +930,7 @@ impl StreamCapture {
 struct BackgroundOutputMonitor {
     stdout: Arc<Mutex<StreamCapture>>,
     stderr: Arc<Mutex<StreamCapture>>,
+    quota_triggered: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -879,6 +958,7 @@ struct BackgroundProcessSpawnRequest<'a> {
     max_lifetime: Duration,
     auto_background_reason: Option<&'static str>,
     lifetime_mode: BackgroundLifetimeMode,
+    registration_fence: Option<BackgroundProcessRegistrationFence>,
     fault_injection: &'a crate::qa_fault_injection::QaFaultRuntime,
 }
 
@@ -891,6 +971,20 @@ struct BackgroundLauncherCompletedContext<'a> {
     auto_background_reason: Option<&'static str>,
     lifetime_mode: BackgroundLifetimeMode,
     process_risk: &'a ProcessRiskReport,
+}
+
+#[cfg(unix)]
+struct PreparedUnixSupervisedBackgroundChild {
+    child: ManagedChildGuard,
+    control: Arc<UnixProcessSupervisorControl>,
+    supervisor_executable_sha256: String,
+}
+
+#[cfg(unix)]
+struct UnixSupervisedBackgroundChild {
+    child: ManagedChildGuard,
+    control: Arc<UnixProcessSupervisorControl>,
+    target_pid: u32,
 }
 
 impl ProcessProgressMonitor {
@@ -970,13 +1064,13 @@ impl ProcessProgressStreamCapture {
 
 /// Liveness snapshot of a background process and its tracked descendants.
 ///
-/// On Windows the tree view comes from the job object the process was bound to at spawn; on
-/// other platforms only the direct pid is observable, so the tree view mirrors it.
+/// The tree view comes from the exact platform ownership domain: a Job Object on Windows or the
+/// anchored process group on Unix. Unsupported platforms mirror direct-pid liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackgroundProcessRuntimeStatus {
-    /// Whether the directly spawned pid is still alive.
+    /// Whether the registered ownership-root pid is still alive.
     pub(crate) direct_pid_alive: bool,
-    /// Whether any process in the tracked tree (job object) is still alive.
+    /// Whether any process in the tracked ownership domain is still alive.
     pub(crate) process_tree_alive: bool,
     /// Number of live processes in the tracked tree, when the platform can count them.
     pub(crate) tracked_process_count: Option<u32>,
@@ -1006,23 +1100,58 @@ impl BackgroundProcessHandleCapabilities {
 #[derive(Debug)]
 struct RegisteredBackgroundProcess {
     active: bool,
+    unix_cleanup_acknowledged: bool,
+    cleanup_authority_retained: bool,
     capabilities: BackgroundProcessHandleCapabilities,
     lifetime_mode: BackgroundLifetimeMode,
-    stdin: Option<ChildStdin>,
+    provenance: ProcessProvenance,
+    target_pid: Option<u32>,
+    stdin: Option<Arc<Mutex<BackgroundStdinState>>>,
     output_monitor: Option<BackgroundOutputMonitor>,
-    stdin_bytes_written: usize,
-    stdin_events_written: usize,
+    #[cfg(unix)]
+    supervisor_control: Option<Arc<UnixProcessSupervisorControl>>,
+    #[cfg(windows)]
+    windows_job: Option<Arc<WindowsBackgroundJob>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+struct BackgroundStdinState {
+    stdin: ChildStdin,
+    bytes_written: usize,
+    events_written: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundProcessIdentity {
+    pid: u32,
+    provenance: ProcessProvenance,
+    #[cfg(unix)]
+    supervisor_control: Option<Arc<UnixProcessSupervisorControl>>,
+    #[cfg(windows)]
+    windows_job: Option<Arc<WindowsBackgroundJob>>,
+}
+
+#[derive(Debug, Clone)]
 struct RegisteredBackgroundProcessSnapshot {
     active: bool,
+    unix_cleanup_acknowledged: bool,
     capabilities: BackgroundProcessHandleCapabilities,
     lifetime_mode: BackgroundLifetimeMode,
+    provenance: ProcessProvenance,
+    identity: BackgroundProcessIdentity,
+}
+
+/// Durable-safe ownership snapshot captured before a background process is acknowledged.
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundProcessProvenanceSnapshot {
+    pub(crate) pid: u32,
+    pub(crate) provenance: ProcessProvenance,
 }
 
 static REGISTERED_BACKGROUND_PROCESSES: OnceLock<Mutex<HashMap<u32, RegisteredBackgroundProcess>>> =
     OnceLock::new();
+#[cfg(test)]
+static FORCED_RETAINED_BACKGROUND_CLEANUP_FAILURES: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
 impl BackgroundProcessRuntimeStatus {
     /// Returns true while either the direct pid or any tracked descendant is alive.
@@ -1030,12 +1159,12 @@ impl BackgroundProcessRuntimeStatus {
         self.process_tree_alive || self.direct_pid_alive
     }
 
-    /// Returns whether the directly spawned pid is still alive.
+    /// Returns whether the registered ownership-root pid is still alive.
     pub(crate) fn direct_pid_alive(self) -> bool {
         self.direct_pid_alive
     }
 
-    /// Returns whether any process in the tracked tree is still alive.
+    /// Returns whether any process in the tracked ownership domain is still alive.
     pub(crate) fn process_tree_alive(self) -> bool {
         self.process_tree_alive
     }
@@ -1050,27 +1179,152 @@ fn registered_background_processes() -> &'static Mutex<HashMap<u32, RegisteredBa
     REGISTERED_BACKGROUND_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn background_process_identity(
+    pid: u32,
+    process: &RegisteredBackgroundProcess,
+) -> BackgroundProcessIdentity {
+    BackgroundProcessIdentity {
+        pid,
+        provenance: process.provenance.clone(),
+        #[cfg(unix)]
+        supervisor_control: process.supervisor_control.clone(),
+        #[cfg(windows)]
+        windows_job: process.windows_job.clone(),
+    }
+}
+
+fn registered_background_process_identity_matches(
+    process: &RegisteredBackgroundProcess,
+    expected: &BackgroundProcessIdentity,
+) -> bool {
+    if process.provenance != expected.provenance {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        match (process.supervisor_control.as_ref(), expected.supervisor_control.as_ref()) {
+            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match (process.windows_job.as_ref(), expected.windows_job.as_ref()) {
+            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+fn compare_update_registered_background_process<R>(
+    expected: &BackgroundProcessIdentity,
+    update: impl FnOnce(&mut RegisteredBackgroundProcess) -> R,
+) -> Result<Option<R>, SandboxProcessRunError> {
+    let mut processes =
+        registered_background_processes().lock().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "background process registry lock poisoned for pid {}: {error}",
+                expected.pid
+            ),
+        })?;
+    let Some(process) = processes.get_mut(&expected.pid) else {
+        return Ok(None);
+    };
+    if !registered_background_process_identity_matches(process, expected) {
+        return Ok(None);
+    }
+    Ok(Some(update(process)))
+}
+
+#[cfg(test)]
+fn forced_retained_background_cleanup_failures() -> &'static Mutex<HashSet<u32>> {
+    FORCED_RETAINED_BACKGROUND_CLEANUP_FAILURES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn register_background_process_pid(
     pid: u32,
     capabilities: BackgroundProcessHandleCapabilities,
     lifetime_mode: BackgroundLifetimeMode,
+    provenance: ProcessProvenance,
     stdin: Option<ChildStdin>,
-) -> Result<(), SandboxProcessRunError> {
+    #[cfg(unix)] supervisor_control: Option<Arc<UnixProcessSupervisorControl>>,
+) -> Result<BackgroundProcessIdentity, SandboxProcessRunError> {
+    provenance.validate().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("background process provenance is invalid for pid {pid}: {error}"),
+    })?;
+    #[cfg(all(unix, not(test)))]
+    if supervisor_control.is_none()
+        && provenance.ownership_kind == ProcessOwnershipKind::UnixProcessGroup
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "background process {pid} cannot register a Unix supervisor anchor without exact control authority"
+            ),
+        });
+    }
+    #[cfg(windows)]
+    let windows_job = windows_background_job(pid);
+    #[cfg(all(windows, not(test)))]
+    if windows_job.is_none() && provenance.ownership_kind == ProcessOwnershipKind::WindowsJobObject
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "background process {pid} cannot register a Windows ownership anchor without its exact Job Object capability"
+            ),
+        });
+    }
     match registered_background_processes().lock() {
         Ok(mut processes) => {
-            processes.insert(
-                pid,
-                RegisteredBackgroundProcess {
-                    active: true,
-                    capabilities,
-                    lifetime_mode,
-                    stdin,
-                    output_monitor: None,
-                    stdin_bytes_written: 0,
-                    stdin_events_written: 0,
-                },
-            );
-            Ok(())
+            if let Some(existing) = processes.get(&pid) {
+                if existing.active || existing.cleanup_authority_retained {
+                    let reason = if existing.active {
+                        "an active owned entry"
+                    } else {
+                        "retained cleanup authority"
+                    };
+                    return Err(SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: format!(
+                            "background process registry already contains {reason} for pid {pid}"
+                        ),
+                    });
+                }
+            }
+            processes.remove(&pid);
+            let process = RegisteredBackgroundProcess {
+                active: true,
+                unix_cleanup_acknowledged: false,
+                cleanup_authority_retained: false,
+                capabilities,
+                lifetime_mode,
+                provenance,
+                target_pid: None,
+                stdin: stdin.map(|stdin| {
+                    Arc::new(Mutex::new(BackgroundStdinState {
+                        stdin,
+                        bytes_written: 0,
+                        events_written: 0,
+                    }))
+                }),
+                output_monitor: None,
+                #[cfg(unix)]
+                supervisor_control,
+                #[cfg(windows)]
+                windows_job,
+            };
+            let identity = background_process_identity(pid, &process);
+            processes.insert(pid, process);
+            Ok(identity)
         }
         Err(error) => Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -1089,8 +1343,11 @@ fn registered_background_process(
                 .get(&pid)
                 .map(|process| RegisteredBackgroundProcessSnapshot {
                     active: process.active,
+                    unix_cleanup_acknowledged: process.unix_cleanup_acknowledged,
                     capabilities: process.capabilities,
                     lifetime_mode: process.lifetime_mode,
+                    provenance: process.provenance.clone(),
+                    identity: background_process_identity(pid, process),
                 })
                 .ok_or_else(|| SandboxProcessRunError {
                     kind: SandboxProcessRunErrorKind::InvalidInput,
@@ -1106,35 +1363,756 @@ fn registered_background_process(
     }
 }
 
-fn attach_background_output_monitor(
+fn capture_background_process_provenance(
     pid: u32,
-    output_monitor: BackgroundOutputMonitor,
-) -> Result<(), SandboxProcessRunError> {
-    match registered_background_processes().lock() {
-        Ok(mut processes) => {
-            let process = processes.get_mut(&pid).ok_or_else(|| SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::InvalidInput,
-                message: format!(
-                    "palyra.process.run failed to attach output monitor because pid {pid} is not registered"
-                ),
-            })?;
-            process.output_monitor = Some(output_monitor);
-            Ok(())
-        }
-        Err(error) => Err(SandboxProcessRunError {
+) -> Result<ProcessProvenance, SandboxProcessRunError> {
+    capture_background_process_provenance_with_executable_sha256(pid, None)
+}
+
+fn capture_background_process_provenance_with_executable_sha256(
+    pid: u32,
+    trusted_executable_sha256: Option<&str>,
+) -> Result<ProcessProvenance, SandboxProcessRunError> {
+    let start_token = current_process_start_token(pid)
+        .map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
-            message: format!("background process registry lock poisoned for pid {pid}: {error}"),
-        }),
+            message: format!("failed to capture process start token for pid {pid}: {error}"),
+        })?
+        .ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("background process pid {pid} exited before provenance capture"),
+        })?;
+    let executable_sha256 = match trusted_executable_sha256 {
+        Some(digest) => digest.to_owned(),
+        None => {
+            let executable_path =
+                current_process_executable_path(pid).map_err(|error| SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!("failed to resolve executable image for pid {pid}: {error}"),
+                })?;
+            sha256_file_bounded(executable_path.as_path()).map_err(|error| {
+                SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!("failed to hash executable image for pid {pid}: {error}"),
+                }
+            })?
+        }
+    };
+    let owner_nonce = process_owner_nonce().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to issue process owner nonce for pid {pid}: {error}"),
+    })?;
+    let ownership_kind = current_process_ownership_kind();
+    verify_live_ownership_anchor(pid).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to verify process ownership anchor for pid {pid}: {error}"),
+    })?;
+    let ownership_identity_sha256 = sha256_text(
+        format!("{}:{pid}:{start_token}:{owner_nonce}", ownership_kind.as_str()).as_str(),
+    );
+    let provenance = ProcessProvenance {
+        ownership_kind,
+        start_token,
+        executable_sha256,
+        owner_nonce,
+        ownership_identity_sha256,
+    };
+    provenance.validate().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("captured process provenance is invalid for pid {pid}: {error}"),
+    })?;
+    Ok(provenance)
+}
+
+/// Returns the provenance captured before a live background process was acknowledged.
+pub(crate) fn background_process_provenance_snapshot(
+    pid: u32,
+) -> Option<BackgroundProcessProvenanceSnapshot> {
+    let processes = registered_background_processes().lock().ok()?;
+    let process = processes.get(&pid)?;
+    Some(BackgroundProcessProvenanceSnapshot { pid, provenance: process.provenance.clone() })
+}
+
+#[cfg(test)]
+pub(crate) fn registered_background_process_pids() -> Vec<u32> {
+    registered_background_processes()
+        .lock()
+        .map(|processes| processes.keys().copied().collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn background_process_cleanup_authority_is_retained(pid: u32) -> bool {
+    background_process_cleanup_authority_retained(pid)
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_retained_background_cleanup_failure(pid: u32) {
+    let _ = forced_retained_background_cleanup_failures().lock().map(|mut failures| {
+        failures.insert(pid);
+    });
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn windows_background_job_process_count(pid: u32) -> Option<io::Result<u32>> {
+    windows_background_job_active_process_count(pid)
+}
+
+/// Verifies the current OS process/tree against the exact registered provenance.
+pub(crate) fn verify_background_process_provenance(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> ProcessProvenanceDisposition {
+    let Ok(registered) = registered_background_process("verify provenance", pid) else {
+        return ProcessProvenanceDisposition::Missing;
+    };
+    if registered.provenance != *expected {
+        return ProcessProvenanceDisposition::Mismatch;
+    }
+    #[cfg(windows)]
+    {
+        match background_process_runtime_status_for_identity(&registered.identity) {
+            Ok(status) if !status.process_tree_alive => ProcessProvenanceDisposition::Missing,
+            Ok(_) => ProcessProvenanceDisposition::Match,
+            Err(_) => ProcessProvenanceDisposition::Unsupported,
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(disposition) = registered_process_liveness_disposition(
+        expected.ownership_kind,
+        owned_background_process_tree_is_alive(pid),
+        process_id_is_alive(pid),
+    ) {
+        return disposition;
+    }
+    #[cfg(unix)]
+    {
+        verify_process_identity_with(pid, expected, true, current_process_start_token, |_| {
+            Ok(expected.executable_sha256.clone())
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        verify_process_identity(pid, expected, true)
     }
 }
 
-fn mark_background_process_stopped(pid: u32) {
-    if let Ok(mut processes) = registered_background_processes().lock() {
-        if let Some(process) = processes.get_mut(&pid) {
-            process.active = false;
-            process.stdin.take();
-        }
+fn registered_process_liveness_disposition(
+    ownership_kind: ProcessOwnershipKind,
+    process_tree_alive: io::Result<bool>,
+    direct_pid_alive: io::Result<bool>,
+) -> Option<ProcessProvenanceDisposition> {
+    match process_tree_alive {
+        Ok(false) => Some(ProcessProvenanceDisposition::Missing),
+        Err(_) => Some(ProcessProvenanceDisposition::Unsupported),
+        Ok(true) => match direct_pid_alive {
+            Ok(true) => None,
+            // A retained Job Object is a stable kernel capability even after its root exits. Unix
+            // process-group IDs are numeric and reusable, so group liveness without the root's
+            // stable identity can never authorize signalling.
+            Ok(false)
+                if cfg!(windows) && ownership_kind == ProcessOwnershipKind::WindowsJobObject =>
+            {
+                Some(ProcessProvenanceDisposition::Match)
+            }
+            Ok(false) | Err(_) => Some(ProcessProvenanceDisposition::Unsupported),
+        },
     }
+}
+
+/// Verifies restart-visible process identity without adopting or signalling the process.
+///
+/// A matching PID/start token/executable proves the process instance, but restart loses the
+/// host's retained process-group or Job Object capability. Live matches therefore remain
+/// unsupported for ownership-sensitive actions. Missing direct identities remain unverifiable:
+/// an absent numeric Unix process group cannot prove that an untrusted descendant did not escape,
+/// while Windows Job Object and remote ownership also require their lost live control capability.
+pub(crate) fn verify_persisted_process_provenance(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> ProcessProvenanceDisposition {
+    verify_process_identity_with(
+        pid,
+        expected,
+        false,
+        current_process_start_token,
+        current_process_executable_sha256,
+    )
+}
+
+fn verify_process_identity(
+    pid: u32,
+    expected: &ProcessProvenance,
+    has_retained_ownership_anchor: bool,
+) -> ProcessProvenanceDisposition {
+    verify_process_identity_with(
+        pid,
+        expected,
+        has_retained_ownership_anchor,
+        current_process_start_token,
+        current_process_executable_sha256,
+    )
+}
+
+fn verify_process_identity_with<StartToken, ExecutableDigest>(
+    pid: u32,
+    expected: &ProcessProvenance,
+    has_retained_ownership_anchor: bool,
+    current_start_token: StartToken,
+    current_executable_sha256: ExecutableDigest,
+) -> ProcessProvenanceDisposition
+where
+    StartToken: FnOnce(u32) -> io::Result<Option<String>>,
+    ExecutableDigest: FnOnce(u32) -> io::Result<String>,
+{
+    match current_start_token(pid) {
+        Ok(Some(start_token)) if start_token != expected.start_token => {
+            ProcessProvenanceDisposition::Mismatch
+        }
+        Ok(Some(_)) => {
+            match current_executable_sha256(pid) {
+                Ok(digest) if digest != expected.executable_sha256 => {
+                    return ProcessProvenanceDisposition::Mismatch;
+                }
+                Ok(_) => {}
+                Err(_) => return ProcessProvenanceDisposition::Unsupported,
+            }
+            if !has_retained_ownership_anchor {
+                return ProcessProvenanceDisposition::Unsupported;
+            }
+            match verify_live_ownership_anchor(pid) {
+                Ok(()) => ProcessProvenanceDisposition::Match,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    ProcessProvenanceDisposition::Unsupported
+                }
+                Err(_) => ProcessProvenanceDisposition::Mismatch,
+            }
+        }
+        // A numeric process-group ID can be reused after the direct launcher exits. Without the
+        // launcher's stable identity, group liveness alone cannot authorize signalling descendants.
+        Ok(None) if has_retained_ownership_anchor => ProcessProvenanceDisposition::Unsupported,
+        Ok(None) => ProcessProvenanceDisposition::Unsupported,
+        Err(_) => ProcessProvenanceDisposition::Unsupported,
+    }
+}
+
+fn current_process_executable_sha256(pid: u32) -> io::Result<String> {
+    let executable_path = current_process_executable_path(pid)?;
+    sha256_file_bounded(executable_path.as_path())
+}
+
+fn require_background_process_provenance(
+    pid: u32,
+    expected: &ProcessProvenance,
+    operation: &str,
+) -> Result<(), SandboxProcessRunError> {
+    let disposition = verify_background_process_provenance(pid, expected);
+    if matches!(disposition, ProcessProvenanceDisposition::Match) {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: format!(
+            "{operation} refused pid {pid} because process provenance was {}",
+            disposition.as_str()
+        ),
+    })
+}
+
+fn process_owner_nonce() -> io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(hex::encode(bytes))
+}
+
+fn sha256_text(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(digest)
+}
+
+fn sha256_file_bounded(path: &Path) -> io::Result<String> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_PROCESS_EXECUTABLE_HASH_BYTES {
+        return Err(io::Error::other("process executable exceeds bounded hash policy"));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if total > MAX_PROCESS_EXECUTABLE_HASH_BYTES {
+            return Err(io::Error::other("process executable exceeded bounded hash policy"));
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+#[cfg(unix)]
+fn current_process_ownership_kind() -> ProcessOwnershipKind {
+    ProcessOwnershipKind::UnixProcessGroup
+}
+
+#[cfg(windows)]
+fn current_process_ownership_kind() -> ProcessOwnershipKind {
+    ProcessOwnershipKind::WindowsJobObject
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_process_ownership_kind() -> ProcessOwnershipKind {
+    ProcessOwnershipKind::RemoteExecutionInstance
+}
+
+#[cfg(unix)]
+fn verify_live_ownership_anchor(pid: u32) -> io::Result<()> {
+    let process_id = unix_pid_from_u32(pid)?;
+    // SAFETY: getpgid reads process metadata for a validated positive pid.
+    let process_group_id = unsafe { libc::getpgid(process_id) };
+    if process_group_id < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getsid reads process metadata for a validated positive pid.
+    let session_id = unsafe { libc::getsid(process_id) };
+    if session_id < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if process_group_id == process_id && session_id == process_id {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "pid {pid} has process group {process_group_id} and session {session_id}, expected both anchors to equal {pid}"
+    )))
+}
+
+#[cfg(windows)]
+fn verify_live_ownership_anchor(pid: u32) -> io::Result<()> {
+    if windows_background_job(pid).is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("pid {pid} has no retained Windows Job Object"),
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_live_ownership_anchor(_pid: u32) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "process ownership verification is unsupported"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let mut stat = Vec::new();
+    match fs::File::open(path) {
+        Ok(file) => file
+            .take(u64::try_from(MAX_LINUX_PROC_STAT_BYTES).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut stat)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if stat.len() > MAX_LINUX_PROC_STAT_BYTES {
+        return Err(io::Error::other("Linux process stat exceeded bounded capacity"));
+    }
+    let text = std::str::from_utf8(stat.as_slice())
+        .map_err(|_| io::Error::other("Linux process stat was not UTF-8"))?;
+    let command_end = text
+        .rfind(") ")
+        .ok_or_else(|| io::Error::other("Linux process stat command terminator missing"))?;
+    let fields = text[command_end.saturating_add(2)..].split_whitespace().collect::<Vec<_>>();
+    if fields.len() <= 19 {
+        return Err(io::Error::other("Linux process stat fields missing"));
+    }
+    let reported_pid = text[..text.find('(').unwrap_or(0)]
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("Linux process stat pid invalid"))?;
+    if reported_pid != pid {
+        return Err(io::Error::other("Linux process stat pid changed"));
+    }
+    let start_token = fields[19]
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("Linux process stat start token invalid"))?;
+    Ok(Some(format!("linux:{start_token}")))
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
+    let process_id = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "macOS pid exceeds i32"))?;
+    let mut information = std::mem::MaybeUninit::<MacProcessUniqueInfo>::zeroed();
+    let information_size = i32::try_from(std::mem::size_of::<MacProcessUniqueInfo>())
+        .map_err(|_| io::Error::other("macOS process identity buffer is invalid"))?;
+    // SAFETY: the buffer exactly matches PROC_PIDUNIQIDENTIFIERINFO's fixed ABI.
+    let read = unsafe {
+        macos_proc_pidinfo(process_id, 17, 0, information.as_mut_ptr().cast(), information_size)
+    };
+    if read <= 0 {
+        let error = io::Error::last_os_error();
+        return if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if read != information_size {
+        return Err(io::Error::other("macOS process identity response was incomplete"));
+    }
+    // SAFETY: proc_pidinfo reported a complete fixed-size structure.
+    let information = unsafe { information.assume_init() };
+    Ok(Some(format!(
+        "macos:{}:{}",
+        information.unique_id,
+        u32::from_ne_bytes(information.id_version.to_ne_bytes())
+    )))
+}
+
+#[cfg(windows)]
+fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
+    let Some(process) = open_windows_process_for_identity(pid)? else {
+        return Ok(None);
+    };
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all FILETIME pointers are valid writable outputs and the process
+    // handle remains owned by `process` for the call.
+    if unsafe { GetProcessTimes(process.get(), &mut creation, &mut exit, &mut kernel, &mut user) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(format!("windows:{:08x}{:08x}", creation.dwHighDateTime, creation.dwLowDateTime)))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+fn current_process_start_token(_pid: u32) -> io::Result<Option<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable Unix process identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_process_start_token(_pid: u32) -> io::Result<Option<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable process identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_process_executable_path(pid: u32) -> io::Result<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_executable_path(pid: u32) -> io::Result<PathBuf> {
+    let process_id = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "macOS pid exceeds i32"))?;
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: buffer is writable for the provided length and process_id is positive.
+    let written = unsafe {
+        macos_proc_pidpath(
+            process_id,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+        )
+    };
+    if written <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let written = usize::try_from(written)
+        .map_err(|_| io::Error::other("macOS process path length is invalid"))?;
+    buffer.truncate(written);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+#[cfg(windows)]
+fn current_process_executable_path(pid: u32) -> io::Result<PathBuf> {
+    let process = open_windows_process_for_identity(pid)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("process {pid} no longer exists"))
+    })?;
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let mut length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        // SAFETY: the process handle is valid and the UTF-16 buffer is writable
+        // for the supplied character count.
+        if unsafe { QueryFullProcessImageNameW(process.get(), 0, buffer.as_mut_ptr(), &mut length) }
+            != 0
+        {
+            let length = usize::try_from(length)
+                .map_err(|_| io::Error::other("Windows process image length is invalid"))?;
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        let error = io::Error::last_os_error();
+        if buffer.len() >= MAX_WINDOWS_PROCESS_IMAGE_CHARS {
+            return Err(error);
+        }
+        buffer.resize((buffer.len() * 2).min(MAX_WINDOWS_PROCESS_IMAGE_CHARS), 0);
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+fn current_process_executable_path(_pid: u32) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process executable lookup is unsupported on this Unix platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_process_executable_path(_pid: u32) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process executable lookup is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn open_windows_process_for_identity(pid: u32) -> io::Result<Option<WindowsOwnedHandle>> {
+    // SAFETY: OpenProcess has no pointer inputs; null is handled below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // SAFETY: GetLastError reads thread-local Win32 state immediately after OpenProcess.
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => Ok(None),
+            ERROR_ACCESS_DENIED => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("access denied opening process {pid} for identity verification"),
+            )),
+            _ => Err(io::Error::last_os_error()),
+        };
+    }
+    WindowsOwnedHandle::new(handle, "process identity").map(Some)
+}
+
+fn attach_background_output_monitor(
+    expected: &BackgroundProcessIdentity,
+    output_monitor: BackgroundOutputMonitor,
+) -> Result<(), SandboxProcessRunError> {
+    compare_update_registered_background_process(expected, |process| {
+        process.output_monitor = Some(output_monitor);
+    })?
+    .ok_or_else(|| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.run refused stale output monitor attachment for pid {}",
+            expected.pid
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn attach_background_target_pid(
+    expected: &BackgroundProcessIdentity,
+    target_pid: u32,
+) -> Result<(), SandboxProcessRunError> {
+    compare_update_registered_background_process(expected, |process| match process.target_pid {
+        Some(existing) if existing != target_pid => Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "background ownership root pid {} already tracks a different target process",
+                expected.pid
+            ),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            process.target_pid = Some(target_pid);
+            Ok(())
+        }
+    })?
+    .ok_or_else(|| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.run refused stale target metadata attachment for ownership root pid {}",
+            expected.pid
+        ),
+    })?
+}
+
+fn mark_background_process_stopped(expected: &BackgroundProcessIdentity) {
+    set_background_process_stopped(expected, false);
+}
+
+fn mark_background_process_stopped_after_unix_cleanup(expected: &BackgroundProcessIdentity) {
+    set_background_process_stopped(expected, true);
+}
+
+fn set_background_process_stopped(
+    expected: &BackgroundProcessIdentity,
+    unix_cleanup_acknowledged: bool,
+) {
+    let _ = compare_update_registered_background_process(expected, |process| {
+        process.active = false;
+        process.unix_cleanup_acknowledged |= unix_cleanup_acknowledged;
+        process.stdin.take();
+    });
+}
+
+fn mark_current_background_process_stopped(pid: u32) {
+    if let Ok(snapshot) = registered_background_process("palyra.process.run", pid) {
+        mark_background_process_stopped(&snapshot.identity);
+    }
+}
+
+fn mark_current_background_process_stopped_after_unix_cleanup(pid: u32) {
+    if let Ok(snapshot) = registered_background_process("palyra.process.run", pid) {
+        mark_background_process_stopped_after_unix_cleanup(&snapshot.identity);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mark_background_process_stopped_for_test(pid: u32) {
+    mark_current_background_process_stopped(pid);
+}
+
+#[cfg(test)]
+pub(crate) fn register_background_process_for_test(
+    pid: u32,
+    provenance: ProcessProvenance,
+) -> Result<(), SandboxProcessRunError> {
+    register_background_process_pid(
+        pid,
+        BackgroundProcessHandleCapabilities {
+            stdin: false,
+            pty_requested: false,
+            pty: false,
+            signals: true,
+            background: true,
+        },
+        BackgroundLifetimeMode::RunOwned,
+        provenance,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Retains the exact platform ownership anchor until durable process cleanup is finalized.
+///
+/// # Errors
+/// Returns an error when the process is missing, its provenance differs, or the registry lock is
+/// poisoned.
+pub(crate) fn retain_background_process_cleanup_authority(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<()> {
+    let mut processes = registered_background_processes().lock().map_err(|error| {
+        io::Error::other(format!(
+            "background process registry lock poisoned for pid {pid}: {error}"
+        ))
+    })?;
+    let process = processes.get_mut(&pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background process {pid} has no registered cleanup authority"),
+        )
+    })?;
+    if process.provenance != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} cleanup authority provenance does not match"),
+        ));
+    }
+    process.cleanup_authority_retained = true;
+    Ok(())
+}
+
+/// Releases a retained cleanup anchor after durable process finalization has committed.
+pub(crate) fn release_background_process_cleanup_authority(pid: u32, expected: &ProcessProvenance) {
+    let identity = registered_background_processes().lock().ok().and_then(|mut processes| {
+        let process = processes.get_mut(&pid)?;
+        if process.provenance != *expected {
+            return None;
+        }
+        process.cleanup_authority_retained = false;
+        Some(background_process_identity(pid, process))
+    });
+    if let Some(identity) = identity {
+        release_background_process_tracking_if_stopped_exact(&identity);
+    }
+}
+
+fn background_process_cleanup_authority_retained(pid: u32) -> bool {
+    registered_background_processes()
+        .lock()
+        .ok()
+        .and_then(|processes| processes.get(&pid).map(|process| process.cleanup_authority_retained))
+        .unwrap_or(true)
+}
+
+fn background_process_cleanup_authority_retained_exact(
+    identity: &BackgroundProcessIdentity,
+) -> bool {
+    registered_background_processes()
+        .lock()
+        .ok()
+        .and_then(|processes| {
+            let process = processes.get(&identity.pid)?;
+            registered_background_process_identity_matches(process, identity)
+                .then_some(process.cleanup_authority_retained)
+        })
+        .unwrap_or(true)
+}
+
+/// Returns the exact registered process activity flag when provenance still matches.
+///
+/// `Some(false)` is emitted only after this runtime has independently verified ownership-domain
+/// absence and marked the registration stopped. Missing or conflicting registry evidence returns
+/// `None` so durable reconciliation keeps the lease fail-closed.
+///
+/// # Errors
+/// Returns an error when the process registry lock is poisoned.
+pub(crate) fn background_process_registration_is_active(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<Option<bool>> {
+    let processes = registered_background_processes().lock().map_err(|error| {
+        io::Error::other(format!(
+            "background process registry lock poisoned for pid {pid}: {error}"
+        ))
+    })?;
+    Ok(processes
+        .get(&pid)
+        .filter(|process| process.provenance == *expected)
+        .map(|process| process.active))
+}
+
+fn require_background_process_cleanup_authority(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<()> {
+    let processes = registered_background_processes().lock().map_err(|error| {
+        io::Error::other(format!(
+            "background process registry lock poisoned for pid {pid}: {error}"
+        ))
+    })?;
+    let process = processes.get(&pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background process {pid} has no retained cleanup authority"),
+        )
+    })?;
+    if process.provenance != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} cleanup authority provenance does not match"),
+        ));
+    }
+    if !process.cleanup_authority_retained {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} cleanup authority is not retained"),
+        ));
+    }
+    Ok(())
 }
 
 /// RAII owner for temporary Win32 handles used while a background process is initialized.
@@ -1281,6 +2259,10 @@ static WINDOWS_BACKGROUND_JOBS: OnceLock<Mutex<HashMap<u32, Arc<WindowsBackgroun
     OnceLock::new();
 
 impl BackgroundOutputMonitor {
+    fn quota_exceeded(&self) -> bool {
+        self.quota_triggered.load(Ordering::Acquire)
+    }
+
     fn snapshot(&self) -> (StreamCapture, StreamCapture) {
         let stdout =
             self.stdout.lock().map(|capture| capture.clone()).unwrap_or_else(|_| StreamCapture {
@@ -1367,7 +2349,16 @@ pub(crate) fn run_constrained_process(
     input_json: &[u8],
     execution_timeout: Duration,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
-    run_constrained_process_with_cancellation(policy, input_json, execution_timeout, None)
+    let registration_fence: BackgroundProcessRegistrationFence = Arc::new(|_| Ok(()));
+    run_constrained_process_with_fault_injection(
+        policy,
+        input_json,
+        execution_timeout,
+        None,
+        None,
+        Some(registration_fence),
+        crate::qa_fault_injection::QaFaultRuntime::default(),
+    )
 }
 
 /// Validates and executes one `palyra.process.run` invocation under `policy`.
@@ -1400,6 +2391,7 @@ pub fn run_constrained_process_with_cancellation(
         execution_timeout,
         cancellation_requested,
         None,
+        None,
         crate::qa_fault_injection::QaFaultRuntime::default(),
     )
 }
@@ -1410,6 +2402,7 @@ pub(crate) fn run_constrained_process_with_fault_injection(
     execution_timeout: Duration,
     cancellation_requested: Option<Arc<AtomicBool>>,
     progress_sink: Option<ProcessProgressSink>,
+    background_registration_fence: Option<BackgroundProcessRegistrationFence>,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     if !policy.enabled {
@@ -1422,6 +2415,7 @@ pub(crate) fn run_constrained_process_with_fault_injection(
     let mut input = parse_process_runner_input(input_json)?;
     validate_input_shape(&input)?;
     validate_background_lifetime_mode(&input)?;
+    validate_background_registration_fence(&input, background_registration_fence.as_ref())?;
     validate_allowed_executable(policy, input.command.as_str())?;
     validate_no_embedded_command_line_arg(&input)?;
     validate_cmd_invocation_shape(input.command.as_str(), input.args.as_slice())?;
@@ -1551,6 +2545,7 @@ pub(crate) fn run_constrained_process_with_fault_injection(
             max_lifetime: max_background_lifetime,
             auto_background_reason: None,
             lifetime_mode: input.effective_lifetime_mode(),
+            registration_fence: background_registration_fence,
             fault_injection: &fault_injection,
         });
     }
@@ -2458,13 +3453,81 @@ fn execute_builtin_process_command(
     Ok(Some(SandboxProcessRunSuccess { output_json }))
 }
 
+const PROCESS_STOP_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStopAcknowledgementV1<'a> {
+    schema_version: u16,
+    pid: u32,
+    ownership_kind: &'a str,
+    ownership_identity_sha256: &'a str,
+    observed_at_unix_ms: i64,
+    proof: ProcessStopProofV1,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProcessStopProofV1 {
+    UnixSupervisorCleanupAcknowledged,
+    WindowsJobObjectEmpty { active_process_count: u32 },
+}
+
+fn process_stop_acknowledgement(
+    pid: u32,
+    registration: &RegisteredBackgroundProcessSnapshot,
+    status: BackgroundProcessRuntimeStatus,
+) -> Option<ProcessStopAcknowledgementV1<'_>> {
+    if status.alive() {
+        return None;
+    }
+    let proof = match registration.provenance.ownership_kind {
+        ProcessOwnershipKind::UnixProcessGroup
+            if registration.unix_cleanup_acknowledged && !status.process_tree_alive =>
+        {
+            ProcessStopProofV1::UnixSupervisorCleanupAcknowledged
+        }
+        ProcessOwnershipKind::WindowsJobObject
+            if !status.process_tree_alive && status.tracked_process_count == Some(0) =>
+        {
+            ProcessStopProofV1::WindowsJobObjectEmpty { active_process_count: 0 }
+        }
+        ProcessOwnershipKind::RemoteExecutionInstance => return None,
+        _ => return None,
+    };
+    Some(ProcessStopAcknowledgementV1 {
+        schema_version: PROCESS_STOP_ACKNOWLEDGEMENT_SCHEMA_VERSION,
+        pid,
+        ownership_kind: registration.provenance.ownership_kind.as_str(),
+        ownership_identity_sha256: registration.provenance.ownership_identity_sha256.as_str(),
+        observed_at_unix_ms: crate::gateway::current_unix_ms(),
+        proof,
+    })
+}
+
 fn builtin_stop_process_success(
     command: &str,
     args: &[String],
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let pid = parse_builtin_pid_arg(command, args)?;
     let registration = registered_background_process(command, pid)?;
+    #[cfg(unix)]
+    let mut registration = registration;
+    // Unix termination is authorized by the registered exact supervisor capability. Requiring a
+    // still-live root PID here would reject the queued acknowledgement after autonomous cleanup.
+    #[cfg(not(unix))]
+    if registration.active {
+        require_background_process_provenance(
+            pid,
+            &registration.provenance,
+            "palyra.process.stop",
+        )?;
+    }
     if !registration.active {
+        let status = background_process_runtime_status(pid).ok();
+        let stop_acknowledgement = status
+            .filter(|status| !status.alive())
+            .and_then(|status| process_stop_acknowledgement(pid, &registration, status));
         let output_json = serde_json::to_vec(&json!({
             "exit_code": 0,
             "stdout": format!("pid={pid} stopped=true was_running=false\n"),
@@ -2481,9 +3544,10 @@ fn builtin_stop_process_success(
             "direct_pid_alive_before_stop": false,
             "process_tree_alive_before_stop": false,
             "tracked_process_count_before_stop": Option::<u32>::None,
-            "direct_pid_alive": false,
-            "process_tree_alive": false,
-            "tracked_process_count": Option::<u32>::None,
+            "direct_pid_alive": status.map(|status| status.direct_pid_alive),
+            "process_tree_alive": status.map(|status| status.process_tree_alive),
+            "tracked_process_count": status.and_then(|status| status.tracked_process_count),
+            "stop_acknowledgement": stop_acknowledgement,
             "tier": "builtin",
             "sandbox_backend": "builtin_portable",
         }))
@@ -2496,9 +3560,17 @@ fn builtin_stop_process_success(
     #[cfg(windows)]
     // The lifetime monitor may remove the registry entry as soon as termination is observed.
     // Retain the job handle so this stop call can still report its verified final process count.
-    let retained_windows_job = windows_background_job(pid);
+    let retained_windows_job = registration.identity.windows_job.clone();
+    #[cfg(unix)]
     let before_status =
-        background_process_runtime_status(pid).map_err(|error| SandboxProcessRunError {
+        background_process_runtime_status(pid).unwrap_or(BackgroundProcessRuntimeStatus {
+            direct_pid_alive: false,
+            process_tree_alive: false,
+            tracked_process_count: None,
+        });
+    #[cfg(not(unix))]
+    let before_status = background_process_runtime_status_for_identity(&registration.identity)
+        .map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!(
                 "palyra.process.run builtin '{command}' failed to inspect pid {pid}: {error}"
@@ -2506,20 +3578,51 @@ fn builtin_stop_process_success(
         })?;
     let was_running = before_status.alive();
     let mut stop_error = None;
+    #[cfg(unix)]
+    if let Err(error) = terminate_background_process_tree_exact(pid, &registration.provenance) {
+        stop_error = Some(error.to_string());
+    }
+    #[cfg(not(unix))]
     if was_running {
-        if let Err(error) = terminate_background_process_tree(pid) {
+        if let Err(error) = terminate_background_process_tree_exact(pid, &registration.provenance) {
             stop_error = Some(error.to_string());
         }
     }
+    #[cfg(unix)]
+    let stopped = stop_error.is_none();
+    #[cfg(windows)]
+    let stopped = !was_running
+        || retained_windows_job
+            .as_deref()
+            .and_then(|job| {
+                wait_for_windows_background_process_inactive(
+                    pid,
+                    &registration.provenance,
+                    job,
+                    Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+                )
+                .ok()
+                .flatten()
+            })
+            .is_some();
+    #[cfg(not(any(unix, windows)))]
     let stopped = !was_running
         || wait_for_process_not_alive(pid, Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS));
     #[cfg(windows)]
     let after_status = match retained_windows_job.as_deref() {
-        Some(job) => background_process_runtime_status_from_windows_job(pid, job),
+        Some(job) => {
+            background_process_runtime_status_from_windows_job(pid, &registration.provenance, job)
+        }
         None => background_process_runtime_status(pid),
     }
     .ok();
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    let after_status = stopped.then_some(BackgroundProcessRuntimeStatus {
+        direct_pid_alive: false,
+        process_tree_alive: false,
+        tracked_process_count: Some(0),
+    });
+    #[cfg(not(any(unix, windows)))]
     let after_status = background_process_runtime_status(pid).ok();
     // When the post-stop probe fails, report alive=true: claiming a process is gone without
     // evidence would let callers skip cleanup.
@@ -2535,8 +3638,19 @@ fn builtin_stop_process_success(
         });
     }
     if !alive {
-        mark_background_process_stopped(pid);
+        #[cfg(unix)]
+        if stopped && stop_error.is_none() {
+            mark_background_process_stopped_after_unix_cleanup(&registration.identity);
+            registration.unix_cleanup_acknowledged = true;
+        } else {
+            mark_background_process_stopped(&registration.identity);
+        }
+        #[cfg(not(unix))]
+        mark_background_process_stopped(&registration.identity);
     }
+    let stop_acknowledgement = after_status
+        .filter(|status| !status.alive())
+        .and_then(|status| process_stop_acknowledgement(pid, &registration, status));
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
         "stdout": format!("pid={pid} stopped={stopped} was_running={was_running}\n"),
@@ -2556,6 +3670,7 @@ fn builtin_stop_process_success(
         "direct_pid_alive": after_status.map(|status| status.direct_pid_alive),
         "process_tree_alive": after_status.map(|status| status.process_tree_alive),
         "tracked_process_count": after_status.and_then(|status| status.tracked_process_count),
+        "stop_acknowledgement": stop_acknowledgement,
         "tier": "builtin",
         "sandbox_backend": "builtin_portable",
     }))
@@ -2563,9 +3678,6 @@ fn builtin_stop_process_success(
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox process stop output JSON: {error}"),
     })?;
-    if !alive {
-        release_background_process_tracking_if_stopped(pid);
-    }
     Ok(SandboxProcessRunSuccess { output_json })
 }
 
@@ -2575,6 +3687,13 @@ fn builtin_process_status_success(
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let pid = parse_builtin_pid_arg(command, args)?;
     let registration = registered_background_process(command, pid)?;
+    if registration.active {
+        require_background_process_provenance(
+            pid,
+            &registration.provenance,
+            "palyra.process.status",
+        )?;
+    }
     if !registration.active {
         let output_json = serde_json::to_vec(&json!({
             "exit_code": 0,
@@ -2599,16 +3718,17 @@ fn builtin_process_status_success(
         })?;
         return Ok(SandboxProcessRunSuccess { output_json });
     }
-    let status =
-        background_process_runtime_status(pid).map_err(|error| SandboxProcessRunError {
+    let status = background_process_runtime_status_for_identity(&registration.identity).map_err(
+        |error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!(
                 "palyra.process.run builtin '{command}' failed to inspect pid {pid}: {error}"
             ),
-        })?;
+        },
+    )?;
     let alive = status.alive();
     if !alive {
-        mark_background_process_stopped(pid);
+        mark_background_process_stopped(&registration.identity);
     }
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
@@ -2690,6 +3810,18 @@ pub(crate) fn write_background_process_stdin(
         payload.push(b'\n');
     }
     validate_process_stdin_payload(input.pid, payload.as_slice())?;
+    let registered = registered_background_process("palyra.process.input", input.pid)?;
+    if !registered.active {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input pid {} is no longer active", input.pid),
+        });
+    }
+    require_background_process_provenance(
+        input.pid,
+        &registered.provenance,
+        "palyra.process.input",
+    )?;
     let status =
         background_process_runtime_status(input.pid).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -2699,15 +3831,15 @@ pub(crate) fn write_background_process_stdin(
             ),
         })?;
     if !status.alive() {
-        mark_background_process_stopped(input.pid);
+        mark_background_process_stopped(&registered.identity);
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
             message: format!("palyra.process.input pid {} is not alive", input.pid),
         });
     }
 
-    let (bytes_written_total, events_written_total, capabilities, lifetime_mode) = {
-        let mut processes =
+    let (stdin_state, capabilities, lifetime_mode, expected_provenance) = {
+        let processes =
             registered_background_processes().lock().map_err(|error| SandboxProcessRunError {
                 kind: SandboxProcessRunErrorKind::RuntimeFailure,
                 message: format!(
@@ -2715,7 +3847,7 @@ pub(crate) fn write_background_process_stdin(
                     input.pid
                 ),
             })?;
-        let process = processes.get_mut(&input.pid).ok_or_else(|| SandboxProcessRunError {
+        let process = processes.get(&input.pid).ok_or_else(|| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
             message: format!(
                 "palyra.process.input requires a pid returned by a live palyra.process.run background result; pid {} is not registered",
@@ -2737,52 +3869,76 @@ pub(crate) fn write_background_process_stdin(
                 ),
             });
         }
-        if process.stdin_events_written >= PROCESS_STDIN_MAX_EVENTS {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::InvalidInput,
-                message: format!(
-                    "palyra.process.input pid {} exceeded {PROCESS_STDIN_MAX_EVENTS} stdin writes",
-                    input.pid
-                ),
-            });
-        }
-        if process.stdin_bytes_written.saturating_add(payload.len()) > PROCESS_STDIN_TOTAL_MAX_BYTES
-        {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::InvalidInput,
-                message: format!(
-                    "palyra.process.input pid {} exceeded {PROCESS_STDIN_TOTAL_MAX_BYTES} total stdin bytes",
-                    input.pid
-                ),
-            });
-        }
-        let stdin = process.stdin.as_mut().ok_or_else(|| SandboxProcessRunError {
+        let stdin_state = process.stdin.clone().ok_or_else(|| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
             message: format!("palyra.process.input pid {} has no writable stdin handle", input.pid),
         })?;
-        stdin.write_all(payload.as_slice()).map_err(|error| SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::RuntimeFailure,
-            message: format!(
-                "palyra.process.input failed to write stdin to pid {}: {error}",
-                input.pid
-            ),
-        })?;
-        stdin.flush().map_err(|error| SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::RuntimeFailure,
-            message: format!(
-                "palyra.process.input failed to flush stdin to pid {}: {error}",
-                input.pid
-            ),
-        })?;
-        process.stdin_bytes_written = process.stdin_bytes_written.saturating_add(payload.len());
-        process.stdin_events_written = process.stdin_events_written.saturating_add(1);
-        (
-            process.stdin_bytes_written,
-            process.stdin_events_written,
-            process.capabilities,
-            process.lifetime_mode,
-        )
+        (stdin_state, process.capabilities, process.lifetime_mode, process.provenance.clone())
     };
+    let stdin_handle = Arc::clone(&stdin_state);
+    let mut stdin_guard = stdin_state.lock().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("background stdin lock poisoned for pid {}: {error}", input.pid),
+    })?;
+    if stdin_guard.events_written >= PROCESS_STDIN_MAX_EVENTS {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.input pid {} exceeded {PROCESS_STDIN_MAX_EVENTS} stdin writes",
+                input.pid
+            ),
+        });
+    }
+    if stdin_guard.bytes_written.saturating_add(payload.len()) > PROCESS_STDIN_TOTAL_MAX_BYTES {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.input pid {} exceeded {PROCESS_STDIN_TOTAL_MAX_BYTES} total stdin bytes",
+                input.pid
+            ),
+        });
+    }
+    stdin_guard.stdin.write_all(payload.as_slice()).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.input failed to write stdin to pid {}: {error}",
+            input.pid
+        ),
+    })?;
+    stdin_guard.stdin.flush().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.input failed to flush stdin to pid {}: {error}",
+            input.pid
+        ),
+    })?;
+    stdin_guard.bytes_written = stdin_guard.bytes_written.saturating_add(payload.len());
+    stdin_guard.events_written = stdin_guard.events_written.saturating_add(1);
+    let bytes_written_total = stdin_guard.bytes_written;
+    let events_written_total = stdin_guard.events_written;
+    drop(stdin_guard);
+    let still_current = registered_background_processes()
+        .lock()
+        .map(|processes| {
+            processes.get(&input.pid).is_some_and(|process| {
+                process.active
+                    && process.provenance == expected_provenance
+                    && process
+                        .stdin
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &stdin_handle))
+            })
+        })
+        .unwrap_or(false);
+    if !still_current {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.input pid {} changed ownership while stdin was being written",
+                input.pid
+            ),
+        });
+    }
 
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
@@ -2899,6 +4055,11 @@ pub(crate) fn send_keys_to_background_process(
             message: format!("palyra.process.send_keys pid {} is no longer active", input.pid),
         });
     }
+    require_background_process_provenance(
+        input.pid,
+        &snapshot.provenance,
+        "palyra.process.send_keys",
+    )?;
     let status =
         background_process_runtime_status(input.pid).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -2908,7 +4069,7 @@ pub(crate) fn send_keys_to_background_process(
             ),
         })?;
     if !status.alive() {
-        mark_background_process_stopped(input.pid);
+        mark_background_process_stopped(&snapshot.identity);
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
             message: format!("palyra.process.send_keys pid {} is not alive", input.pid),
@@ -3222,15 +4383,62 @@ pub(crate) fn background_process_runtime_status(
 #[cfg(windows)]
 fn background_process_runtime_status_from_windows_job(
     pid: u32,
+    expected: &ProcessProvenance,
     job: &WindowsBackgroundJob,
 ) -> io::Result<BackgroundProcessRuntimeStatus> {
-    let direct_pid_alive = process_id_is_alive(pid)?;
+    let direct_pid_alive = match current_process_start_token(pid)? {
+        Some(start_token) if start_token == expected.start_token => process_id_is_alive(pid)?,
+        Some(_) | None => false,
+    };
     let tracked_process_count = job.active_process_count()?;
     Ok(BackgroundProcessRuntimeStatus {
         direct_pid_alive,
         process_tree_alive: tracked_process_count > 0,
         tracked_process_count: Some(tracked_process_count),
     })
+}
+
+#[cfg(windows)]
+fn wait_for_windows_background_process_inactive(
+    pid: u32,
+    expected: &ProcessProvenance,
+    job: &WindowsBackgroundJob,
+    max_wait: Duration,
+) -> io::Result<Option<BackgroundProcessRuntimeStatus>> {
+    let started_at = Instant::now();
+    loop {
+        let status = background_process_runtime_status_from_windows_job(pid, expected, job)?;
+        if !status.alive() {
+            return Ok(Some(status));
+        }
+        if started_at.elapsed() >= max_wait {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
+    }
+}
+
+#[cfg(windows)]
+fn background_process_runtime_status_for_identity(
+    identity: &BackgroundProcessIdentity,
+) -> io::Result<BackgroundProcessRuntimeStatus> {
+    let job = identity.windows_job.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "background process {} has no exact Windows Job Object capability",
+                identity.pid
+            ),
+        )
+    })?;
+    background_process_runtime_status_from_windows_job(identity.pid, &identity.provenance, job)
+}
+
+#[cfg(not(windows))]
+fn background_process_runtime_status_for_identity(
+    identity: &BackgroundProcessIdentity,
+) -> io::Result<BackgroundProcessRuntimeStatus> {
+    background_process_runtime_status(identity.pid)
 }
 
 #[cfg(windows)]
@@ -3779,6 +4987,32 @@ fn validate_background_lifetime_mode(
             message: format!(
                 "palyra.process.run lifetime_mode='{}' requires background=true",
                 lifetime_mode.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_background_registration_fence(
+    input: &ProcessRunnerInput,
+    registration_fence: Option<&BackgroundProcessRegistrationFence>,
+) -> Result<(), SandboxProcessRunError> {
+    if !input.background {
+        return Ok(());
+    }
+    if input.background && registration_fence.is_none() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: "local background process execution requires a host-owned durable registration fence"
+                .to_owned(),
+        });
+    }
+    if input.effective_lifetime_mode().is_detached_handoff() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "local background lifetime_mode='{}' is unavailable until durable detached process handoff is implemented",
+                input.effective_lifetime_mode().as_str()
             ),
         });
     }
@@ -6494,6 +7728,72 @@ fn apply_managed_process_fault_without_child(
     }
 }
 
+#[cfg(unix)]
+fn apply_managed_process_fault_with_unix_supervisor(
+    fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
+    point_id: &'static str,
+    actor: &'static str,
+    child: ManagedChildGuard,
+    supervisor_control: &UnixProcessSupervisorControl,
+    registration_identity: Option<&BackgroundProcessIdentity>,
+) -> Result<ManagedChildGuard, SandboxProcessRunError> {
+    match managed_process_fault(fault_injection, point_id, actor)? {
+        QaFaultDirective::Continue => Ok(child),
+        QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+            QaFaultAction::TerminateProcess => {
+                let recovery_class = match point_id {
+                    "managed_process.after_effect_before_ack" => {
+                        QaFaultRecoveryClass::OutcomeUnknown
+                    }
+                    "managed_process.after_ack_before_transition" => {
+                        QaFaultRecoveryClass::CleanupSucceeded
+                    }
+                    _ => {
+                        return Err(SandboxProcessRunError {
+                            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                            message: format!(
+                                "qa_fault.managed_process_recovery_unclassified: {point_id}"
+                            ),
+                        });
+                    }
+                };
+                terminate_unix_supervised_background_child(
+                    child,
+                    supervisor_control,
+                    registration_identity,
+                    "fault injection",
+                )?;
+                fault_injection
+                    .record_verified_recovery(
+                        &directive,
+                        recovery_class,
+                        "qa_fault.managed_process_owned_tree_cleanup_verified",
+                    )
+                    .map_err(|error| SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                        message: format!("qa_fault.managed_process_recovery_failed: {error}"),
+                    })?;
+                #[cfg(feature = "qa-fault-injection")]
+                fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message:
+                        "qa_fault.feature_disabled: terminate directive reached a feature-off build"
+                            .to_owned(),
+                })
+            }
+            action => Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "qa_fault.managed_process_action_unsupported: {}",
+                    action.kind().as_str()
+                ),
+            }),
+        },
+    }
+}
+
 fn apply_managed_process_fault_with_child(
     fault_injection: &crate::qa_fault_injection::QaFaultRuntime,
     point_id: &'static str,
@@ -6734,6 +8034,168 @@ fn configure_background_child_suspended(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_background_child_suspended(_command: &mut Command) {}
 
+#[cfg(unix)]
+fn freeze_unix_supervisor_launch_spec(
+    command: &Command,
+    policy: &SandboxProcessRunnerPolicy,
+    apply_resource_limits: bool,
+    lifetime: Duration,
+) -> Result<UnixSupervisorLaunchSpec, SandboxProcessRunError> {
+    let program = command.get_program().to_os_string();
+    if !Path::new(&program).is_absolute() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: "sandbox background target plan requires an absolute executable".to_owned(),
+        });
+    }
+    let args = command.get_args().map(OsStr::to_os_string).collect::<Vec<_>>();
+    let cwd =
+        command.get_current_dir().map(Path::to_path_buf).ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: "sandbox background target plan omitted its working directory".to_owned(),
+        })?;
+    let mut environment = Vec::new();
+    for (key, value) in command.get_envs() {
+        let Some(value) = value else {
+            continue;
+        };
+        environment.push((key.to_os_string(), value.to_os_string()));
+    }
+    let limits = apply_resource_limits.then_some(UnixSupervisorLimits {
+        cpu_time_limit_ms: policy.cpu_time_limit_ms,
+        memory_limit_bytes: policy.memory_limit_bytes,
+    });
+    Ok(UnixSupervisorLaunchSpec {
+        program,
+        args,
+        cwd,
+        environment,
+        limits,
+        lifetime_ms: u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+#[cfg(unix)]
+fn spawn_unix_supervised_background_child(
+    target_command: &Command,
+    policy: &SandboxProcessRunnerPolicy,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime: Duration,
+    apply_resource_limits: bool,
+) -> Result<PreparedUnixSupervisedBackgroundChild, SandboxProcessRunError> {
+    let launch_spec = freeze_unix_supervisor_launch_spec(
+        target_command,
+        policy,
+        apply_resource_limits,
+        lifetime,
+    )?;
+    let current_executable = std::env::current_exe().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::SpawnFailed,
+        message: format!("failed to resolve trusted palyrad supervisor executable: {error}"),
+    })?;
+    let selected_executable_sha256 =
+        sha256_file_bounded(current_executable.as_path()).map_err(|error| {
+            SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::SpawnFailed,
+                message: format!("failed to hash trusted palyrad supervisor executable: {error}"),
+            }
+        })?;
+    let (mut supervisor, control) = UnixProcessSupervisorControl::prepare(current_executable)
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: format!("failed to prepare trusted Unix process supervisor: {error}"),
+        })?;
+    supervisor
+        .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = supervisor.spawn().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::SpawnFailed,
+        message: format!("failed to spawn trusted Unix process supervisor: {error}"),
+    })?;
+    let child = ManagedChildGuard::new_reap_only(child);
+    if let Err(error) = control.await_ready(child.id()) {
+        let readiness_error = SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("trusted Unix process supervisor readiness failed: {error}"),
+        };
+        return Err(settle_unready_unix_supervisor_failure(child, control, readiness_error));
+    }
+    let observed_executable_sha256 = match current_process_executable_sha256(child.id()) {
+        Ok(observed) => observed,
+        Err(_) => {
+            let identity_error = SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: "trusted Unix process supervisor image identity could not be verified"
+                    .to_owned(),
+            };
+            return Err(settle_unready_unix_supervisor_failure(child, control, identity_error));
+        }
+    };
+    if observed_executable_sha256 != selected_executable_sha256 {
+        let identity_error = SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: "trusted Unix process supervisor image identity mismatch".to_owned(),
+        };
+        return Err(settle_unready_unix_supervisor_failure(child, control, identity_error));
+    }
+    if let Err(error) = control.set_launch_spec(launch_spec) {
+        let plan_error = SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("trusted Unix process supervisor launch plan failed: {error}"),
+        };
+        return Err(settle_unready_unix_supervisor_failure(child, control, plan_error));
+    }
+    Ok(PreparedUnixSupervisedBackgroundChild {
+        child,
+        control: Arc::new(control),
+        supervisor_executable_sha256: selected_executable_sha256,
+    })
+}
+
+#[cfg(unix)]
+fn settle_unready_unix_supervisor_failure(
+    mut child: ManagedChildGuard,
+    control: UnixProcessSupervisorControl,
+    original: SandboxProcessRunError,
+) -> SandboxProcessRunError {
+    drop(control);
+    match child.wait_for_exit(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
+        Ok(Some(_)) => original,
+        Ok(None) => SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "{}; unregistered trusted supervisor did not exit after control shutdown",
+                original.message
+            ),
+        },
+        Err(error) => SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "{}; unregistered trusted supervisor reap failed: {error}",
+                original.message
+            ),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn release_unix_supervised_background_target(
+    child: ManagedChildGuard,
+    control: Arc<UnixProcessSupervisorControl>,
+) -> Result<UnixSupervisedBackgroundChild, (ManagedChildGuard, SandboxProcessRunError)> {
+    match control.start_target() {
+        Ok(target_pid) => Ok(UnixSupervisedBackgroundChild { child, control, target_pid }),
+        Err(error) => Err((
+            child,
+            SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!("trusted Unix process supervisor failed to start target: {error}"),
+            },
+        )),
+    }
+}
+
 fn spawn_background_process(
     request: BackgroundProcessSpawnRequest<'_>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
@@ -6747,18 +8209,22 @@ fn spawn_background_process(
         max_lifetime,
         auto_background_reason,
         lifetime_mode,
+        registration_fence,
         fault_injection,
     } = request;
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
-    configure_child_process_group(&mut command);
-    configure_background_child_suspended(&mut command);
     let capabilities = BackgroundProcessHandleCapabilities::from_input(input);
-    command
-        .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if !process_runner_allows_host_access(policy) {
-        attach_resource_limits_unix(&mut command, policy);
+    #[cfg(windows)]
+    {
+        configure_child_process_group(&mut command);
+        configure_background_child_suspended(&mut command);
+        command
+            .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if !process_runner_allows_host_access(policy) {
+            attach_resource_limits_unix(&mut command, policy);
+        }
     }
 
     // Every startup wait below is bounded by this budget, which reserves a slice of the
@@ -6772,30 +8238,85 @@ fn spawn_background_process(
         "managed_process.before_effect",
         "background",
     )?;
-    let child = command.spawn().map_err(|error| SandboxProcessRunError {
-        kind: SandboxProcessRunErrorKind::SpawnFailed,
-        message: process_spawn_failed_message(policy, input, cwd, &error),
-    })?;
-    // The advertised lifetime starts once the OS process exists. Fault handling, Windows owner
-    // binding/resume, and registry contention must not give a live process unmetered runtime.
-    let started_at = Instant::now();
     #[cfg(windows)]
-    let child = prepare_windows_background_child(ManagedChildGuard::new(child))?;
-    #[cfg(not(windows))]
-    let child = ManagedChildGuard::new(child);
-    let mut child = apply_managed_process_fault_with_child(
-        fault_injection,
-        "managed_process.after_effect_before_ack",
-        "background",
-        child,
-    )?;
+    let mut child = {
+        let child = command.spawn().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: process_spawn_failed_message(policy, input, cwd, &error),
+        })?;
+        bind_windows_background_child(ManagedChildGuard::new(child))?
+    };
+    #[cfg(unix)]
+    let PreparedUnixSupervisedBackgroundChild {
+        mut child,
+        control: unix_supervisor_control,
+        supervisor_executable_sha256,
+    } = match spawn_unix_supervised_background_child(
+        &command,
+        policy,
+        capabilities,
+        lifetime,
+        !process_runner_allows_host_access(policy),
+    ) {
+        Ok(supervisor) => supervisor,
+        Err(error) => return Err(error),
+    };
+    #[cfg(not(any(unix, windows)))]
+    let mut child = {
+        configure_child_process_group(&mut command);
+        configure_background_child_suspended(&mut command);
+        command
+            .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        ManagedChildGuard::new(command.spawn().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: process_spawn_failed_message(policy, input, cwd, &error),
+        })?)
+    };
+    // The advertised lifetime starts once the ownership root exists. Fault handling, target
+    // release, Windows owner binding/resume, and registry contention must not give a live tree
+    // unmetered runtime.
+    let started_at = Instant::now();
     let pid = child.id();
     #[cfg(windows)]
     let windows_job_bound = true;
     #[cfg(not(windows))]
     let windows_job_bound = false;
+    #[cfg(unix)]
+    let registration_control = Arc::clone(&unix_supervisor_control);
+    #[cfg(unix)]
+    let provenance_result = capture_background_process_provenance_with_executable_sha256(
+        pid,
+        Some(supervisor_executable_sha256.as_str()),
+    );
+    #[cfg(not(unix))]
+    let provenance_result = capture_background_process_provenance(pid);
+    let provenance = match provenance_result {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            #[cfg(unix)]
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                None,
+                "provenance capture failure",
+            )?;
+            #[cfg(not(unix))]
+            terminate_background_child(child)?;
+            return Err(error);
+        }
+    };
     let stdin = capabilities.stdin.then(|| child.child_mut().stdin.take()).flatten();
     if capabilities.stdin && stdin.is_none() {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            None,
+            "stdin capture failure",
+        )?;
+        #[cfg(not(unix))]
         terminate_background_child(child)?;
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -6805,9 +8326,102 @@ fn spawn_background_process(
             ),
         });
     }
-    if let Err(error) = register_background_process_pid(pid, capabilities, lifetime_mode, stdin) {
-        terminate_background_child(child)?;
+    let registration_identity = match register_background_process_pid(
+        pid,
+        capabilities,
+        lifetime_mode,
+        provenance.clone(),
+        stdin,
+        #[cfg(unix)]
+        Some(registration_control),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            #[cfg(unix)]
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                None,
+                "registry insertion failure",
+            )?;
+            #[cfg(not(unix))]
+            terminate_background_child(child)?;
+            return Err(error);
+        }
+    };
+    let registration_request = BackgroundProcessRegistrationRequest {
+        pid,
+        provenance: provenance.clone(),
+        lifetime_ms,
+        lifetime_mode,
+    };
+    if let Some(registration_fence) = registration_fence {
+        if let Err(error) = registration_fence(registration_request) {
+            #[cfg(unix)]
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "durable registration failure",
+            )?;
+            #[cfg(not(unix))]
+            settle_background_registration_failure(child, &registration_identity)?;
+            return Err(error);
+        }
+    }
+    #[cfg(windows)]
+    if let Err(error) = resume_windows_background_child(&child) {
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(error);
+    }
+    #[cfg(unix)]
+    let (released_child, unix_supervisor_control, target_pid) =
+        match release_unix_supervised_background_target(child, unix_supervisor_control) {
+            Ok(released) => (released.child, released.control, released.target_pid),
+            Err((child, error)) => {
+                terminate_unix_supervised_background_child(
+                    child,
+                    unix_supervisor_control.as_ref(),
+                    Some(&registration_identity),
+                    "target start failure",
+                )?;
+                return Err(error);
+            }
+        };
+    #[cfg(unix)]
+    {
+        child = released_child;
+        if let Err(error) = attach_background_target_pid(&registration_identity, target_pid) {
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "target metadata attachment failure",
+            )?;
+            return Err(error);
+        }
+    }
+    #[cfg(not(unix))]
+    let target_pid = pid;
+    #[cfg(unix)]
+    {
+        child = apply_managed_process_fault_with_unix_supervisor(
+            fault_injection,
+            "managed_process.after_effect_before_ack",
+            "background",
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        child = apply_managed_process_fault_with_child(
+            fault_injection,
+            "managed_process.after_effect_before_ack",
+            "background",
+            child,
+        )?;
     }
     let output_monitor = match start_background_output_monitor(
         child.child_mut(),
@@ -6815,11 +8429,29 @@ fn spawn_background_process(
     ) {
         Ok(output_monitor) => output_monitor,
         Err(error) => {
+            #[cfg(unix)]
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "output monitor startup failure",
+            )?;
+            #[cfg(not(unix))]
             terminate_background_child(child)?;
             return Err(error);
         }
     };
-    if let Err(error) = attach_background_output_monitor(pid, output_monitor.clone()) {
+    if let Err(error) =
+        attach_background_output_monitor(&registration_identity, output_monitor.clone())
+    {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "output monitor attachment failure",
+        )?;
+        #[cfg(not(unix))]
         terminate_background_child(child)?;
         return Err(error);
     }
@@ -6828,11 +8460,27 @@ fn spawn_background_process(
         started_at.elapsed(),
         Duration::from_millis(BACKGROUND_STARTUP_CHECK_MS),
     ) else {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "startup budget expiry",
+        )?;
+        #[cfg(not(unix))]
         terminate_background_child(child)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     };
     thread::sleep(startup_check_wait);
     if remaining_background_process_lifetime(startup_budget, started_at.elapsed()).is_none() {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "startup budget expiry",
+        )?;
+        #[cfg(not(unix))]
         terminate_background_child(child)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     }
@@ -6846,6 +8494,14 @@ fn spawn_background_process(
                     input.command
                 ),
             };
+            #[cfg(unix)]
+            terminate_unix_supervised_background_child(
+                child,
+                unix_supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "startup status failure",
+            )?;
+            #[cfg(not(unix))]
             terminate_background_child(child)?;
             return Err(error);
         }
@@ -6858,8 +8514,16 @@ fn spawn_background_process(
         )
         .unwrap_or(Duration::ZERO);
         let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "startup terminal status",
+        )?;
+        #[cfg(not(unix))]
+        terminate_background_child(child)?;
         if status.success() {
-            terminate_background_child(child)?;
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -6874,7 +8538,6 @@ fn spawn_background_process(
                 },
             );
         }
-        terminate_background_child(child)?;
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
     let cleanup = background_cleanup_metadata(pid, lifetime_ms, windows_job_bound);
@@ -6885,6 +8548,18 @@ fn spawn_background_process(
     )
     .unwrap_or(Duration::ZERO);
     let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
+    if output_monitor.quota_exceeded() {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "startup output quota",
+        )?;
+        #[cfg(not(unix))]
+        terminate_background_child(child)?;
+        return Err(background_process_output_quota_error(policy, &stdout, &stderr));
+    }
     let post_output_exit_check = bounded_background_process_wait(
         startup_budget,
         started_at.elapsed(),
@@ -6897,13 +8572,29 @@ fn spawn_background_process(
         match wait_for_background_process_exit(&mut child, post_output_exit_check) {
             Ok(status) => status,
             Err(error) => {
+                #[cfg(unix)]
+                terminate_unix_supervised_background_child(
+                    child,
+                    unix_supervisor_control.as_ref(),
+                    Some(&registration_identity),
+                    "post-output status failure",
+                )?;
+                #[cfg(not(unix))]
                 terminate_background_child(child)?;
                 return Err(error);
             }
         };
     if let Some(status) = post_output_status {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "post-output terminal status",
+        )?;
+        #[cfg(not(unix))]
+        terminate_background_child(child)?;
         if status.success() {
-            terminate_background_child(child)?;
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -6918,31 +8609,68 @@ fn spawn_background_process(
                 },
             );
         }
-        terminate_background_child(child)?;
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
     let Some(remaining_lifetime) =
         remaining_background_process_lifetime(lifetime, started_at.elapsed())
     else {
+        #[cfg(unix)]
+        terminate_unix_supervised_background_child(
+            child,
+            unix_supervisor_control.as_ref(),
+            Some(&registration_identity),
+            "lifetime expiry before monitor handoff",
+        )?;
+        #[cfg(not(unix))]
         terminate_background_child(child)?;
         return Err(background_process_lifetime_expired_error(input, lifetime_ms));
     };
+    #[cfg(unix)]
+    let child = apply_managed_process_fault_with_unix_supervisor(
+        fault_injection,
+        "managed_process.after_ack_before_transition",
+        "background",
+        child,
+        unix_supervisor_control.as_ref(),
+        Some(&registration_identity),
+    )?;
+    #[cfg(not(unix))]
     let child = apply_managed_process_fault_with_child(
         fault_injection,
         "managed_process.after_ack_before_transition",
         "background",
         child,
     )?;
+    let monitor_output = output_monitor.clone();
     // The monitor thread owns the child from here; it reaps a natural exit or kills the tree
     // when the remaining lifetime expires, so no background process can outlive its budget.
     let background_fault_injection = fault_injection.clone();
-    thread::spawn(move || {
-        monitor_background_child_until_lifetime(
-            child,
-            remaining_lifetime,
-            background_fault_injection,
-        )
-    });
+    let monitor =
+        thread::Builder::new().name(format!("palyra-process-monitor-{pid}")).spawn(move || {
+            monitor_background_child_until_lifetime(
+                child,
+                monitor_output,
+                registration_identity,
+                #[cfg(unix)]
+                unix_supervisor_control,
+                remaining_lifetime,
+                background_fault_injection,
+            )
+        });
+    if let Err(error) = monitor {
+        let cleanup_error = terminate_retained_background_process(pid, &provenance).err();
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: match cleanup_error {
+                Some(cleanup_error) => format!(
+                    "failed to start background process monitor for pid {pid}: {error}; exact retained cleanup also failed: {cleanup_error}"
+                ),
+                None => format!(
+                    "failed to start background process monitor for pid {pid}: {error}; exact retained cleanup verified process-tree absence"
+                ),
+            },
+        });
+    }
 
     let RedactedProcessOutputText {
         text: stdout_text,
@@ -7022,13 +8750,17 @@ fn spawn_background_process(
             background_lifetime_adjustment_note,
             background_lifetime_note(durable_handoff, lifetime_ms, max_lifetime_ms)
         ),
+        "target_pid": target_pid,
         "process_handle": {
-            "kind": "pid",
+            "kind": if cfg!(unix) { "unix_process_supervisor" } else { "pid" },
+            "ownership_root_pid": pid,
             "direct_process_pid": pid,
-            "process_tree": cfg!(windows),
+            "target_pid": target_pid,
+            "process_tree": cfg!(any(unix, windows)),
             "windows_job_object": windows_job_bound,
+            "provenance": provenance,
             "capabilities": process_handle_capabilities_json(capabilities, ports.as_slice(), lifetime_mode),
-            "identity_note": "pid is the direct process spawned by palyra.process.run; a descendant process may own listening sockets"
+            "identity_note": "pid identifies the ownership root, not necessarily the user target; lifecycle operations require the matching start token, executable digest, owner nonce, and process-group or Job Object identity"
         },
         "cleanup": cleanup,
         "handoff": handoff,
@@ -7375,6 +9107,21 @@ fn wait_for_background_process_exit(
     }
 }
 
+fn background_process_output_quota_error(
+    policy: &SandboxProcessRunnerPolicy,
+    stdout: &StreamCapture,
+    stderr: &StreamCapture,
+) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::QuotaExceeded,
+        message: format!(
+            "sandbox background process exceeded output quota (max_output_bytes={}) and was terminated; process_output_summary={}",
+            policy.max_output_bytes,
+            process_output_diagnostic_summary(stdout, stderr)
+        ),
+    }
+}
+
 fn background_process_startup_failure(
     input: &ProcessRunnerInput,
     status: ExitStatus,
@@ -7432,10 +9179,10 @@ fn start_background_output_monitor(
     spawn_background_capture_reader(
         stderr,
         remaining_budget,
-        quota_triggered,
+        Arc::clone(&quota_triggered),
         Arc::clone(&stderr_capture),
     );
-    Ok(BackgroundOutputMonitor { stdout: stdout_capture, stderr: stderr_capture })
+    Ok(BackgroundOutputMonitor { stdout: stdout_capture, stderr: stderr_capture, quota_triggered })
 }
 
 // Background variant of spawn_capture_reader: publishes incrementally into a shared capture
@@ -7465,7 +9212,7 @@ fn spawn_background_capture_reader<R>(
                         }
                     }
                     if granted < read_count {
-                        quota_triggered.store(true, Ordering::Relaxed);
+                        quota_triggered.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -7547,42 +9294,170 @@ fn wait_for_owned_background_tree_inactive(pid: u32, max_wait: Duration) -> io::
     }
 }
 
-fn release_verified_background_process_tracking(pid: u32) {
-    mark_background_process_stopped(pid);
+fn terminate_owned_background_process_tree_for_identity(
+    pid: u32,
+    identity: Option<&BackgroundProcessIdentity>,
+) -> io::Result<()> {
     #[cfg(windows)]
-    remove_windows_background_job(pid);
+    if let Some(identity) = identity {
+        return identity
+            .windows_job
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("background process {pid} has no exact Windows Job Object capability"),
+                )
+            })?
+            .terminate();
+    }
+    let _ = identity;
+    terminate_owned_background_process_tree(pid)
+}
+
+fn owned_background_process_tree_is_alive_for_identity(
+    pid: u32,
+    identity: Option<&BackgroundProcessIdentity>,
+) -> io::Result<bool> {
+    #[cfg(windows)]
+    if let Some(identity) = identity {
+        return identity
+            .windows_job
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("background process {pid} has no exact Windows Job Object capability"),
+                )
+            })?
+            .active_process_count()
+            .map(|active_count| active_count > 0);
+    }
+    let _ = identity;
+    owned_background_process_tree_is_alive(pid)
+}
+
+fn wait_for_owned_background_tree_inactive_for_identity(
+    pid: u32,
+    identity: Option<&BackgroundProcessIdentity>,
+    max_wait: Duration,
+) -> io::Result<bool> {
+    let started_at = Instant::now();
+    loop {
+        if !owned_background_process_tree_is_alive_for_identity(pid, identity)? {
+            return Ok(true);
+        }
+        if started_at.elapsed() >= max_wait {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
+    }
+}
+
+fn request_background_child_termination(
+    child: &mut ManagedChildGuard,
+    identity: Option<&BackgroundProcessIdentity>,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(identity) = identity {
+        terminate_owned_background_process_tree_for_identity(child.id(), Some(identity))?;
+        child.note_owned_tree_termination_requested();
+        return Ok(());
+    }
+    let _ = identity;
+    child.request_termination()
+}
+
+fn release_verified_background_process_tracking_exact(identity: &BackgroundProcessIdentity) {
+    mark_background_process_stopped(identity);
+    #[cfg(windows)]
+    if !background_process_cleanup_authority_retained_exact(identity) {
+        if let Some(job) = identity.windows_job.as_ref() {
+            remove_windows_background_job_exact(identity.pid, job);
+        }
+    }
+}
+
+fn release_verified_background_process_tracking(pid: u32) {
+    if let Ok(snapshot) = registered_background_process("release tracking", pid) {
+        release_verified_background_process_tracking_exact(&snapshot.identity);
+    } else {
+        #[cfg(windows)]
+        remove_windows_background_job(pid);
+    }
+}
+
+fn settle_background_registration_failure(
+    child: ManagedChildGuard,
+    identity: &BackgroundProcessIdentity,
+) -> Result<(), SandboxProcessRunError> {
+    match terminate_background_child_exact(child, identity) {
+        Ok(()) => Ok(()),
+        Err(cleanup_error) => {
+            let process_alive = background_process_runtime_status_for_identity(identity)
+                .map(BackgroundProcessRuntimeStatus::alive)
+                .unwrap_or(true);
+            // The registration callback may already have used and released the exact platform
+            // ownership anchor. Suppress the duplicate cleanup failure only when that callback
+            // also proved the ownership domain absent; otherwise losing the anchor remains fatal.
+            if !process_alive && !background_process_cleanup_authority_retained_exact(identity) {
+                mark_background_process_stopped(identity);
+                Ok(())
+            } else {
+                Err(cleanup_error)
+            }
+        }
+    }
 }
 
 fn terminate_background_child(mut child: ManagedChildGuard) -> Result<(), SandboxProcessRunError> {
+    terminate_background_child_with_identity(&mut child, None)
+}
+
+fn terminate_background_child_exact(
+    mut child: ManagedChildGuard,
+    identity: &BackgroundProcessIdentity,
+) -> Result<(), SandboxProcessRunError> {
+    terminate_background_child_with_identity(&mut child, Some(identity))
+}
+
+fn terminate_background_child_with_identity(
+    child: &mut ManagedChildGuard,
+    identity: Option<&BackgroundProcessIdentity>,
+) -> Result<(), SandboxProcessRunError> {
     let pid = child.id();
     match child.try_wait() {
         Ok(Some(_)) => {
-            terminate_owned_background_process_tree(pid).map_err(|error| {
-                SandboxProcessRunError {
+            terminate_owned_background_process_tree_for_identity(pid, identity).map_err(
+                |error| SandboxProcessRunError {
                     kind: SandboxProcessRunErrorKind::RuntimeFailure,
                     message: format!(
                         "sandbox background descendant cleanup failed for reaped pid {pid}: {error}"
                     ),
+                },
+            )?;
+        }
+        Ok(None) => {
+            request_background_child_termination(child, identity).map_err(|error| {
+                SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!(
+                        "sandbox background process cleanup failed for pid {pid}: {error}"
+                    ),
                 }
             })?;
         }
-        Ok(None) => {
-            child.request_termination().map_err(|error| SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::RuntimeFailure,
-                message: format!(
-                    "sandbox background process cleanup failed for pid {pid}: {error}"
-                ),
-            })?;
-        }
         Err(wait_error) => {
-            terminate_owned_background_process_tree(pid).map_err(|termination_error| {
+            terminate_owned_background_process_tree_for_identity(pid, identity).map_err(
+                |termination_error| {
                 SandboxProcessRunError {
                     kind: SandboxProcessRunErrorKind::RuntimeFailure,
                     message: format!(
                         "sandbox background wait probe failed for pid {pid}: {wait_error}; owned-tree termination also failed: {termination_error}"
                     ),
                 }
-            })?;
+            },
+            )?;
             child.note_owned_tree_termination_requested();
         }
     }
@@ -7600,8 +9475,9 @@ fn terminate_background_child(mut child: ManagedChildGuard) -> Result<(), Sandbo
             ),
         });
     }
-    let tree_inactive = wait_for_owned_background_tree_inactive(
+    let tree_inactive = wait_for_owned_background_tree_inactive_for_identity(
         pid,
+        identity,
         Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
     )
     .map_err(|error| SandboxProcessRunError {
@@ -7616,12 +9492,55 @@ fn terminate_background_child(mut child: ManagedChildGuard) -> Result<(), Sandbo
             ),
         });
     }
-    release_verified_background_process_tracking(pid);
+    if let Some(identity) = identity {
+        release_verified_background_process_tracking_exact(identity);
+    } else {
+        release_verified_background_process_tracking(pid);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_unix_supervised_background_child(
+    mut child: ManagedChildGuard,
+    supervisor_control: &UnixProcessSupervisorControl,
+    registration_identity: Option<&BackgroundProcessIdentity>,
+    reason: &str,
+) -> Result<(), SandboxProcessRunError> {
+    let pid = child.id();
+    supervisor_control.terminate().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "trusted Unix process supervisor cleanup failed for pid {pid} ({reason}): {error}"
+        ),
+    })?;
+    let direct_exit = child
+        .wait_for_exit(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "trusted Unix process supervisor reap failed for pid {pid} ({reason}): {error}"
+            ),
+        })?;
+    if direct_exit.is_none() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "trusted Unix process supervisor pid {pid} did not exit after acknowledged cleanup ({reason})"
+            ),
+        });
+    }
+    if let Some(identity) = registration_identity {
+        mark_background_process_stopped_after_unix_cleanup(identity);
+    }
     Ok(())
 }
 
 fn monitor_background_child_until_lifetime(
     mut child: ManagedChildGuard,
+    output_monitor: BackgroundOutputMonitor,
+    registration_identity: BackgroundProcessIdentity,
+    #[cfg(unix)] supervisor_control: Arc<UnixProcessSupervisorControl>,
     lifetime: Duration,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) {
@@ -7629,6 +9548,27 @@ fn monitor_background_child_until_lifetime(
     let started_at = Instant::now();
     let mut direct_child_exited = false;
     loop {
+        if output_monitor.quota_exceeded() {
+            #[cfg(unix)]
+            let cleanup = terminate_unix_supervised_background_child(
+                child,
+                supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "output quota",
+            );
+            #[cfg(not(unix))]
+            let cleanup = terminate_background_child_exact(child, &registration_identity);
+            if let Err(error) = cleanup {
+                warn!(error = ?error, pid, "background process output-quota cleanup failed");
+            } else {
+                warn!(
+                    pid,
+                    reason_code = "process.output_quota_exceeded",
+                    "background process exceeded output quota and was terminated"
+                );
+            }
+            return;
+        }
         if !direct_child_exited {
             match child.try_wait() {
                 Ok(Some(_)) => {
@@ -7637,7 +9577,16 @@ fn monitor_background_child_until_lifetime(
                 Ok(None) => {}
                 Err(error) => {
                     warn!(error = ?error, pid, "background process wait failed; forcing bounded cleanup");
-                    if let Err(cleanup_error) = terminate_background_child(child) {
+                    #[cfg(unix)]
+                    let cleanup = terminate_unix_supervised_background_child(
+                        child,
+                        supervisor_control.as_ref(),
+                        Some(&registration_identity),
+                        "wait failure",
+                    );
+                    #[cfg(not(unix))]
+                    let cleanup = terminate_background_child_exact(child, &registration_identity);
+                    if let Err(cleanup_error) = cleanup {
                         warn!(error = ?cleanup_error, pid, "background process wait-failure cleanup failed");
                     }
                     return;
@@ -7645,15 +9594,36 @@ fn monitor_background_child_until_lifetime(
             }
         }
         if direct_child_exited {
-            match owned_background_process_tree_is_alive(pid) {
+            #[cfg(unix)]
+            {
+                match supervisor_control.terminate() {
+                    Ok(()) => {
+                        mark_background_process_stopped_after_unix_cleanup(&registration_identity);
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = ?error,
+                            pid,
+                            "trusted Unix supervisor exited without consumable cleanup acknowledgement; retaining process tracking"
+                        );
+                    }
+                }
+                return;
+            }
+            #[cfg(not(unix))]
+            match owned_background_process_tree_is_alive_for_identity(
+                pid,
+                Some(&registration_identity),
+            ) {
                 Ok(false) => {
-                    release_verified_background_process_tracking(pid);
+                    release_verified_background_process_tracking_exact(&registration_identity);
                     return;
                 }
                 Ok(true) => {}
                 Err(error) => {
                     warn!(error = ?error, pid, "owned background tree status failed; forcing bounded cleanup");
-                    if let Err(cleanup_error) = terminate_background_child(child) {
+                    let cleanup = terminate_background_child_exact(child, &registration_identity);
+                    if let Err(cleanup_error) = cleanup {
                         warn!(error = ?cleanup_error, pid, "background status-failure cleanup failed");
                     }
                     return;
@@ -7663,7 +9633,16 @@ fn monitor_background_child_until_lifetime(
 
         let elapsed = started_at.elapsed();
         if elapsed >= lifetime {
-            match terminate_background_child(child) {
+            #[cfg(unix)]
+            let cleanup = terminate_unix_supervised_background_child(
+                child,
+                supervisor_control.as_ref(),
+                Some(&registration_identity),
+                "lifetime expiry",
+            );
+            #[cfg(not(unix))]
+            let cleanup = terminate_background_child_exact(child, &registration_identity);
+            match cleanup {
                 Ok(()) => {
                     if let Err(error) = apply_managed_process_fault_after_verified_cleanup(
                         &fault_injection,
@@ -7683,6 +9662,49 @@ fn monitor_background_child_until_lifetime(
         let remaining = lifetime.saturating_sub(elapsed);
         thread::sleep(remaining.min(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS)));
     }
+}
+
+#[cfg(windows)]
+fn bind_windows_background_child(
+    child: ManagedChildGuard,
+) -> Result<ManagedChildGuard, SandboxProcessRunError> {
+    bind_windows_background_child_with_operation(child, bind_child_to_windows_background_job)
+}
+
+#[cfg(windows)]
+fn bind_windows_background_child_with_operation<Bind>(
+    mut child: ManagedChildGuard,
+    bind: Bind,
+) -> Result<ManagedChildGuard, SandboxProcessRunError>
+where
+    Bind: FnOnce(&Child, u32) -> io::Result<()>,
+{
+    let pid = child.id();
+    if let Err(bind_error) = bind(child.child(), pid) {
+        let cleanup = child
+            .terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+            .map(|status| status.is_some());
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process {pid} could not bind its required Windows job object before resume: {bind_error}; bounded direct-exit verification: {cleanup:?}"
+            ),
+        });
+    }
+    Ok(child)
+}
+
+#[cfg(windows)]
+fn resume_windows_background_child(
+    child: &ManagedChildGuard,
+) -> Result<(), SandboxProcessRunError> {
+    let pid = child.id();
+    resume_suspended_windows_process(pid).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "sandbox background process {pid} could not resume after Windows job ownership was established: {error}"
+        ),
+    })
 }
 
 #[cfg(windows)]
@@ -7721,6 +9743,7 @@ where
 
     if let Err(resume_error) = resume(pid) {
         let cleanup = terminate_background_child(child);
+        remove_windows_background_job(pid);
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!(
@@ -7937,6 +9960,16 @@ fn windows_background_jobs() -> &'static Mutex<HashMap<u32, Arc<WindowsBackgroun
 fn register_windows_background_job(pid: u32, job: Arc<WindowsBackgroundJob>) -> io::Result<()> {
     match windows_background_jobs().lock() {
         Ok(mut jobs) => {
+            if let Some(existing) = jobs.get(&pid) {
+                if existing.active_process_count()? > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "background process {pid} already owns an active Windows Job Object"
+                        ),
+                    ));
+                }
+            }
             jobs.insert(pid, job);
             Ok(())
         }
@@ -7974,13 +10007,49 @@ fn remove_windows_background_job(pid: u32) {
     }
 }
 
+#[cfg(any(windows, test))]
+fn remove_arc_registry_entry_if_same<T>(
+    entries: &mut HashMap<u32, Arc<T>>,
+    pid: u32,
+    expected: &Arc<T>,
+) -> bool {
+    if !entries.get(&pid).is_some_and(|current| Arc::ptr_eq(current, expected)) {
+        return false;
+    }
+    entries.remove(&pid);
+    true
+}
+
+#[cfg(windows)]
+fn remove_windows_background_job_exact(pid: u32, expected: &Arc<WindowsBackgroundJob>) -> bool {
+    windows_background_jobs()
+        .lock()
+        .map(|mut jobs| remove_arc_registry_entry_if_same(&mut jobs, pid, expected))
+        .unwrap_or(false)
+}
+
 /// Releases platform-specific process-tree tracking once a caller has verified the tree is
 /// inactive.
 #[cfg(windows)]
 pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
-    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
-        mark_background_process_stopped(pid);
-        remove_windows_background_job(pid);
+    let Ok(snapshot) = registered_background_process("release tracking", pid) else {
+        return;
+    };
+    release_background_process_tracking_if_stopped_exact(&snapshot.identity);
+}
+
+#[cfg(windows)]
+fn release_background_process_tracking_if_stopped_exact(identity: &BackgroundProcessIdentity) {
+    if background_process_runtime_status_for_identity(identity)
+        .map(|status| !status.alive())
+        .unwrap_or(false)
+    {
+        mark_background_process_stopped(identity);
+        if !background_process_cleanup_authority_retained_exact(identity) {
+            if let Some(job) = identity.windows_job.as_ref() {
+                remove_windows_background_job_exact(identity.pid, job);
+            }
+        }
     }
 }
 
@@ -7988,46 +10057,232 @@ pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
 /// inactive.
 #[cfg(not(windows))]
 pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
-    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
-        mark_background_process_stopped(pid);
+    let Ok(snapshot) = registered_background_process("release tracking", pid) else {
+        return;
+    };
+    release_background_process_tracking_if_stopped_exact(&snapshot.identity);
+}
+
+#[cfg(not(windows))]
+fn release_background_process_tracking_if_stopped_exact(identity: &BackgroundProcessIdentity) {
+    if background_process_runtime_status(identity.pid)
+        .map(|status| !status.alive())
+        .unwrap_or(false)
+    {
+        mark_background_process_stopped(identity);
     }
 }
 
-/// Terminates the process tree rooted at `pid` (Windows).
+#[cfg(unix)]
+fn registered_unix_supervisor_control(
+    pid: u32,
+    expected: &ProcessProvenance,
+    require_retained: bool,
+) -> io::Result<Arc<UnixProcessSupervisorControl>> {
+    let processes = registered_background_processes().lock().map_err(|error| {
+        io::Error::other(format!(
+            "background process registry lock poisoned for pid {pid}: {error}"
+        ))
+    })?;
+    let process = processes.get(&pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background process {pid} has no registered Unix supervisor capability"),
+        )
+    })?;
+    if process.provenance != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} Unix supervisor provenance does not match"),
+        ));
+    }
+    if require_retained && !process.cleanup_authority_retained {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} cleanup authority is not retained"),
+        ));
+    }
+    process.supervisor_control.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("background process {pid} has no exact Unix supervisor capability"),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn terminate_registered_unix_supervisor(pid: u32, expected: &ProcessProvenance) -> io::Result<()> {
+    let supervisor_control = registered_unix_supervisor_control(pid, expected, false)?;
+    match verify_background_process_provenance(pid, expected) {
+        ProcessProvenanceDisposition::Match => supervisor_control.terminate(),
+        ProcessProvenanceDisposition::Missing | ProcessProvenanceDisposition::Unsupported => {
+            // The exact control capability, not the reusable numeric PID, is the authority here.
+            // It may consume an autonomous cleanup acknowledgement after the supervisor exits.
+            supervisor_control.terminate()
+        }
+        ProcessProvenanceDisposition::Mismatch => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} provenance no longer matches"),
+        )),
+    }
+}
+
+/// Terminates a retained process tree and returns its verified inactive status.
 ///
-/// Both mechanisms always run: the registered job object catches descendants that detached
-/// from the visible process tree, while `taskkill /T` catches processes spawned before job
-/// binding or when binding failed. Success of either one counts as success.
+/// This recovery path is used when the process launched successfully but its durable lease could
+/// not be committed. It requires the exact in-memory ownership anchor and never falls back to a
+/// PID-only signal.
 ///
 /// # Errors
-///
-/// Returns an error only when every available termination mechanism failed; the message
-/// aggregates the per-mechanism failures.
-#[cfg(windows)]
-pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    let mut succeeded = false;
-    let mut errors = Vec::new();
-
-    if let Some(job) = windows_background_job(pid) {
-        match job.terminate() {
-            Ok(()) => succeeded = true,
-            Err(error) => errors.push(format!("job object termination failed: {error}")),
+/// Returns an error when provenance no longer matches, termination fails, or ownership-domain
+/// absence cannot be established within the bounded cleanup window.
+pub(crate) fn terminate_retained_background_process(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<BackgroundProcessRuntimeStatus> {
+    require_background_process_cleanup_authority(pid, expected)?;
+    let registration = registered_background_process("retained cleanup", pid).map_err(|error| {
+        io::Error::other(format!("failed to capture retained process identity: {}", error.message))
+    })?;
+    if registration.provenance != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} cleanup identity no longer matches"),
+        ));
+    }
+    let current_status = background_process_runtime_status_for_identity(&registration.identity)?;
+    // Cleanup can race the runner's own startup/monitor failure path. The retained exact registry
+    // entry remains the authority, but proven ownership-domain absence makes a second signal both
+    // unnecessary and unsafe if the numeric pid or process-group id is reused before settlement.
+    if !current_status.alive() {
+        mark_background_process_stopped(&registration.identity);
+        return Ok(current_status);
+    }
+    #[cfg(test)]
+    if forced_retained_background_cleanup_failures()
+        .lock()
+        .map_err(|error| {
+            io::Error::other(format!("forced cleanup registry lock poisoned: {error}"))
+        })?
+        .remove(&pid)
+    {
+        return Err(io::Error::other(format!(
+            "forced retained background cleanup failure for pid {pid}"
+        )));
+    }
+    #[cfg(windows)]
+    let retained_windows_job = registration.identity.windows_job.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("background process {pid} has no exact Windows Job Object capability"),
+        )
+    })?;
+    #[cfg(unix)]
+    let supervisor_control = registered_unix_supervisor_control(pid, expected, true)?;
+    #[cfg(unix)]
+    {
+        supervisor_control.terminate()?;
+        if !wait_for_process_not_alive(pid, Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "trusted Unix process supervisor {pid} remained alive after acknowledged cleanup"
+                ),
+            ));
         }
     }
-
-    match terminate_windows_process_tree(pid) {
-        Ok(()) => succeeded = true,
-        Err(error) => errors.push(format!("taskkill fallback failed: {error}")),
+    #[cfg(not(unix))]
+    {
+        terminate_owned_background_process_tree_for_identity(pid, Some(&registration.identity))?;
+        if !wait_for_owned_background_tree_inactive_for_identity(
+            pid,
+            Some(&registration.identity),
+            Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+        )? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("background process tree {pid} remained active after bounded cleanup"),
+            ));
+        }
     }
+    #[cfg(windows)]
+    let status = wait_for_windows_background_process_inactive(
+        pid,
+        expected,
+        &retained_windows_job,
+        Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+    )?
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "background process {pid} remained directly alive after verified ownership-domain cleanup"
+            ),
+        )
+    })?;
+    #[cfg(unix)]
+    let status = BackgroundProcessRuntimeStatus {
+        direct_pid_alive: false,
+        process_tree_alive: false,
+        tracked_process_count: Some(0),
+    };
+    #[cfg(not(any(unix, windows)))]
+    let status = {
+        let status = background_process_runtime_status(pid)?;
+        if status.alive() {
+            return Err(io::Error::other(format!(
+                "background process tree {pid} remained active after verified ownership-domain cleanup"
+            )));
+        }
+        status
+    };
+    #[cfg(unix)]
+    mark_background_process_stopped_after_unix_cleanup(&registration.identity);
+    #[cfg(not(unix))]
+    mark_background_process_stopped(&registration.identity);
+    Ok(status)
+}
 
-    if succeeded {
-        return Ok(());
+/// Terminates the exact registered process tree rooted at `pid` (Windows).
+///
+/// # Errors
+/// Returns an error when durable provenance no longer matches or the retained Job Object cannot
+/// terminate the tree. PID-based `taskkill` is deliberately excluded from this authority path.
+#[cfg(windows)]
+pub(crate) fn terminate_background_process_tree_exact(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<()> {
+    let registration = registered_background_process("exact Windows tree termination", pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error.message))?;
+    if registration.provenance != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("background process {pid} provenance no longer matches"),
+        ));
     }
+    registration
+        .identity
+        .windows_job
+        .as_ref()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("background process {pid} has no exact Windows Job Object capability"),
+            )
+        })?
+        .terminate()
+}
 
-    Err(io::Error::other(format!(
-        "failed to terminate background process tree rooted at pid {pid}: {}",
-        errors.join("; ")
-    )))
+#[cfg(windows)]
+fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
+    let snapshot = background_process_provenance_snapshot(pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background process {pid} has no registered provenance"),
+        )
+    })?;
+    terminate_background_process_tree_exact(pid, &snapshot.provenance)
 }
 
 #[cfg(windows)]
@@ -8096,37 +10351,39 @@ fn trusted_windows_system32_dir() -> io::Result<PathBuf> {
     }
 }
 
-/// Terminates the process tree rooted at `pid` (Unix).
-///
-/// Children are spawned with `process_group(0)`, so killing the process group with `SIGKILL`
-/// reaches the whole tree; a direct-pid kill is the fallback when the group kill fails (e.g.
-/// the leader already changed groups).
-///
-/// The public stop/status APIs only accept decimal `u32` values, but Unix syscalls take
-/// signed `pid_t`; values that cannot round-trip into `pid_t` are rejected instead of wrapping
-/// into another process or process-group id.
+/// Terminates the exact registered Unix target through its trusted supervisor capability.
 ///
 /// # Errors
-///
-/// Returns the OS error when both the group kill and the direct-pid kill fail.
+/// Returns an error when registered provenance differs, a live supervisor identity mismatches, or
+/// the exact supervisor capability cannot acknowledge verified cleanup. Once the supervisor is
+/// absent or live identity cannot be probed, only that retained capability may consume an autonomous
+/// cleanup acknowledgement; no direct-PID or raw process-group fallback is permitted.
 #[cfg(unix)]
-pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    match terminate_unix_process_group(pid) {
-        Ok(()) => Ok(()),
-        Err(group_error) => {
-            let process_id = unix_pid_from_u32(pid)?;
-            // SAFETY: kill(2) with SIGKILL is safe to call with any pid value; the worst case
-            // is an error return, which is handled below.
-            let result = unsafe { libc::kill(process_id, libc::SIGKILL) };
-            if result == 0 {
-                return Ok(());
-            }
-            let process_error = io::Error::last_os_error();
-            Err(io::Error::other(format!(
-                "failed to terminate process group or pid {pid}: group kill failed: {group_error}; pid kill failed: {process_error}"
-            )))
-        }
-    }
+pub(crate) fn terminate_background_process_tree_exact(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<()> {
+    terminate_registered_unix_supervisor(pid, expected)
+}
+
+#[cfg(unix)]
+fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
+    let provenance = registered_background_processes()
+        .lock()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "background process registry lock poisoned for pid {pid}: {error}"
+            ))
+        })?
+        .get(&pid)
+        .map(|process| process.provenance.clone())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("background process {pid} has no registered provenance"),
+            )
+        })?;
+    terminate_background_process_tree_exact(pid, &provenance)
 }
 
 /// Fallback for platforms without a supported termination mechanism: always fails so callers
@@ -8136,12 +10393,26 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
 ///
 /// Always returns [`io::ErrorKind::Unsupported`].
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    let _ = pid;
+pub(crate) fn terminate_background_process_tree_exact(
+    pid: u32,
+    expected: &ProcessProvenance,
+) -> io::Result<()> {
+    let _ = (pid, expected);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "portable background process termination is unsupported on this platform",
     ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
+    let snapshot = background_process_provenance_snapshot(pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background process {pid} has no registered provenance"),
+        )
+    })?;
+    terminate_background_process_tree_exact(pid, &snapshot.provenance)
 }
 
 #[cfg(unix)]
@@ -8157,8 +10428,12 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
+/// Reports whether an owned Unix process group has any live members.
+///
+/// # Errors
+/// Returns an error when the group id is invalid or the operating-system probe fails.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
+pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     let process_group_id = unix_pid_from_u32(pid)?;
     // Signal 0 probes the owned process group without changing it. A missing group is the only
     // successful cleanup proof; permission and other failures stay fail-closed.
@@ -8174,8 +10449,12 @@ fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     Err(error)
 }
 
+/// Reports whether an owned Unix process group has any live members.
+///
+/// # Errors
+/// Returns an error when the group id is invalid or the bounded Darwin snapshot cannot stabilize.
 #[cfg(target_os = "macos")]
-fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
+pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     let process_group_id = unix_pid_from_u32(pid)?;
     let mut process_ids: Vec<libc::pid_t> = vec![0; MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS];
     let buffer_size =
@@ -8276,6 +10555,21 @@ fn macos_process_group_signal_probe(process_group_id: libc::pid_t) -> io::Result
 }
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacProcessUniqueInfo {
+    _executable_uuid: [u8; 16],
+    unique_id: u64,
+    _parent_unique_id: u64,
+    id_version: i32,
+    _original_parent_id_version: i32,
+    _reserved_2: u64,
+    _reserved_3: u64,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacProcessUniqueInfo>() == 56);
+
+#[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
     #[link_name = "proc_listpgrppids"]
@@ -8291,6 +10585,12 @@ unsafe extern "C" {
         argument: u64,
         buffer: *mut std::ffi::c_void,
         buffer_size: i32,
+    ) -> i32;
+    #[link_name = "proc_pidpath"]
+    fn macos_proc_pidpath(
+        process_id: libc::pid_t,
+        buffer: *mut std::ffi::c_void,
+        buffer_size: u32,
     ) -> i32;
 }
 
@@ -8347,7 +10647,7 @@ fn process_id_is_alive(pid: u32) -> io::Result<bool> {
 
 fn terminate_child_process_tree(child: &mut Child) -> io::Result<()> {
     let pid = child.id();
-    match terminate_background_process_tree(pid) {
+    match terminate_owned_background_process_tree(pid) {
         Ok(()) => Ok(()),
         Err(tree_error) => child.kill().map_err(|direct_error| {
             io::Error::other(format!(
@@ -8387,11 +10687,16 @@ fn background_cleanup_command(pid: u32) -> serde_json::Value {
             "args": ["/PID", pid.to_string(), "/T", "/F"],
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        let _ = pid;
+        Value::Null
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         json!({
             "command": "kill",
-            "args": ["-TERM", format!("-{pid}")],
+            "args": ["-TERM", pid.to_string()],
         })
     }
 }
@@ -8401,9 +10706,13 @@ fn background_cleanup_note() -> &'static str {
     {
         "Use cleanup.portable_stop_command to terminate the direct process and its descendants; manual_command is a platform fallback if the run fails before automatic lifetime cleanup runs."
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        "Use cleanup.portable_stop_command to terminate the direct process group; manual_command is a platform fallback if the run fails before automatic lifetime cleanup runs."
+        "Use cleanup.portable_stop_command; the registered Unix pid is a trusted supervisor anchor and must not be signalled as the target cleanup group. Cleanup covers processes that remain in the supervised target process group; descendants that deliberately leave it are outside this portable ownership domain."
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "Use cleanup.portable_stop_command to terminate the registered ownership root; manual_command is a platform fallback if automatic lifetime cleanup fails."
     }
 }
 
@@ -9803,7 +12112,7 @@ where
                     }
                     if granted < read_count {
                         truncated = true;
-                        quota_triggered.store(true, Ordering::Relaxed);
+                        quota_triggered.store(true, Ordering::Release);
                         if let Some(progress) = progress.as_ref() {
                             progress.mark_truncated();
                         }
@@ -9847,7 +12156,7 @@ fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize)
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
@@ -9886,7 +12195,8 @@ mod tests {
         resolve_host_working_directory, resolve_host_working_directory_with_roots,
         resolve_scoped_path, resolve_unrestricted_working_directory, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
-        rewrite_host_virtual_workspace_args, run_constrained_process, same_path_case_aware,
+        rewrite_host_virtual_workspace_args, run_constrained_process,
+        run_constrained_process_with_fault_injection, same_path_case_aware,
         tier_c_plan_inner_path_index, user_owned_host_roots, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
         validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
@@ -12999,8 +15309,8 @@ mod tests {
     #[cfg(windows)]
     fn windows_process_current_dir_deverbatims_canonical_cwd() {
         assert_eq!(
-            super::windows_process_current_dir(Path::new(r"\\?\C:\Users\Palo\fixture")),
-            PathBuf::from(r"C:\Users\Palo\fixture")
+            super::windows_process_current_dir(Path::new(r"\\?\C:\Users\test-user\fixture")),
+            PathBuf::from(r"C:\Users\test-user\fixture")
         );
         assert_eq!(
             super::windows_process_current_dir(Path::new(r"\\?\UNC\server\share\fixture")),
@@ -13597,6 +15907,45 @@ mod tests {
         let _ = fs::remove_dir_all(outside.as_path());
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_supervisor_registration_failure_never_execs_target() {
+        let workspace = unique_temp_dir("workspace-unix-background-registration-fence");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let marker = workspace.join("user-code-executed.marker");
+        let mut policy = unrestricted_os_policy(workspace.clone());
+        policy.allowed_executables = vec!["sh".to_owned()];
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": "sh",
+            "args": ["-c", format!("printf executed > '{}'", marker.display())],
+            "background": true,
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+        let registration_fence: super::BackgroundProcessRegistrationFence = Arc::new(|_| {
+            Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: "forced registration failure".to_owned(),
+            })
+        });
+
+        let error = run_constrained_process_with_fault_injection(
+            &policy,
+            input.as_slice(),
+            background_test_execution_timeout(),
+            None,
+            None,
+            Some(registration_fence),
+            crate::qa_fault_injection::QaFaultRuntime::default(),
+        )
+        .expect_err("Unix target release must stop when durable registration fails");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
+        assert_eq!(error.message, "forced registration failure");
+        assert!(!marker.exists(), "background target code must not run before registration");
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn run_constrained_process_starts_allowlisted_python_background_when_available() {
@@ -13729,6 +16078,16 @@ mod tests {
             Some("palyra.process.status")
         );
         assert!(output.pointer("/cleanup/manual_command/command").is_some());
+        let provenance: palyra_common::runtime_contracts::ProcessProvenance =
+            serde_json::from_value(
+                output
+                    .pointer("/process_handle/provenance")
+                    .cloned()
+                    .expect("background handle should expose process provenance"),
+            )
+            .expect("background handle provenance should decode");
+        provenance.validate().expect("background handle provenance should validate");
+        assert!(!provenance.start_token.is_empty());
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -13736,6 +16095,17 @@ mod tests {
     #[test]
     fn background_process_registry_tracks_input_capabilities() {
         let pid = 4_000_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: "test-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "test-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
         let input = ProcessRunnerInput {
             command: "python".to_owned(),
             args: Vec::new(),
@@ -13763,12 +16133,13 @@ mod tests {
             pid,
             capabilities,
             input.effective_lifetime_mode(),
+            provenance.clone(),
             None,
         )
         .expect("registry should accept stdin-capable metadata without a pipe");
         let snapshot = super::registered_background_process("palyra.process.status", pid)
             .expect("registered process should be readable");
-        super::mark_background_process_stopped(pid);
+        super::mark_current_background_process_stopped(pid);
 
         assert!(snapshot.active);
         assert!(snapshot.capabilities.stdin);
@@ -13776,6 +16147,597 @@ mod tests {
         assert!(!snapshot.capabilities.pty);
         assert!(snapshot.capabilities.signals);
         assert_eq!(snapshot.lifetime_mode, BackgroundLifetimeMode::UntilVerifier);
+        assert_eq!(snapshot.provenance, provenance);
+    }
+
+    #[test]
+    fn unix_stop_proof_requires_recorded_supervisor_acknowledgement() {
+        let pid = 4_015_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind:
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+            start_token: "unix-stop-proof-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "unix-stop-proof-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        super::register_background_process_pid(
+            pid,
+            super::BackgroundProcessHandleCapabilities {
+                stdin: false,
+                pty_requested: false,
+                pty: false,
+                signals: true,
+                background: true,
+            },
+            BackgroundLifetimeMode::RunOwned,
+            provenance,
+            None,
+        )
+        .expect("test process identity should register");
+        let status = super::BackgroundProcessRuntimeStatus {
+            direct_pid_alive: false,
+            process_tree_alive: false,
+            tracked_process_count: Some(0),
+        };
+
+        let before = super::registered_background_process("palyra.process.stop", pid)
+            .expect("registered process should be readable");
+        assert!(super::process_stop_acknowledgement(pid, &before, status).is_none());
+
+        super::mark_current_background_process_stopped_after_unix_cleanup(pid);
+        let after = super::registered_background_process("palyra.process.stop", pid)
+            .expect("stopped process should remain readable");
+        assert!(super::process_stop_acknowledgement(pid, &after, status).is_some());
+    }
+
+    #[test]
+    fn cleanup_authority_hold_is_exact_and_fail_closed() {
+        let pid = 4_025_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: "cleanup-hold-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "cleanup-hold-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        super::register_background_process_pid(
+            pid,
+            super::BackgroundProcessHandleCapabilities {
+                stdin: false,
+                pty_requested: false,
+                pty: false,
+                signals: true,
+                background: true,
+            },
+            BackgroundLifetimeMode::RunOwned,
+            provenance.clone(),
+            None,
+        )
+        .expect("test process identity should register");
+
+        super::retain_background_process_cleanup_authority(pid, &provenance)
+            .expect("matching provenance should retain cleanup authority");
+        assert!(super::background_process_cleanup_authority_retained(pid));
+
+        let mut mismatched = provenance.clone();
+        mismatched.owner_nonce = "other-owner".to_owned();
+        let error = super::retain_background_process_cleanup_authority(pid, &mismatched)
+            .expect_err("mismatched provenance must not retain cleanup authority");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(super::background_process_cleanup_authority_retained(pid));
+
+        super::release_background_process_cleanup_authority(pid, &mismatched);
+        assert!(super::background_process_cleanup_authority_retained(pid));
+        super::release_background_process_cleanup_authority(pid, &provenance);
+        assert!(!super::background_process_cleanup_authority_retained(pid));
+        super::mark_current_background_process_stopped(pid);
+    }
+
+    #[test]
+    fn retained_background_process_cleanup_requires_an_explicit_hold() {
+        let pid = 4_035_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: "missing-cleanup-hold-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "missing-cleanup-hold-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        let error = super::terminate_retained_background_process(pid, &provenance)
+            .expect_err("missing retained authority must fail closed before any signal");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn retained_background_process_cleanup_terminates_exact_live_tree() {
+        #[cfg(windows)]
+        let (command, args) = ("ping.exe", serde_json::json!(["-t", "0x7f000001"]));
+        #[cfg(not(windows))]
+        let (command, args) = ("sleep", serde_json::json!(["60"]));
+
+        let workspace = unique_temp_dir("retained-background-cleanup");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![command.to_owned()]);
+        policy.path_access_mode = PathAccessMode::UnrestrictedOs;
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": command,
+            "args": args,
+            "background": true,
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS,
+        }))
+        .expect("background input should serialize");
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("background process should start");
+        let output: Value =
+            serde_json::from_slice(result.output_json.as_slice()).expect("output should decode");
+        let pid = output
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("background output should include pid");
+        let provenance = super::background_process_provenance_snapshot(pid)
+            .expect("live process provenance should exist")
+            .provenance;
+
+        super::retain_background_process_cleanup_authority(pid, &provenance)
+            .expect("exact cleanup authority should retain");
+        let status = super::terminate_retained_background_process(pid, &provenance)
+            .expect("retained process tree should terminate");
+
+        assert!(!status.direct_pid_alive());
+        assert!(!status.process_tree_alive());
+        assert!(super::background_process_cleanup_authority_retained(pid));
+        let repeated = super::terminate_retained_background_process(pid, &provenance)
+            .expect("already-absent exact retained tree should settle idempotently");
+        assert!(!repeated.alive());
+        assert!(super::background_process_cleanup_authority_retained(pid));
+        super::release_background_process_cleanup_authority(pid, &provenance);
+        assert!(!super::background_process_cleanup_authority_retained(pid));
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn retained_cleanup_authority_prevents_pid_slot_replacement() {
+        let pid = 4_045_000_u32.saturating_add(std::process::id());
+        let provenance = |start_token: &str| palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: start_token.to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: format!("owner-{start_token}"),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        let capabilities = super::BackgroundProcessHandleCapabilities {
+            stdin: false,
+            pty_requested: false,
+            pty: false,
+            signals: true,
+            background: true,
+        };
+        let first = provenance("retained");
+        super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            first.clone(),
+            None,
+        )
+        .expect("first process identity should register");
+        super::retain_background_process_cleanup_authority(pid, &first)
+            .expect("exact cleanup authority should retain");
+        super::mark_current_background_process_stopped(pid);
+
+        let error = super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            provenance("replacement"),
+            None,
+        )
+        .expect_err("retained cleanup authority must reserve the exact pid slot");
+        assert!(error.message.contains("retained cleanup authority"));
+        let snapshot = super::registered_background_process("palyra.process.status", pid)
+            .expect("retained identity should remain readable");
+        assert_eq!(snapshot.provenance, first);
+
+        super::release_background_process_cleanup_authority(pid, &snapshot.provenance);
+    }
+
+    #[test]
+    fn inactive_registry_entry_can_be_replaced_after_verified_cleanup() {
+        let pid = 4_050_000_u32.saturating_add(std::process::id());
+        let provenance = |start_token: &str| palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: start_token.to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: format!("owner-{start_token}"),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        let capabilities = super::BackgroundProcessHandleCapabilities {
+            stdin: false,
+            pty_requested: false,
+            pty: false,
+            signals: true,
+            background: true,
+        };
+        super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            provenance("first"),
+            None,
+        )
+        .expect("first process identity should register");
+        super::mark_current_background_process_stopped(pid);
+        super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            provenance("second"),
+            None,
+        )
+        .expect("inactive pid slot should accept a new exact identity");
+
+        let snapshot = super::registered_background_process("palyra.process.status", pid)
+            .expect("replacement identity should be readable");
+        assert_eq!(snapshot.provenance.start_token, "second");
+        super::mark_current_background_process_stopped(pid);
+    }
+
+    #[test]
+    fn stale_windows_job_capability_cannot_remove_pid_replacement() {
+        let pid = 4_060_000_u32.saturating_add(std::process::id());
+        let stale_job = Arc::new(());
+        let replacement_job = Arc::new(());
+        let mut jobs = HashMap::from([(pid, Arc::clone(&stale_job))]);
+
+        jobs.insert(pid, Arc::clone(&replacement_job));
+
+        assert!(!super::remove_arc_registry_entry_if_same(&mut jobs, pid, &stale_job));
+        assert!(jobs.get(&pid).is_some_and(|job| Arc::ptr_eq(job, &replacement_job)));
+        assert!(super::remove_arc_registry_entry_if_same(&mut jobs, pid, &replacement_job));
+        assert!(!jobs.contains_key(&pid));
+    }
+
+    #[test]
+    fn stale_registry_identity_cannot_mutate_replacement() {
+        let pid = 4_075_000_u32.saturating_add(std::process::id());
+        let provenance = |start_token: &str| palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: start_token.to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: format!("owner-{start_token}"),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        let capabilities = super::BackgroundProcessHandleCapabilities {
+            stdin: false,
+            pty_requested: false,
+            pty: false,
+            signals: true,
+            background: true,
+        };
+        let first = super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            provenance("first"),
+            None,
+        )
+        .expect("first process identity should register");
+        super::mark_background_process_stopped(&first);
+        let second = super::register_background_process_pid(
+            pid,
+            capabilities,
+            BackgroundLifetimeMode::RunOwned,
+            provenance("second"),
+            None,
+        )
+        .expect("replacement process identity should register");
+
+        super::mark_background_process_stopped_after_unix_cleanup(&first);
+        let stale_update = super::compare_update_registered_background_process(&first, |process| {
+            process.target_pid = Some(7);
+        })
+        .expect("registry update should not fail");
+        assert!(stale_update.is_none());
+
+        let snapshot = super::registered_background_process("palyra.process.status", pid)
+            .expect("replacement identity should remain readable");
+        assert!(snapshot.active);
+        assert!(!snapshot.unix_cleanup_acknowledged);
+        assert_eq!(snapshot.provenance.start_token, "second");
+        assert!(super::registered_background_processes()
+            .lock()
+            .expect("registry lock should remain healthy")
+            .get(&pid)
+            .is_some_and(|process| process.target_pid.is_none()));
+        super::mark_background_process_stopped(&second);
+    }
+
+    #[test]
+    fn mismatched_process_provenance_never_authorizes_lifecycle_actions() {
+        let pid = 4_100_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: "registered-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "registered-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        super::register_background_process_pid(
+            pid,
+            super::BackgroundProcessHandleCapabilities {
+                stdin: false,
+                pty_requested: false,
+                pty: false,
+                signals: true,
+                background: true,
+            },
+            BackgroundLifetimeMode::RunOwned,
+            provenance.clone(),
+            None,
+        )
+        .expect("test provenance should register");
+        super::retain_background_process_cleanup_authority(pid, &provenance)
+            .expect("registered provenance should retain cleanup authority");
+        let mut mismatched = provenance.clone();
+        mismatched.start_token = "recycled-start-token".to_owned();
+
+        assert_eq!(
+            super::verify_background_process_provenance(pid, &mismatched),
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Mismatch
+        );
+        let error = super::terminate_retained_background_process(pid, &mismatched)
+            .expect_err("stale provenance must not authorize retained cleanup");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(super::background_process_cleanup_authority_retained(pid));
+
+        super::release_background_process_cleanup_authority(pid, &provenance);
+        super::mark_current_background_process_stopped(pid);
+    }
+
+    fn persisted_process_test_provenance(
+        ownership_kind: palyra_common::runtime_contracts::ProcessOwnershipKind,
+    ) -> palyra_common::runtime_contracts::ProcessProvenance {
+        palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind,
+            start_token: "captured-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "captured-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn persisted_direct_pid_absence_requires_ownership_domain_absence() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Ok(None),
+            |_| panic!("missing pid must not hash an executable"),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_unix_group_with_live_descendant_is_not_absent() {
+        use std::os::unix::process::CommandExt;
+
+        let workspace = unique_temp_dir("persisted-process-group-descendant");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should be created");
+        let pid_file = workspace.join("descendant.pid");
+        let script = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; exit 0",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]).process_group(0);
+        let mut leader = command.spawn().expect("process-group leader should spawn");
+        let group_id = leader.id();
+        let status = leader.wait().expect("process-group leader should exit");
+        assert!(status.success());
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = fs::read_to_string(pid_file.as_path())
+            .expect("descendant pid should be recorded")
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid should parse");
+
+        assert_eq!(
+            super::current_process_start_token(group_id).expect("leader lookup should work"),
+            None
+        );
+        assert!(super::unix_process_group_is_alive(group_id)
+            .expect("process-group probe should observe the live descendant"));
+
+        super::terminate_unix_process_group(group_id)
+            .expect("test process group should terminate through its exact group id");
+        assert!(super::wait_for_process_not_alive(descendant_pid, Duration::from_secs(5)));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn retained_numeric_ownership_anchor_without_direct_identity_fails_closed() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            true,
+            |_| Ok(None),
+            |_| panic!("missing pid must not hash an executable"),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
+        );
+    }
+
+    #[test]
+    fn registered_tree_probe_error_never_proves_absence() {
+        let disposition = super::registered_process_liveness_disposition(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "probe denied")),
+            Ok(false),
+        );
+
+        assert_eq!(
+            disposition,
+            Some(palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported)
+        );
+    }
+
+    #[test]
+    fn registered_unix_group_without_direct_identity_never_authorizes_signalling() {
+        let disposition = super::registered_process_liveness_disposition(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+            Ok(true),
+            Ok(false),
+        );
+
+        assert_eq!(
+            disposition,
+            Some(palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported)
+        );
+    }
+
+    #[test]
+    fn persisted_unix_group_absence_cannot_prove_descendant_absence() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Ok(None),
+            |_| panic!("missing pid must not hash an executable"),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
+        );
+    }
+
+    #[test]
+    fn persisted_live_process_identity_mismatch_fails_closed() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Ok(Some("recycled-start-token".to_owned())),
+            |_| panic!("mismatched start token must stop before executable hashing"),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Mismatch
+        );
+    }
+
+    #[test]
+    fn persisted_live_executable_mismatch_fails_closed() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Ok(Some(provenance.start_token.clone())),
+            |_| Ok("c".repeat(64)),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Mismatch
+        );
+    }
+
+    #[test]
+    fn persisted_live_identity_match_cannot_reconstruct_ownership() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Ok(Some(provenance.start_token.clone())),
+            |_| Ok(provenance.executable_sha256.clone()),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
+        );
+    }
+
+    #[test]
+    fn persisted_identity_lookup_errors_never_prove_absence() {
+        let provenance = persisted_process_test_provenance(
+            palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup,
+        );
+        let disposition = super::verify_process_identity_with(
+            42,
+            &provenance,
+            false,
+            |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            |_| panic!("failed identity lookup must not hash an executable"),
+        );
+
+        assert_eq!(
+            disposition,
+            palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
+        );
     }
 
     #[test]
@@ -14092,100 +17054,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn run_constrained_process_returns_detached_background_handoff() {
-        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
-            Command::new(command)
-                .arg("--version")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        }) else {
-            return;
-        };
-        let workspace = unique_temp_dir("workspace-python-background-detached");
-        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
-        fs::write(
-            workspace.join("detached_ready.py"),
-            format!(
-                "import time\nprint('listening http://127.0.0.1:54321', flush=True)\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"
-            ),
-        )
-        .expect("background script should be written");
-        let mut policy =
-            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
-        policy.allow_interpreters = true;
-        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
-        let input = serde_json::to_vec(&serde_json::json!({
-            "command": python,
-            "args": ["detached_ready.py"],
-            "background": true,
-            "lifetime_mode": "detached",
-            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
-        }))
-        .expect("input should serialize");
+    fn run_constrained_process_rejects_detached_background_handoff_until_durable_registration() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        let input =
+            br#"{"command":"echo","args":["ok"],"background":true,"lifetime_mode":"detached"}"#;
 
-        let result =
-            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
-                .expect("detached background process should start");
-        let output: serde_json::Value =
-            serde_json::from_slice(&result.output_json).expect("output should parse");
-        let pid = output
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .expect("detached background process should return pid") as u32;
-        let _ = super::stop_background_process_by_pid(pid);
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("detached local background lifetime must fail closed");
 
-        assert_eq!(
-            output.get("lifetime_mode").and_then(serde_json::Value::as_str),
-            Some("detached")
-        );
-        assert_eq!(
-            output.get("run_owned_lifetime").and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(output.get("durable_handoff").and_then(serde_json::Value::as_bool), Some(true));
-        assert_eq!(
-            output.pointer("/handoff/pid").and_then(serde_json::Value::as_u64),
-            Some(u64::from(pid))
-        );
-        assert_eq!(
-            output.pointer("/handoff/ports/0").and_then(serde_json::Value::as_u64),
-            Some(54321)
-        );
-        assert_eq!(
-            output.pointer("/handoff/stop_command/command").and_then(serde_json::Value::as_str),
-            Some("palyra.process.stop")
-        );
-        assert!(output
-            .get("verification_hint")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .contains("Probe the inferred port"));
-        assert!(output
-            .pointer("/handoff/verification_hint")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .contains("cleanup.stop_command"));
-        assert_eq!(
-            output
-                .pointer("/background_risk_posture/detached_handoff_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            output
-                .pointer("/background_risk_posture/requires_user_approval")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert!(output
-            .get("run_lifecycle_note")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .contains("after the final answer"));
-
-        let _ = fs::remove_dir_all(workspace.as_path());
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("durable detached process handoff"), "{}", error.message);
     }
 
     #[test]
@@ -14394,6 +17273,32 @@ mod tests {
         let stopped_output: serde_json::Value =
             serde_json::from_slice(&stopped.output_json).expect("stop output should parse");
         assert_eq!(stopped_output.get("stopped").and_then(serde_json::Value::as_bool), Some(true));
+        #[cfg(unix)]
+        assert_eq!(
+            stopped_output
+                .pointer("/stop_acknowledgement/proof")
+                .and_then(serde_json::Value::as_str),
+            Some("unix_supervisor_cleanup_acknowledged")
+        );
+
+        #[cfg(unix)]
+        {
+            let repeated_stop = run_constrained_process(
+                &policy,
+                stop_input.as_slice(),
+                background_test_execution_timeout(),
+            )
+            .expect("repeated portable stop should preserve verified cleanup evidence");
+            let repeated_output: serde_json::Value =
+                serde_json::from_slice(&repeated_stop.output_json)
+                    .expect("repeated stop should parse");
+            assert_eq!(
+                repeated_output
+                    .pointer("/stop_acknowledgement/proof")
+                    .and_then(serde_json::Value::as_str),
+                Some("unix_supervisor_cleanup_acknowledged")
+            );
+        }
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -14898,16 +17803,9 @@ mod tests {
                 Some(true)
             );
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            assert_eq!(
-                metadata.pointer("/manual_command/command").and_then(serde_json::Value::as_str),
-                Some("kill")
-            );
-            assert_eq!(
-                metadata.pointer("/manual_command/args/1").and_then(serde_json::Value::as_str),
-                Some("-1234")
-            );
+            assert_eq!(metadata.get("manual_command"), Some(&serde_json::Value::Null));
             assert_eq!(
                 metadata.get("process_tree").and_then(serde_json::Value::as_bool),
                 Some(true)
@@ -14915,6 +17813,17 @@ mod tests {
             assert_eq!(
                 metadata.get("windows_job_object").and_then(serde_json::Value::as_bool),
                 Some(false)
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            assert_eq!(
+                metadata.pointer("/manual_command/command").and_then(serde_json::Value::as_str),
+                Some("kill")
+            );
+            assert_eq!(
+                metadata.pointer("/manual_command/args/1").and_then(serde_json::Value::as_str),
+                Some("1234")
             );
         }
     }

@@ -1,11 +1,11 @@
 //! `palyrad` binary entry point.
 //!
-//! All daemon behavior (CLI parsing, config load, listeners, lifecycle) lives in
-//! `palyra_daemon::run`; this shim only provides the Tokio runtime and exit code.
+//! The exact hidden Unix supervisor mode runs before Tokio or daemon initialization; normal
+//! invocations construct the async runtime and delegate to `palyra_daemon::run`.
 
 use anyhow::Result;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    palyra_daemon::run().await
+fn main() -> Result<()> {
+    palyra_daemon::dispatch_internal_process_supervisor();
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(palyra_daemon::run())
 }

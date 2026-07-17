@@ -619,6 +619,10 @@ pub mod palyra_memory_v1 {
 
 pub mod palyra_node_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AcknowledgeNetworkedWorkerPayloadRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AcknowledgeNetworkedWorkerPayloadResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BeginPairingSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BeginPairingSessionResponse;
@@ -633,9 +637,15 @@ pub mod palyra_node_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ExecuteCapabilityResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct FetchNetworkedWorkerPayloadRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct FetchNetworkedWorkerPayloadResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetPairingRequestStatusRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetPairingRequestStatusResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct NetworkedWorkerDeliveryReservation;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct NodeCapabilityDispatch;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -657,9 +667,11 @@ pub mod palyra_node_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct RotateDeviceCertificateResponse;
     pub trait NodeServiceClient {
+        fn AcknowledgeNetworkedWorkerPayload(&self);
         fn BeginPairingSession(&self);
         fn CompletePairingSession(&self);
         fn ExecuteCapability(&self);
+        fn FetchNetworkedWorkerPayload(&self);
         fn GetPairingRequestStatus(&self);
         fn RegisterNode(&self);
         fn RevokeDevicePairing(&self);

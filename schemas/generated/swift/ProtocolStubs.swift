@@ -861,6 +861,12 @@ public enum PalyraMemoryV1 {
 }
 
 public enum PalyraNodeV1 {
+    public struct AcknowledgeNetworkedWorkerPayloadRequest: Equatable {
+        public init() {}
+    }
+    public struct AcknowledgeNetworkedWorkerPayloadResponse: Equatable {
+        public init() {}
+    }
     public struct BeginPairingSessionRequest: Equatable {
         public init() {}
     }
@@ -882,10 +888,19 @@ public enum PalyraNodeV1 {
     public struct ExecuteCapabilityResponse: Equatable {
         public init() {}
     }
+    public struct FetchNetworkedWorkerPayloadRequest: Equatable {
+        public init() {}
+    }
+    public struct FetchNetworkedWorkerPayloadResponse: Equatable {
+        public init() {}
+    }
     public struct GetPairingRequestStatusRequest: Equatable {
         public init() {}
     }
     public struct GetPairingRequestStatusResponse: Equatable {
+        public init() {}
+    }
+    public struct NetworkedWorkerDeliveryReservation: Equatable {
         public init() {}
     }
     public struct NodeCapabilityDispatch: Equatable {
@@ -919,9 +934,11 @@ public enum PalyraNodeV1 {
         public init() {}
     }
     public protocol NodeServiceClient {
+        func acknowledgeNetworkedWorkerPayload()
         func beginPairingSession()
         func completePairingSession()
         func executeCapability()
+        func fetchNetworkedWorkerPayload()
         func getPairingRequestStatus()
         func registerNode()
         func revokeDevicePairing()

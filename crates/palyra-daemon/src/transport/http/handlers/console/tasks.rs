@@ -643,15 +643,23 @@ async fn run_task_action(
                 "retry" => AuxiliaryTaskState::Queued,
                 _ => unreachable!("task action is fixed by handler"),
             };
+            let durable_task = state
+                .runtime
+                .get_orchestrator_background_task(task.source_id.clone())
+                .await
+                .map_err(runtime_status_response)?
+                .ok_or_else(|| {
+                    runtime_status_response(Status::not_found("background task not found"))
+                })?;
             state
                 .runtime
                 .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                     task_id: task.source_id.clone(),
+                    expected_revision: durable_task.revision,
                     state: Some(next_state.as_str().to_owned()),
                     target_run_id: None,
-                    increment_attempt_count: action == "retry",
                     last_error: Some(if action == "retry" { None } else { Some(reason.clone()) }),
-                    result_json: None,
+                    result_json: if action == "retry" { Some(None) } else { None },
                     started_at_unix_ms: if action == "retry" { Some(None) } else { None },
                     completed_at_unix_ms: if action == "retry" { Some(None) } else { None },
                 })

@@ -181,7 +181,8 @@ pub(super) async fn execute_workspace_patch_mutation(
         }
     }
 
-    let diagnostic_baseline = code_intel::capture_diagnostic_snapshot_with_providers(
+    let diagnostic_baseline = code_intel::capture_diagnostic_snapshot_with_managed_health(
+        runtime_state,
         &runtime_state.config.code_intel,
         workspace_roots,
         planned_outcome.files_touched.as_slice(),
@@ -335,7 +336,8 @@ pub(super) async fn execute_workspace_patch_mutation(
         pair_error: pair_error.as_deref(),
     };
     append_workspace_checkpoint_output(&mut output_value, checkpoint_output_context);
-    let diagnostic_after = code_intel::capture_diagnostic_snapshot_with_providers(
+    let diagnostic_after = code_intel::capture_diagnostic_snapshot_with_managed_health(
+        runtime_state,
         &runtime_state.config.code_intel,
         workspace_roots,
         outcome.files_touched.as_slice(),

@@ -542,8 +542,10 @@ pub(crate) async fn console_mobile_voice_note_create_handler(
             task_id: Ulid::new().to_string(),
             task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
             session_id: target_session.session_id.clone(),
+            child_session_id: None,
             parent_run_id: target_session.last_run_id.clone(),
             target_run_id: None,
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
@@ -553,6 +555,7 @@ pub(crate) async fn console_mobile_voice_note_create_handler(
             max_attempts: 3,
             budget_tokens: crate::orchestrator::estimate_token_count(transcript_text.as_str()),
             delegation: None,
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: payload

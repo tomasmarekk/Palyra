@@ -20,8 +20,10 @@ use serde_json::{json, Value};
 use tonic::Status;
 
 use crate::{
-    gateway::{GatewayRuntimeState, RequestContext},
-    model_provider::{ProviderImageInput, ProviderRequest, ProviderResponse},
+    gateway::{is_provider_reconfigured_status, GatewayRuntimeState, RequestContext},
+    model_provider::{
+        ProviderImageInput, ProviderRequest, ProviderResponse, ProviderStatusSnapshot,
+    },
     objective_judge::{
         OBJECTIVE_JUDGE_COMPLETED_EVENT, OBJECTIVE_JUDGE_FAILED_EVENT,
         OBJECTIVE_JUDGE_STARTED_EVENT,
@@ -40,6 +42,8 @@ const EXTRACTION_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
 const OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS: u64 = 900;
 const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
 const AUXILIARY_OUTPUT_TEXT_LIMIT: usize = 4_000;
+const MAX_AUXILIARY_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
+const PROVIDER_RECONFIGURED_REASON_CODE: &str = "runtime.generation.provider_reconfigured";
 
 /// Auxiliary task families this executor can run; a strict subset of
 /// `AuxiliaryTaskKind` (queue-only kinds are handled elsewhere).
@@ -406,102 +410,174 @@ pub(crate) async fn execute_auxiliary_task(
     // Only an "enforced" routing decision pins the model; advisory modes let
     // the provider runtime pick, so the lease binding falls back to the
     // routing plan's provider/credential pair below.
-    let provider_model_override =
+    let mut provider_model_override =
         (routing.mode == "enforced").then(|| routing.actual_model_id.clone());
-    let (lease_provider_id, _lease_provider_kind, lease_credential_id) =
-        provider_model_override.as_deref().map_or_else(
-            || {
-                (
-                    routing.provider_id.clone(),
-                    routing.provider_kind.clone(),
-                    routing.credential_id.clone(),
-                )
-            },
-            |model_id| resolve_provider_binding_for_model(&provider_snapshot, model_id),
+    let (mut lease_provider_id, mut lease_credential_id) = auxiliary_provider_binding(
+        &provider_snapshot,
+        &routing,
+        provider_model_override.as_deref(),
+    );
+    let mut supersession_retries = 0_u8;
+
+    let response = loop {
+        let provider_request = ProviderRequest::from_input_text(
+            input_text.to_owned(),
+            contract.json_mode,
+            request.vision_inputs.clone(),
+            provider_model_override.clone(),
         );
-    match runtime_state
-        .execute_model_provider_with_lease(
-            ProviderRequest::from_input_text(
-                input_text.to_owned(),
-                contract.json_mode,
-                request.vision_inputs.clone(),
-                provider_model_override,
-            ),
-            ProviderLeaseExecutionContext {
-                provider_id: lease_provider_id,
-                credential_id: lease_credential_id,
-                priority: contract.routing_task_class.lease_priority(),
-                task_label: contract.routing_task_class.as_str().to_owned(),
-                max_wait_ms: contract.routing_task_class.max_lease_wait_ms(),
-                session_id: Some(request.session_id.clone()),
-                run_id: request.run_id.clone(),
-            },
-        )
-        .await
-    {
-        Ok(response) => {
-            let result = build_execution_result(
-                request.task_id,
-                request.session_id.clone(),
-                request.run_id.clone(),
-                request.task_type,
-                contract,
-                routing,
-                response,
-            );
-            let completed_reason = if result.task_type == AuxiliaryTaskType::ObjectiveJudge {
-                OBJECTIVE_JUDGE_COMPLETED_EVENT
-            } else {
-                "auxiliary executor completed provider request"
-            };
-            record_auxiliary_lifecycle_event(
-                runtime_state,
-                &request.context,
-                Some(request.session_id.as_str()),
-                request.run_id.as_deref(),
-                AuxiliaryLifecycleEventInput {
-                    task_id: result.task_id.as_str(),
-                    task_type: result.task_type.as_str(),
-                    phase: "completed",
-                    reason: completed_reason,
-                    token_budget: Some(effective_budget),
-                    details: result.to_result_json(),
+        match runtime_state
+            .execute_model_provider_with_lease(
+                provider_request,
+                ProviderLeaseExecutionContext {
+                    provider_id: lease_provider_id.clone(),
+                    credential_id: lease_credential_id.clone(),
+                    priority: contract.routing_task_class.lease_priority(),
+                    task_label: contract.routing_task_class.as_str().to_owned(),
+                    max_wait_ms: contract.routing_task_class.max_lease_wait_ms(),
+                    session_id: Some(request.session_id.clone()),
+                    run_id: request.run_id.clone(),
+                    diagnostic_scope_id: Some(request.task_id.clone()),
                 },
             )
-            .await?;
-            Ok(result)
-        }
-        Err(error) => {
-            // Best-effort by design: surfacing the provider error to the
-            // caller matters more than the failure journal entry, so a
-            // journaling error here is deliberately discarded.
-            let failed_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
-                OBJECTIVE_JUDGE_FAILED_EVENT
-            } else {
-                "auxiliary executor provider request failed"
-            };
-            let _ = record_auxiliary_lifecycle_event(
-                runtime_state,
-                &request.context,
-                Some(request.session_id.as_str()),
-                request.run_id.as_deref(),
-                AuxiliaryLifecycleEventInput {
-                    task_id: request.task_id.as_str(),
-                    task_type: request.task_type.as_str(),
-                    phase: "failed",
-                    reason: failed_reason,
-                    token_budget: Some(effective_budget),
-                    details: json!({
-                        "status_code": format!("{:?}", error.code()),
-                        "error": error.message(),
-                        "fallback_policy": contract.fallback_policy.as_str(),
-                    }),
-                },
-            )
-            .await;
+            .await
+        {
+            Ok(response) => break response,
             Err(error)
+                if is_provider_reconfigured_status(&error)
+                    && supersession_retries < MAX_AUXILIARY_PROVIDER_SUPERSESSION_RETRIES =>
+            {
+                supersession_retries = supersession_retries.saturating_add(1);
+                let replacement_snapshot = runtime_state.model_provider_status_snapshot();
+                provider_model_override = replacement_auxiliary_model_override(
+                    &replacement_snapshot,
+                    provider_model_override.as_deref(),
+                );
+                (lease_provider_id, lease_credential_id) = auxiliary_provider_binding(
+                    &replacement_snapshot,
+                    &routing,
+                    provider_model_override.as_deref(),
+                );
+                let _ = record_auxiliary_lifecycle_event(
+                    runtime_state,
+                    &request.context,
+                    Some(request.session_id.as_str()),
+                    request.run_id.as_deref(),
+                    AuxiliaryLifecycleEventInput {
+                        task_id: request.task_id.as_str(),
+                        task_type: request.task_type.as_str(),
+                        phase: "provider_handover",
+                        reason: PROVIDER_RECONFIGURED_REASON_CODE,
+                        token_budget: Some(effective_budget),
+                        details: json!({
+                            "retry_attempt": supersession_retries,
+                            "max_retries": MAX_AUXILIARY_PROVIDER_SUPERSESSION_RETRIES,
+                            "model_override": provider_model_override,
+                        }),
+                    },
+                )
+                .await;
+            }
+            Err(error) => {
+                // Best-effort by design: surfacing the provider error to the
+                // caller matters more than the failure journal entry, so a
+                // journaling error here is deliberately discarded.
+                let failed_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
+                    OBJECTIVE_JUDGE_FAILED_EVENT
+                } else {
+                    "auxiliary executor provider request failed"
+                };
+                let _ = record_auxiliary_lifecycle_event(
+                    runtime_state,
+                    &request.context,
+                    Some(request.session_id.as_str()),
+                    request.run_id.as_deref(),
+                    AuxiliaryLifecycleEventInput {
+                        task_id: request.task_id.as_str(),
+                        task_type: request.task_type.as_str(),
+                        phase: "failed",
+                        reason: failed_reason,
+                        token_budget: Some(effective_budget),
+                        details: json!({
+                            "status_code": format!("{:?}", error.code()),
+                            "error": error.message(),
+                            "fallback_policy": contract.fallback_policy.as_str(),
+                            "provider_supersession_retries": supersession_retries,
+                        }),
+                    },
+                )
+                .await;
+                return Err(error);
+            }
         }
-    }
+    };
+
+    let result = build_execution_result(
+        request.task_id,
+        request.session_id.clone(),
+        request.run_id.clone(),
+        request.task_type,
+        contract,
+        routing,
+        response,
+    );
+    let completed_reason = if result.task_type == AuxiliaryTaskType::ObjectiveJudge {
+        OBJECTIVE_JUDGE_COMPLETED_EVENT
+    } else {
+        "auxiliary executor completed provider request"
+    };
+    record_auxiliary_lifecycle_event(
+        runtime_state,
+        &request.context,
+        Some(request.session_id.as_str()),
+        request.run_id.as_deref(),
+        AuxiliaryLifecycleEventInput {
+            task_id: result.task_id.as_str(),
+            task_type: result.task_type.as_str(),
+            phase: "completed",
+            reason: completed_reason,
+            token_budget: Some(effective_budget),
+            details: result.to_result_json(),
+        },
+    )
+    .await?;
+    Ok(result)
+}
+
+fn auxiliary_provider_binding(
+    provider_snapshot: &ProviderStatusSnapshot,
+    routing: &RoutingDecision,
+    provider_model_override: Option<&str>,
+) -> (String, String) {
+    let (provider_id, _provider_kind, credential_id) = provider_model_override.map_or_else(
+        || {
+            (
+                routing.provider_id.clone(),
+                routing.provider_kind.clone(),
+                routing.credential_id.clone(),
+            )
+        },
+        |model_id| resolve_provider_binding_for_model(provider_snapshot, model_id),
+    );
+    (provider_id, credential_id)
+}
+
+fn replacement_auxiliary_model_override(
+    provider_snapshot: &ProviderStatusSnapshot,
+    previous_model_override: Option<&str>,
+) -> Option<String> {
+    previous_model_override
+        .filter(|model_id| {
+            provider_snapshot
+                .registry
+                .models
+                .iter()
+                .any(|model| model.model_id == *model_id && model.enabled)
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| provider_snapshot.route_selection.selected_model_id.clone())
+        .or_else(|| provider_snapshot.registry.default_chat_model_id.clone())
+        .or_else(|| provider_snapshot.model_id.clone())
 }
 
 fn build_execution_result(
@@ -670,10 +746,167 @@ pub(crate) fn auxiliary_stop_condition(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::{mpsc, Notify};
+    use ulid::Ulid;
+
     use super::{
-        auxiliary_stop_condition, AuxiliaryAuthorityProfile, AuxiliaryFallbackPolicy,
-        AuxiliaryModelPreference, AuxiliaryStopConditionInput, AuxiliaryTaskType,
+        auxiliary_stop_condition, execute_auxiliary_task, AuxiliaryAuthorityProfile,
+        AuxiliaryExecutionRequest, AuxiliaryFallbackPolicy, AuxiliaryModelPreference,
+        AuxiliaryStopConditionInput, AuxiliaryTaskType,
     };
+    use crate::{
+        gateway::{
+            runtime::tests::{provider_status_snapshot, SuccessfulModelProvider},
+            tests::build_test_runtime_state,
+            RequestContext,
+        },
+        journal::OrchestratorSessionUpsertRequest,
+        model_provider::{
+            AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
+            ProviderRequest, ProviderResponse, ProviderStatusSnapshot,
+        },
+    };
+    use std::{future::Future, pin::Pin};
+
+    struct BlockingAuxiliaryProvider {
+        started: mpsc::Sender<()>,
+        release: Arc<Notify>,
+        status: ProviderStatusSnapshot,
+    }
+
+    impl ModelProvider for BlockingAuxiliaryProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: ProviderRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.started
+                    .send(())
+                    .await
+                    .expect("auxiliary supersession receiver should remain open");
+                self.release.notified().await;
+                Err(ProviderError::StatePoisoned)
+            })
+        }
+
+        fn transcribe_audio<'a>(
+            &'a self,
+            _request: AudioTranscriptionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(ProviderError::MissingApiKey) })
+        }
+
+        fn status_snapshot(&self) -> ProviderStatusSnapshot {
+            self.status.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn auxiliary_provider_supersession_retries_without_failed_lifecycle() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::new().to_string();
+        let task_id = Ulid::new().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("auxiliary:{session_id}"),
+                session_label: Some("Auxiliary provider supersession".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("auxiliary test session should be created");
+
+        let (started_tx, mut started_rx) = mpsc::channel(1);
+        let release = Arc::new(Notify::new());
+        let _ = state.configure_model_provider(Arc::new(BlockingAuxiliaryProvider {
+            started: started_tx,
+            release: Arc::clone(&release),
+            status: state.model_provider_status_snapshot(),
+        }));
+        let execution_state = Arc::clone(&state);
+        let execution_session_id = session_id.clone();
+        let execution_task_id = task_id.clone();
+        let execution = tokio::spawn(async move {
+            execute_auxiliary_task(
+                &execution_state,
+                AuxiliaryExecutionRequest {
+                    task_id: execution_task_id,
+                    session_id: execution_session_id,
+                    run_id: None,
+                    context: RequestContext {
+                        principal: "user:test".to_owned(),
+                        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                        channel: Some("test".to_owned()),
+                    },
+                    task_type: AuxiliaryTaskType::Summary,
+                    input_text: "summarize through a replacement provider".to_owned(),
+                    parameter_delta_json: None,
+                    token_budget: Some(128),
+                    vision_inputs: Vec::new(),
+                },
+            )
+            .await
+        });
+
+        started_rx.recv().await.expect("initial auxiliary provider call should start");
+        let (requests_tx, mut requests_rx) = mpsc::channel(1);
+        let replacement_status = provider_status_snapshot(false);
+        let _ = state.configure_model_provider(Arc::new(SuccessfulModelProvider {
+            requests: requests_tx,
+            response_text: "replacement auxiliary response",
+            status: replacement_status,
+        }));
+        release.notify_one();
+
+        let result = execution
+            .await
+            .expect("auxiliary execution task should join")
+            .expect("auxiliary execution should retry through the replacement provider");
+        assert_eq!(result.output_text, "replacement auxiliary response");
+        assert!(!result.output_text.contains("stale"));
+        let replacement_request =
+            requests_rx.recv().await.expect("replacement auxiliary provider should run once");
+        assert_eq!(replacement_request.model_override.as_deref(), Some("gpt-4o-mini"));
+        assert!(requests_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .journal_store
+                .runtime_stale_event_diagnostic_count_for_scope(
+                    session_id.as_str(),
+                    task_id.as_str(),
+                    "runtime.generation.provider_reconfigured",
+                )
+                .expect("auxiliary stale diagnostic count should load"),
+            1
+        );
+        let lifecycle_events = state
+            .journal_store
+            .recent_for_run(session_id.as_str(), 16)
+            .expect("auxiliary lifecycle events should load");
+        let phases = lifecycle_events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.payload_json).ok())
+            .filter_map(|payload| {
+                payload
+                    .get("payload")?
+                    .get("details")?
+                    .get("phase")?
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(phases.iter().any(|phase| phase == "started"));
+        assert!(phases.iter().any(|phase| phase == "provider_handover"));
+        assert!(phases.iter().any(|phase| phase == "completed"));
+        assert!(!phases.iter().any(|phase| phase == "failed"));
+    }
 
     #[test]
     fn auxiliary_task_kind_aliases_resolve_to_executor_types() {

@@ -12,6 +12,7 @@ mod builtin;
 mod catalog;
 mod hashing;
 mod normalization;
+mod reconciliation;
 mod schema;
 mod types;
 
@@ -34,6 +35,9 @@ pub(crate) use normalization::{
     normalization_audit_tape_payload, rejection_tape_payload, tool_call_rejection_outcome,
     validate_tool_call_against_catalog_snapshot, validate_tool_call_against_model_visible_tool,
 };
+pub(crate) use reconciliation::resolve_tool_execution_semantics;
+#[cfg(test)]
+pub(crate) use reconciliation::tool_execution_semantics;
 pub(crate) use schema::sanitize_schema_for_provider;
 pub(crate) use types::{
     FilteredToolCatalogEntry, ModelVisibleToolCatalogSnapshot, NormalizedToolCall,

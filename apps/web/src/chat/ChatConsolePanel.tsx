@@ -718,17 +718,10 @@ export function ChatConsolePanel({
       onQueueFollowUp: queueFollowUpText,
       onDelegate: async (raw) => {
         await delegateWorkAction({
-          api,
           sessionId: sessions.activeSessionId.trim(),
           raw,
           delegationCatalog,
-          upsertSession: sessions.upsertSession,
-          refreshSessionTranscript,
-          appendLocalEntry,
-          setComposerText: updateComposerDraft,
-          setCommandBusy,
           setError,
-          setNotice,
         });
       },
       onResumeSession: resumeSession,

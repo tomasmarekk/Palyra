@@ -29,6 +29,8 @@ pub(crate) async fn admin_status_handler(
         .status_snapshot_async(context.clone(), state.auth.clone())
         .await
         .map_err(runtime_status_response)?;
+    let managed_runtime_health =
+        state.runtime.managed_runtime_health_snapshot().await.map_err(runtime_status_response)?;
     let auth_snapshot = state
         .auth_runtime
         .admin_status_snapshot(Arc::clone(&state.runtime))
@@ -181,6 +183,14 @@ pub(crate) async fn admin_status_handler(
             })?,
         );
         map.insert(
+            "managed_runtime_health".to_owned(),
+            serde_json::to_value(managed_runtime_health).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to serialize managed runtime health snapshot: {error}"
+                )))
+            })?,
+        );
+        map.insert(
             "lifecycle".to_owned(),
             serde_json::to_value(lifecycle).map_err(|error| {
                 runtime_status_response(tonic::Status::internal(format!(
@@ -250,6 +260,8 @@ pub(crate) async fn admin_metrics_handler(
         .status_snapshot_async(context.clone(), state.auth.clone())
         .await
         .map_err(runtime_status_response)?;
+    let managed_runtime_health =
+        state.runtime.managed_runtime_health_snapshot().await.map_err(runtime_status_response)?;
     let tool_jobs = state
         .runtime
         .list_tool_jobs(crate::journal::ToolJobsListFilter {
@@ -261,7 +273,11 @@ pub(crate) async fn admin_metrics_handler(
         })
         .await
         .map_err(runtime_status_response)?;
-    let body = crate::runtime_diagnostics::render_prometheus_metrics(&snapshot, &tool_jobs);
+    let body = crate::runtime_diagnostics::render_prometheus_metrics(
+        &snapshot,
+        &tool_jobs,
+        &managed_runtime_health,
+    );
     Ok(([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body).into_response())
 }
 
@@ -318,6 +334,627 @@ pub(crate) struct AdminStateRepairRequest {
 pub(crate) struct AdminStateCheckpointRequest {
     #[serde(default)]
     mode: Option<crate::journal::state_health::JournalWalCheckpointMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminSideEffectFenceResolutionAction {
+    Reconciled,
+    Abandoned,
+}
+
+impl From<AdminSideEffectFenceResolutionAction>
+    for palyra_common::runtime_contracts::SideEffectFenceState
+{
+    fn from(value: AdminSideEffectFenceResolutionAction) -> Self {
+        match value {
+            AdminSideEffectFenceResolutionAction::Reconciled => Self::Reconciled,
+            AdminSideEffectFenceResolutionAction::Abandoned => Self::Abandoned,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminSideEffectFenceResolutionRequest {
+    expected_intent_sha256: String,
+    action: AdminSideEffectFenceResolutionAction,
+    reason_code: String,
+    evidence_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminRuntimeHealthProbeRequest {
+    reason_code: String,
+    #[serde(default)]
+    security_authorization_evidence_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminRuntimeHealthProbeResponse {
+    disposition: String,
+    resulting_state: String,
+    generation: u64,
+    reason_code: String,
+    completed_at_unix_ms: i64,
+    replayed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminRuntimeHealthQuarantineClearRequest {
+    expected_generation: u64,
+    reason_code: String,
+    #[serde(default)]
+    probe_lease: Option<palyra_common::runtime_contracts::HealthProbeLeaseV1>,
+    #[serde(default)]
+    probe_evidence_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminRuntimeHealthQuarantineClearResponse {
+    component_id: String,
+    resulting_state: String,
+    generation: u64,
+    reason_code: String,
+    security_quarantine: bool,
+    cleared_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_event_sha256: Option<String>,
+    audit_payload_redacted: bool,
+}
+
+/// Resolves one uncertain side-effect fence without dispatching the tool again.
+///
+/// # Errors
+/// Returns an error response when authorization, request validation, or the
+/// durable state/digest precondition fails.
+pub(crate) async fn admin_side_effect_fence_resolution_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(operation_id): Path<String>,
+    Json(payload): Json<AdminSideEffectFenceResolutionRequest>,
+) -> Result<Json<palyra_common::runtime_contracts::SideEffectFenceV1>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let request = crate::journal::SideEffectFenceOperatorResolutionRequest {
+        operation_id: normalize_non_empty_field(operation_id, "operation_id")?,
+        expected_intent_sha256: payload.expected_intent_sha256,
+        resolution: payload.action.into(),
+        reason_code: payload.reason_code,
+        evidence_sha256: payload.evidence_sha256,
+        actor_id_sha256: sha256_hex(context.principal.as_bytes()),
+    };
+    let fence = state
+        .runtime
+        .resolve_tool_side_effect_fence_as_operator(request)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(fence))
+}
+
+/// Runs one exact host-owned provider probe and returns only committed metadata.
+///
+/// # Errors
+/// Returns an auth, validation, unsupported-component, or durable lifecycle error.
+pub(crate) async fn admin_runtime_health_probe_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(component_id): Path<String>,
+    Json(payload): Json<AdminRuntimeHealthProbeRequest>,
+) -> Result<Json<AdminRuntimeHealthProbeResponse>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let authorized_actor_id_sha256 =
+        crate::transport::grpc::auth::bound_admin_actor_principal(&state.auth, &context)
+            .map(|principal| sha256_hex(principal.as_bytes()));
+    state.runtime.record_admin_status_request();
+    let component_id = normalize_non_empty_field(component_id, "component_id")?;
+    let requested_reason = normalize_non_empty_field(payload.reason_code, "reason_code")?;
+    validate_runtime_health_reason_code(requested_reason.as_str())?;
+    if let Some(digest) = payload.security_authorization_evidence_sha256.as_deref() {
+        validate_runtime_health_sha256("security_authorization_evidence_sha256", digest)?;
+    }
+    let outcome = if component_id.starts_with("provider:") {
+        state
+            .runtime
+            .execute_provider_health_probe(
+                component_id.as_str(),
+                requested_reason,
+                payload.security_authorization_evidence_sha256,
+                authorized_actor_id_sha256,
+            )
+            .await
+            .map_err(runtime_status_response)?
+    } else {
+        let begin = state
+            .runtime
+            .begin_managed_runtime_health_probe(
+                component_id.as_str(),
+                requested_reason,
+                payload.security_authorization_evidence_sha256,
+                authorized_actor_id_sha256,
+            )
+            .map_err(runtime_status_response)?;
+        let evaluation = evaluate_managed_runtime_health_probe(&state, component_id.as_str());
+        state
+            .runtime
+            .settle_managed_runtime_health_probe(
+                &begin.lease,
+                evaluation.disposition,
+                evaluation.reason_code,
+                sha256_hex(evaluation.evidence.to_string().as_bytes()),
+            )
+            .map_err(runtime_status_response)?
+    };
+    Ok(Json(AdminRuntimeHealthProbeResponse {
+        disposition: outcome.disposition.as_str().to_owned(),
+        resulting_state: outcome.health.state.as_str().to_owned(),
+        generation: outcome.health.generation.get(),
+        reason_code: outcome.health.reason_code,
+        completed_at_unix_ms: outcome.completed_at_unix_ms,
+        replayed: outcome.replayed,
+    }))
+}
+
+struct ManagedRuntimeHealthProbeEvaluation {
+    disposition: palyra_common::runtime_contracts::HealthProbeDisposition,
+    reason_code: &'static str,
+    evidence: Value,
+}
+
+fn evaluate_managed_runtime_health_probe(
+    state: &AppState,
+    component_id: &str,
+) -> ManagedRuntimeHealthProbeEvaluation {
+    use palyra_common::runtime_contracts::HealthProbeDisposition;
+
+    if component_id.starts_with("plugin:") {
+        let evaluation = crate::plugins::resolve_plugins_root()
+            .and_then(|root| crate::plugins::load_plugin_bindings_index(root.as_path()))
+            .ok()
+            .and_then(|index| {
+                index.entries.into_iter().find(|entry| {
+                    crate::gateway::managed_runtime_health_component_id(
+                        crate::gateway::ManagedRuntimeHealthFamily::Plugin,
+                        entry.plugin_id.as_str(),
+                    )
+                    .is_ok_and(|candidate| candidate.as_str() == component_id)
+                })
+            });
+        let Some(binding) = evaluation else {
+            return ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.plugin_missing",
+                evidence: json!({"binding_present": false}),
+            };
+        };
+        let discovery_installed =
+            binding.discovery.state == crate::plugins::PluginDiscoveryState::Installed;
+        let ready = binding.enabled && discovery_installed && binding.capability_diff.valid;
+        return ManagedRuntimeHealthProbeEvaluation {
+            disposition: if ready {
+                HealthProbeDisposition::Passed
+            } else {
+                HealthProbeDisposition::Failed
+            },
+            reason_code: if ready {
+                "runtime.health.plugin_probe_passed"
+            } else {
+                "runtime.health.plugin_probe_failed"
+            },
+            evidence: json!({
+                "binding_present": true,
+                "enabled": binding.enabled,
+                "discovery_installed": discovery_installed,
+                "capability_diff_valid": binding.capability_diff.valid,
+                "typed_contracts_ready": binding.typed_contracts.ready,
+            }),
+        };
+    }
+    if component_id.starts_with("mcp:") {
+        let snapshot = match state.mcp_supervisor.lock() {
+            Ok(supervisor) => supervisor.snapshot(unix_ms_now().unwrap_or_default()),
+            Err(_) => {
+                return ManagedRuntimeHealthProbeEvaluation {
+                    disposition: HealthProbeDisposition::Inconclusive,
+                    reason_code: "runtime.health.mcp_supervisor_unavailable",
+                    evidence: json!({"supervisor_available": false}),
+                };
+            }
+        };
+        let Some(server) = snapshot.servers.into_iter().find(|server| {
+            crate::gateway::managed_runtime_health_component_id(
+                crate::gateway::ManagedRuntimeHealthFamily::Mcp,
+                server.id.as_str(),
+            )
+            .is_ok_and(|candidate| candidate.as_str() == component_id)
+        }) else {
+            return ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.mcp_server_missing",
+                evidence: json!({"server_present": false}),
+            };
+        };
+        let disposition = match server.state {
+            crate::application::mcp_broker::McpServerLifecycleState::Healthy => {
+                HealthProbeDisposition::Passed
+            }
+            crate::application::mcp_broker::McpServerLifecycleState::Starting
+            | crate::application::mcp_broker::McpServerLifecycleState::Stopped
+            | crate::application::mcp_broker::McpServerLifecycleState::Degraded => {
+                HealthProbeDisposition::Inconclusive
+            }
+            crate::application::mcp_broker::McpServerLifecycleState::Backoff
+            | crate::application::mcp_broker::McpServerLifecycleState::Disabled
+            | crate::application::mcp_broker::McpServerLifecycleState::Quarantined => {
+                HealthProbeDisposition::Failed
+            }
+        };
+        return ManagedRuntimeHealthProbeEvaluation {
+            disposition,
+            reason_code: match disposition {
+                HealthProbeDisposition::Passed => "runtime.health.mcp_probe_passed",
+                HealthProbeDisposition::Failed => "runtime.health.mcp_probe_failed",
+                HealthProbeDisposition::Inconclusive => "runtime.health.mcp_probe_inconclusive",
+                HealthProbeDisposition::DeniedMutatingProbe => {
+                    "runtime.health.mcp_probe_mutation_denied"
+                }
+            },
+            evidence: json!({
+                "server_present": true,
+                "enabled": server.enabled,
+                "state": server.state.as_str(),
+                "catalog_available": server.catalog_available,
+                "consecutive_failures": server.consecutive_failures,
+            }),
+        };
+    }
+    if component_id.starts_with("lsp:") {
+        let language_id = crate::application::code_intel_runtime::CodeIntelLanguage::ALL
+            .iter()
+            .find(|language| {
+                crate::gateway::managed_runtime_health_component_id(
+                    crate::gateway::ManagedRuntimeHealthFamily::Lsp,
+                    language.as_str(),
+                )
+                .is_ok_and(|candidate| candidate.as_str() == component_id)
+            })
+            .map(|language| language.as_str());
+        let Some(language_id) = language_id else {
+            return ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.lsp_provider_missing",
+                evidence: json!({"provider_present": false}),
+            };
+        };
+        let config = match state.loaded_config.lock() {
+            Ok(config) => config.tool_call.code_intel.clone(),
+            Err(_) => {
+                return ManagedRuntimeHealthProbeEvaluation {
+                    disposition: HealthProbeDisposition::Inconclusive,
+                    reason_code: "runtime.health.lsp_config_unavailable",
+                    evidence: json!({"config_available": false}),
+                };
+            }
+        };
+        let Some(status) = crate::application::tool_runtime::code_intel::probe_code_intel_provider(
+            &config,
+            language_id,
+        ) else {
+            return ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.lsp_provider_missing",
+                evidence: json!({"provider_present": false}),
+            };
+        };
+        let disposition = match status.status.as_str() {
+            "ready" => HealthProbeDisposition::Passed,
+            "missing_binary" | "failed" | "disabled" => HealthProbeDisposition::Failed,
+            _ => HealthProbeDisposition::Inconclusive,
+        };
+        return ManagedRuntimeHealthProbeEvaluation {
+            disposition,
+            reason_code: match disposition {
+                HealthProbeDisposition::Passed => "runtime.health.lsp_probe_passed",
+                HealthProbeDisposition::Failed => "runtime.health.lsp_probe_failed",
+                HealthProbeDisposition::Inconclusive => "runtime.health.lsp_probe_inconclusive",
+                HealthProbeDisposition::DeniedMutatingProbe => {
+                    "runtime.health.lsp_probe_mutation_denied"
+                }
+            },
+            evidence: json!({
+                "provider_present": true,
+                "status": status.status,
+                "reason_code": status.reason_code,
+            }),
+        };
+    }
+    if component_id.starts_with("ssh:") {
+        let (profiles, profile_id) = match state.loaded_config.lock() {
+            Ok(config) => {
+                let profiles = config.execution_backend_profiles.clone();
+                let profile_id = profiles
+                    .profiles
+                    .iter()
+                    .find(|profile| {
+                        profile.enabled
+                            && profile.kind == "ssh_worker"
+                            && crate::gateway::managed_runtime_health_component_id(
+                                crate::gateway::ManagedRuntimeHealthFamily::Ssh,
+                                profile.id.as_str(),
+                            )
+                            .is_ok_and(|candidate| candidate.as_str() == component_id)
+                    })
+                    .map(|profile| profile.id.clone());
+                (profiles, profile_id)
+            }
+            Err(_) => {
+                return ManagedRuntimeHealthProbeEvaluation {
+                    disposition: HealthProbeDisposition::Inconclusive,
+                    reason_code: "runtime.health.ssh_config_unavailable",
+                    evidence: json!({"config_available": false}),
+                };
+            }
+        };
+        let Some(profile_id) = profile_id else {
+            return ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.ssh_probe_failed",
+                evidence: json!({"runner_available": false}),
+            };
+        };
+        return match crate::execution_backends::probe_ssh_worker_profile(
+            &profiles,
+            profile_id.as_str(),
+        ) {
+            Ok(health) => {
+                let disposition = match health.status {
+                    crate::execution_backends::ExecutionBackendHealthStatus::Healthy => {
+                        HealthProbeDisposition::Passed
+                    }
+                    crate::execution_backends::ExecutionBackendHealthStatus::Degraded => {
+                        HealthProbeDisposition::Inconclusive
+                    }
+                    crate::execution_backends::ExecutionBackendHealthStatus::Unavailable => {
+                        HealthProbeDisposition::Failed
+                    }
+                };
+                ManagedRuntimeHealthProbeEvaluation {
+                    disposition,
+                    reason_code: match disposition {
+                        HealthProbeDisposition::Passed => "runtime.health.ssh_probe_passed",
+                        HealthProbeDisposition::Failed => "runtime.health.ssh_probe_failed",
+                        HealthProbeDisposition::Inconclusive => {
+                            "runtime.health.ssh_probe_inconclusive"
+                        }
+                        HealthProbeDisposition::DeniedMutatingProbe => {
+                            "runtime.health.ssh_probe_mutation_denied"
+                        }
+                    },
+                    evidence: json!({
+                        "runner_available": true,
+                        "runner_reason_code": health.reason_code,
+                    }),
+                }
+            }
+            Err(_) => ManagedRuntimeHealthProbeEvaluation {
+                disposition: HealthProbeDisposition::Failed,
+                reason_code: "runtime.health.ssh_probe_failed",
+                evidence: json!({"runner_available": false}),
+            },
+        };
+    }
+    if component_id.starts_with("worker:") {
+        let (disposition, reason_code, evidence) =
+            state.runtime.probe_networked_worker_health(component_id);
+        return ManagedRuntimeHealthProbeEvaluation { disposition, reason_code, evidence };
+    }
+    ManagedRuntimeHealthProbeEvaluation {
+        disposition: HealthProbeDisposition::Inconclusive,
+        reason_code: "runtime.health.probe_executor_missing",
+        evidence: json!({"executor_registered": false}),
+    }
+}
+
+/// Clears one exact durable quarantine under the authenticated admin principal.
+///
+/// # Errors
+/// Returns an auth, validation, generation, state, or atomic audit failure.
+pub(crate) async fn admin_runtime_health_quarantine_clear_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(component_id): Path<String>,
+    Json(payload): Json<AdminRuntimeHealthQuarantineClearRequest>,
+) -> Result<Json<AdminRuntimeHealthQuarantineClearResponse>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let authorized_actor =
+        crate::transport::grpc::auth::bound_admin_actor_principal(&state.auth, &context)
+            .ok_or_else(|| {
+                state.runtime.record_denied();
+                runtime_status_response(tonic::Status::permission_denied(
+            "runtime quarantine clear requires an admin credential bound to the request principal",
+        ))
+            })?;
+    state.runtime.record_admin_status_request();
+
+    let component_id = normalize_non_empty_field(component_id, "component_id")?;
+    let component_id = palyra_common::runtime_contracts::RuntimeInstanceId::parse(
+        component_id.as_str(),
+    )
+    .map_err(|_| {
+        validation_error_response(
+            "component_id",
+            "invalid_runtime_instance_id",
+            "component_id must be a bounded runtime instance identity",
+        )
+    })?;
+    let expected_generation =
+        palyra_common::runtime_contracts::RuntimeGeneration::new(payload.expected_generation)
+            .map_err(|_| {
+                validation_error_response(
+                    "expected_generation",
+                    "invalid_runtime_generation",
+                    "expected_generation must be greater than zero",
+                )
+            })?;
+    let reason_code = normalize_non_empty_field(payload.reason_code, "reason_code")?;
+    validate_runtime_health_reason_code(reason_code.as_str())?;
+    if let Some(digest) = payload.probe_evidence_sha256.as_deref() {
+        validate_runtime_health_sha256("probe_evidence_sha256", digest)?;
+    }
+    let authorization_evidence_sha256 = runtime_health_clear_authorization_evidence_sha256(
+        authorized_actor,
+        &context,
+        component_id.as_str(),
+        expected_generation.get(),
+        reason_code.as_str(),
+    );
+    let clear = palyra_common::runtime_contracts::QuarantineClearRequest {
+        schema_version: palyra_common::runtime_contracts::QUARANTINE_CLEAR_REQUEST_SCHEMA_VERSION,
+        component_id,
+        expected_generation,
+        actor_id: sha256_hex(authorized_actor.as_bytes()),
+        reason_code,
+        authorization_evidence_sha256,
+        probe_lease: payload.probe_lease,
+        probe_evidence_sha256: payload.probe_evidence_sha256,
+    };
+    clear.validate().map_err(|_| {
+        validation_error_response(
+            "quarantine_clear",
+            "invalid_quarantine_clear",
+            "quarantine clear evidence must be exact, bounded, and probe evidence must be paired",
+        )
+    })?;
+    let outcome = state
+        .runtime
+        .clear_runtime_component_quarantine(clear, context)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(AdminRuntimeHealthQuarantineClearResponse {
+        component_id: outcome.health.component_id.as_str().to_owned(),
+        resulting_state: outcome.health.state.as_str().to_owned(),
+        generation: outcome.health.generation.get(),
+        reason_code: outcome.health.reason_code,
+        security_quarantine: outcome.health.security_quarantine,
+        cleared_at_unix_ms: outcome.health.updated_at_unix_ms,
+        audit_event_sha256: outcome.audit_event_sha256,
+        audit_payload_redacted: outcome.audit_payload_redacted,
+    }))
+}
+
+/// Rejects a retired runtime-health mutation surface after authentication.
+///
+/// # Errors
+/// Returns an auth or context error before the stable `410 Gone` response.
+pub(crate) async fn admin_runtime_health_legacy_mutation_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    Ok(build_error_response(
+        StatusCode::GONE,
+        "runtime health mutation endpoint was replaced by the host-owned probe operation"
+            .to_owned(),
+        "runtime_health_legacy_endpoint_retired",
+        control_plane::ErrorCategory::Dependency,
+        false,
+        Vec::new(),
+        false,
+    ))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the handler validation boundary returns the shared HTTP response type"
+)]
+fn validate_runtime_health_reason_code(reason_code: &str) -> Result<(), Response> {
+    if !reason_code.is_empty()
+        && reason_code.len() <= 128
+        && reason_code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Ok(());
+    }
+    Err(validation_error_response(
+        "reason_code",
+        "invalid_reason_code",
+        "reason_code must contain 1-128 ASCII letters, digits, '.', '-', or '_'",
+    ))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the handler validation boundary returns the shared HTTP response type"
+)]
+fn validate_runtime_health_sha256(field: &'static str, digest: &str) -> Result<(), Response> {
+    if digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Ok(());
+    }
+    Err(validation_error_response(
+        field,
+        "invalid_sha256",
+        "runtime health evidence must be a lowercase SHA-256 digest",
+    ))
+}
+
+fn runtime_health_clear_authorization_evidence_sha256(
+    bound_principal: &str,
+    context: &crate::gateway::RequestContext,
+    component_id: &str,
+    expected_generation: u64,
+    reason_code: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.runtime_health.quarantine_clear.authorization.v1\0");
+    for value in [
+        bound_principal.as_bytes(),
+        context.principal.as_bytes(),
+        context.device_id.as_bytes(),
+        context.channel.as_deref().unwrap_or_default().as_bytes(),
+        component_id.as_bytes(),
+        reason_code.as_bytes(),
+    ] {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(value);
+    }
+    hasher.update(expected_generation.to_be_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Returns the SQLite journal state doctor report.

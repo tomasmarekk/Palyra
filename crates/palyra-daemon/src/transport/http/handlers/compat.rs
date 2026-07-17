@@ -2624,6 +2624,47 @@ fn build_compat_run_events_streaming_response(
         let limit = requested_limit
             .unwrap_or(COMPAT_RUN_EVENTS_PAGE_LIMIT_DEFAULT)
             .clamp(1, COMPAT_RUN_EVENTS_PAGE_LIMIT_MAX);
+        let (public_event_generation, legacy_runtime_projection) =
+            match state.runtime.persisted_runtime_generation_for_run(run_id.clone()).await {
+                Ok(Some((generation_session_id, generation)))
+                    if generation_session_id == session_id =>
+                {
+                    (generation, false)
+                }
+                Ok(Some(_)) => {
+                    let _ = send_sse_event(
+                        &sender,
+                        "run.failed",
+                        compat_error_payload(
+                            "server_error",
+                            "run_events_generation_session_mismatch",
+                            "persisted runtime event generation belongs to another session",
+                        ),
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
+                Ok(None) => (
+                    palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                        .expect("legacy projection generation"),
+                    true,
+                ),
+                Err(error) => {
+                    let _ = send_sse_event(
+                        &sender,
+                        "run.failed",
+                        compat_error_payload(
+                            "server_error",
+                            "run_events_generation_failed",
+                            sanitize_http_error_message(error.message()),
+                        ),
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
+            };
         let mut cursor = after_seq;
 
         loop {
@@ -2651,12 +2692,82 @@ fn build_compat_run_events_streaming_response(
 
             for record in page.events {
                 cursor = Some(record.seq);
-                let Some(public_event) = public_runtime_event_json_from_tape_record(
-                    run_id.as_str(),
-                    session_id.as_str(),
-                    created_at_unix_ms,
-                    &record,
-                ) else {
+                let Some(event) = run_stream_event_from_tape_record(run_id.as_str(), &record)
+                else {
+                    continue;
+                };
+                let persisted_runtime_event = match state
+                    .runtime
+                    .persisted_runtime_event_for_tape_sequence(run_id.clone(), record.seq)
+                    .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let _ = send_sse_event(
+                            &sender,
+                            "run.failed",
+                            compat_error_payload(
+                                "server_error",
+                                "run_events_runtime_projection_failed",
+                                sanitize_http_error_message(error.message()),
+                            ),
+                        )
+                        .await;
+                        let _ = send_sse_done(&sender).await;
+                        return;
+                    }
+                };
+                if persisted_runtime_event.is_none()
+                    && !legacy_runtime_projection
+                    && crate::application::run_stream::public_events::
+                        run_stream_event_requires_persisted_v2(&event)
+                {
+                    let _ = send_sse_event(
+                        &sender,
+                        "run.failed",
+                        compat_error_payload(
+                            "server_error",
+                            "run_events_runtime_projection_missing",
+                            "canonical runtime event projection is missing for a V2 run",
+                        ),
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
+                let public_event = match persisted_runtime_event.as_ref() {
+                    Some(runtime_event) => {
+                        let public_event = crate::application::run_stream::public_events::
+                            public_runtime_event_json_from_persisted_run_stream_event(
+                                &event,
+                                runtime_event,
+                            );
+                        if public_event.is_none() {
+                            let _ = send_sse_event(
+                                &sender,
+                                "run.failed",
+                                compat_error_payload(
+                                    "server_error",
+                                    "run_events_runtime_projection_mismatch",
+                                    "canonical runtime event does not match its replay tape row",
+                                ),
+                            )
+                            .await;
+                            let _ = send_sse_done(&sender).await;
+                            return;
+                        }
+                        public_event
+                    }
+                    None => public_runtime_event_json_from_legacy_tape_event(
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        created_at_unix_ms,
+                        &record,
+                        &event,
+                        public_event_generation,
+                    ),
+                };
+                let Some(public_event) = public_event else {
                     continue;
                 };
                 let event_name = public_event
@@ -2713,22 +2824,29 @@ fn build_compat_run_events_streaming_response(
     response
 }
 
-fn public_runtime_event_json_from_tape_record(
+fn public_runtime_event_json_from_legacy_tape_event(
     run_id: &str,
     session_id: &str,
     created_at_unix_ms: i64,
     record: &journal::OrchestratorTapeRecord,
+    event: &common_v1::RunStreamEvent,
+    generation: palyra_common::runtime_contracts::RuntimeGeneration,
 ) -> Option<Value> {
-    let event = run_stream_event_from_tape_record(run_id, record)?;
-    let sequence = u64::try_from(record.seq.saturating_add(1)).ok()?;
-    let event_id =
-        crate::application::run_stream::public_events::run_stream_public_event_id(run_id, sequence);
+    let source_sequence = u64::try_from(record.seq).ok()?;
+    let sequence = source_sequence.checked_add(1)?;
+    let event_id = crate::application::run_stream::public_events::run_stream_public_event_id(
+        run_id,
+        source_sequence,
+    );
     crate::application::run_stream::public_events::public_runtime_event_json_from_run_stream_event(
-        &event,
+        event,
         crate::application::run_stream::public_events::PublicRunStreamEventContext {
             event_id: event_id.as_str(),
             session_id,
+            generation,
+            sequence,
             occurred_at_unix_ms: created_at_unix_ms.saturating_add(record.seq.max(0)),
+            causal_parent_event_id: None,
             request_id: None,
         },
     )
@@ -3763,6 +3881,12 @@ fn build_compat_chat_streaming_response(
                 return;
             }
         };
+        let public_event_generation =
+            state.runtime.runtime_generation_for_run(run_id.clone()).await.ok().flatten().and_then(
+                |(generation_session_id, generation)| {
+                    (generation_session_id == session_id).then_some(generation)
+                },
+            );
 
         let mut keepalive = tokio::time::interval(COMPAT_SSE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3785,16 +3909,21 @@ fn build_compat_chat_streaming_response(
                             run_id.as_str(),
                             public_event_sequence,
                         );
-                    let public_event = crate::application::run_stream::public_events::
-                        public_runtime_event_json_from_run_stream_event(
+                    let public_event = public_event_generation.and_then(|generation| {
+                        crate::application::run_stream::public_events::
+                            public_runtime_event_json_from_run_stream_event(
                             &event,
                             crate::application::run_stream::public_events::PublicRunStreamEventContext {
                                 event_id: public_event_id.as_str(),
                                 session_id: session_id.as_str(),
+                                generation,
+                                sequence: public_event_sequence,
                                 occurred_at_unix_ms: unix_ms_now().unwrap_or(created_at_unix_ms),
+                                causal_parent_event_id: None,
                                 request_id: None,
                             },
-                        );
+                        )
+                    });
                     match event.body {
                         Some(common_v1::run_stream_event::Body::ModelToken(token_event))
                             if !send_compat_chat_sse_data(
@@ -4293,6 +4422,12 @@ fn build_compat_responses_streaming_response(
                 return;
             }
         };
+        let public_event_generation =
+            state.runtime.runtime_generation_for_run(run_id.clone()).await.ok().flatten().and_then(
+                |(generation_session_id, generation)| {
+                    (generation_session_id == session_id).then_some(generation)
+                },
+            );
 
         let mut keepalive = tokio::time::interval(Duration::from_secs(15));
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4315,16 +4450,21 @@ fn build_compat_responses_streaming_response(
                                     run_id.as_str(),
                                     public_event_sequence,
                                 );
-                            let public_event = crate::application::run_stream::public_events::
-                                public_runtime_event_json_from_run_stream_event(
+                            let public_event = public_event_generation.and_then(|generation| {
+                                crate::application::run_stream::public_events::
+                                    public_runtime_event_json_from_run_stream_event(
                                     &event,
                                     crate::application::run_stream::public_events::PublicRunStreamEventContext {
                                         event_id: public_event_id.as_str(),
                                         session_id: session_id.as_str(),
+                                        generation,
+                                        sequence: public_event_sequence,
                                         occurred_at_unix_ms: unix_ms_now().unwrap_or(created_at_unix_ms),
+                                        causal_parent_event_id: None,
                                         request_id: None,
                                     },
-                                );
+                                )
+                            });
                             match event.body {
                                 Some(common_v1::run_stream_event::Body::ModelToken(token_event)) => {
                                     content.push_str(token_event.token.as_str());

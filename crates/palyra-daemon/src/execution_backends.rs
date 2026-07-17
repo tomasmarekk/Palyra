@@ -62,7 +62,8 @@ use crate::{
     journal::{ToolJobRecord, ToolJobState},
     node_runtime::RegisteredNodeRecord,
     sandbox_runner::{
-        process_runner_executor_name, ProcessProgressSink, SandboxProcessRunnerPolicy,
+        process_runner_executor_name, BackgroundProcessRegistrationFence, ProcessProgressSink,
+        SandboxProcessRunnerPolicy,
     },
     tool_protocol::{
         build_tool_execution_outcome, build_tool_execution_outcome_with_manifest,
@@ -848,6 +849,7 @@ pub(crate) struct ExecutionBackendProcessRunRequest<'a> {
     pub(crate) vault: Option<&'a Vault>,
     pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
     pub(crate) process_progress_sink: Option<ProcessProgressSink>,
+    pub(crate) background_registration_fence: Option<BackgroundProcessRegistrationFence>,
     pub(crate) fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 }
 
@@ -1074,6 +1076,7 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
                 request.input_json,
                 request.cancellation_requested,
                 request.process_progress_sink,
+                request.background_registration_fence,
                 request.fault_injection,
             )
             .await;
@@ -1284,6 +1287,28 @@ impl ExecutionBackendRunnerRegistry {
     }
 }
 
+/// Probes one enabled SSH-worker profile through the runner's non-mutating
+/// transport health seam. This never opens a shell or dispatches work.
+pub(crate) fn probe_ssh_worker_profile(
+    profiles: &ExecutionBackendProfilesConfig,
+    profile_id: &str,
+) -> Result<ExecutionBackendRunnerHealth, String> {
+    let profile_id = profile_id.trim();
+    let profiles_for_backend =
+        enabled_profiles_for_backend(profiles, ExecutionBackendPreference::SshTunnel);
+    if !profiles_for_backend.iter().any(|profile| profile.id == profile_id) {
+        return Err(format!("enabled SSH worker profile '{profile_id}' is not registered"));
+    }
+    let registry = ExecutionBackendRunnerRegistry::from_execution_backend_profiles(profiles)?;
+    registry
+        .select_runner(
+            ExecutionBackendPreference::SshTunnel,
+            ExecutionBackendRunnerCapability::HealthProbe,
+        )
+        .map(|runner| runner.health_probe())
+        .map_err(|error| error.to_string())
+}
+
 /// Builds status reports that join configured inventory with live runner
 /// capability and cleanup evidence.
 #[must_use]
@@ -1405,6 +1430,14 @@ pub(crate) struct ExecutionBackendRunnerSelectionError {
     reason_code: String,
     message: String,
 }
+
+impl std::fmt::Display for ExecutionBackendRunnerSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.reason_code, self.message)
+    }
+}
+
+impl std::error::Error for ExecutionBackendRunnerSelectionError {}
 
 impl ExecutionBackendRunnerSelectionError {
     fn unavailable_backend(
@@ -4729,13 +4762,11 @@ pub(crate) fn resolve_execution_backend_for_request(
     }
 }
 
-/// Resolves a plain backend preference with fallback semantics.
+/// Resolves a plain backend preference without silently substituting explicit choices.
 ///
-/// `Automatic` pins to the local sandbox. Unselectable preview backends fall
-/// back to the local sandbox (flagged via `fallback_used`) -- except Docker
-/// and `NetworkedWorker`, where falling back would silently downgrade an
-/// explicit isolation or worker grant onto the daemon host, so those requests
-/// fail closed instead. Every non-local resolution requires approval.
+/// `Automatic` pins to the local sandbox. Every explicit backend preference
+/// remains explicit and fails closed when unavailable. Every non-local
+/// resolution requires approval.
 #[must_use]
 pub(crate) fn resolve_execution_backend(
     preference: ExecutionBackendPreference,
@@ -4787,70 +4818,6 @@ pub(crate) fn resolve_execution_backend(
         }
     }
 
-    // Deny local fallback for explicit isolation backends: the caller asked
-    // for a container or attested worker grant and must not silently end up
-    // on the daemon host (pinned by tests).
-    if matches!(
-        preference,
-        ExecutionBackendPreference::Docker | ExecutionBackendPreference::NetworkedWorker
-    ) {
-        return ExecutionBackendResolution {
-            requested: preference,
-            resolved: preference,
-            fallback_used: false,
-            reason_code: format!("backend.unavailable.{}", preference.as_str()),
-            approval_required: true,
-            reason: requested_record
-                .map(|record| {
-                    format!(
-                        "Requested backend '{}' is not selectable and local fallback is denied for explicit isolation grants. {}",
-                        preference.as_str(),
-                        record.operator_summary
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "Requested backend '{}' is missing from inventory and local fallback is denied for explicit isolation grants.",
-                        preference.as_str()
-                    )
-                }),
-        };
-    }
-
-    if let Some(record) = local_record.filter(|entry| entry.selectable) {
-        return ExecutionBackendResolution {
-            requested: preference,
-            resolved: ExecutionBackendPreference::LocalSandbox,
-            fallback_used: true,
-            reason_code: format!("backend.fallback.{}", preference.as_str()),
-            approval_required: false,
-            reason: format!(
-                "Requested backend '{}' is not selectable right now; falling back to local_sandbox. {}",
-                preference.as_str(),
-                record.operator_summary
-            ),
-        };
-    }
-
-    let fallback = inventory.iter().find(|entry| entry.selectable);
-    if let Some(record) = fallback {
-        let resolved = parse_execution_backend_preference(record.backend_id.as_str(), "backend_id")
-            .unwrap_or(ExecutionBackendPreference::Automatic);
-        return ExecutionBackendResolution {
-            requested: preference,
-            resolved,
-            fallback_used: true,
-            reason_code: format!("backend.fallback.{}", record.backend_id),
-            approval_required: !matches!(resolved, ExecutionBackendPreference::LocalSandbox),
-            reason: format!(
-                "Requested backend '{}' is not selectable; falling back to '{}'. {}",
-                preference.as_str(),
-                record.backend_id,
-                record.operator_summary
-            ),
-        };
-    }
-
     ExecutionBackendResolution {
         requested: preference,
         resolved: preference,
@@ -4858,7 +4825,7 @@ pub(crate) fn resolve_execution_backend(
         reason_code: format!("backend.unavailable.{}", preference.as_str()),
         approval_required: !matches!(preference, ExecutionBackendPreference::LocalSandbox),
         reason: format!(
-            "Requested backend '{}' is currently unavailable and no fallback backend is selectable.",
+            "Requested backend '{}' is currently unavailable; local fallback is denied for explicit backend choices.",
             preference.as_str()
         ),
     }
@@ -5783,6 +5750,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unavailable_backend_does_not_fall_back_to_local() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        for preference in [
+            ExecutionBackendPreference::DesktopNode,
+            ExecutionBackendPreference::Docker,
+            ExecutionBackendPreference::NetworkedWorker,
+            ExecutionBackendPreference::SshTunnel,
+        ] {
+            let resolution = resolve_execution_backend(preference, &inventory);
+            assert_eq!(resolution.resolved, preference);
+            assert!(!resolution.fallback_used);
+            assert!(resolution.reason_code.starts_with("backend.unavailable."));
+        }
+    }
+
+    #[test]
     fn execution_backend_parity_matrix_covers_runner_contracts() {
         let remote_tool_cases = [
             ("palyra.fs.read_file", WorkerRemoteToolKind::FsRead),
@@ -5969,6 +5964,10 @@ mod tests {
             Ok(_) => panic!("ssh tunnel must not fall back to local execution"),
             Err(error) => error,
         };
+        assert_eq!(
+            error.to_string(),
+            "runner.unavailable.ssh_tunnel: execution backend ssh_tunnel has no registered runner for open_workspace; local fallback is denied"
+        );
 
         let outcome = error.to_tool_execution_outcome("proposal-ssh", "palyra.fs.read_file", b"{}");
         assert!(!outcome.success);
@@ -6233,6 +6232,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6334,6 +6334,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6481,6 +6482,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection,
             })
             .await;
@@ -6557,6 +6559,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection,
             })
             .await;
@@ -6611,6 +6614,7 @@ mod tests {
                 vault: Some(&vault),
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6657,6 +6661,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6688,6 +6693,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6725,6 +6731,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6776,6 +6783,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6816,6 +6824,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6884,6 +6893,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6954,6 +6964,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -6984,6 +6995,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -7030,6 +7042,7 @@ mod tests {
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
+                background_registration_fence: None,
                 fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
             })
             .await;
@@ -7066,7 +7079,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_backend_resolution_falls_back_to_local_sandbox() {
+    fn explicit_preview_backend_resolution_fails_closed_without_local_fallback() {
         let networked_workers = NetworkedWorkersConfig::default();
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
@@ -7082,8 +7095,10 @@ mod tests {
         );
         let resolution =
             resolve_execution_backend(ExecutionBackendPreference::DesktopNode, &inventory);
-        assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
-        assert!(resolution.fallback_used);
+        assert_eq!(resolution.resolved, ExecutionBackendPreference::DesktopNode);
+        assert!(!resolution.fallback_used);
+        assert_eq!(resolution.reason_code, "backend.unavailable.desktop_node");
+        assert!(resolution.reason.contains("local fallback is denied"));
     }
 
     #[test]

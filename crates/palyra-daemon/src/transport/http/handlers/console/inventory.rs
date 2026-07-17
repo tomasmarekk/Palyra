@@ -167,6 +167,9 @@ fn capability_request_view(
             crate::node_runtime::CapabilityRequestState::Rejected => {
                 control_plane::NodeCapabilityRequestState::Rejected
             }
+            crate::node_runtime::CapabilityRequestState::Cancelled => {
+                control_plane::NodeCapabilityRequestState::Cancelled
+            }
         },
         created_at_unix_ms: record.created_at_unix_ms,
         updated_at_unix_ms: record.updated_at_unix_ms,

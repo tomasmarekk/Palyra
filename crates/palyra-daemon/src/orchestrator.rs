@@ -61,6 +61,17 @@ impl RunLifecycleState {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
+
+    /// Returns the state-machine transition that reaches this terminal state.
+    #[must_use]
+    pub const fn terminal_transition(self) -> Option<RunTransition> {
+        match self {
+            Self::Done => Some(RunTransition::Complete),
+            Self::Failed => Some(RunTransition::Fail),
+            Self::Cancelled => Some(RunTransition::Cancel),
+            Self::Pending | Self::Accepted | Self::InProgress => None,
+        }
+    }
 }
 
 /// Errors produced by [`RunStateMachine::transition`].

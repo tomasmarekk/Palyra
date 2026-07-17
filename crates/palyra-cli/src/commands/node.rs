@@ -1413,6 +1413,7 @@ mod tests {
                 capability: "desktop.open_url".to_owned(),
                 input_json: Vec::new(),
                 max_payload_bytes: 1024,
+                networked_worker_reservation: None,
             },
             "awaiting_local_mediation",
         )

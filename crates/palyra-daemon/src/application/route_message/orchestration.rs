@@ -10,9 +10,14 @@
 //! one `RouteMessageResponse` while being mirrored to the orchestrator tape
 //! and journal.
 
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
-use palyra_common::runtime_contracts::QueueMode;
+use palyra_common::runtime_contracts::{
+    CancellationScopeKind, QueueMode, RuntimeActorKind, RuntimeActorRef, RuntimeTerminalOutcome,
+};
 use palyra_common::{runtime_preview::RuntimePreviewCapability, CANONICAL_PROTOCOL_MAJOR};
 use serde_json::json;
 use tonic::Status;
@@ -39,43 +44,129 @@ use crate::{
             ChannelOutboundCapabilities, OutboundLifecycle, OutboundLifecycleStart,
         },
         provider_input::{
-            build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
+            build_provider_image_inputs, prepare_model_provider_input,
+            rematerialize_provider_input, MemoryPromptFailureMode,
             PrepareModelProviderInputRequest,
         },
+        run_stream::flow_control::RunStreamFlowControl,
         service_authorization::authorize_message_action,
         session_queue::SessionQueueSafeBoundary,
         tool_registry::{
-            build_model_visible_tool_catalog_snapshot, snapshot_to_provider_request_value,
-            tool_catalog_tape_payload, ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest,
-            ToolExposureSurface,
+            build_model_visible_tool_catalog_snapshot, tool_catalog_tape_payload,
+            ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolExposureSurface,
         },
     },
     channel_router::{
         InboundMessage as ChannelInboundMessage, RetryDisposition, RoutePlan as ChannelRoutePlan,
     },
     gateway::{
-        agent_resolution_source_label, current_unix_ms, ingest_memory_best_effort,
+        agent_resolution_source_label, cleanup_run_resources, current_unix_ms,
+        ingest_memory_best_effort, is_provider_reconfigured_status,
         record_message_router_journal_event, request_context_with_resolved_route_channel,
         truncate_with_ellipsis, GatewayRuntimeState, SessionQueueAdmissionRequest,
     },
     journal::{
-        MemorySource, OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
+        MemorySource, OrchestratorRunStartRequest, OrchestratorRunTerminalSettlement,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
-    model_provider::{ProviderMessage, ProviderRequest},
     orchestrator::RunLifecycleState,
     provider_leases::ProviderLeaseExecutionContext,
+    self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
     tool_protocol::ToolRequestContext,
     transport::grpc::{
         auth::RequestContext,
         proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
     },
-    usage_governance::{plan_usage_routing, RoutingTaskClass, UsageRoutingPlanRequest},
+    usage_governance::{
+        plan_usage_routing, resolve_provider_binding_for_model, RoutingTaskClass,
+        UsageRoutingPlanRequest,
+    },
 };
 
 use super::response::{
     build_route_message_outputs, process_route_provider_response, RouteMessageOutputTemplate,
+    RouteProviderResponseProcessingOutcome,
 };
+
+const MAX_ROUTE_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
+/// Route-message runs keep a surface-owned 15-minute wall-clock budget.
+const ROUTE_MESSAGE_WALL_CLOCK_BUDGET_MS: u64 = 15 * 60 * 1_000;
+
+fn route_message_status_tape_payload(state: RunLifecycleState, message: &str) -> String {
+    match state {
+        RunLifecycleState::Done => json!({
+            "kind": "done",
+            "message": message,
+        })
+        .to_string(),
+        RunLifecycleState::Failed => json!({
+            "kind": "failed",
+            "message": message,
+            "lifecycle_state": "failed",
+        })
+        .to_string(),
+        RunLifecycleState::Cancelled => json!({
+            "kind": "cancelled",
+            "wire_kind": "failed",
+            "message": crate::gateway::CANCELLED_REASON,
+            "lifecycle_state": "cancelled",
+            "reason_code": "cancelled_by_request",
+            "controlled": true,
+        })
+        .to_string(),
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => {
+            unreachable!("route-message terminal status requires a terminal state")
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn settle_route_message_run(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    requested_state: RunLifecycleState,
+    reason_code: &str,
+    status_message: &str,
+) -> Result<OrchestratorRunTerminalSettlement, Status> {
+    let settlement = runtime_state
+        .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+            run_id: run_id.to_owned(),
+            requested_state,
+            reason_code: reason_code.to_owned(),
+            status_message: status_message.to_owned(),
+            actor: RuntimeActorRef {
+                kind: RuntimeActorKind::System,
+                id: "route_message".to_owned(),
+            },
+            terminal_summary_payload_json: None,
+            terminal_tape_events: Vec::new(),
+            terminal_status_payload_json: route_message_status_tape_payload(
+                requested_state,
+                status_message,
+            ),
+        })
+        .await?;
+    if settlement.changed {
+        let cleanup_reason = match settlement.effective_state {
+            RunLifecycleState::Cancelled => crate::gateway::CANCELLED_REASON,
+            RunLifecycleState::Done => "completed",
+            RunLifecycleState::Failed => status_message,
+            RunLifecycleState::Pending
+            | RunLifecycleState::Accepted
+            | RunLifecycleState::InProgress => {
+                return Err(Status::internal(
+                    "route-message terminal settlement returned a nonterminal state",
+                ));
+            }
+        };
+        cleanup_run_resources(runtime_state, run_id, cleanup_reason).await;
+        runtime_state.clear_self_healing_heartbeat(WorkHeartbeatKind::Run, run_id);
+    }
+    Ok(settlement)
+}
 
 fn inbound_coalescing_event_type(kind: InboundCoalescingDecisionKind) -> &'static str {
     match kind {
@@ -510,11 +601,46 @@ pub(crate) async fn handle_routed_route_message(
             origin_run_id: None,
             triggered_by_principal: Some(route_request_context.principal.clone()),
             parameter_delta_json: None,
+            delegated_admission: None,
         })
         .await?;
+    let (generation_session_id, generation) =
+        runtime_state.runtime_generation_for_run(run_id.clone()).await?.ok_or_else(|| {
+            Status::failed_precondition(
+                "route-message run admission did not activate a runtime generation",
+            )
+        })?;
+    if generation_session_id != session_id {
+        return Err(Status::failed_precondition(
+            "route-message session does not own the admitted runtime generation",
+        ));
+    }
+    let route_flow_control = RunStreamFlowControl::new(
+        generation,
+        Duration::from_millis(ROUTE_MESSAGE_WALL_CLOCK_BUDGET_MS),
+    )?;
     runtime_state
         .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
         .await?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "status".to_owned(),
+            payload_json: json!({
+                "kind": "in_progress",
+                "message": "route_message_processing",
+                "lifecycle_state": "in_progress",
+            })
+            .to_string(),
+        })
+        .await?;
+    runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        execution_generation: None,
+        summary: format!("route-message run {run_id} in progress"),
+    });
     let _ = record_message_router_journal_event(
         runtime_state,
         &route_request_context,
@@ -561,13 +687,14 @@ pub(crate) async fn handle_routed_route_message(
             runtime_state.record_denied();
             runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
             runtime_state.record_channel_reply_failure();
-            runtime_state
-                .update_orchestrator_run_state(
-                    run_id.clone(),
-                    RunLifecycleState::Failed,
-                    Some("route_target_agent_resolution_failed".to_owned()),
-                )
-                .await?;
+            settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                RunLifecycleState::Failed,
+                "route_message.agent_resolution_failed",
+                "route_target_agent_resolution_failed",
+            )
+            .await?;
             let _ = record_message_router_journal_event(
                 runtime_state,
                 &route_request_context,
@@ -741,7 +868,7 @@ pub(crate) async fn handle_routed_route_message(
     .await?;
 
     let mut remaining_tool_budget = 0_u32;
-    let tool_catalog_snapshot = build_and_record_route_tool_catalog_snapshot(
+    let mut tool_catalog_snapshot = build_and_record_route_tool_catalog_snapshot(
         runtime_state,
         &route_request_context,
         session_id.as_str(),
@@ -775,29 +902,13 @@ pub(crate) async fn handle_routed_route_message(
         },
     )
     .await?;
-    let mut provider_request = ProviderRequest::from_input_text(
-        prepared_provider_input.provider_input_text,
+    let mut current_prepared_provider_input = prepared_provider_input.clone();
+    let mut base_provider_request = prepared_provider_input.into_provider_request(
+        effective_input_text.as_str(),
         json_mode_requested,
-        prepared_provider_input.vision_inputs,
         (routing_decision.mode == "enforced").then(|| routing_decision.actual_model_id.clone()),
+        &tool_catalog_snapshot,
     );
-    provider_request.user_visible_input_text = Some(effective_input_text.clone());
-    provider_request.tool_catalog_snapshot =
-        Some(snapshot_to_provider_request_value(&tool_catalog_snapshot));
-    provider_request.instruction_hash = prepared_provider_input.instruction_hash.clone();
-    provider_request.context_trace_id = prepared_provider_input.context_trace_id.clone();
-    provider_request.budget_profile = prepared_provider_input.budget_profile.clone();
-    provider_request.max_output_tokens = prepared_provider_input.max_output_tokens;
-    provider_request.reasoning_effort = prepared_provider_input.reasoning_effort;
-    provider_request.service_tier = prepared_provider_input.service_tier;
-    provider_request.prompt_segments = prepared_provider_input.prompt_segments.clone();
-    provider_request.prompt_cache_policy = prepared_provider_input.prompt_cache_policy.clone();
-    provider_request.prompt_cache_report = prepared_provider_input.prompt_cache_report.clone();
-    if !prepared_provider_input.provider_messages.is_empty() {
-        let mut messages = prepared_provider_input.provider_messages.clone();
-        messages.push(ProviderMessage::user_text(provider_request.input_text.clone()));
-        provider_request.messages = messages;
-    }
 
     let mut outbound_lifecycle = OutboundLifecycle::start(OutboundLifecycleStart {
         lifecycle_id: format!("out_{run_id}"),
@@ -814,23 +925,213 @@ pub(crate) async fn handle_routed_route_message(
         observed_at_unix_ms: current_unix_ms(),
     });
 
-    let provider_response = runtime_state
-        .execute_model_provider_with_lease(
+    let mut provider_id = routing_decision.provider_id.clone();
+    let mut credential_id = routing_decision.credential_id.clone();
+    let mut supersession_retries = 0_u8;
+    let mut provider_terminal_state = None;
+    let provider_response = loop {
+        let provider_attempt = route_flow_control.child(
+            CancellationScopeKind::ProviderAttempt,
+            Duration::from_millis(ROUTE_MESSAGE_WALL_CLOCK_BUDGET_MS),
+        )?;
+        let remaining = RunStreamFlowControl::remaining_for_new_work(&provider_attempt)?;
+        let provider_request = base_provider_request.clone();
+        let mut provider_future = Box::pin(runtime_state.execute_model_provider_with_lease(
             provider_request,
             ProviderLeaseExecutionContext {
-                provider_id: routing_decision.provider_id.clone(),
-                credential_id: routing_decision.credential_id.clone(),
+                provider_id: provider_id.clone(),
+                credential_id: credential_id.clone(),
                 priority: RoutingTaskClass::PrimaryInteractive.lease_priority(),
                 task_label: RoutingTaskClass::PrimaryInteractive.as_str().to_owned(),
                 max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
                 session_id: Some(session_id.clone()),
                 run_id: Some(run_id.clone()),
+                diagnostic_scope_id: Some(provider_attempt.scope_id.as_str().to_owned()),
             },
-        )
-        .await;
+        ));
+        let provider_deadline = tokio::time::sleep(remaining);
+        tokio::pin!(provider_deadline);
+        let mut cancel_poll = tokio::time::interval(Duration::from_millis(100));
+        cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let provider_result = loop {
+            tokio::select! {
+                result = &mut provider_future => break result,
+                _ = &mut provider_deadline => {
+                    break Err(Status::deadline_exceeded(
+                        "route-message provider deadline exceeded",
+                    ));
+                }
+                _ = cancel_poll.tick() => {
+                    if runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await? {
+                        provider_terminal_state = Some(RunLifecycleState::Cancelled);
+                        break Err(Status::cancelled(crate::gateway::CANCELLED_REASON));
+                    }
+                }
+            }
+        };
+        if provider_terminal_state.is_some() {
+            break Err(Status::cancelled(crate::gateway::CANCELLED_REASON));
+        }
+        match provider_result {
+            Ok(response) => break Ok(response),
+            Err(error)
+                if is_provider_reconfigured_status(&error)
+                    && supersession_retries < MAX_ROUTE_PROVIDER_SUPERSESSION_RETRIES =>
+            {
+                if runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await? {
+                    provider_terminal_state = Some(RunLifecycleState::Cancelled);
+                    break Err(Status::cancelled(crate::gateway::CANCELLED_REASON));
+                }
+                supersession_retries = supersession_retries.saturating_add(1);
+                let provider_snapshot = runtime_state.model_provider_status_snapshot();
+                let replacement_model_id = base_provider_request
+                    .model_override
+                    .as_deref()
+                    .filter(|model_id| {
+                        provider_snapshot
+                            .registry
+                            .models
+                            .iter()
+                            .any(|model| model.model_id == *model_id && model.enabled)
+                    })
+                    .map(ToOwned::to_owned)
+                    .or_else(|| provider_snapshot.route_selection.selected_model_id.clone())
+                    .or_else(|| provider_snapshot.registry.default_chat_model_id.clone())
+                    .or_else(|| provider_snapshot.model_id.clone());
+                let binding_model_id =
+                    replacement_model_id.clone().unwrap_or_else(|| "default".to_owned());
+                let replacement_binding = resolve_provider_binding_for_model(
+                    &provider_snapshot,
+                    binding_model_id.as_str(),
+                );
+                provider_id = replacement_binding.0;
+                let provider_kind = replacement_binding.1;
+                credential_id = replacement_binding.2;
+                tool_catalog_snapshot = build_and_record_route_tool_catalog_snapshot(
+                    runtime_state,
+                    &route_request_context,
+                    session_id.as_str(),
+                    run_id.as_str(),
+                    provider_kind.as_str(),
+                    replacement_model_id.as_deref(),
+                    remaining_tool_budget,
+                    &mut tape_seq,
+                )
+                .await?;
+                current_prepared_provider_input = rematerialize_provider_input(
+                    &current_prepared_provider_input,
+                    &provider_snapshot,
+                    provider_kind.as_str(),
+                    binding_model_id.as_str(),
+                    effective_input_text.as_str(),
+                    &tool_catalog_snapshot,
+                );
+                base_provider_request =
+                    current_prepared_provider_input.clone().into_provider_request(
+                        effective_input_text.as_str(),
+                        json_mode_requested,
+                        replacement_model_id,
+                        &tool_catalog_snapshot,
+                    );
+                continue;
+            }
+            Err(error) => break Err(error),
+        }
+    };
 
     let provider_response = match provider_response {
         Ok(response) => response,
+        Err(_) if provider_terminal_state.is_some() => {
+            let settlement = settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                provider_terminal_state.expect("provider terminal state should be present"),
+                "route_message.provider_cancelled",
+                crate::gateway::CANCELLED_REASON,
+            )
+            .await?;
+            outbound_lifecycle
+                .finalize_failure(crate::gateway::CANCELLED_REASON, current_unix_ms());
+            runtime_state.refresh_channel_router_queue_depth();
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: match settlement.effective_state {
+                    RunLifecycleState::Cancelled => "cancelled_by_request".to_owned(),
+                    RunLifecycleState::Failed => "route_message_failed".to_owned(),
+                    RunLifecycleState::Done => "already_completed".to_owned(),
+                    RunLifecycleState::Pending
+                    | RunLifecycleState::Accepted
+                    | RunLifecycleState::InProgress => {
+                        return Err(Status::internal(
+                            "route-message terminal settlement returned a nonterminal state",
+                        ));
+                    }
+                },
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
+        Err(error) if is_provider_reconfigured_status(&error) => {
+            let error_message = error.message().to_owned();
+            outbound_lifecycle.finalize_failure(error_message.as_str(), current_unix_ms());
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+            runtime_state.record_channel_reply_failure();
+            settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                RunLifecycleState::Failed,
+                "route_message.provider_supersession_exhausted",
+                error_message.as_str(),
+            )
+            .await?;
+            let _ = record_message_router_journal_event(
+                runtime_state,
+                &route_request_context,
+                session_id.as_str(),
+                run_id.as_str(),
+                "message.rejected",
+                common_v1::journal_event::EventActor::System as i32,
+                json!({
+                    "event": "message.rejected",
+                    "envelope_id": input.envelope_id.clone(),
+                    "channel": input.channel.clone(),
+                    "reason": error_message,
+                    "reason_code": "runtime.generation.provider_reconfiguration_exhausted",
+                    "provider_supersession_retries": supersession_retries,
+                    "queued_for_retry": false,
+                    "quarantined": false,
+                    "binding_id": plan.binding_id.clone(),
+                    "binding_kind": plan.binding_kind.clone(),
+                    "outbound_lifecycle": outbound_lifecycle.safe_snapshot_json(),
+                    "config_hash": route_config_hash,
+                    "actor": {
+                        "connector_channel": actor_connector,
+                        "gateway_principal": actor_gateway_principal,
+                        "gateway_device_id": actor_gateway_device_id,
+                    }
+                }),
+            )
+            .await;
+            runtime_state.refresh_channel_router_queue_depth();
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: "model_provider_superseded".to_owned(),
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
         Err(error) => {
             // Provider failure is a retryable outcome, not an RPC error: the
             // router decides whether the envelope is re-queued, quarantined,
@@ -860,13 +1161,14 @@ pub(crate) async fn handle_routed_route_message(
             }
             runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
             runtime_state.record_channel_reply_failure();
-            runtime_state
-                .update_orchestrator_run_state(
-                    run_id.clone(),
-                    RunLifecycleState::Failed,
-                    Some(error_message.clone()),
-                )
-                .await?;
+            settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                RunLifecycleState::Failed,
+                "route_message.provider_failed",
+                error_message.as_str(),
+            )
+            .await?;
             let _ = record_message_router_journal_event(
                 runtime_state,
                 &route_request_context,
@@ -923,14 +1225,81 @@ pub(crate) async fn handle_routed_route_message(
         &tool_catalog_snapshot,
         json_mode_requested,
         plan.response_prefix.as_deref(),
+        &route_flow_control,
         &mut remaining_tool_budget,
         &mut tape_seq,
     )
     .await
     {
-        Ok(outcome) => outcome,
+        Ok(RouteProviderResponseProcessingOutcome::Completed(outcome)) => outcome,
+        Ok(RouteProviderResponseProcessingOutcome::Terminal {
+            state,
+            prompt_tokens,
+            completion_tokens,
+        }) => {
+            runtime_state
+                .add_orchestrator_usage(OrchestratorUsageDelta {
+                    run_id: run_id.clone(),
+                    prompt_tokens_delta: prompt_tokens,
+                    completion_tokens_delta: completion_tokens,
+                })
+                .await?;
+            let terminal_message = match state {
+                RunLifecycleState::Cancelled => crate::gateway::CANCELLED_REASON,
+                RunLifecycleState::Failed => "route-message provider event failed",
+                RunLifecycleState::Done => "route-message provider event completed",
+                RunLifecycleState::Pending
+                | RunLifecycleState::Accepted
+                | RunLifecycleState::InProgress => {
+                    return Err(Status::internal(
+                        "route-message provider event returned a nonterminal state",
+                    ));
+                }
+            };
+            let settlement = settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                state,
+                "route_message.provider_event_terminal",
+                terminal_message,
+            )
+            .await?;
+            outbound_lifecycle.finalize_failure(terminal_message, current_unix_ms());
+            runtime_state.refresh_channel_router_queue_depth();
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: match settlement.effective_state {
+                    RunLifecycleState::Cancelled => "cancelled_by_request".to_owned(),
+                    RunLifecycleState::Failed => "route_message_failed".to_owned(),
+                    RunLifecycleState::Done => "already_completed".to_owned(),
+                    RunLifecycleState::Pending
+                    | RunLifecycleState::Accepted
+                    | RunLifecycleState::InProgress => {
+                        return Err(Status::internal(
+                            "route-message terminal settlement returned a nonterminal state",
+                        ));
+                    }
+                },
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
         Err(error) => {
             outbound_lifecycle.finalize_failure(error.message(), current_unix_ms());
+            settle_route_message_run(
+                runtime_state,
+                run_id.as_str(),
+                RunLifecycleState::Failed,
+                "route_message.response_processing_failed",
+                error.message(),
+            )
+            .await?;
             let _ = record_message_router_journal_event(
                 runtime_state,
                 &route_request_context,
@@ -962,6 +1331,41 @@ pub(crate) async fn handle_routed_route_message(
     };
     let reply_text = route_provider_response.reply_text;
     let route_structured_output = route_provider_response.structured_output;
+    if runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await? {
+        let settlement = settle_route_message_run(
+            runtime_state,
+            run_id.as_str(),
+            RunLifecycleState::Cancelled,
+            "route_message.cancelled_before_delivery",
+            crate::gateway::CANCELLED_REASON,
+        )
+        .await?;
+        outbound_lifecycle.finalize_failure(crate::gateway::CANCELLED_REASON, current_unix_ms());
+        runtime_state.refresh_channel_router_queue_depth();
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: match settlement.effective_state {
+                RunLifecycleState::Cancelled => "cancelled_by_request".to_owned(),
+                RunLifecycleState::Failed => "route_message_failed".to_owned(),
+                RunLifecycleState::Done => "already_completed".to_owned(),
+                RunLifecycleState::Pending
+                | RunLifecycleState::Accepted
+                | RunLifecycleState::InProgress => {
+                    return Err(Status::internal(
+                        "route-message terminal settlement returned a nonterminal state",
+                    ));
+                }
+            },
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
     // Second policy gate: intake authorized receiving the message, but the
     // outbound send is re-checked closest to dispatch (now with session/run
     // context) so a policy change or session-scoped rule landing during
@@ -978,13 +1382,14 @@ pub(crate) async fn handle_routed_route_message(
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
         runtime_state.record_channel_reply_failure();
         outbound_lifecycle.finalize_failure(error.message(), current_unix_ms());
-        runtime_state
-            .update_orchestrator_run_state(
-                run_id.clone(),
-                RunLifecycleState::Failed,
-                Some(error.message().to_owned()),
-            )
-            .await?;
+        settle_route_message_run(
+            runtime_state,
+            run_id.as_str(),
+            RunLifecycleState::Failed,
+            "route_message.outbound_denied",
+            error.message(),
+        )
+        .await?;
         let _ = record_message_router_journal_event(
             runtime_state,
             &route_request_context,
@@ -1033,6 +1438,42 @@ pub(crate) async fn handle_routed_route_message(
             completion_tokens_delta: route_provider_response.completion_tokens,
         })
         .await?;
+
+    if runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await? {
+        let settlement = settle_route_message_run(
+            runtime_state,
+            run_id.as_str(),
+            RunLifecycleState::Cancelled,
+            "route_message.cancelled_before_projection",
+            crate::gateway::CANCELLED_REASON,
+        )
+        .await?;
+        outbound_lifecycle.finalize_failure(crate::gateway::CANCELLED_REASON, current_unix_ms());
+        runtime_state.refresh_channel_router_queue_depth();
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: match settlement.effective_state {
+                RunLifecycleState::Cancelled => "cancelled_by_request".to_owned(),
+                RunLifecycleState::Failed => "route_message_failed".to_owned(),
+                RunLifecycleState::Done => "already_completed".to_owned(),
+                RunLifecycleState::Pending
+                | RunLifecycleState::Accepted
+                | RunLifecycleState::InProgress => {
+                    return Err(Status::internal(
+                        "route-message terminal settlement returned a nonterminal state",
+                    ));
+                }
+            },
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
 
     ingest_memory_best_effort(
         runtime_state,
@@ -1093,9 +1534,41 @@ pub(crate) async fn handle_routed_route_message(
             .to_string(),
         })
         .await?;
-    runtime_state
-        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::Done, None)
-        .await?;
+    let settlement = settle_route_message_run(
+        runtime_state,
+        run_id.as_str(),
+        RunLifecycleState::Done,
+        RuntimeTerminalOutcome::Completed.reason_code(),
+        "completed",
+    )
+    .await?;
+    if settlement.effective_state != RunLifecycleState::Done {
+        outbound_lifecycle.finalize_failure(crate::gateway::CANCELLED_REASON, current_unix_ms());
+        runtime_state.refresh_channel_router_queue_depth();
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: match settlement.effective_state {
+                RunLifecycleState::Cancelled => "cancelled_by_request".to_owned(),
+                RunLifecycleState::Failed => "route_message_failed".to_owned(),
+                RunLifecycleState::Done => unreachable!("done handled above"),
+                RunLifecycleState::Pending
+                | RunLifecycleState::Accepted
+                | RunLifecycleState::InProgress => {
+                    return Err(Status::internal(
+                        "route-message terminal settlement returned a nonterminal state",
+                    ));
+                }
+            },
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
 
     let _ = record_message_router_journal_event(
         runtime_state,
@@ -1208,3 +1681,6 @@ pub(crate) async fn handle_routed_route_message(
         queue_depth: runtime_state.channel_router.queue_depth() as u32,
     })
 }
+
+#[cfg(test)]
+mod tests;

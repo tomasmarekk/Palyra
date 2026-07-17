@@ -289,6 +289,8 @@ fn start_test_run(journal: &JournalStore, session_id: &str, run_id: &str) {
             origin_run_id: None,
             triggered_by_principal: Some("user:ops".to_owned()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("orchestrator run should be created");
 }

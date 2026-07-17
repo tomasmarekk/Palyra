@@ -97,8 +97,8 @@ fn projected_event_id_sha256(
     );
     write!(
         identity,
-        "{}:{}:{}:{source_sequence}:{}",
-        context.run_id, context.generation, context.sequence, record.event_type
+        "{}:{}:{source_sequence}:{}",
+        context.run_id, context.generation, record.event_type
     )
     .ok()?;
     hash_metadata_trace_identifier(MetadataTraceIdentifierDomain::Event, identity.as_str())

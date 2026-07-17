@@ -14,7 +14,10 @@ use std::{
 
 use palyra_common::{
     redaction::{redact_auth_error, redact_url_segments_in_text},
-    runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState},
+    runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
+        RuntimeOperationId,
+    },
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,9 +36,9 @@ use crate::{
         SESSIONS_YIELD_TOOL_NAME,
     },
     journal::{
-        OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
-        OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
-        OrchestratorCancelRequest,
+        BackgroundTaskChildResolution, OrchestratorBackgroundTaskCreateRequest,
+        OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
+        OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
     },
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -235,8 +238,16 @@ pub(crate) async fn execute_delegation_tool(
     tool_name: &str,
     proposal_id: &str,
     input_json: &[u8],
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> ToolExecutionOutcome {
-    let result = execute_delegation_tool_inner(runtime, context, tool_name, input_json).await;
+    let result = execute_delegation_tool_inner(
+        runtime,
+        context,
+        tool_name,
+        input_json,
+        child_task_parent_context,
+    )
+    .await;
     match result {
         Ok(output) => {
             build_outcome(proposal_id, tool_name, input_json, true, output, String::new())
@@ -257,12 +268,13 @@ async fn execute_delegation_tool_inner(
     context: ToolRuntimeExecutionContext<'_>,
     tool_name: &str,
     input_json: &[u8],
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<Value, Status> {
     if tool_name == SESSIONS_SPAWN_TOOL_NAME {
         let input = serde_json::from_slice::<SessionsSpawnInput>(input_json).map_err(|error| {
             Status::invalid_argument(format!("sessions_spawn input is invalid JSON: {error}"))
         })?;
-        return create_sessions_spawn(runtime, context, &input).await;
+        return create_sessions_spawn(runtime, context, &input, child_task_parent_context).await;
     }
     if tool_name == SESSIONS_YIELD_TOOL_NAME {
         let input = serde_json::from_slice::<SessionsYieldInput>(input_json).map_err(|error| {
@@ -285,7 +297,9 @@ async fn execute_delegation_tool_inner(
             )),
         },
         DELEGATION_CONTROL_TOOL_NAME => match operation.as_str() {
-            "delegate" => create_delegation(runtime, context, &input).await,
+            "delegate" => {
+                create_delegation(runtime, context, &input, child_task_parent_context).await
+            }
             "interrupt" => interrupt_delegation(runtime, context, &input).await,
             _ => Err(Status::invalid_argument(
                 "palyra.delegation.control operation must be one of delegate|interrupt",
@@ -299,6 +313,7 @@ async fn create_delegation(
     runtime: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     input: &DelegationToolInput,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<Value, Status> {
     let objective = normalize_required(input.objective.as_deref(), "objective")?;
     let task = create_delegation_background_task(
@@ -330,6 +345,7 @@ async fn create_delegation(
             preallocated_child_run_id: None,
             payload_json: None,
         },
+        child_task_parent_context,
     )
     .await?;
 
@@ -351,11 +367,14 @@ async fn create_sessions_spawn(
     runtime: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     input: &SessionsSpawnInput,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<Value, Status> {
     let child_run_id = Ulid::new().to_string();
     let return_mode = input.return_mode.unwrap_or_default();
     let request = sessions_spawn_delegation_spawn_request(input, child_run_id.clone())?;
-    let task = create_delegation_background_task(runtime, context, request).await?;
+    let task =
+        create_delegation_background_task(runtime, context, request, child_task_parent_context)
+            .await?;
     Ok(sessions_spawn_response(&task, return_mode, child_run_id.as_str()))
 }
 
@@ -402,6 +421,7 @@ async fn create_delegation_background_task(
     runtime: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     request: DelegationSpawnRequest,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<OrchestratorBackgroundTaskRecord, Status> {
     let parent_run_id = context.run_id.to_owned();
     // The delegation resolver enforces per-child budget-share limits against
@@ -442,14 +462,20 @@ async fn create_delegation_background_task(
     if request.explicit_empty_tool_allowlist {
         delegation.tool_allowlist.clear();
     }
+    let cancellation_context = derive_child_task_cancellation_context(
+        child_task_parent_context,
+        delegation.runtime_limits.child_timeout_ms,
+    )?;
 
     runtime
         .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
             task_id: Ulid::new().to_string(),
             task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
             session_id: context.session_id.to_owned(),
+            child_session_id: Some(Ulid::new().to_string()),
             parent_run_id: Some(parent_run_id),
-            target_run_id: request.preallocated_child_run_id,
+            target_run_id: None,
+            planned_child_run_id: request.preallocated_child_run_id,
             queued_input_id: None,
             owner_principal: context.principal.to_owned(),
             device_id: context.device_id.to_owned(),
@@ -459,6 +485,7 @@ async fn create_delegation_background_task(
             max_attempts: delegation.max_attempts,
             budget_tokens: delegation.budget_tokens,
             delegation: Some(delegation),
+            cancellation_context: Some(cancellation_context),
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -466,6 +493,56 @@ async fn create_delegation_background_task(
             payload_json: request.payload_json,
         })
         .await
+}
+
+fn derive_child_task_cancellation_context(
+    parent: Option<&CancellationContextV1>,
+    child_timeout_ms: u64,
+) -> Result<CancellationContextV1, Status> {
+    let parent = parent.ok_or_else(|| {
+        Status::failed_precondition("delegation creation requires an active Run cancellation scope")
+    })?;
+    parent.validate().map_err(|error| {
+        Status::failed_precondition(format!(
+            "delegation Run cancellation scope is invalid: {error}"
+        ))
+    })?;
+    if parent.scope != CancellationScopeKind::Run || parent.parent_scope_id.is_some() {
+        return Err(Status::failed_precondition(
+            "delegation creation requires the root Run cancellation scope",
+        ));
+    }
+    let now = current_unix_ms();
+    if !parent.permits_new_work(now) {
+        return Err(Status::deadline_exceeded(
+            "delegation Run cancellation scope no longer permits child creation",
+        ));
+    }
+    let requested_deadline =
+        now.checked_add(i64::try_from(child_timeout_ms).unwrap_or(i64::MAX))
+            .ok_or_else(|| Status::internal("delegation child deadline overflowed"))?;
+    let deadline_unix_ms = Some(
+        parent
+            .deadline_unix_ms
+            .map_or(requested_deadline, |deadline| deadline.min(requested_deadline)),
+    );
+    let scope_id = RuntimeOperationId::parse(format!("child_task:{}", Ulid::new()).as_str())
+        .map_err(|error| {
+            Status::internal(format!("child task scope identity is invalid: {error}"))
+        })?;
+    parent
+        .derive_child(
+            scope_id,
+            CancellationScopeKind::ChildTask,
+            deadline_unix_ms,
+            parent.graceful_settle_ms,
+            parent.hard_abort_after_ms,
+        )
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "delegation ChildTask cancellation scope is invalid: {error}"
+            ))
+        })
 }
 
 fn delegation_request_for_spawn(request: &DelegationSpawnRequest) -> DelegationRequestInput {
@@ -510,6 +587,7 @@ fn sessions_spawn_response(
     return_mode: SessionsSpawnReturnMode,
     child_run_id: &str,
 ) -> Value {
+    let child_session_id = task.child_session_id.as_deref();
     json!({
         "schema_version": 1,
         "operation": "sessions_spawn",
@@ -517,14 +595,14 @@ fn sessions_spawn_response(
         "task_id": task.task_id,
         "parent_run_id": task.parent_run_id,
         "child_run_id": child_run_id,
-        "child_session_id": task.session_id,
+        "child_session_id": child_session_id,
         "state": task.state,
         "return_mode": return_mode.as_str(),
         "transcript_ref": {
             "kind": "orchestrator_run_tape",
             "status": "pending",
             "run_id": child_run_id,
-            "session_id": task.session_id,
+            "session_id": child_session_id,
         },
         "progress_ref": {
             "task_id": task.task_id,
@@ -620,21 +698,39 @@ async fn sessions_yield_snapshot(
         ) {
             continue;
         }
+        let requested_run_id = sessions_yield_requested_run_id(&task, &requested_child_run_ids);
         matched_task_ids.insert(task.task_id.clone());
-        if let Some(child_run_id) = task.target_run_id.as_ref() {
-            matched_child_run_ids.insert(child_run_id.clone());
-        }
-        let run = if let Some(run_id) = task.target_run_id.as_ref() {
-            runtime.orchestrator_run_status_snapshot(run_id.clone()).await?
-        } else {
-            None
-        };
-        let terminal = sessions_yield_task_terminal(&task, run.as_ref());
-        let projected = sessions_yield_task_projection(&task, run.as_ref(), return_mode, terminal);
-        if terminal {
-            completions.push(projected);
-        } else {
-            pending.push(projected);
+        let resolution = runtime
+            .resolve_background_task_child(
+                task.task_id.clone(),
+                task.state.clone(),
+                requested_run_id,
+            )
+            .await?;
+        match resolution {
+            BackgroundTaskChildResolution::Resolved { task, run, .. } => {
+                matched_child_run_ids.insert(run.run_id.clone());
+                let terminal = sessions_yield_task_terminal(&task, Some(&run));
+                let projected =
+                    sessions_yield_task_projection(&task, Some(&run), return_mode, terminal);
+                if terminal {
+                    completions.push(projected);
+                } else {
+                    pending.push(projected);
+                }
+            }
+            BackgroundTaskChildResolution::NoChild { task, expected_run_id } => {
+                if let Some(run_id) = expected_run_id.as_ref() {
+                    matched_child_run_ids.insert(run_id.clone());
+                }
+                pending.push(sessions_yield_pending_task_json(&task, expected_run_id.as_deref()));
+            }
+            BackgroundTaskChildResolution::Mismatched { requested_run_id, .. } => {
+                pending.push(sessions_yield_mismatched_child_json(requested_run_id.as_str()));
+            }
+            BackgroundTaskChildResolution::Ambiguous { task, .. } => {
+                pending.push(sessions_yield_ambiguous_child_json(task.task_id.as_str()));
+            }
         }
     }
 
@@ -675,9 +771,18 @@ fn sessions_yield_selects_task(
             || task
                 .target_run_id
                 .as_ref()
+                .or(task.planned_child_run_id.as_ref())
                 .is_some_and(|child_run_id| requested_child_run_ids.contains(child_run_id));
     }
     task.parent_run_id.as_deref() == Some(parent_run_id)
+}
+
+fn sessions_yield_requested_run_id(
+    task: &OrchestratorBackgroundTaskRecord,
+    requested_child_run_ids: &BTreeSet<String>,
+) -> Option<String> {
+    let authoritative_run_id = task.target_run_id.as_ref().or(task.planned_child_run_id.as_ref());
+    authoritative_run_id.filter(|run_id| requested_child_run_ids.contains(run_id.as_str())).cloned()
 }
 
 fn sessions_yield_task_terminal(
@@ -698,14 +803,18 @@ fn sessions_yield_task_projection(
     return_mode: SessionsYieldReturnMode,
     terminal: bool,
 ) -> Value {
-    let child_run_id =
-        task.target_run_id.as_deref().or_else(|| run.map(|snapshot| snapshot.run_id.as_str()));
+    let child_run_id = task
+        .target_run_id
+        .as_deref()
+        .or(task.planned_child_run_id.as_deref())
+        .or_else(|| run.map(|snapshot| snapshot.run_id.as_str()));
     let child_state = run.map(|snapshot| snapshot.state.as_str()).unwrap_or(task.state.as_str());
+    let child_session_id = task.child_session_id.as_deref();
     let idempotency_key = sessions_yield_idempotency_key(task, child_run_id, child_state, run);
     let mut output = json!({
         "task_id": task.task_id,
         "child_run_id": child_run_id,
-        "child_session_id": task.session_id,
+        "child_session_id": child_session_id,
         "state": child_state,
         "terminal": terminal,
         "idempotency_key": idempotency_key,
@@ -713,7 +822,7 @@ fn sessions_yield_task_projection(
             "kind": "orchestrator_run_tape",
             "status": if terminal { "complete" } else { "pending" },
             "run_id": run_id,
-            "session_id": task.session_id,
+            "session_id": child_session_id,
         })),
     });
     if return_mode == SessionsYieldReturnMode::IdsOnly {
@@ -808,6 +917,46 @@ fn sessions_yield_missing_child_json(child_run_id: Option<&str>, task_id: Option
     })
 }
 
+fn sessions_yield_pending_task_json(
+    task: &OrchestratorBackgroundTaskRecord,
+    expected_run_id: Option<&str>,
+) -> Value {
+    let child_session_id = task.child_session_id.as_deref();
+    json!({
+        "task_id": task.task_id,
+        "child_run_id": expected_run_id,
+        "child_session_id": child_session_id,
+        "state": task.state,
+        "terminal": false,
+        "transcript_ref": expected_run_id.map(|run_id| json!({
+            "kind": "orchestrator_run_tape",
+            "status": "pending",
+            "run_id": run_id,
+            "session_id": child_session_id,
+        })),
+    })
+}
+
+fn sessions_yield_mismatched_child_json(child_run_id: &str) -> Value {
+    json!({
+        "task_id": Value::Null,
+        "child_run_id": child_run_id,
+        "state": "not_found",
+        "terminal": false,
+        "transcript_ref": Value::Null,
+    })
+}
+
+fn sessions_yield_ambiguous_child_json(task_id: &str) -> Value {
+    json!({
+        "task_id": task_id,
+        "child_run_id": Value::Null,
+        "state": "ambiguous",
+        "terminal": false,
+        "transcript_ref": Value::Null,
+    })
+}
+
 async fn list_delegations(
     runtime: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -839,17 +988,27 @@ async fn delegation_status(
     input: &DelegationToolInput,
 ) -> Result<Value, Status> {
     let task = find_scoped_delegation_task(runtime, context, input).await?;
-    let run = if let Some(run_id) = task.target_run_id.as_deref().or(input.run_id.as_deref()) {
-        runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?
-    } else {
-        None
-    };
-    Ok(json!({
-        "schema_version": 1,
-        "operation": "status",
-        "task": task_safe_json(&task),
-        "child_run": run.as_ref().map(run_safe_json),
-    }))
+    match resolve_delegation_child(runtime, &task, input.run_id.as_deref()).await? {
+        BackgroundTaskChildResolution::Resolved { task, run, .. } => Ok(json!({
+            "schema_version": 1,
+            "operation": "status",
+            "task": task_safe_json(&task),
+            "child_run": run_safe_json(&run),
+        })),
+        BackgroundTaskChildResolution::NoChild { task, expected_run_id } => Ok(json!({
+            "schema_version": 1,
+            "operation": "status",
+            "task": task_safe_json(&task),
+            "child_run": Value::Null,
+            "expected_child_run_id": expected_run_id,
+        })),
+        BackgroundTaskChildResolution::Mismatched { .. } => {
+            Err(Status::not_found("delegated child run not found in scoped runtime"))
+        }
+        BackgroundTaskChildResolution::Ambiguous { .. } => {
+            Err(Status::failed_precondition("delegated task has ambiguous child run evidence"))
+        }
+    }
 }
 
 async fn delegation_merge_preview(
@@ -858,19 +1017,32 @@ async fn delegation_merge_preview(
     input: &DelegationToolInput,
 ) -> Result<Value, Status> {
     let task = find_scoped_delegation_task(runtime, context, input).await?;
-    let run = if let Some(run_id) = task.target_run_id.as_deref().or(input.run_id.as_deref()) {
-        runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?
-    } else {
-        None
-    };
-    let preview = task_merge_preview(&task, run.as_ref());
-    Ok(json!({
-        "schema_version": 1,
-        "operation": "merge_preview",
-        "task": task_safe_json(&task),
-        "child_run": run.as_ref().map(run_safe_json),
-        "merge_preview": preview,
-    }))
+    match resolve_delegation_child(runtime, &task, input.run_id.as_deref()).await? {
+        BackgroundTaskChildResolution::Resolved { task, run, .. } => {
+            let preview = task_merge_preview(&task, Some(&run));
+            Ok(json!({
+                "schema_version": 1,
+                "operation": "merge_preview",
+                "task": task_safe_json(&task),
+                "child_run": run_safe_json(&run),
+                "merge_preview": preview,
+            }))
+        }
+        BackgroundTaskChildResolution::NoChild { task, expected_run_id } => Ok(json!({
+            "schema_version": 1,
+            "operation": "merge_preview",
+            "task": task_safe_json(&task),
+            "child_run": Value::Null,
+            "expected_child_run_id": expected_run_id,
+            "merge_preview": task_merge_preview(&task, None),
+        })),
+        BackgroundTaskChildResolution::Mismatched { .. } => {
+            Err(Status::not_found("delegated child run not found in scoped runtime"))
+        }
+        BackgroundTaskChildResolution::Ambiguous { .. } => {
+            Err(Status::failed_precondition("delegated task has ambiguous child run evidence"))
+        }
+    }
 }
 
 async fn interrupt_delegation(
@@ -881,58 +1053,112 @@ async fn interrupt_delegation(
     let task = find_scoped_delegation_task(runtime, context, input).await?;
     let reason = normalize_optional(input.reason.as_deref())
         .unwrap_or_else(|| "delegated run interrupted by scoped command".to_owned());
-    let child_run_id =
-        task.target_run_id.clone().or_else(|| normalize_optional(input.run_id.as_deref()));
-    let cancel = if let Some(run_id) = child_run_id.clone() {
-        Some(
-            runtime
-                .request_orchestrator_cancel(OrchestratorCancelRequest {
-                    run_id,
-                    reason: reason.clone(),
-                })
-                .await?,
-        )
-    } else {
-        None
+    let resolution = resolve_delegation_child(runtime, &task, input.run_id.as_deref()).await?;
+    let (task, cancel) = match resolution {
+        BackgroundTaskChildResolution::Resolved { task, run, reconciled_terminal } => {
+            if reconciled_terminal {
+                (task, None)
+            } else {
+                let cancel = runtime
+                    .request_orchestrator_cancel(OrchestratorCancelRequest {
+                        run_id: run.run_id,
+                        reason: reason.clone(),
+                    })
+                    .await?;
+                runtime
+                    .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        expected_revision: task.revision,
+                        state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                        last_error: Some(Some(reason.clone())),
+                        ..Default::default()
+                    })
+                    .await?;
+                (task, Some(cancel))
+            }
+        }
+        BackgroundTaskChildResolution::NoChild { task, .. } => {
+            match AuxiliaryTaskState::from_str(task.state.as_str()) {
+                Some(AuxiliaryTaskState::Queued | AuxiliaryTaskState::Paused) => {
+                    runtime
+                        .update_orchestrator_background_task(
+                            OrchestratorBackgroundTaskUpdateRequest {
+                                task_id: task.task_id.clone(),
+                                expected_revision: task.revision,
+                                state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
+                                last_error: Some(Some(reason.clone())),
+                                completed_at_unix_ms: Some(Some(current_unix_ms())),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    (task, None)
+                }
+                Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested) => {
+                    runtime
+                        .update_orchestrator_background_task(
+                            OrchestratorBackgroundTaskUpdateRequest {
+                                task_id: task.task_id.clone(),
+                                expected_revision: task.revision,
+                                state: Some(
+                                    AuxiliaryTaskState::CancelRequested.as_str().to_owned(),
+                                ),
+                                last_error: Some(Some(reason.clone())),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    (task, None)
+                }
+                Some(state) if state.is_terminal() => (task, None),
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "delegated task cannot be interrupted from its current state",
+                    ));
+                }
+            }
+        }
+        BackgroundTaskChildResolution::Mismatched { .. } => {
+            return Err(Status::not_found("delegated child run not found in scoped runtime"));
+        }
+        BackgroundTaskChildResolution::Ambiguous { .. } => {
+            return Err(Status::failed_precondition(
+                "delegated task has ambiguous child run evidence",
+            ));
+        }
     };
-    // The orchestrator cancel only reaches tasks with a live child run; tasks
-    // that never started or are parked in a non-running state are finalized
-    // directly so the background queue cannot pick them up later.
-    if child_run_id.is_none()
-        || matches!(
-            AuxiliaryTaskState::from_str(task.state.as_str()),
-            Some(
-                AuxiliaryTaskState::Queued
-                    | AuxiliaryTaskState::Paused
-                    | AuxiliaryTaskState::Failed
-            )
-        )
-    {
-        runtime
-            .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
-                task_id: task.task_id.clone(),
-                state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
-                last_error: Some(Some(reason.clone())),
-                completed_at_unix_ms: Some(Some(current_unix_ms())),
-                ..Default::default()
-            })
-            .await?;
-    }
     let refreshed = runtime.get_orchestrator_background_task(task.task_id.clone()).await?;
+    let effective_task = refreshed.as_ref().unwrap_or(&task);
     Ok(json!({
         "schema_version": 1,
         "operation": "interrupt",
-        // Without a child run the task was finalized directly above, so the
-        // interrupt is reported as effective.
-        "cancel_requested": cancel.as_ref().is_none_or(|value| value.cancel_requested),
+        "cancel_requested": cancel.as_ref().is_some_and(|value| value.cancel_requested)
+            || AuxiliaryTaskState::from_str(effective_task.state.as_str())
+                == Some(AuxiliaryTaskState::CancelRequested)
+            || AuxiliaryTaskState::from_str(effective_task.state.as_str())
+                == Some(AuxiliaryTaskState::Cancelled),
         "reason": safe_text(reason.as_str()),
-        "task": refreshed.as_ref().map(task_safe_json).unwrap_or_else(|| task_safe_json(&task)),
+        "task": task_safe_json(effective_task),
         "child_run": cancel.map(|value| json!({
             "run_id": value.run_id,
             "cancel_requested": value.cancel_requested,
             "reason": safe_text(value.reason.as_str()),
         })),
     }))
+}
+
+async fn resolve_delegation_child(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    requested_run_id: Option<&str>,
+) -> Result<BackgroundTaskChildResolution, Status> {
+    runtime
+        .resolve_background_task_child(
+            task.task_id.clone(),
+            task.state.clone(),
+            normalize_optional(requested_run_id),
+        )
+        .await
 }
 
 async fn scoped_delegation_tasks(
@@ -965,13 +1191,20 @@ async fn find_scoped_delegation_task(
     let tasks = scoped_delegation_tasks(runtime, context, input, true).await?;
     let task_id = normalize_optional(input.task_id.as_deref());
     let run_id = normalize_optional(input.run_id.as_deref());
+    if task_id.is_none() && run_id.is_none() {
+        return Err(Status::invalid_argument("delegation task_id or run_id is required"));
+    }
+    if let Some(task_id) = task_id.as_deref() {
+        return tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| Status::not_found("delegated task not found in scoped runtime"));
+    }
     tasks
         .into_iter()
         .find(|task| {
-            task_id.as_deref().is_some_and(|value| task.task_id == value)
-                || run_id
-                    .as_deref()
-                    .is_some_and(|value| task.target_run_id.as_deref() == Some(value))
+            task.target_run_id.as_deref() == run_id.as_deref()
+                || task.planned_child_run_id.as_deref() == run_id.as_deref()
         })
         .ok_or_else(|| Status::not_found("delegated task not found in scoped runtime"))
 }
@@ -1002,8 +1235,9 @@ fn task_safe_json(task: &OrchestratorBackgroundTaskRecord) -> Value {
         "task_id": task.task_id,
         "task_kind": task.task_kind,
         "session_id": task.session_id,
+        "child_session_id": task.child_session_id,
         "parent_run_id": task.parent_run_id,
-        "child_run_id": task.target_run_id,
+        "child_run_id": task.target_run_id.as_ref().or(task.planned_child_run_id.as_ref()),
         "state": task.state,
         "priority": task.priority,
         "attempt_count": task.attempt_count,
@@ -1111,6 +1345,7 @@ fn normalize_id_list(values: &[String]) -> Vec<String> {
     let mut normalized = values
         .iter()
         .filter_map(|value| normalize_optional(Some(value.as_str())))
+        .filter(|value| value.len() <= 256)
         .collect::<Vec<_>>();
     normalized.sort();
     normalized.dedup();
@@ -1147,12 +1382,13 @@ fn build_outcome(
 #[cfg(test)]
 mod tests {
     use super::{
-        delegation_request_for_spawn, parent_tool_allowlist_for_spawn_resolution,
+        delegation_request_for_spawn, derive_child_task_cancellation_context,
+        execute_delegation_tool_inner, parent_tool_allowlist_for_spawn_resolution,
         sessions_spawn_delegation_spawn_request, sessions_spawn_response,
         sessions_yield_idempotency_key, sessions_yield_missing_child_json,
-        sessions_yield_selects_task, sessions_yield_task_projection,
-        sessions_yield_terminal_run_state, task_merge_preview, task_safe_json,
-        SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
+        sessions_yield_requested_run_id, sessions_yield_selects_task,
+        sessions_yield_task_projection, sessions_yield_terminal_run_state, task_merge_preview,
+        task_safe_json, SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
         SessionsYieldReturnMode,
     };
     use crate::{
@@ -1161,10 +1397,140 @@ mod tests {
             DelegationMergeContract, DelegationMergeStrategy, DelegationParentContext,
             DelegationRole, DelegationRuntimeLimits, DelegationSnapshot,
         },
-        journal::OrchestratorBackgroundTaskRecord,
+        execution_backends::ExecutionBackendPreference,
+        gateway::{
+            tests::build_test_runtime_state, ToolRuntimeExecutionContext,
+            DELEGATION_CONTROL_TOOL_NAME,
+        },
+        journal::{
+            DelegatedRunAdmissionV1, OrchestratorBackgroundTaskClaimRequest,
+            OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
+            OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        },
     };
-    use palyra_common::runtime_contracts::AuxiliaryTaskState;
+    use palyra_common::runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
+        RuntimeOperationId,
+    };
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn direct_interrupt_rejects_unrelated_targetless_run_id() {
+        let state = build_test_runtime_state(false);
+        let context = test_runtime_context();
+        let task_id = "direct-interrupt-targetless-task";
+        let unrelated_run_id = "direct-interrupt-unrelated-run";
+        create_running_runtime_task(&state, context, task_id, None).await;
+        start_runtime_child(&state, context, unrelated_run_id, None).await;
+
+        let error = execute_delegation_tool_inner(
+            &state,
+            context,
+            DELEGATION_CONTROL_TOOL_NAME,
+            serde_json::to_vec(&serde_json::json!({
+                "operation": "interrupt",
+                "task_id": task_id,
+                "run_id": unrelated_run_id,
+                "reason": "must not cross task authority",
+            }))
+            .expect("interrupt input should serialize")
+            .as_slice(),
+            None,
+        )
+        .await
+        .expect_err("unrelated run assertion must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert!(!state
+            .is_orchestrator_cancel_requested(unrelated_run_id.to_owned())
+            .await
+            .expect("unrelated cancel flag should load"));
+        let task = state
+            .get_orchestrator_background_task(task_id.to_owned())
+            .await
+            .expect("delegated task lookup should succeed")
+            .expect("delegated task should exist");
+        assert_eq!(task.state, AuxiliaryTaskState::Running.as_str());
+        assert!(task.target_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_interrupt_cancels_unique_correlated_child() {
+        let state = build_test_runtime_state(false);
+        let context = test_runtime_context();
+        let task_id = "direct-interrupt-correlated-task";
+        let child_run_id = "direct-interrupt-correlated-run";
+        create_running_runtime_task(&state, context, task_id, None).await;
+        start_runtime_child(&state, context, child_run_id, Some(task_id)).await;
+
+        let output = execute_delegation_tool_inner(
+            &state,
+            context,
+            DELEGATION_CONTROL_TOOL_NAME,
+            serde_json::to_vec(&serde_json::json!({
+                "operation": "interrupt",
+                "task_id": task_id,
+                "run_id": child_run_id,
+                "reason": "stop the correlated child",
+            }))
+            .expect("interrupt input should serialize")
+            .as_slice(),
+            None,
+        )
+        .await
+        .expect("correlated child interrupt should succeed");
+
+        assert_eq!(output["cancel_requested"], true);
+        assert_eq!(output["child_run"]["run_id"], child_run_id);
+        assert!(state
+            .is_orchestrator_cancel_requested(child_run_id.to_owned())
+            .await
+            .expect("correlated child cancel flag should load"));
+        let task = state
+            .get_orchestrator_background_task(task_id.to_owned())
+            .await
+            .expect("delegated task lookup should succeed")
+            .expect("delegated task should exist");
+        assert_eq!(task.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(task.target_run_id.as_deref(), Some(child_run_id));
+    }
+
+    #[tokio::test]
+    async fn direct_interrupt_preserves_pending_cancel_when_planned_child_is_missing() {
+        let state = build_test_runtime_state(false);
+        let context = test_runtime_context();
+        let task_id = "direct-interrupt-planned-task";
+        let planned_run_id = "direct-interrupt-planned-run";
+        create_running_runtime_task(&state, context, task_id, Some(planned_run_id)).await;
+
+        let output = execute_delegation_tool_inner(
+            &state,
+            context,
+            DELEGATION_CONTROL_TOOL_NAME,
+            serde_json::to_vec(&serde_json::json!({
+                "operation": "interrupt",
+                "task_id": task_id,
+                "run_id": planned_run_id,
+                "reason": "cancel before child attachment",
+            }))
+            .expect("interrupt input should serialize")
+            .as_slice(),
+            None,
+        )
+        .await
+        .expect("planned child interrupt should persist cancellation intent");
+
+        assert_eq!(output["cancel_requested"], true);
+        assert!(output["child_run"].is_null());
+        let task = state
+            .get_orchestrator_background_task(task_id.to_owned())
+            .await
+            .expect("delegated task lookup should succeed")
+            .expect("delegated task should exist");
+        assert_eq!(task.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert!(task.target_run_id.is_none());
+        assert_eq!(task.planned_child_run_id.as_deref(), Some(planned_run_id));
+    }
 
     #[test]
     fn task_safe_json_redacts_objective_and_projects_scope() {
@@ -1287,7 +1653,7 @@ mod tests {
 
         assert_eq!(response["operation"], "sessions_spawn");
         assert_eq!(response["child_run_id"], "child-run");
-        assert_eq!(response["child_session_id"], "session-1");
+        assert_eq!(response["child_session_id"], "child-session-1");
         assert!(!response_text.contains("access_token"));
         assert!(!response_text.contains("secret"));
         assert!(!response_text.contains("Read https://example.com"));
@@ -1324,7 +1690,7 @@ mod tests {
 
         assert_eq!(value["task_id"], "task-1");
         assert_eq!(value["child_run_id"], "child-run");
-        assert_eq!(value["child_session_id"], "session-1");
+        assert_eq!(value["child_session_id"], "child-session-1");
         assert_eq!(value["terminal"], true);
         assert_eq!(value["verification_state"], "verified");
         assert_eq!(value["transcript_ref"]["run_id"], "child-run");
@@ -1364,6 +1730,25 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new()
         ));
+
+        let mut planned = task.clone();
+        planned.target_run_id = None;
+        planned.planned_child_run_id = Some("planned-child".to_owned());
+        let requested_planned = ["planned-child".to_owned()].into_iter().collect();
+        assert!(sessions_yield_selects_task(
+            &planned,
+            "other-parent",
+            true,
+            &requested_planned,
+            &BTreeSet::new()
+        ));
+        assert_eq!(
+            sessions_yield_requested_run_id(&planned, &requested_planned).as_deref(),
+            Some("planned-child")
+        );
+
+        let requested_unrelated = ["unrelated-child".to_owned()].into_iter().collect();
+        assert_eq!(sessions_yield_requested_run_id(&task, &requested_unrelated), None);
     }
 
     #[test]
@@ -1387,6 +1772,208 @@ mod tests {
         );
     }
 
+    fn test_runtime_context() -> ToolRuntimeExecutionContext<'static> {
+        ToolRuntimeExecutionContext {
+            principal: "user:delegation-test",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("test"),
+            session_id: "direct-delegation-session",
+            run_id: "direct-delegation-parent-run",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        }
+    }
+
+    async fn create_running_runtime_task(
+        state: &std::sync::Arc<crate::gateway::GatewayRuntimeState>,
+        context: ToolRuntimeExecutionContext<'_>,
+        task_id: &str,
+        planned_child_run_id: Option<&str>,
+    ) {
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: context.session_id.to_owned(),
+                session_key: format!("delegation-test:{}", context.session_id),
+                session_label: Some("Direct delegation runtime test".to_owned()),
+                principal: context.principal.to_owned(),
+                device_id: context.device_id.to_owned(),
+                channel: context.channel.map(ToOwned::to_owned),
+            })
+            .expect("delegation test session should upsert");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: context.run_id.to_owned(),
+                session_id: context.session_id.to_owned(),
+                origin_kind: "delegation_test_parent".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some(context.principal.to_owned()),
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .await
+            .expect("delegation test parent run should start");
+        let (_, generation) = state
+            .runtime_generation_for_run(context.run_id.to_owned())
+            .await
+            .expect("delegation parent generation lookup should succeed")
+            .expect("delegation parent generation should be active");
+        let parent_cancellation = CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("run:delegation-test")
+                .expect("delegation parent scope id"),
+            scope: CancellationScopeKind::Run,
+            generation,
+            parent_scope_id: None,
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        };
+        let cancellation_context = derive_child_task_cancellation_context(
+            Some(&parent_cancellation),
+            DelegationRuntimeLimits::default().child_timeout_ms,
+        )
+        .expect("delegation child cancellation context should derive");
+        let task = state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: context.session_id.to_owned(),
+                child_session_id: Some(format!("child-session-{task_id}")),
+                parent_run_id: Some(context.run_id.to_owned()),
+                target_run_id: None,
+                planned_child_run_id: planned_child_run_id.map(ToOwned::to_owned),
+                queued_input_id: None,
+                owner_principal: context.principal.to_owned(),
+                device_id: context.device_id.to_owned(),
+                channel: context.channel.map(ToOwned::to_owned),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 1_000,
+                delegation: sample_task().delegation,
+                cancellation_context: Some(cancellation_context),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("exercise direct delegation control".to_owned()),
+                payload_json: None,
+            })
+            .await
+            .expect("delegation test task should be created");
+        state
+            .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: task.revision,
+                started_at_unix_ms: crate::gateway::current_unix_ms(),
+            })
+            .await
+            .expect("delegation test task should enter running");
+    }
+
+    async fn start_runtime_child(
+        state: &std::sync::Arc<crate::gateway::GatewayRuntimeState>,
+        context: ToolRuntimeExecutionContext<'_>,
+        run_id: &str,
+        task_id: Option<&str>,
+    ) {
+        let task = if let Some(task_id) = task_id {
+            state
+                .get_orchestrator_background_task(task_id.to_owned())
+                .await
+                .expect("delegation task lookup should succeed")
+                .expect("delegation task should exist")
+        } else {
+            let cancellation_context = CancellationContextV1 {
+                schema_version: 1,
+                scope_id: RuntimeOperationId::parse("child_task:unrelated")
+                    .expect("unrelated child scope id"),
+                scope: CancellationScopeKind::ChildTask,
+                generation: state
+                    .runtime_generation_for_run(context.run_id.to_owned())
+                    .await
+                    .expect("parent generation lookup should succeed")
+                    .expect("parent generation should be active")
+                    .1,
+                parent_scope_id: Some(
+                    RuntimeOperationId::parse("run:unrelated").expect("parent scope id"),
+                ),
+                reason: None,
+                deadline_unix_ms: Some(i64::MAX),
+                graceful_settle_ms: 500,
+                hard_abort_after_ms: 2_000,
+            };
+            state
+                .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                    task_id: format!("task-for-{run_id}"),
+                    task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                    session_id: context.session_id.to_owned(),
+                    child_session_id: Some(format!("child-session-for-{run_id}")),
+                    parent_run_id: Some(context.run_id.to_owned()),
+                    target_run_id: None,
+                    planned_child_run_id: Some(run_id.to_owned()),
+                    queued_input_id: None,
+                    owner_principal: context.principal.to_owned(),
+                    device_id: context.device_id.to_owned(),
+                    channel: context.channel.map(ToOwned::to_owned),
+                    state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                    priority: 0,
+                    max_attempts: 1,
+                    budget_tokens: 1_000,
+                    delegation: sample_task().delegation,
+                    cancellation_context: Some(cancellation_context),
+                    not_before_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    notification_target_json: None,
+                    input_text: Some("unrelated delegated child".to_owned()),
+                    payload_json: None,
+                })
+                .await
+                .expect("unrelated delegation task should be created")
+        };
+        let cancellation_context = task
+            .cancellation_context
+            .clone()
+            .expect("delegation task should carry ChildTask authority");
+        let child_session_id =
+            task.child_session_id.clone().expect("delegation task should own a child session");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: child_session_id.clone(),
+                origin_kind: "delegation".to_owned(),
+                origin_run_id: Some(context.run_id.to_owned()),
+                triggered_by_principal: Some(context.principal.to_owned()),
+                parameter_delta_json: Some(
+                    serde_json::json!({
+                        "background_task": {
+                            "schema_version": 1,
+                            "task_id": task.task_id,
+                            "task_kind": task.task_kind,
+                            "parent_session_id": task.session_id,
+                            "child_session_id": child_session_id,
+                            "parent_run_id": context.run_id,
+                            "budget_tokens": task.budget_tokens,
+                            "cancellation_context": cancellation_context,
+                        }
+                    })
+                    .to_string(),
+                ),
+                delegated_admission: Some(DelegatedRunAdmissionV1 {
+                    task_id: task.task_id,
+                    task_kind: task.task_kind,
+                    parent_session_id: task.session_id,
+                    child_session_id,
+                    parent_run_id: context.run_id.to_owned(),
+                    cancellation_context,
+                }),
+            })
+            .await
+            .expect("delegation test child should start");
+    }
+
     fn test_parent_context(parent_budget_tokens: Option<u64>) -> DelegationParentContext {
         DelegationParentContext {
             parent_run_id: Some("parent-run".to_owned()),
@@ -1403,14 +1990,18 @@ mod tests {
             task_id: "task-1".to_owned(),
             task_kind: "delegation_prompt".to_owned(),
             session_id: "session-1".to_owned(),
+            child_session_id: Some("child-session-1".to_owned()),
             parent_run_id: Some("parent-run".to_owned()),
             target_run_id: Some("child-run".to_owned()),
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: "principal".to_owned(),
             device_id: "device".to_owned(),
             channel: Some("web".to_owned()),
             state: AuxiliaryTaskState::Queued.as_str().to_owned(),
             priority: 0,
+            revision: 0,
+            execution_generation: 0,
             attempt_count: 0,
             max_attempts: 3,
             budget_tokens: 1_000,
@@ -1435,6 +2026,7 @@ mod tests {
                 runtime_limits: DelegationRuntimeLimits::default(),
                 agent_id: Some("main".to_owned()),
             }),
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,

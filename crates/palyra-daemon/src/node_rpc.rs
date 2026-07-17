@@ -37,8 +37,8 @@ use crate::{
         ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
     },
     node_runtime::{
-        self, CapabilityDispatchRecord, DeviceCapabilityView, DevicePairingRequestState,
-        NodeRuntimeState, PairingCodeMethod,
+        self, CapabilityDispatchRecord, CapabilityRequestTimeoutOutcome, DeviceCapabilityView,
+        DevicePairingRequestState, NodeRuntimeState, PairingCodeMethod,
     },
 };
 
@@ -291,11 +291,30 @@ impl NodeRpcServiceImpl {
     }
 
     fn dispatch_to_proto(dispatch: CapabilityDispatchRecord) -> node_v1::NodeCapabilityDispatch {
+        let networked_worker_reservation =
+            dispatch.networked_worker_reservation.map(|reservation| {
+                node_v1::NetworkedWorkerDeliveryReservation {
+                    v: 1,
+                    request_id: Some(common_v1::CanonicalId { ulid: reservation.request_id }),
+                    delivery_attempt_id: Some(common_v1::CanonicalId {
+                        ulid: reservation.delivery_attempt_id,
+                    }),
+                    protocol: node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_PROTOCOL.to_owned(),
+                    fetch_token: reservation.fetch_token,
+                    request_sha256: reservation.request_sha256,
+                    worker_id: reservation.worker_id,
+                    lease_id: Some(common_v1::CanonicalId { ulid: reservation.lease_id }),
+                    run_id: Some(common_v1::CanonicalId { ulid: reservation.run_id }),
+                    fleet_generation: reservation.fleet_generation,
+                    expires_at_unix_ms: u64::try_from(reservation.expires_at_unix_ms).unwrap_or(0),
+                }
+            });
         node_v1::NodeCapabilityDispatch {
             request_id: Some(common_v1::CanonicalId { ulid: dispatch.request_id }),
             capability: dispatch.capability,
             input_json: dispatch.input_json,
             max_payload_bytes: dispatch.max_payload_bytes,
+            networked_worker_reservation,
         }
     }
 
@@ -655,6 +674,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
     ) -> Result<Response<Self::StreamNodeEventsStream>, Status> {
         let peer_fingerprint = self.peer_certificate_fingerprint(&request)?;
         let node_runtime = Arc::clone(&self.node_runtime);
+        let runtime = Arc::clone(&self.runtime);
         let identity_manager = Arc::clone(&self.identity_manager);
         let require_mtls = self.require_mtls;
         let mut inbound = request.into_inner();
@@ -719,21 +739,53 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                 }
 
                 if message.event_name == "capability.awaiting_local_mediation" {
-                    match node_runtime::parse_capability_request_id_payload(&message.payload_json) {
-                        Ok(request_id) => {
-                            let _ = node_runtime
-                                .mark_capability_awaiting_local_mediation(request_id.as_str());
-                        }
+                    let request_id = match node_runtime::parse_capability_request_id_payload(
+                        &message.payload_json,
+                    ) {
+                        Ok(request_id) => request_id,
                         Err(error) => {
                             let _ = sender.send(Err(error)).await;
                             break;
                         }
+                    };
+                    if let Err(error) = node_runtime.mark_capability_awaiting_local_mediation(
+                        device_id.as_str(),
+                        request_id.as_str(),
+                    ) {
+                        let _ = sender.send(Err(error)).await;
+                        break;
                     }
                 } else if message.event_name == "capability.result" {
-                    match node_runtime::parse_capability_result_payload(&message.payload_json) {
-                        Ok((request_id, result)) => {
-                            let _ = node_runtime
-                                .complete_capability_request(request_id.as_str(), result);
+                    let (request_id, delivery_attempt_id, result) =
+                        match node_runtime::parse_capability_result_payload(&message.payload_json) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                let _ = sender.send(Err(error)).await;
+                                break;
+                            }
+                        };
+                    match node_runtime.complete_capability_request(
+                        device_id.as_str(),
+                        request_id.as_str(),
+                        delivery_attempt_id.as_deref(),
+                        result,
+                        runtime.as_ref(),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let response = node_v1::NodeEventResponse {
+                                v: message.v.max(1),
+                                event_id: Some(common_v1::CanonicalId {
+                                    ulid: Ulid::new().to_string(),
+                                }),
+                                accepted: false,
+                                reason: "capability_result_owner_unavailable".to_owned(),
+                                dispatch: None,
+                            };
+                            if sender.send(Ok(response)).await.is_err() {
+                                break;
+                            }
+                            continue;
                         }
                         Err(error) => {
                             let _ = sender.send(Err(error)).await;
@@ -744,25 +796,106 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
 
                 let _ =
                     node_runtime.touch_node_event(device_id.as_str(), message.event_name.as_str());
-                let dispatch = node_runtime
-                    .next_capability_dispatch(device_id.as_str())
-                    .ok()
-                    .flatten()
-                    .map(Self::dispatch_to_proto);
+                let dispatch = match node_runtime
+                    .next_capability_dispatch(device_id.as_str(), runtime.as_ref())
+                {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                };
                 let response = node_v1::NodeEventResponse {
                     v: message.v.max(1),
                     event_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
                     accepted: true,
                     reason: "accepted".to_owned(),
-                    dispatch,
+                    dispatch: dispatch.clone().map(Self::dispatch_to_proto),
                 };
                 if sender.send(Ok(response)).await.is_err() {
+                    if let Some(dispatch) = dispatch.as_ref() {
+                        if let Err(error) = node_runtime
+                            .recover_undelivered_capability_dispatch(dispatch, runtime.as_ref())
+                        {
+                            tracing::warn!(
+                                request_id = %dispatch.request_id,
+                                error = %error,
+                                "failed to recover an undelivered node capability dispatch"
+                            );
+                        }
+                    }
                     break;
                 }
             }
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver)) as Self::StreamNodeEventsStream))
+    }
+
+    async fn fetch_networked_worker_payload(
+        &self,
+        request: Request<node_v1::FetchNetworkedWorkerPayloadRequest>,
+    ) -> Result<Response<node_v1::FetchNetworkedWorkerPayloadResponse>, Status> {
+        let device_id = Self::canonical_id_text(request.get_ref().device_id.as_ref(), "device_id")?;
+        self.enforce_cert_bound_device(&request, device_id.as_str())?;
+        let request_id =
+            Self::canonical_id_text(request.get_ref().request_id.as_ref(), "request_id")?;
+        let delivery_attempt_id = Self::canonical_id_text(
+            request.get_ref().delivery_attempt_id.as_ref(),
+            "delivery_attempt_id",
+        )?;
+        let payload = self.node_runtime.fetch_networked_worker_payload(
+            device_id.as_str(),
+            request_id.as_str(),
+            delivery_attempt_id.as_str(),
+            request.get_ref().fetch_token.as_str(),
+            self.runtime.as_ref(),
+        )?;
+        Ok(Response::new(node_v1::FetchNetworkedWorkerPayloadResponse {
+            v: request.get_ref().v.max(1),
+            request_id: Some(common_v1::CanonicalId { ulid: payload.request_id }),
+            delivery_attempt_id: Some(common_v1::CanonicalId { ulid: payload.delivery_attempt_id }),
+            input_json: payload.input_json,
+            max_payload_bytes: payload.max_payload_bytes,
+            request_sha256: payload.request_sha256,
+        }))
+    }
+
+    async fn acknowledge_networked_worker_payload(
+        &self,
+        request: Request<node_v1::AcknowledgeNetworkedWorkerPayloadRequest>,
+    ) -> Result<Response<node_v1::AcknowledgeNetworkedWorkerPayloadResponse>, Status> {
+        let device_id = Self::canonical_id_text(request.get_ref().device_id.as_ref(), "device_id")?;
+        self.enforce_cert_bound_device(&request, device_id.as_str())?;
+        let request_id =
+            Self::canonical_id_text(request.get_ref().request_id.as_ref(), "request_id")?;
+        let delivery_attempt_id = Self::canonical_id_text(
+            request.get_ref().delivery_attempt_id.as_ref(),
+            "delivery_attempt_id",
+        )?;
+        let outcome = self.node_runtime.acknowledge_networked_worker_payload(
+            device_id.as_str(),
+            request_id.as_str(),
+            delivery_attempt_id.as_str(),
+            request.get_ref().fetch_token.as_str(),
+            self.runtime.as_ref(),
+        )?;
+        let reason = match outcome {
+            crate::journal::NetworkedWorkerPayloadAcknowledgementOutcome::Acknowledged => {
+                "acknowledged"
+            }
+            crate::journal::NetworkedWorkerPayloadAcknowledgementOutcome::AlreadyAcknowledged => {
+                "already_acknowledged"
+            }
+            crate::journal::NetworkedWorkerPayloadAcknowledgementOutcome::Rejected => {
+                unreachable!("node runtime maps rejected acknowledgements to a status error")
+            }
+        };
+        Ok(Response::new(node_v1::AcknowledgeNetworkedWorkerPayloadResponse {
+            v: request.get_ref().v.max(1),
+            acknowledged: true,
+            reason: reason.to_owned(),
+        }))
     }
 
     async fn execute_capability(
@@ -776,7 +909,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                 "node must register before executing capabilities",
             ));
         }
-        let (request_id, receiver) = self.node_runtime.enqueue_capability_request(
+        let (request_id, mut receiver) = self.node_runtime.enqueue_capability_request(
             device_id.as_str(),
             request.get_ref().capability.trim(),
             request.get_ref().input_json.clone(),
@@ -786,19 +919,33 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
         // The deadline is enforced here, not inside the queue: the dispatch
         // record stays addressable so a late node result can still be journaled
         // after this RPC has already returned DEADLINE_EXCEEDED.
-        let result =
-            tokio::time::timeout(Duration::from_millis(NODE_CAPABILITY_TIMEOUT_MS), receiver)
-                .await
-                .map_err(|_| {
-                    let _ = self.node_runtime.mark_capability_timeout(request_id.as_str());
-                    Status::deadline_exceeded("timed out waiting for node capability result")
-                })?
-                .map_err(|_| Status::internal("node capability result channel closed"))?;
+        let result = match tokio::time::timeout(
+            Duration::from_millis(NODE_CAPABILITY_TIMEOUT_MS),
+            receiver.recv(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => match self.node_runtime.mark_capability_timeout(request_id.as_str())? {
+                CapabilityRequestTimeoutOutcome::MarkedTimedOut
+                | CapabilityRequestTimeoutOutcome::AlreadyTerminal => {
+                    return Err(Status::deadline_exceeded(
+                        "timed out waiting for node capability result",
+                    ));
+                }
+                CapabilityRequestTimeoutOutcome::ResultCommitted => receiver.recv().await,
+                CapabilityRequestTimeoutOutcome::Missing => {
+                    return Err(Status::internal(
+                        "node capability request disappeared during timeout handling",
+                    ));
+                }
+            },
+        };
         Ok(Response::new(node_v1::ExecuteCapabilityResponse {
             v: request.get_ref().v.max(1),
-            success: result.success,
-            output_json: result.output_json,
-            error: result.error,
+            success: result.result.success,
+            output_json: result.result.output_json,
+            error: result.result.error,
         }))
     }
 }

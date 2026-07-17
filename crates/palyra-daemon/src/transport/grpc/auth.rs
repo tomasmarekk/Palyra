@@ -87,6 +87,21 @@ pub fn authorize_headers(headers: &HeaderMap, auth: &GatewayAuthConfig) -> Resul
     }
 }
 
+/// Returns the exact principal bound by host configuration to an authenticated admin token.
+///
+/// A valid bearer token without `bound_principal` authenticates the credential but not the
+/// caller-controlled principal header, so it cannot authorize actor-sensitive recovery.
+#[must_use]
+pub(crate) fn bound_admin_actor_principal<'a>(
+    auth: &'a GatewayAuthConfig,
+    context: &RequestContext,
+) -> Option<&'a str> {
+    if !auth.require_auth {
+        return None;
+    }
+    auth.bound_principal.as_deref().filter(|principal| *principal == context.principal)
+}
+
 /// Extracts a validated request context from HTTP headers.
 ///
 /// # Errors

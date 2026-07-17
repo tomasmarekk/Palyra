@@ -322,9 +322,9 @@ impl FlowCoordinator {
                 runtime
                     .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                         task_id: task.task_id.clone(),
+                        expected_revision: task.revision,
                         state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
                         target_run_id: None,
-                        increment_attempt_count: false,
                         last_error: Some(Some("cancelled by parent flow".to_owned())),
                         result_json: Some(Some(
                             json!({
@@ -896,8 +896,10 @@ impl FlowCoordinator {
                 task_id: task_id.clone(),
                 task_kind,
                 session_id,
+                child_session_id: None,
                 parent_run_id: flow.origin_run_id.clone(),
                 target_run_id: None,
+                planned_child_run_id: None,
                 queued_input_id: None,
                 owner_principal: flow.owner_principal.clone(),
                 device_id: flow.device_id.clone(),
@@ -910,6 +912,7 @@ impl FlowCoordinator {
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_BACKGROUND_TASK_BUDGET_TOKENS),
                 delegation: None,
+                cancellation_context: None,
                 not_before_unix_ms: step.not_before_unix_ms,
                 expires_at_unix_ms: input.get("expires_at_unix_ms").and_then(Value::as_i64),
                 notification_target_json: None,
@@ -1363,20 +1366,51 @@ fn parse_step_input(step: &FlowStepRecord) -> Value {
 }
 
 fn resolve_background_task_kind(adapter: &str, input: &Value) -> Result<String, Status> {
-    if let Some(task_kind) = input.get("task_kind").and_then(Value::as_str) {
-        if AuxiliaryTaskKind::from_str(task_kind).is_some() {
-            return Ok(task_kind.to_owned());
+    if adapter == "delegation" {
+        return Err(Status::failed_precondition(
+            "flow delegation dispatch requires admitted Run-root cancellation authority",
+        ));
+    }
+    let kind = if let Some(task_kind) = input.get("task_kind").and_then(Value::as_str) {
+        AuxiliaryTaskKind::from_str(task_kind).ok_or_else(|| {
+            Status::invalid_argument(format!("unsupported flow task_kind '{task_kind}'"))
+        })?
+    } else {
+        match adapter {
+            "auxiliary_task" => AuxiliaryTaskKind::Summary,
+            "background_prompt" => AuxiliaryTaskKind::BackgroundPrompt,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "adapter '{adapter}' cannot dispatch a background task"
+                )));
+            }
         }
-        return Err(Status::invalid_argument(format!("unsupported flow task_kind '{task_kind}'")));
+    };
+    if kind == AuxiliaryTaskKind::DelegationPrompt {
+        return Err(Status::failed_precondition(
+            "flow delegation dispatch requires admitted Run-root cancellation authority",
+        ));
     }
-    match adapter {
-        "delegation" => Ok(AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned()),
-        "auxiliary_task" => Ok(AuxiliaryTaskKind::Summary.as_str().to_owned()),
-        "background_prompt" => Ok(AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned()),
-        _ => Err(Status::invalid_argument(format!(
-            "adapter '{adapter}' cannot dispatch a background task"
-        ))),
+    let adapter_allows_kind = match adapter {
+        "background_prompt" => kind == AuxiliaryTaskKind::BackgroundPrompt,
+        "auxiliary_task" => matches!(
+            kind,
+            AuxiliaryTaskKind::Summary
+                | AuxiliaryTaskKind::RecallSearch
+                | AuxiliaryTaskKind::Classification
+                | AuxiliaryTaskKind::Extraction
+                | AuxiliaryTaskKind::ObjectiveJudge
+                | AuxiliaryTaskKind::Vision
+        ),
+        _ => false,
+    };
+    if !adapter_allows_kind {
+        return Err(Status::invalid_argument(format!(
+            "flow adapter '{adapter}' does not support task_kind '{}'",
+            kind.as_str()
+        )));
     }
+    Ok(kind.as_str().to_owned())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1570,6 +1604,40 @@ mod tests {
             updated_at_unix_ms: 1,
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn background_task_kind_resolution_is_canonical_and_adapter_scoped() {
+        assert_eq!(
+            resolve_background_task_kind(
+                "auxiliary_task",
+                &json!({"task_kind": "auxiliary_summary"})
+            )
+            .expect("summary alias should resolve"),
+            AuxiliaryTaskKind::Summary.as_str()
+        );
+        assert_eq!(
+            resolve_background_task_kind("background_prompt", &json!({}))
+                .expect("background prompt default should resolve"),
+            AuxiliaryTaskKind::BackgroundPrompt.as_str()
+        );
+        assert_eq!(
+            resolve_background_task_kind("background_prompt", &json!({"task_kind": "summary"}),)
+                .expect_err("background prompt adapter must reject auxiliary kinds")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        for request in [
+            ("delegation", json!({})),
+            ("auxiliary_task", json!({"task_kind": "delegation_prompt"})),
+        ] {
+            assert_eq!(
+                resolve_background_task_kind(request.0, &request.1)
+                    .expect_err("flow delegation must fail without Run-root authority")
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
         }
     }
 

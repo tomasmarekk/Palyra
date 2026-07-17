@@ -1259,7 +1259,7 @@ fn background_task_run(task: OrchestratorBackgroundTaskRecord) -> Result<TaskRun
         retry_policy: TaskRetryPolicy {
             attempt_count: task.attempt_count,
             max_attempts: Some(task.max_attempts),
-            retry_allowed: task.attempt_count < task.max_attempts,
+            retry_allowed: task.max_attempts == 0 || task.attempt_count < task.max_attempts,
             policy_json: retry_policy_json.clone(),
         },
         artifact_refs_json: redact_optional_json(task.result_json.as_deref())?,
@@ -1896,6 +1896,60 @@ mod tests {
             heartbeat_at_unix_ms: None,
             completed_at_unix_ms: is_terminal_task_state(state).then_some(updated_at_unix_ms),
         }
+    }
+
+    fn background_task_record(
+        max_attempts: u64,
+        attempt_count: u64,
+    ) -> OrchestratorBackgroundTaskRecord {
+        OrchestratorBackgroundTaskRecord {
+            task_id: "background-1".to_owned(),
+            task_kind: "post_run_reflection".to_owned(),
+            session_id: "session-1".to_owned(),
+            child_session_id: None,
+            parent_run_id: None,
+            target_run_id: None,
+            planned_child_run_id: None,
+            queued_input_id: None,
+            owner_principal: "user:one".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+            state: "failed".to_owned(),
+            priority: 0,
+            revision: 2,
+            execution_generation: 1,
+            attempt_count,
+            max_attempts,
+            budget_tokens: 128,
+            delegation: None,
+            cancellation_context: None,
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: None,
+            payload_json: None,
+            last_error: Some("failed".to_owned()),
+            result_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            started_at_unix_ms: Some(1),
+            completed_at_unix_ms: Some(2),
+        }
+    }
+
+    #[test]
+    fn background_task_retry_policy_treats_zero_as_unlimited() {
+        let unlimited = background_task_run(background_task_record(0, 99))
+            .expect("unlimited background task should project");
+        assert!(unlimited.retry_policy.retry_allowed);
+
+        let available = background_task_run(background_task_record(3, 2))
+            .expect("bounded background task should project");
+        assert!(available.retry_policy.retry_allowed);
+
+        let exhausted = background_task_run(background_task_record(3, 3))
+            .expect("exhausted background task should project");
+        assert!(!exhausted.retry_policy.retry_allowed);
     }
 
     #[test]

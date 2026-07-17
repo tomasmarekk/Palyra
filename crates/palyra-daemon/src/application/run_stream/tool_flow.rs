@@ -12,8 +12,10 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -25,7 +27,9 @@ use palyra_common::{
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
-        ArtifactRetentionPolicy, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        ArtifactRetentionPolicy, BackpressureOverflowAction, CancellationScopeKind,
+        CancellationSettlementOutcome, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        RuntimeIdempotencyClass, SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision,
         ToolResultArtifactRef, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget,
@@ -39,7 +43,7 @@ use tokio::{
     time::{interval, timeout, MissedTickBehavior},
 };
 use tonic::{Status, Streaming};
-use tracing::{info, Instrument};
+use tracing::{info, warn, Instrument};
 use ulid::Ulid;
 
 use crate::{
@@ -50,6 +54,10 @@ use crate::{
         resolve_cached_tool_approval_for_proposal,
     },
     application::execution_gate::ToolProposalApprovalState,
+    application::side_effect_reconciliation::{
+        reconcile_unknown_tool_side_effect, record_side_effect_reconciliation_receipt,
+        SideEffectReconciliationBinding, SideEffectReconciliationOutcome,
+    },
     application::tool_governance::{
         apply_host_tool_result_middleware, build_tool_call_signature,
         evaluate_before_tool_decision_pipeline, synthetic_tool_result_outcome,
@@ -58,12 +66,13 @@ use crate::{
     },
     application::tool_registry::{
         describe_catalog_tool, normalization_audit_tape_payload, projection_policy_for_tool,
-        rejection_tape_payload, resolve_catalog_invoke_target, search_tool_catalog_index,
-        tool_call_rejection_outcome, validate_tool_call_against_catalog_snapshot,
-        validate_tool_call_against_model_visible_tool, ModelVisibleToolCatalogSnapshot,
-        NormalizedToolCall, ToolArgumentNormalizationAudit, ToolCallRejection,
-        ToolCatalogBridgeError, ToolResultProjectionPolicy, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
-        TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
+        rejection_tape_payload, resolve_catalog_invoke_target, resolve_tool_execution_semantics,
+        search_tool_catalog_index, tool_call_rejection_outcome,
+        validate_tool_call_against_catalog_snapshot, validate_tool_call_against_model_visible_tool,
+        ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
+        ToolCallRejection, ToolCatalogBridgeError, ToolReplaySafetyClass,
+        ToolResultProjectionPolicy, TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME,
+        TOOL_CATALOG_SEARCH_TOOL_NAME,
     },
     application::tool_runtime::{
         artifacts::bounded_tool_result_artifact_content,
@@ -89,20 +98,33 @@ use crate::{
     },
     journal::{
         ApprovalCreateRequest, ApprovalResolveRequest, OrchestratorTapeAppendRequest,
+        SideEffectFenceCleanupOutcomeRequest, ToolEffectObservationCommitRequest,
         ToolResultArtifactCreateRequest,
     },
-    orchestrator::RunStateMachine,
+    orchestrator::{RunLifecycleState, RunStateMachine},
     sandbox_runner::{ProcessProgressEvent, ProcessProgressSink},
     tool_protocol::{build_tool_execution_outcome, denied_execution_outcome, ToolExecutionOutcome},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
 use super::{
-    cancellation::transition_run_stream_to_cancelled,
+    cancellation::{
+        record_run_interrupt_observation, request_persisted_run_interrupt,
+        transition_run_stream_to_cancelled,
+    },
+    flow_control::{
+        process_progress_backpressure_policy, LiveCancellationScope, RunInterruptPhase,
+        RunStreamFlowControl, PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE,
+        PROCESS_PROGRESS_BACKPRESSURE_TAPE_EVENT,
+    },
+    orchestration::RunStreamHarnessLifecycle,
     tape::{
-        send_status_with_tape, send_tool_approval_request_with_tape,
-        send_tool_approval_response_with_tape, send_tool_attestation_with_tape,
-        send_tool_decision_with_tape, send_tool_proposal_with_tape, send_tool_result_with_tape,
+        redact_run_stream_text, redacted_run_stream_output_json, send_status_with_tape,
+        send_tool_approval_request_with_tape, send_tool_approval_response_with_tape,
+        send_tool_attestation_with_tape, send_tool_decision_with_tape,
+        send_tool_proposal_with_tape, send_tool_result_with_tape, tool_attestation_event,
+        tool_attestation_tape_payload, tool_result_event, tool_result_tape_payload,
+        ToolAttestationTapePayload, RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
 
@@ -118,6 +140,41 @@ const TOOL_REPAIR_REJECTED_EVENT: &str = "tool.repair.rejected";
 const TOOL_EFFECT_STARTED_EVENT: &str = "tool_effect_started";
 
 type RunStreamProgressSender = mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>;
+
+struct ProcessProgressSlot {
+    latest: Option<ProcessProgressEvent>,
+    coalesced: u64,
+}
+
+struct ProcessProgressReceiver {
+    notifications: mpsc::Receiver<()>,
+    slot: Arc<std::sync::Mutex<ProcessProgressSlot>>,
+}
+
+impl ProcessProgressReceiver {
+    async fn recv(&mut self) -> Option<(ProcessProgressEvent, u64)> {
+        loop {
+            match self.notifications.recv().await {
+                Some(()) => {
+                    let mut slot =
+                        self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(progress) = slot.latest.take() {
+                        let coalesced = std::mem::take(&mut slot.coalesced);
+                        return Some((progress, coalesced));
+                    }
+                }
+                None => {
+                    let mut slot =
+                        self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    return slot
+                        .latest
+                        .take()
+                        .map(|progress| (progress, std::mem::take(&mut slot.coalesced)));
+                }
+            }
+        }
+    }
+}
 
 /// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
@@ -138,6 +195,7 @@ pub(crate) struct RunStreamPreparedToolExecution {
     proposal_id: String,
     tool_name: String,
     input_json: Vec<u8>,
+    replay_safety_class: ToolReplaySafetyClass,
     tool_signature: ToolCallSignature,
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
@@ -153,6 +211,8 @@ struct PreparedToolRuntimeExecution<'a> {
     effect_started_tape_seq: Option<i64>,
     prepared: &'a RunStreamPreparedToolExecution,
     remaining_tool_budget: Option<SharedToolBudget>,
+    flow_control: RunStreamFlowControl,
+    cancellation: LiveCancellationScope,
 }
 
 /// Result of preparing one tool proposal.
@@ -170,8 +230,8 @@ pub(crate) enum RunStreamToolProposalPreparationOutcome {
 pub(crate) enum RunStreamPreparedToolExecutionBatchOutcome {
     /// Outcomes for every proposal, in the original proposal order.
     Completed(Vec<RunStreamToolExecutionOutcome>),
-    /// The run was cancelled mid-batch; the cancel transition already ran.
-    Cancelled,
+    /// A terminal settlement won mid-batch; the state machine already follows it.
+    Terminal(RunLifecycleState),
 }
 
 /// Side-effect classification deciding whether a tool may run in parallel.
@@ -237,6 +297,22 @@ struct ProjectedToolExecutionOutcome {
     middleware_report: Option<ToolResultMiddlewareReport>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveToolSideEffectFence {
+    operation_id: palyra_common::runtime_contracts::RuntimeOperationId,
+    generation: palyra_common::runtime_contracts::RuntimeGeneration,
+    intent_sha256: String,
+    strategy: palyra_common::runtime_contracts::ReconciliationStrategy,
+    external_idempotency_key_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedToolRuntimeOutcome {
+    outcome: ToolExecutionOutcome,
+    side_effect_fence: Option<ActiveToolSideEffectFence>,
+    post_execution_error: Option<Status>,
+}
+
 impl ToolParallelism {
     const fn as_str(self) -> &'static str {
         match self {
@@ -258,7 +334,7 @@ enum ParallelToolExecutionTaskOutcome {
     Completed {
         order: usize,
         prepared: RunStreamPreparedToolExecution,
-        outcome: ToolExecutionOutcome,
+        outcome: PreparedToolRuntimeOutcome,
     },
     Cancelled,
 }
@@ -294,7 +370,9 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     match prepare_run_stream_tool_proposal_event(
         sender,
@@ -311,6 +389,7 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
         remaining_tool_budget,
         allow_sensitive_tools,
         approval_cache_generation,
+        flow_control,
         tape_seq,
     )
     .await?
@@ -324,7 +403,9 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
                 run_id,
                 prepared,
                 remaining_tool_budget,
+                flow_control,
                 tape_seq,
+                harness_lifecycle,
             )
             .await
         }
@@ -363,6 +444,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparationOutcome, Status> {
     let NormalizedToolCall { input_json: normalized_input_json, audit } =
@@ -536,14 +618,22 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         remaining_tool_budget,
         allow_sensitive_tools,
         approval_cache_generation,
+        flow_control,
         tape_seq,
     )
     .await?;
 
+    let replay_safety_class = tool_catalog_snapshot
+        .tools
+        .iter()
+        .chain(tool_catalog_snapshot.indexed_tools.iter())
+        .find(|tool| tool.name == execution_tool_name)
+        .map_or(ToolReplaySafetyClass::RequiresHumanConfirmation, |tool| tool.replay_safety_class);
     let prepared = RunStreamPreparedToolExecution {
         proposal_id: proposal_id.to_owned(),
         tool_name: execution_tool_name,
         input_json: execution_input_json,
+        replay_safety_class,
         tool_signature,
         decision,
         resolved_session_id,
@@ -557,6 +647,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
             run_id,
             &prepared,
             outcome,
+            None,
             tape_seq,
         )
         .await?;
@@ -979,7 +1070,9 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
     run_id: &str,
     prepared_tools: Vec<RunStreamPreparedToolExecution>,
     remaining_tool_budget: &mut u32,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamPreparedToolExecutionBatchOutcome, Status> {
     let mut completed = Vec::new();
     for group in split_parallel_tool_groups(prepared_tools) {
@@ -993,15 +1086,17 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                 run_id,
                 group.tools,
                 remaining_tool_budget,
+                flow_control,
                 tape_seq,
+                harness_lifecycle,
             )
             .await?
             {
                 RunStreamPreparedToolExecutionBatchOutcome::Completed(mut outcomes) => {
                     completed.append(&mut outcomes);
                 }
-                RunStreamPreparedToolExecutionBatchOutcome::Cancelled => {
-                    return Ok(RunStreamPreparedToolExecutionBatchOutcome::Cancelled);
+                RunStreamPreparedToolExecutionBatchOutcome::Terminal(state) => {
+                    return Ok(RunStreamPreparedToolExecutionBatchOutcome::Terminal(state));
                 }
             }
         } else {
@@ -1014,7 +1109,9 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                     run_id,
                     prepared,
                     remaining_tool_budget,
+                    flow_control,
                     tape_seq,
+                    harness_lifecycle,
                 )
                 .await?
                 {
@@ -1031,8 +1128,8 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                             outcome,
                         });
                     }
-                    RunStreamToolExecutionOutcome::Cancelled => {
-                        return Ok(RunStreamPreparedToolExecutionBatchOutcome::Cancelled);
+                    RunStreamToolExecutionOutcome::Terminal(state) => {
+                        return Ok(RunStreamPreparedToolExecutionBatchOutcome::Terminal(state));
                     }
                 }
             }
@@ -1308,7 +1405,9 @@ async fn execute_parallel_prepared_tool_group(
     run_id: &str,
     prepared_tools: Vec<RunStreamPreparedToolExecution>,
     remaining_tool_budget: &mut u32,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamPreparedToolExecutionBatchOutcome, Status> {
     let group_id = Ulid::new().to_string();
     append_tool_parallel_group_tape_event(
@@ -1334,6 +1433,11 @@ async fn execute_parallel_prepared_tool_group(
         let request_context = request_context.clone();
         let run_id = run_id.to_owned();
         let nested_tool_budget = nested_tool_budget.clone();
+        let cancellation = flow_control.live_child(
+            CancellationScopeKind::ToolExecution,
+            tool_execution_timeout(&runtime_state, prepared.tool_name.as_str()),
+        )?;
+        let flow_control = flow_control.clone();
         join_set.spawn(async move {
             match execute_prepared_tool_runtime(PreparedToolRuntimeExecution {
                 progress_sender: None,
@@ -1344,6 +1448,8 @@ async fn execute_parallel_prepared_tool_group(
                 effect_started_tape_seq: Some(effect_started_tape_seq),
                 prepared: &prepared,
                 remaining_tool_budget: Some(nested_tool_budget),
+                flow_control,
+                cancellation,
             })
             .await?
             {
@@ -1358,43 +1464,72 @@ async fn execute_parallel_prepared_tool_group(
     // Keyed by proposal order: tasks join in completion order, but result
     // events and tape rows must be finalized in the model's proposal order.
     let mut completed =
-        BTreeMap::<usize, (RunStreamPreparedToolExecution, ToolExecutionOutcome)>::new();
+        BTreeMap::<usize, (RunStreamPreparedToolExecution, PreparedToolRuntimeOutcome)>::new();
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok(Ok(ParallelToolExecutionTaskOutcome::Completed { order, prepared, outcome })) => {
                 completed.insert(order, (prepared, outcome));
             }
             Ok(Ok(ParallelToolExecutionTaskOutcome::Cancelled)) => {
-                drain_parallel_tool_group_after_cancel(&mut join_set).await?;
+                let settlement = drain_parallel_tool_group_after_cancel(
+                    join_set,
+                    Duration::from_millis(flow_control.root_context().hard_abort_after_ms),
+                )
+                .await?;
+                let (status, reason) = match settlement {
+                    CancellationSettlementOutcome::Graceful => {
+                        ("cancelled", "cancel_requested_after_parallel_drain")
+                    }
+                    CancellationSettlementOutcome::CleanupUnknown => {
+                        ("cleanup_unknown", "parallel_tool_cleanup_unknown")
+                    }
+                    CancellationSettlementOutcome::HardAborted => {
+                        return Err(Status::internal(
+                            "parallel tool drain reported hard abort without cleanup evidence",
+                        ));
+                    }
+                };
                 append_tool_parallel_group_tape_event(
                     runtime_state,
                     run_id,
                     tape_seq,
                     "tool.parallel_group.cancelled",
                     group_id.as_str(),
-                    "cancelled",
+                    status,
                     &[],
-                    Some("cancel_requested_after_parallel_drain"),
+                    Some(reason),
                 )
                 .await?;
-                transition_run_stream_to_cancelled(
+                let effective_state = transition_run_stream_to_cancelled(
                     sender,
                     runtime_state,
                     run_state,
                     run_id,
+                    flow_control,
                     tape_seq,
+                    harness_lifecycle,
                 )
                 .await?;
-                return Ok(RunStreamPreparedToolExecutionBatchOutcome::Cancelled);
+                return Ok(RunStreamPreparedToolExecutionBatchOutcome::Terminal(effective_state));
             }
             Ok(Err(error)) => {
-                return Err(drain_parallel_tool_group_after_error(&mut join_set, error).await);
+                return Err(drain_parallel_tool_group_after_error(
+                    join_set,
+                    error,
+                    Duration::from_millis(flow_control.root_context().hard_abort_after_ms),
+                )
+                .await);
             }
             Err(error) => {
                 let status = Status::internal(format!(
                     "parallel tool execution task failed to join: {error}"
                 ));
-                return Err(drain_parallel_tool_group_after_error(&mut join_set, status).await);
+                return Err(drain_parallel_tool_group_after_error(
+                    join_set,
+                    status,
+                    Duration::from_millis(flow_control.root_context().hard_abort_after_ms),
+                )
+                .await);
             }
         }
     }
@@ -1402,18 +1537,21 @@ async fn execute_parallel_prepared_tool_group(
 
     let mut finalized = Vec::with_capacity(completed.len());
     for (_, (prepared, execution_outcome)) in completed {
-        finalized.push(
-            finalize_prepared_tool_execution_outcome(
-                sender,
-                runtime_state,
-                request_context,
-                run_id,
-                &prepared,
-                execution_outcome,
-                tape_seq,
-            )
-            .await?,
-        );
+        let completed = finalize_prepared_tool_execution_outcome(
+            sender,
+            runtime_state,
+            request_context,
+            run_id,
+            &prepared,
+            execution_outcome.outcome,
+            execution_outcome.side_effect_fence.as_ref(),
+            tape_seq,
+        )
+        .await?;
+        if let Some(error) = execution_outcome.post_execution_error {
+            return Err(error);
+        }
+        finalized.push(completed);
     }
 
     append_tool_parallel_group_tape_event(
@@ -1432,34 +1570,80 @@ async fn execute_parallel_prepared_tool_group(
 
 // INTENTIONAL: waits for sibling tasks instead of aborting them. Aborting
 // would drop tool executions mid-flight (half-applied side effects, leaked
-// browser/process state); a pinning test asserts this drain behavior.
+// browser/process state). The caller supplies one bounded group settlement
+// budget so a hung sibling becomes explicit cleanup_unknown instead of
+// blocking cancellation forever.
 #[allow(clippy::result_large_err)]
 async fn drain_parallel_tool_group_after_cancel(
-    join_set: &mut JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
-) -> Result<(), Status> {
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(ParallelToolExecutionTaskOutcome::Completed { .. }))
-            | Ok(Ok(ParallelToolExecutionTaskOutcome::Cancelled)) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return Err(Status::internal(format!(
-                    "parallel tool execution task failed to join while draining cancellation: {error}"
-                )));
+    mut join_set: JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
+    settle_budget: Duration,
+) -> Result<CancellationSettlementOutcome, Status> {
+    let mut settle_deadline =
+        Box::pin(tokio::time::sleep(settle_budget.max(Duration::from_millis(1))));
+    loop {
+        tokio::select! {
+            joined = join_set.join_next() => {
+                let Some(joined) = joined else {
+                    return Ok(CancellationSettlementOutcome::Graceful);
+                };
+                match joined {
+                    Ok(Ok(ParallelToolExecutionTaskOutcome::Completed { .. }))
+                    | Ok(Ok(ParallelToolExecutionTaskOutcome::Cancelled)) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(Status::internal(format!(
+                            "parallel tool execution task failed to join while draining cancellation: {error}"
+                        )));
+                    }
+                }
+            }
+            _ = &mut settle_deadline => {
+                supervise_parallel_tool_group_cleanup(join_set);
+                return Ok(CancellationSettlementOutcome::CleanupUnknown);
             }
         }
     }
-    Ok(())
+}
+
+fn supervise_parallel_tool_group_cleanup(
+    mut join_set: JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
+) {
+    tokio::spawn(async move {
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(Ok(ParallelToolExecutionTaskOutcome::Completed { .. }))
+                | Ok(Ok(ParallelToolExecutionTaskOutcome::Cancelled)) => {}
+                Ok(Err(error)) => warn!(
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "parallel tool cleanup supervisor observed a task error"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    "parallel tool cleanup supervisor failed to join a task"
+                ),
+            }
+        }
+    });
 }
 
 async fn drain_parallel_tool_group_after_error(
-    join_set: &mut JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
+    join_set: JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
     original_error: Status,
+    settle_budget: Duration,
 ) -> Status {
     let original_code = original_error.code();
     let original_message = original_error.message().to_owned();
-    match drain_parallel_tool_group_after_cancel(join_set).await {
-        Ok(()) => original_error,
+    match drain_parallel_tool_group_after_cancel(join_set, settle_budget).await {
+        Ok(CancellationSettlementOutcome::Graceful) => original_error,
+        Ok(CancellationSettlementOutcome::CleanupUnknown) => Status::new(
+            original_code,
+            format!("{original_message}; parallel tool cleanup remains unknown"),
+        ),
+        Ok(CancellationSettlementOutcome::HardAborted) => Status::new(
+            original_code,
+            format!("{original_message}; invalid hard-abort settlement without cleanup evidence"),
+        ),
         Err(drain_error) => Status::new(
             original_code,
             format!(
@@ -1535,6 +1719,7 @@ async fn prepare_run_stream_tool_proposal_execution(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparation, Status> {
     let resolved_session_id = active_session_id.ok_or_else(|| {
@@ -1654,6 +1839,7 @@ async fn prepare_run_stream_tool_proposal_execution(
         &backend_selection,
         allow_sensitive_tools,
         approval_cache_generation,
+        flow_control,
         tape_seq,
     )
     .await?;
@@ -1804,6 +1990,7 @@ async fn resolve_run_stream_tool_approval_outcome(
     backend_selection: &ToolProposalBackendSelection,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<Option<ToolApprovalOutcome>, Status> {
     // Approval gate precedence: (1) explicit allow-sensitive-tools bypass,
@@ -1949,8 +2136,13 @@ async fn resolve_run_stream_tool_approval_outcome(
         return Err(error);
     }
 
-    let response = match timeout(
-        TOOL_APPROVAL_RESPONSE_TIMEOUT,
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::Approval);
+    let mut approval_cancellation = flow_control
+        .live_child(CancellationScopeKind::ApprovalWait, TOOL_APPROVAL_RESPONSE_TIMEOUT)?;
+    let approval_timeout =
+        RunStreamFlowControl::remaining_for_new_work(approval_cancellation.context())?;
+    let approval_response = timeout(
+        approval_timeout,
         await_tool_approval_response(
             runtime_state,
             stream,
@@ -1959,10 +2151,31 @@ async fn resolve_run_stream_tool_approval_outcome(
             proposal_id,
             pending_approval.approval_id.as_str(),
         ),
-    )
-    .await
-    {
+    );
+    tokio::pin!(approval_response);
+    let approval_result = tokio::select! {
+        biased;
+        reason = approval_cancellation.cancelled() => {
+            flow_control.request_cancel(reason);
+            Ok(Err(Status::cancelled("approval wait cancelled by run authority")))
+        }
+        result = &mut approval_response => result,
+    };
+    let response = match approval_result {
         Ok(Ok(value)) => value,
+        Ok(Err(error)) if error.code() == tonic::Code::Cancelled => {
+            request_persisted_run_interrupt(runtime_state, run_id, flow_control).await?;
+            record_run_interrupt_observation(runtime_state, flow_control);
+            runtime_state.record_run_stream_approval_cancelled();
+            ToolApprovalOutcome {
+                approval_id: pending_approval.approval_id.clone(),
+                approved: false,
+                reason: "approval_cancelled_by_run".to_owned(),
+                decision: crate::journal::ApprovalDecision::Error,
+                decision_scope: crate::journal::ApprovalDecisionScope::Once,
+                decision_scope_ttl_ms: None,
+            }
+        }
         Ok(Err(error)) => ToolApprovalOutcome {
             approval_id: pending_approval.approval_id.clone(),
             approved: false,
@@ -2031,14 +2244,25 @@ async fn resolve_run_stream_tool_approval_outcome(
 
     // Generation-guarded cache write: if the session approval cache was reset
     // while this prompt was pending, the stale decision must not be cached.
-    runtime_state.remember_tool_approval_if_generation(
-        request_context,
-        session_id,
-        approval_subject_id,
-        &response,
-        approval_cache_generation,
-    );
+    if response.reason != "approval_cancelled_by_run" {
+        runtime_state.remember_tool_approval_if_generation(
+            request_context,
+            session_id,
+            approval_subject_id,
+            &response,
+            approval_cache_generation,
+        );
+    }
     Ok(Some(response))
+}
+
+fn tool_execution_timeout(runtime_state: &GatewayRuntimeState, tool_name: &str) -> Duration {
+    let configured = Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms);
+    if tool_name == PROCESS_RUNNER_TOOL_NAME {
+        configured.max(Duration::from_secs(1))
+    } else {
+        configured
+    }
 }
 
 fn allow_sensitive_tools_approval_outcome() -> ToolApprovalOutcome {
@@ -2055,15 +2279,27 @@ fn allow_sensitive_tools_approval_outcome() -> ToolApprovalOutcome {
 fn process_progress_channel_for_tool(
     tool_name: &str,
     enabled: bool,
-) -> (Option<ProcessProgressSink>, Option<mpsc::UnboundedReceiver<ProcessProgressEvent>>) {
+) -> (Option<ProcessProgressSink>, Option<ProcessProgressReceiver>) {
     if !enabled || tool_name != PROCESS_RUNNER_TOOL_NAME {
         return (None, None);
     }
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let policy = process_progress_backpressure_policy()
+        .expect("process progress backpressure policy is a validated compile-time contract");
+    debug_assert_eq!(policy.overflow_action, BackpressureOverflowAction::CoalesceProgress);
+    // One queued notification plus a mutex-held latest snapshot implements
+    // latest-value coalescing without an unbounded producer task backlog.
+    let (sender, receiver) = mpsc::channel(policy.capacity);
+    let slot = Arc::new(std::sync::Mutex::new(ProcessProgressSlot { latest: None, coalesced: 0 }));
+    let slot_for_sink = Arc::clone(&slot);
     let sink: ProcessProgressSink = Arc::new(move |progress| {
-        let _ = sender.send(progress);
+        let mut slot = slot_for_sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.latest.replace(progress).is_some() {
+            slot.coalesced = slot.coalesced.saturating_add(1);
+        }
+        drop(slot);
+        let _ = sender.try_send(());
     });
-    (Some(sink), Some(receiver))
+    (Some(sink), Some(ProcessProgressReceiver { notifications: receiver, slot }))
 }
 
 #[allow(clippy::result_large_err)]
@@ -2087,6 +2323,38 @@ async fn send_process_progress_status_with_tape(
         message.as_str(),
     )
     .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_process_progress_backpressure_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    coalesced: u64,
+) -> Result<(), Status> {
+    if coalesced == 0 {
+        return Ok(());
+    }
+    let policy = process_progress_backpressure_policy()
+        .expect("process progress backpressure policy is a validated compile-time contract");
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: PROCESS_PROGRESS_BACKPRESSURE_TAPE_EVENT.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "boundary": "process_progress",
+                "overflow_action": policy.overflow_action.as_str(),
+                "coalesced_count": coalesced,
+                "capacity": policy.capacity,
+                "reason_code": PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
 }
 
 fn process_progress_status_message(proposal_id: &str, progress: &ProcessProgressEvent) -> String {
@@ -2143,9 +2411,15 @@ async fn execute_prepared_run_stream_tool_proposal(
     run_id: &str,
     prepared: RunStreamPreparedToolExecution,
     remaining_tool_budget: &mut u32,
+    flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
+    let cancellation = flow_control.live_child(
+        CancellationScopeKind::ToolExecution,
+        tool_execution_timeout(runtime_state, prepared.tool_name.as_str()),
+    )?;
     let execution_outcome = match execute_prepared_tool_runtime(PreparedToolRuntimeExecution {
         progress_sender: Some(sender),
         runtime_state,
@@ -2155,33 +2429,48 @@ async fn execute_prepared_run_stream_tool_proposal(
         effect_started_tape_seq: None,
         prepared: &prepared,
         remaining_tool_budget: Some(nested_tool_budget.clone()),
+        flow_control: flow_control.clone(),
+        cancellation,
     })
     .await?
     {
         Some(outcome) => outcome,
         None => {
-            transition_run_stream_to_cancelled(sender, runtime_state, run_state, run_id, tape_seq)
-                .await?;
-            return Ok(RunStreamToolExecutionOutcome::Cancelled);
+            let effective_state = transition_run_stream_to_cancelled(
+                sender,
+                runtime_state,
+                run_state,
+                run_id,
+                flow_control,
+                tape_seq,
+                harness_lifecycle,
+            )
+            .await?;
+            return Ok(RunStreamToolExecutionOutcome::Terminal(effective_state));
         }
     };
     *remaining_tool_budget = shared_tool_budget_remaining(&nested_tool_budget);
-    finalize_prepared_tool_execution_outcome(
+    let finalized = finalize_prepared_tool_execution_outcome(
         sender,
         runtime_state,
         request_context,
         run_id,
         &prepared,
-        execution_outcome,
+        execution_outcome.outcome,
+        execution_outcome.side_effect_fence.as_ref(),
         tape_seq,
     )
-    .await
+    .await?;
+    if let Some(error) = execution_outcome.post_execution_error {
+        return Err(error);
+    }
+    Ok(finalized)
 }
 
 #[allow(clippy::result_large_err)]
 async fn execute_prepared_tool_runtime(
     execution: PreparedToolRuntimeExecution<'_>,
-) -> Result<Option<ToolExecutionOutcome>, Status> {
+) -> Result<Option<PreparedToolRuntimeOutcome>, Status> {
     let PreparedToolRuntimeExecution {
         progress_sender,
         runtime_state,
@@ -2191,17 +2480,30 @@ async fn execute_prepared_tool_runtime(
         effect_started_tape_seq,
         prepared,
         remaining_tool_budget,
+        flow_control,
+        mut cancellation,
     } = execution;
+    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::Tool);
+    if !cancellation.permits_new_work(crate::gateway::current_unix_ms()) {
+        record_run_interrupt_observation(runtime_state, &flow_control);
+        return Ok(None);
+    }
     if !prepared.decision.allowed {
-        return Ok(Some(denied_execution_outcome(
-            prepared.proposal_id.as_str(),
-            prepared.tool_name.as_str(),
-            prepared.input_json.as_slice(),
-            prepared.decision.reason.as_str(),
-        )));
+        return Ok(Some(PreparedToolRuntimeOutcome {
+            outcome: denied_execution_outcome(
+                prepared.proposal_id.as_str(),
+                prepared.tool_name.as_str(),
+                prepared.input_json.as_slice(),
+                prepared.decision.reason.as_str(),
+            ),
+            side_effect_fence: None,
+            post_execution_error: None,
+        }));
     }
 
     if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
+        request_persisted_run_interrupt(runtime_state, run_id, &flow_control).await?;
+        record_run_interrupt_observation(runtime_state, &flow_control);
         return Ok(None);
     }
 
@@ -2209,8 +2511,11 @@ async fn execute_prepared_tool_runtime(
     let started_at = Instant::now();
     let mut cancel_poll = interval(Duration::from_millis(100));
     cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let must_drain_execution_after_cancel =
+    let mut must_drain_execution_after_cancel =
         tool_cancellation_requires_execution_drain(prepared.tool_name.as_str());
+    let active_side_effect_fence =
+        prepare_tool_side_effect_fence(runtime_state, run_id, prepared).await?;
+    must_drain_execution_after_cancel |= active_side_effect_fence.is_some();
     let cancellation_requested = Arc::new(AtomicBool::new(false));
     let tool_span = tracing::info_span!(
         "tool.call",
@@ -2220,10 +2525,30 @@ async fn execute_prepared_tool_runtime(
         execution_surface = "run_stream",
         status = tracing::field::Empty,
     );
+    let process_cancellation = if prepared.tool_name == PROCESS_RUNNER_TOOL_NAME {
+        Some(flow_control.child_from(
+            cancellation.context(),
+            CancellationScopeKind::Process,
+            tool_execution_timeout(runtime_state, prepared.tool_name.as_str()),
+        )?)
+    } else {
+        None
+    };
     let (process_progress_sink, mut process_progress_rx) =
         process_progress_channel_for_tool(prepared.tool_name.as_str(), progress_sender.is_some());
     apply_tool_fault(runtime_state, "tool.before_effect", prepared.proposal_id.as_str())?;
-    if let Some(seq) = effect_started_tape_seq {
+    if let Some(fence) = active_side_effect_fence.as_ref() {
+        runtime_state
+            .transition_tool_side_effect_fence(
+                fence.operation_id.clone(),
+                SideEffectFenceState::EffectStarted,
+                fence.generation,
+                "tool.effect.started".to_owned(),
+                None,
+            )
+            .await?;
+    }
+    let effect_started_tape_result = if let Some(seq) = effect_started_tape_seq {
         append_tool_effect_started_tape_event(
             runtime_state,
             run_id,
@@ -2231,53 +2556,172 @@ async fn execute_prepared_tool_runtime(
             prepared.proposal_id.as_str(),
             prepared.tool_name.as_str(),
         )
-        .await?;
+        .await
     } else if let Some(tape_seq) = progress_tape_seq.as_deref_mut() {
-        append_tool_effect_started_tape_event(
+        let result = append_tool_effect_started_tape_event(
             runtime_state,
             run_id,
             *tape_seq,
             prepared.proposal_id.as_str(),
             prepared.tool_name.as_str(),
         )
-        .await?;
-        *tape_seq = (*tape_seq).saturating_add(1);
+        .await;
+        if result.is_ok() {
+            *tape_seq = (*tape_seq).saturating_add(1);
+        }
+        result
     } else {
-        return Err(Status::internal(
-            "tool effect start requires an assigned durable tape sequence",
-        ));
+        Err(Status::internal("tool effect start requires an assigned durable tape sequence"))
+    };
+    if let Err(error) = effect_started_tape_result {
+        if active_side_effect_fence.is_some() {
+            if let Err(settlement_error) =
+                mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref())
+                    .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    proposal_id = %prepared.proposal_id,
+                    tool_name = %prepared.tool_name,
+                    error = %settlement_error,
+                    "failed to mark tool effect unknown after start-evidence append failure"
+                );
+            }
+        }
+        return Err(error);
     }
+    let execution_deadline = RunStreamFlowControl::remaining_for_new_work(
+        process_cancellation.as_ref().unwrap_or(cancellation.context()),
+    )?;
+    let mut execution_deadline_sleep = Box::pin(tokio::time::sleep(execution_deadline));
+    let execution_runtime_state = Arc::clone(runtime_state);
+    let execution_principal = request_context.principal.clone();
+    let execution_device_id = request_context.device_id.clone();
+    let execution_channel = request_context.channel.clone();
+    let execution_session_id = prepared.resolved_session_id.clone();
+    let execution_run_id = run_id.to_owned();
+    let execution_proposal_id = prepared.proposal_id.clone();
+    let execution_tool_name = prepared.tool_name.clone();
+    let execution_input_json = prepared.input_json.clone();
+    let execution_backend = prepared.backend_selection.resolution.resolved;
+    let execution_backend_reason = prepared.backend_selection.resolution.reason_code.clone();
+    let execution_cancellation =
+        process_cancellation.clone().unwrap_or_else(|| cancellation.context().clone());
+    let execution_cancellation_requested = Arc::clone(&cancellation_requested);
+    let child_task_parent_context = flow_control.root_context().clone();
     let mut execution_future = Box::pin(
-        execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
-            runtime_state,
-            ToolRuntimeExecutionContext {
-                principal: request_context.principal.as_str(),
-                device_id: request_context.device_id.as_str(),
-                channel: request_context.channel.as_deref(),
-                session_id: prepared.resolved_session_id.as_str(),
-                run_id,
-                execution_backend: prepared.backend_selection.resolution.resolved,
-                backend_reason_code: prepared.backend_selection.resolution.reason_code.as_str(),
-            },
-            prepared.proposal_id.as_str(),
-            prepared.tool_name.as_str(),
-            prepared.input_json.as_slice(),
-            ToolRuntimeDispatchControls {
-                remaining_tool_budget,
-                cancellation_requested: Some(Arc::clone(&cancellation_requested)),
-                process_progress_sink,
-            },
-        )
+        async move {
+            execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
+                &execution_runtime_state,
+                ToolRuntimeExecutionContext {
+                    principal: execution_principal.as_str(),
+                    device_id: execution_device_id.as_str(),
+                    channel: execution_channel.as_deref(),
+                    session_id: execution_session_id.as_str(),
+                    run_id: execution_run_id.as_str(),
+                    execution_backend,
+                    backend_reason_code: execution_backend_reason.as_str(),
+                },
+                execution_proposal_id.as_str(),
+                execution_tool_name.as_str(),
+                execution_input_json.as_slice(),
+                ToolRuntimeDispatchControls {
+                    remaining_tool_budget,
+                    cancellation_requested: Some(execution_cancellation_requested),
+                    process_progress_sink,
+                    cancellation_context: Some(execution_cancellation),
+                    child_task_parent_context: Some(child_task_parent_context),
+                },
+            )
+            .await
+        }
         .instrument(tool_span),
     );
-    let mut cancel_requested_during_execution = false;
+    let mut post_start_error = None;
     // The execution future is created once and pinned outside the select
     // loop, so losing a select race to the cancel poll never drops execution
     // progress (cancel-safe polling of `&mut future`).
     let outcome = loop {
         tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                flow_control.request_cancel(reason);
+                record_run_interrupt_observation(runtime_state, &flow_control);
+                if must_drain_execution_after_cancel {
+                    cancellation_requested.store(true, Ordering::Relaxed);
+                    post_start_error = Some(Status::cancelled(
+                        "tool execution completed after cancellation was requested",
+                    ));
+                    match timeout(
+                        Duration::from_millis(cancellation.context().hard_abort_after_ms.max(1)),
+                        &mut execution_future,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => break outcome,
+                        Err(_) => {
+                            supervise_serial_tool_cleanup(
+                                execution_future,
+                                SerialToolCleanupSupervisor {
+                                    runtime_state: Arc::clone(runtime_state),
+                                    fence: active_side_effect_fence.clone(),
+                                    run_id: run_id.to_owned(),
+                                    proposal_id: prepared.proposal_id.clone(),
+                                    tool_name: prepared.tool_name.clone(),
+                                    decision_allowed: prepared.decision.allowed,
+                                    started_at,
+                                },
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                // Read-only and deterministic-idempotent tools may be
+                // abandoned safely; mutating tools are always drained.
+                return Ok(None);
+            }
             result = &mut execution_future => {
                 break result;
+            }
+            _ = &mut execution_deadline_sleep => {
+                runtime_state.record_run_stream_tool_deadline_exceeded();
+                cancellation_requested.store(true, Ordering::Relaxed);
+                if !must_drain_execution_after_cancel {
+                    return Err(Status::deadline_exceeded(format!(
+                        "tool execution deadline exceeded for {}",
+                        prepared.tool_name
+                    )));
+                }
+                post_start_error = Some(Status::deadline_exceeded(format!(
+                    "tool execution deadline exceeded for {}",
+                    prepared.tool_name
+                )));
+                match timeout(
+                    Duration::from_millis(cancellation.context().hard_abort_after_ms.max(1)),
+                    &mut execution_future,
+                )
+                .await
+                {
+                    Ok(outcome) => break outcome,
+                    Err(_) => {
+                        supervise_serial_tool_cleanup(
+                            execution_future,
+                            SerialToolCleanupSupervisor {
+                                runtime_state: Arc::clone(runtime_state),
+                                fence: active_side_effect_fence.clone(),
+                                run_id: run_id.to_owned(),
+                                proposal_id: prepared.proposal_id.clone(),
+                                tool_name: prepared.tool_name.clone(),
+                                decision_allowed: prepared.decision.allowed,
+                                started_at,
+                            },
+                        );
+                        return Err(Status::deadline_exceeded(format!(
+                            "tool execution exceeded the hard boundary for {}; cleanup ownership transferred and durable uncertainty is pending",
+                            prepared.tool_name
+                        )));
+                    }
+                }
             }
             progress = async {
                 match process_progress_rx.as_mut() {
@@ -2286,18 +2730,95 @@ async fn execute_prepared_tool_runtime(
                 }
             }, if process_progress_rx.is_some() => {
                 match progress {
-                    Some(progress) => {
-                        send_process_progress_status_with_tape(
+                    Some((progress, coalesced)) => {
+                        runtime_state.record_run_stream_progress_coalesced(coalesced);
+                        let tape_seq = progress_tape_seq
+                            .as_deref_mut()
+                            .expect("progress receiver requires tape sequence");
+                        if let Err(error) = append_process_progress_backpressure_tape_event(
+                            runtime_state,
+                            run_id,
+                            tape_seq,
+                            coalesced,
+                        )
+                        .await
+                        {
+                            if must_drain_execution_after_cancel {
+                                cancellation_requested.store(true, Ordering::Relaxed);
+                                post_start_error = Some(error);
+                                match timeout(
+                                    Duration::from_millis(
+                                        cancellation.context().hard_abort_after_ms.max(1),
+                                    ),
+                                    &mut execution_future,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => break outcome,
+                                    Err(_) => {
+                                        supervise_serial_tool_cleanup(
+                                            execution_future,
+                                            SerialToolCleanupSupervisor {
+                                                runtime_state: Arc::clone(runtime_state),
+                                                fence: active_side_effect_fence.clone(),
+                                                run_id: run_id.to_owned(),
+                                                proposal_id: prepared.proposal_id.clone(),
+                                                tool_name: prepared.tool_name.clone(),
+                                                decision_allowed: prepared.decision.allowed,
+                                                started_at,
+                                            },
+                                        );
+                                        return Err(post_start_error
+                                            .take()
+                                            .expect("backpressure persistence error should remain available"));
+                                    }
+                                }
+                            }
+                            return Err(error);
+                        }
+                        if let Err(error) = send_process_progress_status_with_tape(
                             progress_sender.expect("progress receiver requires sender"),
                             runtime_state,
                             run_id,
-                            progress_tape_seq
-                                .as_deref_mut()
-                                .expect("progress receiver requires tape sequence"),
+                            tape_seq,
                             prepared.proposal_id.as_str(),
                             &progress,
                         )
-                        .await?;
+                        .await
+                        {
+                            if must_drain_execution_after_cancel {
+                                cancellation_requested.store(true, Ordering::Relaxed);
+                                post_start_error = Some(error);
+                                match timeout(
+                                    Duration::from_millis(
+                                        cancellation.context().hard_abort_after_ms.max(1),
+                                    ),
+                                    &mut execution_future,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => break outcome,
+                                    Err(_) => {
+                                        supervise_serial_tool_cleanup(
+                                            execution_future,
+                                            SerialToolCleanupSupervisor {
+                                                runtime_state: Arc::clone(runtime_state),
+                                                fence: active_side_effect_fence.clone(),
+                                                run_id: run_id.to_owned(),
+                                                proposal_id: prepared.proposal_id.clone(),
+                                                tool_name: prepared.tool_name.clone(),
+                                                decision_allowed: prepared.decision.allowed,
+                                                started_at,
+                                            },
+                                        );
+                                        return Err(post_start_error
+                                            .take()
+                                            .expect("progress delivery error should remain available"));
+                                    }
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
                     None => {
                         process_progress_rx = None;
@@ -2307,25 +2828,134 @@ async fn execute_prepared_tool_runtime(
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
                     Ok(true) => {
+                        request_persisted_run_interrupt(runtime_state, run_id, &flow_control)
+                            .await?;
+                        record_run_interrupt_observation(runtime_state, &flow_control);
                         if must_drain_execution_after_cancel {
-                            // Drain tools whose execution must not be dropped
-                            // mid-flight: signal cooperative cancellation and
-                            // await completion before reporting Cancelled.
                             cancellation_requested.store(true, Ordering::Relaxed);
-                            cancel_requested_during_execution = true;
-                            break execution_future.await;
+                            post_start_error = Some(Status::cancelled(
+                                "tool execution completed after cancellation was requested",
+                            ));
+                            match timeout(
+                                Duration::from_millis(
+                                    cancellation.context().hard_abort_after_ms.max(1),
+                                ),
+                                &mut execution_future,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => break outcome,
+                                Err(_) => {
+                                    supervise_serial_tool_cleanup(
+                                        execution_future,
+                                        SerialToolCleanupSupervisor {
+                                            runtime_state: Arc::clone(runtime_state),
+                                            fence: active_side_effect_fence.clone(),
+                                            run_id: run_id.to_owned(),
+                                            proposal_id: prepared.proposal_id.clone(),
+                                            tool_name: prepared.tool_name.clone(),
+                                            decision_allowed: prepared.decision.allowed,
+                                            started_at,
+                                        },
+                                    );
+                                    return Ok(None);
+                                }
+                            }
                         }
-                        // Safe to abandon: dropping the pinned future here
-                        // skips the tool before it mutates external state.
+                        // Read-only and deterministic-idempotent tools may be
+                        // abandoned safely; mutating tools are always drained.
                         return Ok(None);
                     }
                     Ok(false) => {}
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if must_drain_execution_after_cancel {
+                            cancellation_requested.store(true, Ordering::Relaxed);
+                            post_start_error = Some(error);
+                            match timeout(
+                                Duration::from_millis(
+                                    cancellation.context().hard_abort_after_ms.max(1),
+                                ),
+                                &mut execution_future,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => break outcome,
+                                Err(_) => {
+                                    supervise_serial_tool_cleanup(
+                                        execution_future,
+                                        SerialToolCleanupSupervisor {
+                                            runtime_state: Arc::clone(runtime_state),
+                                            fence: active_side_effect_fence.clone(),
+                                            run_id: run_id.to_owned(),
+                                            proposal_id: prepared.proposal_id.clone(),
+                                            tool_name: prepared.tool_name.clone(),
+                                            decision_allowed: prepared.decision.allowed,
+                                            started_at,
+                                        },
+                                    );
+                                    return Err(post_start_error
+                                        .take()
+                                        .expect("cancellation polling error should remain available"));
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
                 }
             }
         }
     };
-    apply_tool_fault(runtime_state, "tool.after_effect_before_ack", prepared.proposal_id.as_str())?;
+    if let (Some(fence), Some(tape_seq)) = (active_side_effect_fence.as_ref(), progress_tape_seq) {
+        if let Err(error) = record_side_effect_reconciliation_receipt(
+            runtime_state,
+            run_id,
+            tape_seq,
+            prepared.proposal_id.as_str(),
+            prepared.tool_name.as_str(),
+            SideEffectReconciliationBinding {
+                operation_id: &fence.operation_id,
+                generation: fence.generation,
+                intent_sha256: fence.intent_sha256.as_str(),
+                strategy: fence.strategy,
+                external_idempotency_key_sha256: fence.external_idempotency_key_sha256.as_deref(),
+            },
+            &outcome,
+        )
+        .await
+        {
+            if let Err(settlement_error) =
+                mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref())
+                    .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    proposal_id = %prepared.proposal_id,
+                    tool_name = %prepared.tool_name,
+                    error = %settlement_error,
+                    "failed to mark tool effect unknown after reconciliation receipt persistence failure"
+                );
+            }
+            return Err(error);
+        }
+    }
+    if let Err(error) = apply_tool_fault(
+        runtime_state,
+        "tool.after_effect_before_ack",
+        prepared.proposal_id.as_str(),
+    ) {
+        if let Err(settlement_error) =
+            mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref()).await
+        {
+            warn!(
+                run_id = %run_id,
+                proposal_id = %prepared.proposal_id,
+                tool_name = %prepared.tool_name,
+                error = %settlement_error,
+                "failed to mark tool effect unknown after acknowledgement fault"
+            );
+        }
+        return Err(error);
+    }
     record_tool_execution_outcome_metrics(
         runtime_state,
         crate::gateway::ToolExecutionTraceContext {
@@ -2338,12 +2968,365 @@ async fn execute_prepared_tool_runtime(
         started_at,
         &outcome,
     );
-    if cancel_requested_during_execution {
-        // The drained outcome is recorded in metrics above but not surfaced:
-        // the run is terminating as cancelled, not completing this tool.
+    Ok(Some(PreparedToolRuntimeOutcome {
+        outcome,
+        side_effect_fence: active_side_effect_fence,
+        post_execution_error: post_start_error,
+    }))
+}
+
+struct SerialToolCleanupSupervisor {
+    runtime_state: Arc<GatewayRuntimeState>,
+    fence: Option<ActiveToolSideEffectFence>,
+    run_id: String,
+    proposal_id: String,
+    tool_name: String,
+    decision_allowed: bool,
+    started_at: Instant,
+}
+
+fn supervise_serial_tool_cleanup<F>(
+    execution_future: Pin<Box<F>>,
+    supervisor: SerialToolCleanupSupervisor,
+) where
+    F: Future<Output = ToolExecutionOutcome> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) =
+            mark_tool_side_effect_unknown(&supervisor.runtime_state, supervisor.fence.as_ref())
+                .await
+        {
+            warn!(
+                run_id = %supervisor.run_id,
+                proposal_id = %supervisor.proposal_id,
+                tool_name = %supervisor.tool_name,
+                error = %error,
+                "serial tool cleanup supervisor failed to persist effect uncertainty"
+            );
+            return;
+        }
+        let outcome = execution_future.await;
+        if let Err(error) = record_tool_side_effect_cleanup_outcome(
+            &supervisor.runtime_state,
+            supervisor.fence.as_ref(),
+            &outcome,
+        )
+        .await
+        {
+            warn!(
+                run_id = %supervisor.run_id,
+                proposal_id = %supervisor.proposal_id,
+                tool_name = %supervisor.tool_name,
+                error = %error,
+                "serial tool cleanup supervisor failed to record the late effect outcome"
+            );
+        }
+        record_tool_execution_outcome_metrics(
+            &supervisor.runtime_state,
+            crate::gateway::ToolExecutionTraceContext {
+                run_id: supervisor.run_id.as_str(),
+                proposal_id: supervisor.proposal_id.as_str(),
+                tool_name: supervisor.tool_name.as_str(),
+                execution_surface: "run_stream_cleanup_supervisor",
+            },
+            supervisor.decision_allowed,
+            supervisor.started_at,
+            &outcome,
+        );
+    });
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_tool_side_effect_fence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+) -> Result<Option<ActiveToolSideEffectFence>, Status> {
+    let resolved_semantics = resolve_tool_execution_semantics(
+        prepared.tool_name.as_str(),
+        prepared.replay_safety_class,
+        prepared.input_json.as_slice(),
+    );
+    let semantics = resolved_semantics.semantics;
+    if matches!(
+        semantics.idempotency_class,
+        RuntimeIdempotencyClass::ReadOnly | RuntimeIdempotencyClass::DeterministicIdempotent
+    ) {
         return Ok(None);
     }
-    Ok(Some(outcome))
+    semantics.validate().map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let Some((session_id, generation)) =
+        runtime_state.runtime_generation_for_tool(run_id.to_owned()).await?
+    else {
+        return Err(Status::failed_precondition(
+            "tool side effect requires an active runtime generation",
+        ));
+    };
+    if session_id != prepared.resolved_session_id {
+        return Err(Status::failed_precondition(
+            "tool side effect session does not own the active runtime generation",
+        ));
+    }
+    let (operation_id, tool_execution_id) =
+        GatewayRuntimeState::tool_side_effect_identities(prepared.proposal_id.as_str())?;
+    let intent_sha256 = crate::sha256_hex(prepared.input_json.as_slice());
+    let strategy = semantics.reconciliation_strategy;
+    let external_idempotency_key_sha256 = resolved_semantics.external_idempotency_key_sha256;
+    let fence = SideEffectFenceV1 {
+        schema_version: 1,
+        operation_id: operation_id.clone(),
+        tool_execution_id,
+        intent_generation: generation,
+        observed_generation: generation,
+        intent_sha256: intent_sha256.clone(),
+        state: SideEffectFenceState::IntentRecorded,
+        semantics,
+        external_idempotency_key_sha256: external_idempotency_key_sha256.clone(),
+        evidence_sha256: None,
+        reason_code: "tool.effect.intent_recorded".to_owned(),
+        updated_at_unix_ms: crate::gateway::current_unix_ms(),
+    };
+    match runtime_state.prepare_tool_side_effect_fence(session_id, run_id.to_owned(), fence).await?
+    {
+        SideEffectRetryDecision::Safe => {
+            Ok(Some(ActiveToolSideEffectFence {
+                operation_id,
+                generation,
+                intent_sha256,
+                strategy,
+                external_idempotency_key_sha256,
+            }))
+        }
+        SideEffectRetryDecision::Completed => {
+            Err(Status::already_exists("tool side effect already completed for this proposal"))
+        }
+        SideEffectRetryDecision::ReconciliationRequired => {
+            match reconcile_unknown_tool_side_effect(
+                runtime_state,
+                run_id,
+                prepared.proposal_id.as_str(),
+                prepared.tool_name.as_str(),
+                SideEffectReconciliationBinding {
+                    operation_id: &operation_id,
+                    generation,
+                    intent_sha256: intent_sha256.as_str(),
+                    strategy,
+                    external_idempotency_key_sha256: external_idempotency_key_sha256.as_deref(),
+                },
+            )
+            .await?
+            {
+                SideEffectReconciliationOutcome::Reconciled => Err(Status::already_exists(
+                    "tool side effect was reconciled from an exact durable receipt",
+                )),
+                SideEffectReconciliationOutcome::Blocked { reason_code } => {
+                    Err(Status::failed_precondition(format!(
+                        "{reason_code}: tool side effect requires exact reconciliation evidence before retry"
+                    )))
+                }
+            }
+        }
+        SideEffectRetryDecision::ConfirmationRequired => {
+            Err(Status::failed_precondition("tool side effect requires confirmation before retry"))
+        }
+        SideEffectRetryDecision::Blocked => Err(Status::failed_precondition(
+            "tool side effect retry is blocked by durable evidence",
+        )),
+    }
+}
+
+fn tool_side_effect_cleanup_outcome_request(
+    fence: &ActiveToolSideEffectFence,
+    outcome: &ToolExecutionOutcome,
+) -> SideEffectFenceCleanupOutcomeRequest {
+    SideEffectFenceCleanupOutcomeRequest {
+        operation_id: fence.operation_id.as_str().to_owned(),
+        observed_generation: fence.generation,
+        outcome_observed: !outcome.attestation.timed_out,
+        reason_code: if outcome.attestation.timed_out {
+            "tool.effect.cleanup_unknown"
+        } else {
+            "tool.effect.cleanup_reconciled"
+        }
+        .to_owned(),
+        evidence_sha256: (!outcome.attestation.timed_out)
+            .then(|| outcome.attestation.execution_sha256.clone()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn record_tool_side_effect_cleanup_outcome(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    fence: Option<&ActiveToolSideEffectFence>,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    runtime_state
+        .record_tool_side_effect_cleanup_outcome(tool_side_effect_cleanup_outcome_request(
+            fence, outcome,
+        ))
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+async fn commit_run_stream_tool_execution_outcome(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    tool_name: &str,
+    fence: Option<&ActiveToolSideEffectFence>,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    let Some(fence) = fence else {
+        return Err(Status::internal(
+            "mutating run-stream tool result requires an active side-effect fence",
+        ));
+    };
+    let safe_output_json = redacted_run_stream_output_json(outcome.output_json.as_slice());
+    let safe_error = redact_run_stream_text(outcome.error.as_str());
+    let result_seq = *tape_seq;
+    let attestation_seq = result_seq.saturating_add(1);
+    let legacy_seq = attestation_seq.saturating_add(1);
+    let tape_events = vec![
+        OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: result_seq,
+            event_type: "tool_result".to_owned(),
+            payload_json: tool_result_tape_payload(
+                proposal_id,
+                outcome.success,
+                safe_output_json.as_slice(),
+                safe_error.as_str(),
+            ),
+        },
+        OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: attestation_seq,
+            event_type: "tool_attestation".to_owned(),
+            payload_json: tool_attestation_tape_payload(ToolAttestationTapePayload {
+                proposal_id,
+                attestation_id: outcome.attestation.attestation_id.as_str(),
+                execution_sha256: outcome.attestation.execution_sha256.as_str(),
+                executed_at_unix_ms: outcome.attestation.executed_at_unix_ms,
+                timed_out: outcome.attestation.timed_out,
+                executor: outcome.attestation.executor.as_str(),
+                sandbox_enforcement: outcome.attestation.sandbox_enforcement.as_str(),
+                execution_manifest: outcome.attestation.execution_manifest.as_deref(),
+            }),
+        },
+        OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: legacy_seq,
+            event_type: "tool.executed".to_owned(),
+            payload_json: json!({
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "success": outcome.success,
+                "error": outcome.error,
+                "attestation": {
+                    "attestation_id": outcome.attestation.attestation_id,
+                    "execution_sha256": outcome.attestation.execution_sha256,
+                    "executed_at_unix_ms": outcome.attestation.executed_at_unix_ms,
+                    "timed_out": outcome.attestation.timed_out,
+                    "executor": outcome.attestation.executor,
+                    "sandbox_enforcement": outcome.attestation.sandbox_enforcement,
+                }
+            })
+            .to_string(),
+        },
+    ];
+    runtime_state
+        .commit_tool_effect_observation(ToolEffectObservationCommitRequest {
+            operation_id: fence.operation_id.clone(),
+            generation: fence.generation,
+            evidence_sha256: outcome.attestation.execution_sha256.clone(),
+            tape_events,
+        })
+        .await?;
+    runtime_state.record_tool_attestation_emitted();
+    *tape_seq = legacy_seq.saturating_add(1);
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_committed_run_stream_tool_outcome(
+    sender: &RunStreamProgressSender,
+    run_id: &str,
+    proposal_id: &str,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    let result_event = tool_result_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        outcome.success,
+        redacted_run_stream_output_json(outcome.output_json.as_slice()),
+        redact_run_stream_text(outcome.error.as_str()),
+    );
+    sender
+        .send(Ok(result_event))
+        .await
+        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+    let attestation_event = tool_attestation_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        outcome.attestation.attestation_id.clone(),
+        outcome.attestation.execution_sha256.clone(),
+        outcome.attestation.executed_at_unix_ms,
+        outcome.attestation.timed_out,
+        outcome.attestation.executor.clone(),
+    );
+    sender
+        .send(Ok(attestation_event))
+        .await
+        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))
+}
+
+#[allow(clippy::result_large_err)]
+async fn settle_tool_side_effect_fence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    fence: Option<&ActiveToolSideEffectFence>,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    if outcome.attestation.timed_out {
+        return mark_tool_side_effect_unknown(runtime_state, Some(fence)).await;
+    }
+    runtime_state
+        .transition_tool_side_effect_fence(
+            fence.operation_id.clone(),
+            SideEffectFenceState::EffectObserved,
+            fence.generation,
+            "tool.effect.observed".to_owned(),
+            Some(outcome.attestation.execution_sha256.clone()),
+        )
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+async fn mark_tool_side_effect_unknown(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    fence: Option<&ActiveToolSideEffectFence>,
+) -> Result<(), Status> {
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    runtime_state
+        .transition_tool_side_effect_fence(
+            fence.operation_id.clone(),
+            SideEffectFenceState::EffectUnknown,
+            fence.generation,
+            "tool.effect.ack_unknown".to_owned(),
+            None,
+        )
+        .await
+        .map(|_| ())
 }
 
 #[allow(clippy::result_large_err)]
@@ -2357,6 +3340,7 @@ async fn finalize_prepared_tool_execution_outcome(
     run_id: &str,
     prepared: &RunStreamPreparedToolExecution,
     execution_outcome: ToolExecutionOutcome,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     dispatch_after_tool_hook_if_enabled(runtime_state, run_id, prepared, &execution_outcome)
@@ -2411,38 +3395,61 @@ async fn finalize_prepared_tool_execution_outcome(
     )
     .await?;
 
-    send_tool_result_with_tape(
-        sender,
-        runtime_state,
-        run_id,
-        tape_seq,
-        prepared.proposal_id.as_str(),
-        execution_outcome.success,
-        execution_outcome.output_json.as_slice(),
-        execution_outcome.error.as_str(),
-    )
-    .await?;
+    let transition_is_atomic =
+        side_effect_fence.is_some() && !execution_outcome.attestation.timed_out;
+    if transition_is_atomic {
+        commit_run_stream_tool_execution_outcome(
+            runtime_state,
+            run_id,
+            tape_seq,
+            prepared.proposal_id.as_str(),
+            prepared.tool_name.as_str(),
+            side_effect_fence,
+            &execution_outcome,
+        )
+        .await?;
+        send_committed_run_stream_tool_outcome(
+            sender,
+            run_id,
+            prepared.proposal_id.as_str(),
+            &execution_outcome,
+        )
+        .await?;
+    } else {
+        send_tool_result_with_tape(
+            sender,
+            runtime_state,
+            run_id,
+            tape_seq,
+            prepared.proposal_id.as_str(),
+            execution_outcome.success,
+            execution_outcome.output_json.as_slice(),
+            execution_outcome.error.as_str(),
+        )
+        .await?;
 
-    send_tool_attestation_with_tape(
-        sender,
+        send_tool_attestation_with_tape(
+            sender,
+            runtime_state,
+            run_id,
+            tape_seq,
+            prepared.proposal_id.as_str(),
+            execution_outcome.attestation.attestation_id.as_str(),
+            execution_outcome.attestation.execution_sha256.as_str(),
+            execution_outcome.attestation.executed_at_unix_ms,
+            execution_outcome.attestation.timed_out,
+            execution_outcome.attestation.executor.as_str(),
+            execution_outcome.attestation.sandbox_enforcement.as_str(),
+            execution_outcome.attestation.execution_manifest.as_deref(),
+        )
+        .await?;
+        runtime_state.record_tool_attestation_emitted();
+        settle_tool_side_effect_fence(runtime_state, side_effect_fence, &execution_outcome).await?;
+    }
+    apply_tool_fault_after_tool_commit(
         runtime_state,
-        run_id,
-        tape_seq,
         prepared.proposal_id.as_str(),
-        execution_outcome.attestation.attestation_id.as_str(),
-        execution_outcome.attestation.execution_sha256.as_str(),
-        execution_outcome.attestation.executed_at_unix_ms,
-        execution_outcome.attestation.timed_out,
-        execution_outcome.attestation.executor.as_str(),
-        execution_outcome.attestation.sandbox_enforcement.as_str(),
-        execution_outcome.attestation.execution_manifest.as_deref(),
-    )
-    .await?;
-    runtime_state.record_tool_attestation_emitted();
-    apply_tool_fault(
-        runtime_state,
-        "tool.after_ack_before_transition",
-        prepared.proposal_id.as_str(),
+        transition_is_atomic,
     )?;
 
     let _ = build_and_ingest_tool_result_memory_summary(
@@ -2468,6 +3475,54 @@ async fn finalize_prepared_tool_execution_outcome(
         input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
+}
+
+fn apply_tool_fault_after_tool_commit(
+    runtime_state: &GatewayRuntimeState,
+    actor: &str,
+    transition_is_atomic: bool,
+) -> Result<(), Status> {
+    let point_id = "tool.after_ack_before_transition";
+    match runtime_state
+        .fault_injection
+        .checkpoint(point_id, actor)
+        .map_err(|error| Status::internal(format!("qa_fault.tool_checkpoint_failed: {error}")))?
+    {
+        QaFaultDirective::Continue => Ok(()),
+        QaFaultDirective::Activate(directive) => match directive.activation.action.clone() {
+            QaFaultAction::TerminateProcess => {
+                let recovery_class = if transition_is_atomic {
+                    QaFaultRecoveryClass::EffectConfirmed
+                } else {
+                    QaFaultRecoveryClass::TransitionPending
+                };
+                runtime_state
+                    .fault_injection
+                    .record_verified_recovery(
+                        &directive,
+                        recovery_class,
+                        if transition_is_atomic {
+                            "qa_fault.tool_atomic_observation_confirmed_before_termination"
+                        } else {
+                            "qa_fault.tool_boundary_classified_before_termination"
+                        },
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("qa_fault.tool_recovery_failed: {error}"))
+                    })?;
+                #[cfg(feature = "qa-fault-injection")]
+                runtime_state.fault_injection.terminate_process();
+                #[cfg(not(feature = "qa-fault-injection"))]
+                Err(Status::internal(
+                    "qa_fault.feature_disabled: terminate directive reached a feature-off build",
+                ))
+            }
+            action => Err(Status::internal(format!(
+                "qa_fault.tool_action_unsupported: {}",
+                action.kind().as_str()
+            ))),
+        },
+    }
 }
 
 fn apply_tool_fault(
@@ -3337,22 +4392,30 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
-        classify_tool_result_replay_safety, drain_parallel_tool_group_after_cancel,
-        drain_parallel_tool_group_after_error, process_progress_status_message,
-        projection_policy_contract, sessions_spawn_tape_payload,
-        workspace_spill_policy_grants_sensitivity, workspace_spill_unavailable_projection,
-        ParallelToolExecutionTaskOutcome, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
-        TOOL_RESULT_REPLAY_SAFETY_EVENT,
+        allow_sensitive_tools_approval_outcome, append_process_progress_backpressure_tape_event,
+        classify_tool_parallelism, classify_tool_result_replay_safety,
+        commit_run_stream_tool_execution_outcome, drain_parallel_tool_group_after_cancel,
+        drain_parallel_tool_group_after_error, process_progress_channel_for_tool,
+        process_progress_status_message, projection_policy_contract, sessions_spawn_tape_payload,
+        tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
+        workspace_spill_unavailable_projection, ParallelToolExecutionTaskOutcome, ToolParallelism,
+        TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
-    use crate::application::tool_registry::ToolResultProjectionPolicy;
+    use crate::application::tool_registry::{
+        tool_execution_semantics, ToolReplaySafetyClass, ToolResultProjectionPolicy,
+    };
+    use crate::gateway::runtime::tests::{start_test_orchestrator_run, test_runtime_state};
+    use crate::gateway::GatewayRuntimeState;
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
     use palyra_common::runtime_contracts::{
-        project_legacy_runtime_error, ArtifactRetentionPolicy, RuntimeErrorClass,
-        RuntimeErrorObservation, RuntimeRetryability, ToolResultArtifactRef,
-        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
+        project_legacy_runtime_error, ArtifactRetentionPolicy, CancellationSettlementOutcome,
+        ReconciliationStrategy, RuntimeErrorClass, RuntimeErrorObservation, RuntimeEventEnvelopeV2,
+        RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration, RuntimeIdempotencyClass,
+        RuntimeOperationId, RuntimeRetryability, SideEffectFenceState, SideEffectFenceV1,
+        SideEffectRestartPolicy, ToolResultArtifactRef, ToolResultProjectionPolicyKind,
+        ToolResultSensitivity, ToolTurnBudget,
     };
     use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
@@ -3365,6 +4428,10 @@ mod tests {
         time::{sleep, Duration},
     };
     use tonic::{Code, Status};
+
+    fn start_backpressure_test_run(state: &GatewayRuntimeState, session_id: &str, run_id: &str) {
+        start_test_orchestrator_run(state, session_id, run_id);
+    }
 
     fn tool_outcome_for_replay_test(
         success: bool,
@@ -3386,6 +4453,139 @@ mod tests {
                 execution_manifest: None,
             },
         }
+    }
+
+    #[test]
+    fn late_serial_cleanup_maps_definitive_and_ambiguous_outcomes() {
+        let fence = super::ActiveToolSideEffectFence {
+            operation_id: RuntimeOperationId::parse("operation_cleanup_supervisor_test")
+                .expect("operation id should validate"),
+            generation: RuntimeGeneration::new(7).expect("generation should validate"),
+            intent_sha256: "a".repeat(64),
+            strategy: ReconciliationStrategy::WorkspaceDigest,
+            external_idempotency_key_sha256: None,
+        };
+        let definitive = tool_side_effect_cleanup_outcome_request(
+            &fence,
+            &tool_outcome_for_replay_test(true, json!({"ok": true}), "", false),
+        );
+        assert!(definitive.outcome_observed);
+        assert_eq!(definitive.reason_code, "tool.effect.cleanup_reconciled");
+        assert_eq!(definitive.evidence_sha256.as_deref(), Some("0".repeat(64).as_str()));
+
+        let ambiguous = tool_side_effect_cleanup_outcome_request(
+            &fence,
+            &tool_outcome_for_replay_test(false, json!({}), "timed out", true),
+        );
+        assert!(!ambiguous.outcome_observed);
+        assert_eq!(ambiguous.reason_code, "tool.effect.cleanup_unknown");
+        assert_eq!(ambiguous.evidence_sha256, None);
+    }
+
+    #[tokio::test]
+    async fn definitive_run_stream_tool_result_commits_fence_and_canonical_tape_atomically() {
+        let state = test_runtime_state();
+        let session_id = "session_run_stream_atomic_tool_effect";
+        let run_id = "run_run_stream_atomic_tool_effect";
+        let proposal_id = "proposal_run_stream_atomic_tool_effect";
+        start_test_orchestrator_run(&state, session_id, run_id);
+        let (_, generation) = state
+            .runtime_generation_for_tool_blocking(run_id)
+            .expect("tool generation query should succeed")
+            .expect("tool generation should be active");
+        let (operation_id, tool_execution_id) =
+            GatewayRuntimeState::tool_side_effect_identities(proposal_id)
+                .expect("tool side-effect identities should validate");
+        let semantics = tool_execution_semantics(
+            "palyra.fs.apply_patch",
+            ToolReplaySafetyClass::ExternalSideEffect,
+        );
+        let fence = SideEffectFenceV1 {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            tool_execution_id,
+            intent_generation: generation,
+            observed_generation: generation,
+            intent_sha256: "a".repeat(64),
+            state: SideEffectFenceState::IntentRecorded,
+            semantics,
+            external_idempotency_key_sha256: None,
+            evidence_sha256: None,
+            reason_code: "tool.effect.intent_recorded".to_owned(),
+            updated_at_unix_ms: crate::gateway::current_unix_ms(),
+        };
+        state
+            .prepare_tool_side_effect_fence(session_id.to_owned(), run_id.to_owned(), fence)
+            .await
+            .expect("tool effect intent should persist");
+        state
+            .transition_tool_side_effect_fence(
+                operation_id.clone(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started".to_owned(),
+                None,
+            )
+            .await
+            .expect("tool effect should start");
+        let active_fence = super::ActiveToolSideEffectFence {
+            operation_id,
+            generation,
+            intent_sha256: "a".repeat(64),
+            strategy: ReconciliationStrategy::WorkspaceDigest,
+            external_idempotency_key_sha256: None,
+        };
+        let outcome = tool_outcome_for_replay_test(true, json!({"ok": true}), "", false);
+        let mut tape_seq = 0;
+
+        commit_run_stream_tool_execution_outcome(
+            &state,
+            run_id,
+            &mut tape_seq,
+            proposal_id,
+            "palyra.fs.apply_patch",
+            Some(&active_fence),
+            &outcome,
+        )
+        .await
+        .expect("definitive result should commit atomically");
+
+        assert_eq!(tape_seq, 3);
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("journal database should reopen");
+        let tape_types = connection
+            .prepare(
+                "SELECT event_type FROM orchestrator_tape WHERE run_ulid = ?1 ORDER BY seq ASC",
+            )
+            .expect("tape query should prepare")
+            .query_map(rusqlite::params![run_id], |row| row.get::<_, String>(0))
+            .expect("tape query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("tape rows should decode");
+        assert_eq!(tape_types, ["tool_result", "tool_attestation", "tool.executed"]);
+        let (state_name, fence_json): (String, String) = connection
+            .query_row(
+                "SELECT state, fence_json FROM runtime_side_effect_fences WHERE operation_ulid = ?1",
+                rusqlite::params![active_fence.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("side-effect fence should load");
+        assert_eq!(state_name, SideEffectFenceState::EffectObserved.as_str());
+        let persisted: SideEffectFenceV1 =
+            serde_json::from_str(fence_json.as_str()).expect("fence JSON should decode");
+        assert_eq!(persisted.state, SideEffectFenceState::EffectObserved);
+        assert_eq!(
+            persisted.evidence_sha256.as_deref(),
+            Some(outcome.attestation.execution_sha256.as_str())
+        );
+        let observed_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND event_name = ?2",
+                rusqlite::params![run_id, RuntimeEventName::ToolEffectObserved.as_str()],
+                |row| row.get(0),
+            )
+            .expect("observed runtime event count should load");
+        assert_eq!(observed_events, 1);
     }
 
     #[test]
@@ -3427,6 +4627,39 @@ mod tests {
             classify_tool_parallelism("palyra.fs.apply_patch", br#"{"patch":"..."}"#),
             ToolParallelism::Never
         );
+    }
+
+    #[test]
+    fn registry_replay_safety_maps_to_restart_semantics() {
+        let read_only = tool_execution_semantics("palyra.echo", ToolReplaySafetyClass::ReadOnly);
+        assert_eq!(read_only.idempotency_class, RuntimeIdempotencyClass::ReadOnly);
+        assert_eq!(read_only.restart_policy, SideEffectRestartPolicy::SafeRetry);
+        assert_eq!(read_only.reconciliation_strategy, ReconciliationStrategy::None);
+        read_only.validate().expect("read-only semantics should validate");
+
+        let workspace = tool_execution_semantics(
+            "palyra.fs.apply_patch",
+            ToolReplaySafetyClass::ExternalSideEffect,
+        );
+        assert_eq!(workspace.idempotency_class, RuntimeIdempotencyClass::ReconciliableMutation);
+        assert_eq!(workspace.restart_policy, SideEffectRestartPolicy::ReconcileBeforeRetry);
+        assert_eq!(workspace.reconciliation_strategy, ReconciliationStrategy::WorkspaceDigest);
+        workspace.validate().expect("workspace semantics should validate");
+
+        let process = tool_execution_semantics(
+            "palyra.process.run",
+            ToolReplaySafetyClass::ExternalSideEffect,
+        );
+        assert_eq!(process.reconciliation_strategy, ReconciliationStrategy::ProcessProvenance);
+        process.validate().expect("process semantics should validate");
+
+        let confirmed = tool_execution_semantics(
+            "palyra.browser.type",
+            ToolReplaySafetyClass::RequiresHumanConfirmation,
+        );
+        assert_eq!(confirmed.idempotency_class, RuntimeIdempotencyClass::NonIdempotent);
+        assert_eq!(confirmed.restart_policy, SideEffectRestartPolicy::RequireConfirmation);
+        confirmed.validate().expect("confirmation semantics should validate");
     }
 
     #[test]
@@ -3572,6 +4805,136 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_progress_channel_is_bounded_and_coalesces_overflow() {
+        let (sink, receiver) = process_progress_channel_for_tool("palyra.process.run", true);
+        let sink = sink.expect("process progress sink should be enabled");
+        let mut receiver = receiver.expect("process progress receiver should be enabled");
+        for elapsed_ms in 0..100 {
+            sink(ProcessProgressEvent {
+                pid: 42,
+                elapsed_ms,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                last_output_at_ms: None,
+            });
+        }
+        let (latest, coalesced) = receiver.recv().await.expect("latest progress snapshot");
+        assert_eq!(latest.elapsed_ms, 99);
+        assert_eq!(coalesced, 99);
+        assert_eq!(receiver.notifications.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_process_progress_coalescing_emits_no_backpressure_event() {
+        let state = test_runtime_state();
+        let session_id = "session_process_progress_no_backpressure";
+        let run_id = "run_process_progress_no_backpressure";
+        start_backpressure_test_run(&state, session_id, run_id);
+        let mut tape_seq = 0;
+
+        append_process_progress_backpressure_tape_event(&state, run_id, &mut tape_seq, 0)
+            .await
+            .expect("zero coalescing should be a no-op");
+
+        assert_eq!(tape_seq, 0);
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("journal database should reopen");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape count should load");
+        let runtime_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime event count should load");
+        assert_eq!(tape_count, 0);
+        assert_eq!(runtime_event_count, 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_process_progress_emits_metadata_only_backpressure_event() {
+        let state = test_runtime_state();
+        let session_id = "session_process_progress_backpressure";
+        let run_id = "run_process_progress_backpressure";
+        start_backpressure_test_run(&state, session_id, run_id);
+        let mut tape_seq = 0;
+
+        append_process_progress_backpressure_tape_event(&state, run_id, &mut tape_seq, 7)
+            .await
+            .expect("coalescing should persist backpressure evidence");
+
+        assert_eq!(tape_seq, 1);
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("journal database should reopen");
+        let (event_type, payload_json): (String, String) = connection
+            .query_row(
+                "SELECT event_type, payload_json FROM orchestrator_tape WHERE run_ulid = ?1 AND seq = 0",
+                rusqlite::params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("backpressure tape row should exist");
+        assert_eq!(event_type, super::PROCESS_PROGRESS_BACKPRESSURE_TAPE_EVENT);
+        let tape_payload: Value =
+            serde_json::from_str(payload_json.as_str()).expect("tape payload should decode");
+        assert_eq!(tape_payload["boundary"], "process_progress");
+        assert_eq!(tape_payload["overflow_action"], "coalesce_progress");
+        assert_eq!(tape_payload["coalesced_count"], 7);
+        assert_eq!(tape_payload["capacity"], 1);
+        assert_eq!(tape_payload["reason_code"], super::PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE);
+        assert!(!payload_json.contains("prompt"));
+        assert!(!payload_json.contains("stdout_tail"));
+        assert!(!payload_json.contains("stderr_tail"));
+
+        let raw_envelope = connection
+            .query_row(
+                "SELECT envelope_json FROM runtime_events_v2 WHERE run_ulid = ?1 AND event_name = ?2",
+                rusqlite::params![run_id, RuntimeEventName::BackpressureApplied.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("canonical backpressure event should exist");
+        let envelope: RuntimeEventEnvelopeV2 =
+            serde_json::from_str(raw_envelope.as_str()).expect("runtime event should decode");
+        envelope.validate().expect("runtime event should validate");
+        assert_eq!(envelope.event_name, RuntimeEventName::BackpressureApplied);
+        assert_eq!(envelope.reason_code, super::PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE);
+        assert!(matches!(
+            envelope.payload,
+            RuntimeEventPayloadRef::Inline { ref metadata }
+                if metadata["boundary"] == "process_progress"
+                    && metadata["coalesced_count"] == 7
+        ));
+        assert!(!raw_envelope.contains("prompt"));
+        assert!(!raw_envelope.contains("stdout_tail"));
+        assert!(!raw_envelope.contains("stderr_tail"));
+    }
+
+    #[tokio::test]
+    async fn process_progress_backpressure_rejects_inactive_generation() {
+        let state = test_runtime_state();
+        let mut tape_seq = 0;
+
+        let error = append_process_progress_backpressure_tape_event(
+            &state,
+            "run_process_progress_inactive",
+            &mut tape_seq,
+            1,
+        )
+        .await
+        .expect_err("inactive generation must fail closed");
+
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(tape_seq, 0);
+    }
+
     #[test]
     fn process_progress_status_message_is_structured_json() {
         let message = process_progress_status_message(
@@ -3609,14 +4972,32 @@ mod tests {
             Ok(ParallelToolExecutionTaskOutcome::Cancelled)
         });
 
-        drain_parallel_tool_group_after_cancel(&mut join_set)
-            .await
-            .expect("drain should wait for sibling tasks");
+        let settlement =
+            drain_parallel_tool_group_after_cancel(join_set, Duration::from_millis(100))
+                .await
+                .expect("drain should wait for sibling tasks");
 
+        assert_eq!(settlement, CancellationSettlementOutcome::Graceful);
         assert!(
             sibling_completed.load(Ordering::SeqCst),
             "parallel cancellation must wait instead of aborting sibling tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_cancel_drain_reports_cleanup_unknown_after_budget() {
+        let mut join_set = JoinSet::new();
+        join_set.spawn(async move {
+            std::future::pending::<()>().await;
+            Ok(ParallelToolExecutionTaskOutcome::Cancelled)
+        });
+
+        let settlement =
+            drain_parallel_tool_group_after_cancel(join_set, Duration::from_millis(10))
+                .await
+                .expect("hung sibling should produce a bounded settlement");
+
+        assert_eq!(settlement, CancellationSettlementOutcome::CleanupUnknown);
     }
 
     #[tokio::test]
@@ -3630,9 +5011,12 @@ mod tests {
             Ok(ParallelToolExecutionTaskOutcome::Cancelled)
         });
 
-        let error =
-            drain_parallel_tool_group_after_error(&mut join_set, Status::internal("primary error"))
-                .await;
+        let error = drain_parallel_tool_group_after_error(
+            join_set,
+            Status::internal("primary error"),
+            Duration::from_millis(100),
+        )
+        .await;
 
         assert_eq!(error.code(), Code::Internal);
         assert_eq!(error.message(), "primary error");

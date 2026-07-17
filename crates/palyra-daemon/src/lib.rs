@@ -4,10 +4,10 @@
 //!
 //! # Entry points
 //!
-//! [`run`] is the only public entry point; the `palyrad` binary
-//! (`src/bin/palyrad.rs`) just awaits it inside a Tokio runtime. `run` loads
-//! config (`app::bootstrap`), wires the subsystems below, enforces the
-//! remote-bind security guard, then serves HTTP and gRPC until Ctrl+C.
+//! [`run`] is the normal daemon entry point. Before constructing Tokio, the `palyrad` binary
+//! invokes a hidden exact-argv dispatcher used by the trusted Unix process supervisor and its gated
+//! target launcher. `run` loads config (`app::bootstrap`), wires the subsystems below, enforces the remote-bind security
+//! guard, then serves HTTP and gRPC until Ctrl+C.
 //!
 //! # Module map
 //!
@@ -108,6 +108,8 @@ mod task_runtime;
 mod tool_posture;
 mod tool_protocol;
 pub mod transport;
+#[cfg(unix)]
+mod unix_process_supervisor;
 mod usage_governance;
 mod wasm_plugin_runner;
 mod webhooks;
@@ -124,6 +126,15 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+
+/// Dispatches the exact hidden Unix process modes before any async runtime initialization.
+///
+/// Normal daemon invocations return immediately. A matching hidden invocation never returns.
+#[doc(hidden)]
+pub fn dispatch_internal_process_supervisor() {
+    #[cfg(unix)]
+    unix_process_supervisor::dispatch_if_requested();
+}
 use app::{
     bootstrap::load_runtime_bootstrap,
     logging::init_tracing,
@@ -153,9 +164,9 @@ use gateway::{
 };
 use journal::{
     ApprovalDecision, ApprovalDecisionScope, ApprovalSubjectType, CronJobUpdatePatch,
-    JournalAppendRequest, JournalConfig, JournalStore, MemoryPurgeRequest,
-    OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, SkillExecutionStatus,
-    SkillStatusRecord, SkillStatusUpsertRequest,
+    JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryPurgeRequest,
+    OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, RuntimeHealthProbeReconciliationMode,
+    SkillExecutionStatus, SkillStatusRecord, SkillStatusUpsertRequest,
 };
 use model_provider::{
     build_model_provider, ModelProviderAuthProviderKind, ModelProviderConfig,
@@ -2223,14 +2234,154 @@ fn build_learning_runtime_config() -> Result<LearningRuntimeConfig> {
     Ok(config)
 }
 
+const PROCESS_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
+const RUNTIME_HEALTH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+const NETWORKED_WORKER_EXPIRY_INTERVAL: Duration = Duration::from_secs(15);
+
+fn spawn_networked_worker_expiry_loop(
+    runtime: Arc<GatewayRuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_networked_worker_expiry_loop_with_interval(runtime, NETWORKED_WORKER_EXPIRY_INTERVAL)
+}
+
+fn spawn_networked_worker_expiry_loop_with_interval(
+    runtime: Arc<GatewayRuntimeState>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let first_tick = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match runtime.reap_expired_networked_workers().await {
+                Ok(events) if !events.is_empty() => {
+                    tracing::warn!(
+                        networked_workers_reaped = events.len(),
+                        "reclaimed expired networked worker leases"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        status_code = ?error.code(),
+                        status_message = %error.message(),
+                        "periodic networked worker expiry reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn spawn_runtime_health_reconciliation_loop(
+    runtime: Arc<GatewayRuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_runtime_health_reconciliation_loop_with_interval(
+        runtime,
+        RUNTIME_HEALTH_RECONCILIATION_INTERVAL,
+    )
+}
+
+fn spawn_runtime_health_reconciliation_loop_with_interval(
+    runtime: Arc<GatewayRuntimeState>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Startup reconciles inherited probes before runtime activation; delay the first
+        // periodic pass so it cannot race the startup inventory transaction.
+        let first_tick = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match runtime.reconcile_runtime_health_probes_async().await {
+                Ok(outcome)
+                    if outcome.examined > 0
+                        || outcome.repaired_stranded_health > 0
+                        || outcome.retired_orphan_leases > 0 =>
+                {
+                    tracing::info!(
+                        health_probes_examined = outcome.examined,
+                        health_probes_settled_inconclusive = outcome.settled_inconclusive,
+                        health_probes_stranded_repaired = outcome.repaired_stranded_health,
+                        health_probe_orphan_leases_retired = outcome.retired_orphan_leases,
+                        health_probe_generation_mismatches = outcome.skipped_generation_mismatches,
+                        health_probe_reconciliation_remaining = outcome.remaining,
+                        "completed periodic runtime health reconciliation"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        status_code = ?error.code(),
+                        status_message = %error.message(),
+                        "periodic runtime health reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn spawn_process_lease_reconciliation_loop(
+    runtime: Arc<GatewayRuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_process_lease_reconciliation_loop_with_interval(
+        runtime,
+        PROCESS_LEASE_RECONCILIATION_INTERVAL,
+    )
+}
+
+fn spawn_process_lease_reconciliation_loop_with_interval(
+    runtime: Arc<GatewayRuntimeState>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Startup performs the first pass synchronously before listeners bind. `interval_at`
+        // prevents an immediate periodic duplicate while retaining delayed missed-tick behavior.
+        let first_tick = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match runtime.reconcile_persisted_process_leases_async().await {
+                Ok(report)
+                    if report.inspected_count > 0 || report.pending_cleanup_inspected_count > 0 =>
+                {
+                    tracing::info!(
+                        process_leases_inspected = report.inspected_count,
+                        process_leases_closed = report.closed_count,
+                        process_leases_orphaned = report.orphaned_count,
+                        process_leases_quarantined = report.quarantined_count,
+                        process_leases_expired = report.expired_count,
+                        pending_process_cleanups_inspected = report.pending_cleanup_inspected_count,
+                        pending_process_cleanups_completed = report.pending_cleanup_completed_count,
+                        pending_process_cleanups_remaining = report.pending_cleanup_count,
+                        "completed periodic process lease reconciliation"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        status_code = ?error.code(),
+                        status_message = %error.message(),
+                        "periodic process lease reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
 /// Runs the daemon until shutdown: the single entry point used by `palyrad`.
 ///
 /// Startup sequence: install tracing, load config and CLI overrides, open the
 /// identity store, journal, vault, and registries, resolve configured secret
 /// references (auditing each access to the journal), enforce the fail-closed
 /// remote-bind guard, bind the admin HTTP, gateway gRPC, and node-RPC
-/// listeners, spawn the scheduler/channel/hook/background/self-healing loops,
-/// then serve until Ctrl+C triggers graceful shutdown.
+/// listeners, spawn the scheduler/channel/hook/background/self-healing/process-reconciliation
+/// and networked-worker expiry loops, then serve until Ctrl+C triggers graceful shutdown.
 ///
 /// With `--journal-migrate-only` it applies journal migrations and returns
 /// before binding any listener.
@@ -2270,7 +2421,60 @@ pub async fn run() -> Result<()> {
         memory_embedding_selection.profile.clone(),
         qa_fault_runtime.clone(),
     )
-    .context("failed to initialize event journal storage")?;
+    .map_err(|error| match &error {
+        JournalError::RuntimeStateCompatibilityBlocked { report } => anyhow::anyhow!(
+            "failed to initialize event journal storage: {}",
+            report.redacted_reason_summary()
+        ),
+        _ => anyhow::anyhow!("failed to initialize event journal storage: {error}"),
+    })?;
+    let startup_compatibility = journal_store.startup_runtime_state_compatibility_report();
+    info!(
+        compatibility_summary = %startup_compatibility.redacted_reason_summary(),
+        "journal startup compatibility preflight completed"
+    );
+    let runtime_state_compatibility = journal_store
+        .runtime_state_compatibility_report()
+        .context("failed to inspect shared runtime state compatibility")?;
+    journal_store
+        .persist_runtime_state_quarantine_findings(&runtime_state_compatibility)
+        .context("failed to persist shared runtime state quarantine evidence")?;
+    if !runtime_state_compatibility.permits_admission() {
+        anyhow::bail!(
+            "shared runtime state blocks admission: {}",
+            runtime_state_compatibility.redacted_reason_summary(),
+        );
+    }
+    if journal_migrate_only {
+        info!(
+            journal_db_path = %loaded.storage.journal_db_path.display(),
+            hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
+            compatibility_admission = runtime_state_compatibility.admission.as_str(),
+            compatibility_findings = runtime_state_compatibility.findings.len(),
+            startup_compatibility_summary = %startup_compatibility.redacted_reason_summary(),
+            "journal migrations applied; exiting due to --journal-migrate-only"
+        );
+        println!(
+            "journal.migration=ok db_path={} hash_chain_enabled={} compatibility_admission={} compatibility_findings={}",
+            loaded.storage.journal_db_path.display(),
+            loaded.storage.journal_hash_chain_enabled,
+            runtime_state_compatibility.admission.as_str(),
+            runtime_state_compatibility.findings.len(),
+        );
+        return Ok(());
+    }
+    loop {
+        let outcome = journal_store
+            .reconcile_runtime_health_probes(
+                RuntimeHealthProbeReconciliationMode::Startup,
+                unix_ms_now()?,
+            )
+            .context("failed to reconcile inherited runtime health probes")?;
+        if !outcome.remaining {
+            break;
+        }
+    }
+
     let vault = Arc::new(
         Vault::open_with_config(VaultConfigOptions {
             root: Some(loaded.storage.vault_dir.clone()),
@@ -2338,6 +2542,15 @@ pub async fn run() -> Result<()> {
     let tool_posture_registry =
         tool_posture::ToolPostureRegistry::open(runtime_state_root.as_path())
             .context("failed to initialize tool posture state")?;
+    let plugin_bindings =
+        plugins::load_plugin_bindings_index(runtime_state_root.join("plugins").as_path())
+            .context("failed to load plugin bindings for managed runtime health")?;
+    let plugin_binding_ids = plugin_bindings
+        .entries
+        .iter()
+        .filter(|binding| binding.enabled)
+        .map(|binding| binding.plugin_id.clone())
+        .collect::<Vec<_>>();
     let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
         Arc::clone(&auth_registry),
         Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
@@ -2392,6 +2605,8 @@ pub async fn run() -> Result<()> {
             delivery_arbitration: loaded.delivery_arbitration.clone(),
             replay_capture: loaded.replay_capture.clone(),
             networked_workers: loaded.networked_workers.clone(),
+            mcp_servers: loaded.mcp_servers.clone(),
+            plugin_binding_ids,
             execution_backend_profiles: loaded.execution_backend_profiles.clone(),
             agent_harness_registry: loaded.agent_harness_registry.clone(),
             channel_router: loaded.channel_router.clone(),
@@ -2545,20 +2760,6 @@ pub async fn run() -> Result<()> {
     runtime.configure_retrieval(loaded.memory.retrieval.clone());
     runtime.configure_learning(build_learning_runtime_config()?);
 
-    if journal_migrate_only {
-        info!(
-            journal_db_path = %loaded.storage.journal_db_path.display(),
-            hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
-            "journal migrations applied; exiting due to --journal-migrate-only"
-        );
-        println!(
-            "journal.migration=ok db_path={} hash_chain_enabled={}",
-            loaded.storage.journal_db_path.display(),
-            loaded.storage.journal_hash_chain_enabled
-        );
-        return Ok(());
-    }
-
     let startup_flow_dependency_audit = runtime
         .audit_flow_dependencies_on_startup()
         .await
@@ -2579,6 +2780,38 @@ pub async fn run() -> Result<()> {
         )
         .await
         .context("failed to terminalize orphaned orchestrator runs during startup")?;
+    let startup_background_task_recovery = runtime
+        .reconcile_orphaned_background_tasks_on_startup(
+            "daemon startup detected an orphaned in-process background task; automatic replay is blocked and explicit operator retry is required",
+        )
+        .await
+        .context("failed to reconcile orphaned background tasks during startup")?;
+    let startup_process_lease_reconciliation = runtime
+        .reconcile_persisted_process_leases_async()
+        .await
+        .context("failed to reconcile persisted process leases during startup")?;
+    let mut startup_cleanup_traces_finalized = 0usize;
+    for run_id in &startup_run_recovery.deferred_metadata_trace_run_ids {
+        if runtime.journal_store.finalize_startup_recovery_metadata_trace(run_id).with_context(
+            || {
+                format!(
+                    "failed to finalize startup-recovery metadata trace for run digest {}",
+                    crate::metadata_trace::hash_metadata_trace_run_id(run_id)
+                        .unwrap_or_else(|| "invalid".to_owned())
+                )
+            },
+        )? {
+            startup_cleanup_traces_finalized = startup_cleanup_traces_finalized.saturating_add(1);
+        }
+    }
+    let startup_cleanup_traces_pending = startup_run_recovery
+        .deferred_metadata_trace_run_ids
+        .len()
+        .saturating_sub(startup_cleanup_traces_finalized);
+    let startup_networked_worker_expiry = runtime
+        .reap_expired_networked_workers()
+        .await
+        .context("failed to reconcile expired networked worker leases during startup")?;
     let recovered_journal_fault_activations = runtime
         .journal_store
         .reconcile_pending_qa_fault_recoveries()
@@ -2822,15 +3055,37 @@ pub async fn run() -> Result<()> {
     let recovered_fault_activations = recovered_journal_fault_activations
         .saturating_add(recovered_connector_fault_activations)
         .saturating_add(recovered_generic_fault_activations);
-    if startup_run_recovery.terminalized_count > 0 || recovered_fault_activations > 0 {
+    if startup_run_recovery.terminalized_count > 0
+        || startup_background_task_recovery.failed_count > 0
+        || startup_process_lease_reconciliation.inspected_count > 0
+        || startup_process_lease_reconciliation.pending_cleanup_inspected_count > 0
+        || !startup_networked_worker_expiry.is_empty()
+        || recovered_fault_activations > 0
+    {
         warn!(
             terminalized_count = startup_run_recovery.terminalized_count,
             terminalized_run_ids = ?startup_run_recovery.terminalized_run_ids,
+            failed_background_task_count = startup_background_task_recovery.failed_count,
+            failed_background_task_ids = ?startup_background_task_recovery.failed_task_ids,
+            process_leases_inspected = startup_process_lease_reconciliation.inspected_count,
+            process_leases_closed = startup_process_lease_reconciliation.closed_count,
+            process_leases_orphaned = startup_process_lease_reconciliation.orphaned_count,
+            process_leases_quarantined = startup_process_lease_reconciliation.quarantined_count,
+            process_leases_expired = startup_process_lease_reconciliation.expired_count,
+            pending_process_cleanups_inspected =
+                startup_process_lease_reconciliation.pending_cleanup_inspected_count,
+            pending_process_cleanups_completed =
+                startup_process_lease_reconciliation.pending_cleanup_completed_count,
+            pending_process_cleanups_remaining =
+                startup_process_lease_reconciliation.pending_cleanup_count,
+            startup_cleanup_traces_finalized,
+            startup_cleanup_traces_pending,
+            networked_workers_reaped = startup_networked_worker_expiry.len(),
             recovered_journal_fault_activations,
             recovered_connector_fault_activations,
             recovered_generic_fault_activations,
             recovered_fault_activations,
-            "completed startup recovery for orphaned runs and pending QA fault activations"
+            "completed startup recovery for orphaned runtime work and pending QA fault activations"
         );
     }
     runtime.configure_routines_runtime(RoutinesRuntimeConfig {
@@ -2895,6 +3150,11 @@ pub async fn run() -> Result<()> {
         grpc_url.clone(),
     );
     let _self_healing_task = self_healing::spawn_self_healing_loop(state.clone());
+    let _runtime_health_reconciliation_task =
+        spawn_runtime_health_reconciliation_loop(runtime.clone());
+    let _process_lease_reconciliation_task =
+        spawn_process_lease_reconciliation_loop(runtime.clone());
+    let _networked_worker_expiry_task = spawn_networked_worker_expiry_loop(runtime.clone());
 
     let admin_server = async move {
         axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())
@@ -4393,7 +4653,7 @@ mod tests {
         net::IpAddr,
         path::PathBuf,
         str::FromStr,
-        sync::Mutex,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -4420,7 +4680,9 @@ mod tests {
         prune_console_relay_tokens, redact_console_diagnostics_value,
         resolve_discord_intents_from_flags, resolve_model_provider_secret,
         resolve_runtime_state_root_with_override, runtime_status_response,
-        sanitize_http_error_message, sha256_hex, summarize_discord_inbound_monitor,
+        sanitize_http_error_message, sha256_hex, spawn_networked_worker_expiry_loop_with_interval,
+        spawn_process_lease_reconciliation_loop_with_interval,
+        spawn_runtime_health_reconciliation_loop_with_interval, summarize_discord_inbound_monitor,
         validate_admin_auth_config, validate_canvas_http_canvas_id,
         validate_canvas_http_token_query, validate_process_runner_backend_policy,
         ConsoleRelayToken, DiscordBotIdentitySummary, DiscordOnboardingRequest,
@@ -4434,7 +4696,7 @@ mod tests {
         DISCORD_APP_FLAG_GATEWAY_MESSAGE_CONTENT, DISCORD_APP_FLAG_GATEWAY_PRESENCE,
         SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
     };
-    use crate::gateway::GatewayAuthConfig;
+    use crate::gateway::{tests::build_test_runtime_state, GatewayAuthConfig};
     use crate::model_provider::{
         ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
         ModelProviderKind, ProviderRegistryEntryConfig,
@@ -4456,6 +4718,422 @@ mod tests {
         let auth_registry = AuthProfileRegistry::open(identity_store_root.as_path())
             .expect("auth profile registry should initialize");
         (tempdir, auth_registry, vault)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn networked_worker_expiry_loop_delays_first_periodic_pass() {
+        let runtime = crate::gateway::tests::build_test_runtime_state_with_networked_worker_ttl(40);
+        runtime
+            .register_networked_worker(crate::gateway::tests::test_worker_attestation_for_lib(
+                "worker-periodic-delay",
+            ))
+            .await
+            .expect("worker registration should succeed");
+        runtime
+            .assign_networked_worker_lease(
+                "worker-periodic-delay",
+                crate::gateway::tests::test_worker_lease_request_for_lib(
+                    "run-worker-periodic-delay",
+                    40,
+                ),
+            )
+            .await
+            .expect("worker lease assignment should succeed");
+        let handle = spawn_networked_worker_expiry_loop_with_interval(
+            Arc::clone(&runtime),
+            Duration::from_millis(200),
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let before_tick = runtime.worker_fleet_snapshot();
+        assert_eq!(before_tick.active_leases, 1);
+        assert_eq!(before_tick.orphaned_workers, 0);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = runtime.worker_fleet_snapshot();
+                if snapshot.orphaned_workers == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first delayed expiry tick should run");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn networked_worker_expiry_loop_continues_after_journal_failure() {
+        let runtime = crate::gateway::tests::build_test_runtime_state_with_networked_worker_ttl(30);
+        runtime
+            .register_networked_worker(crate::gateway::tests::test_worker_attestation_for_lib(
+                "worker-periodic-retry",
+            ))
+            .await
+            .expect("worker registration should succeed");
+        runtime
+            .assign_networked_worker_lease(
+                "worker-periodic-retry",
+                crate::gateway::tests::test_worker_lease_request_for_lib(
+                    "run-worker-periodic-retry",
+                    30,
+                ),
+            )
+            .await
+            .expect("worker lease assignment should succeed");
+        let connection = rusqlite::Connection::open(&runtime.journal_config.db_path)
+            .expect("test journal database should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_periodic_worker_expiry_journal
+                    BEFORE INSERT ON journal_events
+                    WHEN NEW.payload_json LIKE '%worker.ttl_expired%'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced periodic worker expiry journal failure');
+                    END;
+                "#,
+            )
+            .expect("failure trigger should install");
+        drop(connection);
+        let handle = spawn_networked_worker_expiry_loop_with_interval(
+            Arc::clone(&runtime),
+            Duration::from_millis(60),
+        );
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert_eq!(runtime.worker_fleet_snapshot().orphaned_workers, 1);
+        assert!(!handle.is_finished(), "one failed pass must not stop the periodic loop");
+
+        let connection = rusqlite::Connection::open(&runtime.journal_config.db_path)
+            .expect("test journal database should reopen");
+        connection
+            .execute_batch("DROP TRIGGER fail_periodic_worker_expiry_journal;")
+            .expect("failure trigger should drop");
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = runtime
+                    .recent_journal_snapshot(100)
+                    .await
+                    .expect("journal snapshot should load");
+                if snapshot.events.iter().any(|event| {
+                    serde_json::from_str::<serde_json::Value>(event.payload_json.as_str())
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .pointer("/payload/details/reason_code")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("worker.ttl_expired")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a later periodic pass should persist retained expiry evidence");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_health_reconciliation_loop_delays_first_periodic_pass() {
+        let runtime = build_test_runtime_state(false);
+        let mut health = palyra_common::runtime_contracts::RuntimeComponentHealthV1 {
+            schema_version: 1,
+            component_id: palyra_common::runtime_contracts::RuntimeInstanceId::parse(
+                "provider_periodic_health_probe",
+            )
+            .expect("component identity should validate"),
+            generation: palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                .expect("generation should validate"),
+            state: palyra_common::runtime_contracts::RuntimeHealthState::Cooldown,
+            authority_class:
+                palyra_common::runtime_contracts::RuntimeAuthorityClass::ScopedMutation,
+            strike_count: 3,
+            reason_code: "runtime.health.cooldown".to_owned(),
+            first_failure_at_unix_ms: Some(1),
+            last_failure_at_unix_ms: Some(2),
+            expires_at_unix_ms: Some(0),
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            security_quarantine: false,
+            policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                strike_threshold: 3,
+                cooldown_ms: 1_000,
+                max_probe_concurrency: 1,
+                security_quarantine_auto_clear: false,
+            },
+            updated_at_unix_ms: 2,
+        };
+        runtime
+            .journal_store
+            .upsert_runtime_component_health(&health)
+            .expect("health should persist");
+        let lease = palyra_common::runtime_contracts::HealthProbeLeaseV1 {
+            schema_version: 1,
+            lease_id: palyra_common::runtime_contracts::RuntimeLeaseId::parse(
+                "provider_periodic_health_lease",
+            )
+            .expect("lease identity should validate"),
+            component_id: health.component_id.clone(),
+            expected_generation: health.generation,
+            authority_class: health.authority_class,
+            issued_at_unix_ms: 10,
+            expires_at_unix_ms: 20,
+            non_mutating: true,
+        };
+        runtime
+            .journal_store
+            .begin_runtime_health_probe(&crate::journal::RuntimeHealthProbeBeginRequest {
+                lease,
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+        health.state = palyra_common::runtime_contracts::RuntimeHealthState::Probing;
+
+        let handle = spawn_runtime_health_reconciliation_loop_with_interval(
+            Arc::clone(&runtime),
+            Duration::from_millis(200),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            runtime
+                .journal_store
+                .runtime_component_health(health.component_id.as_str())
+                .expect("health should load before first tick")
+                .expect("health should remain present")
+                .state,
+            palyra_common::runtime_contracts::RuntimeHealthState::Probing
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = runtime
+                    .journal_store
+                    .runtime_component_health(health.component_id.as_str())
+                    .expect("health should load after periodic tick")
+                    .expect("health should remain present");
+                if current.state
+                    == palyra_common::runtime_contracts::RuntimeHealthState::Quarantined
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first delayed runtime health reconciliation tick should run");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_lease_reconciliation_loop_delays_first_periodic_pass() {
+        let runtime = build_test_runtime_state(false);
+        let generation = palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+            .expect("generation should validate");
+        let instance_id = palyra_common::runtime_contracts::RuntimeInstanceId::parse(
+            "process-periodic-delay-test",
+        )
+        .expect("instance id should validate");
+        runtime
+            .journal_store
+            .register_process_handle_and_lease(
+                &palyra_common::runtime_contracts::RuntimeHandleDescriptorV1 {
+                    schema_version: 1,
+                    instance_id: instance_id.clone(),
+                    kind: palyra_common::runtime_contracts::RuntimeHandleKind::Process,
+                    session_id: None,
+                    run_id: None,
+                    generation,
+                    owner: "process-periodic-delay-test".to_owned(),
+                    state: palyra_common::runtime_contracts::RuntimeHandleState::Running,
+                    resume_metadata_json: None,
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+                &palyra_common::runtime_contracts::ProcessLeaseV1 {
+                    schema_version: 1,
+                    lease_id: palyra_common::runtime_contracts::RuntimeLeaseId::parse(
+                        "process-periodic-delay-lease",
+                    )
+                    .expect("lease id should validate"),
+                    instance_id,
+                    generation,
+                    pid: 4_500_000_u32.saturating_add(std::process::id()),
+                    provenance: palyra_common::runtime_contracts::ProcessProvenance {
+                        ownership_kind: palyra_common::runtime_contracts::ProcessOwnershipKind::RemoteExecutionInstance,
+                        start_token: "process-periodic-delay-start".to_owned(),
+                        executable_sha256: "a".repeat(64),
+                        owner_nonce: "process-periodic-delay-owner".to_owned(),
+                        ownership_identity_sha256: "b".repeat(64),
+                    },
+                    issued_at_unix_ms: 1,
+                    expires_at_unix_ms: i64::MAX,
+                    verified_at_unix_ms: 1,
+                },
+            )
+            .expect("process lease should persist");
+        let handle = spawn_process_lease_reconciliation_loop_with_interval(
+            Arc::clone(&runtime),
+            Duration::from_millis(200),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let before_tick = runtime
+            .journal_store
+            .shared_runtime_diagnostics()
+            .expect("diagnostics should load before first tick");
+        assert_eq!(before_tick.handles_by_state.get("running"), Some(&1));
+        assert_eq!(before_tick.active_process_leases, 1);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let diagnostics = runtime
+                    .journal_store
+                    .shared_runtime_diagnostics()
+                    .expect("diagnostics should load after first tick");
+                if diagnostics.handles_by_state.get("orphaned") == Some(&1) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first delayed reconciliation tick should run");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_lease_reconciliation_passes_never_overlap() {
+        let runtime = build_test_runtime_state(false);
+        let first = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.reconcile_persisted_process_leases_async().await })
+        };
+        let second = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.reconcile_persisted_process_leases_async().await })
+        };
+
+        first
+            .await
+            .expect("first reconciliation task should join")
+            .expect("first reconciliation should succeed");
+        second
+            .await
+            .expect("second reconciliation task should join")
+            .expect("second reconciliation should succeed");
+        assert_eq!(runtime.process_lease_reconciliation_max_active(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_lease_reconciliation_loop_continues_after_failure() {
+        let runtime = build_test_runtime_state(false);
+        let generation = palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+            .expect("generation should validate");
+        let instance_id = palyra_common::runtime_contracts::RuntimeInstanceId::parse(
+            "process-periodic-failure-test",
+        )
+        .expect("instance id should validate");
+        runtime
+            .journal_store
+            .register_process_handle_and_lease(
+                &palyra_common::runtime_contracts::RuntimeHandleDescriptorV1 {
+                    schema_version: 1,
+                    instance_id: instance_id.clone(),
+                    kind: palyra_common::runtime_contracts::RuntimeHandleKind::Process,
+                    session_id: None,
+                    run_id: None,
+                    generation,
+                    owner: "process-periodic-failure-test".to_owned(),
+                    state: palyra_common::runtime_contracts::RuntimeHandleState::Running,
+                    resume_metadata_json: None,
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+                &palyra_common::runtime_contracts::ProcessLeaseV1 {
+                    schema_version: 1,
+                    lease_id: palyra_common::runtime_contracts::RuntimeLeaseId::parse(
+                        "process-periodic-failure-lease",
+                    )
+                    .expect("lease id should validate"),
+                    instance_id: instance_id.clone(),
+                    generation,
+                    pid: 4_600_000_u32.saturating_add(std::process::id()),
+                    provenance: palyra_common::runtime_contracts::ProcessProvenance {
+                        ownership_kind: palyra_common::runtime_contracts::ProcessOwnershipKind::RemoteExecutionInstance,
+                        start_token: "process-periodic-failure-start".to_owned(),
+                        executable_sha256: "a".repeat(64),
+                        owner_nonce: "process-periodic-failure-owner".to_owned(),
+                        ownership_identity_sha256: "b".repeat(64),
+                    },
+                    issued_at_unix_ms: 1,
+                    expires_at_unix_ms: i64::MAX,
+                    verified_at_unix_ms: 1,
+                },
+            )
+            .expect("process lease should persist");
+        let connection = rusqlite::Connection::open(&runtime.journal_config.db_path)
+            .expect("test journal database should reopen");
+        connection
+            .execute_batch(
+                format!(
+                    r#"
+                        CREATE TRIGGER fail_periodic_process_reconciliation
+                        BEFORE UPDATE ON runtime_handles
+                        WHEN NEW.instance_ulid = '{}'
+                        BEGIN
+                            SELECT RAISE(ABORT, 'forced periodic reconciliation failure');
+                        END;
+                    "#,
+                    instance_id.as_str()
+                )
+                .as_str(),
+            )
+            .expect("failure trigger should install");
+        drop(connection);
+        let handle = spawn_process_lease_reconciliation_loop_with_interval(
+            Arc::clone(&runtime),
+            Duration::from_millis(80),
+        );
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        let failed_pass = runtime
+            .journal_store
+            .shared_runtime_diagnostics()
+            .expect("diagnostics should load after failed pass");
+        assert_eq!(failed_pass.handles_by_state.get("running"), Some(&1));
+        assert!(!handle.is_finished(), "one failed pass must not stop the periodic loop");
+
+        let connection = rusqlite::Connection::open(&runtime.journal_config.db_path)
+            .expect("test journal database should reopen");
+        connection
+            .execute_batch("DROP TRIGGER fail_periodic_process_reconciliation;")
+            .expect("failure trigger should drop");
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let diagnostics = runtime
+                    .journal_store
+                    .shared_runtime_diagnostics()
+                    .expect("diagnostics should load after recovery pass");
+                if diagnostics.handles_by_state.get("orphaned") == Some(&1) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a later periodic pass should recover after the failure is removed");
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[test]

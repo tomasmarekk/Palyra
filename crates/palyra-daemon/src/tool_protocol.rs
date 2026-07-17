@@ -646,12 +646,14 @@ pub async fn execute_tool_call_with_cancellation_and_progress(
         input_json,
         cancellation_requested,
         process_progress_sink,
+        None,
         crate::qa_fault_injection::QaFaultRuntime::default(),
     )
     .await
 }
 
 /// Executes a tool call with an explicitly injected managed-process fault boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_tool_call_with_fault_injection(
     config: &ToolCallConfig,
     proposal_id: &str,
@@ -659,23 +661,26 @@ pub(crate) async fn execute_tool_call_with_fault_injection(
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
     process_progress_sink: Option<ProcessProgressSink>,
+    background_registration_fence: Option<
+        crate::sandbox_runner::BackgroundProcessRegistrationFence,
+    >,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) -> ToolExecutionOutcome {
     if let Some(raw) = reject_oversized_tool_input(config, tool_name, input_json) {
         return build_execution_outcome(proposal_id, tool_name, input_json, raw);
     }
 
-    // palyra.plugin.run is exempt from the outer tokio timeout: the wasm
-    // runtime enforces the same wall-clock budget internally and can stop the
-    // guest, whereas an outer timeout would only abandon the spawn_blocking
-    // worker while the module keeps burning a blocking thread.
-    let raw = if tool_name == "palyra.plugin.run" {
+    // These runners enforce the same wall-clock budget internally and own
+    // deterministic cleanup. An outer timeout would only abandon their
+    // spawn_blocking worker while effects could continue without a caller.
+    let raw = if tool_name == "palyra.plugin.run" || is_process_runner_run_tool(tool_name) {
         run_allowlisted_tool_with_cancellation(
             config,
             tool_name,
             input_json,
             cancellation_requested,
             process_progress_sink,
+            background_registration_fence.clone(),
             fault_injection.clone(),
         )
         .await
@@ -689,6 +694,7 @@ pub(crate) async fn execute_tool_call_with_fault_injection(
                 input_json,
                 cancellation_requested,
                 process_progress_sink,
+                background_registration_fence,
                 fault_injection,
             ),
         )
@@ -861,6 +867,9 @@ async fn run_allowlisted_tool_with_cancellation(
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
     process_progress_sink: Option<ProcessProgressSink>,
+    background_registration_fence: Option<
+        crate::sandbox_runner::BackgroundProcessRegistrationFence,
+    >,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) -> ToolExecutionRawResult {
     match tool_name {
@@ -1049,6 +1058,7 @@ async fn run_allowlisted_tool_with_cancellation(
                 input_json,
                 cancellation_requested,
                 process_progress_sink,
+                background_registration_fence,
                 fault_injection,
             )
             .await
@@ -1481,6 +1491,9 @@ async fn execute_process_runner_tool(
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
     process_progress_sink: Option<ProcessProgressSink>,
+    background_registration_fence: Option<
+        crate::sandbox_runner::BackgroundProcessRegistrationFence,
+    >,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) -> ToolExecutionRawResult {
     let policy = config.process_runner.clone();
@@ -1504,6 +1517,7 @@ async fn execute_process_runner_tool(
             timeout,
             cancellation_requested,
             process_progress_sink,
+            background_registration_fence,
             fault_injection,
         )
     })

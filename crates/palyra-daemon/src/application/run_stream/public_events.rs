@@ -1,10 +1,14 @@
 //! Adapter from internal run-stream protobuf events to the public runtime event taxonomy.
 
 use palyra_common::runtime_contracts::{
-    validate_public_runtime_event, PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope,
-    PublicRuntimeEventName,
+    project_runtime_event_v2_to_public, validate_public_runtime_event,
+    PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope, PublicRuntimeEventName,
+    PublicRuntimeEventProjectionContext, RuntimeApprovalSubjectId, RuntimeEventEnvelopeV2,
+    RuntimeEventId, RuntimeEventPayloadRef, RuntimeGeneration, RuntimeIdentitySetV1,
+    RuntimeOperationId, RuntimeToolExecutionId, RuntimeToolProposalId,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v1 as common_v1};
 
@@ -13,7 +17,10 @@ use crate::{gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v
 pub(crate) struct PublicRunStreamEventContext<'a> {
     pub(crate) event_id: &'a str,
     pub(crate) session_id: &'a str,
+    pub(crate) generation: RuntimeGeneration,
+    pub(crate) sequence: u64,
     pub(crate) occurred_at_unix_ms: i64,
+    pub(crate) causal_parent_event_id: Option<&'a str>,
     pub(crate) request_id: Option<&'a str>,
 }
 
@@ -36,9 +43,33 @@ pub(crate) fn public_runtime_event_from_run_stream_event(
     let (event_name, mut correlation, payload) = public_event_parts(event)?;
     correlation.run_id.get_or_insert(run_id);
     correlation.session_id.get_or_insert_with(|| context.session_id.to_owned());
+    if correlation.trace_id.is_none() {
+        correlation.trace_id = correlation.run_id.clone();
+    }
+    correlation.generation.get_or_insert(context.generation.get());
+    correlation.sequence.get_or_insert(context.sequence);
+    if let Some(causal_parent_event_id) = context.causal_parent_event_id {
+        correlation.causal_parent_event_id.get_or_insert_with(|| causal_parent_event_id.to_owned());
+    }
     if let Some(request_id) = context.request_id {
         correlation.request_id.get_or_insert_with(|| request_id.to_owned());
     }
+    if event_name.runtime_event_name().is_some() {
+        let runtime_event =
+            runtime_event_v2_from_run_stream_parts(event_name, &correlation, &payload, context)?;
+        return project_runtime_event_v2_to_public(
+            &runtime_event,
+            payload,
+            PublicRuntimeEventProjectionContext {
+                parent_run_id: correlation.parent_run_id,
+                request_id: correlation.request_id,
+            },
+        )
+        .ok();
+    }
+
+    // Public-only compatibility events still carry V2 ordering correlation even though the
+    // closed durable registry has not assigned them persistence semantics.
     let descriptor = event_name.descriptor();
     let public_event = PublicRuntimeEventEnvelope {
         schema_version: descriptor.schema_version,
@@ -56,6 +87,65 @@ pub(crate) fn public_runtime_event_from_run_stream_event(
     Some(public_event)
 }
 
+fn runtime_event_v2_from_run_stream_parts(
+    public_name: PublicRuntimeEventName,
+    correlation: &PublicRuntimeEventCorrelation,
+    public_payload: &Value,
+    context: PublicRunStreamEventContext<'_>,
+) -> Option<RuntimeEventEnvelopeV2> {
+    let event_name = public_name.runtime_event_name()?;
+    let descriptor = event_name.descriptor();
+    let run_id = correlation.run_id.as_deref()?;
+    let (mut identities, legacy_adapter) =
+        RuntimeIdentitySetV1::from_legacy_run(context.session_id, run_id, context.generation)
+            .ok()?;
+    if let Some(proposal_id) = correlation.tool_call_id.as_deref() {
+        identities.tool_proposal_id = Some(RuntimeToolProposalId::parse(proposal_id).ok()?);
+    }
+    if let Some(approval_id) = correlation.approval_id.as_deref() {
+        identities.approval_subject_id = Some(RuntimeApprovalSubjectId::parse(approval_id).ok()?);
+    }
+    if event_name == palyra_common::runtime_contracts::RuntimeEventName::ToolResultObserved {
+        let proposal_id = correlation.tool_call_id.as_deref()?;
+        identities.tool_execution_id =
+            Some(RuntimeToolExecutionId::parse(format!("execution:{proposal_id}").as_str()).ok()?);
+        identities.operation_id =
+            Some(RuntimeOperationId::parse(format!("operation:{proposal_id}").as_str()).ok()?);
+    }
+    let payload_bytes = serde_json::to_vec(public_payload).ok()?;
+    let mut envelope = RuntimeEventEnvelopeV2 {
+        schema_version: palyra_common::runtime_contracts::RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+        event_id: RuntimeEventId::parse(context.event_id).ok()?,
+        identities,
+        sequence: context.sequence,
+        causal_parent_event_id: context
+            .causal_parent_event_id
+            .map(RuntimeEventId::parse)
+            .transpose()
+            .ok()?,
+        subsystem: descriptor.subsystem,
+        phase: descriptor.phase,
+        event_name,
+        reason_code: format!("runtime.event.{}", event_name.as_str().replace('.', "_")),
+        actor_kind: descriptor.actor_kind,
+        retryability: descriptor.retryability,
+        redaction_class: descriptor.redaction_class,
+        terminal: descriptor.terminal,
+        payload: RuntimeEventPayloadRef::Omitted {
+            reason_code: "runtime.event.public_payload_projected".to_owned(),
+            digest_sha256: Some(hex::encode(Sha256::digest(payload_bytes.as_slice()))),
+            size_bytes: u64::try_from(payload_bytes.len()).unwrap_or(u64::MAX),
+        },
+        occurred_at_unix_ms: context.occurred_at_unix_ms,
+        extensions: Default::default(),
+    };
+    if let Some(legacy_adapter) = legacy_adapter.reconcile_with_identities(&envelope.identities) {
+        envelope.record_legacy_identity_adapter(legacy_adapter).ok()?;
+    }
+    envelope.validate().ok()?;
+    Some(envelope)
+}
+
 /// Converts a protobuf run-stream event into JSON suitable for console or compat metadata.
 #[must_use]
 pub(crate) fn public_runtime_event_json_from_run_stream_event(
@@ -64,6 +154,36 @@ pub(crate) fn public_runtime_event_json_from_run_stream_event(
 ) -> Option<Value> {
     public_runtime_event_from_run_stream_event(event, context)
         .and_then(|event| serde_json::to_value(event).ok())
+}
+
+/// Projects a replayed wire event through its exact persisted V2 authority.
+///
+/// This path deliberately rejects event-name mismatches instead of rebuilding
+/// generation or ordering correlation from a replay cursor.
+#[must_use]
+pub(crate) fn public_runtime_event_json_from_persisted_run_stream_event(
+    event: &common_v1::RunStreamEvent,
+    runtime_event: &RuntimeEventEnvelopeV2,
+) -> Option<Value> {
+    let (public_name, _, payload) = public_event_parts(event)?;
+    if public_name.runtime_event_name()? != runtime_event.event_name {
+        return None;
+    }
+    project_runtime_event_v2_to_public(
+        runtime_event,
+        payload,
+        PublicRuntimeEventProjectionContext::default(),
+    )
+    .ok()
+    .and_then(|event| serde_json::to_value(event).ok())
+}
+
+/// Returns whether a wire event belongs to the canonical V2/public mapping.
+#[must_use]
+pub(crate) fn run_stream_event_requires_persisted_v2(event: &common_v1::RunStreamEvent) -> bool {
+    public_event_parts(event)
+        .and_then(|(public_name, _, _)| public_name.runtime_event_name())
+        .is_some()
 }
 
 fn public_event_parts(
@@ -290,10 +410,15 @@ mod tests {
     use super::*;
 
     fn context(event_id: &str) -> PublicRunStreamEventContext<'_> {
+        let sequence =
+            event_id.rsplit_once('_').and_then(|(_, value)| value.parse::<u64>().ok()).unwrap_or(1);
         PublicRunStreamEventContext {
             event_id,
             session_id: "session_01",
+            generation: RuntimeGeneration::new(1).expect("generation"),
+            sequence,
             occurred_at_unix_ms: 42,
+            causal_parent_event_id: None,
             request_id: Some("request_01"),
         }
     }
@@ -320,7 +445,74 @@ mod tests {
         assert_eq!(public_event.event, PublicRuntimeEventName::ModelDelta);
         assert_eq!(public_event.correlation.run_id.as_deref(), Some("run_01"));
         assert_eq!(public_event.correlation.session_id.as_deref(), Some("session_01"));
+        assert_eq!(public_event.correlation.generation, Some(1));
+        assert_eq!(public_event.correlation.sequence, Some(1));
         assert_eq!(public_event.payload["delta"], "hello");
+    }
+
+    #[test]
+    fn run_stream_model_token_uses_v2_hash_only_payload_boundary() {
+        let event =
+            run_event(common_v1::run_stream_event::Body::ModelToken(common_v1::ModelToken {
+                token: "sensitive model output".to_owned(),
+                is_final: false,
+            }));
+        let context = context("evt_7");
+        let (public_name, mut correlation, payload) =
+            public_event_parts(&event).expect("model token parts");
+        correlation.run_id = Some("run_01".to_owned());
+        correlation.session_id = Some("session_01".to_owned());
+
+        let runtime_event =
+            runtime_event_v2_from_run_stream_parts(public_name, &correlation, &payload, context)
+                .expect("model token should map through V2");
+
+        assert_eq!(
+            runtime_event.event_name,
+            palyra_common::runtime_contracts::RuntimeEventName::ModelDelta
+        );
+        assert_eq!(runtime_event.identities.generation.get(), 1);
+        assert_eq!(runtime_event.sequence, 7);
+        let serialized =
+            serde_json::to_string(&runtime_event).expect("runtime event should serialize");
+        assert!(!serialized.contains("sensitive model output"));
+        assert!(matches!(
+            runtime_event.payload,
+            RuntimeEventPayloadRef::Omitted { digest_sha256: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn replay_projection_uses_exact_persisted_v2_ordering() {
+        let event =
+            run_event(common_v1::run_stream_event::Body::ModelToken(common_v1::ModelToken {
+                token: "replayed output".to_owned(),
+                is_final: false,
+            }));
+        let (public_name, mut correlation, payload) =
+            public_event_parts(&event).expect("model token parts");
+        correlation.run_id = Some("run_01".to_owned());
+        correlation.session_id = Some("session_01".to_owned());
+        let mut runtime_event = runtime_event_v2_from_run_stream_parts(
+            public_name,
+            &correlation,
+            &payload,
+            context("evt_1"),
+        )
+        .expect("model token should map through V2");
+        runtime_event.event_id = RuntimeEventId::parse("run_stream:run_01:12").expect("event id");
+        runtime_event.sequence = 19;
+        runtime_event.occurred_at_unix_ms = 1234;
+
+        let public_event =
+            public_runtime_event_json_from_persisted_run_stream_event(&event, &runtime_event)
+                .expect("persisted projection");
+
+        assert_eq!(public_event["event_id"], "run_stream:run_01:12");
+        assert_eq!(public_event["occurred_at_unix_ms"], 1234);
+        assert_eq!(public_event["correlation"]["generation"], 1);
+        assert_eq!(public_event["correlation"]["sequence"], 19);
+        assert_eq!(public_event["payload"]["delta"], "replayed output");
     }
 
     #[test]

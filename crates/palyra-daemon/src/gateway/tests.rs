@@ -8,17 +8,13 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(not(windows))]
-use std::io::{BufRead, BufReader};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 #[cfg(feature = "qa-fault-injection")]
@@ -30,11 +26,16 @@ use palyra_common::qa_fault_injection::{
 };
 use palyra_common::{
     runtime_contracts::{
-        AuxiliaryTaskKind, AuxiliaryTaskState, FlowState, FlowStepState, QueueMode,
-        QueuedInputState,
+        AuxiliaryTaskKind, AuxiliaryTaskState, CleanupOutcome, CleanupReportV1,
+        CleanupStepDisposition, CleanupStepKind, CleanupStepRecord, FlowState, FlowStepState,
+        ProcessLeaseV1, ProcessOwnershipKind, ProcessProvenance, PublicRuntimeEventName, QueueMode,
+        QueuedInputState, RuntimeActorKind, RuntimeActorRef, RuntimeGeneration,
+        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1,
+        RuntimeHandleKind, RuntimeHandleState, RuntimeInstanceId, RuntimeLeaseId,
     },
     workspace_patch::WorkspacePatchRedactionPolicy,
 };
+use palyra_model_providers::retry_provider_classification;
 use reqwest::Url;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -42,7 +43,7 @@ use tokio::{
     net::TcpListener as TokioTcpListener,
     sync::{oneshot, Mutex, MutexGuard, Notify},
 };
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 
 use crate::agents::AgentCreateRequest;
 use crate::feature_usage::{
@@ -56,13 +57,20 @@ use crate::journal::{
     FlowDependenciesRepairRequest, FlowStepDependenciesReplacement, FlowTransitionRequest,
     JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
     MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
-    MemorySearchRequest, MemorySource, OrchestratorBackgroundTaskCreateRequest,
-    OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskUpdateRequest,
-    OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
-    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
-    SessionProjectContextStateUpsertRequest, ToolJobTailReadRequest, ToolJobsListFilter,
-    WorkspaceDocumentWriteRequest,
+    MemorySearchRequest, MemorySource, NetworkedWorkerDeliveryReservationOutcome,
+    NetworkedWorkerDeliveryReservationRequest, NetworkedWorkerDispatchClaimCreateRequest,
+    NetworkedWorkerDispatchClaimState, NetworkedWorkerDispatchSettlement,
+    NetworkedWorkerExpiryOutboxRecord, NetworkedWorkerPayloadReleaseOutcome,
+    NetworkedWorkerPayloadReleaseRequest, NetworkedWorkerResultAuthorizationOutcome,
+    OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
+    OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
+    OrchestratorRunStartRequest, OrchestratorRunTerminalSettlementRequest,
+    OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+    OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent,
+    RuntimeGenerationInvalidateRequest, SessionProjectContextStateUpsertRequest,
+    ToolJobTailReadRequest, ToolJobsListFilter, WorkspaceDocumentWriteRequest,
 };
+use crate::model_provider::ProviderError;
 use crate::objectives::{
     ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveKind, ObjectivePriority, ObjectiveRecord,
     ObjectiveState, ObjectiveUpsert, ObjectiveWorkspaceBinding,
@@ -75,10 +83,26 @@ use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
 
 use super::vault::vault_get_requires_approval;
+
+#[test]
+fn provider_attempt_admission_exhaustion_maps_to_resource_exhausted() {
+    let error = ProviderError::RequestFailed {
+        message: "model provider capacity is busy".to_owned(),
+        retryable: true,
+        retry_count: 0,
+        classification: retry_provider_classification("provider_attempt_admission_timed_out"),
+    };
+
+    let status = map_provider_error(error);
+
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("model provider capacity is busy"));
+}
+
 use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access,
-    has_windows_absolute_path_prefix, ingest_memory_best_effort,
+    has_windows_absolute_path_prefix, ingest_memory_best_effort, map_provider_error,
     matching_tool_approval_response_id, process_run_verification_output_summary,
     process_runner_input_should_use_active_root, process_runner_input_should_use_launch_root,
     process_runner_input_with_facade_mapping, process_runner_input_with_path_env,
@@ -87,16 +111,26 @@ use super::{
     tool_approval_response_proposal_id, verification_status_from_tool_outcome,
     workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig, ProviderRequest, RequestContext, SessionQueueAdmissionRequest,
+    MemoryRuntimeConfig, NetworkedWorkerArtifactReceipt, NetworkedWorkerDispatchSettlementIdentity,
+    PendingNetworkedWorkerExpiry, ProviderRequest, RequestContext, SessionQueueAdmissionRequest,
     ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT,
     HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
     TOOL_APPROVAL_RESPONSE_TIMEOUT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
     VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
-use crate::application::run_stream::orchestration::{
-    finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome,
+use crate::application::run_stream::{
+    cancellation::transition_run_stream_to_cancelled,
+    orchestration::{finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome},
+    public_events::{
+        public_runtime_event_from_run_stream_event, run_stream_public_event_id,
+        PublicRunStreamEventContext,
+    },
 };
-use crate::application::tool_runtime::networked_worker::NodeRuntimeNetworkedWorkerDispatcher;
+use crate::application::tool_runtime::networked_worker::{
+    NetworkedWorkerRemoteDispatchError, NetworkedWorkerRemoteDispatchOutcome,
+    NetworkedWorkerRemoteDispatchResult, NetworkedWorkerRemoteDispatcher,
+    NodeRuntimeNetworkedWorkerDispatcher,
+};
 use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
 use crate::application::tool_security::ToolProposalBackendSelection;
 use crate::application::{
@@ -162,17 +196,162 @@ use crate::sandbox_runner::{
     EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
 };
 use crate::transport::grpc::auth::{
-    authorize_headers, authorize_metadata, request_context_from_headers, AuthError,
+    authorize_headers, authorize_metadata, bound_admin_actor_principal,
+    request_context_from_headers, AuthError,
 };
 use crate::transport::grpc::services::gateway::GatewayServiceImpl;
 use palyra_workerd::{
-    WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLeaseRequest,
-    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRunGrant,
-    WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    networked_worker_expiry_event_id, WorkerArtifactTransport, WorkerAttestation,
+    WorkerCleanupReport, WorkerLease, WorkerLeaseRequest, WorkerLifecycleEvent,
+    WorkerLifecycleState, WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope,
+    WorkerRunGrant, WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL,
+    WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
+
+#[derive(Debug, Clone, Copy)]
+enum InvalidRemoteWorkerResult {
+    IdentityMismatch,
+    BindingMismatch,
+    DigestMismatch,
+    InvalidCompletionTimestamp,
+    CleanupGap,
+}
+
+impl InvalidRemoteWorkerResult {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::IdentityMismatch => "identity-mismatch",
+            Self::BindingMismatch => "binding-mismatch",
+            Self::DigestMismatch => "digest-mismatch",
+            Self::InvalidCompletionTimestamp => "invalid-completion-timestamp",
+            Self::CleanupGap => "cleanup-gap",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InvalidRemoteWorkerResultDispatcher {
+    mutation: InvalidRemoteWorkerResult,
+}
+
+#[derive(Debug)]
+struct ValidRemoteWorkerResultDispatcher;
+
+#[async_trait::async_trait]
+impl NetworkedWorkerRemoteDispatcher for ValidRemoteWorkerResultDispatcher {
+    async fn dispatch_remote_tool(
+        &self,
+        _runtime_state: &Arc<GatewayRuntimeState>,
+        request: WorkerRemoteToolRequestEnvelope,
+        _cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError> {
+        let output_json = serde_json::to_string(&json!({
+            "content": "trusted remote content",
+            "path": "src/lib.rs",
+        }))
+        .expect("remote output should serialize");
+        Ok(NetworkedWorkerRemoteDispatchOutcome::Completed(Box::new(
+            NetworkedWorkerRemoteDispatchResult {
+                result: WorkerRemoteToolResultEnvelope {
+                    protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+                    schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+                    request_id: request.request_id.clone(),
+                    proposal_id: request.proposal_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    tool_kind: request.tool_kind,
+                    worker_id: request.lease.worker_id.clone(),
+                    lease_id: request.lease.lease_id.clone(),
+                    success: true,
+                    output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+                    output_json,
+                    error: None,
+                    output_manifest_sha256: super::sha256_hex(b"trusted-output-manifest"),
+                    cleanup_report: WorkerCleanupReport {
+                        removed_workspace_scope: true,
+                        removed_artifacts: true,
+                        removed_logs: true,
+                        failure_reason: None,
+                    },
+                    worker_identity: request.worker_identity.clone(),
+                    completed_at_unix_ms: crate::gateway::current_unix_ms()
+                        .min(request.lease.expires_at_unix_ms.saturating_sub(1)),
+                },
+                delivery_attempt_id: None,
+                observed_at_unix_ms: crate::gateway::current_unix_ms(),
+            },
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl NetworkedWorkerRemoteDispatcher for InvalidRemoteWorkerResultDispatcher {
+    async fn dispatch_remote_tool(
+        &self,
+        _runtime_state: &Arc<GatewayRuntimeState>,
+        request: WorkerRemoteToolRequestEnvelope,
+        _cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError> {
+        let output_json = serde_json::to_string(&json!({
+            "content": "untrusted remote content",
+            "path": "src/lib.rs",
+        }))
+        .expect("remote output should serialize");
+        let mut result = WorkerRemoteToolResultEnvelope {
+            protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+            schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            proposal_id: request.proposal_id.clone(),
+            tool_name: request.tool_name.clone(),
+            tool_kind: request.tool_kind,
+            worker_id: request.lease.worker_id.clone(),
+            lease_id: request.lease.lease_id.clone(),
+            success: true,
+            output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+            output_json,
+            error: None,
+            output_manifest_sha256: super::sha256_hex(b"untrusted-output-manifest"),
+            cleanup_report: WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+            worker_identity: request.worker_identity.clone(),
+            completed_at_unix_ms: request.lease.expires_at_unix_ms.saturating_sub(1),
+        };
+        match self.mutation {
+            InvalidRemoteWorkerResult::IdentityMismatch => {
+                result.worker_id = "worker-hostile".to_owned();
+                result.worker_identity.worker_id = "worker-hostile".to_owned();
+            }
+            InvalidRemoteWorkerResult::BindingMismatch => {
+                result.request_id = "request-hostile".to_owned();
+            }
+            InvalidRemoteWorkerResult::DigestMismatch => {
+                result.output_json_sha256 = super::sha256_hex(b"different-output");
+            }
+            InvalidRemoteWorkerResult::InvalidCompletionTimestamp => {
+                result.completed_at_unix_ms = -1;
+            }
+            InvalidRemoteWorkerResult::CleanupGap => {
+                result.cleanup_report.removed_artifacts = false;
+                result.cleanup_report.failure_reason =
+                    Some("artifact directory not empty".to_owned());
+            }
+        }
+        Ok(NetworkedWorkerRemoteDispatchOutcome::Completed(Box::new(
+            NetworkedWorkerRemoteDispatchResult {
+                result,
+                delivery_attempt_id: None,
+                observed_at_unix_ms: crate::gateway::current_unix_ms(),
+            },
+        )))
+    }
+}
 
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SESSION_COMPACTION_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static RUN_STREAM_DELIVERY_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 const PARITY_REDIRECT_CREDENTIALS_URL: &str =
     include_str!("../../../../fixtures/parity/redirect-credentials-url.txt");
 const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../../fixtures/parity/tricky-dom.html");
@@ -308,6 +487,8 @@ async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspac
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -443,6 +624,8 @@ async fn process_runner_workspace_alias_subpaths_use_launch_root_outside_state_w
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -526,6 +709,8 @@ async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_rep
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -822,6 +1007,10 @@ async fn lock_session_compaction_test_guard() -> MutexGuard<'static, ()> {
     SESSION_COMPACTION_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await
 }
 
+async fn lock_run_stream_delivery_test_guard() -> MutexGuard<'static, ()> {
+    RUN_STREAM_DELIVERY_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await
+}
+
 fn unique_temp_journal_path() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1026,7 +1215,7 @@ fn default_test_tool_call_config() -> crate::tool_protocol::ToolCallConfig {
     }
 }
 
-fn build_test_runtime_state_with_runtime_overrides(
+pub(crate) fn build_test_runtime_state_with_runtime_overrides(
     hash_chain_enabled: bool,
     allow_private_targets: bool,
     feature_rollouts: crate::config::FeatureRolloutsConfig,
@@ -1036,6 +1225,27 @@ fn build_test_runtime_state_with_runtime_overrides(
         allow_private_targets,
         feature_rollouts,
         default_test_tool_call_config(),
+    )
+}
+
+pub(crate) fn build_test_runtime_state_with_networked_worker_ttl(
+    lease_ttl_ms: u64,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-gateway-worker-expiry-state");
+    let networked_workers = crate::config::NetworkedWorkersConfig {
+        lease_ttl_ms,
+        ..crate::config::NetworkedWorkersConfig::default()
+    };
+    build_test_runtime_state_at_with_fault_injection_and_networked_workers(
+        db_path,
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+        crate::qa_fault_injection::QaFaultRuntime::default(),
+        networked_workers,
     )
 }
 
@@ -1097,6 +1307,72 @@ fn build_test_runtime_state_at_with_fault_injection(
     tool_call: crate::tool_protocol::ToolCallConfig,
     fault_injection: crate::qa_fault_injection::QaFaultRuntime,
 ) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_at_with_fault_injection_and_networked_workers(
+        db_path,
+        state_root,
+        hash_chain_enabled,
+        allow_private_targets,
+        feature_rollouts,
+        tool_call,
+        fault_injection,
+        crate::config::NetworkedWorkersConfig::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_runtime_state_at_with_fault_injection_and_networked_workers(
+    db_path: PathBuf,
+    state_root: PathBuf,
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+    tool_call: crate::tool_protocol::ToolCallConfig,
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+    networked_workers: crate::config::NetworkedWorkersConfig,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_at_with_options(
+        db_path,
+        state_root,
+        hash_chain_enabled,
+        allow_private_targets,
+        feature_rollouts,
+        tool_call,
+        fault_injection,
+        networked_workers,
+        10_000,
+    )
+}
+
+fn build_test_runtime_state_at_with_journal_limit(
+    db_path: PathBuf,
+    state_root: PathBuf,
+    max_events: usize,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_at_with_options(
+        db_path,
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+        crate::qa_fault_injection::QaFaultRuntime::default(),
+        crate::config::NetworkedWorkersConfig::default(),
+        max_events,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_runtime_state_at_with_options(
+    db_path: PathBuf,
+    state_root: PathBuf,
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+    tool_call: crate::tool_protocol::ToolCallConfig,
+    fault_injection: crate::qa_fault_injection::QaFaultRuntime,
+    networked_workers: crate::config::NetworkedWorkersConfig,
+    max_events: usize,
+) -> std::sync::Arc<GatewayRuntimeState> {
     let agent_registry =
         crate::agents::AgentRegistry::open_for_test_state_root(state_root.as_path())
             .expect("agent registry should initialize");
@@ -1104,7 +1380,7 @@ fn build_test_runtime_state_at_with_fault_injection(
         db_path: db_path.clone(),
         hash_chain_enabled,
         max_payload_bytes: 256 * 1024,
-        max_events: 10_000,
+        max_events,
     })
     .expect("journal store should initialize");
     let model_provider_request_timeout_ms =
@@ -1133,7 +1409,9 @@ fn build_test_runtime_state_at_with_fault_injection(
             flow_orchestration: crate::config::FlowOrchestrationConfig::default(),
             delivery_arbitration: crate::config::DeliveryArbitrationConfig::default(),
             replay_capture: crate::config::ReplayCaptureConfig::default(),
-            networked_workers: crate::config::NetworkedWorkersConfig::default(),
+            networked_workers,
+            mcp_servers: crate::config::McpServersConfig::default(),
+            plugin_binding_ids: Vec::new(),
             execution_backend_profiles: crate::config::ExecutionBackendProfilesConfig::default(),
             agent_harness_registry: crate::config::AgentHarnessRegistryConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
@@ -1218,8 +1496,563 @@ fn build_test_runtime_state_with_fault_injection(
     )
 }
 
-fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
+pub(crate) fn build_test_runtime_state(
+    hash_chain_enabled: bool,
+) -> std::sync::Arc<GatewayRuntimeState> {
     build_test_runtime_state_with_http_fetch_private_targets(hash_chain_enabled, false)
+}
+
+fn persist_gateway_process_lease(
+    state: &GatewayRuntimeState,
+    suffix: usize,
+    pid: u32,
+    expires_at_unix_ms: i64,
+) {
+    let generation = RuntimeGeneration::new(1).expect("generation should validate");
+    let instance_id = RuntimeInstanceId::parse(format!("process-reconcile:{suffix:04}").as_str())
+        .expect("instance id should validate");
+    let descriptor = RuntimeHandleDescriptorV1 {
+        schema_version: 1,
+        instance_id: instance_id.clone(),
+        kind: RuntimeHandleKind::Process,
+        session_id: None,
+        run_id: None,
+        generation,
+        owner: "gateway-process-reconcile-test".to_owned(),
+        state: RuntimeHandleState::Running,
+        resume_metadata_json: None,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+    };
+    let lease = ProcessLeaseV1 {
+        schema_version: 1,
+        lease_id: RuntimeLeaseId::parse(format!("process-lease:{suffix:04}").as_str())
+            .expect("lease id should validate"),
+        instance_id,
+        generation,
+        pid,
+        provenance: ProcessProvenance {
+            // Remote ownership is deliberately unverifiable by the local PID probe on every host,
+            // keeping these pagination tests independent of platform PID/group behavior.
+            ownership_kind: ProcessOwnershipKind::RemoteExecutionInstance,
+            start_token: format!("test-start-{suffix}"),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: format!("test-nonce-{suffix}"),
+            ownership_identity_sha256: "b".repeat(64),
+        },
+        issued_at_unix_ms: 1,
+        expires_at_unix_ms,
+        verified_at_unix_ms: 1,
+    };
+    state
+        .journal_store
+        .register_process_handle_and_lease(&descriptor, &lease)
+        .expect("process lease should persist");
+}
+
+fn pending_cleanup_test_process(suffix: usize) -> super::runtime::RunOwnedBackgroundProcess {
+    let generation = RuntimeGeneration::new(1).expect("generation should validate");
+    let instance_id = RuntimeInstanceId::parse(format!("pending-cleanup:{suffix:04}").as_str())
+        .expect("instance id should validate");
+    super::runtime::RunOwnedBackgroundProcess {
+        descriptor: RuntimeHandleDescriptorV1 {
+            schema_version: 1,
+            instance_id: instance_id.clone(),
+            kind: RuntimeHandleKind::Process,
+            session_id: None,
+            run_id: None,
+            generation,
+            owner: "pending-cleanup-test".to_owned(),
+            state: RuntimeHandleState::Running,
+            resume_metadata_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        },
+        lease: ProcessLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse(format!("pending-cleanup-lease:{suffix:04}").as_str())
+                .expect("lease id should validate"),
+            instance_id,
+            generation,
+            pid: 3_200_000_u32.saturating_add(u32::try_from(suffix).unwrap_or(u32::MAX)),
+            provenance: ProcessProvenance {
+                ownership_kind: ProcessOwnershipKind::RemoteExecutionInstance,
+                start_token: format!("pending-cleanup-start-{suffix}"),
+                executable_sha256: "a".repeat(64),
+                owner_nonce: format!("pending-cleanup-owner-{suffix}"),
+                ownership_identity_sha256: "b".repeat(64),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: i64::MAX,
+            verified_at_unix_ms: 1,
+        },
+    }
+}
+
+fn completed_pending_cleanup_report(
+    process: &super::runtime::RunOwnedBackgroundProcess,
+    suffix: usize,
+) -> CleanupReportV1 {
+    CleanupReportV1 {
+        schema_version: 1,
+        report_id: format!("pending-cleanup-report:{suffix:04}"),
+        instance_id: process.descriptor.instance_id.clone(),
+        lease_id: Some(process.lease.lease_id.clone()),
+        outcome: CleanupOutcome::Completed,
+        steps: vec![CleanupStepRecord {
+            ordinal: 0,
+            step: CleanupStepKind::VerifyAbsence,
+            disposition: CleanupStepDisposition::Completed,
+            reason_code: "runtime.cleanup.test_absence_verified".to_owned(),
+            evidence_sha256: None,
+            completed_at_unix_ms: 2,
+        }],
+        reason_code: "runtime.cleanup.test_completed".to_owned(),
+        completed_at_unix_ms: 2,
+    }
+}
+
+#[test]
+fn pending_process_cleanup_queue_is_bounded_and_rejects_conflicting_exact_identity() {
+    let state = build_test_runtime_state(false);
+    let first_process = pending_cleanup_test_process(0);
+    let first = super::runtime::PendingProcessCleanup {
+        run_id: "pending-cleanup-run".to_owned(),
+        report: Some(completed_pending_cleanup_report(&first_process, 0)),
+        process: first_process.clone(),
+        final_state: RuntimeHandleState::Closed,
+    };
+    state
+        .enqueue_pending_process_cleanup(first.clone())
+        .expect("first pending cleanup should enqueue");
+    state
+        .enqueue_pending_process_cleanup(first)
+        .expect("exact duplicate pending cleanup should be idempotent");
+
+    let mut conflict = super::runtime::PendingProcessCleanup {
+        run_id: "pending-cleanup-run".to_owned(),
+        report: Some(completed_pending_cleanup_report(&first_process, 0)),
+        process: first_process,
+        final_state: RuntimeHandleState::Closed,
+    };
+    conflict.process.lease.provenance.owner_nonce = "different-exact-owner".to_owned();
+    let error = state
+        .enqueue_pending_process_cleanup(conflict)
+        .expect_err("same exact key with different provenance must fail closed");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    for suffix in 1..super::runtime::PENDING_PROCESS_CLEANUP_MAX_ENTRIES {
+        let process = pending_cleanup_test_process(suffix);
+        state
+            .enqueue_pending_process_cleanup(super::runtime::PendingProcessCleanup {
+                run_id: "pending-cleanup-run".to_owned(),
+                report: Some(completed_pending_cleanup_report(&process, suffix)),
+                process,
+                final_state: RuntimeHandleState::Closed,
+            })
+            .expect("bounded pending cleanup slot should enqueue");
+    }
+    assert_eq!(
+        state.pending_process_cleanup_count(),
+        super::runtime::PENDING_PROCESS_CLEANUP_MAX_ENTRIES
+    );
+    let overflow_process = pending_cleanup_test_process(
+        super::runtime::PENDING_PROCESS_CLEANUP_MAX_ENTRIES.saturating_add(1),
+    );
+    let error = state
+        .enqueue_pending_process_cleanup(super::runtime::PendingProcessCleanup {
+            run_id: "pending-cleanup-run".to_owned(),
+            report: Some(completed_pending_cleanup_report(
+                &overflow_process,
+                super::runtime::PENDING_PROCESS_CLEANUP_MAX_ENTRIES.saturating_add(1),
+            )),
+            process: overflow_process,
+            final_state: RuntimeHandleState::Closed,
+        })
+        .expect_err("pending cleanup overflow must fail closed");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+}
+
+#[test]
+fn pending_process_cleanup_retries_durable_finalization_and_releases_queue_ownership() {
+    let state = build_test_runtime_state(false);
+    let process = pending_cleanup_test_process(10_000);
+    state
+        .journal_store
+        .register_process_handle_and_lease(&process.descriptor, &process.lease)
+        .expect("pending cleanup durable ownership should persist");
+    state
+        .enqueue_pending_process_cleanup(super::runtime::PendingProcessCleanup {
+            run_id: "pending-cleanup-finalize-run".to_owned(),
+            report: Some(completed_pending_cleanup_report(&process, 10_000)),
+            process: process.clone(),
+            final_state: RuntimeHandleState::Closed,
+        })
+        .expect("pending finalization should enqueue");
+
+    let report =
+        state.reconcile_pending_process_cleanups().expect("pending finalization should reconcile");
+
+    assert_eq!(report.inspected_count, 1);
+    assert_eq!(report.completed_count, 1);
+    assert_eq!(report.pending_count, 0);
+    assert_eq!(state.pending_process_cleanup_count(), 0);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.handles_by_state.get("closed"), Some(&1));
+    assert_eq!(diagnostics.active_process_leases, 0);
+    assert_eq!(diagnostics.cleanup_reports_by_outcome.get("completed"), Some(&1));
+}
+
+#[test]
+fn pending_process_cleanup_synthetic_registration_failure_remains_owned_for_retry() {
+    let state = build_test_runtime_state(false);
+    let process = pending_cleanup_test_process(20_000);
+    state
+        .enqueue_pending_process_cleanup(super::runtime::PendingProcessCleanup {
+            run_id: "pending-cleanup-registration-run".to_owned(),
+            report: None,
+            process,
+            final_state: RuntimeHandleState::Closed,
+        })
+        .expect("registration-failure cleanup should enqueue");
+
+    let report = state
+        .reconcile_pending_process_cleanups()
+        .expect("pending cleanup retry pass should remain operational");
+
+    assert_eq!(report.inspected_count, 1);
+    assert_eq!(report.completed_count, 0);
+    assert_eq!(report.pending_count, 1);
+    assert_eq!(state.pending_process_cleanup_count(), 1);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.active_process_leases, 0);
+    assert!(diagnostics.handles_by_state.is_empty());
+}
+
+#[test]
+fn process_reconciliation_preserves_exact_current_runtime_authority() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 3_450_000_u32.saturating_add(std::process::id());
+    let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "periodic-authority");
+
+    for _ in 0..3 {
+        let report = state
+            .reconcile_persisted_process_leases()
+            .expect("current-runtime reconciliation should succeed");
+        assert_eq!(report.inspected_count, 1);
+        assert_eq!(report.closed_count, 0);
+        assert_eq!(report.orphaned_count, 0);
+        assert_eq!(report.quarantined_count, 0);
+    }
+
+    assert_eq!(state.run_background_process(run_id.as_str(), pid), Some(process.clone()));
+    let remaining = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("current-runtime process lease should remain durable");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].descriptor.state, RuntimeHandleState::Running);
+    assert_eq!(remaining[0].descriptor, process.descriptor);
+    assert_eq!(remaining[0].lease, process.lease);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.handles_by_state.get("running"), Some(&1));
+    assert_eq!(diagnostics.active_process_leases, 1);
+    assert!(diagnostics.cleanup_reports_by_outcome.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn process_reconciliation_finalizes_exact_current_runtime_absence() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 3_475_000_u32.saturating_add(std::process::id());
+    let provenance = ProcessProvenance {
+        ownership_kind: ProcessOwnershipKind::WindowsJobObject,
+        start_token: "periodic-absence-start".to_owned(),
+        executable_sha256: "a".repeat(64),
+        owner_nonce: "periodic-absence-nonce".to_owned(),
+        ownership_identity_sha256: "b".repeat(64),
+    };
+    crate::sandbox_runner::register_background_process_for_test(pid, provenance.clone())
+        .expect("synthetic process should register for exact reconciliation");
+    let process = explicit_stop_test_process_with_provenance(
+        &state,
+        run_id.as_str(),
+        pid,
+        "periodic-absence",
+        provenance,
+    );
+    crate::sandbox_runner::mark_background_process_stopped_for_test(pid);
+    assert_eq!(
+        crate::sandbox_runner::background_process_registration_is_active(
+            pid,
+            &process.lease.provenance,
+        )
+        .expect("test process registration should be inspectable"),
+        Some(false)
+    );
+
+    let report = state
+        .reconcile_persisted_process_leases()
+        .expect("current-runtime absence reconciliation should succeed");
+
+    assert_eq!(report.inspected_count, 1);
+    assert_eq!(report.closed_count, 1);
+    assert_eq!(report.orphaned_count, 0);
+    assert_eq!(report.quarantined_count, 0);
+    assert!(state.run_background_process(run_id.as_str(), pid).is_none());
+    assert!(state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("settled process leases should load")
+        .is_empty());
+    assert!(!crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid));
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("process reconciliation journal should reopen");
+    let (handle_state, outcome, reason_code): (String, String, String) = connection
+        .query_row(
+            r#"
+                SELECT h.state, r.outcome, r.reason_code
+                FROM runtime_handles h
+                JOIN runtime_cleanup_reports r ON r.instance_ulid = h.instance_ulid
+                WHERE h.instance_ulid = ?1
+            "#,
+            params![process.descriptor.instance_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("current-runtime absence cleanup evidence should persist");
+    assert_eq!(handle_state, "closed");
+    assert_eq!(outcome, "completed");
+    assert_eq!(reason_code, "runtime.cleanup.current_runtime_absence_verified");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_reconciliation_keeps_unix_group_absence_orphaned_and_owned() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 3_475_000_u32.saturating_add(std::process::id());
+    let provenance = ProcessProvenance {
+        ownership_kind: ProcessOwnershipKind::UnixProcessGroup,
+        start_token: "periodic-unix-absence-start".to_owned(),
+        executable_sha256: "a".repeat(64),
+        owner_nonce: "periodic-unix-absence-nonce".to_owned(),
+        ownership_identity_sha256: "b".repeat(64),
+    };
+    crate::sandbox_runner::register_background_process_for_test(pid, provenance.clone())
+        .expect("synthetic Unix process should register for exact reconciliation");
+    let process = explicit_stop_test_process_with_provenance(
+        &state,
+        run_id.as_str(),
+        pid,
+        "periodic-unix-absence",
+        provenance,
+    );
+    crate::sandbox_runner::mark_background_process_stopped_for_test(pid);
+
+    let report = state
+        .reconcile_persisted_process_leases()
+        .expect("Unix absence reconciliation should fail closed without signalling");
+
+    assert_eq!(report.inspected_count, 1);
+    assert_eq!(report.closed_count, 0);
+    assert_eq!(report.orphaned_count, 1);
+    assert_eq!(state.run_background_process(run_id.as_str(), pid), Some(process.clone()));
+    let remaining = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("unverifiable Unix process lease should remain durable");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].descriptor.state, RuntimeHandleState::Orphaned);
+    assert_eq!(remaining[0].lease, process.lease);
+    assert!(crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid));
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("Unix process reconciliation journal should reopen");
+    let (outcome, reason_code): (String, String) = connection
+        .query_row(
+            r#"
+                SELECT outcome, reason_code
+                FROM runtime_cleanup_reports
+                WHERE instance_ulid = ?1
+            "#,
+            params![process.descriptor.instance_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Unix unknown cleanup evidence should persist");
+    assert_eq!(outcome, CleanupOutcome::Unknown.as_str());
+    assert_eq!(reason_code, "runtime.cleanup.current_runtime_absence_unverifiable");
+}
+
+#[test]
+fn process_lease_reconciliation_checkpoint_survives_runtime_reconstruction() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-process-reconciliation-checkpoint");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root.clone(),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let base_pid = 3_500_000_u32.saturating_add(std::process::id());
+    for suffix in 0..=super::runtime::PROCESS_LEASE_RECONCILIATION_BATCH_SIZE {
+        persist_gateway_process_lease(
+            &state,
+            suffix,
+            base_pid.saturating_add(u32::try_from(suffix).unwrap_or(u32::MAX)),
+            i64::MAX,
+        );
+    }
+
+    let first = state
+        .reconcile_persisted_process_leases()
+        .expect("first bounded reconciliation pass should succeed");
+    assert_eq!(first.inspected_count, super::runtime::PROCESS_LEASE_RECONCILIATION_BATCH_SIZE);
+    assert_eq!(first.orphaned_count, first.inspected_count);
+    drop(state);
+
+    let reconstructed = build_test_runtime_state_at(
+        db_path,
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let second = reconstructed
+        .reconcile_persisted_process_leases()
+        .expect("reconstructed runtime should resume after the durable cursor");
+    assert_eq!(second.inspected_count, 1);
+    assert_eq!(second.orphaned_count, 1);
+    let diagnostics = reconstructed
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(
+        diagnostics.handles_by_state.get(RuntimeHandleState::Orphaned.as_str()),
+        Some(
+            &u64::try_from(super::runtime::PROCESS_LEASE_RECONCILIATION_BATCH_SIZE + 1)
+                .expect("test batch size should fit u64"),
+        )
+    );
+}
+
+#[test]
+fn process_lease_reconciliation_failure_does_not_advance_checkpoint() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-process-reconciliation-failure-cursor");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let base_pid = 3_650_000_u32.saturating_add(std::process::id());
+    for suffix in 0..super::runtime::PROCESS_LEASE_RECONCILIATION_BATCH_SIZE {
+        persist_gateway_process_lease(
+            &state,
+            suffix,
+            base_pid.saturating_add(u32::try_from(suffix).unwrap_or(u32::MAX)),
+            i64::MAX,
+        );
+    }
+    let failed_instance = RuntimeInstanceId::parse("process-reconcile:0128")
+        .expect("failure instance id should validate");
+    let connection = Connection::open(&db_path).expect("reconciliation journal should reopen");
+    connection
+        .execute_batch(
+            format!(
+                r#"
+                    CREATE TRIGGER fail_process_reconciliation_mid_page
+                    BEFORE UPDATE ON runtime_handles
+                    WHEN NEW.instance_ulid = '{}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced process reconciliation failure');
+                    END;
+                "#,
+                failed_instance.as_str()
+            )
+            .as_str(),
+        )
+        .expect("failure trigger should install");
+
+    let error = state
+        .reconcile_persisted_process_leases()
+        .expect_err("mid-page finalization failure should abort the pass");
+    assert!(error.message().contains("forced process reconciliation failure"));
+    assert_eq!(
+        state
+            .journal_store
+            .process_reconciliation_checkpoint("process_leases.v1")
+            .expect("checkpoint should remain readable"),
+        None,
+        "a failed page must not advance its durable keyset checkpoint"
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_process_reconciliation_mid_page;")
+        .expect("failure trigger should be removed");
+    let replay = state
+        .reconcile_persisted_process_leases()
+        .expect("the same page should replay after the failure is removed");
+    assert_eq!(replay.inspected_count, super::runtime::PROCESS_LEASE_RECONCILIATION_BATCH_SIZE);
+    assert!(
+        state
+            .journal_store
+            .process_reconciliation_checkpoint("process_leases.v1")
+            .expect("advanced checkpoint should load")
+            .is_some(),
+        "a fully successful replay should advance the durable checkpoint"
+    );
+}
+
+#[test]
+fn expired_unverifiable_process_lease_remains_orphaned_and_retained() {
+    let state = build_test_runtime_state(false);
+    let pid = 3_750_000_u32.saturating_add(std::process::id());
+    persist_gateway_process_lease(&state, 9_999, pid, 2);
+
+    let report =
+        state.reconcile_persisted_process_leases().expect("expired reconciliation should succeed");
+
+    assert_eq!(report.inspected_count, 1);
+    assert_eq!(report.expired_count, 1);
+    assert_eq!(report.closed_count, 0);
+    assert_eq!(report.orphaned_count, 1);
+    let remaining = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("unverifiable lease should remain durable");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].descriptor.state, RuntimeHandleState::Orphaned);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&1));
+
+    let repeated = state
+        .reconcile_persisted_process_leases()
+        .expect("repeated reconciliation should stay idempotent");
+    assert_eq!(repeated.inspected_count, 1);
+    let repeated_diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should reload");
+    assert_eq!(repeated_diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1241,6 +2074,8 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("active run should start");
@@ -1306,6 +2141,234 @@ fn configure_model_provider_replaces_live_status_snapshot() {
     assert_eq!(snapshot.kind, "openai_compatible");
     assert_eq!(snapshot.model_id.as_deref(), Some("gpt-4o-mini"));
     assert!(snapshot.api_key_configured);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.component_health_by_state.get("healthy"), Some(&2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_provider_supersession_suppresses_stale_output_and_settles_once() {
+    const STALE_OUTPUT: &str = "generation-N-stale-output";
+    const REPLACEMENT_OUTPUT: &str = "generation-N-plus-1-output";
+
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    let envelope_id = Ulid::new().to_string();
+
+    let (stale_started_tx, mut stale_started_rx) = tokio::sync::mpsc::channel(1);
+    let stale_release = Arc::new(Notify::new());
+    let stale_status = state.model_provider_status_snapshot();
+    let stale_generation = state.configure_model_provider(Arc::new(
+        crate::gateway::runtime::tests::BlockingModelProvider {
+            started: stale_started_tx,
+            release: Arc::clone(&stale_release),
+            response_text: STALE_OUTPUT,
+            status: stale_status,
+        },
+    ));
+
+    let (grpc_url, shutdown_tx, server_task) =
+        spawn_test_gateway_grpc_server(Arc::clone(&state)).await;
+    let mut client =
+        super::gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url)
+            .await
+            .expect("gateway client should connect");
+    let request = common_v1::RunStreamRequest {
+        v: 1,
+        session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
+        run_id: Some(common_v1::CanonicalId { ulid: run_id.clone() }),
+        input: Some(common_v1::MessageEnvelope {
+            v: 1,
+            envelope_id: Some(common_v1::CanonicalId { ulid: envelope_id }),
+            content: Some(common_v1::MessageContent {
+                text: "exercise provider generation supersession".to_owned(),
+                attachments: Vec::new(),
+            }),
+            ..Default::default()
+        }),
+        allow_sensitive_tools: false,
+        session_key: String::new(),
+        session_label: String::new(),
+        reset_session: false,
+        require_existing: false,
+        tool_approval_response: None,
+        origin_kind: String::new(),
+        origin_run_id: None,
+        parameter_delta_json: Vec::new(),
+        queued_input_id: None,
+    };
+    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![request]));
+    stream_request
+        .metadata_mut()
+        .insert(HEADER_PRINCIPAL, "user:test".parse().expect("principal metadata should parse"));
+    stream_request.metadata_mut().insert(
+        HEADER_DEVICE_ID,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("device metadata should parse"),
+    );
+    stream_request
+        .metadata_mut()
+        .insert(HEADER_CHANNEL, "test".parse().expect("channel metadata should parse"));
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.expect("RunStream should start").into_inner();
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = response_stream.next().await {
+            events.push(event.expect("RunStream event should decode"));
+        }
+        events
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), stale_started_rx.recv())
+        .await
+        .expect("generation N should start before timeout")
+        .expect("generation N start signal should arrive");
+
+    let (replacement_tx, mut replacement_rx) = tokio::sync::mpsc::channel(2);
+    let replacement_generation = state.configure_model_provider(Arc::new(
+        crate::gateway::runtime::tests::SuccessfulModelProvider {
+            requests: replacement_tx,
+            response_text: REPLACEMENT_OUTPUT,
+            status: crate::gateway::runtime::tests::provider_status_snapshot(false),
+        },
+    ));
+    assert!(replacement_generation > stale_generation);
+    stale_release.notify_one();
+
+    let events = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("RunStream should complete after provider replacement")
+        .expect("RunStream collector should join");
+    let replacement_request = tokio::time::timeout(Duration::from_secs(5), replacement_rx.recv())
+        .await
+        .expect("generation N+1 should receive one request")
+        .expect("generation N+1 request should arrive");
+    assert_eq!(replacement_request.model_override.as_deref(), Some("gpt-4o-mini"));
+    assert!(replacement_rx.try_recv().is_err(), "generation N+1 must be called exactly once");
+
+    let model_tokens = events
+        .iter()
+        .filter_map(|event| match event.body.as_ref() {
+            Some(common_v1::run_stream_event::Body::ModelToken(token)) => Some(token),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let rendered_tokens = model_tokens.iter().map(|token| token.token.as_str()).collect::<String>();
+    assert_eq!(rendered_tokens, REPLACEMENT_OUTPUT);
+    assert!(!rendered_tokens.contains(STALE_OUTPUT));
+    assert_eq!(model_tokens.iter().filter(|token| token.is_final).count(), 1);
+
+    let terminal_done_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.body.as_ref(),
+                Some(common_v1::run_stream_event::Body::Status(status))
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32
+            )
+        })
+        .count();
+    assert_eq!(terminal_done_count, 1, "RunStream must deliver exactly one Done status");
+
+    let public_model_deltas = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let event_id = run_stream_public_event_id(&run_id, index as u64 + 1);
+            public_runtime_event_from_run_stream_event(
+                event,
+                PublicRunStreamEventContext {
+                    event_id: event_id.as_str(),
+                    session_id: session_id.as_str(),
+                    generation: palyra_common::runtime_contracts::RuntimeGeneration::new(1)
+                        .expect("generation"),
+                    sequence: index as u64 + 1,
+                    occurred_at_unix_ms: index as i64 + 1,
+                    causal_parent_event_id: None,
+                    request_id: None,
+                },
+            )
+        })
+        .filter(|event| event.event == PublicRuntimeEventName::ModelDelta)
+        .collect::<Vec<_>>();
+    let public_rendered = public_model_deltas
+        .iter()
+        .filter_map(|event| event.payload.get("delta").and_then(Value::as_str))
+        .collect::<String>();
+    assert_eq!(public_rendered, REPLACEMENT_OUTPUT);
+    assert!(!public_rendered.contains(STALE_OUTPUT));
+    assert_eq!(
+        public_model_deltas
+            .iter()
+            .filter(|event| event.payload.get("is_final").and_then(Value::as_bool) == Some(true))
+            .count(),
+        1
+    );
+
+    let tape =
+        state.journal_store.orchestrator_tape(run_id.as_str()).expect("RunStream tape should load");
+    assert_eq!(
+        tape.iter()
+            .filter(|event| event.event_type == "agent_loop.provider_request_superseded")
+            .count(),
+        1
+    );
+    assert!(
+        tape.iter().all(|event| !event.payload_json.contains(STALE_OUTPUT)),
+        "generation N output must not reach durable tape"
+    );
+    let durable_token_payloads = tape
+        .iter()
+        .filter(|event| event.event_type == "model_token")
+        .filter_map(|event| serde_json::from_str::<Value>(event.payload_json.as_str()).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(durable_token_payloads.len(), 1);
+    assert_eq!(durable_token_payloads[0].get("token").and_then(Value::as_str), Some("<redacted>"));
+    assert_eq!(durable_token_payloads[0].get("is_final").and_then(Value::as_bool), Some(true));
+
+    let diagnostics =
+        state.shared_runtime_diagnostics().await.expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.stale_events_by_subsystem.get("provider"), Some(&1));
+
+    let snapshot = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist");
+    assert_eq!(snapshot.state, RunLifecycleState::Done.as_str());
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    let terminal_status_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'status' AND json_extract(payload_json, '$.kind') = 'done'",
+            params![run_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("terminal Done tape rows should count");
+    let terminal_runtime_event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND terminal = 1",
+            params![run_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("terminal runtime events should count");
+    let active_generation_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_generation_leases WHERE run_ulid = ?1 AND lane = 'run'",
+            params![run_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("active Run generations should count");
+    assert_eq!(terminal_status_count, 1);
+    assert_eq!(terminal_runtime_event_count, 1);
+    assert_eq!(active_generation_count, 0);
+
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("test gRPC server should join");
 }
 
 fn unique_temp_test_root(prefix: &str) -> PathBuf {
@@ -1476,6 +2539,12 @@ impl ScopedEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn set_str(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
 }
 
 impl Drop for ScopedEnvVar {
@@ -1580,69 +2649,39 @@ fn process_run_verification_status_maps_attested_timeout() {
     );
 }
 
-struct CleanupTestProcess {
-    child: Child,
-    tracked_pid: u32,
-}
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_tape_append_rejects_unmapped_event_after_generation_closure() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .journal_store
+        .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+            session_id,
+            run_id: Some(run_id.clone()),
+            lane: RuntimeGenerationLane::Run,
+            transition_kind: RuntimeGenerationTransitionKind::Released,
+            reason_code: "runtime.generation.test_closed".to_owned(),
+        })
+        .expect("run generation should close");
 
-impl CleanupTestProcess {
-    fn spawn() -> Self {
-        let (child, tracked_pid) = spawn_cleanup_test_process();
-        Self { child, tracked_pid }
-    }
+    let error = state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "message.received".to_owned(),
+            payload_json: json!({"text": "must not persist"}).to_string(),
+        })
+        .await
+        .expect_err("unmapped tape event must require active generation");
 
-    fn pid(&self) -> u32 {
-        self.tracked_pid
-    }
-
-    fn wait_for_cleanup(&mut self) {
-        for _ in 0..50 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => panic!("cleanup test process status should be readable: {error}"),
-            }
-        }
-        panic!("run-owned cleanup should terminate the cleanup test process");
-    }
-}
-
-impl Drop for CleanupTestProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-#[cfg(windows)]
-fn spawn_cleanup_test_process() -> (Child, u32) {
-    let mut command = Command::new("ping");
-    command.args(["-n", "60", "127.0.0.1"]);
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let child = command.spawn().expect("cleanup test process should start");
-    let tracked_pid = child.id();
-    (child, tracked_pid)
-}
-
-#[cfg(not(windows))]
-fn spawn_cleanup_test_process() -> (Child, u32) {
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "sleep 60 & child=$!; printf '%s\n' \"$child\"; wait \"$child\""])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command.spawn().expect("cleanup test process should start");
-    let stdout = child.stdout.take().expect("cleanup test process should expose tracked pid");
-    let mut line = String::new();
-    BufReader::new(stdout)
-        .read_line(&mut line)
-        .expect("cleanup test process should report tracked pid");
-    let tracked_pid = line
-        .trim()
-        .parse::<u32>()
-        .expect("cleanup test process should report a numeric tracked pid");
-    (child, tracked_pid)
+    assert_eq!(error.code(), Code::Aborted);
+    assert!(state
+        .journal_store
+        .orchestrator_tape(run_id.as_str())
+        .expect("tape should load")
+        .is_empty());
 }
 
 async fn start_tool_program_test_run(
@@ -1669,9 +2708,27 @@ async fn start_tool_program_test_run(
             origin_run_id: None,
             triggered_by_principal: Some("user:ops".to_owned()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("tool program test run should start");
+}
+
+async fn run_stream_flow_control(
+    state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> crate::application::run_stream::flow_control::RunStreamFlowControl {
+    let (_, generation) = state
+        .runtime_generation_for_run(run_id.to_owned())
+        .await
+        .expect("run generation should load")
+        .expect("run should have an active generation");
+    crate::application::run_stream::flow_control::RunStreamFlowControl::new(
+        generation,
+        Duration::from_secs(60),
+    )
+    .expect("run flow control should initialize")
 }
 
 async fn spawn_test_gateway_grpc_server(
@@ -1733,6 +2790,10 @@ fn default_backend_selection() -> ToolProposalBackendSelection {
     }
 }
 
+pub(crate) fn test_worker_attestation_for_lib(worker_id: &str) -> WorkerAttestation {
+    test_worker_attestation(worker_id)
+}
+
 fn test_worker_attestation(worker_id: &str) -> WorkerAttestation {
     let now_unix_ms = super::current_unix_ms();
     WorkerAttestation {
@@ -1749,6 +2810,12 @@ fn test_worker_attestation(worker_id: &str) -> WorkerAttestation {
         issued_at_unix_ms: now_unix_ms.saturating_sub(1_000),
         expires_at_unix_ms: now_unix_ms.saturating_add(60_000),
     }
+}
+
+pub(crate) fn test_worker_lease_request_for_lib(run_id: &str, ttl_ms: u64) -> WorkerLeaseRequest {
+    let mut request = test_worker_lease_request(run_id);
+    request.ttl_ms = ttl_ms;
+    request
 }
 
 fn test_worker_lease_request(run_id: &str) -> WorkerLeaseRequest {
@@ -1819,6 +2886,8 @@ fn seed_session_compaction_fixture(
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("orchestrator run should start");
     for (seq, text) in [
@@ -2532,6 +3601,31 @@ fn authorize_headers_accepts_case_insensitive_bearer_scheme() {
 }
 
 #[test]
+fn bound_admin_actor_requires_host_bound_authenticated_principal() {
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let bound_auth = GatewayAuthConfig {
+        require_auth: true,
+        admin_token: Some("secret".to_owned()),
+        connector_token: None,
+        bound_principal: Some("user:ops".to_owned()),
+    };
+    assert_eq!(bound_admin_actor_principal(&bound_auth, &context), Some("user:ops"));
+
+    let unbound_auth = GatewayAuthConfig { bound_principal: None, ..bound_auth.clone() };
+    assert_eq!(bound_admin_actor_principal(&unbound_auth, &context), None);
+
+    let disabled_auth = GatewayAuthConfig { require_auth: false, ..bound_auth.clone() };
+    assert_eq!(bound_admin_actor_principal(&disabled_auth, &context), None);
+
+    let mismatched_context = RequestContext { principal: "user:other".to_owned(), ..context };
+    assert_eq!(bound_admin_actor_principal(&bound_auth, &mismatched_context), None);
+}
+
+#[test]
 fn authorize_metadata_route_message_accepts_connector_token() {
     let auth = GatewayAuthConfig {
         require_auth: true,
@@ -2771,6 +3865,8 @@ async fn build_previous_run_context_prompt_includes_recent_turns_when_available(
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("previous run should start");
     state
@@ -2967,6 +4063,8 @@ async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows()
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("legacy run should start");
 
@@ -3022,6 +4120,8 @@ async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows()
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("rollout run should start");
 
@@ -3139,6 +4239,8 @@ async fn context_engine_injects_observe_only_channel_history() {
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("context-engine run should start");
 
@@ -3403,6 +4505,8 @@ async fn memory_auto_inject_searches_current_scope_without_cross_session_or_chan
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("test run should start");
@@ -3527,6 +4631,8 @@ async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prom
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("test run should start");
@@ -3608,6 +4714,8 @@ async fn memory_auto_inject_does_not_use_broad_ui_query_expansion() {
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("test run should start");
@@ -3690,6 +4798,8 @@ async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("test run should start");
@@ -3822,6 +4932,8 @@ async fn memory_auto_inject_adds_active_project_workspace_memory_to_fresh_sessio
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -3952,6 +5064,8 @@ async fn memory_auto_inject_ignores_legacy_workspace_basename_memory_for_unrelat
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -4056,6 +5170,8 @@ async fn memory_auto_inject_skips_quarantined_active_project_workspace_memory() 
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -4135,6 +5251,8 @@ async fn memory_auto_inject_excludes_transient_tape_memory_sources() {
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("test run should start");
@@ -5109,6 +6227,46 @@ async fn networked_worker_lifecycle_events_are_journaled() {
         .expect("worker lease assignment should succeed");
     assert_eq!(lease.run_id, "run-worker-01");
     assert_eq!(assigned.reason_code, "worker.assigned");
+    let queued_remote_request_id = Ulid::new().to_string();
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: queued_remote_request_id.clone(),
+            node_request_id: Ulid::new().to_string(),
+            worker_id: "worker-01".to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: super::sha256_hex(b"worker-lifecycle-queued-dispatch"),
+        })
+        .expect("queued dispatch claim should be created");
+    let inflight_remote_request_id = Ulid::new().to_string();
+    let inflight_node_request_id = Ulid::new().to_string();
+    let inflight_request_sha256 = super::sha256_hex(b"worker-lifecycle-inflight-dispatch");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: inflight_remote_request_id.clone(),
+            node_request_id: inflight_node_request_id.clone(),
+            worker_id: "worker-01".to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: inflight_request_sha256.clone(),
+        })
+        .expect("in-flight dispatch claim should be created");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                inflight_remote_request_id.as_str(),
+                inflight_node_request_id.as_str(),
+                inflight_request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(1),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
 
     let completed = state
         .complete_networked_worker_lease(
@@ -5124,6 +6282,27 @@ async fn networked_worker_lifecycle_events_are_journaled() {
         .await
         .expect("worker cleanup should succeed");
     assert_eq!(completed.reason_code, "worker.completed");
+    let queued_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(queued_remote_request_id.as_str())
+        .expect("queued dispatch claim should load")
+        .expect("queued dispatch claim should remain auditable");
+    assert_eq!(queued_claim.state, NetworkedWorkerDispatchClaimState::Cancelled);
+    assert_eq!(
+        queued_claim.terminal_reason_code.as_deref(),
+        Some("worker.dispatch.revoked_by_lease_finalization")
+    );
+    let inflight_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(inflight_remote_request_id.as_str())
+        .expect("in-flight dispatch claim should load")
+        .expect("in-flight dispatch claim should remain auditable");
+    assert_eq!(inflight_claim.state, NetworkedWorkerDispatchClaimState::Reconciling);
+    assert_eq!(inflight_claim.reconciliation_disposition.as_deref(), Some("lease_revoked"));
+    assert_eq!(
+        inflight_claim.terminal_reason_code.as_deref(),
+        Some("worker.dispatch.revoked_by_lease_finalization")
+    );
 
     let snapshot = state
         .recent_journal_snapshot(100)
@@ -5157,6 +6336,1043 @@ async fn networked_worker_lifecycle_events_are_journaled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_stale_runtime_cannot_overwrite_newer_lease_authority() {
+    let db_path = unique_temp_journal_path();
+    let first = build_test_runtime_state_at(
+        db_path.clone(),
+        unique_temp_test_root("palyra-gateway-worker-cas-first"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let stale = build_test_runtime_state_at(
+        db_path,
+        unique_temp_test_root("palyra-gateway-worker-cas-stale"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+
+    first
+        .register_networked_worker(test_worker_attestation("worker-cas"))
+        .await
+        .expect("newer runtime should register worker");
+    let (lease, _) = first
+        .assign_networked_worker_lease("worker-cas", test_worker_lease_request("run-worker-cas"))
+        .await
+        .expect("newer runtime should assign lease");
+
+    let stale_error = stale
+        .register_networked_worker(test_worker_attestation("worker-stale-overwrite"))
+        .await
+        .expect_err("stale runtime must not replace a newer durable fleet snapshot");
+    assert_eq!(stale_error.code(), Code::Aborted);
+    assert!(stale_error.message().contains("fleet generation conflict"));
+
+    let durable = first
+        .journal_store
+        .load_networked_worker_fleet_snapshot(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    assert_eq!(durable.generation, 2);
+    assert_eq!(durable.records.len(), 1);
+    let worker = durable.records.get("worker-cas").expect("newer worker must remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Assigned);
+    assert_eq!(worker.lease.as_ref().map(|active| active.identity()), Some(lease.identity()));
+    assert!(
+        !durable.records.contains_key("worker-stale-overwrite"),
+        "the stale candidate must roll back completely"
+    );
+    let stale_snapshot = stale.worker_fleet_snapshot();
+    assert_eq!(stale_snapshot.registered_workers, 1);
+    assert_eq!(stale_snapshot.active_leases, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_stale_noop_expiry_preserves_newer_lease() {
+    let db_path = unique_temp_journal_path();
+    let first = build_test_runtime_state_at(
+        db_path.clone(),
+        unique_temp_test_root("palyra-gateway-worker-expiry-cas-first"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let stale = build_test_runtime_state_at(
+        db_path,
+        unique_temp_test_root("palyra-gateway-worker-expiry-cas-stale"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+
+    first
+        .register_networked_worker(test_worker_attestation("worker-expiry-cas"))
+        .await
+        .expect("newer runtime should register worker");
+    let (lease, _) = first
+        .assign_networked_worker_lease(
+            "worker-expiry-cas",
+            test_worker_lease_request("run-worker-expiry-cas"),
+        )
+        .await
+        .expect("newer runtime should assign lease");
+
+    let events = stale
+        .reap_expired_networked_workers_at(super::current_unix_ms().saturating_add(60_000))
+        .await
+        .expect("a stale empty expiry pass should remain a no-op");
+    assert!(events.is_empty());
+
+    let durable = first
+        .journal_store
+        .load_networked_worker_fleet_snapshot(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    assert_eq!(durable.generation, 2);
+    let worker = durable
+        .records
+        .get("worker-expiry-cas")
+        .expect("newer assigned worker must remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Assigned);
+    assert_eq!(worker.lease.as_ref().map(|active| active.identity()), Some(lease.identity()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_registration_journal_failure_leaves_no_worker_record() {
+    let state = build_test_runtime_state(false);
+    let before_events = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned")
+        .events
+        .len();
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_registration_journal
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.registered%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker registration journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let error = state
+        .register_networked_worker(test_worker_attestation("worker-registration-atomic"))
+        .await
+        .expect_err("registration must fail when lifecycle evidence cannot commit");
+    assert!(error.message().contains("commit networked worker lifecycle"));
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.registered_workers, 0);
+    let durable = state
+        .journal_store
+        .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    assert!(durable.is_empty());
+    assert_eq!(
+        state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("recent journal snapshot should be returned")
+            .events
+            .len(),
+        before_events
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_assignment_journal_failure_rolls_back_fleet_authority() {
+    let state = build_test_runtime_state(false);
+    state
+        .register_networked_worker(test_worker_attestation("worker-assignment-atomic"))
+        .await
+        .expect("worker registration should succeed");
+    let before_events = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned")
+        .events
+        .len();
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_assignment_journal
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.assigned%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker assignment journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let error = state
+        .assign_networked_worker_lease(
+            "worker-assignment-atomic",
+            test_worker_lease_request("run-worker-assignment-atomic"),
+        )
+        .await
+        .expect_err("assignment must fail when lifecycle evidence cannot commit");
+    assert!(error.message().contains("commit networked worker lifecycle"));
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.available_workers, 1);
+    let durable = state
+        .journal_store
+        .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    let worker =
+        durable.get("worker-assignment-atomic").expect("registered worker should remain durable");
+    assert!(worker.lease.is_none());
+    assert_eq!(worker.state, WorkerLifecycleState::Registered);
+    assert_eq!(
+        state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("recent journal snapshot should be returned")
+            .events
+            .len(),
+        before_events
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_completion_journal_failure_retains_exact_active_lease() {
+    let state = build_test_runtime_state(false);
+    state
+        .register_networked_worker(test_worker_attestation("worker-completion-atomic"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-completion-atomic",
+            test_worker_lease_request("run-worker-completion-atomic"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"worker-completion-atomic-dispatch");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: "worker-completion-atomic".to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("exact dispatch claim should be created");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(1),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+    let before_generation = state
+        .journal_store
+        .load_networked_worker_fleet_snapshot(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("fleet snapshot should load")
+        .generation;
+    let before_events = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned")
+        .events
+        .len();
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_completion_journal
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.completed%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker completion journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let error = state
+        .complete_networked_worker_lease(
+            "worker-completion-atomic",
+            lease.identity(),
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+        )
+        .await
+        .expect_err("completion must fail when lifecycle evidence cannot commit");
+    assert!(error.message().contains("commit networked worker lifecycle"));
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 1);
+    assert_eq!(fleet.busy_workers, 1);
+    let durable = state
+        .journal_store
+        .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    let worker =
+        durable.get("worker-completion-atomic").expect("assigned worker should remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Assigned);
+    assert_eq!(worker.lease.as_ref().map(|active| active.identity()), Some(lease.identity()));
+    let claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(claim.state, NetworkedWorkerDispatchClaimState::InFlight);
+    assert!(claim.revoked_fleet_generation.is_none());
+    assert_eq!(
+        state
+            .journal_store
+            .load_networked_worker_fleet_snapshot(
+                crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES,
+            )
+            .expect("fleet snapshot should load")
+            .generation,
+        before_generation,
+        "failed lifecycle evidence must roll back fleet and claim authority together"
+    );
+    assert_eq!(
+        state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("recent journal snapshot should be returned")
+            .events
+            .len(),
+        before_events
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_drain_batch_journal_failure_rolls_back_every_worker() {
+    let state = build_test_runtime_state(false);
+    for worker_id in ["worker-drain-atomic-a", "worker-drain-atomic-b"] {
+        state
+            .register_networked_worker(test_worker_attestation(worker_id))
+            .await
+            .expect("worker registration should succeed");
+    }
+    let before_events = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned")
+        .events
+        .len();
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_drain_second_journal
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.drained_by_operator%'
+                  AND NEW.payload_json LIKE '%worker-drain-atomic-b%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced second worker drain journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    state
+        .drain_networked_workers()
+        .await
+        .expect_err("drain must roll back when any lifecycle row fails");
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.failed_closed_workers, 0);
+    assert_eq!(fleet.available_workers, 2);
+    let durable = state
+        .journal_store
+        .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    assert!(durable.values().all(|worker| {
+        worker.lease.is_none() && worker.state == WorkerLifecycleState::Registered
+    }));
+    assert_eq!(
+        state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("recent journal snapshot should be returned")
+            .events
+            .len(),
+        before_events,
+        "the first drain row must roll back with the failing second row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_revokes_lease_and_journals_recovery_guidance() {
+    let state = build_test_runtime_state(false);
+    let now_unix_ms = super::current_unix_ms();
+    state
+        .register_networked_worker(test_worker_attestation("worker-expired"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-expired",
+            test_worker_lease_request("run-worker-expired"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+
+    let events = state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000))
+        .await
+        .expect("expired worker lease should be reclaimed");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].worker_id, "worker-expired");
+    assert_eq!(events[0].run_id.as_deref(), Some(lease.run_id.as_str()));
+    assert_eq!(events[0].state, WorkerLifecycleState::Orphaned);
+    assert_eq!(events[0].reason_code, "worker.ttl_expired");
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.orphaned_workers, 1);
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let expiry_payloads = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event.payload_json.as_str()).ok())
+        .filter(|payload| {
+            payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.ttl_expired")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expiry_payloads.len(), 1);
+    assert_eq!(
+        expiry_payloads[0]
+            .pointer("/payload/details/orphan_classification")
+            .and_then(Value::as_str),
+        Some("recoverable_requires_force_cleanup")
+    );
+    assert_eq!(
+        expiry_payloads[0]
+            .pointer("/payload/details/recommended_actions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(3)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_retries_missing_journal_evidence_idempotently() {
+    let state = build_test_runtime_state(false);
+    let now_unix_ms = super::current_unix_ms();
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-retry"))
+        .await
+        .expect("worker registration should succeed");
+    state
+        .assign_networked_worker_lease(
+            "worker-expiry-retry",
+            test_worker_lease_request("run-worker-expiry-retry"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_expiry_journal_once
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.ttl_expired%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker expiry journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let error = state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000))
+        .await
+        .expect_err("the first expiry pass should expose the journal failure");
+    assert_eq!(error.code(), Code::Internal);
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    assert_eq!(state.worker_fleet_snapshot().orphaned_workers, 1);
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 1);
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch("DROP TRIGGER fail_worker_expiry_journal_once;")
+        .expect("failure trigger should drop");
+    drop(connection);
+    let retry = state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_001))
+        .await
+        .expect("the next expiry pass should persist retained evidence");
+    assert!(retry.is_empty(), "the worker must not be reclaimed twice");
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 0);
+    state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_002))
+        .await
+        .expect("repeated evidence reconciliation should be idempotent");
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let expiry_event_count = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event.payload_json.as_str()).ok())
+        .filter(|payload| {
+            payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.ttl_expired")
+        })
+        .count();
+    assert_eq!(expiry_event_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_continues_past_undrainable_earlier_evidence() {
+    let state = build_test_runtime_state(false);
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-wave-a"))
+        .await
+        .expect("first worker registration should succeed");
+    let (lease_a, _) = state
+        .assign_networked_worker_lease(
+            "worker-expiry-wave-a",
+            test_worker_lease_request_for_lib("run-worker-expiry-wave-a", 10_000),
+        )
+        .await
+        .expect("first worker lease assignment should succeed");
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-wave-b"))
+        .await
+        .expect("second worker registration should succeed");
+    let (lease_b, _) = state
+        .assign_networked_worker_lease(
+            "worker-expiry-wave-b",
+            test_worker_lease_request_for_lib("run-worker-expiry-wave-b", 20_000),
+        )
+        .await
+        .expect("second worker lease assignment should succeed");
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_expiry_wave_a
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.ttl_expired%'
+                  AND NEW.payload_json LIKE '%worker-expiry-wave-a%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced first-wave expiry journal failure');
+                END;
+            "#,
+        )
+        .expect("first-wave failure trigger should install");
+    drop(connection);
+
+    state
+        .reap_expired_networked_workers_at(lease_a.expires_at_unix_ms)
+        .await
+        .expect_err("first expiry evidence should remain undrainable");
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 1);
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 1);
+
+    state
+        .reap_expired_networked_workers_at(lease_b.expires_at_unix_ms)
+        .await
+        .expect_err("the retained first-wave error should still be reported");
+
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.orphaned_workers, 2);
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 1);
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    let second_wave_outbox_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_networked_worker_expiry_outbox WHERE worker_id = ?1 AND lease_ulid = ?2",
+            params!["worker-expiry-wave-b", lease_b.lease_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("second-wave durable expiry evidence should be queryable");
+    assert_eq!(second_wave_outbox_count, 0);
+    drop(connection);
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let second_wave_count = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event.payload_json.as_str()).ok())
+        .filter(|payload| {
+            payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.ttl_expired")
+                && payload.pointer("/payload/output/id").and_then(Value::as_str)
+                    == Some("worker-expiry-wave-b")
+        })
+        .count();
+    assert_eq!(second_wave_count, 1);
+}
+
+#[test]
+fn networked_worker_expiry_event_ids_are_bound_to_exact_leases() {
+    let first = WorkerLifecycleEvent {
+        worker_id: "worker-expiry-id".to_owned(),
+        state: WorkerLifecycleState::Orphaned,
+        run_id: Some("run-expiry-id".to_owned()),
+        lease_id: Some("lease-expiry-id-a".to_owned()),
+        reason_code: "worker.ttl_expired".to_owned(),
+        timestamp_unix_ms: 42_000,
+    };
+    let second =
+        WorkerLifecycleEvent { lease_id: Some("lease-expiry-id-b".to_owned()), ..first.clone() };
+
+    assert_ne!(
+        networked_worker_expiry_event_id(&first).expect("first expiry event should validate"),
+        networked_worker_expiry_event_id(&second).expect("second expiry event should validate"),
+    );
+}
+
+#[test]
+fn pending_networked_worker_expiry_rejects_mismatched_durable_identity() {
+    let event = WorkerLifecycleEvent {
+        worker_id: "worker-expiry-record".to_owned(),
+        state: WorkerLifecycleState::Orphaned,
+        run_id: Some("run-expiry-record".to_owned()),
+        lease_id: Some("lease-expiry-record".to_owned()),
+        reason_code: "worker.ttl_expired".to_owned(),
+        timestamp_unix_ms: 42_001,
+    };
+    let record = NetworkedWorkerExpiryOutboxRecord {
+        event_id: "worker-expiry:mismatched".to_owned(),
+        event,
+    };
+
+    let error = PendingNetworkedWorkerExpiry::from_record(record)
+        .expect_err("mismatched durable identity must fail closed");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_active_lease_survives_runtime_reconstruction_before_expiry() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-gateway-worker-lease-restart");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root.clone(),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    state
+        .register_networked_worker(test_worker_attestation("worker-lease-restart"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-lease-restart",
+            test_worker_lease_request_for_lib("run-worker-lease-restart", 30_000),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 1);
+    drop(state);
+
+    let reconstructed = build_test_runtime_state_at(
+        db_path,
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+
+    assert_eq!(reconstructed.worker_fleet_snapshot().active_leases, 1);
+    let events = reconstructed
+        .reap_expired_networked_workers_at(lease.expires_at_unix_ms)
+        .await
+        .expect("reconstructed lease should remain eligible for exact expiry");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].worker_id, "worker-lease-restart");
+    assert_eq!(events[0].run_id.as_deref(), Some(lease.run_id.as_str()));
+    assert_eq!(events[0].lease_id.as_deref(), Some(lease.lease_id.as_str()));
+    assert_eq!(reconstructed.worker_fleet_snapshot().active_leases, 0);
+    assert_eq!(reconstructed.worker_fleet_snapshot().orphaned_workers, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_duplicate_replay_retires_outbox_when_journal_is_full() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-gateway-worker-expiry-full-journal");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root.clone(),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-full-journal"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-expiry-full-journal",
+            test_worker_lease_request_for_lib("run-worker-expiry-full-journal", 30_000),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_expiry_outbox_retirement
+                BEFORE DELETE ON runtime_networked_worker_expiry_outbox
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker expiry outbox retirement failure');
+                END;
+            "#,
+        )
+        .expect("outbox retirement failure trigger should install");
+    drop(connection);
+
+    state
+        .reap_expired_networked_workers_at(lease.expires_at_unix_ms)
+        .await
+        .expect_err("the first expiry pass should leave already-journaled outbox evidence");
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 1);
+    drop(state);
+
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    connection
+        .execute_batch("DROP TRIGGER fail_worker_expiry_outbox_retirement;")
+        .expect("outbox retirement failure trigger should drop");
+    let event_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .expect("journal event count should load");
+    connection
+        .execute(
+            "INSERT INTO journal_events (event_ulid, session_ulid, run_ulid, kind, actor, timestamp_unix_ms, payload_json, redacted, principal, device_id, created_at_unix_ms) VALUES (?1, ?2, ?3, 0, 0, 1, '{}', 0, 'test', ?4, 1)",
+            params!["fill-worker-expiry-journal", "fill-worker-expiry-session", "fill-worker-expiry-run", "fill-worker-expiry-device"],
+        )
+        .expect("capacity filler should append directly");
+    drop(connection);
+
+    let runtime = build_test_runtime_state_at_with_journal_limit(
+        db_path.clone(),
+        state_root,
+        usize::try_from(event_count.saturating_add(1)).expect("event count should fit"),
+    );
+
+    runtime
+        .reap_expired_networked_workers_at(lease.expires_at_unix_ms.saturating_add(1))
+        .await
+        .expect("duplicate expiry replay should retire outbox evidence at capacity");
+    assert_eq!(runtime.pending_networked_worker_expiry_evidence_count(), 0);
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    let outbox_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runtime_networked_worker_expiry_outbox", [], |row| {
+            row.get(0)
+        })
+        .expect("outbox count should load");
+    assert_eq!(outbox_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_evidence_survives_runtime_reconstruction() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-gateway-worker-expiry-restart");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root.clone(),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let now_unix_ms = super::current_unix_ms();
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-restart"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-expiry-restart",
+            test_worker_lease_request("run-worker-expiry-restart"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_expiry_journal_until_restart
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.ttl_expired%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker expiry journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000))
+        .await
+        .expect_err("the first expiry pass should expose the journal failure");
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 1);
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    let durable_outbox_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runtime_networked_worker_expiry_outbox", [], |row| {
+            row.get(0)
+        })
+        .expect("durable worker expiry evidence should be queryable");
+    assert_eq!(durable_outbox_count, 1);
+    connection
+        .execute_batch("DROP TRIGGER fail_worker_expiry_journal_until_restart;")
+        .expect("failure trigger should drop");
+    drop(connection);
+    drop(state);
+
+    let reconstructed = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    assert_eq!(reconstructed.pending_networked_worker_expiry_evidence_count(), 1);
+    reconstructed
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_001))
+        .await
+        .expect("reconstructed runtime should drain durable expiry evidence");
+    assert_eq!(reconstructed.pending_networked_worker_expiry_evidence_count(), 0);
+
+    let connection = Connection::open(&db_path).expect("test journal database should reopen");
+    let durable_outbox_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runtime_networked_worker_expiry_outbox", [], |row| {
+            row.get(0)
+        })
+        .expect("durable worker expiry evidence should be queryable");
+    assert_eq!(durable_outbox_count, 0);
+    drop(connection);
+    let snapshot = reconstructed
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let expiry_payload = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+            (payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.ttl_expired"))
+            .then_some(payload)
+        })
+        .expect("reconstructed runtime should persist exact expiry evidence");
+    assert_eq!(
+        expiry_payload.pointer("/payload/details/lease_id").and_then(Value::as_str),
+        Some(lease.lease_id.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_preserves_more_than_recent_event_capacity() {
+    const WORKER_COUNT: usize = 65;
+
+    let state = build_test_runtime_state(false);
+    let now_unix_ms = super::current_unix_ms();
+    for index in 0..WORKER_COUNT {
+        let worker_id = format!("worker-expiry-capacity-{index:03}");
+        state
+            .register_networked_worker(test_worker_attestation(worker_id.as_str()))
+            .await
+            .expect("worker registration should succeed");
+        state
+            .assign_networked_worker_lease(
+                worker_id.as_str(),
+                test_worker_lease_request(format!("run-expiry-capacity-{index:03}").as_str()),
+            )
+            .await
+            .expect("worker lease assignment should succeed");
+    }
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_expiry_journal
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.ttl_expired%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker expiry journal failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let error = state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000))
+        .await
+        .expect_err("the first expiry pass should expose the journal failure");
+    assert_eq!(error.code(), Code::Internal);
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.orphaned_workers, WORKER_COUNT);
+    assert_eq!(state.worker_fleet_recent_events().len(), 64);
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), WORKER_COUNT);
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch("DROP TRIGGER fail_worker_expiry_journal;")
+        .expect("failure trigger should drop");
+    drop(connection);
+    let retry = state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_001))
+        .await
+        .expect("the next expiry pass should persist every retained event");
+    assert!(retry.is_empty(), "the workers must not be reclaimed twice");
+    assert_eq!(state.pending_networked_worker_expiry_evidence_count(), 0);
+
+    let snapshot = state
+        .recent_journal_snapshot(500)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let expiry_worker_ids = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(event.payload_json.as_str()).ok())
+        .filter(|payload| {
+            payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.ttl_expired")
+        })
+        .filter_map(|payload| {
+            payload.pointer("/payload/output/id").and_then(Value::as_str).map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expiry_worker_ids.len(), WORKER_COUNT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_rejects_late_completion_after_reclaim() {
+    let state = build_test_runtime_state(false);
+    let now_unix_ms = super::current_unix_ms();
+    state
+        .register_networked_worker(test_worker_attestation("worker-late-completion"))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            "worker-late-completion",
+            test_worker_lease_request("run-worker-late-completion"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    state
+        .reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000))
+        .await
+        .expect("expired worker lease should be reclaimed");
+
+    let error = state
+        .complete_networked_worker_lease(
+            "worker-late-completion",
+            lease.identity(),
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+        )
+        .await
+        .expect_err("late completion from a reclaimed lease must be rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("completion does not match its active lease"));
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.orphaned_workers, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_expiry_passes_never_overlap() {
+    let state = build_test_runtime_state(false);
+    let now_unix_ms = super::current_unix_ms();
+    state
+        .register_networked_worker(test_worker_attestation("worker-expiry-overlap"))
+        .await
+        .expect("worker registration should succeed");
+    state
+        .assign_networked_worker_lease(
+            "worker-expiry-overlap",
+            test_worker_lease_request("run-worker-expiry-overlap"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+
+    let first = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            state.reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000)).await
+        })
+    };
+    let second = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            state.reap_expired_networked_workers_at(now_unix_ms.saturating_add(60_000)).await
+        })
+    };
+    first.await.expect("first expiry task should join").expect("first expiry pass should succeed");
+    second
+        .await
+        .expect("second expiry task should join")
+        .expect("second expiry pass should succeed");
+
+    assert_eq!(state.networked_worker_expiry_max_active(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
     let state = build_test_runtime_state(false);
     state
@@ -5184,7 +7400,7 @@ async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
         )
         .await
         .expect_err("cleanup failure should fail closed");
-    assert!(error.message().contains("artifact cleanup failed"));
+    assert_eq!(error.message(), "networked worker cleanup did not remove all scoped data");
     assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
 
     let reassignment = state
@@ -5225,6 +7441,13 @@ async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
             .and_then(Value::as_bool),
         Some(false)
     );
+    assert_eq!(
+        failed_payload
+            .pointer("/payload/details/cleanup_report/failure_reason")
+            .and_then(Value::as_str),
+        Some("worker.cleanup.incomplete")
+    );
+    assert!(!failed_payload.to_string().contains("artifact cleanup failed"));
     assert_eq!(
         failed_payload.pointer("/payload/details/orphan_classification").and_then(Value::as_str),
         Some("non_recoverable_requires_operator_cleanup")
@@ -5272,6 +7495,23 @@ async fn networked_worker_operator_actions_are_journaled() {
         )
         .await
         .expect("worker lease assignment should succeed");
+    let active_cleanup = state
+        .force_cleanup_networked_worker(
+            "worker-cleanup",
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+        )
+        .await
+        .expect_err("operator force cleanup must not clear an active lease");
+    assert_eq!(active_cleanup.code(), tonic::Code::FailedPrecondition);
+    state
+        .quarantine_networked_worker("worker-cleanup")
+        .await
+        .expect("operator quarantine should revoke the active lease");
     let force_cleanup = state
         .force_cleanup_networked_worker(
             "worker-cleanup",
@@ -5283,8 +7523,8 @@ async fn networked_worker_operator_actions_are_journaled() {
             },
         )
         .await
-        .expect("operator force cleanup should be journaled");
-    assert_eq!(force_cleanup.reason_code, "worker.completed");
+        .expect("lease-free operator cleanup should be journaled");
+    assert_eq!(force_cleanup.reason_code, "worker.cleanup_verified_requires_reattestation");
 
     let snapshot = state
         .recent_journal_snapshot(100)
@@ -5336,7 +7576,9 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
     assert!(outcome.error.contains("remote worker transport is not configured"));
     assert_eq!(outcome.attestation.executor, "networked_worker");
     assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_unavailable");
-    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    let worker_snapshot = state.worker_fleet_snapshot();
+    assert_eq!(worker_snapshot.active_leases, 0);
+    assert_eq!(worker_snapshot.failed_closed_workers, 1);
 
     let snapshot = state
         .recent_journal_snapshot(100)
@@ -5349,10 +7591,1024 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
                 .and_then(|payload| {
                     payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
                 })
-                .is_some_and(|reason| reason == "worker.completed")
+                .is_some_and(|reason| reason == "worker.cleanup_failed")
         }),
-        "transport-missing path should still complete and journal worker cleanup"
+        "transport-missing path must journal unverified cleanup and fail the worker closed"
     );
+
+    let retry = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-runtime",
+            run_id: "run-networked-worker-runtime-retry",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-runtime-retry",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+    assert!(!retry.success);
+    assert!(retry.error.contains("lease assignment failed"), "{}", retry.error);
+    assert_eq!(retry.attestation.sandbox_enforcement, "networked_worker_lease_denied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_cancellation_removes_queued_node_dispatch() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-cancel-queued";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_root = unique_temp_test_root("palyra-networked-worker-cancel-queued");
+    let node_runtime = Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id,
+            "test-worker",
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY
+                        .to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .expect("worker node should register");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::new(Arc::clone(&node_runtime)),
+    ));
+    let cancellation_requested = Arc::new(AtomicBool::new(true));
+
+    let outcome = super::execute_tool_with_runtime_dispatch_with_cancellation(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-cancel-queued",
+            run_id: "run-networked-worker-cancel-queued",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-cancel-queued",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+        Some(cancellation_requested),
+    )
+    .await;
+
+    assert!(!outcome.success);
+    assert!(outcome.error.contains("dispatch cancelled"), "{}", outcome.error);
+    assert!(outcome.error.contains("cancelled_before_dispatch=true"), "{}", outcome.error);
+    assert!(node_runtime
+        .next_capability_dispatch(worker_id, state.as_ref())
+        .expect("dispatch poll should succeed")
+        .is_none());
+    let requests = node_runtime
+        .capability_requests(Some(worker_id))
+        .expect("capability request ledger should load");
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0].state, CapabilityRequestState::Cancelled));
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
+}
+
+#[tokio::test]
+async fn networked_worker_expiry_cancels_queued_dispatch_claim_before_dequeue() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-dispatch-expiry-queued";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-dispatch-expiry"))
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let claim = state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: super::sha256_hex(b"dispatch-payload"),
+        })
+        .expect("exact dispatch claim should be created");
+    assert_eq!(claim.state, NetworkedWorkerDispatchClaimState::Queued);
+
+    state
+        .reap_expired_networked_workers_at(lease.expires_at_unix_ms)
+        .await
+        .expect("worker expiry should commit");
+
+    let durable_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(durable_claim.state, NetworkedWorkerDispatchClaimState::Cancelled);
+    assert_eq!(durable_claim.terminal_reason_code.as_deref(), Some("worker.ttl_expired"));
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                super::sha256_hex(b"dispatch-payload").as_str(),
+                lease.expires_at_unix_ms,
+            )
+            .expect("rejected dispatch check should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Rejected
+    ));
+}
+
+#[tokio::test]
+async fn networked_worker_revocation_before_payload_release_cancels_reservation() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-dispatch-quarantine-unreleased";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            worker_id,
+            test_worker_lease_request("run-dispatch-quarantine-unreleased"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"unreleased-dispatch-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("exact dispatch claim should be created");
+    let delivery_attempt_id = Ulid::new().to_string();
+    let delivery_token = format!("{}{}", Ulid::new(), Ulid::new());
+    assert!(matches!(
+        state
+            .journal_store
+            .reserve_networked_worker_delivery(&NetworkedWorkerDeliveryReservationRequest {
+                remote_request_id: remote_request_id.clone(),
+                node_request_id: node_request_id.clone(),
+                request_sha256,
+                delivery_attempt_id: delivery_attempt_id.clone(),
+                delivery_token_sha256: super::sha256_hex(delivery_token.as_bytes()),
+                observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(1),
+            })
+            .expect("delivery reservation should succeed"),
+        NetworkedWorkerDeliveryReservationOutcome::Authorized { .. }
+    ));
+
+    state.quarantine_networked_worker(worker_id).await.expect("worker quarantine should commit");
+
+    let durable_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(durable_claim.state, NetworkedWorkerDispatchClaimState::Cancelled);
+    assert_eq!(durable_claim.reconciliation_disposition.as_deref(), Some("payload_not_released"));
+    assert!(durable_claim.revoked_fleet_generation.is_some());
+    assert!(durable_claim.payload_released_at_unix_ms.is_none());
+    assert_eq!(
+        state
+            .journal_store
+            .release_networked_worker_payload(&NetworkedWorkerPayloadReleaseRequest {
+                node_request_id,
+                delivery_attempt_id,
+                delivery_token,
+                reporting_worker_id: worker_id.to_owned(),
+                observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(1),
+            })
+            .expect("post-revocation release should classify"),
+        NetworkedWorkerPayloadReleaseOutcome::Rejected
+    );
+}
+
+#[tokio::test]
+async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-dispatch-quarantine-inflight";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            worker_id,
+            test_worker_lease_request("run-dispatch-quarantine"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"dispatch-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("exact dispatch claim should be created");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(1),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+
+    state.quarantine_networked_worker(worker_id).await.expect("worker quarantine should commit");
+
+    let durable_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(durable_claim.state, NetworkedWorkerDispatchClaimState::Reconciling);
+    assert_eq!(durable_claim.reconciliation_disposition.as_deref(), Some("lease_revoked"));
+    assert_eq!(
+        durable_claim.terminal_reason_code.as_deref(),
+        Some("worker.dispatch.revoked_by_operator_quarantine")
+    );
+    assert!(durable_claim.revoked_fleet_generation.is_some());
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    let wrong_attempt = Ulid::new().to_string();
+    let mismatch = state
+        .settle_reconciling_networked_worker_dispatch(
+            remote_request_id.as_str(),
+            Some(wrong_attempt.as_str()),
+            worker_id,
+            &lease.identity(),
+            super::sha256_hex(b"wrong-attempt-result").as_str(),
+            lease.expires_at_unix_ms.saturating_sub(1),
+        )
+        .expect_err("mismatched delivery attempt must not settle reconciliation authority");
+    assert_eq!(mismatch.code(), Code::FailedPrecondition);
+
+    let observed_at_unix_ms = lease.expires_at_unix_ms.saturating_sub(1);
+    let validated_result_sha256 = super::sha256_hex(b"verified-late-result");
+    state
+        .settle_reconciling_networked_worker_dispatch(
+            remote_request_id.as_str(),
+            durable_claim.delivery_attempt_id.as_deref(),
+            worker_id,
+            &lease.identity(),
+            validated_result_sha256.as_str(),
+            observed_at_unix_ms,
+        )
+        .expect("verified pre-expiry late result should settle reconciliation authority");
+    let settled = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("settled dispatch claim should load")
+        .expect("settled dispatch claim should remain auditable");
+    assert_eq!(settled.state, NetworkedWorkerDispatchClaimState::Settled);
+    assert_eq!(settled.reconciliation_disposition.as_deref(), Some("late_result_verified"));
+    assert_eq!(settled.completed_at_unix_ms, Some(settled.updated_at_unix_ms));
+    assert!(settled.completed_at_unix_ms.unwrap() >= observed_at_unix_ms);
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+}
+
+#[tokio::test]
+async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl_revocation() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-dispatch-late-result-at-expiry";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            worker_id,
+            test_worker_lease_request("run-dispatch-late-result-at-expiry"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"dispatch-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("exact dispatch claim should be created");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(2),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+
+    state
+        .reap_expired_networked_workers_at(lease.expires_at_unix_ms)
+        .await
+        .expect("worker expiry should revoke the released dispatch");
+    let reconciling = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(reconciling.state, NetworkedWorkerDispatchClaimState::Reconciling);
+    assert!(reconciling.updated_at_unix_ms >= lease.expires_at_unix_ms.saturating_sub(2));
+
+    let at_expiry = state
+        .settle_reconciling_networked_worker_dispatch(
+            remote_request_id.as_str(),
+            reconciling.delivery_attempt_id.as_deref(),
+            worker_id,
+            &lease.identity(),
+            super::sha256_hex(b"result-at-expiry").as_str(),
+            lease.expires_at_unix_ms,
+        )
+        .expect_err("a result first observed at expiry must not settle authority");
+    assert_eq!(at_expiry.code(), Code::FailedPrecondition);
+
+    let observed_at_unix_ms = lease.expires_at_unix_ms.saturating_sub(1);
+    let validated_result_sha256 = super::sha256_hex(b"pre-expiry-result");
+    state
+        .settle_reconciling_networked_worker_dispatch(
+            remote_request_id.as_str(),
+            reconciling.delivery_attempt_id.as_deref(),
+            worker_id,
+            &lease.identity(),
+            validated_result_sha256.as_str(),
+            observed_at_unix_ms,
+        )
+        .expect("pre-expiry host observation should survive later revocation persistence");
+    let settled = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("settled claim should load")
+        .expect("settled claim should remain auditable");
+    assert_eq!(settled.state, NetworkedWorkerDispatchClaimState::Settled);
+    assert_eq!(settled.reconciliation_disposition.as_deref(), Some("late_result_verified"));
+    assert!(settled.updated_at_unix_ms >= reconciling.updated_at_unix_ms);
+    assert_eq!(settled.completed_at_unix_ms, Some(settled.updated_at_unix_ms));
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+}
+
+#[tokio::test]
+async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
+    let db_path = unique_temp_journal_path();
+    let state_root = unique_temp_test_root("palyra-worker-dispatch-restart-state");
+    let state = build_test_runtime_state_at(
+        db_path.clone(),
+        state_root.clone(),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let worker_id = "worker-dispatch-restart";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-dispatch-restart"))
+        .await
+        .expect("worker lease assignment should succeed");
+    let queued_remote_request_id = Ulid::new().to_string();
+    let queued_node_request_id = Ulid::new().to_string();
+    let queued_request_sha256 = super::sha256_hex(b"queued-dispatch-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: queued_remote_request_id.clone(),
+            node_request_id: queued_node_request_id,
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: queued_request_sha256,
+        })
+        .expect("queued dispatch claim should be created");
+    let inflight_remote_request_id = Ulid::new().to_string();
+    let inflight_node_request_id = Ulid::new().to_string();
+    let inflight_request_sha256 = super::sha256_hex(b"inflight-dispatch-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: inflight_remote_request_id.clone(),
+            node_request_id: inflight_node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: inflight_request_sha256.clone(),
+        })
+        .expect("in-flight dispatch claim should be created");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                inflight_remote_request_id.as_str(),
+                inflight_node_request_id.as_str(),
+                inflight_request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(1),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+    drop(state);
+
+    let recovered = build_test_runtime_state_at(
+        db_path,
+        state_root,
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let queued = recovered
+        .journal_store
+        .networked_worker_dispatch_claim(queued_remote_request_id.as_str())
+        .expect("queued claim should load")
+        .expect("queued claim should remain auditable");
+    assert_eq!(queued.state, NetworkedWorkerDispatchClaimState::Cancelled);
+    assert_eq!(queued.reconciliation_disposition.as_deref(), Some("payload_lost_on_restart"));
+    assert_eq!(
+        queued.terminal_reason_code.as_deref(),
+        Some("worker.dispatch.cancelled_after_restart")
+    );
+    let inflight = recovered
+        .journal_store
+        .networked_worker_dispatch_claim(inflight_remote_request_id.as_str())
+        .expect("in-flight claim should load")
+        .expect("in-flight claim should remain auditable");
+    assert_eq!(inflight.state, NetworkedWorkerDispatchClaimState::InFlight);
+    assert!(inflight.completed_at_unix_ms.is_none());
+    assert!(recovered
+        .journal_store
+        .settle_networked_worker_dispatch_claim(&NetworkedWorkerDispatchSettlement {
+            remote_request_id: inflight_remote_request_id,
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id,
+            run_id: lease.run_id,
+            delivery_attempt_id: None,
+            validated_result_sha256: super::sha256_hex(b"rejected-settlement"),
+            observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(1),
+        })
+        .is_err());
+}
+
+#[tokio::test]
+async fn networked_worker_result_authorization_requires_exact_active_claim() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-result-authority";
+    let wrong_worker_id = "worker-result-authority-other";
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-result-authority"))
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"result-authority-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("exact dispatch claim should be created");
+
+    let wrong_node_request_id = Ulid::new().to_string();
+    let wrong_remote_request_id = Ulid::new().to_string();
+    for (candidate_remote_request_id, candidate_node_request_id, candidate_worker_id) in [
+        (remote_request_id.as_str(), node_request_id.as_str(), worker_id),
+        (remote_request_id.as_str(), wrong_node_request_id.as_str(), worker_id),
+        (wrong_remote_request_id.as_str(), node_request_id.as_str(), worker_id),
+        (remote_request_id.as_str(), node_request_id.as_str(), wrong_worker_id),
+    ] {
+        assert_eq!(
+            state
+                .journal_store
+                .authorize_networked_worker_result(
+                    candidate_remote_request_id,
+                    candidate_node_request_id,
+                    candidate_worker_id,
+                )
+                .expect("queued authorization check should succeed"),
+            NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+    }
+
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(1),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        state
+            .journal_store
+            .authorize_networked_worker_result(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                worker_id,
+            )
+            .expect("in-flight authorization check should succeed"),
+        NetworkedWorkerResultAuthorizationOutcome::Authorized
+    );
+    assert_eq!(
+        state
+            .journal_store
+            .authorize_networked_worker_result(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                wrong_worker_id,
+            )
+            .expect("wrong-worker authorization check should succeed"),
+        NetworkedWorkerResultAuthorizationOutcome::Rejected
+    );
+
+    state.quarantine_networked_worker(worker_id).await.expect("worker quarantine should commit");
+    assert_eq!(
+        state
+            .journal_store
+            .authorize_networked_worker_result(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                worker_id,
+            )
+            .expect("reconciling authorization check should succeed"),
+        NetworkedWorkerResultAuthorizationOutcome::Authorized
+    );
+    let delivery_attempt_id = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("reconciling dispatch claim should load")
+        .and_then(|claim| claim.delivery_attempt_id)
+        .expect("fenced dispatch should retain its delivery attempt");
+    state
+        .settle_reconciling_networked_worker_dispatch(
+            remote_request_id.as_str(),
+            Some(delivery_attempt_id.as_str()),
+            worker_id,
+            &lease.identity(),
+            super::sha256_hex(b"authorized-late-result").as_str(),
+            lease.expires_at_unix_ms.saturating_sub(1),
+        )
+        .expect("verified late result should settle reconciliation authority");
+    assert_eq!(
+        state
+            .journal_store
+            .authorize_networked_worker_result(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                worker_id,
+            )
+            .expect("settled authorization check should succeed"),
+        NetworkedWorkerResultAuthorizationOutcome::Rejected
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NodeWorkerFailureResponse {
+    MalformedResult,
+    TransportFailure,
+    CleanupGap,
+    DropResultOwner,
+}
+
+async fn dispatch_node_worker_failure_case(
+    suffix: &str,
+    response: NodeWorkerFailureResponse,
+) -> (Arc<GatewayRuntimeState>, String, String, crate::tool_protocol::ToolExecutionOutcome) {
+    let state = build_test_runtime_state(false);
+    let worker_id = format!("worker-runtime-{suffix}");
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id.as_str());
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_label = format!("palyra-networked-worker-{suffix}");
+    let node_runtime_root = unique_temp_test_root(node_runtime_label.as_str());
+    let node_runtime = Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id.as_str(),
+            "test-worker",
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY
+                        .to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .expect("worker node should register");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::new(Arc::clone(&node_runtime)),
+    ));
+
+    let worker_node_runtime = Arc::clone(&node_runtime);
+    let worker_runtime_state = Arc::clone(&state);
+    let worker_id_for_task = worker_id.clone();
+    let remote_worker = tokio::spawn(async move {
+        for _ in 0..100 {
+            if let Some(dispatch) = worker_node_runtime
+                .next_capability_dispatch(
+                    worker_id_for_task.as_str(),
+                    worker_runtime_state.as_ref(),
+                )
+                .expect("dispatch poll should succeed")
+            {
+                let reservation = dispatch
+                    .networked_worker_reservation
+                    .as_ref()
+                    .expect("worker dispatch should carry a delivery reservation");
+                assert!(dispatch.input_json.is_empty());
+                let payload = worker_node_runtime
+                    .fetch_networked_worker_payload(
+                        worker_id_for_task.as_str(),
+                        dispatch.request_id.as_str(),
+                        reservation.delivery_attempt_id.as_str(),
+                        reservation.fetch_token.as_str(),
+                        worker_runtime_state.as_ref(),
+                    )
+                    .expect("reserved worker payload should fetch");
+                let request: WorkerRemoteToolRequestEnvelope =
+                    serde_json::from_slice(payload.input_json.as_slice())
+                        .expect("remote request envelope should deserialize");
+                let remote_request_id = request.request_id.clone();
+                if matches!(response, NodeWorkerFailureResponse::DropResultOwner) {
+                    assert!(worker_node_runtime
+                        .drop_capability_result_owner(dispatch.request_id.as_str())
+                        .expect("result owner removal should succeed"));
+                } else {
+                    let result = match response {
+                        NodeWorkerFailureResponse::MalformedResult => CapabilityExecutionResult {
+                            success: true,
+                            output_json: b"not-a-worker-result".to_vec(),
+                            error: String::new(),
+                        },
+                        NodeWorkerFailureResponse::TransportFailure => CapabilityExecutionResult {
+                            success: false,
+                            output_json: Vec::new(),
+                            error: "worker transport failed".to_owned(),
+                        },
+                        NodeWorkerFailureResponse::CleanupGap => {
+                            let output_json = serde_json::to_string(&json!({
+                                "content": "untrusted remote content",
+                                "path": "src/lib.rs",
+                            }))
+                            .expect("remote output should serialize");
+                            let result = WorkerRemoteToolResultEnvelope {
+                                protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+                                schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+                                request_id: request.request_id.clone(),
+                                proposal_id: request.proposal_id.clone(),
+                                tool_name: request.tool_name.clone(),
+                                tool_kind: request.tool_kind,
+                                worker_id: request.lease.worker_id.clone(),
+                                lease_id: request.lease.lease_id.clone(),
+                                success: true,
+                                output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+                                output_json,
+                                error: None,
+                                output_manifest_sha256: super::sha256_hex(
+                                    b"cleanup-gap-output-manifest",
+                                ),
+                                cleanup_report: WorkerCleanupReport {
+                                    removed_workspace_scope: true,
+                                    removed_artifacts: false,
+                                    removed_logs: true,
+                                    failure_reason: Some("artifact directory not empty".to_owned()),
+                                },
+                                worker_identity: request.worker_identity.clone(),
+                                completed_at_unix_ms: super::current_unix_ms()
+                                    .min(request.lease.expires_at_unix_ms.saturating_sub(1)),
+                            };
+                            CapabilityExecutionResult {
+                                success: true,
+                                output_json: serde_json::to_vec(&result)
+                                    .expect("cleanup-gap result should serialize"),
+                                error: String::new(),
+                            }
+                        }
+                        NodeWorkerFailureResponse::DropResultOwner => unreachable!(),
+                    };
+                    worker_node_runtime
+                        .complete_capability_request(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            Some(reservation.delivery_attempt_id.as_str()),
+                            result,
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect("capability completion should succeed");
+                }
+                return (dispatch.request_id, remote_request_id);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("remote worker did not receive node dispatch");
+    });
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-failure",
+            run_id: suffix,
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        format!("proposal-{suffix}").as_str(),
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+    let (node_request_id, remote_request_id) =
+        remote_worker.await.expect("remote worker task should complete");
+    (state, node_request_id, remote_request_id, outcome)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_node_failures_reconcile_exact_dispatch_claim() {
+    for (suffix, response, expected_error) in [
+        ("malformed-result", NodeWorkerFailureResponse::MalformedResult, "malformed result"),
+        ("transport-failure", NodeWorkerFailureResponse::TransportFailure, "transport failed"),
+        ("cleanup-gap", NodeWorkerFailureResponse::CleanupGap, "cleanup verification incomplete"),
+        (
+            "result-owner-lost",
+            NodeWorkerFailureResponse::DropResultOwner,
+            "timed out after payload release",
+        ),
+    ] {
+        let (state, _node_request_id, remote_request_id, outcome) =
+            dispatch_node_worker_failure_case(suffix, response).await;
+
+        assert!(!outcome.success, "{suffix} must fail closed");
+        assert!(outcome.error.contains(expected_error), "{}", outcome.error);
+        let claim = state
+            .journal_store
+            .networked_worker_dispatch_claim(remote_request_id.as_str())
+            .expect("dispatch claim should load")
+            .expect("dispatch claim should remain auditable");
+        assert_eq!(claim.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(claim.reconciliation_disposition.as_deref(), Some("lease_revoked"));
+        assert_eq!(
+            claim.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.revoked_by_lease_finalization")
+        );
+        assert!(claim.revoked_fleet_generation.is_some());
+        let fleet = state.worker_fleet_snapshot();
+        assert_eq!(fleet.active_leases, 0);
+        assert_eq!(fleet.failed_closed_workers, 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-inflight-timeout";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_root = unique_temp_test_root("palyra-networked-worker-inflight-timeout");
+    let node_runtime = Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id,
+            "test-worker",
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY
+                        .to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .expect("worker node should register");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::with_dispatch_timeout(Arc::clone(&node_runtime), 100),
+    ));
+
+    let worker_node_runtime = Arc::clone(&node_runtime);
+    let worker_runtime_state = Arc::clone(&state);
+    let remote_worker = tokio::spawn(async move {
+        for _ in 0..100 {
+            if let Some(dispatch) = worker_node_runtime
+                .next_capability_dispatch(worker_id, worker_runtime_state.as_ref())
+                .expect("dispatch poll should succeed")
+            {
+                let reservation = dispatch
+                    .networked_worker_reservation
+                    .as_ref()
+                    .expect("worker dispatch should carry a delivery reservation");
+                assert!(dispatch.input_json.is_empty());
+                let payload = worker_node_runtime
+                    .fetch_networked_worker_payload(
+                        worker_id,
+                        dispatch.request_id.as_str(),
+                        reservation.delivery_attempt_id.as_str(),
+                        reservation.fetch_token.as_str(),
+                        worker_runtime_state.as_ref(),
+                    )
+                    .expect("reserved worker payload should fetch");
+                let request: WorkerRemoteToolRequestEnvelope =
+                    serde_json::from_slice(payload.input_json.as_slice())
+                        .expect("remote request envelope should deserialize");
+                return (dispatch.request_id, reservation.delivery_attempt_id.clone(), request);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("remote worker did not receive node dispatch");
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::execute_tool_with_runtime_dispatch(
+            &state,
+            super::ToolRuntimeExecutionContext {
+                principal: "user:ops",
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                channel: Some("cli"),
+                session_id: "session-networked-worker-inflight-timeout",
+                run_id: "run-networked-worker-inflight-timeout",
+                execution_backend: ExecutionBackendPreference::NetworkedWorker,
+                backend_reason_code: "backend.available.networked_worker",
+            },
+            "proposal-networked-worker-inflight-timeout",
+            "palyra.fs.read_file",
+            br#"{"path":"src/lib.rs"}"#,
+            None,
+        ),
+    )
+    .await
+    .expect("in-flight timeout must not wait indefinitely");
+    let (node_request_id, delivery_attempt_id, remote_request) =
+        remote_worker.await.expect("remote worker task should complete");
+    let remote_request_id = remote_request.request_id.clone();
+
+    assert!(!outcome.success);
+    assert!(outcome.error.contains("dispatch timed out"), "{}", outcome.error);
+    assert!(outcome.error.contains("after payload release"), "{}", outcome.error);
+    let claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(claim.state, NetworkedWorkerDispatchClaimState::Reconciling);
+    assert_eq!(claim.delivery_disposition.as_deref(), Some("released_unacknowledged"));
+    assert_eq!(claim.reconciliation_disposition.as_deref(), Some("lease_revoked"));
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
+    let requests =
+        node_runtime.capability_requests(Some(worker_id)).expect("capability requests should load");
+    let request = requests
+        .iter()
+        .find(|request| request.request_id == node_request_id)
+        .expect("timed-out node request should remain auditable");
+    assert!(matches!(request.state, CapabilityRequestState::TimedOut));
+
+    let output_json = serde_json::to_string(&json!({
+        "content": "late remote content",
+        "path": "src/lib.rs"
+    }))
+    .expect("late remote output should serialize");
+    let result = WorkerRemoteToolResultEnvelope {
+        protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+        schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        request_id: remote_request.request_id.clone(),
+        proposal_id: remote_request.proposal_id.clone(),
+        tool_name: remote_request.tool_name.clone(),
+        tool_kind: remote_request.tool_kind,
+        worker_id: remote_request.lease.worker_id.clone(),
+        lease_id: remote_request.lease.lease_id.clone(),
+        success: true,
+        output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+        output_json,
+        error: None,
+        output_manifest_sha256: super::sha256_hex(b"late-output-manifest"),
+        cleanup_report: WorkerCleanupReport {
+            removed_workspace_scope: true,
+            removed_artifacts: true,
+            removed_logs: true,
+            failure_reason: None,
+        },
+        worker_identity: remote_request.worker_identity.clone(),
+        completed_at_unix_ms: remote_request.lease.expires_at_unix_ms.saturating_sub(1),
+    };
+    assert!(node_runtime
+        .complete_capability_request(
+            worker_id,
+            node_request_id.as_str(),
+            Some(delivery_attempt_id.as_str()),
+            CapabilityExecutionResult {
+                success: true,
+                output_json: serde_json::to_vec(&result)
+                    .expect("late result envelope should serialize"),
+                error: String::new(),
+            },
+            state.as_ref(),
+        )
+        .expect("late result should transfer to reconciliation owner"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let claim = state
+                .journal_store
+                .networked_worker_dispatch_claim(remote_request_id.as_str())
+                .expect("late result claim should load")
+                .expect("late result claim should remain auditable");
+            if claim.state == NetworkedWorkerDispatchClaimState::Settled {
+                assert_eq!(
+                    claim.reconciliation_disposition.as_deref(),
+                    Some("late_result_verified")
+                );
+                assert!(claim.validated_result_sha256.is_some());
+                assert!(claim.result_observed_at_unix_ms.is_some());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("late result should settle reconciliation authority");
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5373,7 +8629,14 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
         .register_node(
             worker_id,
             "test-worker",
-            vec![DeviceCapabilityView { name: required_capability.to_owned(), available: true }],
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY
+                        .to_owned(),
+                    available: true,
+                },
+            ],
         )
         .expect("worker node should register");
     state.configure_networked_worker_remote_dispatcher(std::sync::Arc::new(
@@ -5381,16 +8644,124 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
     ));
 
     let worker_node_runtime = std::sync::Arc::clone(&node_runtime);
+    let worker_runtime_state = Arc::clone(&state);
     let worker_id_for_task = worker_id.to_owned();
     let remote_worker = tokio::spawn(async move {
         for _ in 0..100 {
             if let Some(dispatch) = worker_node_runtime
-                .next_capability_dispatch(worker_id_for_task.as_str())
+                .next_capability_dispatch(
+                    worker_id_for_task.as_str(),
+                    worker_runtime_state.as_ref(),
+                )
                 .expect("dispatch poll should succeed")
             {
                 assert_eq!(dispatch.capability, required_capability);
+                let reservation = dispatch
+                    .networked_worker_reservation
+                    .as_ref()
+                    .expect("worker dispatch should carry a delivery reservation");
+                assert!(dispatch.input_json.is_empty());
+                let wrong_attempt = Ulid::new().to_string();
+                assert_eq!(
+                    worker_node_runtime
+                        .fetch_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            wrong_attempt.as_str(),
+                            reservation.fetch_token.as_str(),
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect_err("wrong delivery attempt must not fetch the payload")
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(
+                    worker_node_runtime
+                        .fetch_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            reservation.delivery_attempt_id.as_str(),
+                            "wrong-token-with-valid-length-0123456789abcdef",
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect_err("wrong delivery token must not fetch the payload")
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                let payload = worker_node_runtime
+                    .fetch_networked_worker_payload(
+                        worker_id_for_task.as_str(),
+                        dispatch.request_id.as_str(),
+                        reservation.delivery_attempt_id.as_str(),
+                        reservation.fetch_token.as_str(),
+                        worker_runtime_state.as_ref(),
+                    )
+                    .expect("reserved worker payload should fetch");
+                assert_eq!(
+                    worker_node_runtime
+                        .fetch_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            reservation.delivery_attempt_id.as_str(),
+                            reservation.fetch_token.as_str(),
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect_err("duplicate payload fetch must release no bytes")
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(
+                    worker_node_runtime
+                        .acknowledge_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            wrong_attempt.as_str(),
+                            reservation.fetch_token.as_str(),
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect_err("wrong delivery attempt must not acknowledge the payload")
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(
+                    worker_node_runtime
+                        .acknowledge_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            reservation.delivery_attempt_id.as_str(),
+                            "wrong-token-with-valid-length-0123456789abcdef",
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect_err("wrong delivery token must not acknowledge the payload")
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(
+                    worker_node_runtime
+                        .acknowledge_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            reservation.delivery_attempt_id.as_str(),
+                            reservation.fetch_token.as_str(),
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect("released worker payload should acknowledge"),
+                    crate::journal::NetworkedWorkerPayloadAcknowledgementOutcome::Acknowledged
+                );
+                assert_eq!(
+                    worker_node_runtime
+                        .acknowledge_networked_worker_payload(
+                            worker_id_for_task.as_str(),
+                            dispatch.request_id.as_str(),
+                            reservation.delivery_attempt_id.as_str(),
+                            reservation.fetch_token.as_str(),
+                            worker_runtime_state.as_ref(),
+                        )
+                        .expect("duplicate acknowledgement should remain idempotent"),
+                    crate::journal::NetworkedWorkerPayloadAcknowledgementOutcome::AlreadyAcknowledged
+                );
                 let request: WorkerRemoteToolRequestEnvelope =
-                    serde_json::from_slice(dispatch.input_json.as_slice())
+                    serde_json::from_slice(payload.input_json.as_slice())
                         .expect("remote request envelope should deserialize");
                 request
                     .validate(super::current_unix_ms())
@@ -5426,18 +8797,22 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
                     worker_identity: request.worker_identity.clone(),
                     completed_at_unix_ms: super::current_unix_ms(),
                 };
+                let remote_request_id = request.request_id.clone();
                 worker_node_runtime
                     .complete_capability_request(
+                        worker_id_for_task.as_str(),
                         dispatch.request_id.as_str(),
+                        Some(reservation.delivery_attempt_id.as_str()),
                         CapabilityExecutionResult {
                             success: true,
                             output_json: serde_json::to_vec(&result)
                                 .expect("remote result envelope should serialize"),
                             error: String::new(),
                         },
+                        worker_runtime_state.as_ref(),
                     )
                     .expect("capability completion should succeed");
-                return dispatch.request_id;
+                return (dispatch.request_id, remote_request_id);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -5461,7 +8836,8 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
         None,
     )
     .await;
-    let capability_request_id = remote_worker.await.expect("remote worker task should complete");
+    let (capability_request_id, remote_request_id) =
+        remote_worker.await.expect("remote worker task should complete");
 
     assert!(outcome.success, "remote dispatch should succeed: {}", outcome.error);
     assert_eq!(outcome.attestation.executor, "networked_worker:worker-runtime-01");
@@ -5470,6 +8846,15 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
     assert_eq!(output.get("content").and_then(Value::as_str), Some("remote content"));
     assert_eq!(output.get("path").and_then(Value::as_str), Some("src/lib.rs"));
     assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+    let settled_claim = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("settled dispatch claim should load")
+        .expect("settled dispatch claim should remain auditable");
+    assert_eq!(settled_claim.state, NetworkedWorkerDispatchClaimState::Settled);
+    assert!(settled_claim.delivery_attempt_id.is_some());
+    assert!(settled_claim.payload_acknowledged_at_unix_ms.is_some());
+    assert_eq!(settled_claim.delivery_disposition.as_deref(), Some("acknowledged"));
 
     let capability_requests = node_runtime
         .capability_requests(Some(worker_id))
@@ -5497,6 +8882,799 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
         }),
         "successful remote execution should journal attested artifact transport"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-foreground-drop";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_root = unique_temp_test_root("palyra-networked-worker-foreground-drop");
+    let node_runtime = Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id,
+            "test-worker",
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY
+                        .to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .expect("worker node should register");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::new(Arc::clone(&node_runtime)),
+    ));
+
+    let mut foreground = Box::pin(super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-foreground-drop",
+            run_id: "run-networked-worker-foreground-drop",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-foreground-drop",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    ));
+
+    let (dispatch, request) = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                outcome = &mut foreground => {
+                    panic!("foreground completed before worker dispatch: {}", outcome.error);
+                }
+                dispatch = async {
+                    node_runtime
+                        .next_capability_dispatch(worker_id, state.as_ref())
+                        .expect("dispatch poll should succeed")
+                } => {
+                    if let Some(dispatch) = dispatch {
+                        let reservation = dispatch
+                            .networked_worker_reservation
+                            .as_ref()
+                            .expect("worker dispatch should carry a delivery reservation");
+                        let payload = node_runtime
+                            .fetch_networked_worker_payload(
+                                worker_id,
+                                dispatch.request_id.as_str(),
+                                reservation.delivery_attempt_id.as_str(),
+                                reservation.fetch_token.as_str(),
+                                state.as_ref(),
+                            )
+                            .expect("reserved worker payload should fetch");
+                        let request: WorkerRemoteToolRequestEnvelope =
+                            serde_json::from_slice(payload.input_json.as_slice())
+                                .expect("remote request envelope should deserialize");
+                        break (dispatch, request);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("runtime-owned dispatch should start");
+    drop(foreground);
+
+    let output_json = serde_json::to_string(&json!({
+        "content": "detached remote content",
+        "path": "src/lib.rs"
+    }))
+    .expect("remote output should serialize");
+    let result = WorkerRemoteToolResultEnvelope {
+        protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+        schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        request_id: request.request_id.clone(),
+        proposal_id: request.proposal_id.clone(),
+        tool_name: request.tool_name.clone(),
+        tool_kind: request.tool_kind,
+        worker_id: request.lease.worker_id.clone(),
+        lease_id: request.lease.lease_id.clone(),
+        success: true,
+        output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+        output_json,
+        error: None,
+        output_manifest_sha256: super::sha256_hex(b"detached-output-manifest"),
+        cleanup_report: WorkerCleanupReport {
+            removed_workspace_scope: true,
+            removed_artifacts: true,
+            removed_logs: true,
+            failure_reason: None,
+        },
+        worker_identity: request.worker_identity.clone(),
+        completed_at_unix_ms: super::current_unix_ms()
+            .min(request.lease.expires_at_unix_ms.saturating_sub(1)),
+    };
+    let reservation = dispatch
+        .networked_worker_reservation
+        .as_ref()
+        .expect("worker dispatch should retain delivery identity");
+    node_runtime
+        .complete_capability_request(
+            worker_id,
+            dispatch.request_id.as_str(),
+            Some(reservation.delivery_attempt_id.as_str()),
+            CapabilityExecutionResult {
+                success: true,
+                output_json: serde_json::to_vec(&result)
+                    .expect("remote result envelope should serialize"),
+                error: String::new(),
+            },
+            state.as_ref(),
+        )
+        .expect("capability completion should succeed");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let claim = state
+                .journal_store
+                .networked_worker_dispatch_claim(request.request_id.as_str())
+                .expect("dispatch claim should load")
+                .expect("dispatch claim should remain auditable");
+            if claim.state == NetworkedWorkerDispatchClaimState::Settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime owner should settle after foreground drop");
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+
+    let persisted_node_state =
+        std::fs::read_to_string(node_runtime_root.join("node-runtime.v1.json"))
+            .expect("node runtime state should remain readable");
+    assert!(!persisted_node_state.contains("detached remote content"));
+    let journal_bytes = std::fs::read(state.journal_config.db_path.as_path())
+        .expect("journal should remain readable");
+    assert!(!String::from_utf8_lossy(journal_bytes.as_slice()).contains("detached remote content"));
+}
+
+fn networked_worker_artifact_receipt_from_lease(
+    lease: &WorkerLease,
+    request_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    session_id: &str,
+    observed_at_unix_ms: i64,
+) -> NetworkedWorkerArtifactReceipt {
+    NetworkedWorkerArtifactReceipt {
+        request_id: request_id.to_owned(),
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+        session_id: session_id.to_owned(),
+        run_id: lease.run_id.clone(),
+        input_json_sha256: super::sha256_hex(br#"{"path":"src/lib.rs"}"#),
+        output_json_sha256: super::sha256_hex(b"trusted-output-json"),
+        output_manifest_sha256: super::sha256_hex(b"trusted-output-manifest"),
+        validated_result_sha256: super::sha256_hex(
+            format!("validated-result:{request_id}").as_bytes(),
+        ),
+        grant_id: lease.grant.grant_id.clone(),
+        required_capabilities: lease.required_capabilities.clone(),
+        workspace_scope: lease.workspace_scope.clone(),
+        log_stream_id: lease.artifact_transport.log_stream_id.clone(),
+        scratch_directory_id: lease.artifact_transport.scratch_directory_id.clone(),
+        observed_at_unix_ms,
+    }
+}
+
+fn create_released_networked_worker_dispatch_claim(
+    state: &GatewayRuntimeState,
+    worker_id: &str,
+    lease: &WorkerLease,
+    remote_request_id: &str,
+    node_request_id: &str,
+) -> String {
+    let request_sha256 = super::sha256_hex(b"stable-result-replay-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.to_owned(),
+            node_request_id: node_request_id.to_owned(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.fs.read_file".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("stable replay dispatch claim should create");
+    let delivery_attempt_id = Ulid::new().to_string();
+    let delivery_token = format!("{}{}", Ulid::new(), Ulid::new());
+    assert!(matches!(
+        state
+            .journal_store
+            .reserve_networked_worker_delivery(&NetworkedWorkerDeliveryReservationRequest {
+                remote_request_id: remote_request_id.to_owned(),
+                node_request_id: node_request_id.to_owned(),
+                request_sha256,
+                delivery_attempt_id: delivery_attempt_id.clone(),
+                delivery_token_sha256: super::sha256_hex(delivery_token.as_bytes()),
+                observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(2),
+            })
+            .expect("stable replay delivery should reserve"),
+        NetworkedWorkerDeliveryReservationOutcome::Authorized { .. }
+    ));
+    assert_eq!(
+        state
+            .journal_store
+            .release_networked_worker_payload(&NetworkedWorkerPayloadReleaseRequest {
+                node_request_id: node_request_id.to_owned(),
+                delivery_attempt_id: delivery_attempt_id.clone(),
+                delivery_token,
+                reporting_worker_id: worker_id.to_owned(),
+                observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(2),
+            })
+            .expect("stable replay payload should release"),
+        NetworkedWorkerPayloadReleaseOutcome::Released
+    );
+    delivery_attempt_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-result-replay";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            worker_id,
+            WorkerLeaseRequest {
+                run_id: "run-networked-worker-result-replay".to_owned(),
+                ttl_ms: 30_000,
+                required_capabilities: vec![required_capability.to_owned()],
+                workspace_scope: WorkerWorkspaceScope {
+                    workspace_root: "C:/workspace".to_owned(),
+                    allowed_paths: vec!["src".to_owned()],
+                    read_only: true,
+                },
+                artifact_transport: WorkerArtifactTransport {
+                    input_manifest_sha256: super::sha256_hex(br#"{"path":"src/lib.rs"}"#),
+                    output_manifest_sha256: super::sha256_hex(b"pending-output-manifest"),
+                    log_stream_id: "logs/run-networked-worker-result-replay".to_owned(),
+                    scratch_directory_id: "scratch/run-networked-worker-result-replay".to_owned(),
+                },
+                grant: WorkerRunGrant {
+                    grant_id: "grant-networked-worker-result-replay".to_owned(),
+                    run_id: "run-networked-worker-result-replay".to_owned(),
+                    tool_name: "palyra.fs.read_file".to_owned(),
+                    expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
+                },
+            },
+        )
+        .await
+        .expect("worker assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let delivery_attempt_id = create_released_networked_worker_dispatch_claim(
+        state.as_ref(),
+        worker_id,
+        &lease,
+        remote_request_id.as_str(),
+        node_request_id.as_str(),
+    );
+    let observed_at_unix_ms = lease.expires_at_unix_ms.saturating_sub(1);
+    let receipt = networked_worker_artifact_receipt_from_lease(
+        &lease,
+        remote_request_id.as_str(),
+        "proposal-networked-worker-result-replay",
+        "palyra.fs.read_file",
+        "session-networked-worker-result-replay",
+        observed_at_unix_ms,
+    );
+    let settlement = NetworkedWorkerDispatchSettlementIdentity {
+        remote_request_id: remote_request_id.clone(),
+        delivery_attempt_id: Some(delivery_attempt_id.clone()),
+    };
+    let cleanup = WorkerCleanupReport {
+        removed_workspace_scope: true,
+        removed_artifacts: true,
+        removed_logs: true,
+        failure_reason: None,
+    };
+
+    state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            receipt.clone(),
+            Some(settlement.clone()),
+        )
+        .await
+        .expect("initial result commit should succeed");
+    let events_after_commit =
+        state.journal_store.total_events().expect("journal count should load");
+
+    let mut later_receipt = receipt.clone();
+    later_receipt.observed_at_unix_ms = observed_at_unix_ms.saturating_add(1);
+    let replay = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            later_receipt,
+            Some(settlement.clone()),
+        )
+        .await
+        .expect("exact result replay should succeed");
+    assert_eq!(replay.state, WorkerLifecycleState::Completed);
+    assert_eq!(replay.timestamp_unix_ms, observed_at_unix_ms);
+    assert_eq!(
+        state.journal_store.total_events().expect("journal count should load"),
+        events_after_commit,
+        "exact replay must not append duplicate evidence"
+    );
+    let settled = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("settled dispatch should load")
+        .expect("settled dispatch should remain auditable");
+    assert_eq!(settled.result_observed_at_unix_ms, Some(observed_at_unix_ms));
+
+    let mut conflicting_result = receipt.clone();
+    conflicting_result.validated_result_sha256 = super::sha256_hex(b"conflicting-result-replay");
+    let conflicting_result_error = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            conflicting_result,
+            Some(settlement.clone()),
+        )
+        .await
+        .expect_err("changed result receipt must fail closed");
+    assert_eq!(conflicting_result_error.code(), Code::FailedPrecondition);
+
+    let conflicting_attempt_error = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            receipt.clone(),
+            Some(NetworkedWorkerDispatchSettlementIdentity {
+                remote_request_id: remote_request_id.clone(),
+                delivery_attempt_id: Some(Ulid::new().to_string()),
+            }),
+        )
+        .await
+        .expect_err("changed delivery attempt must fail closed");
+    assert_eq!(conflicting_attempt_error.code(), Code::FailedPrecondition);
+
+    let mut conflicting_artifact = receipt.clone();
+    conflicting_artifact.output_manifest_sha256 = super::sha256_hex(b"conflicting-output-manifest");
+    let conflicting_artifact_error = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            conflicting_artifact,
+            Some(settlement.clone()),
+        )
+        .await
+        .expect_err("changed artifact receipt must fail closed");
+    assert_eq!(conflicting_artifact_error.code(), Code::FailedPrecondition);
+
+    let conflicting_cleanup_error = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: false,
+                removed_logs: true,
+                failure_reason: Some("worker.cleanup.incomplete".to_owned()),
+            },
+            receipt.clone(),
+            Some(settlement.clone()),
+        )
+        .await
+        .expect_err("changed cleanup evidence must fail closed");
+    assert_eq!(conflicting_cleanup_error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        state.journal_store.total_events().expect("journal count should load"),
+        events_after_commit,
+        "conflicting stable receipts must not mutate durable evidence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_archived_result_receipt_replays_with_first_observation() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-archived-result-replay";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(
+            worker_id,
+            WorkerLeaseRequest {
+                run_id: "run-networked-worker-archived-result-replay".to_owned(),
+                ttl_ms: 30_000,
+                required_capabilities: vec![required_capability.to_owned()],
+                workspace_scope: WorkerWorkspaceScope {
+                    workspace_root: "C:/workspace".to_owned(),
+                    allowed_paths: vec!["src".to_owned()],
+                    read_only: true,
+                },
+                artifact_transport: WorkerArtifactTransport {
+                    input_manifest_sha256: super::sha256_hex(br#"{"path":"src/lib.rs"}"#),
+                    output_manifest_sha256: super::sha256_hex(b"pending-output-manifest"),
+                    log_stream_id: "logs/run-networked-worker-archived-result-replay".to_owned(),
+                    scratch_directory_id: "scratch/run-networked-worker-archived-result-replay"
+                        .to_owned(),
+                },
+                grant: WorkerRunGrant {
+                    grant_id: "grant-networked-worker-archived-result-replay".to_owned(),
+                    run_id: "run-networked-worker-archived-result-replay".to_owned(),
+                    tool_name: "palyra.fs.read_file".to_owned(),
+                    expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
+                },
+            },
+        )
+        .await
+        .expect("worker assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let delivery_attempt_id = create_released_networked_worker_dispatch_claim(
+        state.as_ref(),
+        worker_id,
+        &lease,
+        remote_request_id.as_str(),
+        node_request_id.as_str(),
+    );
+    let observed_at_unix_ms = lease.expires_at_unix_ms.saturating_sub(1);
+    let receipt = networked_worker_artifact_receipt_from_lease(
+        &lease,
+        remote_request_id.as_str(),
+        "proposal-networked-worker-archived-result-replay",
+        "palyra.fs.read_file",
+        "session-networked-worker-archived-result-replay",
+        observed_at_unix_ms,
+    );
+    let settlement = NetworkedWorkerDispatchSettlementIdentity {
+        remote_request_id: remote_request_id.clone(),
+        delivery_attempt_id: Some(delivery_attempt_id),
+    };
+    let cleanup = WorkerCleanupReport {
+        removed_workspace_scope: true,
+        removed_artifacts: true,
+        removed_logs: true,
+        failure_reason: None,
+    };
+    state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup.clone(),
+            receipt.clone(),
+            Some(settlement.clone()),
+        )
+        .await
+        .expect("initial result commit should succeed");
+    let events_after_commit =
+        state.journal_store.total_events().expect("journal count should load");
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute(
+            r#"
+                INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                    remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                    issued_fleet_generation, dispatch_fleet_generation, revoked_fleet_generation,
+                    lease_expires_at_unix_ms, capability, request_sha256, state,
+                    reconciliation_disposition, terminal_reason_code, created_at_unix_ms,
+                    updated_at_unix_ms, completed_at_unix_ms, schema_version,
+                    delivery_attempt_ulid, delivery_token_sha256,
+                    delivery_reserved_at_unix_ms, payload_released_at_unix_ms,
+                    payload_release_fleet_generation, payload_acknowledged_at_unix_ms,
+                    delivery_disposition, delivery_payload_present,
+                    validated_result_sha256, result_observed_at_unix_ms
+                )
+                SELECT remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                       issued_fleet_generation, dispatch_fleet_generation, revoked_fleet_generation,
+                       lease_expires_at_unix_ms, capability, request_sha256, state,
+                       reconciliation_disposition, terminal_reason_code, created_at_unix_ms,
+                       updated_at_unix_ms, completed_at_unix_ms, schema_version,
+                       delivery_attempt_ulid, delivery_token_sha256,
+                       delivery_reserved_at_unix_ms, payload_released_at_unix_ms,
+                       payload_release_fleet_generation, payload_acknowledged_at_unix_ms,
+                       delivery_disposition, delivery_payload_present,
+                       validated_result_sha256, result_observed_at_unix_ms
+                FROM runtime_networked_worker_dispatch_claims
+                WHERE remote_request_ulid = ?1
+            "#,
+            params![remote_request_id],
+        )
+        .expect("settled result receipt should archive");
+    connection
+        .execute(
+            "DELETE FROM runtime_networked_worker_dispatch_claims WHERE remote_request_ulid = ?1",
+            params![remote_request_id],
+        )
+        .expect("active settled result receipt should be reclaimed");
+    drop(connection);
+
+    let archived = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("archived result receipt should load")
+        .expect("archived result receipt should remain auditable");
+    assert_eq!(archived.state, NetworkedWorkerDispatchClaimState::Settled);
+    assert_eq!(archived.result_observed_at_unix_ms, Some(observed_at_unix_ms));
+
+    let mut later_receipt = receipt;
+    later_receipt.observed_at_unix_ms = observed_at_unix_ms.saturating_add(1);
+    let replay = state
+        .complete_networked_worker_result(
+            worker_id,
+            lease.identity(),
+            cleanup,
+            later_receipt,
+            Some(settlement),
+        )
+        .await
+        .expect("archived exact result replay should succeed");
+    assert_eq!(replay.timestamp_unix_ms, observed_at_unix_ms);
+    assert_eq!(
+        state.journal_store.total_events().expect("journal count should load"),
+        events_after_commit,
+        "archived exact replay must not append duplicate evidence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_artifact_journal_failure_rolls_back_completion_and_receipt() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-artifact-atomic";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(ValidRemoteWorkerResultDispatcher));
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_worker_artifact_receipt
+                BEFORE INSERT ON journal_events
+                WHEN NEW.payload_json LIKE '%worker.artifact_transport.attested%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced worker artifact receipt failure');
+                END;
+            "#,
+        )
+        .expect("failure trigger should install");
+    drop(connection);
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-artifact-atomic",
+            run_id: "run-networked-worker-artifact-atomic",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-artifact-atomic",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success, "artifact receipt failure must fail closed");
+    assert!(outcome.error.contains("result commit failed"), "{}", outcome.error);
+    assert!(
+        outcome.error.contains("forced worker artifact receipt failure"),
+        "the artifact insertion trigger must be the failing boundary: {}",
+        outcome.error
+    );
+    let fleet = state.worker_fleet_snapshot();
+    assert_eq!(fleet.active_leases, 1);
+    assert_eq!(fleet.busy_workers, 1);
+    let durable = state
+        .journal_store
+        .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load");
+    let worker = durable.get(worker_id).expect("assigned worker should remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Assigned);
+    assert!(worker.lease.is_some());
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    assert!(!snapshot.events.iter().any(|event| {
+        serde_json::from_str::<Value>(event.payload_json.as_str())
+            .ok()
+            .and_then(|payload| {
+                payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
+            })
+            .is_some_and(|reason| reason == "worker.artifact_transport.attested")
+    }));
+    assert!(!snapshot.events.iter().any(|event| {
+        serde_json::from_str::<Value>(event.payload_json.as_str())
+            .ok()
+            .and_then(|payload| {
+                payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
+            })
+            .is_some_and(|reason| reason == "worker.completed")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_invalid_remote_results_cannot_attest_or_release_authority() {
+    for mutation in [
+        InvalidRemoteWorkerResult::IdentityMismatch,
+        InvalidRemoteWorkerResult::BindingMismatch,
+        InvalidRemoteWorkerResult::DigestMismatch,
+        InvalidRemoteWorkerResult::InvalidCompletionTimestamp,
+    ] {
+        let suffix = mutation.suffix();
+        let state = build_test_runtime_state(false);
+        let worker_id = format!("worker-runtime-{suffix}");
+        let required_capability = "tool:palyra.fs.read_file";
+        let mut attestation = test_worker_attestation(worker_id.as_str());
+        attestation.supported_capabilities = vec![required_capability.to_owned()];
+        state
+            .register_networked_worker(attestation)
+            .await
+            .expect("worker registration should succeed");
+        state.configure_networked_worker_remote_dispatcher(Arc::new(
+            InvalidRemoteWorkerResultDispatcher { mutation },
+        ));
+
+        let outcome = super::execute_tool_with_runtime_dispatch(
+            &state,
+            super::ToolRuntimeExecutionContext {
+                principal: "user:ops",
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                channel: Some("cli"),
+                session_id: "session-networked-worker-invalid-result",
+                run_id: suffix,
+                execution_backend: ExecutionBackendPreference::NetworkedWorker,
+                backend_reason_code: "backend.available.networked_worker",
+            },
+            format!("proposal-{suffix}").as_str(),
+            "palyra.fs.read_file",
+            br#"{"path":"src/lib.rs"}"#,
+            None,
+        )
+        .await;
+
+        assert!(!outcome.success, "{suffix} must fail closed");
+        assert!(
+            outcome.error.contains("remote execution failed"),
+            "unexpected {suffix} error: {}",
+            outcome.error
+        );
+        let fleet = state.worker_fleet_snapshot();
+        assert_eq!(fleet.active_leases, 0, "{suffix} must revoke the exact lease");
+        assert_eq!(fleet.failed_closed_workers, 1, "{suffix} must fail the worker closed");
+        assert!(
+            state
+                .worker_fleet_recent_events()
+                .iter()
+                .any(|event| event.reason_code == "worker.cleanup_failed"),
+            "{suffix} must retain unverified cleanup evidence"
+        );
+
+        let snapshot = state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("recent journal snapshot should be returned");
+        assert!(
+            !snapshot.events.iter().any(|event| {
+                serde_json::from_str::<Value>(event.payload_json.as_str())
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .pointer("/payload/reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|reason| reason == "worker.artifact_transport.attested")
+            }),
+            "{suffix} must not attest untrusted artifact transport"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_cleanup_gap_preserves_report_without_artifact_attestation() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-cleanup-gap";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        InvalidRemoteWorkerResultDispatcher { mutation: InvalidRemoteWorkerResult::CleanupGap },
+    ));
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-cleanup-gap",
+            run_id: "run-networked-worker-cleanup-gap",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-cleanup-gap",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success);
+    assert!(outcome.error.contains("cleanup verification incomplete"), "{}", outcome.error);
+    assert!(!outcome.error.contains("artifact directory not empty"));
+    let manifest = outcome
+        .attestation
+        .execution_manifest
+        .as_ref()
+        .expect("validated cleanup gap should preserve the remote execution manifest");
+    assert!(!manifest.cleanup.success);
+    assert_eq!(manifest.cleanup.reason_code, "worker.cleanup.incomplete");
+    assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    assert!(snapshot.events.iter().any(|event| {
+        serde_json::from_str::<Value>(event.payload_json.as_str()).ok().is_some_and(|payload| {
+            payload
+                .pointer("/payload/details/cleanup_report/failure_reason")
+                .and_then(Value::as_str)
+                == Some("worker.cleanup.incomplete")
+        })
+    }));
+    assert!(!snapshot
+        .events
+        .iter()
+        .any(|event| { event.payload_json.contains("artifact directory not empty") }));
+    assert!(!snapshot.events.iter().any(|event| {
+        serde_json::from_str::<Value>(event.payload_json.as_str())
+            .ok()
+            .and_then(|payload| {
+                payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
+            })
+            .is_some_and(|reason| reason == "worker.artifact_transport.attested")
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5595,7 +9773,7 @@ async fn process_lifecycle_tools_reject_unregistered_run_pid() {
 
     assert!(!unowned.success, "unregistered process status must fail");
     assert!(
-        unowned.error.contains("not registered as a run-owned background process"),
+        unowned.error.contains("not authorized by a matching run-owned process lease"),
         "unexpected error: {}",
         unowned.error
     );
@@ -5617,7 +9795,7 @@ async fn process_lifecycle_tools_reject_unregistered_run_pid() {
 
     assert!(!input_unowned.success, "unregistered process input must fail");
     assert!(
-        input_unowned.error.contains("not registered as a run-owned background process"),
+        input_unowned.error.contains("not authorized by a matching run-owned process lease"),
         "unexpected error: {}",
         input_unowned.error
     );
@@ -5639,16 +9817,14 @@ async fn process_lifecycle_tools_reject_unregistered_run_pid() {
 
     assert!(!keys_unowned.success, "unregistered process send_keys must fail");
     assert!(
-        keys_unowned.error.contains("not registered as a run-owned background process"),
+        keys_unowned.error.contains("not authorized by a matching run-owned process lease"),
         "unexpected error: {}",
         keys_unowned.error
     );
 
-    state.record_run_background_process(context.run_id, pid);
-    assert!(super::process_lifecycle_pid_is_run_owned(&state, context.run_id, pid));
     assert!(
-        !super::process_lifecycle_pid_is_run_owned(&state, "run-process-lifecycle-other", pid),
-        "PID ownership must stay bound to the active run id"
+        !super::process_lifecycle_pid_is_run_owned(&state, context.run_id, pid),
+        "PID membership alone must never create process ownership"
     );
 }
 
@@ -5758,15 +9934,66 @@ fn cleanup_resource_parsers_extract_run_owned_handles() {
     let process_output = serde_json::to_vec(&json!({
         "background": true,
         "pid": 111,
+        "target_pid": 444,
         "process_handle": {
-            "kind": "pid",
+            "kind": "unix_process_supervisor",
+            "ownership_root_pid": 333,
             "direct_process_pid": 222,
+            "target_pid": 444,
         },
     }))
     .expect("process output should serialize");
     assert_eq!(
         super::background_process_pid_from_tool_output(process_output.as_slice()),
+        Some(333)
+    );
+
+    let direct_compatibility_output = serde_json::to_vec(&json!({
+        "background": true,
+        "pid": 111,
+        "process_handle": {
+            "direct_process_pid": 222,
+        },
+    }))
+    .expect("direct compatibility output should serialize");
+    assert_eq!(
+        super::background_process_pid_from_tool_output(direct_compatibility_output.as_slice()),
         Some(222)
+    );
+
+    let top_level_compatibility_output = serde_json::to_vec(&json!({
+        "background": true,
+        "pid": 111,
+    }))
+    .expect("top-level compatibility output should serialize");
+    assert_eq!(
+        super::background_process_pid_from_tool_output(top_level_compatibility_output.as_slice()),
+        Some(111)
+    );
+
+    let target_only_output = serde_json::to_vec(&json!({
+        "background": true,
+        "target_pid": 444,
+        "process_handle": {
+            "target_pid": 444,
+        },
+    }))
+    .expect("target-only output should serialize");
+    assert_eq!(super::background_process_pid_from_tool_output(target_only_output.as_slice()), None);
+
+    let malformed_root_output = serde_json::to_vec(&json!({
+        "background": true,
+        "pid": 111,
+        "process_handle": {
+            "ownership_root_pid": "not-a-pid",
+            "direct_process_pid": 222,
+        },
+    }))
+    .expect("malformed root output should serialize");
+    assert_eq!(
+        super::background_process_pid_from_tool_output(malformed_root_output.as_slice()),
+        None,
+        "a malformed preferred ownership root must not fall through to lower-priority fields"
     );
 
     let foreground_output = serde_json::to_vec(&json!({
@@ -5785,60 +10012,270 @@ fn cleanup_resource_parsers_extract_run_owned_handles() {
 }
 
 #[test]
-fn process_stop_parser_requires_verified_tracked_tree_shutdown() {
-    let tracked_without_after_count = serde_json::to_vec(&json!({
-        "alive": false,
-        "process_tree_alive": false,
-        "tracked_process_count_before_stop": 2,
-    }))
-    .expect("stop output should serialize");
-    assert!(
-        !super::process_stop_outcome_verifies_tree_stopped(
-            tracked_without_after_count.as_slice()
-        ),
-        "tracked Windows tree stops need a post-stop tracked count before cleanup tracking is released"
-    );
+fn process_stop_parser_requires_bound_typed_ownership_proof() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 4_000_000_u32.saturating_add(std::process::id());
+    let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "parser");
+    let now = 100_000_i64;
+    let verified_payload = |ownership_identity_sha256: &str, observed_at_unix_ms: i64| {
+        serde_json::to_vec(&json!({
+            "pid": pid,
+            "alive": false,
+            "process_tree_alive": false,
+            "tracked_process_count": 0,
+            "stop_acknowledgement": {
+                "schema_version": 1,
+                "pid": pid,
+                "ownership_kind": "windows_job_object",
+                "ownership_identity_sha256": ownership_identity_sha256,
+                "observed_at_unix_ms": observed_at_unix_ms,
+                "proof": {"windows_job_object_empty": {"active_process_count": 0}},
+            },
+        }))
+        .expect("stop output should serialize")
+    };
 
-    let tracked_with_zero_after_count = serde_json::to_vec(&json!({
+    let sparse = serde_json::to_vec(&json!({
+        "pid": pid,
         "alive": false,
         "process_tree_alive": false,
-        "tracked_process_count_before_stop": 2,
         "tracked_process_count": 0,
     }))
-    .expect("stop output should serialize");
-    assert!(super::process_stop_outcome_verifies_tree_stopped(
-        tracked_with_zero_after_count.as_slice()
-    ));
+    .expect("sparse stop output should serialize");
+    assert!(!super::process_stop_outcome_verifies_tree_stopped(sparse.as_slice(), &process, now));
 
-    let direct_only_stopped = serde_json::to_vec(&json!({
+    let mut unix_process = process.clone();
+    unix_process.lease.provenance.ownership_kind = ProcessOwnershipKind::UnixProcessGroup;
+    let unix_supervisor_acknowledgement = serde_json::to_vec(&json!({
+        "pid": pid,
         "alive": false,
         "process_tree_alive": false,
+        "tracked_process_count": 0,
+        "stop_acknowledgement": {
+            "schema_version": 1,
+            "pid": pid,
+            "ownership_kind": "unix_process_group",
+            "ownership_identity_sha256": unix_process.lease.provenance.ownership_identity_sha256,
+            "observed_at_unix_ms": now,
+            "proof": "unix_supervisor_cleanup_acknowledged",
+        },
     }))
-    .expect("stop output should serialize");
-    assert!(super::process_stop_outcome_verifies_tree_stopped(direct_only_stopped.as_slice()));
+    .expect("Unix supervisor acknowledgement output should serialize");
+    assert!(super::process_stop_outcome_verifies_tree_stopped(
+        unix_supervisor_acknowledgement.as_slice(),
+        &unix_process,
+        now,
+    ));
 
-    let still_alive = serde_json::to_vec(&json!({
-        "alive": true,
-        "process_tree_alive": true,
+    let verified =
+        verified_payload(process.lease.provenance.ownership_identity_sha256.as_str(), now);
+    assert!(super::process_stop_outcome_verifies_tree_stopped(verified.as_slice(), &process, now));
+
+    let wrong_ownership = verified_payload("c", now);
+    assert!(!super::process_stop_outcome_verifies_tree_stopped(
+        wrong_ownership.as_slice(),
+        &process,
+        now
+    ));
+
+    let stale = verified_payload(process.lease.provenance.ownership_identity_sha256.as_str(), 1);
+    assert!(!super::process_stop_outcome_verifies_tree_stopped(stale.as_slice(), &process, now));
+
+    let wrong_pid = serde_json::to_vec(&json!({
+        "pid": pid + 1,
+        "alive": false,
+        "process_tree_alive": false,
+        "tracked_process_count": 0,
+        "stop_acknowledgement": {
+            "schema_version": 1,
+            "pid": pid,
+            "ownership_kind": "windows_job_object",
+            "ownership_identity_sha256": process.lease.provenance.ownership_identity_sha256,
+            "observed_at_unix_ms": now,
+            "proof": {"windows_job_object_empty": {"active_process_count": 0}},
+        },
     }))
-    .expect("stop output should serialize");
-    assert!(!super::process_stop_outcome_verifies_tree_stopped(still_alive.as_slice()));
+    .expect("mismatched stop output should serialize");
+    assert!(!super::process_stop_outcome_verifies_tree_stopped(
+        wrong_pid.as_slice(),
+        &process,
+        now
+    ));
+}
+
+fn explicit_stop_test_process(
+    state: &GatewayRuntimeState,
+    run_id: &str,
+    pid: u32,
+    suffix: &str,
+) -> super::runtime::RunOwnedBackgroundProcess {
+    explicit_stop_test_process_with_provenance(
+        state,
+        run_id,
+        pid,
+        suffix,
+        ProcessProvenance {
+            ownership_kind: ProcessOwnershipKind::WindowsJobObject,
+            start_token: format!("explicit-stop-start-{suffix}"),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: format!("explicit-stop-nonce-{suffix}"),
+            ownership_identity_sha256: "b".repeat(64),
+        },
+    )
+}
+
+fn explicit_stop_test_process_with_provenance(
+    state: &GatewayRuntimeState,
+    run_id: &str,
+    pid: u32,
+    suffix: &str,
+    provenance: ProcessProvenance,
+) -> super::runtime::RunOwnedBackgroundProcess {
+    let generation = RuntimeGeneration::new(1).expect("generation should validate");
+    let instance_id = RuntimeInstanceId::parse(format!("explicit-stop:{suffix}").as_str())
+        .expect("instance id should validate");
+    let process = super::runtime::RunOwnedBackgroundProcess {
+        descriptor: RuntimeHandleDescriptorV1 {
+            schema_version: 1,
+            instance_id: instance_id.clone(),
+            kind: RuntimeHandleKind::Process,
+            session_id: None,
+            run_id: None,
+            generation,
+            owner: "explicit-stop-test".to_owned(),
+            state: RuntimeHandleState::Running,
+            resume_metadata_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        },
+        lease: ProcessLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse(format!("explicit-stop-lease:{suffix}").as_str())
+                .expect("lease id should validate"),
+            instance_id,
+            generation,
+            pid,
+            provenance,
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: i64::MAX,
+            verified_at_unix_ms: 1,
+        },
+    };
+    state
+        .record_run_background_process(run_id, process.clone())
+        .expect("explicit-stop process should persist");
+    process
 }
 
 #[test]
-fn cleanup_resource_registry_deduplicates_and_drains_by_run() {
+fn verified_explicit_process_stop_retires_durable_lease_before_forgetting_authority() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 4_100_000_u32.saturating_add(std::process::id());
+    let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "verified");
+    let output = serde_json::to_vec(&json!({
+        "pid": pid,
+        "alive": false,
+        "process_tree_alive": false,
+        "tracked_process_count_before_stop": 1,
+        "tracked_process_count": 0,
+        "stop_acknowledgement": {
+            "schema_version": 1,
+            "pid": pid,
+            "ownership_kind": "windows_job_object",
+            "ownership_identity_sha256": process.lease.provenance.ownership_identity_sha256,
+            "observed_at_unix_ms": super::current_unix_ms(),
+            "proof": {"windows_job_object_empty": {"active_process_count": 0}},
+        },
+    }))
+    .expect("verified stop output should serialize");
+
+    super::finalize_explicit_process_stop(&state, run_id.as_str(), pid, output.as_slice())
+        .expect("verified explicit stop should finalize");
+
+    assert!(state.run_background_process(run_id.as_str(), pid).is_none());
+    assert!(
+        state
+            .journal_store
+            .list_persisted_process_leases(1)
+            .expect("active process leases should load")
+            .is_empty(),
+        "verified explicit stop must retire the exact durable lease"
+    );
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("explicit-stop journal should reopen");
+    let (handle_state, report_outcome, verify_evidence): (String, String, Option<String>) =
+        connection
+            .query_row(
+                r#"
+                    SELECT h.state, r.outcome, s.evidence_sha256
+                    FROM runtime_handles h
+                    JOIN runtime_cleanup_reports r ON r.instance_ulid = h.instance_ulid
+                    JOIN runtime_cleanup_steps s
+                      ON s.report_ulid = r.report_ulid AND s.step = 'verify_absence'
+                    WHERE h.instance_ulid = ?1
+                "#,
+                params![process.descriptor.instance_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("explicit-stop cleanup evidence should load");
+    assert_eq!(handle_state, RuntimeHandleState::Closed.as_str());
+    assert_eq!(report_outcome, CleanupOutcome::Completed.as_str());
+    assert_eq!(verify_evidence.as_deref(), Some(super::sha256_hex(output.as_slice()).as_str()));
+}
+
+#[test]
+fn unverifiable_explicit_process_stop_retains_durable_lease_and_run_authority() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let pid = 4_200_000_u32.saturating_add(std::process::id());
+    let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "unverified");
+    let output = serde_json::to_vec(&json!({
+        "alive": false,
+        "process_tree_alive": false,
+        "tracked_process_count_before_stop": 1,
+    }))
+    .expect("unverified stop output should serialize");
+
+    super::finalize_explicit_process_stop(&state, run_id.as_str(), pid, output.as_slice())
+        .expect("unverified explicit stop should persist unknown cleanup evidence");
+
+    assert!(state.run_background_process(run_id.as_str(), pid).is_some());
+    let remaining = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("unverified process lease should load");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].lease.lease_id, process.lease.lease_id);
+    assert_eq!(remaining[0].descriptor.state, RuntimeHandleState::Orphaned);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&1));
+
+    super::finalize_explicit_process_stop(&state, run_id.as_str(), pid, output.as_slice())
+        .expect("repeated unverified stop finalization should be idempotent");
+    let repeated_diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should reload");
+    assert_eq!(repeated_diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&1));
+}
+
+#[test]
+fn cleanup_resource_registry_deduplicates_and_drains_browser_sessions() {
     let state = build_test_runtime_state(false);
     let run_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
 
     state.record_run_browser_session(run_id.as_str(), session_id.as_str());
     state.record_run_browser_session(run_id.as_str(), session_id.as_str());
-    state.record_run_background_process(run_id.as_str(), 42);
-    state.record_run_background_process(run_id.as_str(), 42);
 
     let resources = state.take_run_cleanup_resources(run_id.as_str());
     assert_eq!(resources.browser_session_ids, vec![session_id]);
-    assert_eq!(resources.background_process_pids, vec![42]);
+    assert!(resources.background_processes.is_empty());
     assert!(state.take_run_cleanup_resources(run_id.as_str()).is_empty());
 }
 
@@ -5882,6 +10319,9 @@ async fn terminal_cancel_cleanup_drains_registered_resources_after_noop_snapshot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome() {
+    let _env_guard = lock_run_stream_delivery_test_guard().await;
+    let _delivery_timeout =
+        ScopedEnvVar::set_str("PALYRA_TEST_RUN_STREAM_TERMINAL_DELIVERY_TIMEOUT_MS", "5000");
     let state = build_test_runtime_state(false);
     let run_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -5897,6 +10337,7 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
         .expect("barrier event should fill the wire channel");
     let final_state = Arc::clone(&state);
     let final_run_id = run_id.clone();
+    let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
     let finalizer = tokio::spawn(async move {
         let mut tape_seq = 0;
         let outcome = finalize_run_stream_after_provider_response(
@@ -5905,7 +10346,9 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
             &mut run_state,
             final_run_id.as_str(),
             Some("embedded_run_stream"),
+            &flow_control,
             &mut tape_seq,
+            Vec::new(),
         )
         .await;
         (outcome, tape_seq)
@@ -5934,8 +10377,8 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
                 .expect("blocked finalization tape should load");
             if tape.iter().any(|event| event.event_type == "run.runtime_path_summary") {
                 assert!(
-                    !tape.iter().any(|event| event.event_type == "status"),
-                    "runtime-path summary must be durable before the blocked terminal wire send"
+                    tape.iter().any(|event| event.event_type == "status"),
+                    "runtime-path summary and terminal status must commit before wire delivery"
                 );
                 break;
             }
@@ -5986,7 +10429,7 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn orchestrator_cancel_freezes_existing_and_late_feature_usage() {
+async fn orchestrator_cancel_freezes_feature_usage_only_after_settlement() {
     let state = build_test_runtime_state(false);
     let run_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -6034,17 +10477,43 @@ async fn orchestrator_cancel_freezes_existing_and_late_feature_usage() {
         FeatureUsagePath::Direct,
     );
 
+    let pending_cancel = state.feature_usage_snapshot();
+    assert_eq!(pending_cancel.active_runs, 2);
+    assert_eq!(pending_cancel.terminal_runs, 0);
+
+    state
+        .update_orchestrator_run_state(
+            cancel.run_id.clone(),
+            RunLifecycleState::Cancelled,
+            Some(cancel.reason.clone()),
+        )
+        .await
+        .expect("first cancellation should settle");
+    state
+        .update_orchestrator_run_state(
+            late_cancel.run_id.clone(),
+            RunLifecycleState::Cancelled,
+            Some(late_cancel.reason.clone()),
+        )
+        .await
+        .expect("late cancellation should settle");
+    state.record_feature_usage(
+        cancel.run_id.as_str(),
+        FeatureUsageCapability::VerificationRuntime,
+        FeatureUsagePath::Direct,
+    );
+
     let after_cancel = state.feature_usage_snapshot();
     assert_eq!(after_cancel.active_runs, 0);
-    assert_eq!(after_cancel.terminal_runs, 1);
+    assert_eq!(after_cancel.terminal_runs, 2);
     let verification_usage = after_cancel
         .capabilities
         .iter()
         .find(|snapshot| snapshot.capability == FeatureUsageCapability::VerificationRuntime)
         .expect("verification usage bucket should exist");
-    assert_eq!(verification_usage.terminal_direct_runs, 1);
-    assert_eq!(verification_usage.fallback_runs, 0);
-    assert_eq!(verification_usage.dropped_observations, 2);
+    assert_eq!(verification_usage.terminal_direct_runs, 2);
+    assert_eq!(verification_usage.fallback_runs, 1);
+    assert_eq!(verification_usage.dropped_observations, 1);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6807,7 +11276,9 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
     .expect("successful run finalization should complete");
@@ -6827,6 +11298,338 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
     assert_eq!(summary["terminal_state"], "done");
     assert_eq!(summary["terminal_reason"], "runtime.terminal.completed");
     assert_eq!(summary["attempt_owner"], "embedded_run_stream");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_settlement_commits_additional_tape_evidence_before_generation_closure() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+    let terminal_tape_events = vec![
+        OrchestratorTerminalTapeEvent {
+            event_type: "harness.run.completed".to_owned(),
+            payload_json: json!({"schema_version": 1, "event": "harness.run.completed"})
+                .to_string(),
+        },
+        OrchestratorTerminalTapeEvent {
+            event_type: "harness.run.cleaned_up".to_owned(),
+            payload_json: json!({"schema_version": 1, "event": "harness.run.cleaned_up"})
+                .to_string(),
+        },
+    ];
+
+    let outcome = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
+        &mut tape_seq,
+        terminal_tape_events,
+    )
+    .await
+    .expect("terminal evidence should settle atomically");
+
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Completed);
+    assert_eq!(run_state.state(), RunLifecycleState::Done);
+    assert!(
+        state
+            .runtime_generation_for_run(run_id.clone())
+            .await
+            .expect("generation should query")
+            .is_none(),
+        "terminal settlement should close the run generation"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(
+        tape.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+        ["run.runtime_path_summary", "harness.run.completed", "harness.run.cleaned_up", "status",]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_settlement_failure_retains_cleanup_ownership_and_heartbeat() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let durable_state_before = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist")
+        .state;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-settlement-failure");
+    state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        execution_generation: None,
+        summary: "cancel settlement failure ownership regression".to_owned(),
+    });
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_cancelled_terminal_settlement
+                BEFORE INSERT ON orchestrator_tape
+                WHEN NEW.run_ulid = 'RUN_ID'
+                  AND NEW.event_type = 'status'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced cancelled terminal settlement failure');
+                END;
+            "#
+            .replace("RUN_ID", run_id.as_str())
+            .as_str(),
+        )
+        .expect("terminal settlement failure trigger should install");
+    drop(connection);
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
+    let mut tape_seq = 0;
+
+    let error = transition_run_stream_to_cancelled(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        &flow_control,
+        &mut tape_seq,
+        None,
+    )
+    .await
+    .expect_err("injected settlement failure should surface");
+
+    assert_eq!(error.code(), Code::Internal);
+    assert!(error.message().contains("forced cancelled terminal settlement failure"));
+    assert_eq!(run_state.state(), RunLifecycleState::InProgress);
+    let snapshot = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist");
+    assert_eq!(snapshot.state, durable_state_before);
+    assert!(
+        state
+            .runtime_generation_for_run(run_id.clone())
+            .await
+            .expect("generation should query")
+            .is_some(),
+        "failed settlement must leave the exact run generation active"
+    );
+    let resources = state.take_run_cleanup_resources(run_id.as_str());
+    assert_eq!(
+        resources.browser_session_ids,
+        vec!["browser-session-settlement-failure".to_owned()],
+        "failed settlement must retain run-owned cleanup authority"
+    );
+    assert!(
+        state.self_healing_heartbeats().into_iter().any(|heartbeat| {
+            heartbeat.kind == WorkHeartbeatKind::Run && heartbeat.object_id == run_id
+        }),
+        "failed settlement must retain the watchdog recovery owner"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert!(tape.is_empty(), "failed settlement must roll back terminal tape evidence");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_cancelled_finalization_failure_retains_cleanup_ownership_and_heartbeat() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let durable_state_before = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist")
+        .state;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-late-cancel-failure");
+    state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        execution_generation: None,
+        summary: "late cancel settlement failure ownership regression".to_owned(),
+    });
+    state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "late_cancel_settlement_failure".to_owned(),
+        })
+        .await
+        .expect("cancel request should persist");
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_late_cancelled_terminal_settlement
+                BEFORE INSERT ON orchestrator_tape
+                WHEN NEW.run_ulid = 'RUN_ID'
+                  AND NEW.event_type = 'status'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced late cancelled terminal settlement failure');
+                END;
+            "#
+            .replace("RUN_ID", run_id.as_str())
+            .as_str(),
+        )
+        .expect("terminal settlement failure trigger should install");
+    drop(connection);
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let error = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
+        &mut tape_seq,
+        Vec::new(),
+    )
+    .await
+    .expect_err("injected late-cancel settlement failure should surface");
+
+    assert_eq!(error.code(), Code::Internal);
+    assert!(error.message().contains("forced late cancelled terminal settlement failure"));
+    assert_eq!(run_state.state(), RunLifecycleState::InProgress);
+    let snapshot = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist");
+    assert_eq!(snapshot.state, durable_state_before);
+    assert!(
+        state
+            .runtime_generation_for_run(run_id.clone())
+            .await
+            .expect("generation should query")
+            .is_some(),
+        "failed settlement must leave the exact run generation active"
+    );
+    let resources = state.take_run_cleanup_resources(run_id.as_str());
+    assert_eq!(
+        resources.browser_session_ids,
+        vec!["browser-session-late-cancel-failure".to_owned()],
+        "failed settlement must retain run-owned cleanup authority"
+    );
+    assert!(
+        state.self_healing_heartbeats().into_iter().any(|heartbeat| {
+            heartbeat.kind == WorkHeartbeatKind::Run && heartbeat.object_id == run_id
+        }),
+        "failed settlement must retain the watchdog recovery owner"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert!(tape.is_empty(), "failed settlement must roll back terminal tape evidence");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_finalization_failure_retains_cleanup_ownership_and_heartbeat() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let durable_state_before = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist")
+        .state;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-completed-failure");
+    state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.clone(),
+        execution_generation: None,
+        summary: "completed settlement failure ownership regression".to_owned(),
+    });
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_completed_terminal_settlement
+                BEFORE INSERT ON orchestrator_tape
+                WHEN NEW.run_ulid = 'RUN_ID'
+                  AND NEW.event_type = 'status'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced completed terminal settlement failure');
+                END;
+            "#
+            .replace("RUN_ID", run_id.as_str())
+            .as_str(),
+        )
+        .expect("terminal settlement failure trigger should install");
+    drop(connection);
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let error = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
+        &mut tape_seq,
+        Vec::new(),
+    )
+    .await
+    .expect_err("injected completion settlement failure should surface");
+
+    assert_eq!(error.code(), Code::Internal);
+    assert!(error.message().contains("forced completed terminal settlement failure"));
+    assert_eq!(run_state.state(), RunLifecycleState::InProgress);
+    let snapshot = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist");
+    assert_eq!(snapshot.state, durable_state_before);
+    assert!(
+        state
+            .runtime_generation_for_run(run_id.clone())
+            .await
+            .expect("generation should query")
+            .is_some(),
+        "failed settlement must leave the exact run generation active"
+    );
+    let resources = state.take_run_cleanup_resources(run_id.as_str());
+    assert_eq!(
+        resources.browser_session_ids,
+        vec!["browser-session-completed-failure".to_owned()],
+        "failed settlement must retain run-owned cleanup authority"
+    );
+    assert!(
+        state.self_healing_heartbeats().into_iter().any(|heartbeat| {
+            heartbeat.kind == WorkHeartbeatKind::Run && heartbeat.object_id == run_id
+        }),
+        "failed settlement must retain the watchdog recovery owner"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert!(tape.is_empty(), "failed settlement must roll back terminal tape evidence");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6855,7 +11658,9 @@ async fn pending_cancel_before_finalization_records_one_summary_and_terminal_sta
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
     .expect("late cancellation should finalize");
@@ -6879,11 +11684,12 @@ async fn pending_cancel_before_finalization_records_one_summary_and_terminal_sta
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn persisted_cancel_wins_done_finalization_with_one_terminal_summary() {
+async fn preterminalized_cancel_blocks_late_status_projection() {
     let state = build_test_runtime_state(false);
     let session_id = Ulid::new().to_string();
     let run_id = Ulid::new().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
     state
         .update_orchestrator_run_state(
             run_id.clone(),
@@ -6905,21 +11711,62 @@ async fn persisted_cancel_wins_done_finalization_with_one_terminal_summary() {
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &flow_control,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
     .expect("persisted cancellation should win finalization");
 
     assert_eq!(outcome, RunStreamPostProviderOutcome::Cancelled);
+    assert_eq!(run_state.state(), RunLifecycleState::Cancelled);
     let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
-    assert_eq!(
-        tape.iter().filter(|event| event.event_type == "run.runtime_path_summary").count(),
-        1
+    assert!(
+        tape.is_empty(),
+        "the losing finalizer must not append duplicate terminal tape evidence"
     );
-    assert_eq!(tape.iter().filter(|event| event.event_type == "status").count(), 1);
-    assert_eq!(
-        tape.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
-        ["run.runtime_path_summary", "status"]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preterminalized_failure_controls_late_completion_state() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .update_orchestrator_run_state(
+            run_id.clone(),
+            RunLifecycleState::Failed,
+            Some("failure_won_done_race".to_owned()),
+        )
+        .await
+        .expect("test should persist the concurrent terminal state");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let outcome = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
+        &mut tape_seq,
+        Vec::new(),
+    )
+    .await
+    .expect("persisted failure should control late completion");
+
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Failed);
+    assert_eq!(run_state.state(), RunLifecycleState::Failed);
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert!(
+        tape.is_empty(),
+        "the losing completion finalizer must not append duplicate terminal tape evidence"
     );
 }
 
@@ -6939,22 +11786,20 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
     run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
     let mut tape_seq = 0;
 
-    let error = finalize_run_stream_after_provider_response(
+    let outcome = finalize_run_stream_after_provider_response(
         &sender,
         &state,
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
-    .expect_err("closed client channel should still be reported to caller");
+    .expect("durable completion should survive a closed client channel");
 
-    assert_eq!(error.code(), tonic::Code::Cancelled);
-    assert_eq!(
-        error.message(),
-        crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE
-    );
+    assert_eq!(outcome, RunStreamPostProviderOutcome::CompletedDeliveryFailed);
     assert_eq!(run_state.state(), RunLifecycleState::Done);
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
@@ -6963,7 +11808,61 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn successful_run_finalization_cleans_resources_when_summary_append_fails() {
+async fn full_response_channel_times_out_terminal_delivery_after_durable_settlement() {
+    let _env_guard = lock_run_stream_delivery_test_guard().await;
+    let _delivery_timeout =
+        ScopedEnvVar::set_str("PALYRA_TEST_RUN_STREAM_TERMINAL_DELIVERY_TIMEOUT_MS", "20");
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state.record_run_browser_session(run_id.as_str(), "browser-session-delivery-timeout");
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(Ok(common_v1::RunStreamEvent::default()))
+        .await
+        .expect("barrier event should fill the response channel");
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
+    let mut tape_seq = 0;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        finalize_run_stream_after_provider_response(
+            &sender,
+            &state,
+            &mut run_state,
+            run_id.as_str(),
+            Some("embedded_run_stream"),
+            &flow_control,
+            &mut tape_seq,
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("terminal delivery should respect the bounded delivery scope")
+    .expect("durable completion should survive delivery timeout");
+
+    assert_eq!(outcome, RunStreamPostProviderOutcome::CompletedDeliveryFailed);
+    assert_eq!(run_state.state(), RunLifecycleState::Done);
+    assert_eq!(state.counters.snapshot().run_stream_terminal_delivery_timeouts, 1);
+    assert!(
+        state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
+        "delivery timeout must not skip terminal cleanup"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(
+        tape.iter().filter(|event| event.event_type == "status").count(),
+        1,
+        "wire timeout must not duplicate durable terminal evidence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_run_finalization_allocates_after_existing_tape_rows() {
     let state = build_test_runtime_state(false);
     let session_id = Ulid::new().to_string();
     let run_id = Ulid::new().to_string();
@@ -6972,6 +11871,7 @@ async fn successful_run_finalization_cleans_resources_when_summary_append_fails(
     state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
         kind: WorkHeartbeatKind::Run,
         object_id: run_id.clone(),
+        execution_generation: None,
         summary: "summary append failure regression".to_owned(),
     });
     state
@@ -6990,34 +11890,44 @@ async fn successful_run_finalization_cleans_resources_when_summary_append_fails(
     run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
     let mut tape_seq = 0;
 
-    let error = finalize_run_stream_after_provider_response(
+    let outcome = finalize_run_stream_after_provider_response(
         &sender,
         &state,
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
-    .expect_err("the injected tape sequence conflict should be reported");
+    .expect("host sequence allocation should avoid existing tape rows");
 
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Completed);
     assert_eq!(run_state.state(), RunLifecycleState::Done);
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
-        "runtime-path summary persistence failures must not skip terminal cleanup"
+        "host-allocated terminal persistence must not skip terminal cleanup"
     );
     assert!(
         state.self_healing_heartbeats().into_iter().all(|heartbeat| heartbeat.object_id != run_id),
-        "runtime-path summary persistence failures must not leave a run heartbeat"
+        "host-allocated terminal persistence must not leave a run heartbeat"
     );
     let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
-    assert_eq!(tape[0].event_type, "seed.sequence_conflict");
-    assert_eq!(tape.last().map(|event| event.event_type.as_str()), Some("run.cleanup"));
+    assert_eq!(
+        tape.iter().map(|event| (event.seq, event.event_type.as_str())).collect::<Vec<_>>(),
+        vec![
+            (0, "seed.sequence_conflict"),
+            (1, "run.runtime_path_summary"),
+            (2, "status"),
+            (3, "run.cleanup"),
+        ]
+    );
+    assert_eq!(tape_seq, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pending_cancel_cleans_resources_when_summary_append_fails() {
+async fn pending_cancel_allocates_after_existing_tape_rows() {
     let state = build_test_runtime_state(false);
     let session_id = Ulid::new().to_string();
     let run_id = Ulid::new().to_string();
@@ -7026,6 +11936,7 @@ async fn pending_cancel_cleans_resources_when_summary_append_fails() {
     state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
         kind: WorkHeartbeatKind::Run,
         object_id: run_id.clone(),
+        execution_generation: None,
         summary: "cancel summary append failure regression".to_owned(),
     });
     state
@@ -7051,41 +11962,838 @@ async fn pending_cancel_cleans_resources_when_summary_append_fails() {
     run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
     let mut tape_seq = 0;
 
-    let error = finalize_run_stream_after_provider_response(
+    let outcome = finalize_run_stream_after_provider_response(
         &sender,
         &state,
         &mut run_state,
         run_id.as_str(),
         Some("embedded_run_stream"),
+        &run_stream_flow_control(&state, run_id.as_str()).await,
         &mut tape_seq,
+        Vec::new(),
     )
     .await
-    .expect_err("the injected summary conflict should be reported after cleanup");
+    .expect("host sequence allocation should settle the pending cancellation");
 
-    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Cancelled);
     assert_eq!(run_state.state(), RunLifecycleState::Cancelled);
     assert!(state.take_run_cleanup_resources(run_id.as_str()).is_empty());
     assert!(state
         .self_healing_heartbeats()
         .into_iter()
         .all(|heartbeat| heartbeat.object_id != run_id));
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert_eq!(
+        tape.iter().map(|event| (event.seq, event.event_type.as_str())).collect::<Vec<_>>(),
+        vec![
+            (0, "seed.cancel_sequence_conflict"),
+            (1, "run.runtime_path_summary"),
+            (2, "status"),
+            (3, "run.cleanup"),
+        ]
+    );
+    assert_eq!(tape_seq, 3);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_run_finalization_cleans_run_owned_process_tracking() {
-    let state = build_test_runtime_state(false);
+#[cfg(not(target_os = "macos"))]
+async fn start_registered_background_process_for_reconciliation_test(
+    name: &str,
+) -> (
+    Arc<GatewayRuntimeState>,
+    String,
+    String,
+    super::ToolExecutionOutcome,
+    super::runtime::RunOwnedBackgroundProcess,
+    super::PreparedBackgroundProcessRegistration,
+) {
+    #[cfg(windows)]
+    let (command, args) = ("ping.exe", vec!["-t", "0x7f000001"]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60"]);
+
+    let workspace = gateway_tempdir(format!("{name}-").as_str());
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
     let run_id = Ulid::new().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        format!("proposal-{name}").as_str(),
+        super::PROCESS_RUNNER_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "command": command,
+            "args": args,
+            "background": true,
+            "timeout_ms": 120_000,
+        }))
+        .expect("reconciliation process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+    assert!(outcome.success, "background process should start: {}", outcome.error);
+    let process = state
+        .list_run_background_processes(run_id.as_str())
+        .into_iter()
+        .next()
+        .expect("run-owned process should be durably registered");
+    let resume_metadata: Value = serde_json::from_str(
+        process
+            .descriptor
+            .resume_metadata_json
+            .as_deref()
+            .expect("process descriptor should persist resume metadata"),
+    )
+    .expect("process resume metadata should be valid JSON");
+    assert_eq!(
+        resume_metadata.get("ownership_role").and_then(Value::as_str),
+        Some(if cfg!(unix) { "unix_process_supervisor" } else { "direct_process" })
+    );
+    assert!(resume_metadata.get("target_pid").is_none());
+    assert!(resume_metadata.get("env").is_none());
+    assert!(resume_metadata.get("file_descriptors").is_none());
+    assert!(resume_metadata.get("native_handle").is_none());
+    let request = crate::sandbox_runner::BackgroundProcessRegistrationRequest {
+        pid: process.ownership_root_pid(),
+        provenance: process.lease.provenance.clone(),
+        lifetime_ms: u64::try_from(
+            process.lease.expires_at_unix_ms.saturating_sub(process.lease.issued_at_unix_ms),
+        )
+        .expect("test lease lifetime should be non-negative"),
+        lifetime_mode: palyra_common::process_runner_input::BackgroundLifetimeMode::RunOwned,
+    };
+    let prepared = super::PreparedBackgroundProcessRegistration {
+        run_id: run_id.clone(),
+        session_id: process
+            .descriptor
+            .session_id
+            .clone()
+            .expect("process descriptor should have a session id"),
+        run_identity: process
+            .descriptor
+            .run_id
+            .clone()
+            .expect("process descriptor should have a run id"),
+        generation: process.descriptor.generation,
+        instance_id: process.descriptor.instance_id.clone(),
+        lease_id: process.lease.lease_id.clone(),
+        state: Arc::new(std::sync::Mutex::new(
+            super::BackgroundProcessRegistrationState::Committed {
+                request,
+                process: Box::new(process.clone()),
+            },
+        )),
+    };
+    (state, session_id, run_id, outcome, process, prepared)
+}
 
-    let mut cleanup_process = CleanupTestProcess::spawn();
-    let cleanup_test_pid = cleanup_process.pid();
-    state.record_run_background_process(run_id.as_str(), cleanup_test_pid);
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_completed_registration_outcome_settles_committed_root() {
+    let (state, _session_id, run_id, _runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "completed-registration-reconciliation",
+        )
+        .await;
+    let outcome = cleanup_test_tool_outcome(
+        true,
+        json!({
+            "background": true,
+            "run_owned_lifetime": false,
+            "completed": true,
+            "pid": process.ownership_root_pid(),
+            "process_handle": {
+                "ownership_root_pid": process.ownership_root_pid(),
+                "target_pid": process.ownership_root_pid().saturating_add(1),
+                "provenance": process.lease.provenance,
+            },
+        }),
+    );
 
-    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let error = super::settle_background_process_registration(&state, &prepared, &outcome)
+        .expect_err("completed success must not retain a committed background lease");
+
+    assert!(error.message().contains("non-run-owned lifetime"), "{}", error.message());
+    assert!(state.run_background_process(run_id.as_str(), process.ownership_root_pid()).is_none());
+    assert!(state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("active process leases should load")
+        .is_empty());
+    assert!(!crate::sandbox_runner::background_process_cleanup_authority_is_retained(
+        process.ownership_root_pid()
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_selected_root_settles_only_committed_root() {
+    let (state, _session_id, run_id, _runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "mismatched-root-reconciliation",
+        )
+        .await;
+    let committed_root = process.ownership_root_pid();
+    let mismatched_root = committed_root.saturating_add(1);
+    let outcome = cleanup_test_tool_outcome(
+        true,
+        json!({
+            "background": true,
+            "run_owned_lifetime": true,
+            "pid": committed_root,
+            "target_pid": committed_root,
+            "process_handle": {
+                "ownership_root_pid": mismatched_root,
+                "direct_process_pid": committed_root,
+                "target_pid": committed_root,
+                "provenance": process.lease.provenance,
+            },
+        }),
+    );
+
+    let error = super::settle_background_process_registration(&state, &prepared, &outcome)
+        .expect_err("mismatched selected ownership root must fail closed");
+
+    assert!(error.message().contains("does not match committed ownership-root pid"));
+    assert!(state.run_background_process(run_id.as_str(), committed_root).is_none());
+    assert!(state.run_background_process(run_id.as_str(), mismatched_root).is_none());
+    assert!(state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("active process leases should load")
+        .is_empty());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_active_registration_root_keeps_existing_lease() {
+    let (state, _session_id, run_id, runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test("exact-root-reconciliation")
+            .await;
+
+    super::settle_background_process_registration(&state, &prepared, &runner_outcome)
+        .expect("exact active ownership root should retain its existing lease");
+
+    let retained = state
+        .run_background_process(run_id.as_str(), process.ownership_root_pid())
+        .expect("exact active ownership root should remain registered");
+    assert_eq!(retained.descriptor.instance_id, process.descriptor.instance_id);
+    assert_eq!(retained.lease.lease_id, process.lease.lease_id);
+    let leases = state
+        .journal_store
+        .list_persisted_process_leases(2)
+        .expect("active process leases should load");
+    assert_eq!(leases.len(), 1, "exact reconciliation must not synthesize a second lease");
+    assert_eq!(leases[0].lease.lease_id, process.lease.lease_id);
+
+    super::cleanup_run_resources(&state, run_id.as_str(), "exact-root-test-cleanup").await;
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_run_registry_still_settles_stored_committed_root() {
+    let (state, _session_id, run_id, runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "missing-registry-reconciliation",
+        )
+        .await;
+    let root = process.ownership_root_pid();
+    state.forget_run_background_process(run_id.as_str(), root);
+
+    let error = super::settle_background_process_registration(&state, &prepared, &runner_outcome)
+        .expect_err("missing run registry must still clean the stored committed authority");
+
+    assert!(error.message().contains("missing from run cleanup ownership"), "{}", error.message());
+    assert!(error.message().contains("terminated and durably finalized"), "{}", error.message());
+    assert!(!crate::sandbox_runner::background_process_runtime_status(root)
+        .expect("committed root status should remain observable")
+        .alive());
+    assert!(state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("active process leases should load")
+        .is_empty());
+    assert!(!crate::sandbox_runner::background_process_cleanup_authority_is_retained(root));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_run_registry_still_settles_stored_committed_root() {
+    let (state, _session_id, run_id, runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "conflicting-registry-reconciliation",
+        )
+        .await;
+    let root = process.ownership_root_pid();
+    let mut conflicting = process.clone();
+    conflicting.descriptor.owner = "conflicting-process-owner".to_owned();
+    state
+        .record_run_background_process(run_id.as_str(), conflicting)
+        .expect("conflicting exact registry fixture should persist");
+
+    let error = super::settle_background_process_registration(&state, &prepared, &runner_outcome)
+        .expect_err("conflicting run registry must still clean the stored committed authority");
+
+    assert!(
+        error.message().contains("conflicts with the exact registration"),
+        "{}",
+        error.message()
+    );
+    assert!(error.message().contains("terminated and durably finalized"), "{}", error.message());
+    assert!(!crate::sandbox_runner::background_process_runtime_status(root)
+        .expect("committed root status should remain observable")
+        .alive());
+    assert!(state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("active process leases should load")
+        .is_empty());
+    assert!(!crate::sandbox_runner::background_process_cleanup_authority_is_retained(root));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn generic_background_metadata_uses_platform_neutral_ownership_role() {
+    let (state, session_id, run_id, runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "generic-ownership-role-reconciliation",
+        )
+        .await;
+    let root = process.ownership_root_pid();
+    state.forget_run_background_process(run_id.as_str(), root);
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: session_id.as_str(),
+        run_id: run_id.as_str(),
+        execution_backend: ExecutionBackendPreference::SshTunnel,
+        backend_reason_code: "backend.explicit.ssh_tunnel",
+    };
+
+    let synthesized = super::run_owned_background_process_from_tool_output(
+        &state,
+        context,
+        runner_outcome.output_json.as_slice(),
+        None,
+    )
+    .expect("generic worker output should synthesize bounded metadata")
+    .expect("generic worker output should identify a run-owned root");
+    let metadata: Value = serde_json::from_str(
+        synthesized
+            .descriptor
+            .resume_metadata_json
+            .as_deref()
+            .expect("synthesized process should include resume metadata"),
+    )
+    .expect("synthesized resume metadata should decode");
+    assert_eq!(metadata.get("ownership_role").and_then(Value::as_str), Some("ownership_root"));
+    assert!(metadata.get("target_pid").is_none());
+    assert!(metadata.get("env").is_none());
+    assert!(metadata.get("file_descriptors").is_none());
+    assert!(metadata.get("native_handle").is_none());
+    let leases = state
+        .journal_store
+        .list_persisted_process_leases(2)
+        .expect("active process leases should load");
+    assert_eq!(leases.len(), 1, "metadata parsing must not persist a synthetic lease");
+    assert_eq!(leases[0].lease.lease_id, process.lease.lease_id);
+
+    let error = super::settle_background_process_registration(&state, &prepared, &runner_outcome)
+        .expect_err("stored local commitment should settle after generic metadata validation");
+    assert!(error.message().contains("terminated and durably finalized"), "{}", error.message());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn target_pid_cannot_select_or_create_local_committed_lease() {
+    let (state, session_id, run_id, _runner_outcome, process, prepared) =
+        start_registered_background_process_for_reconciliation_test(
+            "target-only-local-registration",
+        )
+        .await;
+    let target_pid = process.ownership_root_pid().saturating_add(1);
+    let output = serde_json::to_vec(&json!({
+        "background": true,
+        "run_owned_lifetime": true,
+        "target_pid": target_pid,
+        "process_handle": {
+            "target_pid": target_pid,
+            "provenance": process.lease.provenance,
+        },
+    }))
+    .expect("target-only output should serialize");
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: session_id.as_str(),
+        run_id: run_id.as_str(),
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+
+    let error = super::run_owned_background_process_from_tool_output(
+        &state,
+        context,
+        output.as_slice(),
+        Some(&prepared),
+    )
+    .expect_err("target pid alone must not select process authority");
+
+    assert!(error.message().contains("ownership-root pid"));
+    let leases = state
+        .journal_store
+        .list_persisted_process_leases(2)
+        .expect("active process leases should load");
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].lease.lease_id, process.lease.lease_id);
+    assert!(state.run_background_process(run_id.as_str(), target_pid).is_none());
+
+    super::cleanup_run_resources(&state, run_id.as_str(), "target-only-test-cleanup").await;
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
+    #[cfg(windows)]
+    let executed_marker_dir = gateway_tempdir("run-registration-failure-marker-");
+    #[cfg(windows)]
+    let executed_marker = executed_marker_dir.path().join("registration-failure-executed.marker");
+    #[cfg(windows)]
+    let marker_command = format!(
+        "New-Item -ItemType File -Force -Path '{}' | Out-Null; Start-Sleep -Seconds 60",
+        executed_marker.to_string_lossy().replace('\'', "''")
+    );
+    #[cfg(windows)]
+    let (command, args) =
+        ("powershell.exe", vec!["-NoProfile".to_owned(), "-Command".to_owned(), marker_command]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60".to_owned()]);
+
+    let workspace = gateway_tempdir("run-registration-failure-");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    #[cfg(windows)]
+    {
+        tool_call.process_runner.allow_interpreters = true;
+    }
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            r#"
+                CREATE TRIGGER fail_process_registration_after_launch
+                BEFORE INSERT ON runtime_handles
+                WHEN NEW.kind = 'process'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced process registration failure');
+                END;
+            "#,
+        )
+        .expect("registration failure trigger should install");
+    drop(connection);
+    let before_pids = crate::sandbox_runner::registered_background_process_pids();
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-registration-failure",
+        super::PROCESS_RUNNER_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "command": command,
+            "args": args,
+            "background": true,
+            "timeout_ms": 120_000,
+        }))
+        .expect("registration failure process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success);
+    #[cfg(windows)]
+    assert!(
+        !executed_marker.exists(),
+        "durable registration failure must reject the suspended process before user code runs"
+    );
+    assert!(
+        outcome.error.contains("background process durable ownership registration failed"),
+        "{}",
+        outcome.error
+    );
+    assert!(outcome.error.contains("forced process registration failure"), "{}", outcome.error);
+    assert!(
+        outcome.error.contains(
+            "exact synchronous cleanup verified direct_pid_alive=false process_tree_alive=false"
+        ),
+        "{}",
+        outcome.error
+    );
+    let after_pids = crate::sandbox_runner::registered_background_process_pids();
+    let created_pids =
+        after_pids.into_iter().filter(|pid| !before_pids.contains(pid)).collect::<Vec<_>>();
+    assert_eq!(created_pids.len(), 1, "one live launch should reach registration");
+    let pid = created_pids[0];
+    let status = crate::sandbox_runner::background_process_runtime_status(pid)
+        .expect("cleaned process status should be observable");
+    assert!(!status.alive());
+    assert!(state.list_run_background_processes(run_id.as_str()).is_empty());
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.active_process_leases, 0);
+    assert_eq!(diagnostics.handles_by_state.get("running"), None);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_cleanup_waits_for_durable_process_publication() {
+    #[cfg(windows)]
+    let (command, args) = ("ping.exe", vec!["-t", "0x7f000001"]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60"]);
+
+    let workspace = gateway_tempdir("run-registration-publication-race-");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
+        .await
+        .expect("test run should enter in-progress state");
+    let committed = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    state.set_background_process_registration_publication_barrier(
+        Arc::clone(&committed),
+        Arc::clone(&release),
+    );
+
+    let registration_state = Arc::clone(&state);
+    let registration_session_id = session_id.clone();
+    let registration_run_id = run_id.clone();
+    let registration = tokio::spawn(async move {
+        super::execute_tool_with_runtime_dispatch(
+            &registration_state,
+            super::ToolRuntimeExecutionContext {
+                principal: "user:ops",
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                channel: Some("cli"),
+                session_id: registration_session_id.as_str(),
+                run_id: registration_run_id.as_str(),
+                execution_backend: ExecutionBackendPreference::LocalSandbox,
+                backend_reason_code: "backend.default.local_sandbox",
+            },
+            "proposal-registration-publication-race",
+            super::PROCESS_RUNNER_TOOL_NAME,
+            serde_json::to_vec(&json!({
+                "command": command,
+                "args": args,
+                "background": true,
+                "timeout_ms": 120_000,
+            }))
+            .expect("publication race process input should serialize")
+            .as_slice(),
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), committed.notified())
+        .await
+        .expect("process registration should durably commit before publication");
+    let terminal_state = Arc::clone(&state);
+    let terminal_run_id = run_id.clone();
+    let terminal = tokio::spawn(async move {
+        let settlement = terminal_state
+            .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
+                run_id: terminal_run_id.clone(),
+                requested_state: RunLifecycleState::Failed,
+                reason_code: "runtime.terminal.failed".to_owned(),
+                status_message: "publication race test".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "gateway-test".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "failed",
+                    "message": "publication race test",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("terminal settlement should commit");
+        let cleanup = super::cleanup_run_resources(
+            &terminal_state,
+            terminal_run_id.as_str(),
+            "publication race test",
+        )
+        .await;
+        (settlement, cleanup)
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !terminal.is_finished(),
+        "terminal cleanup must wait while committed process authority is unpublished"
+    );
+
+    release.notify_one();
+    let outcome = registration.await.expect("registration task should join");
+    let (settlement, cleanup) = terminal.await.expect("terminal task should join");
+    assert!(settlement.changed);
+    assert_eq!(settlement.effective_state, RunLifecycleState::Failed);
+    assert!(cleanup.cleanup_warning.is_none(), "cleanup should verify process termination");
+    assert!(state.list_run_background_processes(run_id.as_str()).is_empty());
+    assert!(
+        state
+            .journal_store
+            .list_persisted_process_leases(1)
+            .expect("active process leases should load")
+            .is_empty(),
+        "terminal cleanup must retire the committed process lease"
+    );
+    assert!(
+        outcome.success
+            || outcome.error.contains("has no owned Windows job object")
+            || outcome.error.contains("no suspended thread was found"),
+        "terminal cleanup may win before the runner acknowledgement, but no other failure is valid: {}",
+        outcome.error
+    );
+    state.clear_background_process_registration_publication_barrier();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn registration_and_synchronous_cleanup_failure_transfers_exact_authority_to_retry_owner() {
+    #[cfg(windows)]
+    let (command, args) = ("ping.exe", vec!["-t", "0x7f000001"]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60"]);
+
+    let workspace = gateway_tempdir("run-registration-cleanup-retry-");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let before_pids = crate::sandbox_runner::registered_background_process_pids();
+    let process_outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-registration-cleanup-retry",
+        super::PROCESS_RUNNER_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "command": command,
+            "args": args,
+            "background": true,
+            "timeout_ms": 120_000,
+        }))
+        .expect("registration retry process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+    assert!(process_outcome.success, "background process should start: {}", process_outcome.error);
+    let process = state
+        .list_run_background_processes(run_id.as_str())
+        .into_iter()
+        .next()
+        .expect("run-owned process should register before the injected retry test");
+    let pid = process.ownership_root_pid();
+    state.forget_run_background_process(run_id.as_str(), pid);
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            format!(
+                r#"
+                    CREATE TRIGGER fail_process_registration_after_launch
+                    BEFORE UPDATE ON runtime_handles
+                    WHEN NEW.instance_ulid = '{}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced process registration failure');
+                    END;
+                "#,
+                process.descriptor.instance_id.as_str()
+            )
+            .as_str(),
+        )
+        .expect("registration failure trigger should install");
+    drop(connection);
+    crate::sandbox_runner::force_next_retained_background_cleanup_failure(pid);
+
+    let error = state
+        .record_run_background_process(run_id.as_str(), process.clone())
+        .expect_err("durable registration and synchronous cleanup should both fail");
+    assert!(
+        error.message().contains("exact authority transferred to the bounded retry supervisor"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(state.pending_process_cleanup_count(), 1);
+    assert!(crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid));
+    let after_pids = crate::sandbox_runner::registered_background_process_pids();
+    assert!(after_pids.contains(&pid));
+    let provenance = crate::sandbox_runner::background_process_provenance_snapshot(pid)
+        .expect("retry-owned process provenance should remain registered");
+    assert_eq!(provenance.provenance, process.lease.provenance);
+    // The global test registry retains inactive entries, so OS pid reuse can make this pid appear
+    // in the pre-launch key snapshot. Exact provenance and retained authority are the ownership
+    // proof; numeric novelty is not.
+    let _ = before_pids;
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch("DROP TRIGGER fail_process_registration_after_launch;")
+        .expect("registration failure trigger should drop");
+    drop(connection);
+    let retry = state
+        .reconcile_persisted_process_leases_async()
+        .await
+        .expect("retry owner should terminate and durably finalize exact process ownership");
+    assert_eq!(retry.pending_cleanup_inspected_count, 1);
+    assert_eq!(retry.pending_cleanup_completed_count, 1);
+    assert_eq!(retry.pending_cleanup_count, 0);
+    assert!(!crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid));
+    let status = crate::sandbox_runner::background_process_runtime_status(pid)
+        .expect("retry-cleaned process status should remain observable");
+    assert!(!status.alive());
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.handles_by_state.get("closed"), Some(&1));
+    assert_eq!(diagnostics.active_process_leases, 0);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_run_finalization_cleans_run_owned_process_tracking() {
+    #[cfg(windows)]
+    let (command, args) = ("ping.exe", vec!["-t"]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60"]);
+
+    let workspace = gateway_tempdir("run-cleanup-process-");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let process_outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-run-cleanup-process",
+        super::PROCESS_RUNNER_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "command": command,
+            "args": if cfg!(windows) {
+                vec![args[0], "0x7f000001"]
+            } else {
+                args
+            },
+            "background": true,
+            "timeout_ms": 120_000,
+        }))
+        .expect("cleanup process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+    assert!(process_outcome.success, "cleanup process should start: {}", process_outcome.error);
+    let cleanup_test_pid =
+        super::background_process_pid_from_tool_output(process_outcome.output_json.as_slice())
+            .expect("cleanup process output should carry a pid");
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
     let mut run_state = RunStateMachine::default();
     run_state.transition(RunTransition::Accept).expect("run state should accept");
     run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
     let mut tape_seq = 0;
 
     super::finalize_run_failure(super::RunFailureFinalization {
@@ -7095,13 +12803,24 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
         active_session_id: Some(session_id.as_str()),
         run_state: &mut run_state,
         active_run_id: Some(run_id.as_str()),
+        flow_control: Some(&flow_control),
         tape_seq: &mut tape_seq,
         reason: "provider error forced terminal failure",
     })
     .await;
 
-    cleanup_process.wait_for_cleanup();
     assert_eq!(run_state.state(), RunLifecycleState::Failed);
+    let terminal_event = receiver
+        .try_recv()
+        .expect("failure finalization should retain delivery authority")
+        .expect("terminal delivery should not carry an error");
+    let common_v1::run_stream_event::Body::Status(status) =
+        terminal_event.body.expect("terminal event should have a body")
+    else {
+        panic!("terminal event should be a status");
+    };
+    assert_eq!(status.kind(), common_v1::stream_status::StatusKind::Failed);
+    assert_eq!(status.message, "provider error forced terminal failure");
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
         "failed terminal path must drain run-owned process tracking"
@@ -7117,6 +12836,14 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     let sequence =
         tape.iter().map(|event| (event.seq, event.event_type.as_str())).collect::<Vec<_>>();
     assert_eq!(sequence, vec![(0, "status"), (1, "run.cleanup")]);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.handles_by_state.get("closed"), Some(&1));
+    assert_eq!(diagnostics.handles_by_state.get("running"), None);
+    assert_eq!(diagnostics.active_process_leases, 0);
+    assert_eq!(diagnostics.cleanup_reports_by_outcome.get("completed"), Some(&1));
     let cleanup = tape.last().expect("cleanup event should be present");
     let payload: Value =
         serde_json::from_str(cleanup.payload_json.as_str()).expect("cleanup payload should decode");
@@ -7136,6 +12863,148 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
         payload.pointer("/background_processes/alive_after/0/alive").and_then(Value::as_bool),
         Some(false)
     );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_process_cleanup_finalization_retries_after_failure() {
+    #[cfg(windows)]
+    let (command, args) = ("ping.exe", vec!["-t", "0x7f000001"]);
+    #[cfg(not(windows))]
+    let (command, args) = ("sleep", vec!["60"]);
+
+    let workspace = gateway_tempdir("run-cleanup-retry-");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 180_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.path_access_mode =
+        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let process_outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-run-cleanup-retry",
+        super::PROCESS_RUNNER_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "command": command,
+            "args": args,
+            "background": true,
+            "timeout_ms": 120_000,
+        }))
+        .expect("cleanup retry process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+    assert!(process_outcome.success, "cleanup process should start: {}", process_outcome.error);
+    let process = state
+        .list_run_background_processes(run_id.as_str())
+        .into_iter()
+        .next()
+        .expect("run-owned process should register");
+    let pid = process.ownership_root_pid();
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch(
+            format!(
+                r#"
+                    CREATE TRIGGER fail_process_cleanup_finalization_once
+                    BEFORE UPDATE ON runtime_handles
+                    WHEN NEW.instance_ulid = '{}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced process cleanup finalization failure');
+                    END;
+                "#,
+                process.descriptor.instance_id.as_str()
+            )
+            .as_str(),
+        )
+        .expect("failure trigger should install");
+
+    let first = super::cleanup_run_resources(&state, run_id.as_str(), "retry-test-first").await;
+    assert_eq!(first, super::RunCleanupSummary::default());
+    assert!(
+        state.run_background_process(run_id.as_str(), pid).is_some(),
+        "failed durable finalization must retain exact in-memory cleanup authority"
+    );
+    assert_eq!(
+        crate::sandbox_runner::verify_background_process_provenance(pid, &process.lease.provenance),
+        palyra_common::runtime_contracts::ProcessProvenanceDisposition::Missing,
+        "the exact process tree should be absent even while durable finalization is pending"
+    );
+    let first_diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(first_diagnostics.handles_by_state.get("running"), Some(&1));
+    assert_eq!(first_diagnostics.active_process_leases, 1);
+    assert_eq!(
+        state.pending_process_cleanup_count(),
+        1,
+        "durable finalization failure should transfer exact authority to the retry owner"
+    );
+    assert!(
+        crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid),
+        "exact platform authority must remain held while durable finalization is pending"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        crate::sandbox_runner::windows_background_job_process_count(pid)
+            .expect("retained Windows Job Object should remain registered")
+            .expect("retained Windows Job Object should remain queryable"),
+        0,
+        "verified process absence must retain an empty Job Object until commit"
+    );
+    drop(connection);
+
+    let connection = Connection::open(&state.journal_config.db_path)
+        .expect("test journal database should reopen");
+    connection
+        .execute_batch("DROP TRIGGER fail_process_cleanup_finalization_once;")
+        .expect("failure trigger should drop");
+    drop(connection);
+
+    let retry = state
+        .reconcile_persisted_process_leases_async()
+        .await
+        .expect("serialized retry owner should finalize verified cleanup");
+    assert_eq!(retry.pending_cleanup_inspected_count, 1);
+    assert_eq!(retry.pending_cleanup_completed_count, 1);
+    assert_eq!(retry.pending_cleanup_count, 0);
+    assert!(state.run_background_process(run_id.as_str(), pid).is_none());
+    assert!(
+        !crate::sandbox_runner::background_process_cleanup_authority_is_retained(pid),
+        "exact platform authority should release only after durable cleanup commits"
+    );
+    #[cfg(windows)]
+    assert!(
+        crate::sandbox_runner::windows_background_job_process_count(pid).is_none(),
+        "successful durable retry should remove the retained Windows Job Object"
+    );
+    let second_diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(second_diagnostics.handles_by_state.get("closed"), Some(&1));
+    assert_eq!(second_diagnostics.handles_by_state.get("running"), None);
+    assert_eq!(second_diagnostics.active_process_leases, 0);
+    assert_eq!(second_diagnostics.cleanup_reports_by_outcome.get("completed"), Some(&1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7184,8 +13053,8 @@ async fn failed_run_does_not_remain_lifecycle_active() {
     assert_eq!(lifecycle.active_runs, 0);
 }
 
-#[test]
-fn tool_outcomes_record_and_forget_run_cleanup_resources() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_outcomes_record_and_forget_run_cleanup_resources() {
     let state = build_test_runtime_state(false);
     let run_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -7198,6 +13067,7 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
         execution_backend: ExecutionBackendPreference::LocalSandbox,
         backend_reason_code: "backend.default.local_sandbox",
     };
+    start_tool_program_test_run(&state, context.session_id, context.run_id).await;
 
     let browser_outcome =
         cleanup_test_tool_outcome(true, json!({ "session_id": session_id.as_str() }));
@@ -7207,24 +13077,10 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
         super::BROWSER_SESSION_CREATE_TOOL_NAME,
         b"{}",
         &browser_outcome,
-    );
+        None,
+    )
+    .expect("browser cleanup resource should record");
 
-    let process_outcome = cleanup_test_tool_outcome(
-        true,
-        json!({
-            "background": true,
-            "process_handle": {
-                "direct_process_pid": 1234,
-            },
-        }),
-    );
-    super::record_run_cleanup_resource_from_tool_outcome(
-        &state,
-        context,
-        super::PROCESS_RUNNER_TOOL_NAME,
-        b"{}",
-        &process_outcome,
-    );
     let detached_process_outcome = cleanup_test_tool_outcome(
         true,
         json!({
@@ -7258,7 +13114,9 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
         super::PROCESS_RUNNER_TOOL_NAME,
         b"{}",
         &detached_process_outcome,
-    );
+        None,
+    )
+    .expect("detached process handoff should record");
 
     let close_outcome = cleanup_test_tool_outcome(true, json!({ "closed": true }));
     let close_input =
@@ -7269,11 +13127,13 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
         super::BROWSER_SESSION_CLOSE_TOOL_NAME,
         close_input.as_slice(),
         &close_outcome,
-    );
+        None,
+    )
+    .expect("browser close cleanup resource should record");
 
     let resources = state.take_run_cleanup_resources(run_id.as_str());
     assert!(resources.browser_session_ids.is_empty());
-    assert_eq!(resources.background_process_pids, vec![1234]);
+    assert!(resources.background_processes.is_empty());
     let detached_resources = state.take_run_detached_resources(run_id.as_str());
     assert_eq!(detached_resources.background_processes.len(), 1);
     let detached = &detached_resources.background_processes[0];
@@ -7753,6 +13613,7 @@ async fn tool_rpc_file_transport_executes_fake_remote_worker_request() {
             response_dir: response_dir.clone(),
             orphan_timeout: Duration::from_secs(30),
         },
+        None,
     )
     .await
     .expect("file transport sweep should succeed");
@@ -7818,6 +13679,7 @@ async fn tool_rpc_file_transport_denies_grant_escalation() {
             response_dir: response_dir.clone(),
             orphan_timeout: Duration::from_secs(30),
         },
+        None,
     )
     .await
     .expect("file transport sweep should succeed");
@@ -7881,6 +13743,7 @@ async fn tool_rpc_file_transport_cleans_orphaned_request() {
             response_dir: response_dir.clone(),
             orphan_timeout: Duration::from_millis(0),
         },
+        None,
     )
     .await
     .expect("file transport sweep should succeed");
@@ -8596,6 +14459,8 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_pending_record_acros
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("first run should be started for route approval test");
@@ -8635,6 +14500,8 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_pending_record_acros
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("second run should be started for route approval test");
@@ -8767,6 +14634,8 @@ async fn resolve_route_tool_approval_outcome_does_not_rehydrate_resolved_record_
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("run should be started for resolved route approval test");
@@ -8868,6 +14737,8 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_once_scope_record() 
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("run should be started for route approval once test");
@@ -9052,6 +14923,8 @@ fn orchestrator_tape_snapshot_paginates_and_redacts_payloads() {
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("orchestrator run should start");
     state
@@ -9126,6 +14999,8 @@ async fn diagnostics_run_id_resolver_accepts_linked_cron_run_id() {
             origin_run_id: Some(cron_run_id.to_owned()),
             triggered_by_principal: Some("user:ops".to_owned()),
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start");
@@ -9768,6 +15643,8 @@ async fn memory_search_tool_all_scope_uses_active_project_workspace_prefix() {
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -10027,6 +15904,8 @@ async fn memory_search_tool_workspace_scope_uses_active_project_prefix_by_defaul
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -10662,6 +16541,8 @@ async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -10725,6 +16606,8 @@ async fn project_memory_defaults_to_launch_workspace_prefix() {
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -11479,6 +17362,8 @@ async fn model_token_tape_compaction_emits_real_lifecycle_event() {
             origin_run_id: None,
             triggered_by_principal: None,
             parameter_delta_json: None,
+
+            delegated_admission: None,
         })
         .expect("orchestrator run should start");
     for (seq, text) in [
@@ -12386,6 +18271,8 @@ async fn workspace_patch_tool_workspace_alias_uses_launch_root_outside_state_wor
                 })
                 .to_string(),
             ),
+
+            delegated_admission: None,
         })
         .await
         .expect("orchestrator run should start with launch workspace metadata");
@@ -12567,8 +18454,10 @@ async fn create_queued_flow_background_task(
             task_id: task_id.clone(),
             task_kind: AuxiliaryTaskKind::Summary.as_str().to_owned(),
             session_id,
+            child_session_id: None,
             parent_run_id: None,
             target_run_id: None,
+            planned_child_run_id: None,
             queued_input_id: None,
             owner_principal: owner_principal.to_owned(),
             device_id: device_id.to_owned(),
@@ -12578,6 +18467,7 @@ async fn create_queued_flow_background_task(
             max_attempts: 1,
             budget_tokens: 64,
             delegation: None,
+            cancellation_context: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -12601,6 +18491,7 @@ async fn create_completed_flow_background_task(
     state
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task_id.clone(),
+            expected_revision: 0,
             state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
             result_json: Some(Some(result_json.to_string())),
             started_at_unix_ms: Some(Some(100)),

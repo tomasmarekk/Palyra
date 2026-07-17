@@ -9,7 +9,9 @@ use crate::journal::{
     ApprovalCreateRequest, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
     ApprovalRecord, ApprovalRiskLevel,
 };
-use crate::node_runtime::{CapabilityExecutionResult, RegisteredNodeRecord};
+use crate::node_runtime::{
+    CapabilityExecutionResult, CapabilityRequestTimeoutOutcome, RegisteredNodeRecord,
+};
 use crate::*;
 use palyra_common::runtime_contracts::REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS;
 use sha2::{Digest, Sha256};
@@ -162,7 +164,7 @@ pub(crate) async fn console_node_invoke_handler(
         )
         .await?;
     }
-    let (request_id, receiver) = state
+    let (request_id, mut receiver) = state
         .node_runtime
         .enqueue_capability_request(
             device_id.as_str(),
@@ -172,20 +174,29 @@ pub(crate) async fn console_node_invoke_handler(
             Some(timeout_ms),
         )
         .map_err(runtime_status_response)?;
-    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), receiver)
-        .await
-        .map_err(|_| {
-            let _ = state.node_runtime.mark_capability_timeout(request_id.as_str());
-            runtime_status_response(tonic::Status::deadline_exceeded(
-                "timed out waiting for node capability result",
-            ))
-        })?
-        .map_err(|_| {
-            runtime_status_response(tonic::Status::internal(
-                "node capability result channel closed",
-            ))
-        })?;
-    Ok(Json(node_capability_result_json(device_id.as_str(), capability.as_str(), result)))
+    let result =
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver.recv()).await {
+            Ok(result) => result,
+            Err(_) => match state
+                .node_runtime
+                .mark_capability_timeout(request_id.as_str())
+                .map_err(runtime_status_response)?
+            {
+                CapabilityRequestTimeoutOutcome::MarkedTimedOut
+                | CapabilityRequestTimeoutOutcome::AlreadyTerminal => {
+                    return Err(runtime_status_response(tonic::Status::deadline_exceeded(
+                        "timed out waiting for node capability result",
+                    )));
+                }
+                CapabilityRequestTimeoutOutcome::ResultCommitted => receiver.recv().await,
+                CapabilityRequestTimeoutOutcome::Missing => {
+                    return Err(runtime_status_response(tonic::Status::internal(
+                        "node capability request disappeared during timeout handling",
+                    )));
+                }
+            },
+        };
+    Ok(Json(node_capability_result_json(device_id.as_str(), capability.as_str(), result.result)))
 }
 
 async fn require_node_capability_local_mediation(

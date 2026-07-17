@@ -196,6 +196,8 @@ pub(crate) struct WorkHeartbeatRecord {
     pub heartbeat_key: String,
     pub kind: WorkHeartbeatKind,
     pub object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_generation: Option<u64>,
     pub summary: String,
     pub updated_at_unix_ms: i64,
 }
@@ -241,6 +243,7 @@ pub(crate) struct RuntimeIncidentObservation {
 pub(crate) struct WorkHeartbeatUpdate {
     pub kind: WorkHeartbeatKind,
     pub object_id: String,
+    pub execution_generation: Option<u64>,
     pub summary: String,
 }
 
@@ -443,6 +446,7 @@ impl SelfHealingState {
                 heartbeat_key,
                 kind: update.kind,
                 object_id: update.object_id,
+                execution_generation: update.execution_generation,
                 summary: update.summary,
                 updated_at_unix_ms: current_unix_ms(),
             },
@@ -456,11 +460,27 @@ impl SelfHealingState {
     ///
     /// Panics if the self-healing mutex is poisoned.
     pub(crate) fn clear_heartbeat(&self, kind: WorkHeartbeatKind, object_id: &str) {
+        self.clear_heartbeat_if_generation(kind, object_id, None);
+    }
+
+    /// Removes a heartbeat only when it still belongs to the supplied execution generation.
+    pub(crate) fn clear_heartbeat_if_generation(
+        &self,
+        kind: WorkHeartbeatKind,
+        object_id: &str,
+        execution_generation: Option<u64>,
+    ) {
         let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
-        let Some(heartbeat) = inner.heartbeats.remove(heartbeat_key(kind, object_id).as_str())
-        else {
+        let key = heartbeat_key(kind, object_id);
+        let Some(heartbeat) = inner.heartbeats.get(key.as_str()) else {
             return;
         };
+        if execution_generation.is_some() && heartbeat.execution_generation != execution_generation
+        {
+            return;
+        }
+        let heartbeat =
+            inner.heartbeats.remove(key.as_str()).expect("heartbeat exists after generation check");
         resolve_incident_locked(
             &mut inner,
             IncidentDomain::Watchdog,
@@ -1307,6 +1327,7 @@ mod tests {
         state.record_heartbeat(WorkHeartbeatUpdate {
             kind: WorkHeartbeatKind::Run,
             object_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            execution_generation: None,
             summary: "run summary".to_owned(),
         });
 
@@ -1319,12 +1340,31 @@ mod tests {
     }
 
     #[test]
+    fn stale_execution_cannot_clear_newer_background_heartbeat() {
+        let state = SelfHealingState::new();
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FBT";
+        state.record_heartbeat(WorkHeartbeatUpdate {
+            kind: WorkHeartbeatKind::BackgroundTask,
+            object_id: task_id.to_owned(),
+            execution_generation: Some(2),
+            summary: "newer background execution".to_owned(),
+        });
+
+        state.clear_heartbeat_if_generation(WorkHeartbeatKind::BackgroundTask, task_id, Some(1));
+        assert_eq!(state.list_heartbeats().len(), 1);
+
+        state.clear_heartbeat_if_generation(WorkHeartbeatKind::BackgroundTask, task_id, Some(2));
+        assert!(state.list_heartbeats().is_empty());
+    }
+
+    #[test]
     fn clearing_heartbeat_resolves_matching_watchdog_incident() {
         let state = SelfHealingState::new();
         let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
         state.record_heartbeat(WorkHeartbeatUpdate {
             kind: WorkHeartbeatKind::Run,
             object_id: run_id.to_owned(),
+            execution_generation: None,
             summary: "run summary".to_owned(),
         });
         let heartbeat = state.list_heartbeats().pop().expect("heartbeat should exist");

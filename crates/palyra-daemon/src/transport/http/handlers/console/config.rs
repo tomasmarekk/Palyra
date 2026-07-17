@@ -398,13 +398,25 @@ pub(crate) async fn apply_config_reload_for_context(
                     )))
                 })?;
         if let Some(model_provider) = next_model_provider {
-            provider_runtime_generation =
-                Some(state.runtime.configure_model_provider(model_provider));
+            provider_runtime_generation = Some(
+                state.runtime.try_configure_model_provider(model_provider).map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to activate replacement provider health: {error}"
+                    )))
+                })?,
+            );
         }
         if current.memory != candidate.memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
         }
         if current.mcp_servers != candidate.mcp_servers {
+            state.runtime.try_configure_mcp_runtime_health(&next_loaded.mcp_servers).map_err(
+                |error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to activate replacement MCP runtime health: {error}"
+                    )))
+                },
+            )?;
             let reload_at_unix_ms = unix_ms_now().unwrap_or(0);
             state
                 .mcp_supervisor

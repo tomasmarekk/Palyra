@@ -23,6 +23,7 @@ use crate::{
         route_message::tool_flow::process_route_tool_proposal_event,
         run_stream::{
             cancellation::transition_run_stream_to_cancelled,
+            orchestration::RunStreamHarnessLifecycle,
             tape::{
                 append_runtime_decision_tape_event, redact_run_stream_text,
                 send_model_token_with_tape,
@@ -40,7 +41,7 @@ use crate::{
         current_unix_ms, GatewayRuntimeState, RunStreamToolExecutionOutcome, CANCELLED_REASON,
     },
     model_provider::ProviderEvent,
-    orchestrator::RunStateMachine,
+    orchestrator::{RunLifecycleState, RunStateMachine},
     tool_protocol::ToolExecutionOutcome,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -52,19 +53,19 @@ const MAX_PARTIAL_ASSISTANT_ABORT_CHARS: usize = 4_096;
 /// Result of the pre-event cancellation gate.
 ///
 /// Same shape as [`RunStreamProviderEventOutcome`] but kept as a distinct
-/// type: a gate `Cancelled` means the run was already transitioned to the
-/// cancelled state before the event was processed.
+/// type: a terminal gate means durable settlement already chose the state
+/// before the event was processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventGateOutcome {
     Continue,
-    Cancelled,
+    Terminal(RunLifecycleState),
 }
 
 /// Result of processing a single provider event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventOutcome {
     Continue,
-    Cancelled,
+    Terminal(RunLifecycleState),
 }
 
 /// Result of processing a whole provider-event batch.
@@ -76,7 +77,7 @@ pub(crate) enum RunStreamProviderEventsOutcome {
         summary_tokens: Vec<String>,
         tool_results: Vec<RunStreamToolResultForModel>,
     },
-    Cancelled,
+    Terminal(RunLifecycleState),
 }
 
 /// A completed tool execution, keyed for the model's follow-up round.
@@ -111,8 +112,10 @@ struct RunStreamProviderCancellationGate<'a> {
     run_state: &'a mut RunStateMachine,
     session_id: &'a str,
     run_id: &'a str,
+    flow_control: &'a crate::application::run_stream::flow_control::RunStreamFlowControl,
     tape_seq: &'a mut i64,
     partial_abort: Option<RunStreamPartialAbortContext<'a>>,
+    harness_lifecycle: Option<&'a RunStreamHarnessLifecycle>,
 }
 
 /// Mutable run-stream state a provider event may touch while being handled.
@@ -126,12 +129,15 @@ pub(crate) struct RunStreamProviderEventSurface<'a> {
     pub(crate) model_token_compaction_emitted: &'a mut bool,
     pub(crate) allow_sensitive_tools: bool,
     pub(crate) approval_cache_generation: Option<u64>,
+    pub(crate) flow_control: &'a crate::application::run_stream::flow_control::RunStreamFlowControl,
     pub(crate) stream_model_tokens_immediately: bool,
+    pub(crate) harness_lifecycle: Option<&'a RunStreamHarnessLifecycle>,
 }
 
 /// Route-message state a provider event may touch while being handled.
 pub(crate) struct RouteMessageProviderEventSurface<'a> {
     pub(crate) request_context: &'a RequestContext,
+    pub(crate) flow_control: &'a crate::application::run_stream::flow_control::RunStreamFlowControl,
     pub(crate) reply_text: &'a mut String,
 }
 
@@ -144,8 +150,8 @@ pub(crate) enum ProviderEventSurface<'a> {
 /// Checks for a pending cancel request and, if found, cancels the run.
 ///
 /// A positive check records a `run_cancel_requested` runtime decision, tapes
-/// it, and transitions the run state machine to cancelled before reporting
-/// [`RunStreamProviderEventGateOutcome::Cancelled`] to the caller.
+/// it, and follows the effective durable terminal state before reporting it to
+/// the caller.
 #[allow(clippy::result_large_err)]
 async fn gate_run_stream_provider_event_on_cancellation(
     context: RunStreamProviderCancellationGate<'_>,
@@ -157,8 +163,10 @@ async fn gate_run_stream_provider_event_on_cancellation(
         run_state,
         session_id,
         run_id,
+        flow_control,
         tape_seq,
         partial_abort,
+        harness_lifecycle,
     } = context;
     match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
         Ok(true) => {
@@ -200,9 +208,17 @@ async fn gate_run_stream_provider_event_on_cancellation(
                 .await?;
             append_runtime_decision_tape_event(runtime_state, run_id, tape_seq, &event_payload)
                 .await?;
-            transition_run_stream_to_cancelled(sender, runtime_state, run_state, run_id, tape_seq)
-                .await?;
-            Ok(RunStreamProviderEventGateOutcome::Cancelled)
+            let effective_state = transition_run_stream_to_cancelled(
+                sender,
+                runtime_state,
+                run_state,
+                run_id,
+                flow_control,
+                tape_seq,
+                harness_lifecycle,
+            )
+            .await?;
+            Ok(RunStreamProviderEventGateOutcome::Terminal(effective_state))
         }
         Ok(false) => Ok(RunStreamProviderEventGateOutcome::Continue),
         Err(error) => Err(error),
@@ -377,7 +393,9 @@ pub(crate) async fn process_provider_event_for_surface(
                     remaining_tool_budget,
                     context.allow_sensitive_tools,
                     context.approval_cache_generation,
+                    context.flow_control,
                     tape_seq,
+                    context.harness_lifecycle,
                 )
                 .await?
                 {
@@ -395,8 +413,8 @@ pub(crate) async fn process_provider_event_for_surface(
                         });
                         Ok(RunStreamProviderEventOutcome::Continue)
                     }
-                    RunStreamToolExecutionOutcome::Cancelled => {
-                        Ok(RunStreamProviderEventOutcome::Cancelled)
+                    RunStreamToolExecutionOutcome::Terminal(state) => {
+                        Ok(RunStreamProviderEventOutcome::Terminal(state))
                     }
                 }
             }
@@ -410,6 +428,7 @@ pub(crate) async fn process_provider_event_for_surface(
                     tool_name.as_str(),
                     input_json.as_slice(),
                     tool_catalog_snapshot,
+                    context.flow_control,
                     remaining_tool_budget,
                     tape_seq,
                 )
@@ -450,10 +469,12 @@ pub(crate) async fn process_run_stream_provider_events(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &crate::application::run_stream::flow_control::RunStreamFlowControl,
     tape_seq: &mut i64,
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
     stream_model_tokens_immediately: bool,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamProviderEventsOutcome, Status> {
     let mut summary_tokens = Vec::new();
     let mut tool_results = Vec::new();
@@ -466,6 +487,7 @@ pub(crate) async fn process_run_stream_provider_events(
             run_state,
             session_id,
             run_id,
+            flow_control,
             tape_seq,
             partial_abort: Some(RunStreamPartialAbortContext {
                 summary_tokens: summary_tokens.as_slice(),
@@ -473,12 +495,13 @@ pub(crate) async fn process_run_stream_provider_events(
                 model_token_tape_events: *model_token_tape_events,
                 model_token_compaction_emitted: *model_token_compaction_emitted,
             }),
+            harness_lifecycle,
         })
         .await?
         {
             RunStreamProviderEventGateOutcome::Continue => {}
-            RunStreamProviderEventGateOutcome::Cancelled => {
-                return Ok(RunStreamProviderEventsOutcome::Cancelled);
+            RunStreamProviderEventGateOutcome::Terminal(state) => {
+                return Ok(RunStreamProviderEventsOutcome::Terminal(state));
             }
         }
 
@@ -508,13 +531,15 @@ pub(crate) async fn process_run_stream_provider_events(
                     remaining_tool_budget,
                     allow_sensitive_tools,
                     approval_cache_generation,
+                    flow_control,
                     tape_seq,
+                    harness_lifecycle,
                 )
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
-                    RunStreamProviderEventOutcome::Cancelled => {
-                        return Ok(RunStreamProviderEventsOutcome::Cancelled);
+                    RunStreamProviderEventOutcome::Terminal(state) => {
+                        return Ok(RunStreamProviderEventsOutcome::Terminal(state));
                     }
                 }
 
@@ -534,16 +559,18 @@ pub(crate) async fn process_run_stream_provider_events(
                     remaining_tool_budget,
                     allow_sensitive_tools,
                     approval_cache_generation,
+                    flow_control,
                     tape_seq,
                     model_token_tape_events,
                     model_token_compaction_emitted,
                     stream_model_tokens_immediately,
+                    harness_lifecycle,
                 )
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
-                    RunStreamProviderEventOutcome::Cancelled => {
-                        return Ok(RunStreamProviderEventsOutcome::Cancelled);
+                    RunStreamProviderEventOutcome::Terminal(state) => {
+                        return Ok(RunStreamProviderEventsOutcome::Terminal(state));
                     }
                 }
             }
@@ -565,13 +592,15 @@ pub(crate) async fn process_run_stream_provider_events(
         remaining_tool_budget,
         allow_sensitive_tools,
         approval_cache_generation,
+        flow_control,
         tape_seq,
+        harness_lifecycle,
     )
     .await?
     {
         RunStreamProviderEventOutcome::Continue => {}
-        RunStreamProviderEventOutcome::Cancelled => {
-            return Ok(RunStreamProviderEventsOutcome::Cancelled);
+        RunStreamProviderEventOutcome::Terminal(state) => {
+            return Ok(RunStreamProviderEventsOutcome::Terminal(state));
         }
     }
 
@@ -601,7 +630,9 @@ async fn flush_pending_run_stream_tool_proposals(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &crate::application::run_stream::flow_control::RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamProviderEventOutcome, Status> {
     if pending_tool_proposals.is_empty() {
         return Ok(RunStreamProviderEventOutcome::Continue);
@@ -617,14 +648,16 @@ async fn flush_pending_run_stream_tool_proposals(
             run_state,
             session_id,
             run_id,
+            flow_control,
             tape_seq,
             partial_abort: None,
+            harness_lifecycle,
         })
         .await?
         {
             RunStreamProviderEventGateOutcome::Continue => {}
-            RunStreamProviderEventGateOutcome::Cancelled => {
-                return Ok(RunStreamProviderEventOutcome::Cancelled);
+            RunStreamProviderEventGateOutcome::Terminal(state) => {
+                return Ok(RunStreamProviderEventOutcome::Terminal(state));
             }
         }
 
@@ -643,6 +676,7 @@ async fn flush_pending_run_stream_tool_proposals(
             remaining_tool_budget,
             allow_sensitive_tools,
             approval_cache_generation,
+            flow_control,
             tape_seq,
         )
         .await?
@@ -662,19 +696,21 @@ async fn flush_pending_run_stream_tool_proposals(
                     &mut prepared_tools,
                     tool_results,
                     remaining_tool_budget,
+                    flow_control,
                     tape_seq,
+                    harness_lifecycle,
                 )
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
-                    RunStreamProviderEventOutcome::Cancelled => {
-                        return Ok(RunStreamProviderEventOutcome::Cancelled);
+                    RunStreamProviderEventOutcome::Terminal(state) => {
+                        return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
                 }
                 match push_run_stream_tool_execution_outcome(tool_results, outcome) {
                     RunStreamProviderEventOutcome::Continue => {}
-                    RunStreamProviderEventOutcome::Cancelled => {
-                        return Ok(RunStreamProviderEventOutcome::Cancelled);
+                    RunStreamProviderEventOutcome::Terminal(state) => {
+                        return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
                 }
             }
@@ -690,7 +726,9 @@ async fn flush_pending_run_stream_tool_proposals(
         &mut prepared_tools,
         tool_results,
         remaining_tool_budget,
+        flow_control,
         tape_seq,
+        harness_lifecycle,
     )
     .await
 }
@@ -707,7 +745,9 @@ async fn flush_prepared_run_stream_tool_batch(
     prepared_tools: &mut Vec<RunStreamPreparedToolExecution>,
     tool_results: &mut Vec<RunStreamToolResultForModel>,
     remaining_tool_budget: &mut u32,
+    flow_control: &crate::application::run_stream::flow_control::RunStreamFlowControl,
     tape_seq: &mut i64,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamProviderEventOutcome, Status> {
     if prepared_tools.is_empty() {
         return Ok(RunStreamProviderEventOutcome::Continue);
@@ -721,7 +761,9 @@ async fn flush_prepared_run_stream_tool_batch(
         run_id,
         std::mem::take(prepared_tools),
         remaining_tool_budget,
+        flow_control,
         tape_seq,
+        harness_lifecycle,
     )
     .await?
     {
@@ -729,15 +771,15 @@ async fn flush_prepared_run_stream_tool_batch(
             for outcome in outcomes {
                 match push_run_stream_tool_execution_outcome(tool_results, outcome) {
                     RunStreamProviderEventOutcome::Continue => {}
-                    RunStreamProviderEventOutcome::Cancelled => {
-                        return Ok(RunStreamProviderEventOutcome::Cancelled);
+                    RunStreamProviderEventOutcome::Terminal(state) => {
+                        return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
                 }
             }
             Ok(RunStreamProviderEventOutcome::Continue)
         }
-        RunStreamPreparedToolExecutionBatchOutcome::Cancelled => {
-            Ok(RunStreamProviderEventOutcome::Cancelled)
+        RunStreamPreparedToolExecutionBatchOutcome::Terminal(state) => {
+            Ok(RunStreamProviderEventOutcome::Terminal(state))
         }
     }
 }
@@ -762,7 +804,9 @@ fn push_run_stream_tool_execution_outcome(
             });
             RunStreamProviderEventOutcome::Continue
         }
-        RunStreamToolExecutionOutcome::Cancelled => RunStreamProviderEventOutcome::Cancelled,
+        RunStreamToolExecutionOutcome::Terminal(state) => {
+            RunStreamProviderEventOutcome::Terminal(state)
+        }
     }
 }
 
@@ -785,10 +829,12 @@ async fn process_run_stream_provider_event(
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
+    flow_control: &crate::application::run_stream::flow_control::RunStreamFlowControl,
     tape_seq: &mut i64,
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
     stream_model_tokens_immediately: bool,
+    harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamProviderEventOutcome, Status> {
     process_provider_event_for_surface(
         runtime_state,
@@ -810,7 +856,9 @@ async fn process_run_stream_provider_event(
             model_token_compaction_emitted,
             allow_sensitive_tools,
             approval_cache_generation,
+            flow_control,
             stream_model_tokens_immediately,
+            harness_lifecycle,
         }),
     )
     .await

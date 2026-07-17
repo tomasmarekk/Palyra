@@ -5,7 +5,7 @@
 //! the daemon state root; every mutation is written back synchronously so a
 //! daemon restart cannot resurrect consumed pairing codes or lose request
 //! states. Volatile coordination (reserved codes mid-handshake, queued
-//! dispatches, oneshot result waiters) deliberately lives only in memory.
+//! dispatches, bounded result channels) deliberately lives only in memory.
 //! Consumed by `node_rpc` (gRPC surface) and the realtime `command_router`.
 //! Summaries persisted from payloads are redacted before storage.
 
@@ -13,25 +13,39 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
-use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tonic::Status;
 use ulid::Ulid;
 
 use palyra_identity::{PairingClientKind, PairingMethod, PairingResult, VerifiedPairing};
 
+use crate::journal::{
+    NetworkedWorkerDeliveryReservationOutcome, NetworkedWorkerDeliveryReservationRequest,
+    NetworkedWorkerDispatchAbortBeforeReleaseOutcome, NetworkedWorkerDispatchCancelOutcome,
+    NetworkedWorkerDispatchClaim, NetworkedWorkerPayloadAcknowledgementOutcome,
+    NetworkedWorkerPayloadAcknowledgementRequest, NetworkedWorkerPayloadReleaseOutcome,
+    NetworkedWorkerPayloadReleaseRequest,
+};
+
 const NODE_RUNTIME_STATE_FILE_NAME: &str = "node-runtime.v1.json";
 const DEFAULT_PAIRING_CODE_TTL_MS: u64 = 10 * 60 * 1_000;
 const MIN_PAIRING_CODE_TTL_MS: u64 = 30 * 1_000;
 const MAX_PAIRING_CODE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+pub(crate) const NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY: &str =
+    "protocol:palyra.networked_worker.delivery_fence.v1";
+pub(crate) const NETWORKED_WORKER_DELIVERY_FENCE_PROTOCOL: &str =
+    "palyra.networked_worker.delivery_fence.v1";
+const NETWORKED_WORKER_DELIVERY_TOKEN_BYTES: usize = 32;
 
 /// How a pairing code is presented to the device being paired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +202,131 @@ pub(crate) struct CapabilityDispatchRecord {
     pub(crate) capability: String,
     pub(crate) input_json: Vec<u8>,
     pub(crate) max_payload_bytes: u64,
+    pub(crate) networked_worker_reservation: Option<NetworkedWorkerDeliveryReservation>,
+    authority: CapabilityDispatchAuthority,
+}
+
+/// Metadata-only reservation emitted before a networked worker may fetch its raw payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerDeliveryReservation {
+    pub(crate) request_id: String,
+    pub(crate) delivery_attempt_id: String,
+    pub(crate) fetch_token: String,
+    pub(crate) request_sha256: String,
+    pub(crate) worker_id: String,
+    pub(crate) lease_id: String,
+    pub(crate) run_id: String,
+    pub(crate) fleet_generation: u64,
+    pub(crate) expires_at_unix_ms: i64,
+}
+
+/// Raw payload returned only after the exact durable release transaction commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerFetchedPayload {
+    pub(crate) request_id: String,
+    pub(crate) delivery_attempt_id: String,
+    pub(crate) input_json: Vec<u8>,
+    pub(crate) max_payload_bytes: u64,
+    pub(crate) request_sha256: String,
+}
+
+/// Durable authority required before a queued networked-worker payload may leave the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityDispatchAuthority {
+    Generic,
+    NetworkedWorker {
+        remote_request_id: String,
+        request_sha256: String,
+        lease_id: String,
+        run_id: String,
+        lease_expires_at_unix_ms: i64,
+    },
+}
+
+/// Payload-redacted authority marker persisted in the node request audit ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CapabilityRequestAuthorityRecord {
+    #[default]
+    Generic,
+    NetworkedWorker {
+        remote_request_id: String,
+    },
+}
+
+/// Whether a node-returned result matches active durable networked-worker authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkedWorkerResultAuthorizationOutcome {
+    Authorized,
+    Rejected,
+}
+
+/// Boundary used by the node queue to cross durable networked-worker dispatch authority.
+pub(crate) trait CapabilityDispatchAuthorizer: Send + Sync {
+    /// Reserves an exact metadata-only delivery attempt for the queued claim.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable authority cannot be checked or updated.
+    fn reserve_networked_worker_delivery(
+        &self,
+        request: &NetworkedWorkerDeliveryReservationRequest,
+    ) -> Result<NetworkedWorkerDeliveryReservationOutcome, Status>;
+
+    /// Commits the exact one-time payload-release boundary before bytes leave the daemon.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable authority cannot be checked or updated.
+    fn release_networked_worker_payload(
+        &self,
+        request: &NetworkedWorkerPayloadReleaseRequest,
+    ) -> Result<NetworkedWorkerPayloadReleaseOutcome, Status>;
+
+    /// Records one exact payload acknowledgement idempotently.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable evidence cannot be checked or updated.
+    fn acknowledge_networked_worker_payload(
+        &self,
+        request: &NetworkedWorkerPayloadAcknowledgementRequest,
+    ) -> Result<NetworkedWorkerPayloadAcknowledgementOutcome, Status>;
+
+    /// Rolls back an exact dispatch whose payload has not left the daemon.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable evidence cannot be checked or committed.
+    fn abort_networked_worker_dispatch_before_payload_release(
+        &self,
+        remote_request_id: &str,
+        node_request_id: &str,
+        request_sha256: &str,
+        dispatch_fleet_generation: u64,
+        observed_at_unix_ms: i64,
+    ) -> Result<NetworkedWorkerDispatchAbortBeforeReleaseOutcome, Status>;
+
+    /// Cancels the exact durable claim while it remains queued.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable claim state cannot be checked or updated.
+    fn cancel_networked_worker_dispatch(
+        &self,
+        remote_request_id: &str,
+        node_request_id: &str,
+        reason_code: &str,
+        observed_at_unix_ms: i64,
+    ) -> Result<NetworkedWorkerDispatchCancelOutcome, Status>;
+
+    /// Verifies that an authenticated worker owns the exact released attempt returning this result.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable claim authority cannot be checked.
+    fn authorize_networked_worker_result(
+        &self,
+        remote_request_id: &str,
+        node_request_id: &str,
+        delivery_attempt_id: &str,
+        reporting_worker_id: &str,
+        observed_at_unix_ms: i64,
+    ) -> Result<NetworkedWorkerResultAuthorizationOutcome, Status>;
 }
 
 /// Result a node reports back for a dispatched capability request.
@@ -196,6 +335,51 @@ pub(crate) struct CapabilityExecutionResult {
     pub(crate) success: bool,
     pub(crate) output_json: Vec<u8>,
     pub(crate) error: String,
+}
+
+/// One authenticated result notification plus host-owned receipt evidence.
+#[derive(Debug, Clone)]
+pub(crate) struct CapabilityExecutionNotification {
+    pub(crate) result: CapabilityExecutionResult,
+    pub(crate) delivery_attempt_id: Option<String>,
+    pub(crate) observed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityExecutionSlot {
+    notification: Mutex<Option<CapabilityExecutionNotification>>,
+    ready: Notify,
+}
+
+/// Single-consumer result handle backed by a runtime-owned one-item slot.
+#[derive(Debug)]
+pub(crate) struct CapabilityExecutionReceiver {
+    slot: Arc<CapabilityExecutionSlot>,
+}
+
+impl CapabilityExecutionReceiver {
+    /// Receives the authenticated result once it has been durably committed and published.
+    pub(crate) async fn recv(&mut self) -> CapabilityExecutionNotification {
+        loop {
+            let notified = self.slot.ready.notified();
+            if let Some(notification) =
+                lock_mutex(&self.slot.notification, "node capability result notification")
+                    .expect("capability result notification lock must remain usable")
+                    .take()
+            {
+                return notification;
+            }
+            notified.await;
+        }
+    }
+
+    /// Tries to receive the published result without waiting.
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<CapabilityExecutionNotification> {
+        lock_mutex(&self.slot.notification, "node capability result notification")
+            .expect("capability result notification lock must remain usable")
+            .take()
+    }
 }
 
 /// Lifecycle of a capability request from enqueue to terminal outcome.
@@ -209,6 +393,25 @@ pub(crate) enum CapabilityRequestState {
     Failed,
     TimedOut,
     Rejected,
+    Cancelled,
+}
+
+/// Outcome of attempting to stop one capability request without recalling released work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapabilityRequestStopOutcome {
+    CancelledBeforeRelease,
+    ReleasedReconciliationOwned,
+    AlreadyTerminal,
+    Missing,
+}
+
+/// Outcome of recording a caller deadline after work may already have completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapabilityRequestTimeoutOutcome {
+    MarkedTimedOut,
+    ResultCommitted,
+    AlreadyTerminal,
+    Missing,
 }
 
 /// Persisted, payload-redacted audit record for one capability request.
@@ -223,18 +426,31 @@ pub(crate) struct CapabilityRequestRecord {
     pub(crate) dispatched_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: Option<i64>,
     pub(crate) max_payload_bytes: u64,
+    #[serde(default)]
+    authority: CapabilityRequestAuthorityRecord,
     pub(crate) input_summary: Option<String>,
     pub(crate) output_summary: Option<String>,
     pub(crate) error: Option<String>,
 }
 
-// In-memory only: queues and waiters reference live oneshot channels and raw
-// payload bytes, neither of which would survive (or should reach) disk.
+// In-memory only: queues and result channels reference live process ownership and raw payload
+// bytes, neither of which would survive (or should reach) disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkedWorkerInFlightMetadata {
+    device_id: String,
+    remote_request_id: String,
+    delivery_attempt_id: String,
+    request_sha256: String,
+    payload_released: bool,
+}
+
 #[derive(Default)]
 struct CapabilityRuntimeState {
     queued_by_device: HashMap<String, VecDeque<CapabilityDispatchRecord>>,
-    inflight_by_request_id: HashMap<String, CapabilityDispatchRecord>,
-    waiters_by_request_id: HashMap<String, oneshot::Sender<CapabilityExecutionResult>>,
+    reserved_worker_payloads_by_request_id: HashMap<String, CapabilityDispatchRecord>,
+    generic_inflight_by_request_id: HashMap<String, CapabilityDispatchRecord>,
+    networked_worker_inflight_by_request_id: HashMap<String, NetworkedWorkerInFlightMetadata>,
+    result_slots_by_request_id: HashMap<String, Arc<CapabilityExecutionSlot>>,
 }
 
 #[derive(Default)]
@@ -246,14 +462,16 @@ struct ReservedPairingCodeState {
 ///
 /// Persistent data (`persisted`) is flushed to `node-runtime.v1.json` on every
 /// mutation; `reserved_codes` and `capabilities` are volatile coordination
-/// state. Lock discipline: methods take at most one of the three mutexes at a
-/// time (or release the first before taking the second), so there is no
-/// cross-mutex ordering to violate.
+/// state. Methods that must atomically cancel a queued request take
+/// `capabilities` before `persisted`; no method may acquire these locks in the
+/// reverse order.
 pub(crate) struct NodeRuntimeState {
     state_root: PathBuf,
     persisted: Mutex<PersistedNodeRuntimeState>,
     reserved_codes: Mutex<ReservedPairingCodeState>,
     capabilities: Mutex<CapabilityRuntimeState>,
+    #[cfg(test)]
+    fail_next_persist: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for NodeRuntimeState {
@@ -286,6 +504,8 @@ impl NodeRuntimeState {
             persisted: Mutex::new(persisted),
             reserved_codes: Mutex::new(ReservedPairingCodeState::default()),
             capabilities: Mutex::new(CapabilityRuntimeState::default()),
+            #[cfg(test)]
+            fail_next_persist: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -668,7 +888,7 @@ impl NodeRuntimeState {
     }
 
     /// Queues a capability request for `device_id` and returns its id plus a
-    /// oneshot receiver that resolves when the node reports a result.
+    /// bounded receiver that resolves when the node reports a result.
     ///
     /// `_timeout_ms` is accepted for API symmetry but deliberately unused:
     /// the deadline is enforced by the caller racing the receiver (see
@@ -683,7 +903,7 @@ impl NodeRuntimeState {
         input_json: Vec<u8>,
         max_payload_bytes: u64,
         _timeout_ms: Option<u64>,
-    ) -> Result<(String, oneshot::Receiver<CapabilityExecutionResult>), Status> {
+    ) -> Result<(String, CapabilityExecutionReceiver), Status> {
         let now = current_unix_ms()?;
         let request_id = Ulid::new().to_string();
         let dispatch = CapabilityDispatchRecord {
@@ -691,8 +911,10 @@ impl NodeRuntimeState {
             capability: capability.to_owned(),
             input_json: input_json.clone(),
             max_payload_bytes,
+            networked_worker_reservation: None,
+            authority: CapabilityDispatchAuthority::Generic,
         };
-        let (sender, receiver) = oneshot::channel();
+        let slot = Arc::new(CapabilityExecutionSlot::default());
         let request = CapabilityRequestRecord {
             request_id: request_id.clone(),
             device_id: device_id.to_owned(),
@@ -703,6 +925,7 @@ impl NodeRuntimeState {
             dispatched_at_unix_ms: None,
             completed_at_unix_ms: None,
             max_payload_bytes,
+            authority: CapabilityRequestAuthorityRecord::Generic,
             input_summary: summarize_payload_bytes(input_json.as_slice()),
             output_summary: None,
             error: None,
@@ -714,113 +937,869 @@ impl NodeRuntimeState {
         }
         let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
         capabilities.queued_by_device.entry(device_id.to_owned()).or_default().push_back(dispatch);
-        capabilities.waiters_by_request_id.insert(request_id.clone(), sender);
-        Ok((request_id, receiver))
+        capabilities.result_slots_by_request_id.insert(request_id.clone(), Arc::clone(&slot));
+        Ok((request_id, CapabilityExecutionReceiver { slot }))
     }
 
-    /// Pops the next queued dispatch for `device_id` (FIFO), moving it to the
-    /// in-flight set and marking the persisted record `Dispatched`.
+    /// Enqueues a networked-worker payload only after its exact durable claim exists.
+    ///
+    /// `claim.node_request_id` is caller-generated and shared by the durable claim and volatile
+    /// queue record, preventing queue presence from becoming an independent authority source.
     ///
     /// # Errors
-    /// Returns `Status::internal` on clock, lock, or persistence failure.
+    /// Returns `Status::internal` on clock, lock, or persistence failure, or
+    /// `Status::failed_precondition` when the claim metadata does not match the payload.
+    pub(crate) fn enqueue_claimed_capability_request(
+        &self,
+        device_id: &str,
+        capability: &str,
+        input_json: Vec<u8>,
+        max_payload_bytes: u64,
+        claim: &NetworkedWorkerDispatchClaim,
+    ) -> Result<CapabilityExecutionReceiver, Status> {
+        let now = current_unix_ms()?;
+        if claim.node_request_id.is_empty()
+            || claim.remote_request_id.is_empty()
+            || claim.worker_id != device_id
+            || claim.capability != capability
+            || claim.request_sha256 != sha256_hex(input_json.as_slice())
+            || !matches!(claim.state, crate::journal::NetworkedWorkerDispatchClaimState::Queued)
+        {
+            return Err(Status::failed_precondition(
+                "networked worker dispatch claim does not match queued payload",
+            ));
+        }
+        let request_id = claim.node_request_id.clone();
+        let dispatch = CapabilityDispatchRecord {
+            request_id: request_id.clone(),
+            capability: capability.to_owned(),
+            input_json: input_json.clone(),
+            max_payload_bytes,
+            networked_worker_reservation: None,
+            authority: CapabilityDispatchAuthority::NetworkedWorker {
+                remote_request_id: claim.remote_request_id.clone(),
+                request_sha256: claim.request_sha256.clone(),
+                lease_id: claim.lease_id.clone(),
+                run_id: claim.run_id.clone(),
+                lease_expires_at_unix_ms: claim.lease_expires_at_unix_ms,
+            },
+        };
+        let slot = Arc::new(CapabilityExecutionSlot::default());
+        let request = CapabilityRequestRecord {
+            request_id: request_id.clone(),
+            device_id: device_id.to_owned(),
+            capability: capability.to_owned(),
+            state: CapabilityRequestState::Queued,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            dispatched_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            max_payload_bytes,
+            authority: CapabilityRequestAuthorityRecord::NetworkedWorker {
+                remote_request_id: claim.remote_request_id.clone(),
+            },
+            input_summary: summarize_payload_bytes(input_json.as_slice()),
+            output_summary: None,
+            error: None,
+        };
+        let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+        if capabilities.result_slots_by_request_id.contains_key(request_id.as_str())
+            || capabilities.generic_inflight_by_request_id.contains_key(request_id.as_str())
+            || capabilities
+                .networked_worker_inflight_by_request_id
+                .contains_key(request_id.as_str())
+            || capabilities.reserved_worker_payloads_by_request_id.contains_key(request_id.as_str())
+            || capabilities
+                .queued_by_device
+                .values()
+                .any(|queue| queue.iter().any(|item| item.request_id == request_id))
+        {
+            return Err(Status::already_exists("networked worker node request is already queued"));
+        }
+        let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+        if persisted.capability_requests.contains_key(request_id.as_str()) {
+            return Err(Status::already_exists(
+                "networked worker node request audit record already exists",
+            ));
+        }
+        persisted.capability_requests.insert(request_id.clone(), request);
+        self.persist_locked(&persisted)?;
+        capabilities.queued_by_device.entry(device_id.to_owned()).or_default().push_back(dispatch);
+        capabilities.result_slots_by_request_id.insert(request_id, Arc::clone(&slot));
+        Ok(CapabilityExecutionReceiver { slot })
+    }
+
+    /// Returns the next generic dispatch or metadata-only worker reservation after durable writes.
+    ///
+    /// A fenced worker payload remains process-local until [`Self::fetch_networked_worker_payload`]
+    /// commits the exact release transaction. The event stream never receives its raw bytes.
+    ///
+    /// # Errors
+    /// Returns a gRPC status on clock, lock, persistence, randomness, or durable authorization
+    /// failure.
     pub(crate) fn next_capability_dispatch(
         &self,
         device_id: &str,
+        authorizer: &dyn CapabilityDispatchAuthorizer,
     ) -> Result<Option<CapabilityDispatchRecord>, Status> {
-        let now = current_unix_ms()?;
-        let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
-        let Some(queue) = capabilities.queued_by_device.get_mut(device_id) else {
-            return Ok(None);
-        };
-        let Some(dispatch) = queue.pop_front() else {
-            return Ok(None);
-        };
-        capabilities.inflight_by_request_id.insert(dispatch.request_id.clone(), dispatch.clone());
-        drop(capabilities);
-        let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
-        if let Some(request) = persisted.capability_requests.get_mut(dispatch.request_id.as_str()) {
+        loop {
+            let now = current_unix_ms()?;
+            let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+            let Some(mut dispatch) = capabilities
+                .queued_by_device
+                .get(device_id)
+                .and_then(|queue| queue.front())
+                .cloned()
+            else {
+                return Ok(None);
+            };
+
+            let mut reserved_delivery = None;
+            let rejected_reason = match &dispatch.authority {
+                CapabilityDispatchAuthority::Generic => None,
+                CapabilityDispatchAuthority::NetworkedWorker {
+                    remote_request_id,
+                    request_sha256,
+                    lease_id,
+                    run_id,
+                    lease_expires_at_unix_ms,
+                } => {
+                    let observed_sha256 = sha256_hex(dispatch.input_json.as_slice());
+                    if observed_sha256 != *request_sha256 {
+                        match authorizer.cancel_networked_worker_dispatch(
+                            remote_request_id,
+                            dispatch.request_id.as_str(),
+                            "worker.dispatch.payload_digest_mismatch",
+                            now,
+                        )? {
+                            NetworkedWorkerDispatchCancelOutcome::Cancelled
+                            | NetworkedWorkerDispatchCancelOutcome::AlreadyCancelled => {}
+                            NetworkedWorkerDispatchCancelOutcome::InFlight => {
+                                return Err(Status::failed_precondition(
+                                    "networked worker payload changed after dispatch authority began",
+                                ));
+                            }
+                            NetworkedWorkerDispatchCancelOutcome::Missing => {
+                                return Err(Status::failed_precondition(
+                                    "networked worker payload mismatch claim is missing",
+                                ));
+                            }
+                        }
+                        Some("networked worker queued payload digest mismatch")
+                    } else {
+                        let delivery_attempt_id = Ulid::new().to_string();
+                        let fetch_token = mint_networked_worker_delivery_token();
+                        let reservation_request = NetworkedWorkerDeliveryReservationRequest {
+                            remote_request_id: remote_request_id.clone(),
+                            node_request_id: dispatch.request_id.clone(),
+                            request_sha256: request_sha256.clone(),
+                            delivery_attempt_id: delivery_attempt_id.clone(),
+                            delivery_token_sha256: sha256_hex(fetch_token.as_bytes()),
+                            observed_at_unix_ms: now,
+                        };
+                        match authorizer.reserve_networked_worker_delivery(&reservation_request)? {
+                            NetworkedWorkerDeliveryReservationOutcome::Authorized {
+                                fleet_generation,
+                            } => {
+                                reserved_delivery = Some(NetworkedWorkerDeliveryReservation {
+                                    request_id: dispatch.request_id.clone(),
+                                    delivery_attempt_id,
+                                    fetch_token,
+                                    request_sha256: request_sha256.clone(),
+                                    worker_id: device_id.to_owned(),
+                                    lease_id: lease_id.clone(),
+                                    run_id: run_id.clone(),
+                                    fleet_generation,
+                                    expires_at_unix_ms: *lease_expires_at_unix_ms,
+                                });
+                                None
+                            }
+                            NetworkedWorkerDeliveryReservationOutcome::Rejected => {
+                                Some("networked worker durable delivery reservation rejected")
+                            }
+                        }
+                    }
+                }
+            };
+
+            let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+            let Some(request) = persisted.capability_requests.get_mut(dispatch.request_id.as_str())
+            else {
+                return Err(Status::failed_precondition(
+                    "queued capability request has no persisted audit record",
+                ));
+            };
+            if let Some(reason) = rejected_reason {
+                request.state = CapabilityRequestState::Rejected;
+                request.updated_at_unix_ms = now;
+                request.completed_at_unix_ms = Some(now);
+                request.error = Some(reason.to_owned());
+                self.persist_locked(&persisted)?;
+                remove_queued_capability(
+                    &mut capabilities,
+                    device_id,
+                    dispatch.request_id.as_str(),
+                )?;
+                capabilities.result_slots_by_request_id.remove(dispatch.request_id.as_str());
+                continue;
+            }
+
+            let request_before_dispatch = request.clone();
             request.state = CapabilityRequestState::Dispatched;
             request.updated_at_unix_ms = now;
             request.dispatched_at_unix_ms = Some(now);
-        }
-        self.persist_locked(&persisted)?;
-        Ok(Some(dispatch))
-    }
+            if let Err(persist_error) = self.persist_locked(&persisted) {
+                persisted
+                    .capability_requests
+                    .insert(dispatch.request_id.clone(), request_before_dispatch);
+                enum RollbackOutcome {
+                    Exact,
+                    Inexact,
+                    CheckFailed(Status),
+                }
 
-    /// Records a node-reported result and wakes the waiting caller; returns
-    /// `false` when no waiter remained (caller timed out or disconnected).
-    ///
-    /// NOTE: a late result deliberately overwrites a `TimedOut` record
-    /// with the real Succeeded/Failed outcome for audit accuracy, even though
-    /// the original caller already received DEADLINE_EXCEEDED. Do not "fix"
-    /// this by guarding on state without revisiting node_rpc timeout handling.
-    ///
-    /// # Errors
-    /// Returns `Status::internal` on clock, lock, or persistence failure.
-    pub(crate) fn complete_capability_request(
-        &self,
-        request_id: &str,
-        result: CapabilityExecutionResult,
-    ) -> Result<bool, Status> {
-        let now = current_unix_ms()?;
-        {
-            let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
-            if let Some(request) = persisted.capability_requests.get_mut(request_id) {
-                request.state = if result.success {
-                    CapabilityRequestState::Succeeded
+                let rollback_outcome = match (&dispatch.authority, &reserved_delivery) {
+                    (
+                        CapabilityDispatchAuthority::NetworkedWorker {
+                            remote_request_id,
+                            request_sha256,
+                            ..
+                        },
+                        Some(reservation),
+                    ) => match authorizer.abort_networked_worker_dispatch_before_payload_release(
+                        remote_request_id.as_str(),
+                        dispatch.request_id.as_str(),
+                        request_sha256.as_str(),
+                        reservation.fleet_generation,
+                        now,
+                    ) {
+                        Ok(
+                            NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted
+                            | NetworkedWorkerDispatchAbortBeforeReleaseOutcome::AlreadyAborted,
+                        ) => RollbackOutcome::Exact,
+                        Ok(
+                            NetworkedWorkerDispatchAbortBeforeReleaseOutcome::NotAbortable
+                            | NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Missing,
+                        ) => RollbackOutcome::Inexact,
+                        Err(error) => RollbackOutcome::CheckFailed(error),
+                    },
+                    _ => return Err(persist_error),
+                };
+
+                let request = persisted
+                    .capability_requests
+                    .get_mut(dispatch.request_id.as_str())
+                    .expect("queued capability request was restored before recovery");
+                request.state = if matches!(&rollback_outcome, RollbackOutcome::Exact) {
+                    CapabilityRequestState::Cancelled
                 } else {
                     CapabilityRequestState::Failed
                 };
-                request.updated_at_unix_ms = now;
-                request.completed_at_unix_ms = Some(now);
-                request.output_summary = summarize_payload_bytes(result.output_json.as_slice());
-                request.error = normalize_summary_text(result.error.as_str());
+                request.updated_at_unix_ms = now.max(request.updated_at_unix_ms);
+                request.dispatched_at_unix_ms = None;
+                request.completed_at_unix_ms = Some(request.updated_at_unix_ms);
+                request.error = Some(
+                    if matches!(&rollback_outcome, RollbackOutcome::Exact) {
+                        "networked worker payload withheld after local audit persistence failure; durable dispatch authority cancelled"
+                    } else {
+                        "networked worker payload withheld after local audit persistence failure; durable dispatch authority requires reconciliation"
+                    }
+                    .to_owned(),
+                );
+                let recovery_persist_error = self.persist_locked(&persisted).err();
+
+                remove_queued_capability(
+                    &mut capabilities,
+                    device_id,
+                    dispatch.request_id.as_str(),
+                )?;
+                capabilities.result_slots_by_request_id.remove(dispatch.request_id.as_str());
+
+                let recovery_failure = recovery_persist_error
+                    .as_ref()
+                    .map(|error| {
+                        format!("; terminal local audit recovery also failed: {}", error.message())
+                    })
+                    .unwrap_or_default();
+                return match rollback_outcome {
+                    RollbackOutcome::Exact => {
+                        if recovery_persist_error.is_some() {
+                            Err(Status::internal(format!(
+                                "node audit persistence failed before payload release and durable dispatch was cancelled{recovery_failure}; initial failure: {}",
+                                persist_error.message()
+                            )))
+                        } else {
+                            Err(persist_error)
+                        }
+                    }
+                    RollbackOutcome::Inexact => Err(Status::failed_precondition(format!(
+                        "node audit persistence failed before payload release and durable dispatch rollback was not exact: {}{recovery_failure}",
+                        persist_error.message()
+                    ))),
+                    RollbackOutcome::CheckFailed(rollback_error) => {
+                        Err(Status::failed_precondition(format!(
+                            "node audit persistence failed before payload release and durable dispatch rollback could not be confirmed: {}; rollback check failed: {}{recovery_failure}",
+                            persist_error.message(),
+                            rollback_error.message()
+                        )))
+                    }
+                };
             }
-            self.persist_locked(&persisted)?;
+
+            remove_queued_capability(&mut capabilities, device_id, dispatch.request_id.as_str())?;
+            if let Some(reservation) = reserved_delivery {
+                let mut reserved_dispatch = dispatch.clone();
+                reserved_dispatch.networked_worker_reservation = Some(reservation.clone());
+                capabilities
+                    .reserved_worker_payloads_by_request_id
+                    .insert(dispatch.request_id.clone(), reserved_dispatch);
+                capabilities.networked_worker_inflight_by_request_id.insert(
+                    dispatch.request_id.clone(),
+                    NetworkedWorkerInFlightMetadata {
+                        device_id: device_id.to_owned(),
+                        remote_request_id: match &dispatch.authority {
+                            CapabilityDispatchAuthority::NetworkedWorker {
+                                remote_request_id,
+                                ..
+                            } => remote_request_id.clone(),
+                            CapabilityDispatchAuthority::Generic => unreachable!(
+                                "worker reservation requires networked-worker dispatch authority"
+                            ),
+                        },
+                        delivery_attempt_id: reservation.delivery_attempt_id.clone(),
+                        request_sha256: reservation.request_sha256.clone(),
+                        payload_released: false,
+                    },
+                );
+                dispatch.input_json.clear();
+                dispatch.networked_worker_reservation = Some(reservation);
+            } else {
+                capabilities
+                    .generic_inflight_by_request_id
+                    .insert(dispatch.request_id.clone(), dispatch.clone());
+            }
+            return Ok(Some(dispatch));
         }
+    }
+
+    /// Recovers a metadata reservation that could not be delivered to the node event stream.
+    ///
+    /// The event sender reports failure only when the response was not accepted by its bounded
+    /// channel, so an unreleased reservation can be durably cancelled without claiming recall of
+    /// bytes. Generic dispatches and already-released worker payloads remain reconciliation-owned.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable authority or local audit evidence cannot be checked or
+    /// committed.
+    pub(crate) fn recover_undelivered_capability_dispatch(
+        &self,
+        dispatch: &CapabilityDispatchRecord,
+        authorizer: &dyn CapabilityDispatchAuthorizer,
+    ) -> Result<CapabilityRequestStopOutcome, Status> {
+        self.stop_capability_request(
+            dispatch.request_id.as_str(),
+            "node event stream closed before dispatch delivery",
+            Some(authorizer),
+        )
+    }
+
+    /// Releases the exact reserved worker payload after durable authority commits.
+    ///
+    /// No bytes are returned for a mismatched device, request, attempt, token, digest, or durable
+    /// release denial. The raw payload is removed from reserved ownership after the release commit;
+    /// a lost RPC response is therefore treated as released and reconciliation-owned.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when volatile reservation state is missing/inconsistent or durable
+    /// release authority cannot be checked or committed.
+    pub(crate) fn fetch_networked_worker_payload(
+        &self,
+        reporting_device_id: &str,
+        request_id: &str,
+        delivery_attempt_id: &str,
+        fetch_token: &str,
+        authorizer: &dyn CapabilityDispatchAuthorizer,
+    ) -> Result<NetworkedWorkerFetchedPayload, Status> {
+        let now = current_unix_ms()?;
         let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
-        capabilities.inflight_by_request_id.remove(request_id);
-        let Some(waiter) = capabilities.waiters_by_request_id.remove(request_id) else {
+        let metadata = capabilities
+            .networked_worker_inflight_by_request_id
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition("networked worker delivery reservation is not active")
+            })?;
+        if metadata.device_id != reporting_device_id
+            || metadata.delivery_attempt_id != delivery_attempt_id
+            || metadata.payload_released
+        {
+            return Err(Status::failed_precondition(
+                "networked worker delivery reservation does not match the authenticated request",
+            ));
+        }
+        let dispatch = capabilities
+            .reserved_worker_payloads_by_request_id
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition("networked worker reserved payload is unavailable")
+            })?;
+        if sha256_hex(dispatch.input_json.as_slice()) != metadata.request_sha256 {
+            return Err(Status::failed_precondition(
+                "networked worker reserved payload digest is inconsistent",
+            ));
+        }
+        match authorizer.release_networked_worker_payload(
+            &NetworkedWorkerPayloadReleaseRequest {
+                node_request_id: request_id.to_owned(),
+                delivery_attempt_id: delivery_attempt_id.to_owned(),
+                delivery_token: fetch_token.to_owned(),
+                reporting_worker_id: reporting_device_id.to_owned(),
+                observed_at_unix_ms: now,
+            },
+        )? {
+            NetworkedWorkerPayloadReleaseOutcome::Released => {}
+            NetworkedWorkerPayloadReleaseOutcome::AlreadyReleased => {
+                return Err(Status::failed_precondition(
+                    "networked worker payload was already released",
+                ));
+            }
+            NetworkedWorkerPayloadReleaseOutcome::Rejected => {
+                return Err(Status::failed_precondition(
+                    "networked worker payload release authority was rejected",
+                ));
+            }
+        }
+        capabilities.reserved_worker_payloads_by_request_id.remove(request_id);
+        let metadata = capabilities
+            .networked_worker_inflight_by_request_id
+            .get_mut(request_id)
+            .expect("networked worker in-flight metadata was checked before durable release");
+        metadata.payload_released = true;
+        Ok(NetworkedWorkerFetchedPayload {
+            request_id: request_id.to_owned(),
+            delivery_attempt_id: delivery_attempt_id.to_owned(),
+            input_json: dispatch.input_json,
+            max_payload_bytes: dispatch.max_payload_bytes,
+            request_sha256: metadata.request_sha256.clone(),
+        })
+    }
+
+    /// Records one exact worker payload acknowledgement.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when the reservation does not belong to the authenticated node or
+    /// durable acknowledgement evidence cannot be checked or committed.
+    pub(crate) fn acknowledge_networked_worker_payload(
+        &self,
+        reporting_device_id: &str,
+        request_id: &str,
+        delivery_attempt_id: &str,
+        fetch_token: &str,
+        authorizer: &dyn CapabilityDispatchAuthorizer,
+    ) -> Result<NetworkedWorkerPayloadAcknowledgementOutcome, Status> {
+        let now = current_unix_ms()?;
+        let capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+        let metadata = capabilities
+            .networked_worker_inflight_by_request_id
+            .get(request_id)
+            .ok_or_else(|| {
+                Status::failed_precondition("networked worker delivery reservation is not active")
+            })?;
+        if metadata.device_id != reporting_device_id
+            || metadata.delivery_attempt_id != delivery_attempt_id
+            || !metadata.payload_released
+        {
+            return Err(Status::failed_precondition(
+                "networked worker acknowledgement does not match a released payload",
+            ));
+        }
+        let outcome = authorizer.acknowledge_networked_worker_payload(
+            &NetworkedWorkerPayloadAcknowledgementRequest {
+                node_request_id: request_id.to_owned(),
+                delivery_attempt_id: delivery_attempt_id.to_owned(),
+                delivery_token: fetch_token.to_owned(),
+                reporting_worker_id: reporting_device_id.to_owned(),
+                observed_at_unix_ms: now,
+            },
+        )?;
+        if matches!(outcome, NetworkedWorkerPayloadAcknowledgementOutcome::Rejected) {
+            return Err(Status::failed_precondition(
+                "networked worker payload acknowledgement was rejected",
+            ));
+        }
+        Ok(outcome)
+    }
+
+    /// Records a node-reported result after authenticating request ownership and wakes the caller.
+    ///
+    /// A valid late result overwrites a `TimedOut` record only when its runtime-owned one-item slot
+    /// is empty. The slot survives dropped waiting futures, so caller cancellation cannot create an
+    /// ownerless retry gap.
+    ///
+    /// # Errors
+    /// Returns `permission_denied` for the wrong reporting node, `failed_precondition` for missing
+    /// or inactive request/claim authority, and `internal` on clock, lock, or persistence failure.
+    pub(crate) fn complete_capability_request(
+        &self,
+        reporting_device_id: &str,
+        request_id: &str,
+        delivery_attempt_id: Option<&str>,
+        result: CapabilityExecutionResult,
+        authorizer: &dyn CapabilityDispatchAuthorizer,
+    ) -> Result<bool, Status> {
+        let now = current_unix_ms()?;
+        let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+        let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+        let request = persisted.capability_requests.get_mut(request_id).ok_or_else(|| {
+            Status::failed_precondition("capability result request is not active")
+        })?;
+        authorize_capability_request_owner(request, reporting_device_id)?;
+        let authenticated_delivery_attempt_id =
+            if let CapabilityRequestAuthorityRecord::NetworkedWorker { remote_request_id } =
+                &request.authority
+            {
+                let delivery_attempt_id = delivery_attempt_id.ok_or_else(|| {
+                    Status::invalid_argument("networked worker result missing delivery_attempt_id")
+                })?;
+                let metadata = capabilities
+                    .networked_worker_inflight_by_request_id
+                    .get(request_id)
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "networked worker result delivery reservation is not active",
+                        )
+                    })?;
+                if metadata.remote_request_id != *remote_request_id
+                    || metadata.device_id != reporting_device_id
+                    || metadata.delivery_attempt_id != delivery_attempt_id
+                    || !metadata.payload_released
+                {
+                    return Err(Status::failed_precondition(
+                        "networked worker result does not match the released delivery attempt",
+                    ));
+                }
+                if !matches!(
+                    authorizer.authorize_networked_worker_result(
+                        remote_request_id,
+                        request_id,
+                        delivery_attempt_id,
+                        reporting_device_id,
+                        now,
+                    )?,
+                    NetworkedWorkerResultAuthorizationOutcome::Authorized
+                ) {
+                    return Err(Status::failed_precondition(
+                        "networked worker result claim is not active for this node",
+                    ));
+                }
+                Some(delivery_attempt_id.to_owned())
+            } else {
+                if delivery_attempt_id.is_some() {
+                    return Err(Status::invalid_argument(
+                        "generic capability result must not include delivery_attempt_id",
+                    ));
+                }
+                None
+            };
+
+        if !matches!(
+            request.state,
+            CapabilityRequestState::Dispatched
+                | CapabilityRequestState::AwaitingLocalMediation
+                | CapabilityRequestState::TimedOut
+        ) {
+            return Err(Status::failed_precondition(
+                "capability result request is not awaiting a result",
+            ));
+        }
+        let result_state = if result.success {
+            CapabilityRequestState::Succeeded
+        } else {
+            CapabilityRequestState::Failed
+        };
+        let output_summary = summarize_payload_bytes(result.output_json.as_slice());
+        let error = normalize_summary_text(result.error.as_str());
+        let Some(slot) = capabilities.result_slots_by_request_id.get(request_id).cloned() else {
             return Ok(false);
         };
-        let _ = waiter.send(result);
+        let mut notification_slot =
+            lock_mutex(&slot.notification, "node capability result notification")?;
+        if notification_slot.is_some() {
+            return Err(Status::unavailable(
+                "capability result notification slot is already occupied",
+            ));
+        }
+
+        let request_before_completion = request.clone();
+        request.state = result_state;
+        request.updated_at_unix_ms = now;
+        request.completed_at_unix_ms = Some(now);
+        request.output_summary = output_summary;
+        request.error = error;
+        if let Err(persist_error) = self.persist_locked(&persisted) {
+            persisted.capability_requests.insert(request_id.to_owned(), request_before_completion);
+            return Err(persist_error);
+        }
+
+        *notification_slot = Some(CapabilityExecutionNotification {
+            result,
+            delivery_attempt_id: authenticated_delivery_attempt_id,
+            observed_at_unix_ms: now,
+        });
+        drop(notification_slot);
+        slot.ready.notify_one();
+        capabilities.result_slots_by_request_id.remove(request_id);
+        capabilities.generic_inflight_by_request_id.remove(request_id);
+        capabilities.networked_worker_inflight_by_request_id.remove(request_id);
+        capabilities.reserved_worker_payloads_by_request_id.remove(request_id);
         Ok(true)
     }
 
-    /// Marks a request `TimedOut` in the persisted ledger; the in-memory
-    /// queue/waiter entries are left for the dispatch and completion paths to
-    /// reconcile (see [`Self::complete_capability_request`]).
+    /// Marks a pending request `TimedOut` without overwriting a committed result.
+    ///
+    /// Dropping a waiting future does not remove the runtime-owned result slot while reconciliation
+    /// owns it. A late node result clears volatile dispatch state only after publication.
+    /// Callers must treat [`CapabilityRequestTimeoutOutcome::ResultCommitted`] as authoritative and
+    /// drain their existing result receiver before returning a deadline.
     ///
     /// # Errors
     /// Returns `Status::internal` on clock, lock, or persistence failure.
-    pub(crate) fn mark_capability_timeout(&self, request_id: &str) -> Result<bool, Status> {
+    pub(crate) fn mark_capability_timeout(
+        &self,
+        request_id: &str,
+    ) -> Result<CapabilityRequestTimeoutOutcome, Status> {
         let now = current_unix_ms()?;
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
         let Some(request) = persisted.capability_requests.get_mut(request_id) else {
-            return Ok(false);
+            return Ok(CapabilityRequestTimeoutOutcome::Missing);
         };
-        request.state = CapabilityRequestState::TimedOut;
-        request.updated_at_unix_ms = now;
-        request.completed_at_unix_ms = Some(now);
-        request.error = Some("timed out waiting for node capability result".to_owned());
-        self.persist_locked(&persisted)?;
-        Ok(true)
+        let outcome = match request.state {
+            CapabilityRequestState::Queued
+            | CapabilityRequestState::Dispatched
+            | CapabilityRequestState::AwaitingLocalMediation => {
+                request.state = CapabilityRequestState::TimedOut;
+                request.updated_at_unix_ms = now;
+                request.completed_at_unix_ms = Some(now);
+                request.error = Some("timed out waiting for node capability result".to_owned());
+                self.persist_locked(&persisted)?;
+                CapabilityRequestTimeoutOutcome::MarkedTimedOut
+            }
+            CapabilityRequestState::Succeeded | CapabilityRequestState::Failed => {
+                CapabilityRequestTimeoutOutcome::ResultCommitted
+            }
+            CapabilityRequestState::TimedOut
+            | CapabilityRequestState::Rejected
+            | CapabilityRequestState::Cancelled => CapabilityRequestTimeoutOutcome::AlreadyTerminal,
+        };
+        Ok(outcome)
     }
 
-    /// Marks a dispatched request as blocked on local (on-device) mediation,
-    /// e.g. a user prompt the node must resolve before reporting a result.
+    /// Test-only hook that simulates loss of runtime-owned result delivery after dispatch.
+    #[cfg(test)]
+    pub(crate) fn drop_capability_result_owner(&self, request_id: &str) -> Result<bool, Status> {
+        let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+        Ok(capabilities.result_slots_by_request_id.remove(request_id).is_some())
+    }
+
+    /// Test-only hook that fails the result audit write after ownership checks.
+    #[cfg(test)]
+    pub(crate) fn fail_next_result_persist_for_test(&self) {
+        self.fail_next_persist_for_test();
+    }
+
+    /// Stops queued or unreleased work without claiming recall after payload release.
     ///
     /// # Errors
-    /// Returns `Status::internal` on clock, lock, or persistence failure.
+    /// Returns a gRPC status when durable authority or local audit evidence cannot be checked or
+    /// committed.
+    pub(crate) fn stop_capability_request(
+        &self,
+        request_id: &str,
+        reason: &str,
+        authorizer: Option<&dyn CapabilityDispatchAuthorizer>,
+    ) -> Result<CapabilityRequestStopOutcome, Status> {
+        let now = current_unix_ms()?;
+        let mut capabilities = lock_mutex(&self.capabilities, "node capability runtime")?;
+        if capabilities.generic_inflight_by_request_id.contains_key(request_id) {
+            return Ok(CapabilityRequestStopOutcome::ReleasedReconciliationOwned);
+        }
+        if let Some(metadata) =
+            capabilities.networked_worker_inflight_by_request_id.get(request_id).cloned()
+        {
+            if metadata.payload_released {
+                return Ok(CapabilityRequestStopOutcome::ReleasedReconciliationOwned);
+            }
+            let Some(authorizer) = authorizer else {
+                return Err(Status::failed_precondition(
+                    "networked worker reservation cancellation requires durable authorizer",
+                ));
+            };
+            let dispatch = capabilities
+                .reserved_worker_payloads_by_request_id
+                .get(request_id)
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "networked worker unreleased reservation is missing its payload",
+                    )
+                })?;
+            let dispatch_fleet_generation = match &dispatch.networked_worker_reservation {
+                Some(reservation) => reservation.fleet_generation,
+                None => {
+                    return Err(Status::failed_precondition(
+                        "networked worker unreleased reservation is missing delivery metadata",
+                    ));
+                }
+            };
+            match authorizer.abort_networked_worker_dispatch_before_payload_release(
+                metadata.remote_request_id.as_str(),
+                request_id,
+                metadata.request_sha256.as_str(),
+                dispatch_fleet_generation,
+                now,
+            )? {
+                NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted
+                | NetworkedWorkerDispatchAbortBeforeReleaseOutcome::AlreadyAborted => {}
+                NetworkedWorkerDispatchAbortBeforeReleaseOutcome::NotAbortable => {
+                    return Ok(CapabilityRequestStopOutcome::ReleasedReconciliationOwned);
+                }
+                NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Missing => {
+                    return Err(Status::failed_precondition(
+                        "networked worker reservation cancellation claim is missing",
+                    ));
+                }
+            }
+            let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+            let request = persisted.capability_requests.get_mut(request_id).ok_or_else(|| {
+                Status::failed_precondition(
+                    "networked worker reservation cancellation audit record is missing",
+                )
+            })?;
+            if !matches!(request.state, CapabilityRequestState::Dispatched) {
+                return Ok(CapabilityRequestStopOutcome::AlreadyTerminal);
+            }
+            request.state = CapabilityRequestState::Cancelled;
+            request.updated_at_unix_ms = now;
+            request.completed_at_unix_ms = Some(now);
+            request.error = normalize_summary_text(reason)
+                .or_else(|| Some("capability request cancelled before payload release".to_owned()));
+            self.persist_locked(&persisted)?;
+            capabilities.reserved_worker_payloads_by_request_id.remove(request_id);
+            capabilities.networked_worker_inflight_by_request_id.remove(request_id);
+            capabilities.result_slots_by_request_id.remove(request_id);
+            return Ok(CapabilityRequestStopOutcome::CancelledBeforeRelease);
+        }
+        let queued_device = capabilities.queued_by_device.iter().find_map(|(device_id, queue)| {
+            queue
+                .iter()
+                .any(|dispatch| dispatch.request_id == request_id)
+                .then(|| device_id.clone())
+        });
+        let Some(queued_device) = queued_device else {
+            let persisted = lock_mutex(&self.persisted, "node runtime state")?;
+            return Ok(match persisted.capability_requests.get(request_id) {
+                Some(request)
+                    if matches!(
+                        request.state,
+                        CapabilityRequestState::Succeeded
+                            | CapabilityRequestState::Failed
+                            | CapabilityRequestState::TimedOut
+                            | CapabilityRequestState::Rejected
+                            | CapabilityRequestState::Cancelled
+                    ) =>
+                {
+                    CapabilityRequestStopOutcome::AlreadyTerminal
+                }
+                Some(_) => CapabilityRequestStopOutcome::ReleasedReconciliationOwned,
+                None => CapabilityRequestStopOutcome::Missing,
+            });
+        };
+        let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+        let Some(request) = persisted.capability_requests.get_mut(request_id) else {
+            return Ok(CapabilityRequestStopOutcome::Missing);
+        };
+        if let CapabilityRequestAuthorityRecord::NetworkedWorker { remote_request_id } =
+            &request.authority
+        {
+            let Some(authorizer) = authorizer else {
+                return Err(Status::failed_precondition(
+                    "networked worker queued cancellation requires durable authorizer",
+                ));
+            };
+            match authorizer.cancel_networked_worker_dispatch(
+                remote_request_id,
+                request_id,
+                "worker.dispatch.cancelled_before_dispatch",
+                now,
+            )? {
+                NetworkedWorkerDispatchCancelOutcome::Cancelled
+                | NetworkedWorkerDispatchCancelOutcome::AlreadyCancelled => {}
+                NetworkedWorkerDispatchCancelOutcome::InFlight => {
+                    return Ok(CapabilityRequestStopOutcome::ReleasedReconciliationOwned);
+                }
+                NetworkedWorkerDispatchCancelOutcome::Missing => {
+                    return Err(Status::failed_precondition(
+                        "networked worker queued cancellation claim is missing",
+                    ));
+                }
+            }
+        }
+        request.state = CapabilityRequestState::Cancelled;
+        request.updated_at_unix_ms = now;
+        request.completed_at_unix_ms = Some(now);
+        request.error = normalize_summary_text(reason)
+            .or_else(|| Some("capability request cancelled before dispatch".to_owned()));
+        self.persist_locked(&persisted)?;
+        if let Some(queue) = capabilities.queued_by_device.get_mut(queued_device.as_str()) {
+            queue.retain(|dispatch| dispatch.request_id != request_id);
+            if queue.is_empty() {
+                capabilities.queued_by_device.remove(queued_device.as_str());
+            }
+        }
+        capabilities.result_slots_by_request_id.remove(request_id);
+        Ok(CapabilityRequestStopOutcome::CancelledBeforeRelease)
+    }
+
+    /// Compatibility wrapper returning whether [`Self::stop_capability_request`] proved recall.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when durable authority or local audit evidence cannot be checked or
+    /// committed.
+    #[cfg(test)]
+    pub(crate) fn cancel_queued_capability_request(
+        &self,
+        request_id: &str,
+        reason: &str,
+        authorizer: Option<&dyn CapabilityDispatchAuthorizer>,
+    ) -> Result<bool, Status> {
+        self.stop_capability_request(request_id, reason, authorizer)
+            .map(|outcome| matches!(outcome, CapabilityRequestStopOutcome::CancelledBeforeRelease))
+    }
+
+    /// Marks an owned dispatched request as blocked on local (on-device) mediation.
+    ///
+    /// # Errors
+    /// Returns `permission_denied` for the wrong reporting node, `failed_precondition` when the
+    /// request is missing or not dispatched, and `internal` on clock, lock, or persistence failure.
     pub(crate) fn mark_capability_awaiting_local_mediation(
         &self,
+        reporting_device_id: &str,
         request_id: &str,
     ) -> Result<bool, Status> {
         let now = current_unix_ms()?;
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
-        let Some(request) = persisted.capability_requests.get_mut(request_id) else {
-            return Ok(false);
-        };
+        let request = persisted.capability_requests.get_mut(request_id).ok_or_else(|| {
+            Status::failed_precondition("capability mediation request is not active")
+        })?;
+        authorize_capability_request_owner(request, reporting_device_id)?;
+        if !matches!(
+            request.state,
+            CapabilityRequestState::Dispatched | CapabilityRequestState::AwaitingLocalMediation
+        ) {
+            return Err(Status::failed_precondition(
+                "capability mediation request is not dispatched",
+            ));
+        }
         request.state = CapabilityRequestState::AwaitingLocalMediation;
         request.updated_at_unix_ms = now;
         request.dispatched_at_unix_ms = Some(request.dispatched_at_unix_ms.unwrap_or(now));
@@ -855,10 +1834,21 @@ impl NodeRuntimeState {
         Ok(requests)
     }
 
+    /// Test-only hook that fails the next node runtime persistence attempt.
+    #[cfg(test)]
+    pub(crate) fn fail_next_persist_for_test(&self) {
+        self.fail_next_persist.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     // Re-canonicalizes the root and rejects any join that escapes it on every
     // write: defense in depth against the state root being swapped for a
     // symlink between load and persist.
     fn persist_locked(&self, persisted: &PersistedNodeRuntimeState) -> Result<(), Status> {
+        #[cfg(test)]
+        if self.fail_next_persist.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Err(Status::internal("injected node runtime persistence failure"));
+        }
+
         let encoded = serde_json::to_vec_pretty(persisted).map_err(|error| {
             Status::internal(format!("failed to encode node runtime state: {error}"))
         })?;
@@ -946,6 +1936,41 @@ fn lock_mutex<'a, T>(
     mutex.lock().map_err(|_| Status::internal(format!("{label} lock poisoned")))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn mint_networked_worker_delivery_token() -> String {
+    let token_bytes: [u8; NETWORKED_WORKER_DELIVERY_TOKEN_BYTES] = rand::random();
+    URL_SAFE_NO_PAD.encode(token_bytes)
+}
+
+fn remove_queued_capability(
+    capabilities: &mut CapabilityRuntimeState,
+    device_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    let queue = capabilities
+        .queued_by_device
+        .get_mut(device_id)
+        .ok_or_else(|| Status::aborted("capability queue changed during dispatch"))?;
+    let removed =
+        queue.pop_front().ok_or_else(|| Status::aborted("capability queue head disappeared"))?;
+    if removed.request_id != request_id {
+        return Err(Status::aborted("capability queue head changed during dispatch"));
+    }
+    if queue.is_empty() {
+        capabilities.queued_by_device.remove(device_id);
+    }
+    Ok(())
+}
+
 /// Current wall-clock time as Unix milliseconds.
 ///
 /// # Errors
@@ -989,18 +2014,24 @@ fn summarize_payload_bytes(payload_json: &[u8]) -> Option<String> {
 /// `request_id`.
 pub(crate) fn parse_capability_result_payload(
     payload_json: &[u8],
-) -> Result<(String, CapabilityExecutionResult), Status> {
+) -> Result<(String, Option<String>, CapabilityExecutionResult), Status> {
     let value: Value = serde_json::from_slice(payload_json).map_err(|error| {
         Status::invalid_argument(format!("invalid capability result payload: {error}"))
     })?;
     let request_id = parse_capability_request_id(&value)?;
+    let delivery_attempt_id = value
+        .get("delivery_attempt_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .map(ToOwned::to_owned);
     let success = value.get("success").and_then(Value::as_bool).unwrap_or(false);
     let error = value.get("error").and_then(Value::as_str).unwrap_or_default().to_owned();
     let output_json = value
         .get("output_json")
         .map(|inner| serde_json::to_vec(inner).unwrap_or_default())
         .unwrap_or_default();
-    Ok((request_id, CapabilityExecutionResult { success, output_json, error }))
+    Ok((request_id, delivery_attempt_id, CapabilityExecutionResult { success, output_json, error }))
 }
 
 /// Extracts the `request_id` from a capability lifecycle event payload.
@@ -1013,6 +2044,17 @@ pub(crate) fn parse_capability_request_id_payload(payload_json: &[u8]) -> Result
         Status::invalid_argument(format!("invalid capability lifecycle payload: {error}"))
     })?;
     parse_capability_request_id(&value)
+}
+
+fn authorize_capability_request_owner(
+    request: &CapabilityRequestRecord,
+    reporting_device_id: &str,
+) -> Result<(), Status> {
+    if request.device_id == reporting_device_id {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("capability request is not authorized for this node"))
+    }
 }
 
 fn parse_capability_request_id(value: &Value) -> Result<String, Status> {
@@ -1028,9 +2070,97 @@ fn parse_capability_request_id(value: &Value) -> Result<String, Status> {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_canonical_state_root, DevicePairingMaterialRecord, NodeRuntimeState,
-        NODE_RUNTIME_STATE_FILE_NAME,
+        resolve_canonical_state_root, CapabilityDispatchAuthorizer, DevicePairingMaterialRecord,
+        NetworkedWorkerResultAuthorizationOutcome, NodeRuntimeState, NODE_RUNTIME_STATE_FILE_NAME,
     };
+    use crate::journal::{
+        NetworkedWorkerDeliveryReservationOutcome,
+        NetworkedWorkerDispatchAbortBeforeReleaseOutcome, NetworkedWorkerDispatchCancelOutcome,
+        NetworkedWorkerPayloadAcknowledgementOutcome, NetworkedWorkerPayloadReleaseOutcome,
+    };
+    use tonic::{Code, Status};
+    use ulid::Ulid;
+
+    struct TestClaimAuthorizer {
+        result_outcome: NetworkedWorkerResultAuthorizationOutcome,
+        begin_outcome: NetworkedWorkerDeliveryReservationOutcome,
+        abort_outcome: NetworkedWorkerDispatchAbortBeforeReleaseOutcome,
+    }
+
+    impl TestClaimAuthorizer {
+        const REJECTING: Self = Self {
+            result_outcome: NetworkedWorkerResultAuthorizationOutcome::Rejected,
+            begin_outcome: NetworkedWorkerDeliveryReservationOutcome::Rejected,
+            abort_outcome: NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted,
+        };
+
+        const fn dispatching(
+            abort_outcome: NetworkedWorkerDispatchAbortBeforeReleaseOutcome,
+        ) -> Self {
+            Self {
+                result_outcome: NetworkedWorkerResultAuthorizationOutcome::Rejected,
+                begin_outcome: NetworkedWorkerDeliveryReservationOutcome::Authorized {
+                    fleet_generation: 7,
+                },
+                abort_outcome,
+            }
+        }
+    }
+
+    impl CapabilityDispatchAuthorizer for TestClaimAuthorizer {
+        fn reserve_networked_worker_delivery(
+            &self,
+            _request: &crate::journal::NetworkedWorkerDeliveryReservationRequest,
+        ) -> Result<NetworkedWorkerDeliveryReservationOutcome, Status> {
+            Ok(self.begin_outcome)
+        }
+
+        fn release_networked_worker_payload(
+            &self,
+            _request: &crate::journal::NetworkedWorkerPayloadReleaseRequest,
+        ) -> Result<NetworkedWorkerPayloadReleaseOutcome, Status> {
+            Ok(NetworkedWorkerPayloadReleaseOutcome::Released)
+        }
+
+        fn acknowledge_networked_worker_payload(
+            &self,
+            _request: &crate::journal::NetworkedWorkerPayloadAcknowledgementRequest,
+        ) -> Result<NetworkedWorkerPayloadAcknowledgementOutcome, Status> {
+            Ok(NetworkedWorkerPayloadAcknowledgementOutcome::Acknowledged)
+        }
+
+        fn abort_networked_worker_dispatch_before_payload_release(
+            &self,
+            _remote_request_id: &str,
+            _node_request_id: &str,
+            _request_sha256: &str,
+            _dispatch_fleet_generation: u64,
+            _observed_at_unix_ms: i64,
+        ) -> Result<NetworkedWorkerDispatchAbortBeforeReleaseOutcome, Status> {
+            Ok(self.abort_outcome)
+        }
+
+        fn cancel_networked_worker_dispatch(
+            &self,
+            _remote_request_id: &str,
+            _node_request_id: &str,
+            _reason_code: &str,
+            _observed_at_unix_ms: i64,
+        ) -> Result<NetworkedWorkerDispatchCancelOutcome, Status> {
+            Ok(NetworkedWorkerDispatchCancelOutcome::Cancelled)
+        }
+
+        fn authorize_networked_worker_result(
+            &self,
+            _remote_request_id: &str,
+            _node_request_id: &str,
+            _delivery_attempt_id: &str,
+            _reporting_worker_id: &str,
+            _observed_at_unix_ms: i64,
+        ) -> Result<NetworkedWorkerResultAuthorizationOutcome, Status> {
+            Ok(self.result_outcome)
+        }
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -1115,7 +2245,7 @@ mod tests {
         );
 
         let dispatched = runtime
-            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ")
+            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ", &TestClaimAuthorizer::REJECTING)
             .expect("dispatch should succeed")
             .expect("request should dispatch");
         assert_eq!(dispatched.request_id, request_id);
@@ -1126,12 +2256,15 @@ mod tests {
 
         runtime
             .complete_capability_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
                 request_id.as_str(),
+                None,
                 super::CapabilityExecutionResult {
                     success: true,
                     output_json: br#"{"status":"ok"}"#.to_vec(),
                     error: String::new(),
                 },
+                &TestClaimAuthorizer::REJECTING,
             )
             .expect("request completion should succeed");
         let completed = runtime.capability_requests(Some("01ARZ3NDEKTSV4RRFFQ69G5FAZ")).unwrap();
@@ -1148,9 +2281,12 @@ mod tests {
                 Some(30_000),
             )
             .expect("timeout request should queue");
-        runtime
-            .mark_capability_timeout(timeout_request_id.as_str())
-            .expect("timeout should mark request");
+        assert_eq!(
+            runtime
+                .mark_capability_timeout(timeout_request_id.as_str())
+                .expect("timeout should mark request"),
+            super::CapabilityRequestTimeoutOutcome::MarkedTimedOut
+        );
         let requests = runtime.capability_requests(Some("01ARZ3NDEKTSV4RRFFQ69G5FAZ")).unwrap();
         let timeout = requests
             .iter()
@@ -1159,6 +2295,38 @@ mod tests {
         assert!(matches!(timeout.state, super::CapabilityRequestState::TimedOut));
         assert_eq!(timeout.error.as_deref(), Some("timed out waiting for node capability result"));
         assert!(timeout.completed_at_unix_ms.is_some());
+
+        let (cancelled_request_id, _cancelled_receiver) = runtime
+            .enqueue_capability_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+                "desktop.open_url",
+                br#"{"url":"https://example.com/cancelled"}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("cancelled request should queue");
+        assert!(runtime
+            .cancel_queued_capability_request(
+                cancelled_request_id.as_str(),
+                "cancelled by parent run",
+                None,
+            )
+            .expect("queued cancellation should succeed"));
+        assert!(runtime
+            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ", &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch poll should succeed")
+            .is_some_and(|dispatch| dispatch.request_id == timeout_request_id));
+        assert!(runtime
+            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ", &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch poll should succeed")
+            .is_none());
+        let requests = runtime.capability_requests(Some("01ARZ3NDEKTSV4RRFFQ69G5FAZ")).unwrap();
+        let cancelled = requests
+            .iter()
+            .find(|record| record.request_id == cancelled_request_id)
+            .expect("cancelled request should remain visible");
+        assert!(matches!(cancelled.state, super::CapabilityRequestState::Cancelled));
+        assert_eq!(cancelled.error.as_deref(), Some("cancelled by parent run"));
 
         let (mediation_request_id, _mediation_receiver) = runtime
             .enqueue_capability_request(
@@ -1170,11 +2338,14 @@ mod tests {
             )
             .expect("mediation request should queue");
         runtime
-            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ")
+            .next_capability_dispatch("01ARZ3NDEKTSV4RRFFQ69G5FAZ", &TestClaimAuthorizer::REJECTING)
             .expect("dispatch should work")
             .expect("mediation request should dispatch");
         runtime
-            .mark_capability_awaiting_local_mediation(mediation_request_id.as_str())
+            .mark_capability_awaiting_local_mediation(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+                mediation_request_id.as_str(),
+            )
             .expect("mediation state should persist");
         let requests = runtime.capability_requests(Some("01ARZ3NDEKTSV4RRFFQ69G5FAZ")).unwrap();
         let mediation = requests
@@ -1183,6 +2354,722 @@ mod tests {
             .expect("mediation request should remain visible");
         assert!(matches!(mediation.state, super::CapabilityRequestState::AwaitingLocalMediation));
         assert!(mediation.dispatched_at_unix_ms.is_some());
+    }
+
+    fn queued_worker_claim(
+        worker_id: &str,
+        capability: &str,
+        input_json: &[u8],
+    ) -> crate::journal::NetworkedWorkerDispatchClaim {
+        let now = super::current_unix_ms().expect("clock should be available");
+        crate::journal::NetworkedWorkerDispatchClaim {
+            schema_version: 3,
+            remote_request_id: Ulid::new().to_string(),
+            node_request_id: Ulid::new().to_string(),
+            worker_id: worker_id.to_owned(),
+            lease_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            issued_fleet_generation: 7,
+            dispatch_fleet_generation: None,
+            revoked_fleet_generation: None,
+            lease_expires_at_unix_ms: now.saturating_add(30_000),
+            capability: capability.to_owned(),
+            request_sha256: super::sha256_hex(input_json),
+            state: crate::journal::NetworkedWorkerDispatchClaimState::Queued,
+            delivery_attempt_id: None,
+            delivery_token_sha256: None,
+            delivery_reserved_at_unix_ms: None,
+            payload_released_at_unix_ms: None,
+            payload_release_fleet_generation: None,
+            payload_acknowledged_at_unix_ms: None,
+            delivery_disposition: None,
+            delivery_payload_present: Some(true),
+            validated_result_sha256: None,
+            result_observed_at_unix_ms: None,
+            reconciliation_disposition: None,
+            terminal_reason_code: None,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            completed_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn released_worker_result_and_timeout_are_linearized_by_capability_lock() {
+        const WORKER_ID: &str = "worker-result-timeout-linearization";
+        const CAPABILITY: &str = "tool:palyra.echo";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                WORKER_ID,
+                "test-worker",
+                vec![super::DeviceCapabilityView { name: CAPABILITY.to_owned(), available: true }],
+            )
+            .expect("worker node should register");
+        let input_json = br#"{"message":"linearize"}"#.to_vec();
+        let claim = queued_worker_claim(WORKER_ID, CAPABILITY, input_json.as_slice());
+        let mut receiver = runtime
+            .enqueue_claimed_capability_request(WORKER_ID, CAPABILITY, input_json, 4_096, &claim)
+            .expect("claimed payload should queue");
+        let authorizer = TestClaimAuthorizer {
+            result_outcome: NetworkedWorkerResultAuthorizationOutcome::Authorized,
+            begin_outcome: NetworkedWorkerDeliveryReservationOutcome::Authorized {
+                fleet_generation: 7,
+            },
+            abort_outcome: NetworkedWorkerDispatchAbortBeforeReleaseOutcome::NotAbortable,
+        };
+        let dispatch = runtime
+            .next_capability_dispatch(WORKER_ID, &authorizer)
+            .expect("dispatch poll should succeed")
+            .expect("worker request should dispatch");
+        let reservation =
+            dispatch.networked_worker_reservation.expect("worker dispatch should reserve delivery");
+        runtime
+            .fetch_networked_worker_payload(
+                WORKER_ID,
+                dispatch.request_id.as_str(),
+                reservation.delivery_attempt_id.as_str(),
+                reservation.fetch_token.as_str(),
+                &authorizer,
+            )
+            .expect("worker payload should release");
+        runtime
+            .complete_capability_request(
+                WORKER_ID,
+                dispatch.request_id.as_str(),
+                Some(reservation.delivery_attempt_id.as_str()),
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"ok"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &authorizer,
+            )
+            .expect("worker result should commit");
+
+        assert_eq!(
+            runtime
+                .stop_capability_request(
+                    dispatch.request_id.as_str(),
+                    "caller cancelled after result commit",
+                    Some(&authorizer),
+                )
+                .expect("stop classification should load committed state"),
+            super::CapabilityRequestStopOutcome::AlreadyTerminal
+        );
+        assert_eq!(
+            runtime
+                .mark_capability_timeout(dispatch.request_id.as_str())
+                .expect("timeout classification should load committed state"),
+            super::CapabilityRequestTimeoutOutcome::ResultCommitted
+        );
+        let notification = receiver.try_recv().expect("committed result should remain deliverable");
+        assert!(notification.result.success);
+        assert_eq!(
+            notification.delivery_attempt_id.as_deref(),
+            Some(reservation.delivery_attempt_id.as_str())
+        );
+        let request = runtime
+            .capability_requests(Some(WORKER_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == dispatch.request_id)
+            .expect("completed request should remain auditable");
+        assert_eq!(notification.observed_at_unix_ms, request.completed_at_unix_ms.unwrap());
+    }
+
+    #[test]
+    fn undelivered_worker_reservation_is_cancelled_before_payload_release() {
+        const WORKER_ID: &str = "worker-undelivered-reservation";
+        const CAPABILITY: &str = "tool:palyra.echo";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                WORKER_ID,
+                "test-worker",
+                vec![super::DeviceCapabilityView { name: CAPABILITY.to_owned(), available: true }],
+            )
+            .expect("worker node should register");
+        let input_json = br#"{"message":"withhold on closed stream"}"#.to_vec();
+        let claim = queued_worker_claim(WORKER_ID, CAPABILITY, input_json.as_slice());
+        let mut receiver = runtime
+            .enqueue_claimed_capability_request(WORKER_ID, CAPABILITY, input_json, 4_096, &claim)
+            .expect("claimed payload should queue");
+        let authorizer = TestClaimAuthorizer::dispatching(
+            NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted,
+        );
+        let dispatch = runtime
+            .next_capability_dispatch(WORKER_ID, &authorizer)
+            .expect("dispatch poll should succeed")
+            .expect("worker reservation should be produced");
+        let reservation = dispatch
+            .networked_worker_reservation
+            .as_ref()
+            .expect("worker dispatch should contain a reservation");
+
+        assert_eq!(
+            runtime
+                .recover_undelivered_capability_dispatch(&dispatch, &authorizer)
+                .expect("undelivered reservation should recover"),
+            super::CapabilityRequestStopOutcome::CancelledBeforeRelease
+        );
+        let fetch_error = runtime
+            .fetch_networked_worker_payload(
+                WORKER_ID,
+                dispatch.request_id.as_str(),
+                reservation.delivery_attempt_id.as_str(),
+                reservation.fetch_token.as_str(),
+                &authorizer,
+            )
+            .expect_err("cancelled undelivered reservation must release no bytes");
+        assert_eq!(fetch_error.code(), Code::FailedPrecondition);
+        assert!(receiver.try_recv().is_none());
+        let request = runtime
+            .capability_requests(Some(WORKER_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == claim.node_request_id)
+            .expect("request audit should remain visible");
+        assert!(matches!(request.state, super::CapabilityRequestState::Cancelled));
+        assert!(request
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("closed before dispatch delivery")));
+    }
+
+    #[test]
+    fn claimed_dispatch_persistence_failure_withholds_payload_and_drops_volatile_authority() {
+        const WORKER_ID: &str = "worker-local-audit-failure";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                WORKER_ID,
+                "test-worker",
+                vec![super::DeviceCapabilityView {
+                    name: "tool:palyra.echo".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("worker node should register");
+        let input_json = br#"{"message":"never release"}"#.to_vec();
+        let claim = queued_worker_claim(WORKER_ID, "tool:palyra.echo", input_json.as_slice());
+        let mut receiver = runtime
+            .enqueue_claimed_capability_request(
+                WORKER_ID,
+                claim.capability.as_str(),
+                input_json,
+                4_096,
+                &claim,
+            )
+            .expect("claimed payload should queue");
+
+        runtime.fail_next_persist_for_test();
+        let error = runtime
+            .next_capability_dispatch(
+                WORKER_ID,
+                &TestClaimAuthorizer::dispatching(
+                    NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted,
+                ),
+            )
+            .expect_err("failed local audit persistence must withhold the payload");
+        assert_eq!(error.code(), Code::Internal);
+        assert!(error.message().contains("injected node runtime persistence failure"));
+        assert!(runtime
+            .next_capability_dispatch(WORKER_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("subsequent dispatch poll should succeed")
+            .is_none());
+        assert!(receiver.try_recv().is_none());
+        let request = runtime
+            .capability_requests(Some(WORKER_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == claim.node_request_id)
+            .expect("request audit should remain visible");
+        assert!(matches!(request.state, super::CapabilityRequestState::Cancelled));
+        assert!(request.dispatched_at_unix_ms.is_none());
+        assert!(request.completed_at_unix_ms.is_some());
+        assert!(request
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("durable dispatch authority cancelled")));
+    }
+
+    #[test]
+    fn claimed_dispatch_inexact_rollback_drops_payload_and_marks_reconciliation_required() {
+        const WORKER_ID: &str = "worker-local-audit-uncertain";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                WORKER_ID,
+                "test-worker",
+                vec![super::DeviceCapabilityView {
+                    name: "tool:palyra.echo".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("worker node should register");
+        let input_json = br#"{"message":"uncertain authority"}"#.to_vec();
+        let claim = queued_worker_claim(WORKER_ID, "tool:palyra.echo", input_json.as_slice());
+        let mut receiver = runtime
+            .enqueue_claimed_capability_request(
+                WORKER_ID,
+                claim.capability.as_str(),
+                input_json,
+                4_096,
+                &claim,
+            )
+            .expect("claimed payload should queue");
+
+        runtime.fail_next_persist_for_test();
+        let error = runtime
+            .next_capability_dispatch(
+                WORKER_ID,
+                &TestClaimAuthorizer::dispatching(
+                    NetworkedWorkerDispatchAbortBeforeReleaseOutcome::NotAbortable,
+                ),
+            )
+            .expect_err("inexact rollback must fail closed");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("rollback was not exact"));
+        assert!(runtime
+            .next_capability_dispatch(WORKER_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("subsequent dispatch poll should succeed")
+            .is_none());
+        assert!(receiver.try_recv().is_none());
+        let request = runtime
+            .capability_requests(Some(WORKER_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == claim.node_request_id)
+            .expect("request audit should remain visible");
+        assert!(matches!(request.state, super::CapabilityRequestState::Failed));
+        assert!(request.dispatched_at_unix_ms.is_none());
+        assert!(request.completed_at_unix_ms.is_some());
+        assert!(request
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires reconciliation")));
+    }
+
+    #[test]
+    fn capability_result_and_mediation_require_authenticated_request_owner() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+        const OTHER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        for device_id in [OWNER_DEVICE_ID, OTHER_DEVICE_ID] {
+            runtime
+                .register_node(
+                    device_id,
+                    "windows-x86_64",
+                    vec![super::DeviceCapabilityView {
+                        name: "system.health".to_owned(),
+                        available: true,
+                    }],
+                )
+                .expect("node should register");
+        }
+
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+
+        let denial = runtime
+            .complete_capability_request(
+                OTHER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"forged"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect_err("another node must not complete the request");
+        assert_eq!(denial.code(), Code::PermissionDenied);
+        assert!(matches!(
+            runtime.capability_requests(Some(OWNER_DEVICE_ID)).expect("request audit should load")
+                [0]
+            .state,
+            super::CapabilityRequestState::Dispatched
+        ));
+        assert!(receiver.try_recv().is_none());
+
+        let mediation_denial = runtime
+            .mark_capability_awaiting_local_mediation(OTHER_DEVICE_ID, request_id.as_str())
+            .expect_err("another node must not alter mediation state");
+        assert_eq!(mediation_denial.code(), Code::PermissionDenied);
+        assert!(matches!(
+            runtime.capability_requests(Some(OWNER_DEVICE_ID)).expect("request audit should load")
+                [0]
+            .state,
+            super::CapabilityRequestState::Dispatched
+        ));
+
+        runtime
+            .mark_capability_awaiting_local_mediation(OWNER_DEVICE_ID, request_id.as_str())
+            .expect("request owner should enter mediation");
+        runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"ok"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("request owner should complete the request");
+        let notification = receiver.try_recv().expect("owner result should reach original waiter");
+        assert_eq!(notification.result.output_json, br#"{"status":"ok"}"#);
+        assert!(notification.delivery_attempt_id.is_none());
+        assert!(matches!(
+            runtime.capability_requests(Some(OWNER_DEVICE_ID)).expect("request audit should load")
+                [0]
+            .state,
+            super::CapabilityRequestState::Succeeded
+        ));
+    }
+
+    #[test]
+    fn committed_capability_result_wins_timeout_marking() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                OWNER_DEVICE_ID,
+                "windows-x86_64",
+                vec![super::DeviceCapabilityView {
+                    name: "system.health".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("node should register");
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+        runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"ok"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("request owner should complete the request");
+
+        assert_eq!(
+            runtime
+                .mark_capability_timeout(request_id.as_str())
+                .expect("timeout classification should load committed state"),
+            super::CapabilityRequestTimeoutOutcome::ResultCommitted
+        );
+        let notification = receiver.try_recv().expect("committed result should remain deliverable");
+        assert!(notification.result.success);
+        assert_eq!(notification.result.output_json, br#"{"status":"ok"}"#);
+        let request = runtime
+            .capability_requests(Some(OWNER_DEVICE_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .expect("completed request should remain auditable");
+        assert!(matches!(request.state, super::CapabilityRequestState::Succeeded));
+        assert_eq!(notification.observed_at_unix_ms, request.completed_at_unix_ms.unwrap());
+    }
+
+    #[test]
+    fn capability_request_accepts_owned_late_result_after_timeout() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                OWNER_DEVICE_ID,
+                "windows-x86_64",
+                vec![super::DeviceCapabilityView {
+                    name: "system.health".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("node should register");
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+        assert_eq!(
+            runtime
+                .mark_capability_timeout(request_id.as_str())
+                .expect("request timeout should persist"),
+            super::CapabilityRequestTimeoutOutcome::MarkedTimedOut
+        );
+
+        runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: false,
+                    output_json: Vec::new(),
+                    error: "worker failed after timeout".to_owned(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("owned late result should update audit evidence");
+        let notification = receiver.try_recv().expect("late result should reach retained waiter");
+        assert!(!notification.result.success);
+        assert!(notification.delivery_attempt_id.is_none());
+        let request = runtime
+            .capability_requests(Some(OWNER_DEVICE_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .expect("late-result request should remain auditable");
+        assert!(matches!(request.state, super::CapabilityRequestState::Failed));
+        assert_eq!(request.error.as_deref(), Some("worker failed after timeout"));
+        assert_eq!(notification.observed_at_unix_ms, request.completed_at_unix_ms.unwrap());
+    }
+
+    #[test]
+    fn capability_result_persistence_failure_preserves_owner_for_exact_retry() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                OWNER_DEVICE_ID,
+                "windows-x86_64",
+                vec![super::DeviceCapabilityView {
+                    name: "system.health".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("node should register");
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+        let result = super::CapabilityExecutionResult {
+            success: true,
+            output_json: br#"{"status":"retry"}"#.to_vec(),
+            error: String::new(),
+        };
+
+        runtime.fail_next_result_persist_for_test();
+        let error = runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                result.clone(),
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect_err("injected persistence failure should reject the result");
+        assert_eq!(error.code(), Code::Internal);
+        assert!(receiver.try_recv().is_none());
+        let request = runtime
+            .capability_requests(Some(OWNER_DEVICE_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .expect("request should remain auditable");
+        assert!(matches!(request.state, super::CapabilityRequestState::Dispatched));
+        assert!(request.output_summary.is_none());
+
+        assert!(runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                result,
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("exact retry should use the retained owner"));
+        let notification = receiver.try_recv().expect("retried result should be delivered");
+        assert_eq!(notification.result.output_json, br#"{"status":"retry"}"#);
+    }
+
+    #[test]
+    fn capability_result_remains_deliverable_when_no_future_is_polling() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                OWNER_DEVICE_ID,
+                "windows-x86_64",
+                vec![super::DeviceCapabilityView {
+                    name: "system.health".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("node should register");
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+        runtime
+            .mark_capability_timeout(request_id.as_str())
+            .expect("request timeout should persist");
+
+        assert!(runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"late"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("runtime-owned channel should accept the result"));
+        let notification = receiver.try_recv().expect("buffered result should remain deliverable");
+        assert!(notification.result.success);
+        assert_eq!(notification.result.output_json, br#"{"status":"late"}"#);
+        let request = runtime
+            .capability_requests(Some(OWNER_DEVICE_ID))
+            .expect("request audit should load")
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .expect("request should remain auditable");
+        assert!(matches!(request.state, super::CapabilityRequestState::Succeeded));
+        assert!(request.completed_at_unix_ms.is_some());
+        assert!(request.output_summary.is_some());
+        assert!(request.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn capability_result_wakeup_is_retained_before_wait_registration() {
+        const OWNER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node(
+                OWNER_DEVICE_ID,
+                "windows-x86_64",
+                vec![super::DeviceCapabilityView {
+                    name: "system.health".to_owned(),
+                    available: true,
+                }],
+            )
+            .expect("node should register");
+        let (request_id, mut receiver) = runtime
+            .enqueue_capability_request(
+                OWNER_DEVICE_ID,
+                "system.health",
+                br#"{"ok":true}"#.to_vec(),
+                4096,
+                Some(30_000),
+            )
+            .expect("capability request should queue");
+        runtime
+            .next_capability_dispatch(OWNER_DEVICE_ID, &TestClaimAuthorizer::REJECTING)
+            .expect("dispatch should succeed")
+            .expect("request should dispatch");
+
+        let slot = std::sync::Arc::clone(&receiver.slot);
+        let notified = slot.ready.notified();
+        assert!(receiver.try_recv().is_none());
+        runtime
+            .complete_capability_request(
+                OWNER_DEVICE_ID,
+                request_id.as_str(),
+                None,
+                super::CapabilityExecutionResult {
+                    success: true,
+                    output_json: br#"{"status":"between-check-and-await"}"#.to_vec(),
+                    error: String::new(),
+                },
+                &TestClaimAuthorizer::REJECTING,
+            )
+            .expect("request owner should publish the result");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("publication should retain a wakeup until the receiver registers");
+        let notification = receiver.try_recv().expect("published result should remain deliverable");
+        assert_eq!(notification.result.output_json, br#"{"status":"between-check-and-await"}"#);
     }
 
     #[test]

@@ -18,7 +18,8 @@ use futures::future::join_all;
 use palyra_common::{
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
-        ArtifactRetentionPolicy, ToolResultArtifactRef, ToolResultSensitivity, ToolTurnBudget,
+        ArtifactRetentionPolicy, CancellationContextV1, ToolResultArtifactRef,
+        ToolResultSensitivity, ToolTurnBudget,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -383,6 +384,7 @@ pub(crate) async fn execute_tool_program_run_tool(
     proposal_id: &str,
     input_json: &[u8],
     remaining_tool_budget: SharedToolBudget,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> ToolExecutionOutcome {
     let request = match parse_and_validate_request(input_json) {
         Ok(request) => request,
@@ -405,6 +407,7 @@ pub(crate) async fn execute_tool_program_run_tool(
         input_json,
         request,
         remaining_tool_budget,
+        child_task_parent_context,
     )
     .await
     {
@@ -430,6 +433,7 @@ async fn execute_validated_program(
     input_json: &[u8],
     request: ToolProgramRunRequest,
     remaining_tool_budget: SharedToolBudget,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<(ToolProgramRunResponse, String), String> {
     let started_at = Instant::now();
     let mut budget = ToolProgramBudgetReport::default();
@@ -607,6 +611,7 @@ async fn execute_validated_program(
                         &budget_snapshot,
                         &grants,
                         Some(remaining_tool_budget.clone()),
+                        child_task_parent_context,
                     )
                 });
                 join_all(futures).await
@@ -624,6 +629,7 @@ async fn execute_validated_program(
                             &budget,
                             &grants,
                             Some(remaining_tool_budget.clone()),
+                            child_task_parent_context,
                         )
                         .await,
                     );
@@ -931,6 +937,7 @@ async fn execute_program_step(
     budget_snapshot: &ToolProgramBudgetReport,
     grants: &BTreeSet<String>,
     remaining_tool_budget: Option<SharedToolBudget>,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<(ToolProgramStepResult, Option<ChildToolAttestation>, ToolProgramBudgetReport), String>
 {
     let mut budget_delta =
@@ -996,6 +1003,7 @@ async fn execute_program_step(
         remaining_tool_budget,
         rpc_request,
         &step.retry_policy,
+        child_task_parent_context,
     )
     .await;
     budget_delta.child_runs_used += usize::try_from(child_runs_consumed).unwrap_or(usize::MAX);
@@ -1100,6 +1108,7 @@ async fn execute_program_step(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_rpc_with_retries(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1108,6 +1117,7 @@ async fn execute_tool_rpc_with_retries(
     remaining_tool_budget: Option<SharedToolBudget>,
     request: ToolRpcRequest,
     retry_policy: &ToolProgramStepRetryPolicy,
+    child_task_parent_context: Option<&CancellationContextV1>,
 ) -> (ToolRpcResponse, u32) {
     let max_attempts = retry_policy.max_attempts.max(1);
     let mut attempt = 1;
@@ -1120,6 +1130,7 @@ async fn execute_tool_rpc_with_retries(
             grants,
             remaining_tool_budget.clone(),
             request.clone(),
+            child_task_parent_context,
         )
         .await;
         child_runs_consumed = child_runs_consumed.saturating_add(consumed);

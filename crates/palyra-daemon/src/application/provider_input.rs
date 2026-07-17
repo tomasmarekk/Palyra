@@ -102,6 +102,8 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) provider_messages: Vec<ProviderMessage>,
     pub(crate) vision_inputs: Vec<ProviderImageInput>,
     pub(crate) instruction_hash: Option<String>,
+    pub(crate) instruction_trust_summary:
+        Option<crate::application::instruction_compiler::InstructionTrustSummary>,
     pub(crate) context_trace_id: Option<String>,
     pub(crate) budget_profile: Option<String>,
     pub(crate) max_output_tokens: Option<u64>,
@@ -110,6 +112,43 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) prompt_segments: Vec<ProviderPromptSegment>,
     pub(crate) prompt_cache_policy: PromptCachePolicy,
     pub(crate) prompt_cache_report: Option<PromptCacheReport>,
+}
+
+impl PreparedModelProviderInput {
+    pub(crate) fn into_provider_request(
+        self,
+        user_visible_input_text: &str,
+        json_mode_requested: bool,
+        model_override: Option<String>,
+        tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+    ) -> crate::model_provider::ProviderRequest {
+        let mut request = crate::model_provider::ProviderRequest::from_input_text(
+            self.provider_input_text,
+            json_mode_requested,
+            self.vision_inputs,
+            model_override,
+        );
+        request.user_visible_input_text = Some(user_visible_input_text.to_owned());
+        request.tool_catalog_snapshot =
+            Some(crate::application::tool_registry::snapshot_to_provider_request_value(
+                tool_catalog_snapshot,
+            ));
+        request.instruction_hash = self.instruction_hash;
+        request.context_trace_id = self.context_trace_id;
+        request.budget_profile = self.budget_profile;
+        request.max_output_tokens = self.max_output_tokens;
+        request.reasoning_effort = self.reasoning_effort;
+        request.service_tier = self.service_tier;
+        request.prompt_segments = self.prompt_segments;
+        request.prompt_cache_policy = self.prompt_cache_policy;
+        request.prompt_cache_report = self.prompt_cache_report;
+        if !self.provider_messages.is_empty() {
+            let mut messages = self.provider_messages;
+            messages.push(ProviderMessage::user_text(request.input_text.clone()));
+            request.messages = messages;
+        }
+        request
+    }
 }
 
 /// Hash-only cache identity derived by the context engine for one session turn.
@@ -137,6 +176,70 @@ impl PromptCacheSessionMetadata {
             .as_slice(),
         );
         u64::from_str_radix(&digest[..16], 16).unwrap_or(0)
+    }
+}
+
+pub(crate) fn rematerialize_provider_input(
+    prepared: &PreparedModelProviderInput,
+    provider_snapshot: &crate::model_provider::ProviderStatusSnapshot,
+    provider_kind: &str,
+    provider_model_id: &str,
+    user_visible_input_text: &str,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> PreparedModelProviderInput {
+    if prepared.instruction_hash.is_none() {
+        let mut rematerialized = prepared.clone();
+        let session_metadata = rematerialized_prompt_cache_session_metadata(
+            prepared.prompt_cache_report.as_ref(),
+            provider_kind,
+            tool_catalog_snapshot,
+        );
+        let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
+            build_prompt_cache_metadata(
+                rematerialized.provider_input_text.as_str(),
+                rematerialized.provider_messages.as_slice(),
+                Some(user_visible_input_text),
+                Some(tool_catalog_snapshot),
+                Some(&session_metadata),
+            );
+        rematerialized.prompt_segments = prompt_segments;
+        rematerialized.prompt_cache_policy = prompt_cache_policy;
+        rematerialized.prompt_cache_report = prompt_cache_report;
+        return rematerialized;
+    }
+    crate::application::context_engine::rematerialize_prepared_model_provider_input(
+        prepared,
+        provider_snapshot,
+        provider_kind,
+        provider_model_id,
+        user_visible_input_text,
+        tool_catalog_snapshot,
+    )
+}
+
+pub(crate) fn rematerialized_prompt_cache_session_metadata(
+    previous_report: Option<&PromptCacheReport>,
+    provider_kind: &str,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> PromptCacheSessionMetadata {
+    PromptCacheSessionMetadata {
+        stable_prefix_hash: previous_report.and_then(|report| report.stable_prefix_hash.clone()),
+        cache_scope_hash: previous_report.and_then(|report| report.cache_scope_hash.clone()),
+        tool_catalog_hash: Some(tool_catalog_snapshot.catalog_hash.clone()),
+        memory_snapshot_hash: previous_report
+            .and_then(|report| report.memory_snapshot_hash.clone()),
+        provider_cache_strategy: provider_cache_strategy_for_kind(provider_kind),
+    }
+}
+
+fn provider_cache_strategy_for_kind(provider_kind: &str) -> String {
+    let provider_kind = provider_kind.trim().to_ascii_lowercase();
+    if provider_kind.contains("anthropic") || provider_kind.contains("minimax") {
+        "anthropic_cache_control".to_owned()
+    } else if provider_kind.contains("openai") || provider_kind.contains("chatgpt") {
+        "openai_prompt_cache_key".to_owned()
+    } else {
+        "metadata_only".to_owned()
     }
 }
 
@@ -1804,6 +1907,7 @@ async fn prepare_model_provider_input_legacy(
             provider_messages: Vec::new(),
             vision_inputs: build_provider_image_inputs(attachments, &runtime_state.config.media),
             instruction_hash: None,
+            instruction_trust_summary: None,
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
@@ -1895,6 +1999,7 @@ async fn prepare_model_provider_input_legacy(
         provider_messages: previous_provider_messages,
         vision_inputs: build_provider_image_inputs(attachments, &runtime_state.config.media),
         instruction_hash: None,
+        instruction_trust_summary: None,
         context_trace_id: None,
         budget_profile: None,
         max_output_tokens: None,

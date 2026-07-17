@@ -34,9 +34,86 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
                 "journal capacity reached ({current_events} >= {max_events})"
             ))
         }
+        JournalError::NetworkedWorkerExpiryOutboxCapacityExceeded {
+            current_entries,
+            max_entries,
+        } => Status::resource_exhausted(format!(
+            "networked worker expiry outbox capacity reached ({current_entries} >= {max_entries})"
+        )),
+        JournalError::NetworkedWorkerDispatchClaimCapacityExceeded {
+            current_entries,
+            max_entries,
+        } => Status::resource_exhausted(format!(
+            "networked worker dispatch claim capacity reached ({current_entries} >= {max_entries})"
+        )),
+        JournalError::NetworkedWorkerDispatchClaimConflict { remote_request_id } => {
+            Status::already_exists(format!(
+                "networked worker dispatch claim conflicts for request {remote_request_id}"
+            ))
+        }
+        JournalError::NetworkedWorkerDispatchAuthorityRejected { remote_request_id } => {
+            Status::failed_precondition(format!(
+                "networked worker dispatch authority rejected for request {remote_request_id}"
+            ))
+        }
+        JournalError::NetworkedWorkerDispatchSettlementRejected { remote_request_id } => {
+            Status::failed_precondition(format!(
+                "networked worker dispatch settlement rejected for request {remote_request_id}"
+            ))
+        }
+        JournalError::NetworkedWorkerFleetCapacityExceeded {
+            current_entries,
+            max_entries,
+        } => Status::resource_exhausted(format!(
+            "networked worker fleet capacity reached ({current_entries} >= {max_entries})"
+        )),
+        JournalError::NetworkedWorkerFleetGenerationConflict {
+            expected_generation,
+            actual_generation,
+        } => Status::aborted(format!(
+            "networked worker fleet generation conflict: expected {expected_generation}, found {actual_generation}"
+        )),
         JournalError::SessionIdentityMismatch { session_id } => Status::failed_precondition(
             format!("orchestrator session identity mismatch for session: {session_id}"),
         ),
+        JournalError::BackgroundTaskNotFound { task_id } => {
+            Status::not_found(format!("background task not found: {task_id}"))
+        }
+        JournalError::BackgroundTaskRevisionConflict {
+            task_id,
+            expected_revision,
+            actual_revision,
+        } => Status::aborted(format!(
+            "background task revision conflict for {task_id}: expected {expected_revision}, found {actual_revision}"
+        )),
+        JournalError::BackgroundTaskExecutionGenerationConflict {
+            task_id,
+            expected_generation,
+            actual_generation,
+        } => Status::aborted(format!(
+            "background task execution generation conflict for {task_id}: expected {expected_generation}, found {actual_generation}"
+        )),
+        JournalError::BackgroundTaskClaimRejected { task_id, reason } => {
+            Status::failed_precondition(format!(
+                "background task claim rejected for {task_id}: {reason}"
+            ))
+        }
+        JournalError::BackgroundTaskWorkerUpdateRejected { task_id, reason } => {
+            Status::failed_precondition(format!(
+                "background task worker update rejected for {task_id}: {reason}"
+            ))
+        }
+        JournalError::BackgroundTaskChildConflict { reason } => {
+            Status::failed_precondition(reason)
+        }
+        JournalError::ToolSideEffectFenceNotFound { operation_id } => {
+            Status::not_found(format!("tool side-effect fence not found: {operation_id}"))
+        }
+        JournalError::ToolSideEffectFencePrecondition { operation_id, reason } => {
+            Status::failed_precondition(format!(
+                "tool side-effect fence precondition failed for {operation_id}: {reason}"
+            ))
+        }
         JournalError::SessionNotFound { selector } => {
             Status::not_found(format!("orchestrator session not found for selector: {selector}"))
         }
@@ -362,6 +439,74 @@ mod tests {
         assert!(status.message().contains("session-1"));
         assert!(status.message().contains("lease-1"));
         assert!(status.message().contains("start_orchestrator_run"));
+    }
+
+    #[test]
+    fn map_orchestrator_store_error_maps_background_task_authority_failures() {
+        let revision = map_orchestrator_store_error(
+            "update background task",
+            JournalError::BackgroundTaskRevisionConflict {
+                task_id: "task-1".to_owned(),
+                expected_revision: 2,
+                actual_revision: 3,
+            },
+        );
+        assert_eq!(revision.code(), Code::Aborted);
+        assert!(revision.message().contains("expected 2, found 3"));
+
+        let generation = map_orchestrator_store_error(
+            "settle background task",
+            JournalError::BackgroundTaskExecutionGenerationConflict {
+                task_id: "task-1".to_owned(),
+                expected_generation: 4,
+                actual_generation: 5,
+            },
+        );
+        assert_eq!(generation.code(), Code::Aborted);
+        assert!(generation.message().contains("expected 4, found 5"));
+
+        let claim = map_orchestrator_store_error(
+            "claim background task",
+            JournalError::BackgroundTaskClaimRejected {
+                task_id: "task-1".to_owned(),
+                reason: "task is not queued".to_owned(),
+            },
+        );
+        assert_eq!(claim.code(), Code::FailedPrecondition);
+
+        let callback = map_orchestrator_store_error(
+            "settle background task",
+            JournalError::BackgroundTaskWorkerUpdateRejected {
+                task_id: "task-1".to_owned(),
+                reason: "cancel-requested work may settle only as cancelled".to_owned(),
+            },
+        );
+        assert_eq!(callback.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn map_orchestrator_store_error_maps_missing_side_effect_fence_to_not_found() {
+        let status = map_orchestrator_store_error(
+            "resolve side-effect fence",
+            JournalError::ToolSideEffectFenceNotFound { operation_id: "operation-1".to_owned() },
+        );
+
+        assert_eq!(status.code(), Code::NotFound);
+        assert!(status.message().contains("operation-1"));
+    }
+
+    #[test]
+    fn map_orchestrator_store_error_maps_side_effect_precondition() {
+        let status = map_orchestrator_store_error(
+            "resolve side-effect fence",
+            JournalError::ToolSideEffectFencePrecondition {
+                operation_id: "operation-1".to_owned(),
+                reason: "intent digest no longer matches".to_owned(),
+            },
+        );
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(status.message().contains("intent digest no longer matches"));
     }
 
     #[test]

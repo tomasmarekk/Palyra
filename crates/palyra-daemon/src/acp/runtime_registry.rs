@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use palyra_common::runtime_contracts::{
-    AcpCapability, AcpScope, AcpSessionBindingRecord, ACP_DEFAULT_DISCONNECT_GRACE_MS,
+    AcpCapability, AcpScope, AcpSessionBindingRecord, RuntimeGeneration,
+    ACP_DEFAULT_DISCONNECT_GRACE_MS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +199,10 @@ pub(crate) enum AcpRuntimeHandleReasonCode {
     RolloutDisabled,
     AdapterMissing,
     BindingMismatch,
+    #[serde(rename = "runtime.generation.stale_suppressed")]
+    StaleGeneration,
+    #[serde(rename = "runtime.generation.exhausted")]
+    GenerationExhausted,
     Disposed,
 }
 
@@ -215,6 +220,8 @@ impl AcpRuntimeHandleReasonCode {
             Self::RolloutDisabled => "acp_runtime.rollout_disabled",
             Self::AdapterMissing => "acp_runtime.adapter_missing",
             Self::BindingMismatch => "acp_runtime.binding_mismatch",
+            Self::StaleGeneration => "runtime.generation.stale_suppressed",
+            Self::GenerationExhausted => "runtime.generation.exhausted",
             Self::Disposed => "acp_runtime.disposed",
         }
     }
@@ -239,7 +246,7 @@ pub(crate) struct AcpRuntimeHandle {
     pub binding_id: String,
     pub acp_session_id: String,
     pub palyra_session_id: String,
-    pub generation: u64,
+    pub generation: RuntimeGeneration,
     pub granted_scopes: BTreeSet<AcpScope>,
     pub granted_capabilities: BTreeSet<AcpCapability>,
     pub permission_fingerprint: String,
@@ -301,7 +308,8 @@ impl AcpRuntimeRegistry {
             return Err(AcpRuntimeHandleReasonCode::RolloutDisabled);
         }
 
-        let generation = 1;
+        let generation = RuntimeGeneration::new(1)
+            .expect("the initial ACP runtime generation is a valid non-zero constant");
         let handle_id = format!("acphandle_{runtime_id}_{}_{}", binding.binding_id, generation);
         let permission_fingerprint = permission_fingerprint(binding);
         let audit = vec![audit_record(
@@ -340,10 +348,19 @@ impl AcpRuntimeRegistry {
     pub(crate) fn validate_handle(
         &mut self,
         handle_id: &str,
+        expected_generation: RuntimeGeneration,
         now_unix_ms: i64,
     ) -> Result<AcpHandleValidation, AcpRuntimeHandleReasonCode> {
         let handle =
             self.handles.get_mut(handle_id).ok_or(AcpRuntimeHandleReasonCode::AdapterMissing)?;
+        if handle.generation != expected_generation {
+            append_stale_generation_audit(handle, expected_generation);
+            return Ok(AcpHandleValidation {
+                ok: false,
+                handle: handle.clone(),
+                reason_code: AcpRuntimeHandleReasonCode::StaleGeneration,
+            });
+        }
         let reason = if handle.state == AcpRuntimeHandleState::Disposed {
             AcpRuntimeHandleReasonCode::Disposed
         } else if handle.crash_classification.is_some() {
@@ -370,11 +387,16 @@ impl AcpRuntimeRegistry {
     pub(crate) fn refresh_handle(
         &mut self,
         handle_id: &str,
+        expected_generation: RuntimeGeneration,
         binding: &AcpSessionBindingRecord,
         now_unix_ms: i64,
     ) -> Result<AcpRuntimeHandle, AcpRuntimeHandleReasonCode> {
         let handle =
             self.handles.get_mut(handle_id).ok_or(AcpRuntimeHandleReasonCode::AdapterMissing)?;
+        if handle.generation != expected_generation {
+            append_stale_generation_audit(handle, expected_generation);
+            return Err(AcpRuntimeHandleReasonCode::StaleGeneration);
+        }
         if handle.binding_id != binding.binding_id {
             return Err(AcpRuntimeHandleReasonCode::BindingMismatch);
         }
@@ -395,7 +417,19 @@ impl AcpRuntimeRegistry {
             .adapters
             .get(handle.runtime_id.as_str())
             .ok_or(AcpRuntimeHandleReasonCode::AdapterMissing)?;
-        handle.generation = handle.generation.saturating_add(1);
+        let next_generation = match handle.generation.next() {
+            Ok(generation) => generation,
+            Err(_) => {
+                handle.audit.push(audit_record(
+                    handle.runtime_id.as_str(),
+                    handle.handle_id.as_str(),
+                    AcpRuntimeHandleReasonCode::GenerationExhausted,
+                    [("state", handle.state_label())],
+                ));
+                return Err(AcpRuntimeHandleReasonCode::GenerationExhausted);
+            }
+        };
+        handle.generation = next_generation;
         handle.granted_scopes = new_scopes;
         handle.granted_capabilities = new_capabilities;
         handle.permission_fingerprint = permission_fingerprint(binding);
@@ -457,6 +491,24 @@ impl AcpRuntimeHandle {
             AcpRuntimeHandleState::Disposed => "disposed",
         }
     }
+}
+
+fn append_stale_generation_audit(
+    handle: &mut AcpRuntimeHandle,
+    observed_generation: RuntimeGeneration,
+) {
+    // A superseded handle may add redacted forensic evidence, but it cannot refresh validation
+    // time, permissions, lifecycle state, or any other authority owned by the current generation.
+    handle.audit.push(audit_record(
+        handle.runtime_id.as_str(),
+        handle.handle_id.as_str(),
+        AcpRuntimeHandleReasonCode::StaleGeneration,
+        [
+            ("state", handle.state_label().to_owned()),
+            ("expected_generation", handle.generation.to_string()),
+            ("observed_generation", observed_generation.to_string()),
+        ],
+    ));
 }
 
 fn permission_fingerprint(binding: &AcpSessionBindingRecord) -> String {
@@ -568,7 +620,7 @@ mod tests {
         assert_eq!(handle.native_thread_identity.as_deref(), Some("thread/native-1"));
 
         let validation = registry
-            .validate_handle(handle.handle_id.as_str(), 2_000)
+            .validate_handle(handle.handle_id.as_str(), handle.generation, 2_000)
             .expect("handle should validate");
         assert!(validation.ok);
         assert_eq!(validation.reason_code, AcpRuntimeHandleReasonCode::HandleValidated);
@@ -586,19 +638,20 @@ mod tests {
             .create_handle("native-acp", &original, 1_000)
             .expect("handle should be created");
         let validation = registry
-            .validate_handle(handle.handle_id.as_str(), 12_000)
+            .validate_handle(handle.handle_id.as_str(), handle.generation, 12_000)
             .expect("expired handle should classify");
         assert_eq!(validation.reason_code, AcpRuntimeHandleReasonCode::TtlExpired);
 
         let refreshed = registry
             .refresh_handle(
                 handle.handle_id.as_str(),
+                handle.generation,
                 &binding(vec![AcpScope::SessionsRead], vec![AcpCapability::SessionLoad]),
                 12_100,
             )
             .expect("narrower permissions should refresh");
         assert_eq!(refreshed.state, AcpRuntimeHandleState::Active);
-        assert_eq!(refreshed.generation, 2);
+        assert_eq!(refreshed.generation.get(), 2);
     }
 
     #[test]
@@ -616,6 +669,7 @@ mod tests {
         let error = registry
             .refresh_handle(
                 handle.handle_id.as_str(),
+                handle.generation,
                 &binding(
                     vec![AcpScope::SessionsRead, AcpScope::ApprovalsWrite],
                     vec![AcpCapability::SessionLoad, AcpCapability::ApprovalBridge],
@@ -624,6 +678,75 @@ mod tests {
             )
             .expect_err("widening must fail closed");
         assert_eq!(error, AcpRuntimeHandleReasonCode::PermissionWideningDenied);
+    }
+
+    #[test]
+    fn refreshed_handle_rejects_stale_generation_without_mutating_authority() {
+        let mut registry = AcpRuntimeRegistry::new();
+        registry.register_adapter(descriptor());
+        let narrowed_binding =
+            binding(vec![AcpScope::SessionsRead], vec![AcpCapability::SessionLoad]);
+        let original = registry
+            .create_handle("native-acp", &narrowed_binding, 1_000)
+            .expect("handle should be created");
+
+        let refreshed = registry
+            .refresh_handle(
+                original.handle_id.as_str(),
+                original.generation,
+                &narrowed_binding,
+                2_000,
+            )
+            .expect("current handle authority should refresh");
+        assert_eq!(original.generation.get(), 1);
+        assert_eq!(refreshed.generation.get(), 2);
+
+        let stale_validation = registry
+            .validate_handle(original.handle_id.as_str(), original.generation, 3_000)
+            .expect("stale validation should produce a diagnostic result");
+        assert!(!stale_validation.ok);
+        assert_eq!(stale_validation.reason_code, AcpRuntimeHandleReasonCode::StaleGeneration);
+        assert_eq!(stale_validation.handle.generation, refreshed.generation);
+        assert_eq!(stale_validation.handle.state, AcpRuntimeHandleState::Active);
+        assert_eq!(stale_validation.handle.last_validated_at_unix_ms, 2_000);
+        let stale_audit = stale_validation
+            .handle
+            .audit
+            .last()
+            .expect("stale validation should append audit evidence");
+        assert_eq!(stale_audit.reason_code, AcpRuntimeHandleReasonCode::StaleGeneration);
+        assert_eq!(
+            stale_audit.redacted_diagnostics.get("expected_generation").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            stale_audit.redacted_diagnostics.get("observed_generation").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            serde_json::to_value(stale_audit)
+                .expect("audit should serialize")
+                .pointer("/reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("runtime.generation.stale_suppressed")
+        );
+
+        let refresh_error = registry
+            .refresh_handle(
+                original.handle_id.as_str(),
+                original.generation,
+                &narrowed_binding,
+                3_100,
+            )
+            .expect_err("superseded handle authority must not refresh again");
+        assert_eq!(refresh_error, AcpRuntimeHandleReasonCode::StaleGeneration);
+
+        let current_validation = registry
+            .validate_handle(original.handle_id.as_str(), refreshed.generation, 3_200)
+            .expect("refreshed authority should remain valid");
+        assert!(current_validation.ok);
+        assert_eq!(current_validation.reason_code, AcpRuntimeHandleReasonCode::HandleValidated);
+        assert_eq!(current_validation.handle.last_validated_at_unix_ms, 3_200);
     }
 
     #[test]

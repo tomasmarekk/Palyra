@@ -34,14 +34,20 @@ use palyra_a2ui::{apply_patch_document, parse_patch_document};
 use palyra_common::metadata_trace::MetadataTraceTerminalOutcomeV1;
 use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass};
 use palyra_common::runtime_contracts::{
-    ArtifactReadResponse, ArtifactRetentionPolicy, FlowState, IdempotencyOperationState,
+    ArtifactReadResponse, ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState,
+    CancellationContextV1, CancellationScopeKind, FlowState, IdempotencyOperationState,
     IdempotencyRecordSnapshot, IdempotencyReplayDecision, RunLifecyclePhase,
-    RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, StableErrorEnvelope,
-    ToolResultArtifactRef, ToolResultSensitivity, ToolResultVisibility,
+    RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, RuntimeEventEnvelopeV2,
+    RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration,
+    RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
+    RuntimeStateCompatibilityFinding, RuntimeStateCompatibilityOutcome,
+    RuntimeStateCompatibilityReport, StableErrorEnvelope, ToolResultArtifactRef,
+    ToolResultSensitivity, ToolResultVisibility,
 };
 use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use rusqlite::{
-    params, params_from_iter, Connection, ErrorCode, OptionalExtension, ToSql, Transaction,
+    params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql,
+    Transaction, TransactionBehavior,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -75,12 +81,49 @@ use crate::{
 
 mod metadata_trace;
 mod retrieval_index_status;
+mod shared_runtime;
 pub(crate) mod state_health;
+
+#[cfg(test)]
+pub use shared_runtime::NetworkedWorkerDispatchBeginOutcome;
+use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
+pub use shared_runtime::{
+    NetworkedWorkerDeliveryReservationOutcome, NetworkedWorkerDeliveryReservationRequest,
+    NetworkedWorkerDispatchAbortBeforeReleaseOutcome, NetworkedWorkerDispatchCancelOutcome,
+    NetworkedWorkerDispatchClaim, NetworkedWorkerDispatchClaimCreateRequest,
+    NetworkedWorkerDispatchClaimState, NetworkedWorkerDispatchSettlement,
+    NetworkedWorkerExpiryOutboxRecord, NetworkedWorkerLeaseRevocation,
+    NetworkedWorkerPayloadAcknowledgementOutcome, NetworkedWorkerPayloadAcknowledgementRequest,
+    NetworkedWorkerPayloadReleaseOutcome, NetworkedWorkerPayloadReleaseRequest,
+    NetworkedWorkerResultAuthorizationOutcome, PersistedProcessLeaseRecord,
+    ProviderAttemptCompletionOutcome, ProviderAttemptCompletionRequest,
+    ProviderAttemptRuntimeAuthority, ProviderAttemptStartRequest,
+    ProviderConfigurationAttemptCompletionOutcome, ProviderConfigurationAttemptCompletionRequest,
+    ProviderConfigurationAttemptRuntimeAuthority, ProviderConfigurationAttemptStartRequest,
+    RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeGenerationInvalidateRequest,
+    RuntimeStaleEventDiagnosticRequest, SharedRuntimeDiagnostics,
+    SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
+};
+#[cfg(test)]
+pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInvalidateOutcome};
+pub(crate) use shared_runtime::{
+    RuntimeHealthActivationOutcome, RuntimeHealthComponentActivation,
+    RuntimeHealthObservationRequest, RuntimeHealthProbeReconciliationMode,
+    RuntimeHealthProbeReconciliationOutcome, RuntimeHealthProbeSettlementOutcome,
+    RuntimeHealthProbeSettlementRequest, RuntimeHealthQuarantineClearOutcome,
+    RuntimeHealthQuarantineClearRequest, ToolEffectObservationCommitOutcome,
+};
+pub(crate) use shared_runtime::{RuntimeHealthProbeBeginOutcome, RuntimeHealthProbeBeginRequest};
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
 
 const REDACTED_MARKER: &str = "<redacted>";
 const MAX_RECENT_EVENTS_LIMIT: usize = 500;
+const JOURNAL_COMPATIBILITY_SNAPSHOT_MAX_ATTEMPTS: usize = 3;
+pub(crate) const NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES: usize = 1_024;
+pub(crate) const NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES: usize = 16_384;
+pub(crate) const NETWORKED_WORKER_EXPIRY_MAX_ENTRIES: usize = 256;
+pub(crate) const NETWORKED_WORKER_FLEET_MAX_ENTRIES: usize = 256;
 const MEMORY_EMBEDDING_JOB_INDEX_TARGET: &str = "memory_vectors";
 const MEMORY_EMBEDDING_JOB_CLAIM_OWNER: &str = "memory_embeddings_backfill";
 const MEMORY_EMBEDDING_JOB_CLAIM_TIMEOUT_MS: i64 = 15 * 60 * 1000;
@@ -95,6 +138,7 @@ pub(crate) const WORKSPACE_CHECKPOINT_LIST_LIMIT_MAX: usize = 256;
 const FLOW_DEPENDENCY_STARTUP_AUDIT_ACTOR: &str = "system:flow-dependency-startup-audit";
 const FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE: usize = 64;
 const FLOW_DEPENDENCY_STARTUP_AUDIT_CONFLICT_RETRIES: usize = 1;
+const ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE: &str = "run.recovery.startup_orphaned";
 const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
     "secret",
     "token",
@@ -1487,6 +1531,21 @@ pub struct JournalAppendRequest {
     pub channel: Option<String>,
 }
 
+/// One worker lifecycle event committed with its resulting durable fleet snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkedWorkerLifecycleCommit {
+    pub request: JournalAppendRequest,
+    pub event: palyra_workerd::WorkerLifecycleEvent,
+}
+
+/// Atomic worker lifecycle commit result, including any post-commit acknowledgement failure.
+#[derive(Debug)]
+pub(crate) struct NetworkedWorkerLifecycleCommitOutcome {
+    pub fleet_generation: u64,
+    pub journal_outcomes: Vec<JournalAppendOutcome>,
+    pub acknowledgement_error: Option<JournalError>,
+}
+
 /// Result of appending one journal event (redaction flag and hash-chain links).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalAppendOutcome {
@@ -1737,6 +1796,18 @@ pub struct OrchestratorRunStartRequest {
     pub origin_run_id: Option<String>,
     pub triggered_by_principal: Option<String>,
     pub parameter_delta_json: Option<String>,
+    pub delegated_admission: Option<DelegatedRunAdmissionV1>,
+}
+
+/// Exact inherited authority required to admit one delegated child run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedRunAdmissionV1 {
+    pub task_id: String,
+    pub task_kind: String,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub parent_run_id: String,
+    pub cancellation_context: CancellationContextV1,
 }
 
 /// Token usage increment applied to a run.
@@ -1756,6 +1827,15 @@ pub struct OrchestratorTapeAppendRequest {
     pub payload_json: String,
 }
 
+/// Atomic result-evidence batch for one completed mutating tool execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEffectObservationCommitRequest {
+    pub operation_id: RuntimeOperationId,
+    pub generation: RuntimeGeneration,
+    pub evidence_sha256: String,
+    pub tape_events: Vec<OrchestratorTapeAppendRequest>,
+}
+
 /// Cancellation request for a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCancelRequest {
@@ -1772,11 +1852,122 @@ pub struct OrchestratorCancelSnapshot {
     pub reason: String,
 }
 
+/// Additional tape evidence committed before the terminal status row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorTerminalTapeEvent {
+    pub event_type: String,
+    pub payload_json: String,
+}
+
+/// Canonical request to settle an orchestrator run into a terminal state.
+#[derive(Debug, Clone)]
+pub struct OrchestratorRunTerminalSettlementRequest {
+    pub run_id: String,
+    pub requested_state: RunLifecycleState,
+    pub reason_code: String,
+    pub status_message: String,
+    pub actor: RuntimeActorRef,
+    pub terminal_summary_payload_json: Option<String>,
+    pub terminal_tape_events: Vec<OrchestratorTerminalTapeEvent>,
+    pub terminal_status_payload_json: String,
+}
+
+/// Durable result of terminal settlement; existing terminal states are sticky.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorRunTerminalSettlement {
+    pub run_id: String,
+    pub requested_state: RunLifecycleState,
+    pub effective_state: RunLifecycleState,
+    pub changed: bool,
+    pub cancellation_won: bool,
+    pub runtime_event_sequence: Option<u64>,
+    pub summary_tape_sequence: Option<i64>,
+    pub tape_sequence: Option<i64>,
+}
+
 /// Runs force-failed by startup orphan recovery.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct OrchestratorStartupRunRecoveryReport {
     pub terminalized_count: u64,
     pub terminalized_run_ids: Vec<String>,
+    pub deferred_metadata_trace_run_ids: Vec<String>,
+}
+
+/// Background tasks reconciled or failed closed during daemon startup.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct OrchestratorStartupBackgroundTaskRecoveryReport {
+    pub recovered_count: u64,
+    pub recovered_task_ids: Vec<String>,
+    pub failed_count: u64,
+    pub failed_task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTaskChildStateExpectation<'a> {
+    Exact(&'a str),
+    AttachWindow,
+}
+
+impl BackgroundTaskChildStateExpectation<'_> {
+    fn permits(self, task: &OrchestratorBackgroundTaskRecord) -> bool {
+        match self {
+            Self::Exact(expected_state) => task.state == expected_state,
+            Self::AttachWindow => {
+                task.started_at_unix_ms.is_some()
+                    && matches!(
+                        AuxiliaryTaskState::from_str(task.state.as_str()),
+                        Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested)
+                    )
+            }
+        }
+    }
+
+    const fn conflict_reason(self) -> &'static str {
+        match self {
+            Self::Exact(_) => "background task state changed before child resolution",
+            Self::AttachWindow => "background task left the child attach window",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupChildTaskCandidate {
+    task_id: String,
+    task_kind: String,
+    session_id: String,
+    child_session_id: Option<String>,
+    parent_run_id: Option<String>,
+    target_run_id: Option<String>,
+    planned_child_run_id: Option<String>,
+    owner_principal: String,
+    device_id: String,
+    channel: Option<String>,
+    delegated: bool,
+    result_run_id: Option<String>,
+    previous_state: String,
+    revision: u64,
+    attempt_count: u64,
+    max_attempts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupChildRunMatch {
+    run_id: String,
+    state: RunLifecycleState,
+    completed_at_unix_ms: Option<i64>,
+}
+
+struct StartupBackgroundTaskFailure<'a> {
+    task_id: &'a str,
+    task_kind: &'a str,
+    previous_state: &'a str,
+    revision: u64,
+    attempt_count: u64,
+    max_attempts: u64,
+    recovery: &'a str,
+    reason_code: &'a str,
+    reason: &'a str,
+    candidate_run_ids: &'a [String],
 }
 
 /// Index and generation allocated to one durable metadata trace segment.
@@ -2285,6 +2476,19 @@ pub struct OrchestratorRunMetadataUpdateRequest {
     pub merge_result: Option<Option<DelegationMergeResult>>,
 }
 
+/// Exact parent runtime authority required for a detached child mutation.
+///
+/// The journal evaluates this fence inside the same immediate transaction as
+/// the guarded write. That transaction boundary, rather than an earlier async
+/// read, is what prevents a callback from landing after a steer supersedes its
+/// parent generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrchestratorParentGenerationGuard {
+    pub session_id: String,
+    pub run_id: String,
+    pub expected_generation: RuntimeGeneration,
+}
+
 /// Stored queued user input awaiting forwarding into a run.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputRecord {
@@ -2652,11 +2856,19 @@ pub struct WorkspaceRestoreReportCreateRequest {
 pub struct OrchestratorBackgroundTaskRecord {
     pub task_id: String,
     pub task_kind: String,
+    /// Parent scheduling and memory-scope session.
     pub session_id: String,
+    /// Dedicated session that owns the delegated child run generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_run_id: Option<String>,
+    /// Host-planned child run identity. This is not proof that the child exists;
+    /// only `target_run_id` is a foreign-key-backed attachment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_child_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queued_input_id: Option<String>,
     pub owner_principal: String,
@@ -2665,11 +2877,17 @@ pub struct OrchestratorBackgroundTaskRecord {
     pub channel: Option<String>,
     pub state: String,
     pub priority: i64,
+    /// Monotonic controller/admin compare-and-set revision.
+    pub revision: u64,
+    /// Monotonic worker authority allocated only by a successful claim.
+    pub execution_generation: u64,
     pub attempt_count: u64,
     pub max_attempts: u64,
     pub budget_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation: Option<DelegationSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_context: Option<CancellationContextV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2697,9 +2915,13 @@ pub struct OrchestratorBackgroundTaskRecord {
 pub struct OrchestratorBackgroundTaskCreateRequest {
     pub task_id: String,
     pub task_kind: String,
+    /// Parent scheduling and memory-scope session.
     pub session_id: String,
+    /// Host-allocated dedicated child session for delegation tasks.
+    pub child_session_id: Option<String>,
     pub parent_run_id: Option<String>,
     pub target_run_id: Option<String>,
+    pub planned_child_run_id: Option<String>,
     pub queued_input_id: Option<String>,
     pub owner_principal: String,
     pub device_id: String,
@@ -2709,6 +2931,7 @@ pub struct OrchestratorBackgroundTaskCreateRequest {
     pub max_attempts: u64,
     pub budget_tokens: u64,
     pub delegation: Option<DelegationSnapshot>,
+    pub cancellation_context: Option<CancellationContextV1>,
     pub not_before_unix_ms: Option<i64>,
     pub expires_at_unix_ms: Option<i64>,
     pub notification_target_json: Option<String>,
@@ -2716,13 +2939,35 @@ pub struct OrchestratorBackgroundTaskCreateRequest {
     pub payload_json: Option<String>,
 }
 
-/// Partial background task update; `Some(None)` clears a field.
+/// Host-owned partial update; `Some(None)` clears a field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestratorBackgroundTaskUpdateRequest {
     pub task_id: String,
+    /// Exact durable snapshot revision required for compare-and-set authority.
+    pub expected_revision: u64,
     pub state: Option<String>,
     pub target_run_id: Option<Option<String>>,
-    pub increment_attempt_count: bool,
+    pub last_error: Option<Option<String>>,
+    pub result_json: Option<Option<String>>,
+    pub started_at_unix_ms: Option<Option<i64>>,
+    pub completed_at_unix_ms: Option<Option<i64>>,
+}
+
+/// Atomic queued-to-running claim request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorBackgroundTaskClaimRequest {
+    pub task_id: String,
+    pub expected_revision: u64,
+    pub started_at_unix_ms: i64,
+}
+
+/// Worker-owned partial update fenced by an exact execution generation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OrchestratorBackgroundTaskWorkerUpdateRequest {
+    pub task_id: String,
+    pub execution_generation: u64,
+    pub state: Option<String>,
+    pub target_run_id: Option<Option<String>>,
     pub last_error: Option<Option<String>>,
     pub result_json: Option<Option<String>>,
     pub started_at_unix_ms: Option<Option<i64>>,
@@ -2738,6 +2983,24 @@ pub struct OrchestratorBackgroundTaskListFilter {
     pub session_id: Option<String>,
     pub include_completed: bool,
     pub limit: usize,
+}
+
+/// Result of resolving a child-backed task against exact durable run metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundTaskChildResolution {
+    /// One exact child was found. Terminal children are reconciled into the task;
+    /// nonterminal children are attached without changing task state.
+    Resolved {
+        task: OrchestratorBackgroundTaskRecord,
+        run: Box<OrchestratorRunStatusSnapshot>,
+        reconciled_terminal: bool,
+    },
+    /// No exact durable child row exists yet.
+    NoChild { task: OrchestratorBackgroundTaskRecord, expected_run_id: Option<String> },
+    /// A caller-supplied run exists or is attached elsewhere but does not match this task.
+    Mismatched { task: OrchestratorBackgroundTaskRecord, requested_run_id: String },
+    /// More than one child matched the task's exact durable metadata.
+    Ambiguous { task: OrchestratorBackgroundTaskRecord, candidate_run_ids: Vec<String> },
 }
 
 /// Stored flow (multi-step orchestrated workflow) header.
@@ -4596,6 +4859,30 @@ pub enum JournalError {
     MetadataTraceInvariant { run_id: String, reason_code: &'static str },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
     SessionIdentityMismatch { session_id: String },
+    #[error("background task not found: {task_id}")]
+    BackgroundTaskNotFound { task_id: String },
+    #[error(
+        "background task revision conflict for {task_id}: expected {expected_revision}, found {actual_revision}"
+    )]
+    BackgroundTaskRevisionConflict { task_id: String, expected_revision: u64, actual_revision: u64 },
+    #[error(
+        "background task execution generation conflict for {task_id}: expected {expected_generation}, found {actual_generation}"
+    )]
+    BackgroundTaskExecutionGenerationConflict {
+        task_id: String,
+        expected_generation: u64,
+        actual_generation: u64,
+    },
+    #[error("background task claim rejected for {task_id}: {reason}")]
+    BackgroundTaskClaimRejected { task_id: String, reason: String },
+    #[error("background task worker update rejected for {task_id}: {reason}")]
+    BackgroundTaskWorkerUpdateRejected { task_id: String, reason: String },
+    #[error("background task child resolution conflict: {reason}")]
+    BackgroundTaskChildConflict { reason: String },
+    #[error("tool side-effect fence not found: {operation_id}")]
+    ToolSideEffectFenceNotFound { operation_id: String },
+    #[error("tool side-effect fence precondition failed for {operation_id}: {reason}")]
+    ToolSideEffectFencePrecondition { operation_id: String, reason: String },
     #[error("orchestrator session not found for selector: {selector}")]
     SessionNotFound { selector: String },
     #[error(
@@ -4631,8 +4918,46 @@ pub enum JournalError {
     InvalidPayloadLimit,
     #[error("journal max events must be greater than 0")]
     InvalidEventLimit,
+    #[error("journal schema compatibility blocks writable open")]
+    RuntimeStateCompatibilityBlocked { report: Box<RuntimeStateCompatibilityReport> },
+    #[error("failed to prepare read-only journal compatibility snapshot for {path}: {source}")]
+    CompatibilitySnapshot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("journal compatibility snapshot remained unstable after {attempts} attempts: {path}")]
+    CompatibilitySnapshotUnstable { path: PathBuf, attempts: usize },
     #[error("journal capacity reached ({current_events} >= {max_events})")]
     JournalCapacityExceeded { current_events: usize, max_events: usize },
+    #[error(
+        "networked worker expiry outbox capacity reached ({current_entries} >= {max_entries})"
+    )]
+    NetworkedWorkerExpiryOutboxCapacityExceeded { current_entries: usize, max_entries: usize },
+    #[error(
+        "networked worker dispatch claim capacity reached ({current_entries} >= {max_entries})"
+    )]
+    NetworkedWorkerDispatchClaimCapacityExceeded { current_entries: usize, max_entries: usize },
+    #[error(
+        "networked worker dispatch terminal evidence capacity reached ({current_entries} + {requested_entries} > {max_entries})"
+    )]
+    NetworkedWorkerDispatchTerminalEvidenceCapacityExceeded {
+        current_entries: usize,
+        requested_entries: usize,
+        max_entries: usize,
+    },
+    #[error("networked worker dispatch claim conflicts for request {remote_request_id}")]
+    NetworkedWorkerDispatchClaimConflict { remote_request_id: String },
+    #[error("networked worker dispatch authority rejected for request {remote_request_id}")]
+    NetworkedWorkerDispatchAuthorityRejected { remote_request_id: String },
+    #[error("networked worker dispatch settlement rejected for request {remote_request_id}")]
+    NetworkedWorkerDispatchSettlementRejected { remote_request_id: String },
+    #[error("networked worker fleet capacity reached ({current_entries} >= {max_entries})")]
+    NetworkedWorkerFleetCapacityExceeded { current_entries: usize, max_entries: usize },
+    #[error(
+        "networked worker fleet generation conflict: expected {expected_generation}, found {actual_generation}"
+    )]
+    NetworkedWorkerFleetGenerationConflict { expected_generation: u64, actual_generation: u64 },
     #[error("memory embedding vector dimensions must be greater than 0")]
     InvalidMemoryVectorDimensions,
     #[error("journal sqlite operation failed: {0}")]
@@ -6762,6 +7087,142 @@ const MIGRATIONS: &[Migration] = &[
         name: "metadata_trace_segments",
         sql: metadata_trace::MIGRATION_44_SQL,
     },
+    Migration {
+        version: 45,
+        name: "shared_runtime_generations_and_events",
+        sql: shared_runtime::MIGRATION_45_SQL,
+    },
+    Migration {
+        version: 46,
+        name: "shared_runtime_side_effect_fences",
+        sql: shared_runtime::MIGRATION_46_SQL,
+    },
+    Migration {
+        version: 47,
+        name: "shared_runtime_component_health",
+        sql: shared_runtime::MIGRATION_47_SQL,
+    },
+    Migration {
+        version: 48,
+        name: "shared_runtime_handles_and_cleanup",
+        sql: shared_runtime::MIGRATION_48_SQL,
+    },
+    Migration {
+        version: 49,
+        name: "shared_runtime_compatibility_quarantine",
+        sql: shared_runtime::MIGRATION_49_SQL,
+    },
+    Migration {
+        version: 50,
+        name: "shared_runtime_lease_schema_versions",
+        sql: shared_runtime::MIGRATION_50_SQL,
+    },
+    Migration {
+        version: 51,
+        name: "shared_runtime_health_probe_leases",
+        sql: shared_runtime::MIGRATION_51_SQL,
+    },
+    Migration {
+        version: 52,
+        name: "background_task_planned_child_identity",
+        sql: r#"
+            ALTER TABLE orchestrator_background_tasks
+                ADD COLUMN planned_child_run_ulid TEXT;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestrator_background_tasks_planned_child
+                ON orchestrator_background_tasks(planned_child_run_ulid)
+                WHERE planned_child_run_ulid IS NOT NULL;
+        "#,
+    },
+    Migration {
+        version: 53,
+        name: "process_reconciliation_checkpoint",
+        sql: shared_runtime::MIGRATION_53_SQL,
+    },
+    Migration {
+        version: 54,
+        name: "networked_worker_expiry_outbox",
+        sql: shared_runtime::MIGRATION_54_SQL,
+    },
+    Migration {
+        version: 55,
+        name: "networked_worker_fleet_state",
+        sql: shared_runtime::MIGRATION_55_SQL,
+    },
+    Migration {
+        version: 56,
+        name: "networked_worker_fleet_generation",
+        sql: shared_runtime::MIGRATION_56_SQL,
+    },
+    Migration {
+        version: 57,
+        name: "networked_worker_dispatch_claims",
+        sql: shared_runtime::MIGRATION_57_SQL,
+    },
+    Migration {
+        version: 58,
+        name: "shared_runtime_event_schema_versions",
+        sql: shared_runtime::MIGRATION_58_SQL,
+    },
+    Migration {
+        version: 59,
+        name: "networked_worker_dispatch_terminal_evidence",
+        sql: shared_runtime::MIGRATION_59_SQL,
+    },
+    Migration {
+        version: 60,
+        name: "networked_worker_delivery_fence",
+        sql: shared_runtime::MIGRATION_60_SQL,
+    },
+    Migration {
+        version: 61,
+        name: "networked_worker_validated_result_receipt",
+        sql: shared_runtime::MIGRATION_61_SQL,
+    },
+    Migration {
+        version: 62,
+        name: "background_task_cancellation_context",
+        sql: shared_runtime::MIGRATION_62_SQL,
+    },
+    Migration {
+        version: 63,
+        name: "durable_runtime_health_lifecycle",
+        sql: shared_runtime::MIGRATION_63_SQL,
+    },
+    Migration {
+        version: 64,
+        name: "runtime_health_terminal_snapshots",
+        sql: shared_runtime::MIGRATION_64_SQL,
+    },
+    Migration {
+        version: 65,
+        name: "runtime_health_probe_actor_attribution",
+        sql: shared_runtime::MIGRATION_65_SQL,
+    },
+    Migration {
+        version: 66,
+        name: "delegated_child_sessions",
+        sql: shared_runtime::MIGRATION_66_SQL,
+    },
+    Migration {
+        version: 67,
+        name: "background_task_execution_fences",
+        sql: shared_runtime::MIGRATION_67_SQL,
+    },
+    Migration {
+        version: 68,
+        name: "provider_configuration_authority",
+        sql: shared_runtime::MIGRATION_68_SQL,
+    },
+    Migration {
+        version: 69,
+        name: "provider_configuration_attempt_authority",
+        sql: shared_runtime::MIGRATION_69_SQL,
+    },
+    Migration {
+        version: 70,
+        name: "shared_runtime_cleanup_and_quarantine_versions",
+        sql: shared_runtime::MIGRATION_70_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -6816,6 +7277,816 @@ fn parse_optional_json_column<T: DeserializeOwned>(
             Box::new(std::io::Error::other(format!("failed to decode {field}: {error}"))),
         )
     })
+}
+
+fn background_task_result_run_id(result_json: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<Value>(result_json?).ok()?;
+    let run_id = value.get("run_id")?.as_str()?.trim();
+    (!run_id.is_empty() && run_id.len() <= 256).then(|| run_id.to_owned())
+}
+
+fn startup_child_task_candidate(
+    task: &OrchestratorBackgroundTaskRecord,
+) -> StartupChildTaskCandidate {
+    StartupChildTaskCandidate {
+        task_id: task.task_id.clone(),
+        task_kind: task.task_kind.clone(),
+        session_id: task.session_id.clone(),
+        child_session_id: task.child_session_id.clone(),
+        parent_run_id: task.parent_run_id.clone(),
+        target_run_id: task.target_run_id.clone(),
+        planned_child_run_id: task.planned_child_run_id.clone(),
+        owner_principal: task.owner_principal.clone(),
+        device_id: task.device_id.clone(),
+        channel: task.channel.clone(),
+        delegated: task.delegation.is_some(),
+        result_run_id: background_task_result_run_id(task.result_json.as_deref()),
+        previous_state: task.state.clone(),
+        revision: task.revision,
+        attempt_count: task.attempt_count,
+        max_attempts: task.max_attempts,
+    }
+}
+
+fn load_startup_child_run_matches_tx(
+    connection: &Connection,
+    candidate: &StartupChildTaskCandidate,
+) -> Result<Vec<StartupChildRunMatch>, JournalError> {
+    load_matching_background_task_run_snapshots(connection, candidate)?
+        .into_iter()
+        .map(|run| {
+            let state = RunLifecycleState::from_str(run.state.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "background child run {} has unsupported state {}",
+                    run.run_id, run.state
+                ))
+            })?;
+            Ok(StartupChildRunMatch {
+                run_id: run.run_id,
+                state,
+                completed_at_unix_ms: run.completed_at_unix_ms,
+            })
+        })
+        .collect()
+}
+
+fn load_matching_background_task_run_snapshots(
+    connection: &Connection,
+    candidate: &StartupChildTaskCandidate,
+) -> Result<Vec<OrchestratorRunStatusSnapshot>, JournalError> {
+    if !matches!(
+        AuxiliaryTaskKind::from_str(candidate.task_kind.as_str()),
+        Some(AuxiliaryTaskKind::BackgroundPrompt | AuxiliaryTaskKind::DelegationPrompt)
+    ) {
+        return Ok(Vec::new());
+    }
+    let expected_origin_kind = if candidate.delegated { "delegation" } else { "background" };
+    if let Some(target_run_id) = candidate.target_run_id.as_deref() {
+        let matches =
+            query_matching_background_task_runs(connection, candidate, Some(target_run_id))?;
+        if matches.len() == 1 {
+            return Ok(matches);
+        }
+        return Err(JournalError::InvalidArgument(format!(
+            "attached background child {target_run_id} is missing or does not match task metadata"
+        )));
+    }
+    if let Some(planned_child_run_id) = candidate.planned_child_run_id.as_deref() {
+        let matches =
+            query_matching_background_task_runs(connection, candidate, Some(planned_child_run_id))?;
+        if matches.len() == 1 {
+            return Ok(matches);
+        }
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE run_ulid = ?1)",
+            params![planned_child_run_id],
+            |row| row.get::<_, i64>(0),
+        )? == 1;
+        if exists {
+            return Err(JournalError::InvalidArgument(format!(
+                "planned background child {planned_child_run_id} does not match task metadata"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    if let Some(result_run_id) = candidate.result_run_id.as_deref() {
+        let matches =
+            query_matching_background_task_runs(connection, candidate, Some(result_run_id))?;
+        if matches.len() == 1 {
+            return Ok(matches);
+        }
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE run_ulid = ?1)",
+            params![result_run_id],
+            |row| row.get::<_, i64>(0),
+        )? == 1;
+        if exists {
+            return Err(JournalError::InvalidArgument(format!(
+                "background child {result_run_id} does not match task metadata"
+            )));
+        }
+    }
+    let matches = query_matching_background_task_runs(connection, candidate, None)?;
+    if matches.iter().any(|run| run.origin_kind != expected_origin_kind) {
+        return Err(JournalError::InvalidArgument(
+            "background child origin metadata mismatch".to_owned(),
+        ));
+    }
+    Ok(matches)
+}
+
+fn query_matching_background_task_runs(
+    connection: &Connection,
+    candidate: &StartupChildTaskCandidate,
+    exact_run_id: Option<&str>,
+) -> Result<Vec<OrchestratorRunStatusSnapshot>, JournalError> {
+    let expected_origin_kind = if candidate.delegated { "delegation" } else { "background" };
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                runs.run_ulid,
+                runs.session_ulid,
+                runs.state,
+                runs.cancel_requested,
+                runs.cancel_reason,
+                sessions.principal,
+                sessions.device_id,
+                sessions.channel,
+                runs.prompt_tokens,
+                runs.completion_tokens,
+                runs.total_tokens,
+                runs.created_at_unix_ms,
+                runs.started_at_unix_ms,
+                runs.completed_at_unix_ms,
+                runs.updated_at_unix_ms,
+                runs.last_error,
+                runs.origin_kind,
+                runs.origin_run_ulid,
+                runs.parent_run_ulid,
+                runs.triggered_by_principal,
+                runs.parameter_delta_json,
+                runs.delegation_json,
+                runs.merge_result_json,
+                (SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = runs.run_ulid)
+            FROM orchestrator_runs AS runs
+            INNER JOIN orchestrator_sessions AS sessions
+                ON sessions.session_ulid = runs.session_ulid
+            WHERE runs.session_ulid = ?1
+              AND sessions.principal = ?2
+              AND sessions.device_id = ?3
+              AND COALESCE(sessions.channel, '') = COALESCE(?4, '')
+              AND runs.origin_kind = ?5
+              AND runs.origin_run_ulid IS ?6
+              AND runs.parent_run_ulid IS ?6
+              AND runs.triggered_by_principal = ?2
+              AND json_extract(runs.parameter_delta_json, '$.background_task.task_id') = ?7
+              AND json_extract(runs.parameter_delta_json, '$.background_task.task_kind') = ?8
+              AND json_extract(runs.parameter_delta_json, '$.background_task.parent_run_id') IS ?6
+              AND (?9 IS NULL OR runs.run_ulid = ?9)
+            ORDER BY runs.created_at_unix_ms ASC, runs.run_ulid ASC
+            LIMIT 3
+        "#,
+    )?;
+    let expected_child_session_id =
+        candidate.child_session_id.as_deref().unwrap_or(candidate.session_id.as_str());
+    let rows = statement.query_map(
+        params![
+            expected_child_session_id,
+            candidate.owner_principal,
+            candidate.device_id,
+            candidate.channel,
+            expected_origin_kind,
+            candidate.parent_run_id,
+            candidate.task_id,
+            candidate.task_kind,
+            exact_run_id,
+        ],
+        |row| {
+            let raw_state: String = row.get(2)?;
+            let normalized_state = RunLifecycleState::from_str(raw_state.as_str())
+                .map(|state| state.as_str().to_owned())
+                .unwrap_or(raw_state);
+            Ok(OrchestratorRunStatusSnapshot {
+                run_id: row.get(0)?,
+                session_id: row.get(1)?,
+                state: normalized_state,
+                cancel_requested: row.get::<_, i64>(3)? == 1,
+                cancel_reason: row.get(4)?,
+                principal: row.get(5)?,
+                device_id: row.get(6)?,
+                channel: row.get(7)?,
+                prompt_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                completion_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                total_tokens: row.get::<_, i64>(10)?.max(0) as u64,
+                created_at_unix_ms: row.get(11)?,
+                started_at_unix_ms: row.get(12)?,
+                completed_at_unix_ms: row.get(13)?,
+                updated_at_unix_ms: row.get(14)?,
+                last_error: row.get(15)?,
+                origin_kind: row.get(16)?,
+                origin_run_id: row.get(17)?,
+                parent_run_id: row.get(18)?,
+                triggered_by_principal: row.get(19)?,
+                parameter_delta_json: row.get(20)?,
+                delegation: parse_optional_json_column(row.get(21)?, "delegation_json")?,
+                merge_result: parse_optional_json_column(row.get(22)?, "merge_result_json")?,
+                tape_events: row.get::<_, i64>(23)?.max(0) as u64,
+            })
+        },
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn fail_orphaned_background_task_tx(
+    connection: &Connection,
+    failure: StartupBackgroundTaskFailure<'_>,
+    now: i64,
+) -> Result<bool, JournalError> {
+    let result_json = json!({
+        "schema_version": 1,
+        "status": AuxiliaryTaskState::Failed.as_str(),
+        "task_id": failure.task_id,
+        "task_kind": failure.task_kind,
+        "recovery": failure.recovery,
+        "recovery_state": "manual_retry_required",
+        "previous_state": failure.previous_state,
+        "attempt_count": failure.attempt_count,
+        "max_attempts": failure.max_attempts,
+        "reason_code": failure.reason_code,
+        "candidate_run_ids": failure.candidate_run_ids,
+    })
+    .to_string();
+    let updated = connection.execute(
+        r#"
+            UPDATE orchestrator_background_tasks
+            SET
+                state = ?2,
+                last_error = ?3,
+                result_json = ?4,
+                completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?5),
+                updated_at_unix_ms = ?5,
+                revision = revision + 1
+            WHERE task_ulid = ?1
+              AND state = ?6
+              AND revision = ?7
+              AND target_run_ulid IS NULL
+              AND started_at_unix_ms IS NOT NULL
+        "#,
+        params![
+            failure.task_id,
+            AuxiliaryTaskState::Failed.as_str(),
+            failure.reason,
+            result_json,
+            now,
+            failure.previous_state,
+            u64_to_sqlite(failure.revision, "revision")?,
+        ],
+    )?;
+    Ok(updated == 1)
+}
+
+fn attach_background_task_child_run_tx(
+    connection: &Connection,
+    candidate: &StartupChildTaskCandidate,
+    run_id: &str,
+    now: i64,
+) -> Result<bool, JournalError> {
+    let updated = connection.execute(
+        r#"
+            UPDATE orchestrator_background_tasks
+            SET target_run_ulid = ?2, updated_at_unix_ms = ?3, revision = revision + 1
+            WHERE task_ulid = ?1
+              AND state = ?4
+              AND revision = ?6
+              AND (target_run_ulid IS NULL OR target_run_ulid = ?2)
+              AND (planned_child_run_ulid IS NULL OR planned_child_run_ulid = ?2)
+              AND (?5 IS NULL OR planned_child_run_ulid = ?5)
+        "#,
+        params![
+            candidate.task_id,
+            run_id,
+            now,
+            candidate.previous_state,
+            candidate.planned_child_run_id,
+            u64_to_sqlite(candidate.revision, "revision")?,
+        ],
+    )?;
+    Ok(updated == 1)
+}
+
+fn recover_background_task_from_child_run_tx(
+    connection: &Connection,
+    candidate: &StartupChildTaskCandidate,
+    run: &StartupChildRunMatch,
+    recovery: &str,
+    reason_code: &str,
+    now: i64,
+) -> Result<bool, JournalError> {
+    let cancellation_requested =
+        candidate.previous_state == AuxiliaryTaskState::CancelRequested.as_str();
+    let task_state = match run.state {
+        RunLifecycleState::Done | RunLifecycleState::Failed if cancellation_requested => {
+            AuxiliaryTaskState::Cancelled
+        }
+        RunLifecycleState::Done => AuxiliaryTaskState::Succeeded,
+        RunLifecycleState::Cancelled => AuxiliaryTaskState::Cancelled,
+        RunLifecycleState::Failed => AuxiliaryTaskState::Failed,
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => {
+            return Err(JournalError::InvalidArgument(format!(
+                "background child {} is not terminal",
+                run.run_id
+            )));
+        }
+    };
+    let completed_at_unix_ms = run.completed_at_unix_ms.unwrap_or(now);
+    let result_json = json!({
+        "schema_version": 1,
+        "status": task_state.as_str(),
+        "task_id": candidate.task_id,
+        "task_kind": candidate.task_kind,
+        "recovery": recovery,
+        "recovery_state": "existing_child_reconciled",
+        "previous_state": candidate.previous_state,
+        "run_id": run.run_id,
+        "child_state": run.state.as_str(),
+        "attempt_count": candidate.attempt_count,
+        "max_attempts": candidate.max_attempts,
+        "reason_code": reason_code,
+    })
+    .to_string();
+    let last_error = (task_state == AuxiliaryTaskState::Failed).then_some(reason_code);
+    let updated = connection.execute(
+        r#"
+            UPDATE orchestrator_background_tasks
+            SET
+                state = ?2,
+                target_run_ulid = ?3,
+                last_error = ?4,
+                result_json = ?5,
+                completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?6),
+                updated_at_unix_ms = ?7,
+                revision = revision + 1
+            WHERE task_ulid = ?1
+              AND state = ?8
+              AND revision = ?10
+              AND (target_run_ulid IS NULL OR target_run_ulid = ?3)
+              AND (planned_child_run_ulid IS NULL OR planned_child_run_ulid = ?3)
+              AND (?9 IS NULL OR planned_child_run_ulid = ?9)
+              AND started_at_unix_ms IS NOT NULL
+        "#,
+        params![
+            candidate.task_id,
+            task_state.as_str(),
+            run.run_id,
+            last_error,
+            result_json,
+            completed_at_unix_ms,
+            now,
+            candidate.previous_state,
+            candidate.planned_child_run_id,
+            u64_to_sqlite(candidate.revision, "revision")?,
+        ],
+    )?;
+    Ok(updated == 1)
+}
+
+fn validate_background_task_cancellation_context(
+    context: &CancellationContextV1,
+) -> Result<(), JournalError> {
+    context.validate().map_err(|error| {
+        JournalError::InvalidArgument(format!(
+            "background task cancellation context is invalid: {error}"
+        ))
+    })?;
+    if context.scope != CancellationScopeKind::ChildTask || context.parent_scope_id.is_none() {
+        return Err(JournalError::InvalidArgument(
+            "background task cancellation context must be a parented ChildTask scope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delegated_run_admission_tx(
+    connection: &Connection,
+    request: &OrchestratorRunStartRequest,
+    now: i64,
+) -> Result<(), JournalError> {
+    let is_delegation = request.origin_kind.trim().eq_ignore_ascii_case("delegation");
+    let Some(admission) = request.delegated_admission.as_ref() else {
+        return if is_delegation {
+            Err(JournalError::InvalidArgument(
+                "delegated run admission requires exact ChildTask authority".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    if !is_delegation {
+        return Err(JournalError::InvalidArgument(
+            "non-delegation run cannot carry delegated ChildTask authority".to_owned(),
+        ));
+    }
+    validate_background_task_cancellation_context(&admission.cancellation_context)?;
+    if !admission.cancellation_context.permits_new_work(now) {
+        return Err(JournalError::InvalidArgument(
+            "delegated ChildTask cancellation authority no longer permits admission".to_owned(),
+        ));
+    }
+    if admission.child_session_id != request.session_id
+        || request.origin_run_id.as_deref() != Some(admission.parent_run_id.as_str())
+    {
+        return Err(JournalError::InvalidArgument(
+            "delegated run identity does not match inherited ChildTask authority".to_owned(),
+        ));
+    }
+    let task =
+        load_background_task_tx(connection, admission.task_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "delegated run references a missing background task".to_owned(),
+            )
+        })?;
+    if task.task_kind != admission.task_kind
+        || task.task_kind != AuxiliaryTaskKind::DelegationPrompt.as_str()
+        || task.session_id != admission.parent_session_id
+        || task.child_session_id.as_deref() != Some(admission.child_session_id.as_str())
+        || task.parent_run_id.as_deref() != Some(admission.parent_run_id.as_str())
+        || task.cancellation_context.as_ref() != Some(&admission.cancellation_context)
+        || task.delegation.is_none()
+        || task.completed_at_unix_ms.is_some()
+        || !matches!(
+            AuxiliaryTaskState::from_str(task.state.as_str()),
+            Some(
+                AuxiliaryTaskState::Queued
+                    | AuxiliaryTaskState::Running
+                    | AuxiliaryTaskState::CancelRequested
+            )
+        )
+    {
+        return Err(JournalError::InvalidArgument(
+            "delegated run authority does not match the durable background task".to_owned(),
+        ));
+    }
+    if task.planned_child_run_id.as_deref().is_some_and(|planned| planned != request.run_id)
+        || task.target_run_id.as_deref().is_some_and(|target| target != request.run_id)
+    {
+        return Err(JournalError::InvalidArgument(
+            "delegated run id does not match the durable child identity".to_owned(),
+        ));
+    }
+    let child_session = load_orchestrator_session_by_id(connection, request.session_id.as_str())?
+        .ok_or_else(|| JournalError::SessionNotFound {
+        selector: request.session_id.clone(),
+    })?;
+    if child_session.parent_session_id.as_deref() != Some(admission.parent_session_id.as_str())
+        || child_session.branch_origin_run_id.as_deref() != Some(admission.parent_run_id.as_str())
+        || child_session.branch_state != "delegated"
+        || child_session.principal != task.owner_principal
+        || child_session.device_id != task.device_id
+        || child_session.channel != task.channel
+    {
+        return Err(JournalError::InvalidArgument(
+            "delegated child session lineage is invalid".to_owned(),
+        ));
+    }
+    let active_generation = shared_runtime::active_runtime_generation_tx(
+        connection,
+        admission.parent_session_id.as_str(),
+        admission.parent_run_id.as_str(),
+        RuntimeGenerationLane::Run,
+        now,
+    )?
+    .ok_or_else(|| {
+        JournalError::InvalidArgument(
+            "delegated parent run has no active runtime generation".to_owned(),
+        )
+    })?;
+    if active_generation.generation != admission.cancellation_context.generation {
+        return Err(JournalError::InvalidArgument(
+            "delegated ChildTask cancellation generation is stale".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn update_orchestrator_run_metadata_tx(
+    connection: &Connection,
+    request: &OrchestratorRunMetadataUpdateRequest,
+    now: i64,
+) -> Result<(), JournalError> {
+    let parent_run_id = request.parent_run_id.clone().flatten();
+    let clear_parent_run_id = request.parent_run_id.is_some() && parent_run_id.is_none();
+    let delegation_json = request
+        .delegation
+        .clone()
+        .flatten()
+        .map(|value| serialize_json_field(&value, "delegation_json"))
+        .transpose()?;
+    let clear_delegation_json = request.delegation.is_some() && delegation_json.is_none();
+    let merge_result_json = request
+        .merge_result
+        .clone()
+        .flatten()
+        .map(|value| serialize_json_field(&value, "merge_result_json"))
+        .transpose()?;
+    let clear_merge_result_json = request.merge_result.is_some() && merge_result_json.is_none();
+
+    let updated = connection.execute(
+        r#"
+            UPDATE orchestrator_runs
+            SET
+                parent_run_ulid = CASE
+                    WHEN ?3 = 1 THEN NULL
+                    ELSE COALESCE(?2, parent_run_ulid)
+                END,
+                delegation_json = CASE
+                    WHEN ?5 = 1 THEN NULL
+                    ELSE COALESCE(?4, delegation_json)
+                END,
+                merge_result_json = CASE
+                    WHEN ?7 = 1 THEN NULL
+                    ELSE COALESCE(?6, merge_result_json)
+                END,
+                updated_at_unix_ms = ?8
+            WHERE run_ulid = ?1
+        "#,
+        params![
+            request.run_id,
+            parent_run_id,
+            if clear_parent_run_id { 1_i64 } else { 0_i64 },
+            delegation_json,
+            if clear_delegation_json { 1_i64 } else { 0_i64 },
+            merge_result_json,
+            if clear_merge_result_json { 1_i64 } else { 0_i64 },
+            now,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct BackgroundTaskUpdateValues {
+    state: Option<String>,
+    target_run_id: Option<String>,
+    clear_target_run_id: i64,
+    last_error: Option<String>,
+    clear_last_error: i64,
+    result_json: Option<String>,
+    clear_result_json: i64,
+    started_at_unix_ms: Option<i64>,
+    clear_started_at_unix_ms: i64,
+    completed_at_unix_ms: Option<i64>,
+    clear_completed_at_unix_ms: i64,
+}
+
+impl BackgroundTaskUpdateValues {
+    fn new(
+        state: &Option<String>,
+        target_run_id: &Option<Option<String>>,
+        last_error: &Option<Option<String>>,
+        result_json: &Option<Option<String>>,
+        started_at_unix_ms: &Option<Option<i64>>,
+        completed_at_unix_ms: &Option<Option<i64>>,
+    ) -> Self {
+        let target_run_id_value = target_run_id.clone().flatten();
+        let last_error_value = last_error.clone().flatten();
+        let result_json_value = result_json.clone().flatten();
+        let started_at_unix_ms_value = started_at_unix_ms.flatten();
+        let completed_at_unix_ms_value = completed_at_unix_ms.flatten();
+        Self {
+            state: state.clone(),
+            clear_target_run_id: if target_run_id.is_some() && target_run_id_value.is_none() {
+                1
+            } else {
+                0
+            },
+            target_run_id: target_run_id_value,
+            clear_last_error: if last_error.is_some() && last_error_value.is_none() {
+                1
+            } else {
+                0
+            },
+            last_error: last_error_value,
+            clear_result_json: if result_json.is_some() && result_json_value.is_none() {
+                1
+            } else {
+                0
+            },
+            result_json: result_json_value,
+            clear_started_at_unix_ms: if started_at_unix_ms.is_some()
+                && started_at_unix_ms_value.is_none()
+            {
+                1
+            } else {
+                0
+            },
+            started_at_unix_ms: started_at_unix_ms_value,
+            clear_completed_at_unix_ms: if completed_at_unix_ms.is_some()
+                && completed_at_unix_ms_value.is_none()
+            {
+                1
+            } else {
+                0
+            },
+            completed_at_unix_ms: completed_at_unix_ms_value,
+        }
+    }
+}
+
+const BACKGROUND_TASK_CONTROLLER_UPDATE_SQL: &str = r#"
+    UPDATE orchestrator_background_tasks
+    SET
+        state = COALESCE(?2, state),
+        target_run_ulid = CASE WHEN ?3 = 1 THEN NULL ELSE COALESCE(?4, target_run_ulid) END,
+        last_error = CASE WHEN ?5 = 1 THEN NULL ELSE COALESCE(?6, last_error) END,
+        result_json = CASE WHEN ?7 = 1 THEN NULL ELSE COALESCE(?8, result_json) END,
+        started_at_unix_ms = CASE
+            WHEN ?9 = 1 THEN NULL
+            ELSE COALESCE(?10, started_at_unix_ms)
+        END,
+        completed_at_unix_ms = CASE
+            WHEN ?11 = 1 THEN NULL
+            ELSE COALESCE(?12, completed_at_unix_ms)
+        END,
+        updated_at_unix_ms = ?13,
+        revision = ?15
+    WHERE task_ulid = ?1 AND revision = ?14
+"#;
+
+const BACKGROUND_TASK_WORKER_UPDATE_SQL: &str = r#"
+    UPDATE orchestrator_background_tasks
+    SET
+        state = COALESCE(?2, state),
+        target_run_ulid = CASE WHEN ?3 = 1 THEN NULL ELSE COALESCE(?4, target_run_ulid) END,
+        last_error = CASE WHEN ?5 = 1 THEN NULL ELSE COALESCE(?6, last_error) END,
+        result_json = CASE WHEN ?7 = 1 THEN NULL ELSE COALESCE(?8, result_json) END,
+        started_at_unix_ms = CASE
+            WHEN ?9 = 1 THEN NULL
+            ELSE COALESCE(?10, started_at_unix_ms)
+        END,
+        completed_at_unix_ms = CASE
+            WHEN ?11 = 1 THEN NULL
+            ELSE COALESCE(?12, completed_at_unix_ms)
+        END,
+        updated_at_unix_ms = ?13,
+        revision = ?15
+    WHERE task_ulid = ?1 AND execution_generation = ?14 AND state = ?16
+"#;
+
+fn update_orchestrator_background_task_from_worker_tx(
+    connection: &Connection,
+    request: &OrchestratorBackgroundTaskWorkerUpdateRequest,
+) -> Result<OrchestratorBackgroundTaskRecord, JournalError> {
+    let expected_generation = u64_to_sqlite(request.execution_generation, "execution_generation")?;
+    let current = load_background_task_tx(connection, request.task_id.as_str())?
+        .ok_or_else(|| JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() })?;
+    if current.execution_generation != request.execution_generation {
+        return Err(JournalError::BackgroundTaskExecutionGenerationConflict {
+            task_id: request.task_id.clone(),
+            expected_generation: request.execution_generation,
+            actual_generation: current.execution_generation,
+        });
+    }
+    let current_state = AuxiliaryTaskState::from_str(current.state.as_str());
+    if !matches!(
+        current_state,
+        Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested)
+    ) {
+        return Err(JournalError::BackgroundTaskWorkerUpdateRejected {
+            task_id: request.task_id.clone(),
+            reason: format!("task does not accept worker callbacks in state {}", current.state),
+        });
+    }
+    if current_state == Some(AuxiliaryTaskState::CancelRequested)
+        && request.state.as_deref() != Some(AuxiliaryTaskState::Cancelled.as_str())
+    {
+        return Err(JournalError::BackgroundTaskWorkerUpdateRejected {
+            task_id: request.task_id.clone(),
+            reason: "cancel-requested work may settle only as cancelled".to_owned(),
+        });
+    }
+    let next_revision = current.revision.checked_add(1).ok_or_else(|| {
+        JournalError::InvalidArgument("background task revision is exhausted".to_owned())
+    })?;
+    let patch = BackgroundTaskUpdateValues::new(
+        &request.state,
+        &request.target_run_id,
+        &request.last_error,
+        &request.result_json,
+        &request.started_at_unix_ms,
+        &request.completed_at_unix_ms,
+    );
+    let updated = connection.execute(
+        BACKGROUND_TASK_WORKER_UPDATE_SQL,
+        params![
+            request.task_id,
+            patch.state,
+            patch.clear_target_run_id,
+            patch.target_run_id,
+            patch.clear_last_error,
+            patch.last_error,
+            patch.clear_result_json,
+            patch.result_json,
+            patch.clear_started_at_unix_ms,
+            patch.started_at_unix_ms,
+            patch.clear_completed_at_unix_ms,
+            patch.completed_at_unix_ms,
+            current_unix_ms()?,
+            expected_generation,
+            u64_to_sqlite(next_revision, "revision")?,
+            current.state,
+        ],
+    )?;
+    if updated != 1 {
+        let actual =
+            load_background_task_tx(connection, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        if actual.execution_generation != request.execution_generation {
+            return Err(JournalError::BackgroundTaskExecutionGenerationConflict {
+                task_id: request.task_id.clone(),
+                expected_generation: request.execution_generation,
+                actual_generation: actual.execution_generation,
+            });
+        }
+        return Err(JournalError::BackgroundTaskWorkerUpdateRejected {
+            task_id: request.task_id.clone(),
+            reason: format!(
+                "task changed to state {} before worker callback committed",
+                actual.state
+            ),
+        });
+    }
+    load_background_task_tx(connection, request.task_id.as_str())?
+        .ok_or_else(|| JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() })
+}
+
+fn load_background_task_tx(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<OrchestratorBackgroundTaskRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    task_ulid, task_kind, session_ulid, child_session_ulid,
+                    parent_run_ulid, target_run_ulid, planned_child_run_ulid, queued_input_ulid,
+                    owner_principal, device_id, channel, state, priority,
+                    revision, execution_generation, attempt_count, max_attempts,
+                    budget_tokens, delegation_json, cancellation_context_json,
+                    not_before_unix_ms, expires_at_unix_ms, notification_target_json,
+                    input_text, payload_json, last_error, result_json,
+                    created_at_unix_ms, updated_at_unix_ms, started_at_unix_ms,
+                    completed_at_unix_ms
+                FROM orchestrator_background_tasks
+                WHERE task_ulid = ?1
+            "#,
+            params![task_id],
+            |row| {
+                Ok(OrchestratorBackgroundTaskRecord {
+                    task_id: row.get(0)?,
+                    task_kind: row.get(1)?,
+                    session_id: row.get(2)?,
+                    child_session_id: row.get(3)?,
+                    parent_run_id: row.get(4)?,
+                    target_run_id: row.get(5)?,
+                    planned_child_run_id: row.get(6)?,
+                    queued_input_id: row.get(7)?,
+                    owner_principal: row.get(8)?,
+                    device_id: row.get(9)?,
+                    channel: row.get(10)?,
+                    state: row.get(11)?,
+                    priority: row.get(12)?,
+                    revision: row.get::<_, i64>(13)?.max(0) as u64,
+                    execution_generation: row.get::<_, i64>(14)?.max(0) as u64,
+                    attempt_count: row.get::<_, i64>(15)?.max(0) as u64,
+                    max_attempts: row.get::<_, i64>(16)?.max(0) as u64,
+                    budget_tokens: row.get::<_, i64>(17)?.max(0) as u64,
+                    delegation: parse_optional_json_column(row.get(18)?, "delegation_json")?,
+                    cancellation_context: parse_optional_json_column(
+                        row.get(19)?,
+                        "cancellation_context_json",
+                    )?,
+                    not_before_unix_ms: row.get(20)?,
+                    expires_at_unix_ms: row.get(21)?,
+                    notification_target_json: row.get(22)?,
+                    input_text: row.get(23)?,
+                    payload_json: row.get(24)?,
+                    last_error: row.get(25)?,
+                    result_json: row.get(26)?,
+                    created_at_unix_ms: row.get(27)?,
+                    updated_at_unix_ms: row.get(28)?,
+                    started_at_unix_ms: row.get(29)?,
+                    completed_at_unix_ms: row.get(30)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn normalize_session_write_lease_text(
@@ -7470,6 +8741,46 @@ fn append_orchestrator_tape_event_tx(
     request: &OrchestratorTapeAppendRequest,
     now: i64,
 ) -> Result<(), JournalError> {
+    let payload_json = sanitize_orchestrator_tape_payload(request, max_payload_bytes)?;
+    insert_orchestrator_tape_event_tx(connection, request, payload_json.as_str(), now)
+}
+
+fn append_or_replay_orchestrator_tape_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    request: &OrchestratorTapeAppendRequest,
+    now: i64,
+) -> Result<(), JournalError> {
+    let payload_json = sanitize_orchestrator_tape_payload(request, max_payload_bytes)?;
+    let existing = connection
+        .query_row(
+            r#"
+                SELECT event_type, payload_json
+                FROM orchestrator_tape
+                WHERE run_ulid = ?1 AND seq = ?2
+            "#,
+            params![request.run_id, request.seq],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match existing {
+        Some((event_type, existing_payload_json))
+            if event_type == request.event_type && existing_payload_json == payload_json =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(JournalError::DuplicateTapeSequence {
+            run_id: request.run_id.clone(),
+            seq: request.seq,
+        }),
+        None => insert_orchestrator_tape_event_tx(connection, request, payload_json.as_str(), now),
+    }
+}
+
+fn sanitize_orchestrator_tape_payload(
+    request: &OrchestratorTapeAppendRequest,
+    max_payload_bytes: usize,
+) -> Result<String, JournalError> {
     if request.payload_json.len() > max_payload_bytes {
         return Err(JournalError::PayloadTooLarge {
             payload_kind: "orchestrator_tape",
@@ -7477,7 +8788,15 @@ fn append_orchestrator_tape_event_tx(
             max_bytes: max_payload_bytes,
         });
     }
-    let (payload_json, _) = sanitize_payload(request.payload_json.as_bytes())?;
+    sanitize_payload(request.payload_json.as_bytes()).map(|(payload_json, _)| payload_json)
+}
+
+fn insert_orchestrator_tape_event_tx(
+    connection: &Connection,
+    request: &OrchestratorTapeAppendRequest,
+    payload_json: &str,
+    now: i64,
+) -> Result<(), JournalError> {
     match connection.execute(
         r#"
             INSERT INTO orchestrator_tape (
@@ -8120,6 +9439,7 @@ struct QueryEmbeddingCacheState {
 pub struct JournalStore {
     config: JournalConfig,
     connection: Mutex<Connection>,
+    startup_compatibility: RuntimeStateCompatibilityReport,
     memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
     memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
     query_embedding_cache: Mutex<QueryEmbeddingCacheState>,
@@ -8164,6 +9484,77 @@ fn metadata_trace_terminal_outcome(
     }
 }
 
+fn run_has_nonterminal_process_handles_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<bool, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM runtime_handles
+                    WHERE run_ulid = ?1
+                      AND kind = 'process'
+                      AND state IN ('starting', 'running', 'draining', 'cleaning')
+                )
+            "#,
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .map_err(Into::into)
+}
+
+fn runtime_terminal_event_name(state: RunLifecycleState) -> Option<RuntimeEventName> {
+    match state {
+        RunLifecycleState::Done => Some(RuntimeEventName::RunCompleted),
+        RunLifecycleState::Failed => Some(RuntimeEventName::RunFailed),
+        RunLifecycleState::Cancelled => Some(RuntimeEventName::RunCancelled),
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => None,
+    }
+}
+
+fn valid_terminal_reason_code(reason_code: &str) -> bool {
+    let bytes = reason_code.as_bytes();
+    (3..=128).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'/' | b'-')
+        })
+}
+
+fn run_terminal_status_payload(
+    state: RunLifecycleState,
+    status_message: &str,
+    reason_code: &str,
+) -> String {
+    let (kind, wire_kind) = match state {
+        RunLifecycleState::Done => ("done", "done"),
+        RunLifecycleState::Failed => ("failed", "failed"),
+        RunLifecycleState::Cancelled => ("cancelled", "failed"),
+        RunLifecycleState::Pending
+        | RunLifecycleState::Accepted
+        | RunLifecycleState::InProgress => {
+            unreachable!("terminal status payload requires a terminal run state")
+        }
+    };
+    json!({
+        "kind": kind,
+        "wire_kind": wire_kind,
+        "message": status_message,
+        "lifecycle_state": state.as_str(),
+        "reason_code": reason_code,
+        "controlled": state == RunLifecycleState::Cancelled,
+    })
+    .to_string()
+}
+
 /// Returns the session's `last_run` id if that run is still active.
 fn active_session_last_run(
     connection: &Connection,
@@ -8192,6 +9583,121 @@ fn active_session_last_run(
 }
 
 impl JournalStore {
+    /// Closes a terminal run's metadata trace after run-owned cleanup has finished.
+    ///
+    /// Cleanup callers invoke this even when no resources were present; terminal
+    /// append is idempotent, so an already-complete trace remains unchanged.
+    pub(crate) fn finalize_orchestrator_run_metadata_trace(
+        &self,
+        run_id: &str,
+    ) -> Result<(), JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let (state, startup_recovered, has_nonterminal_process_handles) = guard
+            .query_row(
+                r#"
+                    SELECT
+                        runs.state,
+                        EXISTS(
+                            SELECT 1
+                            FROM run_lifecycle_events AS lifecycle
+                            WHERE lifecycle.run_ulid = runs.run_ulid
+                              AND lifecycle.reason = ?2
+                        ),
+                        EXISTS(
+                            SELECT 1
+                            FROM runtime_handles AS handles
+                            WHERE handles.run_ulid = runs.run_ulid
+                              AND handles.kind = 'process'
+                              AND handles.state IN (
+                                  'starting', 'running', 'draining', 'cleaning'
+                              )
+                        )
+                    FROM orchestrator_runs AS runs
+                    WHERE runs.run_ulid = ?1
+                "#,
+                params![run_id, ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::RunNotFound { run_id: run_id.to_owned() })?;
+        drop(guard);
+        if has_nonterminal_process_handles {
+            return Err(JournalError::InvalidArgument(format!(
+                "orchestrator run {run_id} still has nonterminal process cleanup"
+            )));
+        }
+        let state = RunLifecycleState::from_str(state.as_str()).ok_or_else(|| {
+            JournalError::InvalidArgument(format!(
+                "orchestrator run {run_id} has unknown state {state}"
+            ))
+        })?;
+        let terminal = if startup_recovered {
+            Some((MetadataTraceTerminalOutcomeV1::ForcedAbort, "run.terminal.forced_abort"))
+        } else {
+            metadata_trace_terminal_outcome(state)
+        };
+        let Some((outcome, reason_code)) = terminal else {
+            return Err(JournalError::InvalidArgument(format!(
+                "orchestrator run {run_id} is not terminal"
+            )));
+        };
+        self.append_metadata_trace_terminalization_best_effort(run_id, outcome, reason_code);
+        Ok(())
+    }
+
+    /// Closes a startup-recovered run's trace after persisted process cleanup.
+    ///
+    /// Startup recovery represents an interrupted host process even though the
+    /// durable run state is failed, so its terminal trace outcome remains a
+    /// forced abort after cleanup evidence has been appended.
+    pub(crate) fn finalize_startup_recovery_metadata_trace(
+        &self,
+        run_id: &str,
+    ) -> Result<bool, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let (startup_recovered, has_nonterminal_process_handles) = guard.query_row(
+            r#"
+                    SELECT
+                        EXISTS(
+                            SELECT 1
+                            FROM run_lifecycle_events
+                            WHERE run_ulid = ?1
+                              AND reason = ?2
+                        ),
+                        EXISTS(
+                            SELECT 1
+                            FROM runtime_handles
+                            WHERE run_ulid = ?1
+                              AND kind = 'process'
+                              AND state IN ('starting', 'running', 'draining', 'cleaning')
+                        )
+                "#,
+            params![run_id, ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+        )?;
+        drop(guard);
+        if !startup_recovered || has_nonterminal_process_handles {
+            return Ok(false);
+        }
+        self.finalize_orchestrator_run_metadata_trace(run_id)?;
+        Ok(true)
+    }
+
+    /// Returns the read-only startup finding projection after any safe migration completed.
+    ///
+    /// The report records `migrated` only for legacy journal versions observed
+    /// by preflight; it is not a substitute for the current record-level scan.
+    #[must_use]
+    pub fn startup_runtime_state_compatibility_report(&self) -> &RuntimeStateCompatibilityReport {
+        &self.startup_compatibility
+    }
+
     /// Maximum accepted payload size in bytes for journal, tape, and artifact writes.
     pub(crate) fn max_payload_bytes(&self) -> usize {
         self.config.max_payload_bytes
@@ -8354,6 +9860,61 @@ impl JournalStore {
         )
     }
 
+    /// Inspects existing journal compatibility without creating or mutating storage.
+    ///
+    /// The preflight reads a private snapshot when a WAL is present so SQLite never opens the
+    /// source database or its sidecars. A missing database is compatible because the subsequent
+    /// writable open may initialize it. The returned report is available even when normal
+    /// admission is blocked, making this the offline inspection boundary for downgrade tooling.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the path is invalid, the source snapshot cannot be read, or
+    /// SQLite cannot inspect the existing schema.
+    pub fn inspect_runtime_state_read_only(
+        config: &JournalConfig,
+    ) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+        validate_db_path(&config.db_path)?;
+        let database_metadata = match fs::metadata(&config.db_path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return runtime_state_compatibility_report_from_findings(Vec::new());
+            }
+            Err(source) => {
+                return Err(JournalError::CompatibilitySnapshot {
+                    path: config.db_path.clone(),
+                    source,
+                });
+            }
+        };
+        let wal_path = sqlite_sidecar_path(&config.db_path, "-wal");
+        let wal_metadata = match fs::metadata(&wal_path) {
+            Ok(metadata) => Some(metadata),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(JournalError::CompatibilitySnapshot { path: wal_path, source });
+            }
+        };
+        let payload_bytes = database_metadata
+            .len()
+            .saturating_add(wal_metadata.as_ref().map_or(0, fs::Metadata::len));
+
+        if wal_metadata.is_none() {
+            let report =
+                inspect_journal_schema_read_only(&config.db_path, &config.db_path, payload_bytes)?;
+            match fs::metadata(&wal_path) {
+                Ok(_) => return inspect_journal_schema_snapshot(&config.db_path),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(report);
+                }
+                Err(source) => {
+                    return Err(JournalError::CompatibilitySnapshot { path: wal_path, source });
+                }
+            }
+        }
+
+        inspect_journal_schema_snapshot(&config.db_path)
+    }
+
     /// Opens the journal with an explicitly injected QA fault boundary.
     ///
     /// Normal callers use [`Self::open_with_memory_embedding_runtime`], which
@@ -8378,6 +9939,12 @@ impl JournalStore {
         if config.max_events == 0 {
             return Err(JournalError::InvalidEventLimit);
         }
+        let compatibility = Self::inspect_runtime_state_read_only(&config)?;
+        if !compatibility.permits_writable_migration() {
+            return Err(JournalError::RuntimeStateCompatibilityBlocked {
+                report: Box::new(compatibility),
+            });
+        }
         if let Some(parent) = config.db_path.parent() {
             if !parent.as_os_str().is_empty() {
                 let parent_existed = parent.exists();
@@ -8395,16 +9962,23 @@ impl JournalStore {
             JournalError::OpenConnection { path: config.db_path.clone(), source }
         })?;
         enforce_owner_only_permissions(&config.db_path, 0o600)?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
-        )?;
+        connection.busy_timeout(Duration::from_secs(30))?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        state_health::retry_sqlite_busy(|| {
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA synchronous = NORMAL;",
+                )
+                .map_err(JournalError::from)
+        })?;
 
-        apply_migrations(&mut connection)?;
+        state_health::retry_sqlite_busy(|| apply_migrations(&mut connection))?;
+        let startup_compatibility = migrated_startup_compatibility_report(&compatibility)?;
         Ok(Self {
             config,
             connection: Mutex::new(connection),
+            startup_compatibility,
             memory_embedding_provider,
             memory_embedding_runtime,
             query_embedding_cache: Mutex::new(QueryEmbeddingCacheState::default()),
@@ -8600,6 +10174,17 @@ impl JournalStore {
         // transaction so the hash chain stays linear: reading the latest hash
         // outside it could interleave with another append and fork the chain.
         let transaction = guard.transaction()?;
+        let event_id_exists = transaction
+            .query_row(
+                "SELECT 1 FROM journal_events WHERE event_ulid = ?1",
+                params![request.event_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if event_id_exists {
+            return Err(JournalError::DuplicateEventId { event_id: request.event_id.clone() });
+        }
         let current_events: i64 =
             transaction.query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))?;
         let current_events = current_events.max(0) as usize;
@@ -8693,6 +10278,171 @@ impl JournalStore {
         Ok(JournalAppendOutcome { redacted, hash, prev_hash, write_duration: started_at.elapsed() })
     }
 
+    /// Atomically appends worker lifecycle evidence, revokes exact dispatch claims, and replaces
+    /// the durable fleet snapshot.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the fleet, lifecycle evidence, or exact revocation is invalid,
+    /// journal capacity is exhausted, an event id conflicts, redaction fails, or SQLite cannot
+    /// commit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_networked_worker_lifecycle_with_revocations(
+        &self,
+        commits: &[NetworkedWorkerLifecycleCommit],
+        fleet: &BTreeMap<String, palyra_workerd::WorkerFleetRecord>,
+        expected_generation: u64,
+        max_fleet_entries: usize,
+        updated_at_unix_ms: i64,
+        revocations: &[NetworkedWorkerLeaseRevocation],
+        settlement: Option<&NetworkedWorkerDispatchSettlement>,
+    ) -> Result<NetworkedWorkerLifecycleCommitOutcome, JournalError> {
+        self.ensure_hash_chain_writes_allowed()?;
+        if commits.is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "networked worker lifecycle commit requires evidence".to_owned(),
+            ));
+        }
+        shared_runtime::validate_networked_worker_fleet_snapshot(
+            fleet,
+            max_fleet_entries,
+            updated_at_unix_ms,
+        )?;
+        let encoded_fleet = shared_runtime::encode_networked_worker_fleet_records(fleet)?;
+        let mut prepared = Vec::with_capacity(commits.len());
+        let mut event_ids = BTreeSet::new();
+        for commit in commits {
+            if !event_ids.insert(commit.request.event_id.as_str()) {
+                return Err(JournalError::InvalidArgument(
+                    "networked worker lifecycle commit repeats an event id".to_owned(),
+                ));
+            }
+            validate_networked_worker_lifecycle_commit(commit, fleet)?;
+            if commit.request.payload_json.len() > self.config.max_payload_bytes {
+                return Err(JournalError::PayloadTooLarge {
+                    payload_kind: "journal",
+                    actual_bytes: commit.request.payload_json.len(),
+                    max_bytes: self.config.max_payload_bytes,
+                });
+            }
+            let (payload_json, redacted) = sanitize_payload(&commit.request.payload_json)?;
+            prepared.push((commit.request.clone(), payload_json, redacted));
+        }
+
+        let started_at = Instant::now();
+        let created_at_unix_ms = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_events: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))?;
+        let current_events = current_events.max(0) as usize;
+        let projected_events = current_events.saturating_add(prepared.len());
+        if projected_events > self.config.max_events {
+            return Err(JournalError::JournalCapacityExceeded {
+                current_events,
+                max_events: self.config.max_events,
+            });
+        }
+        let mut prev_hash = if self.config.hash_chain_enabled {
+            transaction
+                .query_row("SELECT hash FROM journal_events ORDER BY seq DESC LIMIT 1", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten()
+        } else {
+            None
+        };
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for (request, payload_json, redacted) in &prepared {
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM journal_events WHERE event_ulid = ?1",
+                    params![request.event_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(JournalError::DuplicateEventId { event_id: request.event_id.clone() });
+            }
+            let hash = if self.config.hash_chain_enabled {
+                Some(compute_hash(prev_hash.as_deref(), request, payload_json))
+            } else {
+                None
+            };
+            self.apply_journal_fault("journal.before_effect", request.event_id.as_str())?;
+            transaction.execute(
+                r#"
+                    INSERT INTO journal_events (
+                        event_ulid, session_ulid, run_ulid, kind, actor,
+                        timestamp_unix_ms, payload_json, redacted, hash, prev_hash,
+                        principal, device_id, channel, created_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                "#,
+                params![
+                    request.event_id,
+                    request.session_id,
+                    request.run_id,
+                    request.kind,
+                    request.actor,
+                    request.timestamp_unix_ms,
+                    payload_json,
+                    *redacted as i64,
+                    hash,
+                    prev_hash,
+                    request.principal,
+                    request.device_id,
+                    request.channel,
+                    created_at_unix_ms,
+                ],
+            )?;
+            outcomes.push(JournalAppendOutcome {
+                redacted: *redacted,
+                hash: hash.clone(),
+                prev_hash: prev_hash.clone(),
+                write_duration: Duration::ZERO,
+            });
+            prev_hash = hash;
+        }
+        let fleet_generation = shared_runtime::replace_networked_worker_fleet_records_tx(
+            &transaction,
+            encoded_fleet.as_slice(),
+            expected_generation,
+            updated_at_unix_ms,
+        )?;
+        shared_runtime::revoke_networked_worker_dispatch_claims_tx(
+            &transaction,
+            revocations,
+            fleet_generation,
+            updated_at_unix_ms,
+        )?;
+        if let Some(settlement) = settlement {
+            shared_runtime::settle_networked_worker_dispatch_claim_during_completion_tx(
+                &transaction,
+                settlement,
+            )?;
+        }
+        transaction.commit()?;
+        let write_duration = started_at.elapsed();
+        for outcome in &mut outcomes {
+            outcome.write_duration = write_duration;
+        }
+        let mut acknowledgement_error = None;
+        for (request, _, _) in &prepared {
+            if let Err(error) = self
+                .apply_journal_fault("journal.after_effect_before_ack", request.event_id.as_str())
+            {
+                acknowledgement_error = Some(error);
+                break;
+            }
+        }
+        Ok(NetworkedWorkerLifecycleCommitOutcome {
+            fleet_generation,
+            journal_outcomes: outcomes,
+            acknowledgement_error,
+        })
+    }
+
     /// Returns the total number of journal events.
     ///
     /// # Errors
@@ -8716,6 +10466,59 @@ impl JournalStore {
             })
             .optional()
             .map(|row| row.flatten())
+            .map_err(JournalError::from)
+    }
+
+    /// Loads one journal event by exact id.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn event_by_id(&self, event_id: &str) -> Result<Option<JournalEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT
+                        seq,
+                        event_ulid,
+                        session_ulid,
+                        run_ulid,
+                        kind,
+                        actor,
+                        timestamp_unix_ms,
+                        payload_json,
+                        redacted,
+                        hash,
+                        prev_hash,
+                        principal,
+                        device_id,
+                        channel,
+                        created_at_unix_ms
+                    FROM journal_events
+                    WHERE event_ulid = ?1
+                "#,
+                params![event_id],
+                |row| {
+                    Ok(JournalEventRecord {
+                        seq: row.get(0)?,
+                        event_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        run_id: row.get(3)?,
+                        kind: row.get(4)?,
+                        actor: row.get(5)?,
+                        timestamp_unix_ms: row.get(6)?,
+                        payload_json: row.get(7)?,
+                        redacted: row.get::<_, i64>(8)? == 1,
+                        hash: row.get(9)?,
+                        prev_hash: row.get(10)?,
+                        principal: row.get(11)?,
+                        device_id: row.get(12)?,
+                        channel: row.get(13)?,
+                        created_at_unix_ms: row.get(14)?,
+                    })
+                },
+            )
+            .optional()
             .map_err(JournalError::from)
     }
 
@@ -10034,7 +11837,8 @@ impl JournalStore {
             "start_orchestrator_run",
             false,
             |guard, now| {
-                let transaction = guard.transaction()?;
+                let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                validate_delegated_run_admission_tx(&transaction, request, now)?;
                 let updates_session_last_run =
                     origin_kind_updates_session_last_run(request.origin_kind.as_str());
                 if updates_session_last_run {
@@ -10134,6 +11938,16 @@ impl JournalStore {
                             request,
                             now,
                         )?;
+                        shared_runtime::activate_or_refresh_run_generation_tx(
+                            &transaction,
+                            request.session_id.as_str(),
+                            request.run_id.as_str(),
+                            "orchestrator_run",
+                            24_i64 * 60 * 60 * 1_000,
+                            RuntimeGenerationTransitionKind::Activated,
+                            "runtime.generation.run_admitted",
+                            now,
+                        )?;
                         transaction.commit()?;
                         Ok(())
                     }
@@ -10163,57 +11977,36 @@ impl JournalStore {
     ) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let parent_run_id = request.parent_run_id.clone().flatten();
-        let clear_parent_run_id = request.parent_run_id.is_some() && parent_run_id.is_none();
-        let delegation_json = request
-            .delegation
-            .clone()
-            .flatten()
-            .map(|value| serialize_json_field(&value, "delegation_json"))
-            .transpose()?;
-        let clear_delegation_json = request.delegation.is_some() && delegation_json.is_none();
-        let merge_result_json = request
-            .merge_result
-            .clone()
-            .flatten()
-            .map(|value| serialize_json_field(&value, "merge_result_json"))
-            .transpose()?;
-        let clear_merge_result_json = request.merge_result.is_some() && merge_result_json.is_none();
+        update_orchestrator_run_metadata_tx(&guard, request, now)
+    }
 
-        let updated = guard.execute(
-            r#"
-                UPDATE orchestrator_runs
-                SET
-                    parent_run_ulid = CASE
-                        WHEN ?3 = 1 THEN NULL
-                        ELSE COALESCE(?2, parent_run_ulid)
-                    END,
-                    delegation_json = CASE
-                        WHEN ?5 = 1 THEN NULL
-                        ELSE COALESCE(?4, delegation_json)
-                    END,
-                    merge_result_json = CASE
-                        WHEN ?7 = 1 THEN NULL
-                        ELSE COALESCE(?6, merge_result_json)
-                    END,
-                    updated_at_unix_ms = ?8
-                WHERE run_ulid = ?1
-            "#,
-            params![
-                request.run_id,
-                parent_run_id,
-                if clear_parent_run_id { 1_i64 } else { 0_i64 },
-                delegation_json,
-                if clear_delegation_json { 1_i64 } else { 0_i64 },
-                merge_result_json,
-                if clear_merge_result_json { 1_i64 } else { 0_i64 },
-                now,
-            ],
+    /// Applies child run metadata only while the exact parent generation still
+    /// owns the durable run lane.
+    ///
+    /// `false` means a steer or another run superseded the supplied authority;
+    /// no metadata field is changed.
+    pub(crate) fn update_orchestrator_run_metadata_if_parent_generation(
+        &self,
+        request: &OrchestratorRunMetadataUpdateRequest,
+        parent_guard: &OrchestratorParentGenerationGuard,
+    ) -> Result<bool, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (matches, _) = shared_runtime::runtime_generation_fence_matches_tx(
+            &transaction,
+            parent_guard.session_id.as_str(),
+            parent_guard.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            parent_guard.expected_generation,
         )?;
-        if updated == 0 {
-            return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+        if !matches {
+            transaction.commit()?;
+            return Ok(false);
         }
-        Ok(())
+        update_orchestrator_run_metadata_tx(&transaction, request, now)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Transitions a run's state and appends a lifecycle event; terminal states are
@@ -10253,14 +12046,19 @@ impl JournalStore {
         if let Some(previous_terminal) =
             RunLifecycleState::from_str(previous_state.as_str()).filter(|state| state.is_terminal())
         {
+            let defer_metadata_trace_terminalization =
+                run_has_nonterminal_process_handles_tx(&guard, run_id)?;
             drop(guard);
-            if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(previous_terminal)
-            {
-                self.append_metadata_trace_terminalization_best_effort(
-                    run_id,
-                    outcome,
-                    reason_code,
-                );
+            if !defer_metadata_trace_terminalization {
+                if let Some((outcome, reason_code)) =
+                    metadata_trace_terminal_outcome(previous_terminal)
+                {
+                    self.append_metadata_trace_terminalization_best_effort(
+                        run_id,
+                        outcome,
+                        reason_code,
+                    );
+                }
             }
             return Ok(());
         }
@@ -10284,7 +12082,7 @@ impl JournalStore {
             &RunLifecycleEventAppendRequest {
                 event_id: Ulid::new().to_string(),
                 run_id: run_id.to_owned(),
-                session_id,
+                session_id: session_id.clone(),
                 from_state: RunLifecyclePhase::parse(previous_state.as_str()),
                 to_state: canonical_run_lifecycle_phase(state),
                 actor: RuntimeActorRef { kind: RuntimeActorKind::System, id: "system".to_owned() },
@@ -10302,11 +12100,394 @@ impl JournalStore {
             },
             now,
         )?;
+        if state == RunLifecycleState::Cancelled {
+            let _ = shared_runtime::invalidate_provider_generation_for_run_tx(
+                &guard,
+                session_id.as_str(),
+                run_id,
+                RuntimeGenerationTransitionKind::Cancelled,
+                "runtime.generation.provider_run_cancelled",
+                now,
+            )?;
+            let _ = invalidate_runtime_generation_tx(
+                &guard,
+                &RuntimeGenerationInvalidateRequest {
+                    session_id: session_id.clone(),
+                    run_id: Some(run_id.to_owned()),
+                    lane: RuntimeGenerationLane::Run,
+                    transition_kind: RuntimeGenerationTransitionKind::Cancelled,
+                    reason_code: "runtime.generation.run_cancelled".to_owned(),
+                },
+                now,
+            )?;
+        }
+        let defer_metadata_trace_terminalization =
+            state.is_terminal() && run_has_nonterminal_process_handles_tx(&guard, run_id)?;
         drop(guard);
-        if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(state) {
-            self.append_metadata_trace_terminalization_best_effort(run_id, outcome, reason_code);
+        if !defer_metadata_trace_terminalization {
+            if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(state) {
+                self.append_metadata_trace_terminalization_best_effort(
+                    run_id,
+                    outcome,
+                    reason_code,
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Atomically settles one terminal run outcome across state, lifecycle,
+    /// generation-aware runtime event, legacy tape, and generation closure.
+    ///
+    /// A cancellation intent that committed before this transaction wins over a
+    /// requested `done` or `failed` outcome. Existing terminal states are sticky.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], [`JournalError::InvalidArgument`],
+    /// or [`JournalError`] on storage failure.
+    pub fn settle_orchestrator_run_terminal(
+        &self,
+        request: &OrchestratorRunTerminalSettlementRequest,
+    ) -> Result<OrchestratorRunTerminalSettlement, JournalError> {
+        if !request.requested_state.is_terminal()
+            || !valid_terminal_reason_code(request.reason_code.as_str())
+            || request.status_message.trim().is_empty()
+            || request.terminal_status_payload_json.trim().is_empty()
+        {
+            return Err(JournalError::InvalidArgument(
+                "orchestrator terminal settlement request is invalid".to_owned(),
+            ));
+        }
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                r#"
+                    SELECT state, session_ulid, parent_run_ulid, cancel_requested, cancel_reason
+                    FROM orchestrator_runs
+                    WHERE run_ulid = ?1
+                "#,
+                params![request.run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)? == 1,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_state, session_id, parent_run_id, cancel_requested, cancel_reason)) =
+            current
+        else {
+            return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+        };
+        let current_state =
+            RunLifecycleState::from_str(current_state.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "orchestrator run {} has unknown state {}",
+                    request.run_id, current_state
+                ))
+            })?;
+        if current_state.is_terminal() {
+            let defer_metadata_trace_terminalization =
+                run_has_nonterminal_process_handles_tx(&transaction, request.run_id.as_str())?;
+            transaction.commit()?;
+            drop(guard);
+            if !defer_metadata_trace_terminalization {
+                if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(current_state)
+                {
+                    self.append_metadata_trace_terminalization_best_effort(
+                        request.run_id.as_str(),
+                        outcome,
+                        reason_code,
+                    );
+                }
+            }
+            return Ok(OrchestratorRunTerminalSettlement {
+                run_id: request.run_id.clone(),
+                requested_state: request.requested_state,
+                effective_state: current_state,
+                changed: false,
+                cancellation_won: false,
+                runtime_event_sequence: None,
+                summary_tape_sequence: None,
+                tape_sequence: None,
+            });
+        }
+        let cancellation_won = cancel_requested
+            && matches!(
+                request.requested_state,
+                RunLifecycleState::Done | RunLifecycleState::Failed
+            );
+        let effective_state =
+            if cancellation_won { RunLifecycleState::Cancelled } else { request.requested_state };
+        let settlement_reason_code = if effective_state == RunLifecycleState::Cancelled {
+            palyra_common::runtime_contracts::RuntimeTerminalOutcome::Cancelled.reason_code()
+        } else {
+            request.reason_code.as_str()
+        };
+        let settlement_status_message = if effective_state == RunLifecycleState::Cancelled {
+            cancel_reason.as_deref().unwrap_or(request.status_message.as_str())
+        } else {
+            request.status_message.as_str()
+        };
+        let active_generation = shared_runtime::active_runtime_generation_tx(
+            &transaction,
+            session_id.as_str(),
+            request.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            now,
+        )?
+        .ok_or_else(|| {
+            JournalError::InvalidArgument(format!(
+                "orchestrator run {} has no active run generation for terminal settlement",
+                request.run_id
+            ))
+        })?;
+        let updated = transaction.execute(
+            r#"
+                UPDATE orchestrator_runs
+                SET
+                    state = ?2,
+                    completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?3),
+                    updated_at_unix_ms = ?3,
+                    last_error = COALESCE(?4, last_error)
+                WHERE run_ulid = ?1
+                  AND state = ?5
+            "#,
+            params![
+                request.run_id,
+                effective_state.as_str(),
+                now,
+                if effective_state == RunLifecycleState::Done {
+                    None
+                } else {
+                    Some(settlement_status_message)
+                },
+                current_state.as_str(),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(JournalError::InvalidArgument(format!(
+                "orchestrator run {} changed during terminal settlement",
+                request.run_id
+            )));
+        }
+        append_run_lifecycle_event_tx(
+            &transaction,
+            &RunLifecycleEventAppendRequest {
+                event_id: Ulid::new().to_string(),
+                run_id: request.run_id.clone(),
+                session_id: session_id.clone(),
+                from_state: Some(canonical_run_lifecycle_phase(current_state)),
+                to_state: canonical_run_lifecycle_phase(effective_state),
+                actor: request.actor.clone(),
+                correlation_id: request.run_id.clone(),
+                parent_run_id,
+                idempotency_key: Some(format!("run:terminal:{}", request.run_id)),
+                reason: settlement_reason_code.to_owned(),
+                payload_json: json!({
+                    "legacy_state": effective_state.as_str(),
+                    "requested_state": request.requested_state.as_str(),
+                    "cancellation_won": cancellation_won,
+                    "reason_code": settlement_reason_code,
+                })
+                .to_string(),
+            },
+            now,
+        )?;
+        let (identities, legacy_identity_adapter) =
+            palyra_common::runtime_contracts::RuntimeIdentitySetV1::from_legacy_run(
+                session_id.as_str(),
+                request.run_id.as_str(),
+                active_generation.generation,
+            )
+            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+        let event_name = runtime_terminal_event_name(effective_state).ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "terminal settlement selected a nonterminal event".to_owned(),
+            )
+        })?;
+        let descriptor = event_name.descriptor();
+        let mut runtime_event_envelope = RuntimeEventEnvelopeV2 {
+            schema_version: 2,
+            event_id: RuntimeEventId::parse(format!("run_terminal:{}", Ulid::new()).as_str())
+                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
+            identities,
+            sequence: 0,
+            causal_parent_event_id: None,
+            subsystem: descriptor.subsystem,
+            phase: descriptor.phase,
+            event_name,
+            reason_code: settlement_reason_code.to_owned(),
+            actor_kind: descriptor.actor_kind,
+            retryability: descriptor.retryability,
+            redaction_class: descriptor.redaction_class,
+            terminal: descriptor.terminal,
+            payload: RuntimeEventPayloadRef::Inline {
+                metadata: json!({
+                    "state": effective_state.as_str(),
+                    "requested_state": request.requested_state.as_str(),
+                    "cancellation_won": cancellation_won,
+                }),
+            },
+            occurred_at_unix_ms: now,
+            extensions: BTreeMap::new(),
+        };
+        runtime_event_envelope
+            .record_legacy_identity_adapter(legacy_identity_adapter)
+            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+        let runtime_event = RuntimeEventAppendRequest {
+            lane: RuntimeGenerationLane::Run,
+            envelope: runtime_event_envelope,
+        };
+        let runtime_event_sequence = match append_runtime_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &runtime_event,
+            now,
+        )? {
+            RuntimeEventAppendOutcome::Appended { sequence }
+            | RuntimeEventAppendOutcome::AlreadyAppended { sequence } => sequence,
+            RuntimeEventAppendOutcome::StaleSuppressed => {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} lost generation authority during terminal settlement",
+                    request.run_id
+                )));
+            }
+        };
+        let mut tape_sequence = next_orchestrator_tape_seq(&transaction, request.run_id.as_str())?;
+        let summary_tape_sequence =
+            request.terminal_summary_payload_json.as_ref().map(|_| tape_sequence);
+        if let Some(summary_payload_json) = request.terminal_summary_payload_json.as_ref() {
+            append_orchestrator_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &OrchestratorTapeAppendRequest {
+                    run_id: request.run_id.clone(),
+                    seq: tape_sequence,
+                    event_type: crate::runtime_diagnostics::RUN_RUNTIME_PATH_SUMMARY_EVENT
+                        .to_owned(),
+                    payload_json: summary_payload_json.clone(),
+                },
+                now,
+            )?;
+            tape_sequence = tape_sequence.checked_add(1).ok_or_else(|| {
+                JournalError::InvalidArgument("orchestrator tape sequence is exhausted".to_owned())
+            })?;
+        }
+        for terminal_event in &request.terminal_tape_events {
+            if terminal_event.event_type.trim().is_empty()
+                || terminal_event.payload_json.trim().is_empty()
+                || terminal_event.event_type == "status"
+            {
+                return Err(JournalError::InvalidArgument(
+                    "orchestrator terminal tape event is invalid".to_owned(),
+                ));
+            }
+            append_orchestrator_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &OrchestratorTapeAppendRequest {
+                    run_id: request.run_id.clone(),
+                    seq: tape_sequence,
+                    event_type: terminal_event.event_type.clone(),
+                    payload_json: terminal_event.payload_json.clone(),
+                },
+                now,
+            )?;
+            tape_sequence = tape_sequence.checked_add(1).ok_or_else(|| {
+                JournalError::InvalidArgument("orchestrator tape sequence is exhausted".to_owned())
+            })?;
+        }
+        let terminal_status_payload_json = if cancellation_won {
+            run_terminal_status_payload(
+                RunLifecycleState::Cancelled,
+                crate::gateway::CANCELLED_REASON,
+                "cancelled_by_request",
+            )
+        } else {
+            request.terminal_status_payload_json.clone()
+        };
+        append_orchestrator_tape_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &OrchestratorTapeAppendRequest {
+                run_id: request.run_id.clone(),
+                seq: tape_sequence,
+                event_type: "status".to_owned(),
+                payload_json: terminal_status_payload_json,
+            },
+            now,
+        )?;
+        let transition_kind = if effective_state == RunLifecycleState::Cancelled {
+            RuntimeGenerationTransitionKind::Cancelled
+        } else {
+            RuntimeGenerationTransitionKind::Released
+        };
+        let provider_invalidation = shared_runtime::invalidate_provider_generation_for_run_tx(
+            &transaction,
+            session_id.as_str(),
+            request.run_id.as_str(),
+            transition_kind,
+            "runtime.generation.provider_run_terminal",
+            now,
+        )?;
+        // A different concurrently-owned run in the same session keeps its Provider lane.
+        let _ = provider_invalidation;
+        let invalidation = invalidate_runtime_generation_tx(
+            &transaction,
+            &RuntimeGenerationInvalidateRequest {
+                session_id,
+                run_id: Some(request.run_id.clone()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind,
+                reason_code: format!("runtime.generation.run_{}", effective_state.as_str()),
+            },
+            now,
+        )?;
+        if invalidation != shared_runtime::RuntimeGenerationInvalidateOutcome::Invalidated {
+            return Err(JournalError::InvalidArgument(format!(
+                "orchestrator run {} generation could not close during terminal settlement",
+                request.run_id
+            )));
+        }
+        let defer_metadata_trace_terminalization =
+            run_has_nonterminal_process_handles_tx(&transaction, request.run_id.as_str())?;
+        transaction.commit()?;
+        drop(guard);
+        if let Some(summary_tape_sequence) = summary_tape_sequence {
+            let summary_record = OrchestratorTapeRecord {
+                seq: summary_tape_sequence,
+                event_type: crate::runtime_diagnostics::RUN_RUNTIME_PATH_SUMMARY_EVENT.to_owned(),
+                payload_json: request.terminal_summary_payload_json.clone().unwrap_or_default(),
+            };
+            let _ = self
+                .append_projected_metadata_trace_event(request.run_id.as_str(), &summary_record);
+        }
+        if !defer_metadata_trace_terminalization {
+            if let Some((outcome, reason_code)) = metadata_trace_terminal_outcome(effective_state) {
+                self.append_metadata_trace_terminalization_best_effort(
+                    request.run_id.as_str(),
+                    outcome,
+                    reason_code,
+                );
+            }
+        }
+        Ok(OrchestratorRunTerminalSettlement {
+            run_id: request.run_id.clone(),
+            requested_state: request.requested_state,
+            effective_state,
+            changed: true,
+            cancellation_won,
+            runtime_event_sequence: Some(runtime_event_sequence),
+            summary_tape_sequence,
+            tape_sequence: Some(tape_sequence),
+        })
     }
 
     /// Force-fails runs left active by a previous daemon process, recording
@@ -10318,8 +12499,7 @@ impl JournalStore {
         &self,
         reason: &str,
     ) -> Result<OrchestratorStartupRunRecoveryReport, JournalError> {
-        let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let active_runs = {
             let mut statement = guard.prepare(
                 r#"
@@ -10362,16 +12542,29 @@ impl JournalStore {
             records
         };
         let mut terminalized_run_ids = Vec::new();
+        let mut deferred_metadata_trace_run_ids = Vec::new();
         for candidate in active_runs {
+            let now = current_unix_ms()?;
+            let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_state = transaction
+                .query_row(
+                    "SELECT state FROM orchestrator_runs WHERE run_ulid = ?1",
+                    params![candidate.run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if !current_state.as_deref().is_some_and(|state| {
+                matches!(
+                    RunLifecycleState::from_str(state),
+                    Some(RunLifecycleState::Accepted | RunLifecycleState::InProgress)
+                )
+            }) {
+                transaction.commit()?;
+                continue;
+            }
             let (resume_input, replay_transcript_signals) =
-                startup_resume_classifier_input(&guard, &candidate, now)?;
+                startup_resume_classifier_input(&transaction, &candidate, now)?;
             let resume_decision = classify_resume(&resume_input);
-            append_resume_decision_tape_event_tx(
-                &guard,
-                self.config.max_payload_bytes,
-                &resume_decision,
-                now,
-            )?;
             let replay_projection = project_replay_continuity_policy(
                 &ReplayContinuityPolicyInput::from_resume_decision(
                     &resume_decision,
@@ -10380,13 +12573,20 @@ impl JournalStore {
                     replay_transcript_signals,
                 ),
             );
-            append_replay_continuity_policy_tape_event_tx(
-                &guard,
-                self.config.max_payload_bytes,
-                &replay_projection,
+            let active_generation = shared_runtime::active_runtime_generation_tx(
+                &transaction,
+                candidate.session_id.as_str(),
+                candidate.run_id.as_str(),
+                RuntimeGenerationLane::Run,
                 now,
-            )?;
-            let updated = guard.execute(
+            )?
+            .ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "orphaned orchestrator run {} has no active run generation",
+                    candidate.run_id
+                ))
+            })?;
+            let updated = transaction.execute(
                 r#"
                     UPDATE orchestrator_runs
                     SET
@@ -10395,22 +12595,24 @@ impl JournalStore {
                         updated_at_unix_ms = ?3,
                         last_error = COALESCE(last_error, ?4)
                     WHERE run_ulid = ?1
-                      AND state IN (?5, ?6)
+                      AND state = ?5
                 "#,
                 params![
                     candidate.run_id.as_str(),
                     RunLifecycleState::Failed.as_str(),
                     now,
                     reason,
-                    RunLifecycleState::Accepted.as_str(),
-                    RunLifecycleState::InProgress.as_str(),
+                    candidate.previous_state.as_str(),
                 ],
             )?;
-            if updated == 0 {
-                continue;
+            if updated != 1 {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} changed during startup recovery",
+                    candidate.run_id
+                )));
             }
             append_run_lifecycle_event_tx(
-                &guard,
+                &transaction,
                 &RunLifecycleEventAppendRequest {
                     event_id: Ulid::new().to_string(),
                     run_id: candidate.run_id.clone(),
@@ -10419,15 +12621,14 @@ impl JournalStore {
                     to_state: canonical_run_lifecycle_phase(RunLifecycleState::Failed),
                     actor: RuntimeActorRef {
                         kind: RuntimeActorKind::System,
-                        id: "system".to_owned(),
+                        id: "startup_recovery".to_owned(),
                     },
                     correlation_id: candidate.run_id.clone(),
                     parent_run_id: candidate.parent_run_id.clone(),
-                    idempotency_key: None,
-                    reason: reason.to_owned(),
+                    idempotency_key: Some(format!("run:startup-recovery:{}", candidate.run_id)),
+                    reason: ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE.to_owned(),
                     payload_json: json!({
                         "legacy_state": RunLifecycleState::Failed.as_str(),
-                        "error": reason,
                         "recovery": "startup_orphaned_run",
                         "resume_decision": resume_decision.decision.as_str(),
                         "resume_reason_code": resume_decision.reason_code.as_str(),
@@ -10442,8 +12643,78 @@ impl JournalStore {
                 },
                 now,
             )?;
+            let (identities, legacy_identity_adapter) =
+                palyra_common::runtime_contracts::RuntimeIdentitySetV1::from_legacy_run(
+                    candidate.session_id.as_str(),
+                    candidate.run_id.as_str(),
+                    active_generation.generation,
+                )
+                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+            let event_name = RuntimeEventName::RunFailed;
+            let descriptor = event_name.descriptor();
+            let mut runtime_event_envelope = RuntimeEventEnvelopeV2 {
+                schema_version: 2,
+                event_id: RuntimeEventId::parse(
+                    format!("run_recovery_terminal:{}", Ulid::new()).as_str(),
+                )
+                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
+                identities,
+                sequence: 0,
+                causal_parent_event_id: None,
+                subsystem: descriptor.subsystem,
+                phase: descriptor.phase,
+                event_name,
+                reason_code: ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE.to_owned(),
+                actor_kind: descriptor.actor_kind,
+                retryability: descriptor.retryability,
+                redaction_class: descriptor.redaction_class,
+                terminal: descriptor.terminal,
+                payload: RuntimeEventPayloadRef::Inline {
+                    metadata: json!({
+                        "state": RunLifecycleState::Failed.as_str(),
+                        "recovery": "startup_orphaned_run",
+                        "resume_decision": resume_decision.decision.as_str(),
+                        "replay_rollout_mode": replay_projection.rollout_mode.as_str(),
+                    }),
+                },
+                occurred_at_unix_ms: now,
+                extensions: BTreeMap::new(),
+            };
+            runtime_event_envelope
+                .record_legacy_identity_adapter(legacy_identity_adapter)
+                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+            let runtime_event = RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event_envelope,
+            };
+            if matches!(
+                append_runtime_event_tx(
+                    &transaction,
+                    self.config.max_payload_bytes,
+                    &runtime_event,
+                    now,
+                )?,
+                RuntimeEventAppendOutcome::StaleSuppressed
+            ) {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} lost generation authority during startup recovery",
+                    candidate.run_id
+                )));
+            }
+            append_resume_decision_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &resume_decision,
+                now,
+            )?;
+            append_replay_continuity_policy_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &replay_projection,
+                now,
+            )?;
             append_startup_recovery_tape_event_tx(
-                &guard,
+                &transaction,
                 self.config.max_payload_bytes,
                 &candidate,
                 reason,
@@ -10451,6 +12722,56 @@ impl JournalStore {
                 &replay_projection,
                 now,
             )?;
+            let terminal_tape_sequence =
+                next_orchestrator_tape_seq(&transaction, candidate.run_id.as_str())?;
+            append_orchestrator_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &OrchestratorTapeAppendRequest {
+                    run_id: candidate.run_id.clone(),
+                    seq: terminal_tape_sequence,
+                    event_type: "status".to_owned(),
+                    payload_json: run_terminal_status_payload(
+                        RunLifecycleState::Failed,
+                        reason,
+                        ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE,
+                    ),
+                },
+                now,
+            )?;
+            let provider_invalidation = shared_runtime::invalidate_provider_generation_for_run_tx(
+                &transaction,
+                candidate.session_id.as_str(),
+                candidate.run_id.as_str(),
+                RuntimeGenerationTransitionKind::Released,
+                "runtime.generation.provider_startup_recovered",
+                now,
+            )?;
+            // A different concurrently-owned run in the same session keeps its Provider lane.
+            let _ = provider_invalidation;
+            let invalidation = invalidate_runtime_generation_tx(
+                &transaction,
+                &RuntimeGenerationInvalidateRequest {
+                    session_id: candidate.session_id.clone(),
+                    run_id: Some(candidate.run_id.clone()),
+                    lane: RuntimeGenerationLane::Run,
+                    transition_kind: RuntimeGenerationTransitionKind::Released,
+                    reason_code: "runtime.generation.run_startup_recovered".to_owned(),
+                },
+                now,
+            )?;
+            if invalidation != shared_runtime::RuntimeGenerationInvalidateOutcome::Invalidated {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} generation could not close during startup recovery",
+                    candidate.run_id
+                )));
+            }
+            let defer_metadata_trace_terminalization =
+                run_has_nonterminal_process_handles_tx(&transaction, candidate.run_id.as_str())?;
+            transaction.commit()?;
+            if defer_metadata_trace_terminalization {
+                deferred_metadata_trace_run_ids.push(candidate.run_id.clone());
+            }
             terminalized_run_ids.push(candidate.run_id);
         }
         drop(guard);
@@ -10471,16 +12792,537 @@ impl JournalStore {
                 );
                 continue;
             }
-            self.append_metadata_trace_terminalization_best_effort(
-                run_id.as_str(),
-                MetadataTraceTerminalOutcomeV1::ForcedAbort,
-                "run.terminal.forced_abort",
-            );
+            if !deferred_metadata_trace_run_ids.contains(run_id) {
+                self.append_metadata_trace_terminalization_best_effort(
+                    run_id.as_str(),
+                    MetadataTraceTerminalOutcomeV1::ForcedAbort,
+                    "run.terminal.forced_abort",
+                );
+            }
         }
         Ok(OrchestratorStartupRunRecoveryReport {
             terminalized_count: terminalized_run_ids.len() as u64,
             terminalized_run_ids,
+            deferred_metadata_trace_run_ids,
         })
+    }
+
+    /// Reconciles background tasks whose detached workers could not survive a
+    /// daemon restart.
+    ///
+    /// Child-backed tasks are correlated only through exact durable evidence.
+    /// A unique terminal child is reattached and folded into the task; missing,
+    /// ambiguous, or mismatched evidence fails closed without replay. In-process
+    /// auxiliary tasks are failed directly because they have no durable child.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage read or write fails.
+    pub fn reconcile_orphaned_background_tasks_on_startup(
+        &self,
+        reason: &str,
+    ) -> Result<OrchestratorStartupBackgroundTaskRecoveryReport, JournalError> {
+        const IN_PROCESS_REASON_CODE: &str = "background_task.recovery.startup_orphaned";
+        const CHILD_REATTACHED_REASON_CODE: &str =
+            "background_task.recovery.attach_window.child_reattached";
+        const NO_CHILD_REASON_CODE: &str =
+            "background_task.recovery.attach_window.no_child_evidence";
+        const AMBIGUOUS_CHILD_REASON_CODE: &str =
+            "background_task.recovery.attach_window.ambiguous_child_evidence";
+        const CHILD_NONTERMINAL_REASON_CODE: &str =
+            "background_task.recovery.attach_window.child_nonterminal_after_run_recovery";
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let in_process_task_kinds = [
+            AuxiliaryTaskKind::Summary.as_str(),
+            AuxiliaryTaskKind::RecallSearch.as_str(),
+            AuxiliaryTaskKind::Classification.as_str(),
+            AuxiliaryTaskKind::Extraction.as_str(),
+            AuxiliaryTaskKind::ObjectiveJudge.as_str(),
+            AuxiliaryTaskKind::Vision.as_str(),
+            AuxiliaryTaskKind::PostRunReflection.as_str(),
+        ];
+        let in_process_candidates = {
+            let mut statement = transaction.prepare(
+                r#"
+                    SELECT task_ulid, task_kind, state, revision, attempt_count, max_attempts
+                    FROM orchestrator_background_tasks
+                    WHERE state IN (?1, ?2)
+                      AND target_run_ulid IS NULL
+                      AND started_at_unix_ms IS NOT NULL
+                      AND task_kind IN (?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ORDER BY started_at_unix_ms ASC, task_ulid ASC
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![
+                    AuxiliaryTaskState::Running.as_str(),
+                    AuxiliaryTaskState::CancelRequested.as_str(),
+                    in_process_task_kinds[0],
+                    in_process_task_kinds[1],
+                    in_process_task_kinds[2],
+                    in_process_task_kinds[3],
+                    in_process_task_kinds[4],
+                    in_process_task_kinds[5],
+                    in_process_task_kinds[6],
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?.max(0) as u64,
+                        row.get::<_, i64>(4)?.max(0) as u64,
+                        row.get::<_, i64>(5)?.max(0) as u64,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let child_candidates = {
+            let mut statement = transaction.prepare(
+                r#"
+                    SELECT task_ulid, task_kind, session_ulid, child_session_ulid,
+                           parent_run_ulid, planned_child_run_ulid, owner_principal, device_id,
+                           channel, delegation_json IS NOT NULL, result_json,
+                           state, revision, attempt_count, max_attempts
+                    FROM orchestrator_background_tasks
+                    WHERE state IN (?1, ?2)
+                      AND target_run_ulid IS NULL
+                      AND started_at_unix_ms IS NOT NULL
+                      AND task_kind IN (?3, ?4)
+                    ORDER BY started_at_unix_ms ASC, task_ulid ASC
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![
+                    AuxiliaryTaskState::Running.as_str(),
+                    AuxiliaryTaskState::CancelRequested.as_str(),
+                    AuxiliaryTaskKind::BackgroundPrompt.as_str(),
+                    AuxiliaryTaskKind::DelegationPrompt.as_str(),
+                ],
+                |row| {
+                    Ok(StartupChildTaskCandidate {
+                        task_id: row.get(0)?,
+                        task_kind: row.get(1)?,
+                        session_id: row.get(2)?,
+                        child_session_id: row.get(3)?,
+                        parent_run_id: row.get(4)?,
+                        target_run_id: None,
+                        planned_child_run_id: row.get(5)?,
+                        owner_principal: row.get(6)?,
+                        device_id: row.get(7)?,
+                        channel: row.get(8)?,
+                        delegated: row.get::<_, i64>(9)? == 1,
+                        result_run_id: background_task_result_run_id(
+                            row.get::<_, Option<String>>(10)?.as_deref(),
+                        ),
+                        previous_state: row.get(11)?,
+                        revision: row.get::<_, i64>(12)?.max(0) as u64,
+                        attempt_count: row.get::<_, i64>(13)?.max(0) as u64,
+                        max_attempts: row.get::<_, i64>(14)?.max(0) as u64,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut recovered_task_ids = Vec::new();
+        let mut failed_task_ids = Vec::new();
+        for (task_id, task_kind, previous_state, revision, attempt_count, max_attempts) in
+            in_process_candidates
+        {
+            if fail_orphaned_background_task_tx(
+                &transaction,
+                StartupBackgroundTaskFailure {
+                    task_id: task_id.as_str(),
+                    task_kind: task_kind.as_str(),
+                    previous_state: previous_state.as_str(),
+                    revision,
+                    attempt_count,
+                    max_attempts,
+                    recovery: "startup_orphaned_in_process_task",
+                    reason_code: IN_PROCESS_REASON_CODE,
+                    reason,
+                    candidate_run_ids: &[],
+                },
+                now,
+            )? {
+                failed_task_ids.push(task_id);
+            }
+        }
+        for candidate in child_candidates {
+            let mut matching_runs = load_startup_child_run_matches_tx(&transaction, &candidate)?;
+            matching_runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+            match matching_runs.as_slice() {
+                [run] if run.state.is_terminal() => {
+                    if recover_background_task_from_child_run_tx(
+                        &transaction,
+                        &candidate,
+                        run,
+                        "startup_child_attach_window",
+                        CHILD_REATTACHED_REASON_CODE,
+                        now,
+                    )? {
+                        recovered_task_ids.push(candidate.task_id);
+                    }
+                }
+                [run] => {
+                    if fail_orphaned_background_task_tx(
+                        &transaction,
+                        StartupBackgroundTaskFailure {
+                            task_id: candidate.task_id.as_str(),
+                            task_kind: candidate.task_kind.as_str(),
+                            previous_state: candidate.previous_state.as_str(),
+                            revision: candidate.revision,
+                            attempt_count: candidate.attempt_count,
+                            max_attempts: candidate.max_attempts,
+                            recovery: "startup_child_attach_window",
+                            reason_code: CHILD_NONTERMINAL_REASON_CODE,
+                            reason,
+                            candidate_run_ids: std::slice::from_ref(&run.run_id),
+                        },
+                        now,
+                    )? {
+                        failed_task_ids.push(candidate.task_id);
+                    }
+                }
+                [] => {
+                    if fail_orphaned_background_task_tx(
+                        &transaction,
+                        StartupBackgroundTaskFailure {
+                            task_id: candidate.task_id.as_str(),
+                            task_kind: candidate.task_kind.as_str(),
+                            previous_state: candidate.previous_state.as_str(),
+                            revision: candidate.revision,
+                            attempt_count: candidate.attempt_count,
+                            max_attempts: candidate.max_attempts,
+                            recovery: "startup_child_attach_window",
+                            reason_code: NO_CHILD_REASON_CODE,
+                            reason,
+                            candidate_run_ids: &[],
+                        },
+                        now,
+                    )? {
+                        failed_task_ids.push(candidate.task_id);
+                    }
+                }
+                runs => {
+                    let run_ids = runs.iter().map(|run| run.run_id.clone()).collect::<Vec<_>>();
+                    if fail_orphaned_background_task_tx(
+                        &transaction,
+                        StartupBackgroundTaskFailure {
+                            task_id: candidate.task_id.as_str(),
+                            task_kind: candidate.task_kind.as_str(),
+                            previous_state: candidate.previous_state.as_str(),
+                            revision: candidate.revision,
+                            attempt_count: candidate.attempt_count,
+                            max_attempts: candidate.max_attempts,
+                            recovery: "startup_child_attach_window",
+                            reason_code: AMBIGUOUS_CHILD_REASON_CODE,
+                            reason,
+                            candidate_run_ids: run_ids.as_slice(),
+                        },
+                        now,
+                    )? {
+                        failed_task_ids.push(candidate.task_id);
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(OrchestratorStartupBackgroundTaskRecoveryReport {
+            recovered_count: recovered_task_ids.len() as u64,
+            recovered_task_ids,
+            failed_count: failed_task_ids.len() as u64,
+            failed_task_ids,
+        })
+    }
+
+    /// Resolves one child-backed task against exact durable run metadata.
+    ///
+    /// A caller-supplied run ID is an assertion, never an untrusted fallback. A unique
+    /// nonterminal child is attached atomically; a unique terminal child is attached and folded
+    /// into the task. Missing evidence is returned without mutation and ambiguity fails closed.
+    /// Model-visible delegation callers remain scope-filtered by the tool runtime.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when durable evidence is mismatched, corrupt, or changes during
+    /// the compare-and-set update.
+    pub fn resolve_background_task_child(
+        &self,
+        task_id: &str,
+        expected_state: &str,
+        requested_run_id: Option<&str>,
+    ) -> Result<BackgroundTaskChildResolution, JournalError> {
+        self.resolve_background_task_child_with_state(
+            task_id,
+            BackgroundTaskChildStateExpectation::Exact(expected_state),
+            requested_run_id,
+            None,
+        )
+    }
+
+    /// Attaches the exact host-planned child while the task is running or cancellation is pending.
+    ///
+    /// The task state is loaded under the same immediate transaction as metadata correlation and
+    /// attachment. `cancel_requested` is accepted only because work may already be in flight; all
+    /// other states fail closed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when durable evidence is mismatched, corrupt, or changes during
+    /// the compare-and-set update.
+    pub fn attach_background_task_child(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        execution_generation: u64,
+    ) -> Result<BackgroundTaskChildResolution, JournalError> {
+        self.resolve_background_task_child_with_state(
+            task_id,
+            BackgroundTaskChildStateExpectation::AttachWindow,
+            Some(run_id),
+            Some(execution_generation),
+        )
+    }
+
+    fn resolve_background_task_child_with_state(
+        &self,
+        task_id: &str,
+        state_expectation: BackgroundTaskChildStateExpectation<'_>,
+        requested_run_id: Option<&str>,
+        expected_execution_generation: Option<u64>,
+    ) -> Result<BackgroundTaskChildResolution, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_background_task_tx(&transaction, task_id)?
+            .ok_or_else(|| JournalError::BackgroundTaskNotFound { task_id: task_id.to_owned() })?;
+        if let Some(expected_generation) = expected_execution_generation {
+            if task.execution_generation != expected_generation {
+                return Err(JournalError::BackgroundTaskExecutionGenerationConflict {
+                    task_id: task_id.to_owned(),
+                    expected_generation,
+                    actual_generation: task.execution_generation,
+                });
+            }
+        }
+        if !state_expectation.permits(&task) {
+            return Err(JournalError::BackgroundTaskChildConflict {
+                reason: state_expectation.conflict_reason().to_owned(),
+            });
+        }
+        if !matches!(
+            AuxiliaryTaskKind::from_str(task.task_kind.as_str()),
+            Some(AuxiliaryTaskKind::BackgroundPrompt | AuxiliaryTaskKind::DelegationPrompt)
+        ) {
+            return Err(JournalError::BackgroundTaskChildConflict {
+                reason: "background child resolution requires a child-backed task".to_owned(),
+            });
+        }
+
+        let requested_run_id = requested_run_id.map(str::trim).filter(|value| !value.is_empty());
+        let authoritative_run_id =
+            task.target_run_id.clone().or_else(|| task.planned_child_run_id.clone());
+        if let (Some(authoritative_run_id), Some(requested_run_id)) =
+            (authoritative_run_id.as_deref(), requested_run_id)
+        {
+            if authoritative_run_id != requested_run_id {
+                transaction.commit()?;
+                return Ok(BackgroundTaskChildResolution::Mismatched {
+                    task,
+                    requested_run_id: requested_run_id.to_owned(),
+                });
+            }
+        }
+
+        let candidate = startup_child_task_candidate(&task);
+        let exact_run_id =
+            authoritative_run_id.clone().or_else(|| requested_run_id.map(ToOwned::to_owned));
+        let mut matching_runs = if let Some(authoritative_run_id) = authoritative_run_id.as_deref()
+        {
+            let matches = query_matching_background_task_runs(
+                &transaction,
+                &candidate,
+                Some(authoritative_run_id),
+            )?;
+            if matches.is_empty() {
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE run_ulid = ?1)",
+                    params![authoritative_run_id],
+                    |row| row.get::<_, i64>(0),
+                )? == 1;
+                if exists {
+                    transaction.commit()?;
+                    return Ok(BackgroundTaskChildResolution::Mismatched {
+                        task,
+                        requested_run_id: authoritative_run_id.to_owned(),
+                    });
+                }
+            }
+            matches
+        } else if let Some(requested_run_id) = requested_run_id {
+            let exact_matches = query_matching_background_task_runs(
+                &transaction,
+                &candidate,
+                Some(requested_run_id),
+            )?;
+            if exact_matches.len() == 1 {
+                exact_matches
+            } else {
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE run_ulid = ?1)",
+                    params![requested_run_id],
+                    |row| row.get::<_, i64>(0),
+                )? == 1;
+                if exists {
+                    transaction.commit()?;
+                    return Ok(BackgroundTaskChildResolution::Mismatched {
+                        task,
+                        requested_run_id: requested_run_id.to_owned(),
+                    });
+                }
+                let mut matches =
+                    load_matching_background_task_run_snapshots(&transaction, &candidate)?;
+                matches.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+                if matches.is_empty() {
+                    Vec::new()
+                } else if matches.len() == 1 {
+                    transaction.commit()?;
+                    return Ok(BackgroundTaskChildResolution::Mismatched {
+                        task,
+                        requested_run_id: requested_run_id.to_owned(),
+                    });
+                } else {
+                    transaction.commit()?;
+                    return Ok(BackgroundTaskChildResolution::Ambiguous {
+                        task,
+                        candidate_run_ids: matches.iter().map(|run| run.run_id.clone()).collect(),
+                    });
+                }
+            }
+        } else {
+            load_matching_background_task_run_snapshots(&transaction, &candidate)?
+        };
+        matching_runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+
+        let resolution = match matching_runs.as_slice() {
+            [] => BackgroundTaskChildResolution::NoChild { task, expected_run_id: exact_run_id },
+            [run] => {
+                let run_state =
+                    RunLifecycleState::from_str(run.state.as_str()).ok_or_else(|| {
+                        JournalError::BackgroundTaskChildConflict {
+                            reason: format!(
+                                "background child run {} has unsupported state {}",
+                                run.run_id, run.state
+                            ),
+                        }
+                    })?;
+                let run_match = StartupChildRunMatch {
+                    run_id: run.run_id.clone(),
+                    state: run_state,
+                    completed_at_unix_ms: run.completed_at_unix_ms,
+                };
+                let reconciled_terminal = run_state.is_terminal();
+                let updated = if reconciled_terminal {
+                    recover_background_task_from_child_run_tx(
+                        &transaction,
+                        &candidate,
+                        &run_match,
+                        "runtime_child_resolution",
+                        "background_task.runtime.existing_child_reconciled",
+                        now,
+                    )?
+                } else {
+                    attach_background_task_child_run_tx(
+                        &transaction,
+                        &candidate,
+                        run.run_id.as_str(),
+                        now,
+                    )?
+                };
+                if !updated {
+                    return Err(JournalError::BackgroundTaskChildConflict {
+                        reason: "background task changed during child resolution".to_owned(),
+                    });
+                }
+                let resolved_task =
+                    load_background_task_tx(&transaction, task_id)?.ok_or_else(|| {
+                        JournalError::SessionNotFound { selector: task_id.to_owned() }
+                    })?;
+                BackgroundTaskChildResolution::Resolved {
+                    task: resolved_task,
+                    run: Box::new(run.clone()),
+                    reconciled_terminal,
+                }
+            }
+            runs => BackgroundTaskChildResolution::Ambiguous {
+                task,
+                candidate_run_ids: runs.iter().map(|run| run.run_id.clone()).collect(),
+            },
+        };
+        transaction.commit()?;
+        Ok(resolution)
+    }
+
+    /// Reconciles a terminal task with a unique child run discovered after lost attachment.
+    ///
+    /// The update is compare-and-set against the supplied terminal task state. It never starts a
+    /// new child and leaves ambiguous or nonterminal evidence untouched.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when correlation or persistence fails.
+    pub fn reconcile_background_task_before_retry(
+        &self,
+        task_id: &str,
+        expected_state: &str,
+    ) -> Result<Option<OrchestratorBackgroundTaskRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_background_task_tx(&transaction, task_id)?
+            .ok_or_else(|| JournalError::SessionNotFound { selector: task_id.to_owned() })?;
+        if task.state != expected_state {
+            return Err(JournalError::InvalidArgument(
+                "background task state changed before retry reconciliation".to_owned(),
+            ));
+        }
+        if !matches!(
+            AuxiliaryTaskKind::from_str(task.task_kind.as_str()),
+            Some(AuxiliaryTaskKind::BackgroundPrompt | AuxiliaryTaskKind::DelegationPrompt)
+        ) {
+            return Ok(None);
+        }
+        let candidate = startup_child_task_candidate(&task);
+        let matching_runs = load_startup_child_run_matches_tx(&transaction, &candidate)?;
+        match matching_runs.as_slice() {
+            [] => Ok(None),
+            [run] if run.state.is_terminal() => {
+                let updated = recover_background_task_from_child_run_tx(
+                    &transaction,
+                    &candidate,
+                    run,
+                    "retry_child_resolution",
+                    "background_task.retry.existing_child_reconciled",
+                    now,
+                )?;
+                if !updated {
+                    return Err(JournalError::InvalidArgument(
+                        "background task changed during retry reconciliation".to_owned(),
+                    ));
+                }
+                transaction.commit()?;
+                Ok(load_background_task_tx(&guard, task_id)?)
+            }
+            [run] => Err(JournalError::InvalidArgument(format!(
+                "background task retry blocked by existing nonterminal child {}",
+                run.run_id
+            ))),
+            _ => Err(JournalError::InvalidArgument(
+                "background task retry blocked by ambiguous child evidence".to_owned(),
+            )),
+        }
     }
 
     /// Adds token deltas to a run's usage counters; an all-zero delta is a no-op.
@@ -10529,8 +13371,66 @@ impl JournalStore {
         &self,
         request: &OrchestratorTapeAppendRequest,
     ) -> Result<(), JournalError> {
+        self.append_orchestrator_tape_event_with_runtime_projection(request, None).map(|_| ())
+    }
+
+    /// Appends one detached-child event only while its exact parent generation
+    /// remains current.
+    ///
+    /// The generation comparison and tape insert share one immediate
+    /// transaction. `false` is a stale-authority outcome and guarantees that
+    /// no tape row was inserted.
+    pub(crate) fn append_orchestrator_tape_event_if_parent_generation(
+        &self,
+        request: &OrchestratorTapeAppendRequest,
+        parent_guard: &OrchestratorParentGenerationGuard,
+    ) -> Result<bool, JournalError> {
+        if request.run_id != parent_guard.run_id {
+            return Err(JournalError::InvalidArgument(
+                "guarded parent tape request targets a different run".to_owned(),
+            ));
+        }
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (matches, _) = shared_runtime::runtime_generation_fence_matches_tx(
+            &transaction,
+            parent_guard.session_id.as_str(),
+            parent_guard.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            parent_guard.expected_generation,
+        )?;
+        if !matches {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        append_orchestrator_tape_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            request,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Atomically appends one tape event and its optional generation-aware projection.
+    ///
+    /// The projection is checked and sequenced in the same transaction as the
+    /// legacy tape row. A stale projection commits only its bounded diagnostic;
+    /// no tape row is appended, so the two durable event views cannot diverge.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::PayloadTooLarge`],
+    /// [`JournalError::DuplicateTapeSequence`], [`JournalError::RunNotFound`],
+    /// or [`JournalError`] on storage failure.
+    pub fn append_orchestrator_tape_event_with_runtime_projection(
+        &self,
+        request: &OrchestratorTapeAppendRequest,
+        runtime_event: Option<&RuntimeEventAppendRequest>,
+    ) -> Result<Option<RuntimeEventAppendOutcome>, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let session_id = guard
             .query_row(
                 "SELECT session_ulid FROM orchestrator_runs WHERE run_ulid = ?1",
@@ -10545,19 +13445,113 @@ impl JournalStore {
             false,
         );
         let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
-        let append_result =
-            append_orchestrator_tape_event_tx(&guard, self.config.max_payload_bytes, request, now);
+        let append_result = (|| {
+            let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let projected = runtime_event
+                .map(|runtime_event| {
+                    append_runtime_event_tx(
+                        &transaction,
+                        self.config.max_payload_bytes,
+                        runtime_event,
+                        now,
+                    )
+                })
+                .transpose()?;
+            if matches!(projected, Some(RuntimeEventAppendOutcome::StaleSuppressed)) {
+                transaction.commit()?;
+                return Ok(projected);
+            }
+            if runtime_event.is_some() {
+                append_or_replay_orchestrator_tape_event_tx(
+                    &transaction,
+                    self.config.max_payload_bytes,
+                    request,
+                    now,
+                )?;
+            } else {
+                append_orchestrator_tape_event_tx(
+                    &transaction,
+                    self.config.max_payload_bytes,
+                    request,
+                    now,
+                )?;
+            }
+            transaction.commit()?;
+            Ok(projected)
+        })();
         let release_now = current_unix_ms().unwrap_or(now);
         let release_result = release_session_write_lease_record_tx(&guard, &lease, release_now);
         match (append_result, release_result) {
-            (Ok(()), Ok(_)) => Ok(()),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(projected), Ok(_)) => Ok(projected),
+            (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
     }
 
-    /// Marks a run cancelled (unless already terminal) and appends a lifecycle
-    /// event; returns the observed state.
+    /// Atomically appends canonical result evidence and observes a mutating tool effect.
+    ///
+    /// Every tape row and optional V2 projection commits in the same transaction
+    /// as the `effect_started` to `effect_observed` fence transition.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the fence scope, generation, evidence, or
+    /// tape/runtime event batch is invalid, stale, conflicting, or cannot persist.
+    #[cfg(test)]
+    pub fn commit_tool_effect_observation_with_runtime_projections(
+        &self,
+        request: &ToolEffectObservationCommitRequest,
+        runtime_events: &[Option<RuntimeEventAppendRequest>],
+    ) -> Result<palyra_common::runtime_contracts::SideEffectFenceV1, JournalError> {
+        self.commit_tool_effect_observation_with_runtime_projection_outcome(request, runtime_events)
+            .map(|outcome| outcome.fence)
+    }
+
+    /// Atomically commits a tool observation and reports actual metadata writes.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the fence scope, generation, evidence, or
+    /// tape/runtime event batch is invalid, stale, conflicting, or cannot persist.
+    pub(crate) fn commit_tool_effect_observation_with_runtime_projection_outcome(
+        &self,
+        request: &ToolEffectObservationCommitRequest,
+        runtime_events: &[Option<RuntimeEventAppendRequest>],
+    ) -> Result<ToolEffectObservationCommitOutcome, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let run_id =
+            request.tape_events.first().map(|event| event.run_id.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(
+                    "tool effect observation evidence batch is empty".to_owned(),
+                )
+            })?;
+        let session_id = guard
+            .query_row(
+                "SELECT session_ulid FROM orchestrator_runs WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::RunNotFound { run_id: run_id.to_owned() })?;
+        let lease_request = internal_session_write_lease_request(
+            session_id.as_str(),
+            "commit_tool_effect_observation",
+            false,
+        );
+        let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
+        drop(guard);
+        let commit_result = self.commit_tool_effect_observation(request, runtime_events);
+        let release_now = current_unix_ms().unwrap_or(now);
+        let release_result =
+            self.connection.lock().map_err(|_| JournalError::LockPoisoned).and_then(|guard| {
+                release_session_write_lease_record_tx(&guard, &lease, release_now)
+            });
+        match (commit_result, release_result) {
+            (Ok(outcome), Ok(_)) => Ok(outcome),
+            (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        }
+    }
+
+    /// Records cancellation intent for a nonterminal run without terminalizing it.
     ///
     /// # Errors
     /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
@@ -10566,30 +13560,22 @@ impl JournalStore {
         request: &OrchestratorCancelRequest,
     ) -> Result<OrchestratorCancelSnapshot, JournalError> {
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let previous = guard
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_state = transaction
             .query_row(
-                r#"
-                    SELECT state, session_ulid, parent_run_ulid
-                    FROM orchestrator_runs
-                    WHERE run_ulid = ?1
-                "#,
+                "SELECT state FROM orchestrator_runs WHERE run_ulid = ?1",
                 params![request.run_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let Some((previous_state, session_id, parent_run_id)) = previous else {
+        let Some(previous_state) = previous_state else {
             return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
         };
         let previous_lifecycle = RunLifecycleState::from_str(previous_state.as_str());
         let should_cancel = !previous_lifecycle.is_some_and(RunLifecycleState::is_terminal);
         if !should_cancel {
+            transaction.commit()?;
             drop(guard);
             if let Some((outcome, reason_code)) =
                 previous_lifecycle.and_then(metadata_trace_terminal_outcome)
@@ -10607,53 +13593,24 @@ impl JournalStore {
                 reason: format!("run already terminal: {previous_state}"),
             });
         }
-        let updated = guard.execute(
+        let updated = transaction.execute(
             r#"
                 UPDATE orchestrator_runs
                 SET
-                    state = ?4,
                     cancel_requested = 1,
-                    cancel_reason = ?2,
-                    completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?3),
-                    updated_at_unix_ms = ?3,
-                    last_error = COALESCE(?2, last_error)
+                    cancel_reason = COALESCE(cancel_reason, ?2),
+                    updated_at_unix_ms = ?3
                 WHERE run_ulid = ?1
             "#,
-            params![request.run_id, request.reason, now, RunLifecycleState::Cancelled.as_str()],
+            params![request.run_id, request.reason, now],
         )?;
         if updated == 0 {
             return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
         }
-        append_run_lifecycle_event_tx(
-            &guard,
-            &RunLifecycleEventAppendRequest {
-                event_id: Ulid::new().to_string(),
-                run_id: request.run_id.clone(),
-                session_id,
-                from_state: RunLifecyclePhase::parse(previous_state.as_str()),
-                to_state: canonical_run_lifecycle_phase(RunLifecycleState::Cancelled),
-                actor: RuntimeActorRef { kind: RuntimeActorKind::System, id: "system".to_owned() },
-                correlation_id: request.run_id.clone(),
-                parent_run_id,
-                idempotency_key: None,
-                reason: request.reason.clone(),
-                payload_json: json!({
-                    "legacy_state": RunLifecycleState::Cancelled.as_str(),
-                    "error": request.reason,
-                })
-                .to_string(),
-            },
-            now,
-        )?;
-        drop(guard);
-        self.append_metadata_trace_terminalization_best_effort(
-            request.run_id.as_str(),
-            MetadataTraceTerminalOutcomeV1::Cancelled,
-            "run.terminal.cancelled",
-        );
+        transaction.commit()?;
         Ok(OrchestratorCancelSnapshot {
             run_id: request.run_id.clone(),
-            state: RunLifecycleState::Cancelled.as_str().to_owned(),
+            state: previous_state,
             cancel_requested: true,
             reason: request.reason.clone(),
         })
@@ -14462,30 +17419,185 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let max_attempts = u64_to_sqlite(request.max_attempts, "max_attempts")?;
         let budget_tokens = u64_to_sqlite(request.budget_tokens, "budget_tokens")?;
+        if request.target_run_id.is_some()
+            && request.planned_child_run_id.is_some()
+            && request.target_run_id != request.planned_child_run_id
+        {
+            return Err(JournalError::InvalidArgument(
+                "background task target and planned child run ids must agree".to_owned(),
+            ));
+        }
+        if request
+            .planned_child_run_id
+            .as_deref()
+            .is_some_and(|run_id| run_id.trim().is_empty() || run_id.len() > 256)
+        {
+            return Err(JournalError::InvalidArgument(
+                "background task planned child run id must be 1..=256 bytes".to_owned(),
+            ));
+        }
         let delegation_json = request
             .delegation
             .as_ref()
             .map(|value| serialize_json_field(value, "delegation_json"))
             .transpose()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
+        let task_kind =
+            AuxiliaryTaskKind::from_str(request.task_kind.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "unsupported background task kind '{}'",
+                    request.task_kind
+                ))
+            })?;
+        let is_delegation_task = task_kind == AuxiliaryTaskKind::DelegationPrompt;
+        if is_delegation_task != request.delegation.is_some() {
+            return Err(JournalError::InvalidArgument(
+                "delegation task kind and delegation payload must agree".to_owned(),
+            ));
+        }
+        if is_delegation_task != request.cancellation_context.is_some() {
+            return Err(JournalError::InvalidArgument(
+                "delegation task kind and ChildTask cancellation authority must agree".to_owned(),
+            ));
+        }
+        if is_delegation_task != request.child_session_id.is_some() {
+            return Err(JournalError::InvalidArgument(
+                "delegation task kind and dedicated child session must agree".to_owned(),
+            ));
+        }
+        if request.child_session_id.as_deref().is_some_and(|child_session_id| {
+            child_session_id == request.session_id
+                || child_session_id.trim().is_empty()
+                || child_session_id.len() > 128
+        }) {
+            return Err(JournalError::InvalidArgument(
+                "delegation child session must be distinct and 1..=128 bytes".to_owned(),
+            ));
+        }
+        let cancellation_context_json = request
+            .cancellation_context
+            .as_ref()
+            .map(|context| {
+                validate_background_task_cancellation_context(context)?;
+                serialize_json_field(context, "cancellation_context_json")
+            })
+            .transpose()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(cancellation_context) = request.cancellation_context.as_ref() {
+            let parent_run_id = request.parent_run_id.as_deref().ok_or_else(|| {
+                JournalError::InvalidArgument(
+                    "delegation cancellation context requires a parent run".to_owned(),
+                )
+            })?;
+            let child_session_id = request.child_session_id.as_deref().ok_or_else(|| {
+                JournalError::InvalidArgument(
+                    "delegation cancellation context requires a dedicated child session".to_owned(),
+                )
+            })?;
+            if !cancellation_context.permits_new_work(now) {
+                return Err(JournalError::InvalidArgument(
+                    "delegation cancellation context no longer permits enqueue".to_owned(),
+                ));
+            }
+            let active_generation = shared_runtime::active_runtime_generation_tx(
+                &transaction,
+                request.session_id.as_str(),
+                parent_run_id,
+                RuntimeGenerationLane::Run,
+                now,
+            )?
+            .ok_or_else(|| {
+                JournalError::InvalidArgument(
+                    "delegation parent run has no active runtime generation".to_owned(),
+                )
+            })?;
+            if active_generation.generation != cancellation_context.generation {
+                return Err(JournalError::InvalidArgument(
+                    "delegation cancellation generation is stale".to_owned(),
+                ));
+            }
+            let parent_session =
+                load_orchestrator_session_by_id(&transaction, request.session_id.as_str())?
+                    .ok_or_else(|| JournalError::SessionNotFound {
+                        selector: request.session_id.clone(),
+                    })?;
+            if parent_session.principal != request.owner_principal
+                || parent_session.device_id != request.device_id
+                || parent_session.channel != request.channel
+            {
+                return Err(JournalError::InvalidArgument(
+                    "delegation parent session identity does not match the task authority"
+                        .to_owned(),
+                ));
+            }
+            let inserted = transaction.execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid,
+                        session_key,
+                        session_label,
+                        principal,
+                        device_id,
+                        channel,
+                        created_at_unix_ms,
+                        updated_at_unix_ms,
+                        last_run_ulid,
+                        title_generation_state,
+                        manual_title_locked,
+                        manual_title_updated_at_unix_ms,
+                        model_profile_override,
+                        thinking_override,
+                        trace_override,
+                        verbose_override,
+                        branch_state,
+                        parent_session_ulid,
+                        branch_origin_run_ulid
+                    ) VALUES (
+                        ?1, ?1, NULL, ?2, ?3, ?4, ?5, ?5, NULL, ?6, 0, NULL,
+                        NULL, NULL, NULL, NULL, 'delegated', ?7, ?8
+                    )
+                    ON CONFLICT(session_ulid) DO NOTHING
+                "#,
+                params![
+                    child_session_id,
+                    request.owner_principal,
+                    request.device_id,
+                    request.channel,
+                    now,
+                    ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE,
+                    request.session_id,
+                    parent_run_id,
+                ],
+            )?;
+            if inserted == 0 {
+                return Err(JournalError::InvalidArgument(
+                    "delegation child session identity is already allocated".to_owned(),
+                ));
+            }
+        }
+        transaction.execute(
             r#"
                 INSERT INTO orchestrator_background_tasks (
                     task_ulid,
                     task_kind,
                     session_ulid,
+                    child_session_ulid,
                     parent_run_ulid,
                     target_run_ulid,
+                    planned_child_run_ulid,
                     queued_input_ulid,
                     owner_principal,
                     device_id,
                     channel,
                     state,
                     priority,
+                    revision,
+                    execution_generation,
                     attempt_count,
                     max_attempts,
                     budget_tokens,
                     delegation_json,
+                    cancellation_context_json,
                     not_before_unix_ms,
                     expires_at_unix_ms,
                     notification_target_json,
@@ -14498,15 +17610,19 @@ impl JournalStore {
                     started_at_unix_ms,
                     completed_at_unix_ms
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, NULL, NULL, ?20, ?20, NULL, NULL
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    0, 0, 0, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
+                    NULL, NULL, ?23, ?23, NULL, NULL
                 )
             "#,
             params![
                 request.task_id,
-                request.task_kind,
+                task_kind.as_str(),
                 request.session_id,
+                request.child_session_id,
                 request.parent_run_id,
                 request.target_run_id,
+                request.planned_child_run_id,
                 request.queued_input_id,
                 request.owner_principal,
                 request.device_id,
@@ -14516,6 +17632,7 @@ impl JournalStore {
                 max_attempts,
                 budget_tokens,
                 delegation_json,
+                cancellation_context_json,
                 request.not_before_unix_ms,
                 request.expires_at_unix_ms,
                 request.notification_target_json,
@@ -14524,22 +17641,28 @@ impl JournalStore {
                 now,
             ],
         )?;
+        transaction.commit()?;
         Ok(OrchestratorBackgroundTaskRecord {
             task_id: request.task_id.clone(),
-            task_kind: request.task_kind.clone(),
+            task_kind: task_kind.as_str().to_owned(),
             session_id: request.session_id.clone(),
+            child_session_id: request.child_session_id.clone(),
             parent_run_id: request.parent_run_id.clone(),
             target_run_id: request.target_run_id.clone(),
+            planned_child_run_id: request.planned_child_run_id.clone(),
             queued_input_id: request.queued_input_id.clone(),
             owner_principal: request.owner_principal.clone(),
             device_id: request.device_id.clone(),
             channel: request.channel.clone(),
             state: request.state.clone(),
             priority: request.priority,
+            revision: 0,
+            execution_generation: 0,
             attempt_count: 0,
             max_attempts: request.max_attempts,
             budget_tokens: request.budget_tokens,
             delegation: request.delegation.clone(),
+            cancellation_context: request.cancellation_context.clone(),
             not_before_unix_ms: request.not_before_unix_ms,
             expires_at_unix_ms: request.expires_at_unix_ms,
             notification_target_json: request.notification_target_json.clone(),
@@ -14558,76 +17681,279 @@ impl JournalStore {
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
+    #[cfg(test)]
+    pub(crate) fn clear_background_task_cancellation_context_for_test(
+        &self,
+        task_id: &str,
+    ) -> Result<(), JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            "UPDATE orchestrator_background_tasks SET cancellation_context_json = NULL WHERE task_ulid = ?1",
+            params![task_id],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::SessionNotFound { selector: task_id.to_owned() });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_background_task_cancellation_context_for_test(
+        &self,
+        task_id: &str,
+        cancellation_context: &CancellationContextV1,
+    ) -> Result<(), JournalError> {
+        cancellation_context
+            .validate()
+            .expect("background task cancellation context fixture should validate");
+        let encoded = serde_json::to_string(cancellation_context)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            "UPDATE orchestrator_background_tasks SET cancellation_context_json = ?2 WHERE task_ulid = ?1",
+            params![task_id, encoded],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::SessionNotFound { selector: task_id.to_owned() });
+        }
+        Ok(())
+    }
+
+    /// Applies a host-owned update under an exact durable revision.
+    ///
+    /// Host updates advance `revision` but never allocate worker execution authority.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::BackgroundTaskNotFound`] for an unknown task,
+    /// [`JournalError::BackgroundTaskRevisionConflict`] for a stale snapshot, or a storage error.
     pub fn update_orchestrator_background_task(
         &self,
         request: &OrchestratorBackgroundTaskUpdateRequest,
-    ) -> Result<(), JournalError> {
+    ) -> Result<OrchestratorBackgroundTaskRecord, JournalError> {
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let state = request.state.clone();
-        let last_error = request.last_error.clone().flatten();
-        let clear_last_error = request.last_error.is_some() && last_error.is_none();
-        let result_json = request.result_json.clone().flatten();
-        let clear_result_json = request.result_json.is_some() && result_json.is_none();
-        let started_at_unix_ms = request.started_at_unix_ms.flatten();
-        let clear_started_at_unix_ms =
-            request.started_at_unix_ms.is_some() && started_at_unix_ms.is_none();
-        let completed_at_unix_ms = request.completed_at_unix_ms.flatten();
-        let clear_completed_at_unix_ms =
-            request.completed_at_unix_ms.is_some() && completed_at_unix_ms.is_none();
-        let target_run_id = request.target_run_id.clone().flatten();
-        let clear_target_run_id = request.target_run_id.is_some() && target_run_id.is_none();
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            load_background_task_tx(&transaction, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        let expected_revision = request.expected_revision;
+        let expected_revision_sql = u64_to_sqlite(expected_revision, "expected_revision")?;
+        if current.revision != expected_revision {
+            return Err(JournalError::BackgroundTaskRevisionConflict {
+                task_id: request.task_id.clone(),
+                expected_revision,
+                actual_revision: current.revision,
+            });
+        }
+        let next_revision = current.revision.checked_add(1).ok_or_else(|| {
+            JournalError::InvalidArgument("background task revision is exhausted".to_owned())
+        })?;
+        let next_revision_sql = u64_to_sqlite(next_revision, "revision")?;
+        let patch = BackgroundTaskUpdateValues::new(
+            &request.state,
+            &request.target_run_id,
+            &request.last_error,
+            &request.result_json,
+            &request.started_at_unix_ms,
+            &request.completed_at_unix_ms,
+        );
+        let updated = transaction.execute(
+            BACKGROUND_TASK_CONTROLLER_UPDATE_SQL,
+            params![
+                request.task_id,
+                patch.state,
+                patch.clear_target_run_id,
+                patch.target_run_id,
+                patch.clear_last_error,
+                patch.last_error,
+                patch.clear_result_json,
+                patch.result_json,
+                patch.clear_started_at_unix_ms,
+                patch.started_at_unix_ms,
+                patch.clear_completed_at_unix_ms,
+                patch.completed_at_unix_ms,
+                now,
+                expected_revision_sql,
+                next_revision_sql,
+            ],
+        )?;
+        if updated != 1 {
+            let actual = load_background_task_tx(&transaction, request.task_id.as_str())?
+                .ok_or_else(|| JournalError::BackgroundTaskNotFound {
+                    task_id: request.task_id.clone(),
+                })?;
+            return Err(JournalError::BackgroundTaskRevisionConflict {
+                task_id: request.task_id.clone(),
+                expected_revision,
+                actual_revision: actual.revision,
+            });
+        }
+        let record =
+            load_background_task_tx(&transaction, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        transaction.commit()?;
+        Ok(record)
+    }
 
-        let updated = guard.execute(
+    /// Atomically claims queued work and returns the exact worker authority.
+    ///
+    /// A successful claim advances the controller revision, execution generation, and attempt
+    /// count together. `max_attempts == 0` remains the durable unlimited-retry sentinel.
+    ///
+    /// # Errors
+    /// Returns a typed not-found, revision-conflict, or claim-rejected error when admission fails.
+    pub fn claim_orchestrator_background_task(
+        &self,
+        request: &OrchestratorBackgroundTaskClaimRequest,
+    ) -> Result<OrchestratorBackgroundTaskRecord, JournalError> {
+        if request.started_at_unix_ms < 0 {
+            return Err(JournalError::InvalidArgument(
+                "background task claim timestamp must be non-negative".to_owned(),
+            ));
+        }
+        let expected_revision = u64_to_sqlite(request.expected_revision, "expected_revision")?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            load_background_task_tx(&transaction, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        if current.revision != request.expected_revision {
+            return Err(JournalError::BackgroundTaskRevisionConflict {
+                task_id: request.task_id.clone(),
+                expected_revision: request.expected_revision,
+                actual_revision: current.revision,
+            });
+        }
+        if AuxiliaryTaskState::from_str(current.state.as_str()) != Some(AuxiliaryTaskState::Queued)
+        {
+            return Err(JournalError::BackgroundTaskClaimRejected {
+                task_id: request.task_id.clone(),
+                reason: format!("task is not queued: {}", current.state),
+            });
+        }
+        if current.max_attempts > 0 && current.attempt_count >= current.max_attempts {
+            return Err(JournalError::BackgroundTaskClaimRejected {
+                task_id: request.task_id.clone(),
+                reason: "retry budget is exhausted".to_owned(),
+            });
+        }
+        let next_revision = current.revision.checked_add(1).ok_or_else(|| {
+            JournalError::InvalidArgument("background task revision is exhausted".to_owned())
+        })?;
+        let next_generation = current.execution_generation.checked_add(1).ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "background task execution generation is exhausted".to_owned(),
+            )
+        })?;
+        let next_attempt = current.attempt_count.checked_add(1).ok_or_else(|| {
+            JournalError::InvalidArgument("background task attempt count is exhausted".to_owned())
+        })?;
+        let updated = transaction.execute(
             r#"
                 UPDATE orchestrator_background_tasks
                 SET
-                    state = COALESCE(?2, state),
-                    target_run_ulid = CASE
-                        WHEN ?3 = 1 THEN NULL
-                        ELSE COALESCE(?4, target_run_ulid)
-                    END,
-                    attempt_count = attempt_count + ?5,
-                    last_error = CASE
-                        WHEN ?6 = 1 THEN NULL
-                        ELSE COALESCE(?7, last_error)
-                    END,
-                    result_json = CASE
-                        WHEN ?8 = 1 THEN NULL
-                        ELSE COALESCE(?9, result_json)
-                    END,
-                    started_at_unix_ms = CASE
-                        WHEN ?10 = 1 THEN NULL
-                        ELSE COALESCE(?11, started_at_unix_ms)
-                    END,
-                    completed_at_unix_ms = CASE
-                        WHEN ?12 = 1 THEN NULL
-                        ELSE COALESCE(?13, completed_at_unix_ms)
-                    END,
-                    updated_at_unix_ms = ?14
+                    state = ?2,
+                    target_run_ulid = NULL,
+                    revision = ?3,
+                    execution_generation = ?4,
+                    attempt_count = ?5,
+                    last_error = NULL,
+                    result_json = NULL,
+                    started_at_unix_ms = ?6,
+                    completed_at_unix_ms = NULL,
+                    updated_at_unix_ms = ?6
                 WHERE task_ulid = ?1
+                  AND revision = ?7
+                  AND execution_generation = ?8
+                  AND state = ?9
+                  AND (max_attempts = 0 OR attempt_count < max_attempts)
             "#,
             params![
                 request.task_id,
-                state,
-                if clear_target_run_id { 1_i64 } else { 0_i64 },
-                target_run_id,
-                if request.increment_attempt_count { 1_i64 } else { 0_i64 },
-                if clear_last_error { 1_i64 } else { 0_i64 },
-                last_error,
-                if clear_result_json { 1_i64 } else { 0_i64 },
-                result_json,
-                if clear_started_at_unix_ms { 1_i64 } else { 0_i64 },
-                started_at_unix_ms,
-                if clear_completed_at_unix_ms { 1_i64 } else { 0_i64 },
-                completed_at_unix_ms,
-                now,
+                AuxiliaryTaskState::Running.as_str(),
+                u64_to_sqlite(next_revision, "revision")?,
+                u64_to_sqlite(next_generation, "execution_generation")?,
+                u64_to_sqlite(next_attempt, "attempt_count")?,
+                request.started_at_unix_ms,
+                expected_revision,
+                u64_to_sqlite(current.execution_generation, "execution_generation")?,
+                current.state,
             ],
         )?;
-        if updated == 0 {
-            return Err(JournalError::SessionNotFound { selector: request.task_id.clone() });
+        if updated != 1 {
+            return Err(JournalError::BackgroundTaskClaimRejected {
+                task_id: request.task_id.clone(),
+                reason: "task changed during claim".to_owned(),
+            });
         }
-        Ok(())
+        let record =
+            load_background_task_tx(&transaction, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Applies a worker callback under the exact execution generation allocated by claim.
+    ///
+    /// Worker callbacks may settle `running` work normally. Once cancellation is requested, the
+    /// same execution generation may settle only as `cancelled`. Every accepted callback advances
+    /// the controller revision so older host snapshots cannot later overwrite it.
+    ///
+    /// # Errors
+    /// Returns a typed not-found, generation-conflict, or state-rejection error when authority is
+    /// stale or the task no longer accepts worker callbacks.
+    pub fn update_orchestrator_background_task_from_worker(
+        &self,
+        request: &OrchestratorBackgroundTaskWorkerUpdateRequest,
+    ) -> Result<OrchestratorBackgroundTaskRecord, JournalError> {
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = update_orchestrator_background_task_from_worker_tx(&transaction, request)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Applies a worker callback only while the exact parent generation remains
+    /// current.
+    ///
+    /// A `None` result is a stale-generation suppression; task state, result,
+    /// and completion timestamps remain unchanged.
+    pub(crate) fn update_orchestrator_background_task_from_worker_if_parent_generation(
+        &self,
+        request: &OrchestratorBackgroundTaskWorkerUpdateRequest,
+        parent_guard: &OrchestratorParentGenerationGuard,
+    ) -> Result<Option<OrchestratorBackgroundTaskRecord>, JournalError> {
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task =
+            load_background_task_tx(&transaction, request.task_id.as_str())?.ok_or_else(|| {
+                JournalError::BackgroundTaskNotFound { task_id: request.task_id.clone() }
+            })?;
+        if task.session_id != parent_guard.session_id
+            || task.parent_run_id.as_deref() != Some(parent_guard.run_id.as_str())
+        {
+            return Err(JournalError::InvalidArgument(
+                "guarded worker callback does not belong to the supplied parent generation"
+                    .to_owned(),
+            ));
+        }
+        let (matches, _) = shared_runtime::runtime_generation_fence_matches_tx(
+            &transaction,
+            parent_guard.session_id.as_str(),
+            parent_guard.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            parent_guard.expected_generation,
+        )?;
+        if !matches {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let record = update_orchestrator_background_task_from_worker_tx(&transaction, request)?;
+        transaction.commit()?;
+        Ok(Some(record))
     }
 
     /// Lists background tasks matching the filter.
@@ -14646,18 +17972,23 @@ impl JournalStore {
                     task_ulid,
                     task_kind,
                     session_ulid,
+                    child_session_ulid,
                     parent_run_ulid,
                     target_run_ulid,
+                    planned_child_run_ulid,
                     queued_input_ulid,
                     owner_principal,
                     device_id,
                     channel,
                     state,
                     priority,
+                    revision,
+                    execution_generation,
                     attempt_count,
                     max_attempts,
                     budget_tokens,
                     delegation_json,
+                    cancellation_context_json,
                     not_before_unix_ms,
                     expires_at_unix_ms,
                     notification_target_json,
@@ -14705,29 +18036,37 @@ impl JournalStore {
                 task_id: row.get(0)?,
                 task_kind: row.get(1)?,
                 session_id: row.get(2)?,
-                parent_run_id: row.get(3)?,
-                target_run_id: row.get(4)?,
-                queued_input_id: row.get(5)?,
-                owner_principal: row.get(6)?,
-                device_id: row.get(7)?,
-                channel: row.get(8)?,
-                state: row.get(9)?,
-                priority: row.get(10)?,
-                attempt_count: row.get::<_, i64>(11)?.max(0) as u64,
-                max_attempts: row.get::<_, i64>(12)?.max(0) as u64,
-                budget_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                delegation: parse_optional_json_column(row.get(14)?, "delegation_json")?,
-                not_before_unix_ms: row.get(15)?,
-                expires_at_unix_ms: row.get(16)?,
-                notification_target_json: row.get(17)?,
-                input_text: row.get(18)?,
-                payload_json: row.get(19)?,
-                last_error: row.get(20)?,
-                result_json: row.get(21)?,
-                created_at_unix_ms: row.get(22)?,
-                updated_at_unix_ms: row.get(23)?,
-                started_at_unix_ms: row.get(24)?,
-                completed_at_unix_ms: row.get(25)?,
+                child_session_id: row.get(3)?,
+                parent_run_id: row.get(4)?,
+                target_run_id: row.get(5)?,
+                planned_child_run_id: row.get(6)?,
+                queued_input_id: row.get(7)?,
+                owner_principal: row.get(8)?,
+                device_id: row.get(9)?,
+                channel: row.get(10)?,
+                state: row.get(11)?,
+                priority: row.get(12)?,
+                revision: row.get::<_, i64>(13)?.max(0) as u64,
+                execution_generation: row.get::<_, i64>(14)?.max(0) as u64,
+                attempt_count: row.get::<_, i64>(15)?.max(0) as u64,
+                max_attempts: row.get::<_, i64>(16)?.max(0) as u64,
+                budget_tokens: row.get::<_, i64>(17)?.max(0) as u64,
+                delegation: parse_optional_json_column(row.get(18)?, "delegation_json")?,
+                cancellation_context: parse_optional_json_column(
+                    row.get(19)?,
+                    "cancellation_context_json",
+                )?,
+                not_before_unix_ms: row.get(20)?,
+                expires_at_unix_ms: row.get(21)?,
+                notification_target_json: row.get(22)?,
+                input_text: row.get(23)?,
+                payload_json: row.get(24)?,
+                last_error: row.get(25)?,
+                result_json: row.get(26)?,
+                created_at_unix_ms: row.get(27)?,
+                updated_at_unix_ms: row.get(28)?,
+                started_at_unix_ms: row.get(29)?,
+                completed_at_unix_ms: row.get(30)?,
             });
         }
         Ok(records)
@@ -14749,18 +18088,23 @@ impl JournalStore {
                         task_ulid,
                         task_kind,
                         session_ulid,
+                        child_session_ulid,
                         parent_run_ulid,
                         target_run_ulid,
+                        planned_child_run_ulid,
                         queued_input_ulid,
                         owner_principal,
                         device_id,
                         channel,
                         state,
                         priority,
+                        revision,
+                        execution_generation,
                         attempt_count,
                         max_attempts,
                         budget_tokens,
                         delegation_json,
+                        cancellation_context_json,
                         not_before_unix_ms,
                         expires_at_unix_ms,
                         notification_target_json,
@@ -14781,29 +18125,37 @@ impl JournalStore {
                         task_id: row.get(0)?,
                         task_kind: row.get(1)?,
                         session_id: row.get(2)?,
-                        parent_run_id: row.get(3)?,
-                        target_run_id: row.get(4)?,
-                        queued_input_id: row.get(5)?,
-                        owner_principal: row.get(6)?,
-                        device_id: row.get(7)?,
-                        channel: row.get(8)?,
-                        state: row.get(9)?,
-                        priority: row.get(10)?,
-                        attempt_count: row.get::<_, i64>(11)?.max(0) as u64,
-                        max_attempts: row.get::<_, i64>(12)?.max(0) as u64,
-                        budget_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                        delegation: parse_optional_json_column(row.get(14)?, "delegation_json")?,
-                        not_before_unix_ms: row.get(15)?,
-                        expires_at_unix_ms: row.get(16)?,
-                        notification_target_json: row.get(17)?,
-                        input_text: row.get(18)?,
-                        payload_json: row.get(19)?,
-                        last_error: row.get(20)?,
-                        result_json: row.get(21)?,
-                        created_at_unix_ms: row.get(22)?,
-                        updated_at_unix_ms: row.get(23)?,
-                        started_at_unix_ms: row.get(24)?,
-                        completed_at_unix_ms: row.get(25)?,
+                        child_session_id: row.get(3)?,
+                        parent_run_id: row.get(4)?,
+                        target_run_id: row.get(5)?,
+                        planned_child_run_id: row.get(6)?,
+                        queued_input_id: row.get(7)?,
+                        owner_principal: row.get(8)?,
+                        device_id: row.get(9)?,
+                        channel: row.get(10)?,
+                        state: row.get(11)?,
+                        priority: row.get(12)?,
+                        revision: row.get::<_, i64>(13)?.max(0) as u64,
+                        execution_generation: row.get::<_, i64>(14)?.max(0) as u64,
+                        attempt_count: row.get::<_, i64>(15)?.max(0) as u64,
+                        max_attempts: row.get::<_, i64>(16)?.max(0) as u64,
+                        budget_tokens: row.get::<_, i64>(17)?.max(0) as u64,
+                        delegation: parse_optional_json_column(row.get(18)?, "delegation_json")?,
+                        cancellation_context: parse_optional_json_column(
+                            row.get(19)?,
+                            "cancellation_context_json",
+                        )?,
+                        not_before_unix_ms: row.get(20)?,
+                        expires_at_unix_ms: row.get(21)?,
+                        notification_target_json: row.get(22)?,
+                        input_text: row.get(23)?,
+                        payload_json: row.get(24)?,
+                        last_error: row.get(25)?,
+                        result_json: row.get(26)?,
+                        created_at_unix_ms: row.get(27)?,
+                        updated_at_unix_ms: row.get(28)?,
+                        started_at_unix_ms: row.get(29)?,
+                        completed_at_unix_ms: row.get(30)?,
                     })
                 },
             )
@@ -28342,10 +31694,274 @@ fn decode_vector_blob(blob: &[u8], dims: usize) -> Vec<f32> {
     vector
 }
 
-/// Applies pending schema migrations in version order, each in its own
-/// transaction, recording applied versions in `schema_migrations`.
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalSnapshotFileState {
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+impl JournalSnapshotFileState {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalSnapshotSourceState {
+    database: JournalSnapshotFileState,
+    wal: Option<JournalSnapshotFileState>,
+}
+
+impl JournalSnapshotSourceState {
+    fn payload_bytes(&self) -> u64 {
+        self.database.len.saturating_add(self.wal.as_ref().map_or(0, |wal| wal.len))
+    }
+}
+
+fn journal_snapshot_source_state(
+    source_path: &Path,
+) -> Result<JournalSnapshotSourceState, JournalError> {
+    let database_metadata = fs::metadata(source_path).map_err(|source| {
+        JournalError::CompatibilitySnapshot { path: source_path.to_path_buf(), source }
+    })?;
+    let wal_path = sqlite_sidecar_path(source_path, "-wal");
+    let wal = match fs::metadata(&wal_path) {
+        Ok(metadata) => Some(JournalSnapshotFileState::from_metadata(&metadata)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(JournalError::CompatibilitySnapshot { path: wal_path, source });
+        }
+    };
+    Ok(JournalSnapshotSourceState {
+        database: JournalSnapshotFileState::from_metadata(&database_metadata),
+        wal,
+    })
+}
+
+fn sqlite_read_only_uri(path: &Path, immutable: bool) -> Result<String, JournalError> {
+    #[cfg(unix)]
+    let normalized = {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let normalized = {
+        let raw = path.to_str().ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "journal compatibility path is not valid Unicode".to_owned(),
+            )
+        })?;
+        let without_verbatim = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+        let normalized = without_verbatim.replace('\\', "/");
+        if normalized.as_bytes().get(1) == Some(&b':') {
+            format!("/{normalized}").into_bytes()
+        } else {
+            normalized.into_bytes()
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let normalized = path
+        .to_str()
+        .ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "journal compatibility path is not valid Unicode".to_owned(),
+            )
+        })?
+        .as_bytes()
+        .to_vec();
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = String::with_capacity(normalized.len().saturating_mul(3).saturating_add(32));
+    uri.push_str("file:");
+    for byte in normalized {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    uri.push_str("?mode=ro");
+    if immutable {
+        uri.push_str("&immutable=1");
+    }
+    Ok(uri)
+}
+
+fn inspect_journal_schema_snapshot(
+    source_path: &Path,
+) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+    for _attempt in 1..=JOURNAL_COMPATIBILITY_SNAPSHOT_MAX_ATTEMPTS {
+        let source_before = journal_snapshot_source_state(source_path)?;
+        let snapshot_dir = tempfile::tempdir().map_err(|source| {
+            JournalError::CompatibilitySnapshot { path: source_path.to_path_buf(), source }
+        })?;
+        let snapshot_path = snapshot_dir.path().join("journal.sqlite3");
+        fs::copy(source_path, &snapshot_path).map_err(|source| {
+            JournalError::CompatibilitySnapshot { path: source_path.to_path_buf(), source }
+        })?;
+
+        let source_wal_path = sqlite_sidecar_path(source_path, "-wal");
+        if source_before.wal.is_some() {
+            let snapshot_wal_path = sqlite_sidecar_path(&snapshot_path, "-wal");
+            match fs::copy(&source_wal_path, snapshot_wal_path) {
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(JournalError::CompatibilitySnapshot {
+                        path: source_wal_path,
+                        source,
+                    });
+                }
+            }
+        }
+
+        let source_after = journal_snapshot_source_state(source_path)?;
+        if source_before != source_after {
+            continue;
+        }
+        return inspect_journal_schema_read_only(
+            &snapshot_path,
+            source_path,
+            source_before.payload_bytes(),
+        );
+    }
+
+    Err(JournalError::CompatibilitySnapshotUnstable {
+        path: source_path.to_path_buf(),
+        attempts: JOURNAL_COMPATIBILITY_SNAPSHOT_MAX_ATTEMPTS,
+    })
+}
+
+fn inspect_journal_schema_read_only(
+    inspected_path: &Path,
+    source_path: &Path,
+    payload_bytes: u64,
+) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+    let wal_exists = sqlite_sidecar_path(inspected_path, "-wal").exists();
+    let database_uri = sqlite_read_only_uri(inspected_path, !wal_exists)?;
+    let connection = Connection::open_with_flags(
+        database_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|source| JournalError::OpenConnection { path: source_path.to_path_buf(), source })?;
+    connection.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")?;
+    inspect_journal_schema_connection(&connection, payload_bytes)
+}
+
+fn inspect_journal_schema_connection(
+    connection: &Connection,
+    payload_bytes: u64,
+) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+    let migration_table_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !migration_table_exists {
+        return runtime_state_compatibility_report_from_findings(Vec::new());
+    }
+
+    let latest_stored = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let latest_supported = MIGRATIONS.last().map_or(0_i64, |migration| migration.version);
+    if latest_stored == latest_supported {
+        return runtime_state_compatibility_report_from_findings(Vec::new());
+    }
+    let supported_schema_version = u32::try_from(latest_supported).map_err(|_| {
+        JournalError::InvalidArgument(
+            "supported journal schema version cannot be represented as u32".to_owned(),
+        )
+    })?;
+    let record_ref = sha256_hex(format!("schema_migrations:{latest_stored}").as_bytes());
+    if latest_stored >= 0 && latest_stored < latest_supported {
+        return runtime_state_compatibility_report_from_findings(vec![
+            RuntimeStateCompatibilityFinding {
+                contract: "schema_migrations".to_owned(),
+                record_ref_sha256: record_ref,
+                observed_schema_version: u32::try_from(latest_stored).ok(),
+                supported_schema_version,
+                outcome: RuntimeStateCompatibilityOutcome::ReadableLegacy,
+                reason_code: "runtime.compatibility.legacy_journal_schema".to_owned(),
+                blocks_admission: false,
+                payload_bytes,
+            },
+        ]);
+    }
+    if latest_stored < 0 {
+        return runtime_state_compatibility_report_from_findings(vec![
+            RuntimeStateCompatibilityFinding {
+                contract: "schema_migrations".to_owned(),
+                record_ref_sha256: record_ref,
+                observed_schema_version: None,
+                supported_schema_version,
+                outcome: RuntimeStateCompatibilityOutcome::QuarantinedCorrupt,
+                reason_code: "runtime.compatibility.invalid_journal_schema".to_owned(),
+                blocks_admission: true,
+                payload_bytes,
+            },
+        ]);
+    }
+    runtime_state_compatibility_report_from_findings(vec![RuntimeStateCompatibilityFinding {
+        contract: "schema_migrations".to_owned(),
+        record_ref_sha256: record_ref,
+        observed_schema_version: u32::try_from(latest_stored).ok(),
+        supported_schema_version,
+        outcome: RuntimeStateCompatibilityOutcome::BlockedNewerSchema,
+        reason_code: "runtime.compatibility.newer_journal_schema".to_owned(),
+        blocks_admission: true,
+        payload_bytes,
+    }])
+}
+
+fn runtime_state_compatibility_report_from_findings(
+    findings: Vec<RuntimeStateCompatibilityFinding>,
+) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+    RuntimeStateCompatibilityReport::from_findings(findings, current_unix_ms()?)
+        .map_err(|error| JournalError::InvalidArgument(error.to_string()))
+}
+
+fn migrated_startup_compatibility_report(
+    preflight: &RuntimeStateCompatibilityReport,
+) -> Result<RuntimeStateCompatibilityReport, JournalError> {
+    let findings = preflight
+        .findings
+        .iter()
+        .map(|finding| {
+            let mut finding = finding.clone();
+            if finding.outcome == RuntimeStateCompatibilityOutcome::ReadableLegacy {
+                finding.outcome = RuntimeStateCompatibilityOutcome::Migrated;
+                finding.reason_code = "runtime.compatibility.journal_schema_migrated".to_owned();
+                finding.blocks_admission = false;
+            }
+            finding
+        })
+        .collect();
+    runtime_state_compatibility_report_from_findings(findings)
+}
+
+/// Applies every pending schema migration under one SQLite-owned writer lock.
 fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
-    connection.execute_batch(
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
         r#"
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -28355,8 +31971,20 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
         "#,
     )?;
 
+    let latest_known = MIGRATIONS.last().map_or(0_i64, |migration| migration.version);
+    let latest_stored = transaction.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if latest_stored > latest_known {
+        return Err(JournalError::InvalidArgument(format!(
+            "journal schema version {latest_stored} is newer than supported version {latest_known}"
+        )));
+    }
+
     for migration in MIGRATIONS {
-        let already_applied = connection
+        let already_applied = transaction
             .query_row(
                 "SELECT 1 FROM schema_migrations WHERE version = ?1 LIMIT 1",
                 params![migration.version],
@@ -28368,14 +31996,13 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
             continue;
         }
 
-        let transaction = connection.transaction()?;
         transaction.execute_batch(migration.sql)?;
         transaction.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, ?3)",
             params![migration.version, migration.name, current_unix_ms()?],
         )?;
-        transaction.commit()?;
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -28731,6 +32358,63 @@ fn redact_error_text(input: &str) -> String {
     crate::model_provider::sanitize_remote_error(trimmed)
 }
 
+fn validate_networked_worker_lifecycle_commit(
+    commit: &NetworkedWorkerLifecycleCommit,
+    fleet: &BTreeMap<String, palyra_workerd::WorkerFleetRecord>,
+) -> Result<(), JournalError> {
+    let event = &commit.event;
+    if event.worker_id.is_empty()
+        || event.worker_id.len() > 128
+        || event.reason_code.is_empty()
+        || event.reason_code.len() > 128
+        || event.timestamp_unix_ms < 0
+    {
+        return Err(JournalError::InvalidArgument(
+            "networked worker lifecycle evidence is invalid".to_owned(),
+        ));
+    }
+    let record = fleet.get(event.worker_id.as_str()).ok_or_else(|| {
+        JournalError::InvalidArgument(
+            "networked worker lifecycle evidence references a missing fleet record".to_owned(),
+        )
+    })?;
+    if commit.request.session_id.is_empty()
+        || commit.request.run_id.is_empty()
+        || commit.request.principal.is_empty()
+        || commit.request.device_id.is_empty()
+    {
+        return Err(JournalError::InvalidArgument(
+            "networked worker lifecycle journal identity is invalid".to_owned(),
+        ));
+    }
+    if record.state != event.state || commit.request.timestamp_unix_ms != event.timestamp_unix_ms {
+        return Err(JournalError::InvalidArgument(
+            "networked worker lifecycle evidence does not match the durable fleet transition"
+                .to_owned(),
+        ));
+    }
+    if let Some(run_id) = event.run_id.as_deref() {
+        if commit.request.run_id != run_id {
+            return Err(JournalError::InvalidArgument(
+                "networked worker lifecycle journal run identity does not match the event"
+                    .to_owned(),
+            ));
+        }
+    }
+    match (record.lease.as_ref(), event.lease_id.as_deref()) {
+        (Some(lease), Some(lease_id))
+            if lease.lease_id == lease_id
+                && event.run_id.as_deref() == Some(lease.run_id.as_str()) => {}
+        (Some(_), _) => {
+            return Err(JournalError::InvalidArgument(
+                "networked worker lifecycle evidence does not match the active lease".to_owned(),
+            ));
+        }
+        (None, _) => {}
+    }
+    Ok(())
+}
+
 /// Computes a journal event's chain hash from the previous hash, the identity
 /// fields, and the sanitized payload.
 // INTENTIONAL: the field order and `|` separators below are the persisted
@@ -28817,25 +32501,51 @@ fn validate_db_path(path: &Path) -> Result<(), JournalError> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
-        path::PathBuf,
+        collections::BTreeMap,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
         sync::{mpsc, Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use palyra_common::runtime_contracts::{
-        ArtifactRetentionPolicy, IdempotencyOperationState, IdempotencyReplayDecision,
-        RunLifecyclePhase, ToolResultSensitivity, ToolResultVisibility,
+    use palyra_common::{
+        metadata_trace::{MetadataTraceEventDataV1, MetadataTraceRecoveryStrategyV1},
+        runtime_contracts::{
+            ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1,
+            CancellationScopeKind, CleanupOutcome, CleanupReportV1, CleanupStepDisposition,
+            CleanupStepKind, CleanupStepRecord, GenerationCheckDisposition, HealthProbeDisposition,
+            HealthProbeLeaseV1, HealthProbeResult, HealthProbeSettlementV1,
+            IdempotencyOperationState, IdempotencyReplayDecision, ProcessLeaseV1,
+            ProcessOwnershipKind, ProcessProvenance, QuarantineClearRequest,
+            ReconciliationStrategy, RunLifecyclePhase, RuntimeActorKind, RuntimeActorRef,
+            RuntimeAttemptId, RuntimeAuthorityClass, RuntimeCausalLinkKind,
+            RuntimeComponentHealthV1, RuntimeErrorPhase, RuntimeEventActorKind,
+            RuntimeEventEnvelopeV2, RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef,
+            RuntimeEventRedactionClass, RuntimeGeneration, RuntimeGenerationLane,
+            RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1, RuntimeHandleKind,
+            RuntimeHandleState, RuntimeHealthState, RuntimeIdempotencyClass, RuntimeIdentityKind,
+            RuntimeInstanceId, RuntimeLeaseId, RuntimeOperationId, RuntimeStateAdmissionPosture,
+            RuntimeStateCompatibilityOutcome, RuntimeSubsystem, RuntimeToolExecutionId,
+            SideEffectFenceState, SideEffectFenceV1, SideEffectRestartPolicy,
+            SideEffectRetryDecision, ToolExecutionSemantics, ToolResultSensitivity,
+            ToolResultVisibility, HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+            HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
+        },
     };
-    use rusqlite::{params, Connection};
+    use proptest::prelude::*;
+    use rusqlite::{params, Connection, TransactionBehavior};
     use serde_json::{json, Value};
+    use ulid::Ulid;
 
     use crate::{
+        delegation::{
+            DelegationExecutionMode, DelegationMemoryScopeKind, DelegationMergeContract,
+            DelegationMergeStrategy, DelegationRole, DelegationRuntimeLimits, DelegationSnapshot,
+        },
         domain::workspace::{WorkspaceDocumentState, WorkspaceRiskState},
         orchestrator::RunLifecycleState,
         retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
@@ -28849,36 +32559,58 @@ mod tests {
         AgentPlanCreateRequest, AgentPlanListFilter, AgentPlanUpdateRequest, ApprovalCreateRequest,
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
         ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType,
-        ApprovalsListFilter, CanvasStateTransitionRequest, CommitmentCreateRequest,
-        CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter, CommitmentUpdateRequest,
-        CompatResponseUpsertRequest, CronConcurrencyPolicy, CronJobCreateRequest,
-        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
-        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
-        FlowCreateRequest, FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest,
-        FlowStepCreateRequest, FlowStepDependenciesReplacement, FlowStepUpdateRequest,
-        FlowTransitionRequest, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
-        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
-        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
-        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
-        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
-        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, ProgressDraftListFilter,
-        ProgressDraftTapeEventRequest, RecallArtifactCreateRequest, RecallArtifactListFilter,
-        SessionProjectContextStateUpsertRequest, SessionSearchRequest,
-        SessionSearchUxSourceRefsProjection, SessionSearchUxSourceRefsReasonCode,
-        SessionWriteLeaseAcquireRequest, SessionWriteLeaseRecord, SessionWriteLeaseReleaseRequest,
-        SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
-        ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
-        ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
-        ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
-        ToolResultArtifactReadRequest, TurnControlAuditEventAppendRequest,
-        TurnControlAuditEventListFilter, WorkItemCreateRequest, WorkItemUpdateRequest,
-        WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter,
-        WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
-        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
-        MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
-        RECALL_ARTIFACT_KIND_SESSION_SEARCH, SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED,
+        ApprovalsListFilter, BackgroundTaskChildResolution, CanvasStateTransitionRequest,
+        CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter,
+        CommitmentUpdateRequest, CompatResponseUpsertRequest, CronConcurrencyPolicy,
+        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
+        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
+        CronScheduleType, DelegatedRunAdmissionV1, FlowCreateRequest,
+        FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest, FlowStepCreateRequest,
+        FlowStepDependenciesReplacement, FlowStepUpdateRequest, FlowTransitionRequest,
+        HashMemoryEmbeddingProvider, IdempotencyBeginRequest, IdempotencyCompleteRequest,
+        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryEmbeddingProvider,
+        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
+        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
+        NetworkedWorkerDispatchClaimCreateRequest, NetworkedWorkerDispatchClaimState,
+        NetworkedWorkerDispatchSettlement, NetworkedWorkerExpiryOutboxRecord,
+        NetworkedWorkerLifecycleCommit, OrchestratorBackgroundTaskClaimRequest,
+        OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
+        OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
+        OrchestratorCancelRequest, OrchestratorParentGenerationGuard,
+        OrchestratorQueuedInputCreateRequest, OrchestratorRunMetadataUpdateRequest,
+        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlementRequest,
+        OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorStartupBackgroundTaskRecoveryReport,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, PersistedProcessLeaseRecord,
+        ProgressDraftListFilter, ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
+        ProviderAttemptCompletionRequest, ProviderAttemptStartRequest,
+        ProviderConfigurationAttemptCompletionOutcome,
+        ProviderConfigurationAttemptCompletionRequest, ProviderConfigurationAttemptStartRequest,
+        RecallArtifactCreateRequest, RecallArtifactListFilter, RuntimeEventAppendOutcome,
+        RuntimeEventAppendRequest, RuntimeGenerationActivateRequest,
+        RuntimeGenerationInvalidateOutcome, RuntimeGenerationInvalidateRequest,
+        RuntimeHealthComponentActivation, RuntimeHealthObservationRequest,
+        RuntimeHealthProbeBeginRequest, RuntimeHealthProbeReconciliationMode,
+        RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
+        RuntimeHealthQuarantineClearRequest, SessionProjectContextStateUpsertRequest,
+        SessionSearchRequest, SessionSearchUxSourceRefsProjection,
+        SessionSearchUxSourceRefsReasonCode, SessionWriteLeaseAcquireRequest,
+        SessionWriteLeaseRecord, SessionWriteLeaseReleaseRequest,
+        SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
+        SkillExecutionStatus, SkillStatusUpsertRequest, ToolEffectObservationCommitRequest,
+        ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRetentionPolicy, ToolJobRetryPolicy,
+        ToolJobRetryRequest, ToolJobState, ToolJobTailAppendRequest, ToolJobTailReadRequest,
+        ToolJobTailStream, ToolJobTransitionRequest, ToolJobsListFilter,
+        ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
+        TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter, WorkItemCreateRequest,
+        WorkItemUpdateRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
+        WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest,
+        WorkspaceSearchRequest, CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS,
+        MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
+        NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
+        NETWORKED_WORKER_EXPIRY_MAX_ENTRIES, NETWORKED_WORKER_FLEET_MAX_ENTRIES,
+        RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+        SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29001,8 +32733,679 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("orchestrator run should be created");
+    }
+
+    fn provider_runtime_events(store: &JournalStore, run_id: &str) -> Vec<RuntimeEventEnvelopeV2> {
+        let guard = store.connection.lock().expect("journal lock should not be poisoned");
+        let mut statement = guard
+            .prepare(
+                r#"
+                    SELECT envelope_json
+                    FROM runtime_events_v2
+                    WHERE run_ulid = ?1 AND lane = ?2
+                    ORDER BY generation ASC, sequence ASC
+                "#,
+            )
+            .expect("provider runtime event query should prepare");
+        statement
+            .query_map(params![run_id, RuntimeGenerationLane::Provider.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("provider runtime events should query")
+            .map(|row| {
+                serde_json::from_str(row.expect("provider runtime event row should load").as_str())
+                    .expect("provider runtime envelope should deserialize")
+            })
+            .collect()
+    }
+
+    fn test_provider_health_activation() -> RuntimeHealthComponentActivation {
+        RuntimeHealthComponentActivation {
+            component_id: RuntimeInstanceId::parse("provider:openai-primary")
+                .expect("provider health identity should validate"),
+            authority_class: RuntimeAuthorityClass::PrivilegedMutation,
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                strike_threshold: 2,
+                cooldown_ms: 1_000,
+                max_probe_concurrency: 1,
+                security_quarantine_auto_clear: false,
+            },
+            reason_code: "runtime.health.provider_activated".to_owned(),
+        }
+    }
+
+    fn activate_test_provider_runtime(store: &JournalStore) -> RuntimeGeneration {
+        store
+            .activate_provider_runtime(
+                &[test_provider_health_activation()],
+                current_unix_ms().expect("test clock should load"),
+            )
+            .expect("provider runtime should activate")
+            .configuration_epoch
+    }
+
+    #[test]
+    fn provider_attempt_events_bind_stable_identity_and_causal_parent() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PA1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PA2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let configuration_epoch = activate_test_provider_runtime(&store);
+        let attempt_id = RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PA3")
+            .expect("attempt identity should validate");
+
+        let authority = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: attempt_id.clone(),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("provider attempt should start");
+        let completion = store
+            .complete_provider_attempt(&ProviderAttemptCompletionRequest {
+                authority: authority.clone(),
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+                outcome: "success".to_owned(),
+                error_class: None,
+            })
+            .expect("provider attempt should complete");
+        assert!(matches!(completion, ProviderAttemptCompletionOutcome::Appended { sequence: 2 }));
+
+        let events = provider_runtime_events(&store, run_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_name, RuntimeEventName::ProviderAttemptStarted);
+        assert_eq!(events[1].event_name, RuntimeEventName::ProviderAttemptCompleted);
+        assert_eq!(events[0].identities.attempt_id.as_ref(), Some(&attempt_id));
+        assert_eq!(events[1].identities.attempt_id.as_ref(), Some(&attempt_id));
+        assert_eq!(events[0].identities.generation, authority.generation);
+        assert_eq!(events[1].identities.generation, authority.generation);
+        assert_eq!(events[1].causal_parent_event_id.as_ref(), Some(&authority.started_event_id));
+        assert_eq!(events[0].identities.causal_links, events[1].identities.causal_links);
+        for event in &events {
+            let child_of = event
+                .identities
+                .causal_links
+                .iter()
+                .find(|link| link.relation == RuntimeCausalLinkKind::ChildOf)
+                .expect("provider attempt should be a child of its run");
+            assert_eq!(child_of.source.kind, RuntimeIdentityKind::Attempt);
+            assert_eq!(child_of.source.value, attempt_id.as_str());
+            assert_eq!(child_of.target.kind, RuntimeIdentityKind::Run);
+            assert_eq!(child_of.target.value, run_id);
+            let diagnostics = event
+                .extensions
+                .get("runtime_identity_diagnostics_v1")
+                .expect("causal identities should publish redacted diagnostics");
+            let serialized =
+                serde_json::to_string(diagnostics).expect("diagnostics should serialize");
+            assert!(!serialized.contains(run_id));
+            assert!(!serialized.contains(attempt_id.as_str()));
+            let RuntimeEventPayloadRef::Inline { metadata } = &event.payload else {
+                panic!("provider attempt event metadata should remain inline");
+            };
+            assert_eq!(
+                metadata.get("configuration_epoch").and_then(serde_json::Value::as_u64),
+                Some(configuration_epoch.get())
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_provider_event_projects_supersedes_and_redacted_diagnostics() {
+        let event_id = RuntimeEventId::parse("provider-attempt:replacement")
+            .expect("event id should validate");
+        let parent_event_id =
+            RuntimeEventId::parse("provider-attempt:original").expect("parent id should validate");
+        let request = super::shared_runtime::provider_attempt_runtime_event(
+            "provider_causal_session",
+            "provider_causal_run",
+            RuntimeAttemptId::parse("provider_causal_attempt").expect("attempt id should validate"),
+            RuntimeGeneration::new(1).expect("generation should validate"),
+            RuntimeGeneration::new(1).expect("configuration epoch should validate"),
+            event_id.clone(),
+            Some(parent_event_id.clone()),
+            RuntimeEventName::ProviderAttemptCompleted,
+            "provider.attempt.superseded",
+            "provider-primary",
+            "model-primary",
+            "failure",
+            Some("superseded"),
+            1_730_000_000_000,
+        )
+        .expect("superseded provider event should build");
+
+        let supersedes = request
+            .envelope
+            .identities
+            .causal_links
+            .iter()
+            .find(|link| link.relation == RuntimeCausalLinkKind::Supersedes)
+            .expect("superseded event should retain replacement causality");
+        assert_eq!(supersedes.source.kind, RuntimeIdentityKind::Event);
+        assert_eq!(supersedes.source.value, event_id.as_str());
+        assert_eq!(supersedes.target.kind, RuntimeIdentityKind::Event);
+        assert_eq!(supersedes.target.value, parent_event_id.as_str());
+        let diagnostics = request
+            .envelope
+            .extensions
+            .get("runtime_identity_diagnostics_v1")
+            .expect("causal diagnostics should project");
+        let serialized = serde_json::to_string(diagnostics).expect("diagnostics should serialize");
+        assert!(!serialized.contains(event_id.as_str()));
+        assert!(!serialized.contains(parent_event_id.as_str()));
+    }
+
+    #[test]
+    fn provider_attempt_start_rejects_stale_configuration_epoch() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PC1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PC2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let stale_epoch = activate_test_provider_runtime(&store);
+        let current_epoch = activate_test_provider_runtime(&store);
+        assert!(current_epoch > stale_epoch);
+
+        let error = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PC3")
+                    .expect("attempt identity should validate"),
+                expected_configuration_epoch: stale_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect_err("stale configuration authority must fail before effect start");
+        assert!(matches!(
+            error,
+            JournalError::InvalidArgument(message)
+                if message == "provider attempt was superseded before effect start"
+        ));
+        assert!(provider_runtime_events(&store, run_id).is_empty());
+    }
+
+    #[test]
+    fn provider_attempt_completion_rejects_forged_parent_authority() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PD1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PD2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let configuration_epoch = activate_test_provider_runtime(&store);
+        let mut authority = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PD3")
+                    .expect("attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("provider attempt should start");
+        authority.started_event_id = RuntimeEventId::parse("provider_attempt:forged:started")
+            .expect("forged event identity should validate");
+
+        let error = store
+            .complete_provider_attempt(&ProviderAttemptCompletionRequest {
+                authority,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+                outcome: "success".to_owned(),
+                error_class: None,
+            })
+            .expect_err("forged parent evidence must fail closed");
+        assert!(matches!(
+            error,
+            JournalError::InvalidArgument(message)
+                if message == "provider attempt completion parent evidence is missing or mismatched"
+        ));
+        assert_eq!(provider_runtime_events(&store, run_id).len(), 1);
+    }
+
+    #[test]
+    fn provider_configuration_epoch_survives_reopen() {
+        let db_path = temp_db_path();
+        let first_epoch = {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            activate_test_provider_runtime(&store)
+        };
+        let second_epoch = {
+            let store = JournalStore::open(test_journal_config(db_path, false))
+                .expect("journal store should reopen");
+            activate_test_provider_runtime(&store)
+        };
+        assert!(second_epoch > first_epoch);
+    }
+
+    #[test]
+    fn provider_runtime_activation_rolls_back_epoch_when_health_activation_fails() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let first_epoch = activate_test_provider_runtime(&store);
+        let mut invalid = test_provider_health_activation();
+        invalid.authority_class = RuntimeAuthorityClass::ObserveOnly;
+        let error = store
+            .activate_provider_runtime(
+                &[invalid],
+                current_unix_ms().expect("test clock should load"),
+            )
+            .expect_err("protected health-authority mismatch must abort reload");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        let next_epoch = activate_test_provider_runtime(&store);
+        assert_eq!(next_epoch.get(), first_epoch.get() + 1);
+    }
+
+    #[test]
+    fn provider_attempt_completion_is_idempotent_and_stale_after_reload() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PB1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PB2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let configuration_epoch = activate_test_provider_runtime(&store);
+        let first = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB3")
+                    .expect("first attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("first provider attempt should start");
+        let first_completion = ProviderAttemptCompletionRequest {
+            authority: first.clone(),
+            provider_id: "openai-primary".to_owned(),
+            model_id: "gpt-4o-mini".to_owned(),
+            outcome: "failure".to_owned(),
+            error_class: Some("rate_limit".to_owned()),
+        };
+        assert!(matches!(
+            store
+                .complete_provider_attempt(&first_completion)
+                .expect("first completion should append"),
+            ProviderAttemptCompletionOutcome::Appended { sequence: 2 }
+        ));
+        assert!(matches!(
+            store
+                .complete_provider_attempt(&first_completion)
+                .expect("matching completion replay should succeed"),
+            ProviderAttemptCompletionOutcome::AlreadyAppended { sequence: 2 }
+        ));
+        assert_eq!(
+            provider_runtime_events(&store, run_id)
+                .iter()
+                .filter(|event| event.event_name == RuntimeEventName::ProviderAttemptCompleted)
+                .count(),
+            1,
+            "matching completion replay must not append a second completion event"
+        );
+
+        let stale = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB4")
+                    .expect("stale attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("second provider attempt should start");
+        let concurrent = store
+            .start_provider_attempt(&ProviderAttemptStartRequest {
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB5")
+                    .expect("concurrent attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "anthropic-primary".to_owned(),
+                model_id: "claude-sonnet".to_owned(),
+            })
+            .expect("concurrent provider attempt should share configuration authority");
+        assert_eq!(concurrent.generation, stale.generation);
+        assert_eq!(concurrent.configuration_epoch, stale.configuration_epoch);
+
+        let replacement_epoch = activate_test_provider_runtime(&store);
+        assert!(replacement_epoch > configuration_epoch);
+        assert_eq!(
+            store
+                .complete_provider_attempt(&ProviderAttemptCompletionRequest {
+                    authority: stale,
+                    provider_id: "openai-primary".to_owned(),
+                    model_id: "gpt-4o-mini".to_owned(),
+                    outcome: "success".to_owned(),
+                    error_class: None,
+                })
+                .expect("stale completion should be diagnosed"),
+            ProviderAttemptCompletionOutcome::StaleSuppressed
+        );
+    }
+
+    #[test]
+    fn provider_configuration_attempt_completion_replays_after_reopen() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let configuration_epoch = activate_test_provider_runtime(&store);
+        let authority = store
+            .start_provider_configuration_attempt(&ProviderConfigurationAttemptStartRequest {
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PG1")
+                    .expect("attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("configuration-scoped provider attempt should start");
+        let completion = ProviderConfigurationAttemptCompletionRequest {
+            authority,
+            provider_id: "openai-primary".to_owned(),
+            model_id: "gpt-4o-mini".to_owned(),
+            outcome: "failure".to_owned(),
+            error_class: Some("rate_limit".to_owned()),
+        };
+        assert_eq!(
+            store
+                .complete_provider_configuration_attempt(&completion)
+                .expect("first configuration-scoped completion should append"),
+            ProviderConfigurationAttemptCompletionOutcome::Appended
+        );
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        assert_eq!(
+            reopened
+                .complete_provider_configuration_attempt(&completion)
+                .expect("matching completion should replay after reopen"),
+            ProviderConfigurationAttemptCompletionOutcome::AlreadyAppended
+        );
+        let completion_count: i64 = reopened
+            .connection
+            .lock()
+            .expect("journal lock should not be poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_provider_attempt_completions WHERE attempt_ulid = ?1",
+                params![completion.authority.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("configuration-scoped completion count should load");
+        assert_eq!(completion_count, 1);
+    }
+
+    #[test]
+    fn provider_configuration_attempt_completion_is_stale_after_reload() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let configuration_epoch = activate_test_provider_runtime(&store);
+        let authority = store
+            .start_provider_configuration_attempt(&ProviderConfigurationAttemptStartRequest {
+                attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PG2")
+                    .expect("attempt identity should validate"),
+                expected_configuration_epoch: configuration_epoch,
+                provider_id: "openai-primary".to_owned(),
+                model_id: "gpt-4o-mini".to_owned(),
+            })
+            .expect("configuration-scoped provider attempt should start");
+        let replacement_epoch = activate_test_provider_runtime(&store);
+        assert!(replacement_epoch > configuration_epoch);
+
+        assert_eq!(
+            store
+                .complete_provider_configuration_attempt(
+                    &ProviderConfigurationAttemptCompletionRequest {
+                        authority: authority.clone(),
+                        provider_id: "openai-primary".to_owned(),
+                        model_id: "gpt-4o-mini".to_owned(),
+                        outcome: "success".to_owned(),
+                        error_class: None,
+                    },
+                )
+                .expect("late configuration-scoped completion should be diagnosed"),
+            ProviderConfigurationAttemptCompletionOutcome::StaleSuppressed
+        );
+        let completion_count: i64 = store
+            .connection
+            .lock()
+            .expect("journal lock should not be poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_provider_attempt_completions WHERE attempt_ulid = ?1",
+                params![authority.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("configuration-scoped completion count should load");
+        assert_eq!(
+            completion_count, 0,
+            "stale configuration-scoped completion must append no canonical result"
+        );
+    }
+
+    fn test_delegation_snapshot() -> DelegationSnapshot {
+        DelegationSnapshot {
+            profile_id: "research".to_owned(),
+            display_name: "Research".to_owned(),
+            description: None,
+            template_id: None,
+            role: DelegationRole::Research,
+            execution_mode: DelegationExecutionMode::Parallel,
+            group_id: "default".to_owned(),
+            model_profile: "deterministic".to_owned(),
+            tool_allowlist: Vec::new(),
+            skill_allowlist: Vec::new(),
+            memory_scope: DelegationMemoryScopeKind::ParentSession,
+            budget_tokens: 128,
+            max_attempts: 3,
+            merge_contract: DelegationMergeContract {
+                strategy: DelegationMergeStrategy::Summarize,
+                approval_required: false,
+            },
+            runtime_limits: DelegationRuntimeLimits::default(),
+            agent_id: Some("main".to_owned()),
+        }
+    }
+
+    fn test_child_task_cancellation_context(
+        generation: RuntimeGeneration,
+    ) -> CancellationContextV1 {
+        CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("child_task:test").expect("child scope id"),
+            scope: CancellationScopeKind::ChildTask,
+            generation,
+            parent_scope_id: Some(RuntimeOperationId::parse("run:test").expect("parent scope id")),
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        }
+    }
+
+    fn create_running_delegation_task(
+        store: &JournalStore,
+        session_id: &str,
+        task_id: &str,
+        planned_child_run_id: Option<&str>,
+    ) -> super::OrchestratorBackgroundTaskRecord {
+        let parent_run_id = format!("{task_id}_parent");
+        start_orchestrator_run(store, session_id, parent_run_id.as_str());
+        let generation = store
+            .active_runtime_generation_for_run(parent_run_id.as_str(), RuntimeGenerationLane::Run)
+            .expect("parent runtime generation should load")
+            .expect("parent runtime generation should be active")
+            .generation;
+        let task = store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: session_id.to_owned(),
+                child_session_id: Some(format!("{task_id}_child_session")),
+                parent_run_id: Some(parent_run_id),
+                target_run_id: None,
+                planned_child_run_id: planned_child_run_id.map(ToOwned::to_owned),
+                queued_input_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: Some(test_delegation_snapshot()),
+                cancellation_context: Some(test_child_task_cancellation_context(generation)),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("test delegated child".to_owned()),
+                payload_json: None,
+            })
+            .expect("delegated background task should be created");
+        store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: task.revision,
+                started_at_unix_ms: 1,
+            })
+            .expect("delegated background task should enter running");
+        store
+            .get_orchestrator_background_task(task_id)
+            .expect("delegated background task should load")
+            .expect("delegated background task should exist")
+    }
+
+    fn create_test_background_task(
+        store: &JournalStore,
+        session_id: &str,
+        task_id: &str,
+        max_attempts: u64,
+    ) -> super::OrchestratorBackgroundTaskRecord {
+        store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::PostRunReflection.as_str().to_owned(),
+                session_id: session_id.to_owned(),
+                child_session_id: None,
+                parent_run_id: None,
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: None,
+                payload_json: None,
+            })
+            .expect("background task should be created")
+    }
+
+    fn queued_delegation_request(
+        session_id: &str,
+        parent_run_id: &str,
+        task_id: &str,
+        cancellation_context: Option<CancellationContextV1>,
+    ) -> OrchestratorBackgroundTaskCreateRequest {
+        OrchestratorBackgroundTaskCreateRequest {
+            task_id: task_id.to_owned(),
+            task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+            session_id: session_id.to_owned(),
+            child_session_id: Some(format!("child-session-{task_id}")),
+            parent_run_id: Some(parent_run_id.to_owned()),
+            target_run_id: None,
+            planned_child_run_id: None,
+            queued_input_id: None,
+            owner_principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+            priority: 0,
+            max_attempts: 3,
+            budget_tokens: 128,
+            delegation: Some(test_delegation_snapshot()),
+            cancellation_context,
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some("test delegated child".to_owned()),
+            payload_json: None,
+        }
+    }
+
+    fn start_background_task_child_run(
+        store: &JournalStore,
+        task: &super::OrchestratorBackgroundTaskRecord,
+        run_id: &str,
+    ) {
+        let delegated_admission = task.delegation.as_ref().map(|_| DelegatedRunAdmissionV1 {
+            task_id: task.task_id.clone(),
+            task_kind: task.task_kind.clone(),
+            parent_session_id: task.session_id.clone(),
+            child_session_id: task
+                .child_session_id
+                .clone()
+                .expect("delegated task should own a child session"),
+            parent_run_id: task
+                .parent_run_id
+                .clone()
+                .expect("delegated task should retain its parent run"),
+            cancellation_context: task
+                .cancellation_context
+                .clone()
+                .expect("delegated task should retain ChildTask authority"),
+        });
+        let origin_kind = if delegated_admission.is_some() { "delegation" } else { "background" };
+        let run_session_id = task.child_session_id.as_ref().unwrap_or(&task.session_id);
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: run_session_id.clone(),
+                origin_kind: origin_kind.to_owned(),
+                origin_run_id: task.parent_run_id.clone(),
+                triggered_by_principal: Some(task.owner_principal.clone()),
+                parameter_delta_json: Some(
+                    json!({
+                        "background_task": {
+                            "schema_version": 1,
+                            "task_id": task.task_id,
+                            "task_kind": task.task_kind,
+                            "parent_session_id": task.session_id,
+                            "child_session_id": task.child_session_id,
+                            "parent_run_id": task.parent_run_id,
+                            "budget_tokens": task.budget_tokens,
+                            "cancellation_context": task.cancellation_context,
+                        }
+                    })
+                    .to_string(),
+                ),
+                delegated_admission,
+            })
+            .expect("background task child run should be created");
     }
 
     fn append_tape_event(store: &JournalStore, run_id: &str, seq: i64) {
@@ -29086,6 +33489,205 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    #[test]
+    fn background_task_claim_and_callbacks_are_generation_fenced() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BG1";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BG2";
+        upsert_orchestrator_session(&store, session_id);
+
+        let created = create_test_background_task(&store, session_id, task_id, 2);
+        assert_eq!(created.revision, 0);
+        assert_eq!(created.execution_generation, 0);
+        assert_eq!(created.attempt_count, 0);
+
+        let claimed = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                started_at_unix_ms: 10,
+            })
+            .expect("first claim should succeed");
+        assert_eq!(claimed.revision, 1);
+        assert_eq!(claimed.execution_generation, 1);
+        assert_eq!(claimed.attempt_count, 1);
+        assert_eq!(claimed.state, AuxiliaryTaskState::Running.as_str());
+
+        let stale_claim = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                started_at_unix_ms: 11,
+            })
+            .expect_err("a competing stale claim must fail");
+        assert!(matches!(
+            stale_claim,
+            JournalError::BackgroundTaskRevisionConflict {
+                expected_revision: 0,
+                actual_revision: 1,
+                ..
+            }
+        ));
+
+        let settled = store
+            .update_orchestrator_background_task_from_worker(
+                &super::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.to_owned(),
+                    execution_generation: claimed.execution_generation,
+                    state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
+                    target_run_id: None,
+                    last_error: Some(None),
+                    result_json: Some(Some(r#"{"status":"ok"}"#.to_owned())),
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: Some(Some(20)),
+                },
+            )
+            .expect("matching worker callback should settle");
+        assert_eq!(settled.revision, 2);
+        assert_eq!(settled.execution_generation, 1);
+        assert_eq!(settled.attempt_count, 1);
+        assert_eq!(settled.state, AuxiliaryTaskState::Succeeded.as_str());
+
+        let stale_callback = store
+            .update_orchestrator_background_task_from_worker(
+                &super::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.to_owned(),
+                    execution_generation: claimed.execution_generation,
+                    state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                    target_run_id: None,
+                    last_error: Some(Some("late callback".to_owned())),
+                    result_json: None,
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: Some(Some(21)),
+                },
+            )
+            .expect_err("terminal rows must reject late callbacks");
+        assert!(matches!(stale_callback, JournalError::BackgroundTaskWorkerUpdateRejected { .. }));
+    }
+
+    #[test]
+    fn background_task_host_updates_require_exact_revision_without_side_effects() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BG3";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BG4";
+        upsert_orchestrator_session(&store, session_id);
+        let created = create_test_background_task(&store, session_id, task_id, 3);
+
+        let updated = store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                state: Some(AuxiliaryTaskState::Paused.as_str().to_owned()),
+                last_error: Some(Some("operator paused".to_owned())),
+                ..Default::default()
+            })
+            .expect("matching revision should update");
+        assert_eq!(updated.revision, 1);
+        assert_eq!(updated.execution_generation, 0);
+        assert_eq!(updated.attempt_count, 0);
+
+        let conflict = store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
+                last_error: Some(Some("stale overwrite".to_owned())),
+                ..Default::default()
+            })
+            .expect_err("stale host update should fail");
+        assert!(matches!(conflict, JournalError::BackgroundTaskRevisionConflict { .. }));
+        let durable = store
+            .get_orchestrator_background_task(task_id)
+            .expect("background task should load")
+            .expect("background task should exist");
+        assert_eq!(durable.state, AuxiliaryTaskState::Paused.as_str());
+        assert_eq!(durable.last_error.as_deref(), Some("operator paused"));
+        assert_eq!(durable.revision, 1);
+    }
+
+    #[test]
+    fn background_task_cancellation_wins_over_late_worker_success() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BG5";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BG6";
+        upsert_orchestrator_session(&store, session_id);
+        let created = create_test_background_task(&store, session_id, task_id, 1);
+        let claimed = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                started_at_unix_ms: 10,
+            })
+            .expect("claim should succeed");
+        let cancel_requested = store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: claimed.revision,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                last_error: Some(Some("cancelled by operator".to_owned())),
+                ..Default::default()
+            })
+            .expect("host cancellation should advance revision");
+
+        let late_success = store
+            .update_orchestrator_background_task_from_worker(
+                &super::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.to_owned(),
+                    execution_generation: claimed.execution_generation,
+                    state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
+                    target_run_id: None,
+                    last_error: Some(None),
+                    result_json: None,
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: Some(Some(20)),
+                },
+            )
+            .expect_err("late success must not resurrect cancelled work");
+        assert!(matches!(late_success, JournalError::BackgroundTaskWorkerUpdateRejected { .. }));
+
+        let cancelled = store
+            .update_orchestrator_background_task_from_worker(
+                &super::OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task_id.to_owned(),
+                    execution_generation: claimed.execution_generation,
+                    state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
+                    target_run_id: None,
+                    last_error: Some(Some("cancelled by operator".to_owned())),
+                    result_json: None,
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: Some(Some(21)),
+                },
+            )
+            .expect("matching generation may settle cancellation");
+        assert_eq!(cancelled.state, AuxiliaryTaskState::Cancelled.as_str());
+        assert_eq!(cancelled.revision, cancel_requested.revision + 1);
+    }
+
+    #[test]
+    fn background_task_zero_max_attempts_is_unlimited() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BG7";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BG8";
+        upsert_orchestrator_session(&store, session_id);
+        let created = create_test_background_task(&store, session_id, task_id, 0);
+        let claimed = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: created.revision,
+                started_at_unix_ms: 10,
+            })
+            .expect("unlimited task should claim");
+        assert_eq!(claimed.attempt_count, 1);
     }
 
     #[test]
@@ -29418,6 +34020,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect_err("second writer must not mutate a leased session");
         match error {
@@ -29755,6 +34359,12 @@ mod tests {
 
         upsert_orchestrator_session(&store, in_progress_session_id);
         start_orchestrator_run(&store, in_progress_session_id, in_progress_run_id);
+        activate_runtime_generation(
+            &store,
+            in_progress_session_id,
+            in_progress_run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
         store
             .update_orchestrator_run_state(in_progress_run_id, RunLifecycleState::InProgress, None)
             .expect("run should enter in_progress");
@@ -29774,6 +34384,12 @@ mod tests {
 
         upsert_orchestrator_session(&store, accepted_session_id);
         start_orchestrator_run(&store, accepted_session_id, accepted_run_id);
+        activate_runtime_generation(
+            &store,
+            accepted_session_id,
+            accepted_run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
 
         upsert_orchestrator_session(&store, done_session_id);
         start_orchestrator_run(&store, done_session_id, done_run_id);
@@ -29796,7 +34412,7 @@ mod tests {
         assert_eq!(in_progress.state, RunLifecycleState::Failed.as_str());
         assert_eq!(in_progress.last_error.as_deref(), Some(reason));
         assert!(in_progress.completed_at_unix_ms.is_some());
-        assert_eq!(in_progress.tape_events, 4);
+        assert_eq!(in_progress.tape_events, 5);
 
         let accepted = store
             .orchestrator_run_status_snapshot(accepted_run_id)
@@ -29805,7 +34421,7 @@ mod tests {
         assert_eq!(accepted.state, RunLifecycleState::Failed.as_str());
         assert_eq!(accepted.last_error.as_deref(), Some(reason));
         assert!(accepted.completed_at_unix_ms.is_some());
-        assert_eq!(accepted.tape_events, 3);
+        assert_eq!(accepted.tape_events, 4);
 
         let done = store
             .orchestrator_run_status_snapshot(done_run_id)
@@ -29819,7 +34435,7 @@ mod tests {
         let terminal = lifecycle.last().expect("startup recovery should append lifecycle event");
         assert_eq!(terminal.from_state, Some(RunLifecyclePhase::Running));
         assert_eq!(terminal.to_state, RunLifecyclePhase::Failed);
-        assert_eq!(terminal.reason, reason);
+        assert_eq!(terminal.reason, "run.recovery.startup_orphaned");
 
         let in_progress_tape = store
             .orchestrator_tape(in_progress_run_id)
@@ -29865,10 +34481,11 @@ mod tests {
         );
         assert_eq!(replay_payload["redaction_level"], "none");
 
-        let recovery =
-            in_progress_tape.last().expect("startup recovery should append a final tape event");
+        let recovery = in_progress_tape
+            .iter()
+            .find(|event| event.event_type == "run.recovery")
+            .expect("startup recovery should append recovery evidence");
         assert_eq!(recovery.seq, 3);
-        assert_eq!(recovery.event_type, "run.recovery");
         let recovery_payload =
             serde_json::from_str::<serde_json::Value>(recovery.payload_json.as_str())
                 .expect("recovery payload should be JSON");
@@ -29888,11 +34505,20 @@ mod tests {
             "block_replay"
         );
         assert_eq!(recovery_payload["reason"], reason);
+        let terminal_status = in_progress_tape.last().expect("terminal status should be last");
+        assert_eq!(terminal_status.seq, 4);
+        assert_eq!(terminal_status.event_type, "status");
+        let terminal_status_payload =
+            serde_json::from_str::<serde_json::Value>(terminal_status.payload_json.as_str())
+                .expect("terminal status should be JSON");
+        assert_eq!(terminal_status_payload["kind"], "failed");
+        assert_eq!(terminal_status_payload["lifecycle_state"], "failed");
+        assert_eq!(terminal_status_payload["reason_code"], "run.recovery.startup_orphaned");
 
         let accepted_tape = store
             .orchestrator_tape(accepted_run_id)
             .expect("accepted recovery tape should be readable");
-        assert_eq!(accepted_tape.len(), 3);
+        assert_eq!(accepted_tape.len(), 4);
         assert_eq!(accepted_tape[0].seq, 0);
         assert_eq!(
             accepted_tape[0].event_type,
@@ -29905,6 +34531,983 @@ mod tests {
         );
         assert_eq!(accepted_tape[2].seq, 2);
         assert_eq!(accepted_tape[2].event_type, "run.recovery");
+        assert_eq!(accepted_tape[3].seq, 3);
+        assert_eq!(accepted_tape[3].event_type, "status");
+
+        let connection = store.connection.lock().expect("connection lock should not be poisoned");
+        for run_id in [in_progress_run_id, accepted_run_id] {
+            let terminal_event_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND terminal = 1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .expect("terminal runtime event should count");
+            let active_generation_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_generation_leases WHERE run_ulid = ?1 AND lane = 'run'",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .expect("active generation should count");
+            assert_eq!(terminal_event_count, 1);
+            assert_eq!(active_generation_count, 0);
+        }
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_orphaned_in_process_background_tasks() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BT1";
+        let summary_task_id = "01ARZ3NDEKTSV4RRFFQ69G5BT2";
+        let reflection_task_id = "01ARZ3NDEKTSV4RRFFQ69G5BT3";
+        let cancel_requested_task_id = "01ARZ3NDEKTSV4RRFFQ69G5BT4";
+        let queued_task_id = "01ARZ3NDEKTSV4RRFFQ69G5BT6";
+        let reason = "daemon startup detected an orphaned in-process background task";
+        upsert_orchestrator_session(&store, session_id);
+
+        for (task_id, task_kind) in [
+            (summary_task_id, AuxiliaryTaskKind::Summary),
+            (reflection_task_id, AuxiliaryTaskKind::PostRunReflection),
+            (cancel_requested_task_id, AuxiliaryTaskKind::Classification),
+            (queued_task_id, AuxiliaryTaskKind::Summary),
+        ] {
+            store
+                .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                    task_id: task_id.to_owned(),
+                    task_kind: task_kind.as_str().to_owned(),
+                    session_id: session_id.to_owned(),
+                    child_session_id: None,
+                    parent_run_id: None,
+                    target_run_id: None,
+                    planned_child_run_id: None,
+                    queued_input_id: None,
+                    owner_principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                    priority: 0,
+                    max_attempts: 1,
+                    budget_tokens: 128,
+                    delegation: None,
+                    cancellation_context: None,
+                    not_before_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    notification_target_json: None,
+                    input_text: Some("test task".to_owned()),
+                    payload_json: None,
+                })
+                .expect("background task should be created");
+        }
+        for task_id in [summary_task_id, reflection_task_id, cancel_requested_task_id] {
+            store
+                .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                    task_id: task_id.to_owned(),
+                    expected_revision: 0,
+                    started_at_unix_ms: 1,
+                })
+                .expect("background task should enter running");
+        }
+        store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: cancel_requested_task_id.to_owned(),
+                expected_revision: 1,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                ..Default::default()
+            })
+            .expect("background task should enter cancel-requested state");
+
+        let report = store
+            .reconcile_orphaned_background_tasks_on_startup(reason)
+            .expect("startup task recovery should succeed");
+        assert_eq!(report.recovered_count, 0);
+        assert_eq!(report.failed_count, 3);
+        assert_eq!(
+            report.failed_task_ids,
+            vec![
+                summary_task_id.to_owned(),
+                reflection_task_id.to_owned(),
+                cancel_requested_task_id.to_owned(),
+            ]
+        );
+
+        for task_id in [summary_task_id, reflection_task_id, cancel_requested_task_id] {
+            let task = store
+                .get_orchestrator_background_task(task_id)
+                .expect("background task should load")
+                .expect("background task should exist");
+            assert_eq!(task.state, AuxiliaryTaskState::Failed.as_str());
+            assert_eq!(task.attempt_count, 1);
+            let expected_revision = if task_id == cancel_requested_task_id { 3 } else { 2 };
+            assert_eq!(task.revision, expected_revision);
+            assert_eq!(task.last_error.as_deref(), Some(reason));
+            assert!(task.completed_at_unix_ms.is_some());
+            let result = serde_json::from_str::<Value>(
+                task.result_json.as_deref().expect("recovery result should persist"),
+            )
+            .expect("recovery result should be JSON");
+            assert_eq!(result["recovery_state"], "manual_retry_required");
+            assert_eq!(result["reason_code"], "background_task.recovery.startup_orphaned");
+            let expected_previous_state = if task_id == cancel_requested_task_id {
+                AuxiliaryTaskState::CancelRequested.as_str()
+            } else {
+                AuxiliaryTaskState::Running.as_str()
+            };
+            assert_eq!(result["previous_state"], expected_previous_state);
+        }
+
+        let queued = store
+            .get_orchestrator_background_task(queued_task_id)
+            .expect("queued task should load")
+            .expect("queued task should exist");
+        assert_eq!(queued.state, AuxiliaryTaskState::Queued.as_str());
+        assert_eq!(queued.attempt_count, 0);
+
+        let second = store
+            .reconcile_orphaned_background_tasks_on_startup(reason)
+            .expect("startup task recovery should be idempotent");
+        assert_eq!(second, OrchestratorStartupBackgroundTaskRecoveryReport::default());
+    }
+
+    #[test]
+    fn startup_recovery_reattaches_unique_terminal_background_child() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BU1";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BU2";
+        let child_run_id = "01ARZ3NDEKTSV4RRFFQ69G5BU3";
+        let reason = "daemon startup detected an orphaned background child";
+        upsert_orchestrator_session(&store, session_id);
+        store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                session_id: session_id.to_owned(),
+                child_session_id: None,
+                parent_run_id: None,
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 2,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("test background child".to_owned()),
+                payload_json: None,
+            })
+            .expect("background task should be created");
+        store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: 0,
+                started_at_unix_ms: 1,
+            })
+            .expect("background task should enter running");
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("background task should load")
+            .expect("background task should exist");
+        start_background_task_child_run(&store, &task, child_run_id);
+        store
+            .update_orchestrator_run_state(child_run_id, RunLifecycleState::Done, None)
+            .expect("child run should complete");
+
+        let report = store
+            .reconcile_orphaned_background_tasks_on_startup(reason)
+            .expect("startup task recovery should succeed");
+        assert_eq!(
+            report,
+            OrchestratorStartupBackgroundTaskRecoveryReport {
+                recovered_count: 1,
+                recovered_task_ids: vec![task_id.to_owned()],
+                failed_count: 0,
+                failed_task_ids: Vec::new(),
+            }
+        );
+        let recovered = store
+            .get_orchestrator_background_task(task_id)
+            .expect("background task should load")
+            .expect("background task should exist");
+        assert_eq!(recovered.state, AuxiliaryTaskState::Succeeded.as_str());
+        assert_eq!(recovered.target_run_id.as_deref(), Some(child_run_id));
+        assert_eq!(recovered.attempt_count, 1);
+        assert_eq!(recovered.revision, 2);
+        assert!(recovered.last_error.is_none());
+        let result = serde_json::from_str::<Value>(
+            recovered.result_json.as_deref().expect("recovery result should persist"),
+        )
+        .expect("recovery result should be JSON");
+        assert_eq!(result["run_id"], child_run_id);
+        assert_eq!(result["child_state"], RunLifecycleState::Done.as_str());
+        assert_eq!(result["recovery_state"], "existing_child_reconciled");
+
+        let second = store
+            .reconcile_orphaned_background_tasks_on_startup(reason)
+            .expect("startup task recovery should be idempotent");
+        assert_eq!(second, OrchestratorStartupBackgroundTaskRecoveryReport::default());
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_ambiguous_background_children() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5BV1";
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5BV2";
+        let child_run_ids = ["01ARZ3NDEKTSV4RRFFQ69G5BV3", "01ARZ3NDEKTSV4RRFFQ69G5BV4"];
+        let reason = "daemon startup detected ambiguous background children";
+        upsert_orchestrator_session(&store, session_id);
+        store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                session_id: session_id.to_owned(),
+                child_session_id: None,
+                parent_run_id: None,
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("test ambiguous children".to_owned()),
+                payload_json: None,
+            })
+            .expect("background task should be created");
+        store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: 0,
+                started_at_unix_ms: 1,
+            })
+            .expect("background task should enter running");
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("background task should load")
+            .expect("background task should exist");
+        for child_run_id in child_run_ids {
+            start_background_task_child_run(&store, &task, child_run_id);
+            store
+                .update_orchestrator_run_state(child_run_id, RunLifecycleState::Done, None)
+                .expect("child run should complete");
+        }
+
+        let report = store
+            .reconcile_orphaned_background_tasks_on_startup(reason)
+            .expect("startup task recovery should fail closed");
+        assert_eq!(report.recovered_count, 0);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.failed_task_ids, vec![task_id.to_owned()]);
+        let failed = store
+            .get_orchestrator_background_task(task_id)
+            .expect("background task should load")
+            .expect("background task should exist");
+        assert_eq!(failed.state, AuxiliaryTaskState::Failed.as_str());
+        assert!(failed.target_run_id.is_none());
+        assert_eq!(failed.last_error.as_deref(), Some(reason));
+        let result = serde_json::from_str::<Value>(
+            failed.result_json.as_deref().expect("recovery result should persist"),
+        )
+        .expect("recovery result should be JSON");
+        assert_eq!(
+            result["reason_code"],
+            "background_task.recovery.attach_window.ambiguous_child_evidence"
+        );
+        assert_eq!(result["candidate_run_ids"], json!(child_run_ids));
+    }
+
+    #[test]
+    fn delegation_cancellation_context_round_trips_and_reopens() {
+        let db_path = temp_db_path();
+        let session_id = "delegation_context_round_trip_session";
+        let parent_run_id = "delegation_context_round_trip_parent";
+        let task_id = "delegation_context_round_trip_task";
+        let expected = {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, parent_run_id);
+            let generation = store
+                .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+                .expect("parent runtime generation should load")
+                .expect("parent runtime generation should be active")
+                .generation;
+            let context = test_child_task_cancellation_context(generation);
+            let created = store
+                .create_orchestrator_background_task(&queued_delegation_request(
+                    session_id,
+                    parent_run_id,
+                    task_id,
+                    Some(context.clone()),
+                ))
+                .expect("delegation task should persist cancellation context");
+            assert_eq!(created.cancellation_context.as_ref(), Some(&context));
+            context
+        };
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let task = reopened
+            .get_orchestrator_background_task(task_id)
+            .expect("delegation task should load")
+            .expect("delegation task should exist");
+        assert_eq!(task.cancellation_context.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn delegated_children_keep_parent_and_sibling_generation_ownership_independent() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let parent_session_id = "delegated_generation_parent_session";
+        let parent_run_id = "delegated_generation_parent_run";
+        upsert_orchestrator_session(&store, parent_session_id);
+        start_orchestrator_run(&store, parent_session_id, parent_run_id);
+        let parent_before = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("parent generation should load")
+            .expect("parent generation should be active");
+
+        let mut child_evidence = Vec::new();
+        for suffix in ["a", "b"] {
+            let task_id = format!("delegated_generation_task_{suffix}");
+            let child_run_id = format!("delegated_generation_child_run_{suffix}");
+            let task = store
+                .create_orchestrator_background_task(&queued_delegation_request(
+                    parent_session_id,
+                    parent_run_id,
+                    task_id.as_str(),
+                    Some(test_child_task_cancellation_context(parent_before.generation)),
+                ))
+                .expect("delegated task should persist");
+            start_background_task_child_run(&store, &task, child_run_id.as_str());
+            let child_generation = store
+                .active_runtime_generation_for_run(
+                    child_run_id.as_str(),
+                    RuntimeGenerationLane::Run,
+                )
+                .expect("child generation should load")
+                .expect("child generation should be active");
+            child_evidence.push((task, child_run_id, child_generation));
+        }
+
+        let parent_after = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("parent generation should reload")
+            .expect("parent generation should remain active");
+        assert_eq!(parent_after.lease_id, parent_before.lease_id);
+        assert_eq!(parent_after.generation, parent_before.generation);
+        assert_ne!(child_evidence[0].0.child_session_id, child_evidence[1].0.child_session_id);
+        assert_ne!(child_evidence[0].2.lease_id, child_evidence[1].2.lease_id);
+        assert_eq!(child_evidence[0].2.generation.get(), 1);
+        assert_eq!(child_evidence[1].2.generation.get(), 1);
+
+        let tasks = store
+            .list_orchestrator_background_tasks(&OrchestratorBackgroundTaskListFilter {
+                owner_principal: None,
+                device_id: None,
+                channel: None,
+                session_id: Some(parent_session_id.to_owned()),
+                include_completed: true,
+                limit: 10,
+            })
+            .expect("parent-scoped delegated tasks should list");
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.session_id == parent_session_id));
+        assert!(tasks.iter().all(|task| task.child_session_id.is_some()));
+        let child_scoped_tasks = store
+            .list_orchestrator_background_tasks(&OrchestratorBackgroundTaskListFilter {
+                owner_principal: None,
+                device_id: None,
+                channel: None,
+                session_id: child_evidence[0].0.child_session_id.clone(),
+                include_completed: true,
+                limit: 10,
+            })
+            .expect("child-scoped delegated task lookup should succeed");
+        assert!(child_scoped_tasks.is_empty());
+    }
+
+    #[test]
+    fn delegation_enqueue_rejects_missing_expired_and_stale_authority() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "delegation_context_reject_session";
+        let parent_run_id = "delegation_context_reject_parent";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, parent_run_id);
+        let generation = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("parent runtime generation should load")
+            .expect("parent runtime generation should be active")
+            .generation;
+
+        let missing_parent = OrchestratorBackgroundTaskCreateRequest {
+            parent_run_id: None,
+            ..queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_missing_parent",
+                Some(test_child_task_cancellation_context(generation)),
+            )
+        };
+        assert!(matches!(
+            store.create_orchestrator_background_task(&missing_parent),
+            Err(JournalError::InvalidArgument(message)) if message.contains("parent run")
+        ));
+
+        let missing_delegation_payload = OrchestratorBackgroundTaskCreateRequest {
+            delegation: None,
+            ..queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_missing_payload",
+                Some(test_child_task_cancellation_context(generation)),
+            )
+        };
+        assert!(matches!(
+            store.create_orchestrator_background_task(&missing_delegation_payload),
+            Err(JournalError::InvalidArgument(message)) if message.contains("must agree")
+        ));
+
+        let missing_cancellation_context = queued_delegation_request(
+            session_id,
+            parent_run_id,
+            "delegation_context_missing_authority",
+            None,
+        );
+        assert!(matches!(
+            store.create_orchestrator_background_task(&missing_cancellation_context),
+            Err(JournalError::InvalidArgument(message)) if message.contains("must agree")
+        ));
+
+        let alias_task = OrchestratorBackgroundTaskCreateRequest {
+            task_id: "delegation_context_alias_kind".to_owned(),
+            task_kind: "auxiliary_summary".to_owned(),
+            session_id: session_id.to_owned(),
+            child_session_id: None,
+            parent_run_id: None,
+            target_run_id: None,
+            planned_child_run_id: None,
+            queued_input_id: None,
+            owner_principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+            priority: 0,
+            max_attempts: 1,
+            budget_tokens: 128,
+            delegation: None,
+            cancellation_context: None,
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some("alias task".to_owned()),
+            payload_json: None,
+        };
+        let alias_task = store
+            .create_orchestrator_background_task(&alias_task)
+            .expect("recognized task-kind aliases should canonicalize");
+        assert_eq!(alias_task.task_kind, AuxiliaryTaskKind::Summary.as_str());
+
+        let unexpected_delegation_payload = OrchestratorBackgroundTaskCreateRequest {
+            task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+            cancellation_context: None,
+            ..queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_unexpected_payload",
+                None,
+            )
+        };
+        assert!(matches!(
+            store.create_orchestrator_background_task(&unexpected_delegation_payload),
+            Err(JournalError::InvalidArgument(message)) if message.contains("must agree")
+        ));
+
+        let unexpected_cancellation_context = OrchestratorBackgroundTaskCreateRequest {
+            task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+            delegation: None,
+            ..queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_unexpected_authority",
+                Some(test_child_task_cancellation_context(generation)),
+            )
+        };
+        assert!(matches!(
+            store.create_orchestrator_background_task(&unexpected_cancellation_context),
+            Err(JournalError::InvalidArgument(message)) if message.contains("must agree")
+        ));
+
+        let unknown_task_kind = OrchestratorBackgroundTaskCreateRequest {
+            task_kind: "future_auxiliary_kind".to_owned(),
+            delegation: None,
+            cancellation_context: None,
+            ..queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_unknown_kind",
+                None,
+            )
+        };
+        assert!(matches!(
+            store.create_orchestrator_background_task(&unknown_task_kind),
+            Err(JournalError::InvalidArgument(message)) if message.contains("unsupported")
+        ));
+
+        let mut expired = test_child_task_cancellation_context(generation);
+        expired.deadline_unix_ms = Some(0);
+        assert!(matches!(
+            store.create_orchestrator_background_task(&queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_expired",
+                Some(expired),
+            )),
+            Err(JournalError::InvalidArgument(message)) if message.contains("no longer permits")
+        ));
+
+        let stale_generation = RuntimeGeneration::new(generation.get().saturating_add(1))
+            .expect("stale generation should remain valid");
+        assert!(matches!(
+            store.create_orchestrator_background_task(&queued_delegation_request(
+                session_id,
+                parent_run_id,
+                "delegation_context_stale",
+                Some(test_child_task_cancellation_context(stale_generation)),
+            )),
+            Err(JournalError::InvalidArgument(message)) if message.contains("stale")
+        ));
+        for task_id in [
+            "delegation_context_missing_parent",
+            "delegation_context_missing_payload",
+            "delegation_context_missing_authority",
+            "delegation_context_unexpected_payload",
+            "delegation_context_unexpected_authority",
+            "delegation_context_unknown_kind",
+            "delegation_context_expired",
+            "delegation_context_stale",
+        ] {
+            assert!(store
+                .get_orchestrator_background_task(task_id)
+                .expect("rejected task lookup should succeed")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_child_resolution_attaches_nonterminal_delegated_child() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_nonterminal_session";
+        let task_id = "runtime_child_nonterminal_task";
+        let run_id = "runtime_child_nonterminal_run";
+        upsert_orchestrator_session(&store, session_id);
+        let task = create_running_delegation_task(&store, session_id, task_id, None);
+        start_background_task_child_run(&store, &task, run_id);
+
+        let resolution = store
+            .resolve_background_task_child(task_id, AuxiliaryTaskState::Running.as_str(), None)
+            .expect("runtime child resolution should succeed");
+        let BackgroundTaskChildResolution::Resolved { task, run, reconciled_terminal } = resolution
+        else {
+            panic!("unique child should resolve");
+        };
+        assert!(!reconciled_terminal);
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(run.state, RunLifecycleState::Accepted.as_str());
+        assert_eq!(task.state, AuxiliaryTaskState::Running.as_str());
+        assert_eq!(task.target_run_id.as_deref(), Some(run_id));
+        assert_eq!(task.attempt_count, 1);
+        assert_eq!(task.revision, 2);
+        assert!(task.result_json.is_none());
+        assert!(task.completed_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn runtime_child_attachment_preserves_pending_cancellation() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_cancel_attach_session";
+        let task_id = "runtime_child_cancel_attach_task";
+        let run_id = "runtime_child_cancel_attach_run";
+        upsert_orchestrator_session(&store, session_id);
+        let task = create_running_delegation_task(&store, session_id, task_id, Some(run_id));
+        store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: task.revision,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                last_error: Some(Some("interrupt arrived during child attachment".to_owned())),
+                ..Default::default()
+            })
+            .expect("delegated task should record pending cancellation");
+        start_background_task_child_run(&store, &task, run_id);
+
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("delegated task should load")
+            .expect("delegated task should exist");
+        let resolution = store
+            .attach_background_task_child(task_id, run_id, task.execution_generation)
+            .expect("exact child should attach while cancellation is pending");
+        let BackgroundTaskChildResolution::Resolved { task, run, reconciled_terminal } = resolution
+        else {
+            panic!("pending-cancel child should resolve");
+        };
+        assert!(!reconciled_terminal);
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(task.state, AuxiliaryTaskState::CancelRequested.as_str());
+        assert_eq!(task.target_run_id.as_deref(), Some(run_id));
+        assert_eq!(task.planned_child_run_id.as_deref(), Some(run_id));
+        assert_eq!(task.revision, 3);
+        assert_eq!(task.last_error.as_deref(), Some("interrupt arrived during child attachment"));
+    }
+
+    #[test]
+    fn runtime_child_resolution_reconciles_terminal_delegated_child() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_terminal_session";
+        let task_id = "runtime_child_terminal_task";
+        let run_id = "runtime_child_terminal_run";
+        upsert_orchestrator_session(&store, session_id);
+        let task = create_running_delegation_task(&store, session_id, task_id, None);
+        start_background_task_child_run(&store, &task, run_id);
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+            .expect("child run should complete");
+
+        let resolution = store
+            .resolve_background_task_child(task_id, AuxiliaryTaskState::Running.as_str(), None)
+            .expect("terminal child resolution should succeed");
+        let BackgroundTaskChildResolution::Resolved { task, run, reconciled_terminal } = resolution
+        else {
+            panic!("terminal child should resolve");
+        };
+        assert!(reconciled_terminal);
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(task.state, AuxiliaryTaskState::Succeeded.as_str());
+        assert_eq!(task.target_run_id.as_deref(), Some(run_id));
+        assert_eq!(task.revision, 2);
+        let result = serde_json::from_str::<Value>(
+            task.result_json.as_deref().expect("resolution evidence should persist"),
+        )
+        .expect("resolution evidence should be JSON");
+        assert_eq!(result["recovery"], "runtime_child_resolution");
+        assert_eq!(result["reason_code"], "background_task.runtime.existing_child_reconciled");
+    }
+
+    #[test]
+    fn runtime_child_reconciliation_preserves_cancellation_precedence() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_cancel_terminal_session";
+        let task_id = "runtime_child_cancel_terminal_task";
+        let run_id = "runtime_child_cancel_terminal_run";
+        upsert_orchestrator_session(&store, session_id);
+        let task = create_running_delegation_task(&store, session_id, task_id, None);
+        start_background_task_child_run(&store, &task, run_id);
+        let cancel_requested = store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: task.revision,
+                state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                last_error: Some(Some("cancelled during child run".to_owned())),
+                ..Default::default()
+            })
+            .expect("task should enter cancel-requested state");
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+            .expect("child run should complete");
+
+        let resolution = store
+            .resolve_background_task_child(
+                task_id,
+                AuxiliaryTaskState::CancelRequested.as_str(),
+                None,
+            )
+            .expect("terminal child resolution should succeed");
+        let BackgroundTaskChildResolution::Resolved { task, reconciled_terminal, .. } = resolution
+        else {
+            panic!("terminal child should resolve");
+        };
+        assert!(reconciled_terminal);
+        assert_eq!(task.state, AuxiliaryTaskState::Cancelled.as_str());
+        assert_eq!(task.revision, cancel_requested.revision + 1);
+        let result = serde_json::from_str::<Value>(
+            task.result_json.as_deref().expect("resolution evidence should persist"),
+        )
+        .expect("resolution evidence should be JSON");
+        assert_eq!(result["child_state"], RunLifecycleState::Done.as_str());
+    }
+
+    #[test]
+    fn runtime_child_resolution_fails_closed_for_mismatch_and_ambiguity() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_fail_closed_session";
+        let task_id = "runtime_child_fail_closed_task";
+        let first_run_id = "runtime_child_fail_closed_run_a";
+        let second_run_id = "runtime_child_fail_closed_run_b";
+        upsert_orchestrator_session(&store, session_id);
+        let task = create_running_delegation_task(&store, session_id, task_id, None);
+        for run_id in [first_run_id, second_run_id] {
+            start_background_task_child_run(&store, &task, run_id);
+        }
+
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "unrelated-existing-run".to_owned(),
+                session_id: session_id.to_owned(),
+                origin_kind: "background".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: None,
+                parameter_delta_json: None,
+
+                delegated_admission: None,
+            })
+            .expect("unrelated background run should be created");
+        let mismatched = store
+            .resolve_background_task_child(
+                task_id,
+                AuxiliaryTaskState::Running.as_str(),
+                Some("unrelated-existing-run"),
+            )
+            .expect("mismatched exact run should fail closed");
+        assert!(matches!(
+            mismatched,
+            BackgroundTaskChildResolution::Mismatched {
+                ref requested_run_id,
+                ..
+            } if requested_run_id == "unrelated-existing-run"
+        ));
+
+        let ambiguous = store
+            .resolve_background_task_child(task_id, AuxiliaryTaskState::Running.as_str(), None)
+            .expect("ambiguous evidence should be returned fail-closed");
+        assert!(matches!(
+            ambiguous,
+            BackgroundTaskChildResolution::Ambiguous { ref candidate_run_ids, .. }
+                if candidate_run_ids == &vec![first_run_id.to_owned(), second_run_id.to_owned()]
+        ));
+        let unchanged = store
+            .get_orchestrator_background_task(task_id)
+            .expect("delegated task should load")
+            .expect("delegated task should exist");
+        assert!(unchanged.target_run_id.is_none());
+        assert_eq!(unchanged.state, AuxiliaryTaskState::Running.as_str());
+    }
+
+    #[test]
+    fn runtime_child_resolution_preserves_preallocated_missing_target() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "runtime_child_preallocated_session";
+        let task_id = "runtime_child_preallocated_task";
+        let run_id = "runtime_child_preallocated_run";
+        upsert_orchestrator_session(&store, session_id);
+        create_running_delegation_task(&store, session_id, task_id, Some(run_id));
+
+        let resolution = store
+            .resolve_background_task_child(
+                task_id,
+                AuxiliaryTaskState::Running.as_str(),
+                Some(run_id),
+            )
+            .expect("preallocated target should remain pending");
+        assert!(matches!(
+            resolution,
+            BackgroundTaskChildResolution::NoChild {
+                expected_run_id: Some(ref expected),
+                ..
+            } if expected == run_id
+        ));
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("preallocated task should load")
+            .expect("preallocated task should exist");
+        assert!(task.target_run_id.is_none());
+        assert_eq!(task.planned_child_run_id.as_deref(), Some(run_id));
+    }
+
+    #[test]
+    fn retry_reconciliation_reattaches_terminal_child_and_blocks_nonterminal_or_ambiguous_evidence()
+    {
+        for (suffix, states, expected_message) in [
+            ("terminal", vec![RunLifecycleState::Done], None),
+            ("nonterminal", vec![RunLifecycleState::Accepted], Some("existing nonterminal child")),
+            (
+                "ambiguous",
+                vec![RunLifecycleState::Done, RunLifecycleState::Failed],
+                Some("ambiguous child evidence"),
+            ),
+        ] {
+            let db_path = temp_db_path();
+            let store = JournalStore::open(test_journal_config(db_path, false))
+                .expect("journal store should open");
+            let session_id = format!("retry_{suffix}_session");
+            let task_id = format!("retry_{suffix}_task");
+            upsert_orchestrator_session(&store, session_id.as_str());
+            store
+                .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                    task_id: task_id.clone(),
+                    task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                    session_id: session_id.clone(),
+                    child_session_id: None,
+                    parent_run_id: None,
+                    target_run_id: None,
+                    planned_child_run_id: None,
+                    queued_input_id: None,
+                    owner_principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                    priority: 0,
+                    max_attempts: 3,
+                    budget_tokens: 128,
+                    delegation: None,
+                    cancellation_context: None,
+                    not_before_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    notification_target_json: None,
+                    input_text: Some("test retry reconciliation".to_owned()),
+                    payload_json: None,
+                })
+                .expect("background task should be created");
+            store
+                .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                    task_id: task_id.clone(),
+                    expected_revision: 0,
+                    started_at_unix_ms: 1,
+                })
+                .expect("background task should enter running");
+            let task = store
+                .get_orchestrator_background_task(task_id.as_str())
+                .expect("background task should load")
+                .expect("background task should exist");
+            for (index, state) in states.into_iter().enumerate() {
+                let run_id = format!("retry_{suffix}_child_{index}");
+                start_background_task_child_run(&store, &task, run_id.as_str());
+                if state != RunLifecycleState::Accepted {
+                    store
+                        .update_orchestrator_run_state(run_id.as_str(), state, None)
+                        .expect("child run state should update");
+                }
+            }
+            store
+                .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                    task_id: task_id.clone(),
+                    expected_revision: task.revision,
+                    state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                    last_error: Some(Some("dispatch outcome was not persisted".to_owned())),
+                    completed_at_unix_ms: Some(Some(2)),
+                    ..Default::default()
+                })
+                .expect("background task should fail before retry reconciliation");
+
+            let result = store.reconcile_background_task_before_retry(
+                task_id.as_str(),
+                AuxiliaryTaskState::Failed.as_str(),
+            );
+            if let Some(expected_message) = expected_message {
+                let error = result.expect_err("retry reconciliation should fail closed");
+                assert!(
+                    matches!(error, JournalError::InvalidArgument(ref message) if message.contains(expected_message)),
+                    "unexpected retry reconciliation error: {error}"
+                );
+                let unchanged = store
+                    .get_orchestrator_background_task(task_id.as_str())
+                    .expect("background task should load")
+                    .expect("background task should exist");
+                assert_eq!(unchanged.state, AuxiliaryTaskState::Failed.as_str());
+                assert!(unchanged.target_run_id.is_none());
+            } else {
+                let recovered = result
+                    .expect("retry reconciliation should succeed")
+                    .expect("terminal child should reconcile");
+                assert_eq!(recovered.state, AuxiliaryTaskState::Succeeded.as_str());
+                assert_eq!(recovered.attempt_count, 1);
+                assert!(recovered.target_run_id.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn retry_reconciliation_allows_retry_when_no_child_evidence_exists() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "retry_no_child_session";
+        let task_id = "retry_no_child_task";
+        upsert_orchestrator_session(&store, session_id);
+        store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.to_owned(),
+                task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                session_id: session_id.to_owned(),
+                child_session_id: None,
+                parent_run_id: None,
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("test retry without child".to_owned()),
+                payload_json: None,
+            })
+            .expect("background task should be created");
+        store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: 0,
+                started_at_unix_ms: 1,
+            })
+            .expect("background task should enter running");
+        store
+            .update_orchestrator_background_task(&OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task_id.to_owned(),
+                expected_revision: 1,
+                state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                last_error: Some(Some("dispatch failed before child creation".to_owned())),
+                completed_at_unix_ms: Some(Some(2)),
+                ..Default::default()
+            })
+            .expect("background task should fail");
+
+        assert!(store
+            .reconcile_background_task_before_retry(task_id, AuxiliaryTaskState::Failed.as_str(),)
+            .expect("retry reconciliation should succeed")
+            .is_none());
     }
 
     #[test]
@@ -30202,6 +35805,175 @@ mod tests {
             hash_chain_enabled,
             max_payload_bytes: 256 * 1024,
             max_events: 10_000,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileMutationSnapshot {
+        exists: bool,
+        bytes: Option<Vec<u8>>,
+        sha256: Option<String>,
+        size: Option<u64>,
+        modified: Option<SystemTime>,
+        created: Option<SystemTime>,
+    }
+
+    impl FileMutationSnapshot {
+        fn capture(path: &Path) -> Self {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    let metadata = fs::metadata(path).expect("snapshot metadata should load");
+                    Self {
+                        exists: true,
+                        sha256: Some(sha256_hex(&bytes)),
+                        size: Some(metadata.len()),
+                        modified: metadata.modified().ok(),
+                        created: metadata.created().ok(),
+                        bytes: Some(bytes),
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
+                    exists: false,
+                    bytes: None,
+                    sha256: None,
+                    size: None,
+                    modified: None,
+                    created: None,
+                },
+                Err(error) => panic!("snapshot file should be readable: {error}"),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SqliteMutationSnapshot {
+        database: FileMutationSnapshot,
+        wal: FileMutationSnapshot,
+        shm: FileMutationSnapshot,
+    }
+
+    impl SqliteMutationSnapshot {
+        fn capture(database_path: &Path) -> Self {
+            Self {
+                database: FileMutationSnapshot::capture(database_path),
+                wal: FileMutationSnapshot::capture(
+                    super::sqlite_sidecar_path(database_path, "-wal").as_path(),
+                ),
+                shm: FileMutationSnapshot::capture(
+                    super::sqlite_sidecar_path(database_path, "-shm").as_path(),
+                ),
+            }
+        }
+    }
+
+    fn runtime_state_quarantine_count(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COUNT(*) FROM runtime_state_quarantine", [], |row| row.get(0))
+            .expect("runtime state quarantine should be queryable")
+    }
+
+    fn seed_networked_worker_dispatch_authority(
+        store: &JournalStore,
+        worker_id: &str,
+        run_id: &str,
+        now_unix_ms: i64,
+    ) -> palyra_workerd::WorkerLease {
+        let attestation = palyra_workerd::WorkerAttestation {
+            worker_id: worker_id.to_owned(),
+            image_digest_sha256: "a".repeat(64),
+            build_digest_sha256: "b".repeat(64),
+            artifact_digest_sha256: "c".repeat(64),
+            egress_proxy_attested: true,
+            supported_capabilities: vec!["tool:palyra.echo".to_owned()],
+            capability_authority_sha256: None,
+            sdk_protocol_version: 1,
+            wit_abi_version: "palyra-worker-abi/v1".to_owned(),
+            heartbeat_unix_ms: now_unix_ms,
+            issued_at_unix_ms: now_unix_ms.saturating_sub(1),
+            expires_at_unix_ms: now_unix_ms.saturating_add(60_000),
+        };
+        let policy = palyra_workerd::WorkerFleetPolicy::default();
+        let mut fleet = palyra_workerd::WorkerFleetManager::default();
+        fleet.register_worker(attestation, &policy, now_unix_ms).expect("worker should register");
+        let (lease, _) = fleet
+            .assign_work(
+                worker_id,
+                palyra_workerd::WorkerLeaseRequest {
+                    run_id: run_id.to_owned(),
+                    ttl_ms: 30_000,
+                    required_capabilities: vec!["tool:palyra.echo".to_owned()],
+                    workspace_scope: palyra_workerd::WorkerWorkspaceScope {
+                        workspace_root: "C:/workspace".to_owned(),
+                        allowed_paths: vec!["src".to_owned()],
+                        read_only: true,
+                    },
+                    artifact_transport: palyra_workerd::WorkerArtifactTransport {
+                        input_manifest_sha256: "d".repeat(64),
+                        output_manifest_sha256: "e".repeat(64),
+                        log_stream_id: format!("logs/{run_id}"),
+                        scratch_directory_id: format!("scratch/{run_id}"),
+                    },
+                    grant: palyra_workerd::WorkerRunGrant {
+                        grant_id: format!("grant-{run_id}"),
+                        run_id: run_id.to_owned(),
+                        tool_name: "palyra.echo".to_owned(),
+                        expires_at_unix_ms: now_unix_ms.saturating_add(30_000),
+                    },
+                },
+                &policy,
+                now_unix_ms,
+            )
+            .expect("worker lease should assign");
+        store
+            .commit_networked_worker_lifecycle_with_revocations(
+                &[NetworkedWorkerLifecycleCommit {
+                    request: JournalAppendRequest {
+                        event_id: format!("worker-test-authority:{}", Ulid::new()),
+                        session_id: format!("session-{run_id}"),
+                        run_id: run_id.to_owned(),
+                        kind: 0,
+                        actor: 0,
+                        timestamp_unix_ms: now_unix_ms,
+                        payload_json: b"{}".to_vec(),
+                        principal: "system:test".to_owned(),
+                        device_id: "test".to_owned(),
+                        channel: Some("test".to_owned()),
+                    },
+                    event: palyra_workerd::WorkerLifecycleEvent {
+                        worker_id: worker_id.to_owned(),
+                        state: palyra_common::runtime_contracts::WorkerLifecycleState::Assigned,
+                        run_id: Some(run_id.to_owned()),
+                        lease_id: Some(lease.lease_id.clone()),
+                        reason_code: "worker.assigned".to_owned(),
+                        timestamp_unix_ms: now_unix_ms,
+                    },
+                }],
+                &fleet.durable_records(),
+                0,
+                NETWORKED_WORKER_FLEET_MAX_ENTRIES,
+                now_unix_ms,
+                &[],
+                None,
+            )
+            .expect("worker fleet authority should persist");
+        lease
+    }
+
+    fn dispatch_claim_request(
+        lease: &palyra_workerd::WorkerLease,
+        remote_request_id: &str,
+        node_request_id: &str,
+        payload_label: &str,
+    ) -> NetworkedWorkerDispatchClaimCreateRequest {
+        NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.to_owned(),
+            node_request_id: node_request_id.to_owned(),
+            worker_id: lease.worker_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            run_id: lease.run_id.clone(),
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: sha256_hex(payload_label.as_bytes()),
         }
     }
 
@@ -31073,6 +36845,7751 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_inspection_is_read_only_before_transactional_migration() {
+        let db_path = temp_db_path();
+        let latest_version = MIGRATIONS.last().expect("migrations should not be empty").version;
+        let legacy_version = latest_version.saturating_sub(1);
+        create_journal_fixture_through(&db_path, legacy_version);
+        let storage_before = SqliteMutationSnapshot::capture(&db_path);
+
+        let inspection = JournalStore::inspect_runtime_state_read_only(&test_journal_config(
+            db_path.clone(),
+            false,
+        ))
+        .expect("legacy journal should be inspectable without writes");
+        assert_eq!(inspection.admission, RuntimeStateAdmissionPosture::ReadOnly);
+        assert!(inspection.permits_offline_inspection());
+        assert!(inspection.permits_writable_migration());
+        assert_eq!(inspection.findings.len(), 1);
+        let finding = &inspection.findings[0];
+        assert_eq!(finding.contract, "schema_migrations");
+        assert_eq!(finding.observed_schema_version, u32::try_from(legacy_version).ok());
+        assert_eq!(finding.outcome, RuntimeStateCompatibilityOutcome::ReadableLegacy);
+        assert_eq!(
+            SqliteMutationSnapshot::capture(&db_path),
+            storage_before,
+            "offline legacy inspection must not mutate database or sidecar state"
+        );
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("known legacy journal should migrate under the writable transaction");
+        let startup = store.startup_runtime_state_compatibility_report();
+        assert_eq!(startup.admission, RuntimeStateAdmissionPosture::Ready);
+        assert_eq!(startup.findings.len(), 1);
+        assert_eq!(startup.findings[0].outcome, RuntimeStateCompatibilityOutcome::Migrated);
+        assert_eq!(
+            startup.findings[0].reason_code,
+            "runtime.compatibility.journal_schema_migrated"
+        );
+        let connection = Connection::open(db_path).expect("migrated journal should reopen");
+        let stored_version: i64 = connection
+            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("latest migrated version should load");
+        assert_eq!(stored_version, latest_version);
+    }
+
+    #[test]
+    fn future_schema_migration_version_blocks_without_mutation() {
+        let db_path = temp_db_path();
+        {
+            let _store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+        }
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("future-schema fixture should retain WAL evidence");
+        let future_version =
+            MIGRATIONS.last().expect("migrations should not be empty").version.saturating_add(1);
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_unix_ms) VALUES (?1, 'future', 1)",
+                params![future_version],
+            )
+            .expect("future migration marker should insert");
+        let quarantine_before = runtime_state_quarantine_count(&connection);
+        let storage_before = SqliteMutationSnapshot::capture(&db_path);
+        assert!(storage_before.database.exists);
+        assert!(storage_before.wal.exists);
+        assert!(storage_before.shm.exists);
+
+        let preflight = JournalStore::inspect_runtime_state_read_only(&test_journal_config(
+            db_path.clone(),
+            false,
+        ))
+        .expect("read-only compatibility preflight should inspect WAL state");
+        assert_eq!(preflight.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(preflight.findings.len(), 1);
+        let finding = &preflight.findings[0];
+        assert_eq!(finding.contract, "schema_migrations");
+        assert_eq!(finding.observed_schema_version, u32::try_from(future_version).ok());
+        assert_eq!(
+            finding.supported_schema_version,
+            u32::try_from(future_version.saturating_sub(1))
+                .expect("supported migration version should fit u32")
+        );
+        assert_eq!(finding.outcome, RuntimeStateCompatibilityOutcome::BlockedNewerSchema);
+        assert_eq!(finding.reason_code, "runtime.compatibility.newer_journal_schema");
+
+        let error = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect_err("future schema must block downgraded writer");
+        let JournalError::RuntimeStateCompatibilityBlocked { report } = error else {
+            panic!("future schema should return a structured compatibility blocker");
+        };
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(
+            report.findings.first().map(|finding| finding.observed_schema_version),
+            Some(u32::try_from(future_version).ok())
+        );
+
+        let storage_after = SqliteMutationSnapshot::capture(&db_path);
+        assert_eq!(
+            storage_after, storage_before,
+            "preflight and rejected writable open must preserve database, WAL, and SHM bytes, hashes, sizes, and timestamps"
+        );
+        assert_eq!(runtime_state_quarantine_count(&connection), quarantine_before);
+        let marker_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![future_version],
+                |row| row.get(0),
+            )
+            .expect("future marker should remain");
+        assert_eq!(marker_count, 1);
+    }
+
+    #[test]
+    fn compatibility_snapshot_source_state_detects_wal_mutation() {
+        let db_path = temp_db_path();
+        {
+            let _store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+        }
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA wal_autocheckpoint = 0;
+                    CREATE TABLE compatibility_snapshot_probe (
+                        sequence INTEGER PRIMARY KEY
+                    );
+                    INSERT INTO compatibility_snapshot_probe(sequence) VALUES (1);
+                "#,
+            )
+            .expect("initial WAL fixture should persist");
+        let before =
+            super::journal_snapshot_source_state(&db_path).expect("source metadata should load");
+        assert!(before.wal.is_some());
+
+        connection
+            .execute("INSERT INTO compatibility_snapshot_probe(sequence) VALUES (2)", [])
+            .expect("WAL mutation should persist");
+        let after = super::journal_snapshot_source_state(&db_path)
+            .expect("mutated source metadata should load");
+
+        assert_ne!(
+            after, before,
+            "the stable-copy loop must observe a source WAL that advances between copy boundaries"
+        );
+    }
+
+    #[test]
+    fn compatibility_preflight_does_not_create_missing_storage() {
+        let root = tempfile::tempdir().expect("test root should create");
+        let missing_parent = root.path().join("missing").join("nested");
+        let db_path = missing_parent.join("journal.sqlite3");
+        assert!(!missing_parent.exists());
+
+        let report = JournalStore::inspect_runtime_state_read_only(&test_journal_config(
+            db_path.clone(),
+            false,
+        ))
+        .expect("missing journal should be compatible without creation");
+
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(report.findings.is_empty());
+        assert!(!missing_parent.exists());
+        assert!(!db_path.exists());
+        assert!(!super::sqlite_sidecar_path(&db_path, "-wal").exists());
+        assert!(!super::sqlite_sidecar_path(&db_path, "-shm").exists());
+    }
+
+    fn activate_runtime_generation(
+        store: &JournalStore,
+        session_id: &str,
+        run_id: &str,
+        transition_kind: RuntimeGenerationTransitionKind,
+    ) -> palyra_common::runtime_contracts::GenerationLeaseV1 {
+        store
+            .activate_runtime_generation(&RuntimeGenerationActivateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                lane: RuntimeGenerationLane::Run,
+                owner: "journal-test".to_owned(),
+                ttl_ms: 60_000,
+                transition_kind,
+                reason_code: "runtime.generation.test".to_owned(),
+            })
+            .expect("runtime generation should activate")
+    }
+
+    fn runtime_event(
+        session_id: &str,
+        run_id: &str,
+        generation: RuntimeGeneration,
+        sequence: u64,
+        event_name: RuntimeEventName,
+    ) -> RuntimeEventEnvelopeV2 {
+        let (identities, legacy_identity_adapter) =
+            palyra_common::runtime_contracts::RuntimeIdentitySetV1::from_legacy_run(
+                session_id, run_id, generation,
+            )
+            .expect("legacy runtime identities should adapt");
+        let descriptor = event_name.descriptor();
+        let mut envelope = RuntimeEventEnvelopeV2 {
+            schema_version: 2,
+            event_id: RuntimeEventId::parse(format!("event_{generation}_{sequence}").as_str())
+                .expect("event id should validate"),
+            identities,
+            sequence,
+            causal_parent_event_id: None,
+            subsystem: descriptor.subsystem,
+            phase: descriptor.phase,
+            event_name,
+            reason_code: "runtime.event.test".to_owned(),
+            actor_kind: descriptor.actor_kind,
+            retryability: descriptor.retryability,
+            redaction_class: descriptor.redaction_class,
+            terminal: descriptor.terminal,
+            payload: RuntimeEventPayloadRef::Inline { metadata: json!({"test": true}) },
+            occurred_at_unix_ms: 1,
+            extensions: std::collections::BTreeMap::new(),
+        };
+        envelope
+            .record_legacy_identity_adapter(legacy_identity_adapter)
+            .expect("legacy adapter should record");
+        envelope
+    }
+
+    fn runtime_side_effect_fence() -> SideEffectFenceV1 {
+        SideEffectFenceV1 {
+            schema_version: 1,
+            operation_id: RuntimeOperationId::parse("operation_journal_test")
+                .expect("operation id should validate"),
+            tool_execution_id: RuntimeToolExecutionId::parse("execution_journal_test")
+                .expect("tool execution id should validate"),
+            intent_generation: RuntimeGeneration::new(1).expect("generation should validate"),
+            observed_generation: RuntimeGeneration::new(1).expect("generation should validate"),
+            intent_sha256: "a".repeat(64),
+            state: SideEffectFenceState::IntentRecorded,
+            semantics: ToolExecutionSemantics {
+                schema_version: 1,
+                tool_name: "palyra.fs.apply_patch".to_owned(),
+                idempotency_class: RuntimeIdempotencyClass::ReconciliableMutation,
+                restart_policy: SideEffectRestartPolicy::ReconcileBeforeRetry,
+                reconciliation_strategy: ReconciliationStrategy::WorkspaceDigest,
+                external_idempotency_key_required: false,
+            },
+            external_idempotency_key_sha256: None,
+            evidence_sha256: None,
+            reason_code: "tool.effect.intent_recorded".to_owned(),
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn create_journal_fixture_through(db_path: &Path, max_version: i64) {
+        let mut connection = Connection::open(db_path).expect("journal db should open");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("baseline migration transaction should open");
+        transaction
+            .execute_batch(
+                r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    )
+                "#,
+            )
+            .expect("baseline migration table should be created");
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= max_version) {
+            transaction.execute_batch(migration.sql).expect("baseline migration should apply");
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, 0)",
+                    params![migration.version, migration.name],
+                )
+                .expect("baseline migration marker should persist");
+        }
+        transaction.commit().expect("baseline fixture should commit");
+    }
+
+    fn create_v44_journal_fixture(db_path: &Path) {
+        create_journal_fixture_through(db_path, 44);
+    }
+
+    const PRE_V2_V44_FIXTURE_NAME: &str = "pre_v2_v44.sql";
+    const PRE_V2_V44_FIXTURE_SQL: &str =
+        include_str!("../../../fixtures/golden/journal_migrations/pre_v2_v44.sql");
+    const PRE_V2_V44_FIXTURE_MANIFEST: &str =
+        include_str!("../../../fixtures/golden/journal_migrations/pre_v2_v44.sha256");
+
+    fn materialize_pre_v2_v44_golden_fixture(db_path: &Path) {
+        let manifest_line = PRE_V2_V44_FIXTURE_MANIFEST
+            .strip_suffix('\n')
+            .expect("golden migration manifest should end with one LF");
+        assert!(
+            !manifest_line.contains('\r') && !manifest_line.contains('\n'),
+            "golden migration manifest should contain exactly one LF-terminated line"
+        );
+        let (expected_sha256, fixture_name) = manifest_line
+            .split_once("  ")
+            .expect("golden migration manifest should use sha256sum format");
+        assert_eq!(fixture_name, PRE_V2_V44_FIXTURE_NAME);
+        assert_eq!(expected_sha256.len(), 64);
+        assert!(expected_sha256
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f')));
+        assert_eq!(
+            sha256_hex(PRE_V2_V44_FIXTURE_SQL.as_bytes()),
+            expected_sha256,
+            "golden migration fixture drift requires an intentional manifest review"
+        );
+
+        let connection =
+            Connection::open(db_path).expect("pre-V2 golden journal fixture should materialize");
+        connection
+            .execute_batch(PRE_V2_V44_FIXTURE_SQL)
+            .expect("pre-V2 golden journal SQL should execute");
+        let (latest_version, applied_count): (i64, i64) = connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0), COUNT(*) FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("pre-V2 migration markers should load");
+        assert_eq!((latest_version, applied_count), (44, 44));
+        let shared_v2_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'runtime_generation_leases'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pre-V2 table inventory should load");
+        assert_eq!(shared_v2_table_count, 0);
+    }
+
+    fn schema_migration_rows(connection: &Connection) -> Vec<(i64, String, i64)> {
+        connection
+            .prepare(
+                "SELECT version, name, applied_at_unix_ms FROM schema_migrations ORDER BY version",
+            )
+            .expect("migration marker query should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("migration markers should query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration markers should decode")
+    }
+
+    fn table_has_column(connection: &Connection, table: &str, column: &str) -> bool {
+        connection
+            .prepare(format!("PRAGMA table_info({table})").as_str())
+            .expect("table metadata query should prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("table metadata should query")
+            .filter_map(Result::ok)
+            .any(|candidate| candidate == column)
+    }
+
+    #[test]
+    fn pre_v2_golden_migration_acceptance() {
+        let fixture_root = tempfile::tempdir().expect("golden migration test root should create");
+        let db_path = fixture_root.path().join("pre-v2-v44.sqlite3");
+        materialize_pre_v2_v44_golden_fixture(&db_path);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut startup_workers = Vec::new();
+        for _ in 0..2 {
+            let worker_path = db_path.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            startup_workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                JournalStore::open(test_journal_config(worker_path, false))
+                    .expect("concurrent startup should serialize migration ownership")
+            }));
+        }
+        barrier.wait();
+        for worker in startup_workers {
+            drop(worker.join().expect("migration startup worker should not panic"));
+        }
+
+        let connection = Connection::open(&db_path).expect("upgraded golden journal should reopen");
+        let latest_version = MIGRATIONS.last().expect("migrations should not be empty").version;
+        for migration in MIGRATIONS {
+            let applied: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1 AND name = ?2",
+                    params![migration.version, migration.name],
+                    |row| row.get(0),
+                )
+                .expect("migration marker should load");
+            assert_eq!(applied, 1, "migration v{} should apply exactly once", migration.version);
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row
+                    .get::<_, i64>(0),)
+                .expect("latest migration should load"),
+            latest_version
+        );
+        for table in [
+            "runtime_generation_leases",
+            "runtime_generation_events",
+            "runtime_stale_event_diagnostics",
+            "runtime_side_effect_fence_events",
+            "runtime_component_health_events",
+            "runtime_process_leases",
+            "runtime_cleanup_reports",
+            "runtime_state_quarantine",
+        ] {
+            assert!(
+                table_has_column(&connection, table, "schema_version"),
+                "{table} should carry an explicit durable row schema version"
+            );
+        }
+        let first_migration_rows = schema_migration_rows(&connection);
+        drop(connection);
+
+        drop(
+            JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("repeated startup migration should be idempotent"),
+        );
+        let connection =
+            Connection::open(&db_path).expect("repeatedly upgraded journal should reopen");
+        assert_eq!(
+            schema_migration_rows(&connection),
+            first_migration_rows,
+            "repeated startup must not rewrite migration evidence"
+        );
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json,
+                        updated_at_unix_ms
+                    ) VALUES (
+                        'golden_corrupt_health', 1, 'degraded',
+                        'runtime.health.corrupt', '{', 1
+                    )
+                "#,
+                [],
+            )
+            .expect("corrupt shared-runtime fixture should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("corrupt rows should remain inspectable without a migration panic");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("corrupt rows should produce a compatibility report");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_component_health"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+        }));
+        {
+            let guard = store.connection.lock().expect("journal connection should lock");
+            assert_eq!(runtime_state_quarantine_count(&guard), 0);
+        }
+        store
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("corrupt compatibility evidence should persist explicitly");
+        {
+            let guard = store.connection.lock().expect("journal connection should lock");
+            let (quarantine_count, schema_version): (i64, i64) = guard
+                .query_row(
+                    r#"
+                        SELECT COUNT(*), COALESCE(MAX(schema_version), 0)
+                        FROM runtime_state_quarantine
+                        WHERE contract_name = 'runtime_component_health'
+                    "#,
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("versioned quarantine evidence should load");
+            assert_eq!((quarantine_count, schema_version), (1, 1));
+        }
+        drop(store);
+
+        let connection =
+            Connection::open(&db_path).expect("future-schema golden journal should reopen");
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("downgrade fixture should retain WAL evidence");
+        let future_version = latest_version.saturating_add(1);
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_unix_ms) VALUES (?1, 'future', 1)",
+                params![future_version],
+            )
+            .expect("future migration marker should insert");
+        let quarantine_before = runtime_state_quarantine_count(&connection);
+        let storage_before = SqliteMutationSnapshot::capture(&db_path);
+        assert!(storage_before.database.exists);
+        assert!(storage_before.wal.exists);
+        assert!(storage_before.shm.exists);
+
+        let preflight = JournalStore::inspect_runtime_state_read_only(&test_journal_config(
+            db_path.clone(),
+            false,
+        ))
+        .expect("downgrade preflight should inspect the journal read-only");
+        assert_eq!(preflight.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(preflight.findings.iter().any(|finding| {
+            finding.contract == "schema_migrations"
+                && finding.observed_schema_version == u32::try_from(future_version).ok()
+                && finding.outcome == RuntimeStateCompatibilityOutcome::BlockedNewerSchema
+        }));
+        let error = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect_err("downgraded writer must fail closed");
+        assert!(matches!(error, JournalError::RuntimeStateCompatibilityBlocked { .. }));
+        assert_eq!(
+            SqliteMutationSnapshot::capture(&db_path),
+            storage_before,
+            "downgrade inspection and rejection must not mutate database, WAL, or SHM"
+        );
+        assert_eq!(
+            runtime_state_quarantine_count(&connection),
+            quarantine_before,
+            "downgrade rejection must preserve existing quarantine state"
+        );
+        drop(connection);
+    }
+
+    #[test]
+    fn background_task_execution_fence_migration_defaults_and_reopens() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 66);
+        let connection = Connection::open(db_path.clone()).expect("v66 journal db should open");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms, session_key
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)
+                "#,
+                params![
+                    "01ARZ3NDEKTSV4RRFFQ69G5BM1",
+                    "user:ops",
+                    "device",
+                    "cli",
+                    "migration-67-session"
+                ],
+            )
+            .expect("legacy session should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_background_tasks (
+                        task_ulid, task_kind, session_ulid, owner_principal, device_id, channel,
+                        state, priority, attempt_count, max_attempts, budget_tokens,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 4, 8, 128, 1, 1)
+                "#,
+                params![
+                    "01ARZ3NDEKTSV4RRFFQ69G5BM2",
+                    AuxiliaryTaskKind::PostRunReflection.as_str(),
+                    "01ARZ3NDEKTSV4RRFFQ69G5BM1",
+                    "user:ops",
+                    "device",
+                    "cli",
+                    AuxiliaryTaskState::Queued.as_str(),
+                ],
+            )
+            .expect("legacy task should insert");
+        drop(connection);
+
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("v66 database should upgrade");
+            let migrated = store
+                .get_orchestrator_background_task("01ARZ3NDEKTSV4RRFFQ69G5BM2")
+                .expect("migrated task should load")
+                .expect("migrated task should exist");
+            assert_eq!(migrated.revision, 0);
+            assert_eq!(migrated.execution_generation, 0);
+            assert_eq!(migrated.attempt_count, 4);
+        }
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("upgraded database should reopen idempotently");
+        let migrated = reopened
+            .get_orchestrator_background_task("01ARZ3NDEKTSV4RRFFQ69G5BM2")
+            .expect("reopened task should load")
+            .expect("reopened task should exist");
+        assert_eq!((migrated.revision, migrated.execution_generation), (0, 0));
+        let connection = Connection::open(db_path).expect("upgraded journal db should reopen");
+        let applied: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 67", [], |row| {
+                row.get(0)
+            })
+            .expect("migration marker should load");
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn shared_runtime_migrations_upgrade_v44_database() {
+        let db_path = temp_db_path();
+        create_v44_journal_fixture(db_path.as_path());
+
+        let _store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v44 database should upgrade");
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let latest_version = MIGRATIONS.last().expect("migrations should not be empty").version;
+        for version in 45_i64..=latest_version {
+            let applied: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get(0),
+                )
+                .expect("migration marker should load");
+            assert_eq!(applied, 1, "migration v{version} should apply exactly once");
+        }
+        let (generation, updated_at, schema_version): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT generation, updated_at_unix_ms, schema_version FROM runtime_networked_worker_fleet_meta WHERE singleton_key = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("worker fleet generation metadata should be seeded");
+        assert_eq!((generation, updated_at, schema_version), (0, 0, 1));
+        let cancellation_context_columns = connection
+            .prepare("PRAGMA table_info(orchestrator_background_tasks)")
+            .expect("background task metadata query should prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("background task metadata should query")
+            .filter_map(Result::ok)
+            .filter(|column| column == "cancellation_context_json")
+            .count();
+        assert_eq!(cancellation_context_columns, 1);
+        let child_session_columns = connection
+            .prepare("PRAGMA table_info(orchestrator_background_tasks)")
+            .expect("background task child-session metadata query should prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("background task child-session metadata should query")
+            .filter_map(Result::ok)
+            .filter(|column| column == "child_session_ulid")
+            .count();
+        assert_eq!(child_session_columns, 1);
+        let task_fence_columns = connection
+            .prepare("PRAGMA table_info(orchestrator_background_tasks)")
+            .expect("background task fence metadata query should prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("background task fence metadata should query")
+            .filter_map(Result::ok)
+            .filter(|column| matches!(column.as_str(), "revision" | "execution_generation"))
+            .count();
+        assert_eq!(task_fence_columns, 2);
+        for table in [
+            "runtime_generation_events",
+            "runtime_stale_event_diagnostics",
+            "runtime_side_effect_fence_events",
+            "runtime_component_health_events",
+        ] {
+            let schema_version_columns: i64 = connection
+                .prepare(format!("PRAGMA table_info({table})").as_str())
+                .expect("table metadata query should prepare")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("table metadata should query")
+                .filter_map(Result::ok)
+                .filter(|column| column == "schema_version")
+                .count() as i64;
+            assert_eq!(schema_version_columns, 1, "{table} should be versioned");
+        }
+    }
+
+    #[test]
+    fn runtime_health_lifecycle_migration_backfills_heads_without_inventing_evidence() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 62);
+        let health = runtime_health_fixture(
+            "provider_health_migration",
+            RuntimeHealthState::Degraded,
+            7,
+            false,
+        );
+        let mut legacy_json = serde_json::to_value(&health).expect("health should serialize");
+        legacy_json["policy"]["max_probe_concurrency"] = json!(4);
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json,
+                        updated_at_unix_ms
+                    ) VALUES (?1, 7, 'degraded', ?2, ?3, 2)
+                "#,
+                params![
+                    health.component_id.as_str(),
+                    health.reason_code,
+                    serde_json::to_string(&legacy_json).expect("legacy health should serialize"),
+                ],
+            )
+            .expect("legacy health should persist");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v62 database should upgrade");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        let (generation, schema_version): (i64, i64) = connection
+            .query_row(
+                r#"
+                    SELECT last_generation, schema_version
+                    FROM runtime_component_generation_heads
+                    WHERE component_ulid = ?1
+                "#,
+                params![health.component_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("generation head should backfill");
+        assert_eq!((generation, schema_version), (7, 1));
+        let normalized_probe_concurrency: i64 = connection
+            .query_row(
+                r#"
+                    SELECT json_extract(health_json, '$.policy.max_probe_concurrency')
+                    FROM runtime_component_health
+                    WHERE component_ulid = ?1
+                "#,
+                params![health.component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("normalized health should load");
+        assert_eq!(normalized_probe_concurrency, 1);
+        for table in ["runtime_health_probe_begins", "runtime_health_probe_terminal_evidence"] {
+            let count: i64 = connection
+                .query_row(format!("SELECT COUNT(*) FROM {table}").as_str(), [], |row| row.get(0))
+                .expect("probe evidence should count");
+            assert_eq!(count, 0, "migration must not invent {table} evidence");
+        }
+        drop(connection);
+
+        let activation = RuntimeHealthComponentActivation {
+            component_id: health.component_id.clone(),
+            authority_class: health.authority_class,
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            policy: health.policy.clone(),
+            reason_code: "runtime.health.activated".to_owned(),
+        };
+        let activated = store
+            .activate_runtime_health_components(std::slice::from_ref(&activation), 10)
+            .expect("activation should advance the generation");
+        assert_eq!(
+            activated.generations.get(health.component_id.as_str()).map(|value| value.get()),
+            Some(8)
+        );
+        let activated_health = store
+            .runtime_component_health(health.component_id.as_str())
+            .expect("activated health should load")
+            .expect("activated health should remain present");
+        assert_eq!(activated_health.state, RuntimeHealthState::Degraded);
+        assert_eq!(activated_health.strike_count, health.strike_count);
+        assert_eq!(activated_health.reason_code, health.reason_code);
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let reactivated = reopened
+            .activate_runtime_health_components(&[activation], 11)
+            .expect("reopen activation should remain monotonic");
+        assert_eq!(
+            reactivated.generations.get(health.component_id.as_str()).map(|value| value.get()),
+            Some(9)
+        );
+        assert_eq!(
+            reopened
+                .runtime_component_health(health.component_id.as_str())
+                .expect("reactivated health should load")
+                .expect("reactivated health should remain present")
+                .state,
+            RuntimeHealthState::Degraded
+        );
+    }
+
+    #[test]
+    fn runtime_health_terminal_snapshot_migration_preserves_historical_evidence() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 63);
+        let health = runtime_health_fixture(
+            "provider_health_terminal_snapshot_migration",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        let lease =
+            runtime_health_probe_lease(&health, "probe_terminal_snapshot_migration", 100, 200);
+        let mut settled_health = health.clone();
+        settled_health.state = RuntimeHealthState::Healthy;
+        settled_health.strike_count = 0;
+        settled_health.reason_code = "runtime.health.probe_passed".to_owned();
+        settled_health.first_failure_at_unix_ms = None;
+        settled_health.last_failure_at_unix_ms = None;
+        settled_health.expires_at_unix_ms = None;
+        settled_health.updated_at_unix_ms = 150;
+        let lease_json =
+            serde_json::to_string(&lease).expect("historical probe lease should serialize");
+        let settlement = HealthProbeSettlementV1 {
+            schema_version: 1,
+            lease_id: lease.lease_id.clone(),
+            expected_generation: lease.expected_generation,
+            result: HealthProbeResult {
+                schema_version: 1,
+                component_id: lease.component_id.clone(),
+                disposition: HealthProbeDisposition::Passed,
+                reason_code: "runtime.health.probe_passed".to_owned(),
+                mutation_attempted: false,
+                completed_at_unix_ms: 150,
+            },
+        };
+        let settlement_json =
+            serde_json::to_string(&settlement).expect("historical settlement should serialize");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json,
+                        updated_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    health.component_id.as_str(),
+                    1_i64,
+                    settled_health.state.as_str(),
+                    settled_health.reason_code,
+                    serde_json::to_string(&settled_health)
+                        .expect("historical health should serialize"),
+                    settled_health.updated_at_unix_ms,
+                ],
+            )
+            .expect("historical health should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_generation_heads (
+                        component_ulid, last_generation, updated_at_unix_ms, schema_version
+                    ) VALUES (?1, 1, ?2, 1)
+                "#,
+                params![settled_health.component_id.as_str(), settled_health.updated_at_unix_ms,],
+            )
+            .expect("historical generation head should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_health_probe_begins (
+                        lease_ulid, component_ulid, expected_generation, authority_class,
+                        source_state, security_quarantine_before, reason_code,
+                        authorization_evidence_sha256, lease_json, begun_at_unix_ms,
+                        schema_version
+                    ) VALUES (?1, ?2, 1, ?3, 'cooldown', 0, ?4, NULL, ?5, 100, 1)
+                "#,
+                params![
+                    lease.lease_id.as_str(),
+                    lease.component_id.as_str(),
+                    lease.authority_class.as_str(),
+                    "runtime.health.probe_started",
+                    lease_json,
+                ],
+            )
+            .expect("historical begin evidence should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_health_probe_terminal_evidence (
+                        lease_ulid, component_ulid, expected_generation, authority_class,
+                        source_state, result_state, disposition, mutation_attempted,
+                        security_quarantine_before, security_quarantine_after, health_mutated,
+                        terminal_kind, reason_code, settlement_json, probe_evidence_sha256,
+                        completed_at_unix_ms, settled_at_unix_ms, schema_version
+                    ) VALUES (?1, ?2, 1, ?3, 'cooldown', 'healthy', 'passed', 0,
+                        0, 0, 1, 'settlement', ?4, ?5, ?6, 150, 150, 1)
+                "#,
+                params![
+                    lease.lease_id.as_str(),
+                    lease.component_id.as_str(),
+                    lease.authority_class.as_str(),
+                    settlement.result.reason_code,
+                    settlement_json,
+                    "a".repeat(64),
+                ],
+            )
+            .expect("historical terminal evidence should persist");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v63 database should upgrade");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("historical terminal evidence should remain compatible");
+        assert!(report.permits_admission(), "unexpected findings: {:?}", report.findings);
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let preserved: (i64, Option<String>) = connection
+            .query_row(
+                r#"
+                    SELECT schema_version, result_health_json
+                    FROM runtime_health_probe_terminal_evidence
+                    WHERE lease_ulid = ?1
+                "#,
+                params![lease.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("historical terminal evidence should load");
+        assert_eq!(preserved, (1, None));
+    }
+
+    #[test]
+    fn runtime_health_probe_actor_migration_preserves_historical_begin_without_actor() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 64);
+        let health = runtime_health_fixture(
+            "provider_probe_actor_migration",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        let lease = runtime_health_probe_lease(&health, "probe_actor_migration", 100, 200);
+        let lease_json =
+            serde_json::to_string(&lease).expect("historical probe lease should serialize");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json,
+                        updated_at_unix_ms
+                    ) VALUES (?1, 1, 'cooldown', ?2, ?3, ?4)
+                "#,
+                params![
+                    health.component_id.as_str(),
+                    health.reason_code,
+                    serde_json::to_string(&health).expect("historical health should serialize"),
+                    health.updated_at_unix_ms,
+                ],
+            )
+            .expect("historical health should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_generation_heads (
+                        component_ulid, last_generation, updated_at_unix_ms, schema_version
+                    ) VALUES (?1, 1, ?2, 1)
+                "#,
+                params![health.component_id.as_str(), health.updated_at_unix_ms],
+            )
+            .expect("historical generation head should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_health_probe_begins (
+                        lease_ulid, component_ulid, expected_generation, authority_class,
+                        source_state, security_quarantine_before, reason_code,
+                        authorization_evidence_sha256, lease_json, begun_at_unix_ms,
+                        schema_version
+                    ) VALUES (?1, ?2, 1, ?3, 'cooldown', 0, ?4, ?5, ?6, 100, 1)
+                "#,
+                params![
+                    lease.lease_id.as_str(),
+                    lease.component_id.as_str(),
+                    lease.authority_class.as_str(),
+                    "runtime.health.probe_started",
+                    "a".repeat(64),
+                    lease_json,
+                ],
+            )
+            .expect("historical begin evidence should persist");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v64 database should upgrade");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("historical begin evidence should remain compatible");
+        assert!(report.permits_admission(), "unexpected findings: {:?}", report.findings);
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let preserved: (i64, Option<String>, Option<String>) = connection
+            .query_row(
+                r#"
+                    SELECT schema_version, authorization_evidence_sha256,
+                           authorized_actor_id_sha256
+                    FROM runtime_health_probe_begins
+                    WHERE lease_ulid = ?1
+                "#,
+                params![lease.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("historical begin evidence should load");
+        assert_eq!(preserved, (1, Some("a".repeat(64)), None));
+    }
+
+    #[test]
+    fn runtime_health_lifecycle_migration_preserves_future_health_without_backfilling_authority() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 62);
+        let health = runtime_health_fixture(
+            "provider_health_future_migration",
+            RuntimeHealthState::Degraded,
+            11,
+            false,
+        );
+        let mut future_json = serde_json::to_value(&health).expect("health should serialize");
+        future_json["schema_version"] = json!(2);
+        future_json["future_contract_field"] = json!("preserve-me");
+        let future_json =
+            serde_json::to_string(&future_json).expect("future health should serialize");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json,
+                        updated_at_unix_ms
+                    ) VALUES (?1, 11, 'degraded', ?2, ?3, 2)
+                "#,
+                params![health.component_id.as_str(), health.reason_code, future_json],
+            )
+            .expect("future health should persist before migration");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v62 database should upgrade without interpreting future health");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("future health should produce a compatibility report");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_component_health"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::BlockedNewerSchema
+        }));
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let preserved_json: String = connection
+            .query_row(
+                "SELECT health_json FROM runtime_component_health WHERE component_ulid = ?1",
+                params![health.component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("future health should remain present");
+        assert_eq!(preserved_json, future_json);
+        let head_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_component_generation_heads WHERE component_ulid = ?1",
+                params![health.component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("generation head count should load");
+        assert_eq!(head_count, 0, "migration must not invent authority for future health");
+    }
+
+    #[test]
+    fn background_task_cancellation_context_migration_preserves_legacy_rows_without_authority() {
+        let db_path = temp_db_path();
+        let task_id = "legacy_delegation_without_cancellation_context";
+        let mut connection = Connection::open(db_path.clone()).expect("journal db should open");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("migration fixture transaction should open");
+        transaction
+            .execute_batch(
+                r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    )
+                "#,
+            )
+            .expect("migration fixture table should create");
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 61) {
+            transaction.execute_batch(migration.sql).expect("fixture migration should apply");
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, 0)",
+                    params![migration.version, migration.name],
+                )
+                .expect("fixture migration marker should persist");
+        }
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_session', 'user:legacy', 'legacy_device', 'test', 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy session should insert");
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state, created_at_unix_ms,
+                        started_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_parent_run', 'legacy_session', 'accepted', 1, 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy parent run should insert");
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_background_tasks (
+                        task_ulid,
+                        task_kind,
+                        session_ulid,
+                        parent_run_ulid,
+                        owner_principal,
+                        device_id,
+                        state,
+                        delegation_json,
+                        created_at_unix_ms,
+                        updated_at_unix_ms
+                    ) VALUES (?1, ?2, 'legacy_session', 'legacy_parent_run', 'user:legacy',
+                        'legacy_device', 'queued', ?3, 1, 1)
+                "#,
+                params![
+                    task_id,
+                    AuxiliaryTaskKind::DelegationPrompt.as_str(),
+                    serde_json::to_string(&test_delegation_snapshot())
+                        .expect("delegation fixture should serialize"),
+                ],
+            )
+            .expect("legacy delegation row should insert");
+        transaction.commit().expect("migration fixture should commit");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v61 database should upgrade");
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("legacy delegation task should load")
+            .expect("legacy delegation task should remain present");
+        assert!(task.delegation.is_some());
+        assert_eq!(task.cancellation_context, None);
+        assert_eq!(task.state, AuxiliaryTaskState::Failed.as_str());
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("legacy delegation is missing durable ChildTask cancellation authority")
+        );
+        let result = serde_json::from_str::<Value>(
+            task.result_json.as_deref().expect("migration result should persist"),
+        )
+        .expect("migration result should be JSON");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["task_id"], task_id);
+        assert_eq!(result["reason"], "legacy_missing_child_task_context");
+        assert!(task.completed_at_unix_ms.is_some());
+        let compatibility = store
+            .runtime_state_compatibility_report()
+            .expect("migrated legacy delegation should remain compatible");
+        assert!(compatibility.permits_admission());
+        assert!(compatibility.findings.is_empty());
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 62", [], |row| {
+                row.get(0)
+            })
+            .expect("cancellation-context migration marker should load");
+        assert_eq!(migration_count, 1);
+        let raw_context: Option<String> = connection
+            .query_row(
+                "SELECT cancellation_context_json FROM orchestrator_background_tasks WHERE task_ulid = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .expect("legacy cancellation context should remain queryable");
+        assert_eq!(raw_context, None);
+        let preserved_delegation: Option<String> = connection
+            .query_row(
+                "SELECT delegation_json FROM orchestrator_background_tasks WHERE task_ulid = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .expect("legacy delegation evidence should remain queryable");
+        assert!(preserved_delegation.is_some());
+    }
+
+    #[test]
+    fn background_task_cancellation_context_migration_normalizes_active_aliases() {
+        let db_path = temp_db_path();
+        let mut connection = Connection::open(db_path.clone()).expect("journal db should open");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("migration fixture transaction should open");
+        transaction
+            .execute_batch(
+                r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    )
+                "#,
+            )
+            .expect("migration fixture table should create");
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 61) {
+            transaction.execute_batch(migration.sql).expect("fixture migration should apply");
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, 0)",
+                    params![migration.version, migration.name],
+                )
+                .expect("fixture migration marker should persist");
+        }
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_alias_session', 'user:legacy', 'legacy_device', 'test', 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy alias session should insert");
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state, created_at_unix_ms,
+                        started_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_alias_parent', 'legacy_alias_session', 'accepted', 1, 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy alias parent should insert");
+        for (task_id, state) in
+            [("legacy_alias_pending", " PENDING "), ("legacy_alias_in_progress", " In_Progress ")]
+        {
+            transaction
+                .execute(
+                    r#"
+                        INSERT INTO orchestrator_background_tasks (
+                            task_ulid, task_kind, session_ulid, parent_run_ulid,
+                            owner_principal, device_id, state, delegation_json,
+                            created_at_unix_ms, updated_at_unix_ms
+                        ) VALUES (?1, ' Delegation_Prompt ', 'legacy_alias_session',
+                            'legacy_alias_parent', 'user:legacy', 'legacy_device', ?2, ?3, 1, 1)
+                    "#,
+                    params![
+                        task_id,
+                        state,
+                        serde_json::to_string(&test_delegation_snapshot())
+                            .expect("delegation fixture should serialize"),
+                    ],
+                )
+                .expect("legacy alias delegation should insert");
+        }
+        transaction.commit().expect("migration fixture should commit");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("v61 alias database should upgrade");
+        for task_id in ["legacy_alias_pending", "legacy_alias_in_progress"] {
+            let task = store
+                .get_orchestrator_background_task(task_id)
+                .expect("legacy alias task should load")
+                .expect("legacy alias task should remain present");
+            assert_eq!(task.state, AuxiliaryTaskState::Failed.as_str());
+            assert_eq!(task.cancellation_context, None);
+        }
+        let compatibility = store
+            .runtime_state_compatibility_report()
+            .expect("migrated aliases should remain compatible");
+        assert!(compatibility.permits_admission());
+        assert!(compatibility.findings.is_empty());
+    }
+
+    #[test]
+    fn delegated_child_session_migration_terminalizes_active_legacy_authority() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 65);
+        let task_id = "legacy_delegation_without_child_session";
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_child_parent_session', 'user:legacy',
+                        'legacy_device', 'test', 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy parent session should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state, created_at_unix_ms,
+                        started_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('legacy_child_parent_run', 'legacy_child_parent_session',
+                        'accepted', 1, 1, 1)
+                "#,
+                [],
+            )
+            .expect("legacy parent run should insert");
+        let cancellation_context = test_child_task_cancellation_context(
+            RuntimeGeneration::new(1).expect("fixture generation"),
+        );
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_background_tasks (
+                        task_ulid, task_kind, session_ulid, parent_run_ulid,
+                        owner_principal, device_id, state, delegation_json,
+                        cancellation_context_json, created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (?1, 'delegation_prompt', 'legacy_child_parent_session',
+                        'legacy_child_parent_run', 'user:legacy', 'legacy_device', 'queued',
+                        ?2, ?3, 1, 1)
+                "#,
+                params![
+                    task_id,
+                    serde_json::to_string(&test_delegation_snapshot())
+                        .expect("delegation fixture should serialize"),
+                    serde_json::to_string(&cancellation_context)
+                        .expect("cancellation fixture should serialize"),
+                ],
+            )
+            .expect("legacy delegated task should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v65 database should upgrade");
+        let task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("migrated delegation should load")
+            .expect("migrated delegation should remain present");
+        assert_eq!(task.state, AuxiliaryTaskState::Failed.as_str());
+        assert_eq!(task.child_session_id, None);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("legacy delegation is missing dedicated child-session authority")
+        );
+        let result = serde_json::from_str::<Value>(
+            task.result_json.as_deref().expect("migration result should persist"),
+        )
+        .expect("migration result should be JSON");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["task_id"], task_id);
+        assert_eq!(result["reason"], "legacy_missing_child_session");
+        assert!(task.completed_at_unix_ms.is_some());
+        let compatibility = store
+            .runtime_state_compatibility_report()
+            .expect("terminalized delegation should remain compatible");
+        assert!(compatibility.permits_admission());
+        assert!(compatibility.findings.is_empty());
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("migrated journal should reopen");
+        drop(reopened);
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 66", [], |row| {
+                row.get(0)
+            })
+            .expect("child-session migration marker should load");
+        assert_eq!(migration_count, 1);
+        let child_session_id: Option<String> = connection
+            .query_row(
+                "SELECT child_session_ulid FROM orchestrator_background_tasks WHERE task_ulid = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .expect("legacy child-session evidence should remain queryable");
+        assert_eq!(child_session_id, None);
+    }
+
+    #[test]
+    fn terminal_legacy_delegation_without_child_authority_remains_admissible() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('terminal_legacy_session', 'user:legacy', 'legacy_device', 'test', 1, 1)
+                "#,
+                [],
+            )
+            .expect("terminal legacy session should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state, created_at_unix_ms,
+                        started_at_unix_ms, completed_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('terminal_legacy_parent', 'terminal_legacy_session', 'done', 1, 1, 2, 2)
+                "#,
+                [],
+            )
+            .expect("terminal legacy parent should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_background_tasks (
+                        task_ulid, task_kind, session_ulid, parent_run_ulid,
+                        owner_principal, device_id, state, delegation_json,
+                        result_json, created_at_unix_ms, updated_at_unix_ms,
+                        started_at_unix_ms, completed_at_unix_ms
+                    ) VALUES ('terminal_legacy_task', 'delegation_prompt',
+                        'terminal_legacy_session', 'terminal_legacy_parent', 'user:legacy',
+                        'legacy_device', 'completed', ?1, '{"status":"succeeded"}', 1, 2, 1, 2)
+                "#,
+                params![serde_json::to_string(&test_delegation_snapshot())
+                    .expect("delegation fixture should serialize")],
+            )
+            .expect("terminal legacy delegation should insert");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("terminal legacy journal should reopen without hydrating active work");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("terminal legacy compatibility should scan");
+        assert!(report.permits_admission());
+        assert!(report.findings.is_empty());
+        let task = reopened
+            .get_orchestrator_background_task("terminal_legacy_task")
+            .expect("terminal legacy delegation should hydrate")
+            .expect("terminal legacy delegation should remain present");
+        assert_eq!(task.state, "completed");
+        assert!(task.delegation.is_some());
+        assert_eq!(task.cancellation_context, None);
+    }
+
+    #[test]
+    fn malformed_legacy_delegation_blocks_admission_before_hydration() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('malformed_legacy_session', 'user:legacy', 'legacy_device', 'test', 1, 1)
+                "#,
+                [],
+            )
+            .expect("malformed legacy session should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state, created_at_unix_ms,
+                        started_at_unix_ms, completed_at_unix_ms, updated_at_unix_ms
+                    ) VALUES ('malformed_legacy_parent', 'malformed_legacy_session', 'done', 1, 1, 2, 2)
+                "#,
+                [],
+            )
+            .expect("malformed legacy parent should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_background_tasks (
+                        task_ulid, task_kind, session_ulid, parent_run_ulid,
+                        owner_principal, device_id, state, delegation_json,
+                        created_at_unix_ms, updated_at_unix_ms, completed_at_unix_ms
+                    ) VALUES ('malformed_legacy_task', 'delegation_prompt',
+                        'malformed_legacy_session', 'malformed_legacy_parent', 'user:legacy',
+                        'legacy_device', 'failed', '{"profile_id":', 1, 2, 2)
+                "#,
+                [],
+            )
+            .expect("malformed legacy delegation should insert");
+        drop(connection);
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("malformed legacy journal should remain inspectable");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("malformed legacy compatibility should scan before hydration");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "orchestrator_background_tasks"
+                && finding.reason_code == "runtime.compatibility.invalid_contract"
+                && finding.blocks_admission
+        }));
+        assert!(reopened.get_orchestrator_background_task("malformed_legacy_task").is_err());
+    }
+
+    #[test]
+    fn networked_worker_validated_result_receipt_migrates_from_delivery_fence() {
+        let db_path = temp_db_path();
+        let mut connection = Connection::open(db_path.clone()).expect("journal db should open");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("migration fixture transaction should open");
+        transaction
+            .execute_batch(
+                r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    )
+                "#,
+            )
+            .expect("migration fixture table should create");
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 60) {
+            transaction.execute_batch(migration.sql).expect("fixture migration should apply");
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, 0)",
+                    params![migration.version, migration.name],
+                )
+                .expect("fixture migration marker should persist");
+        }
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present
+                    ) VALUES (
+                        'remote-migration-61-active', 'node-migration-61-active',
+                        'worker-migration-61', 'lease-migration-61', 'run-migration-61',
+                        0, NULL, NULL, 100, 'tool:palyra.echo', ?1, 'queued', NULL, NULL,
+                        1, 1, NULL, 2, 1
+                    )
+                "#,
+                params![sha256_hex(b"migration-61-active")],
+            )
+            .expect("schema 2 active fixture should insert");
+        transaction
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present
+                    ) VALUES (
+                        'remote-migration-61-terminal', 'node-migration-61-terminal',
+                        'worker-migration-61', 'lease-migration-61-terminal',
+                        'run-migration-61-terminal', 0, NULL, NULL, 100,
+                        'tool:palyra.echo', ?1, 'cancelled', NULL,
+                        'worker.dispatch.test_cancelled', 1, 2, 2, 2, 0
+                    )
+                "#,
+                params![sha256_hex(b"migration-61-terminal")],
+            )
+            .expect("schema 2 terminal fixture should insert");
+        transaction.commit().expect("migration fixture should commit");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("migration 61 should apply");
+        let active = store
+            .networked_worker_dispatch_claim("remote-migration-61-active")
+            .expect("migrated active claim should load")
+            .expect("migrated active claim should remain auditable");
+        assert_eq!(active.schema_version, 3);
+        assert_eq!(active.state, NetworkedWorkerDispatchClaimState::Queued);
+        assert!(active.validated_result_sha256.is_none());
+        assert!(active.result_observed_at_unix_ms.is_none());
+        let terminal = store
+            .networked_worker_dispatch_claim("remote-migration-61-terminal")
+            .expect("terminal claim should load")
+            .expect("terminal claim should remain auditable");
+        assert_eq!(terminal.schema_version, 2);
+        assert!(terminal.validated_result_sha256.is_none());
+        assert!(terminal.result_observed_at_unix_ms.is_none());
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        for table in [
+            "runtime_networked_worker_dispatch_claims",
+            "runtime_networked_worker_dispatch_claim_terminal_evidence",
+        ] {
+            let columns = connection
+                .prepare(format!("PRAGMA table_info({table})").as_str())
+                .expect("dispatch receipt table metadata should prepare")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("dispatch receipt table metadata should query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("dispatch receipt table metadata should decode");
+            assert_eq!(
+                columns
+                    .iter()
+                    .filter(|column| column.as_str() == "validated_result_sha256")
+                    .count(),
+                1,
+                "{table} should contain one validated-result digest column"
+            );
+            assert_eq!(
+                columns
+                    .iter()
+                    .filter(|column| column.as_str() == "result_observed_at_unix_ms")
+                    .count(),
+                1,
+                "{table} should contain one result-observation column"
+            );
+        }
+        assert!(connection
+            .execute(
+                "UPDATE runtime_networked_worker_dispatch_claim_terminal_evidence SET validated_result_sha256 = ?1 WHERE remote_request_ulid = 'remote-migration-61-terminal'",
+                params![sha256_hex(b"forbidden-terminal-mutation")],
+            )
+            .is_err());
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("migration 61 reopen should be idempotent");
+        assert_eq!(
+            reopened
+                .networked_worker_dispatch_claim("remote-migration-61-active")
+                .expect("reopened active claim should load")
+                .expect("reopened active claim should remain auditable")
+                .schema_version,
+            3
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_terminal_migration_backfills_supported_only() {
+        let db_path = temp_db_path();
+        let mut connection = Connection::open(db_path.clone()).expect("journal db should open");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("migration fixture transaction should open");
+        transaction
+            .execute_batch(
+                r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    )
+                "#,
+            )
+            .expect("migration fixture table should create");
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 58) {
+            transaction.execute_batch(migration.sql).expect("fixture migration should apply");
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms) VALUES (?1, ?2, 0)",
+                    params![migration.version, migration.name],
+                )
+                .expect("fixture migration marker should persist");
+        }
+        for (remote_request_id, node_request_id, state, schema_version, completed_at_unix_ms) in [
+            ("remote-migration-terminal", "node-migration-terminal", "cancelled", 1, Some(4_i64)),
+            ("remote-migration-malformed", "node-migration-malformed", "cancelled", 1, None),
+            ("remote-migration-unresolved", "node-migration-unresolved", "queued", 1, None),
+            ("remote-migration-future", "node-migration-future", "cancelled", 4, Some(5_i64)),
+        ] {
+            transaction
+                .execute(
+                    r#"
+                        INSERT INTO runtime_networked_worker_dispatch_claims (
+                            remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                            issued_fleet_generation, dispatch_fleet_generation,
+                            revoked_fleet_generation, lease_expires_at_unix_ms,
+                            capability, request_sha256, state, reconciliation_disposition,
+                            terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                            completed_at_unix_ms, schema_version
+                        ) VALUES (?1, ?2, 'worker-migration', 'lease-migration', 'run-migration',
+                                  0, NULL, NULL, 100, 'tool:palyra.echo', ?3, ?4, NULL,
+                                  'worker.dispatch.test', 1, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        remote_request_id,
+                        node_request_id,
+                        sha256_hex(remote_request_id.as_bytes()),
+                        state,
+                        completed_at_unix_ms.unwrap_or(1),
+                        completed_at_unix_ms,
+                        schema_version,
+                    ],
+                )
+                .expect("dispatch migration fixture should insert");
+        }
+        transaction.commit().expect("migration fixture should commit");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("migration 59 should apply");
+        let compatibility = store
+            .runtime_state_compatibility_report()
+            .expect("future dispatch claim schema should remain inspectable");
+        assert_eq!(compatibility.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(compatibility.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.observed_schema_version == Some(4)
+                && finding.reason_code == "runtime.compatibility.unsupported_schema"
+        }));
+        assert_eq!(
+            compatibility
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.contract == "runtime_networked_worker_dispatch_claims"
+                        && finding.observed_schema_version == Some(4)
+                })
+                .count(),
+            1,
+            "future dispatch schemas should not also be parsed as current exact evidence"
+        );
+        assert!(compatibility.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.observed_schema_version == Some(2)
+                && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+                && finding.blocks_admission
+        }));
+        drop(store);
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let archived_schema_version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM runtime_networked_worker_dispatch_claim_terminal_evidence WHERE remote_request_ulid = 'remote-migration-terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("archived migration row should load");
+        assert_eq!(archived_schema_version, 1);
+        let malformed_archived: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claim_terminal_evidence WHERE remote_request_ulid = 'remote-migration-malformed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("malformed migration row archive should count");
+        assert_eq!(malformed_archived, 0);
+        let preserved: Vec<(String, i64)> = connection
+            .prepare(
+                "SELECT remote_request_ulid, schema_version FROM runtime_networked_worker_dispatch_claims ORDER BY remote_request_ulid",
+            )
+            .expect("active migration rows should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("active migration rows should query")
+            .collect::<Result<_, _>>()
+            .expect("active migration rows should decode");
+        assert_eq!(
+            preserved,
+            vec![
+                ("remote-migration-future".to_owned(), 4),
+                ("remote-migration-malformed".to_owned(), 2),
+                ("remote-migration-unresolved".to_owned(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_capacity_archives_terminal_evidence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 10_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-archive",
+            "run-claim-archive",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-first",
+            "node-claim-archive-first",
+            "claim-archive-first",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms)
+            .expect("first claim should create");
+        assert_eq!(
+            store
+                .cancel_networked_worker_dispatch_claim(
+                    first.remote_request_id.as_str(),
+                    first.node_request_id.as_str(),
+                    "worker.dispatch.test_cancelled",
+                    now_unix_ms.saturating_add(1),
+                )
+                .expect("first claim should cancel"),
+            super::NetworkedWorkerDispatchCancelOutcome::Cancelled
+        );
+
+        let second = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-second",
+            "node-claim-archive-second",
+            "claim-archive-second",
+        );
+        let created = store
+            .create_networked_worker_dispatch_claim(&second, 1, now_unix_ms.saturating_add(2))
+            .expect("terminal evidence should be archived to free authority capacity");
+        assert_eq!(created.state, NetworkedWorkerDispatchClaimState::Queued);
+        assert_eq!(
+            store
+                .networked_worker_dispatch_claim(first.remote_request_id.as_str())
+                .expect("archived claim should load")
+                .expect("archived claim should remain auditable")
+                .state,
+            NetworkedWorkerDispatchClaimState::Cancelled
+        );
+        assert_eq!(
+            store
+                .cancel_networked_worker_dispatch_claim(
+                    first.remote_request_id.as_str(),
+                    first.node_request_id.as_str(),
+                    "worker.dispatch.test_cancelled",
+                    now_unix_ms.saturating_add(3),
+                )
+                .expect("archived cancellation replay should classify"),
+            super::NetworkedWorkerDispatchCancelOutcome::AlreadyCancelled
+        );
+        let replay = store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms.saturating_add(4))
+            .expect("exact archived replay should remain idempotent");
+        assert_eq!(replay.state, NetworkedWorkerDispatchClaimState::Cancelled);
+
+        let conflict = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-conflict",
+            first.node_request_id.as_str(),
+            "claim-archive-conflict",
+        );
+        assert!(matches!(
+            store
+                .create_networked_worker_dispatch_claim(&conflict, 1, now_unix_ms.saturating_add(5))
+                .expect_err("archived node identity reuse must fail closed"),
+            JournalError::NetworkedWorkerDispatchClaimConflict { .. }
+        ));
+
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        let active_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claims", [], |row| {
+                row.get(0)
+            })
+            .expect("active claims should count");
+        let archived_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claim_terminal_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .expect("archived claims should count");
+        assert_eq!((active_count, archived_count), (1, 1));
+        drop(connection);
+
+        let diagnostics = store.shared_runtime_diagnostics().expect("diagnostics should load");
+        assert_eq!(diagnostics.networked_worker_dispatch_active_by_state.get("queued"), Some(&1));
+        assert_eq!(
+            diagnostics.networked_worker_dispatch_archived_by_state.get("cancelled"),
+            Some(&1)
+        );
+        assert_eq!(diagnostics.networked_worker_dispatch_reclaimable_terminal, 0);
+        assert_eq!(diagnostics.networked_worker_dispatch_unresolved, 1);
+        assert_eq!(
+            diagnostics.networked_worker_dispatch_headroom_after_reclaim,
+            NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES.saturating_sub(1)
+        );
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_networked_worker_dispatch_claims SET schema_version = 4 WHERE remote_request_ulid = ?1",
+                params![second.remote_request_id.as_str()],
+            )
+            .expect("future unresolved fixture should persist");
+        drop(connection);
+        let diagnostics = store.shared_runtime_diagnostics().expect("diagnostics should reload");
+        assert_eq!(diagnostics.networked_worker_dispatch_unresolved, 0);
+        assert_eq!(
+            diagnostics.networked_worker_dispatch_headroom_after_reclaim,
+            NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES
+        );
+        assert_eq!(diagnostics.compatibility_admission, RuntimeStateAdmissionPosture::Blocked);
+    }
+
+    #[test]
+    fn networked_worker_dispatch_cancel_replay_requires_cancelled_terminal_state() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 10_500;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-cancel-replay",
+            "run-claim-cancel-replay",
+            now_unix_ms,
+        );
+        let request = dispatch_claim_request(
+            &lease,
+            "remote-claim-cancel-replay",
+            "node-claim-cancel-replay",
+            "claim-cancel-replay",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&request, 1, now_unix_ms)
+            .expect("dispatch claim should create");
+        assert!(matches!(
+            store
+                .begin_networked_worker_dispatch(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    request.request_sha256.as_str(),
+                    now_unix_ms.saturating_add(1),
+                )
+                .expect("dispatch should begin"),
+            super::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+        ));
+        store
+            .settle_networked_worker_dispatch_claim(&NetworkedWorkerDispatchSettlement {
+                remote_request_id: request.remote_request_id.clone(),
+                worker_id: request.worker_id.clone(),
+                lease_id: request.lease_id.clone(),
+                run_id: request.run_id.clone(),
+                delivery_attempt_id: None,
+                validated_result_sha256: super::sha256_hex(b"rejected-settlement"),
+                observed_at_unix_ms: now_unix_ms.saturating_add(2),
+            })
+            .expect_err("normal in-flight settlement requires the lifecycle transaction");
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_networked_worker_dispatch_claims
+                    SET state = 'settled', terminal_reason_code = 'worker.dispatch.settled',
+                        validated_result_sha256 = ?1,
+                        result_observed_at_unix_ms = ?2,
+                        updated_at_unix_ms = ?2, completed_at_unix_ms = ?2
+                    WHERE remote_request_ulid = ?3
+                "#,
+                params![
+                    super::sha256_hex(b"settled-replay-fixture"),
+                    now_unix_ms.saturating_add(2),
+                    request.remote_request_id.as_str()
+                ],
+            )
+            .expect("settled replay fixture should persist");
+        drop(connection);
+        let next = dispatch_claim_request(
+            &lease,
+            "remote-claim-cancel-replay-next",
+            "node-claim-cancel-replay-next",
+            "claim-cancel-replay-next",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&next, 1, now_unix_ms.saturating_add(3))
+            .expect("settled claim should archive to free authority capacity");
+        assert_eq!(
+            store
+                .cancel_networked_worker_dispatch_claim(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    "worker.dispatch.test_cancelled",
+                    now_unix_ms.saturating_add(4),
+                )
+                .expect("settled cancellation replay should classify"),
+            super::NetworkedWorkerDispatchCancelOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_abort_before_release_requires_exact_authority() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 11_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-abort",
+            "run-claim-abort",
+            now_unix_ms,
+        );
+        let request = dispatch_claim_request(
+            &lease,
+            "remote-claim-abort",
+            "node-claim-abort",
+            "claim-abort-payload",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&request, 1, now_unix_ms)
+            .expect("dispatch claim should create");
+        let fleet_generation = match store
+            .reserve_networked_worker_delivery(&super::NetworkedWorkerDeliveryReservationRequest {
+                remote_request_id: request.remote_request_id.clone(),
+                node_request_id: request.node_request_id.clone(),
+                request_sha256: request.request_sha256.clone(),
+                delivery_attempt_id: ulid::Ulid::new().to_string(),
+                delivery_token_sha256: super::sha256_hex(b"claim-abort-delivery-token"),
+                observed_at_unix_ms: now_unix_ms.saturating_add(1),
+            })
+            .expect("dispatch should reserve")
+        {
+            super::NetworkedWorkerDeliveryReservationOutcome::Authorized { fleet_generation } => {
+                fleet_generation
+            }
+            super::NetworkedWorkerDeliveryReservationOutcome::Rejected => {
+                panic!("exact dispatch authority should be accepted")
+            }
+        };
+        assert_eq!(
+            store
+                .abort_networked_worker_dispatch_before_payload_release(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    request.request_sha256.as_str(),
+                    fleet_generation.saturating_add(1),
+                    now_unix_ms,
+                )
+                .expect("mismatched abort should classify"),
+            super::NetworkedWorkerDispatchAbortBeforeReleaseOutcome::NotAbortable
+        );
+        assert_eq!(
+            store
+                .abort_networked_worker_dispatch_before_payload_release(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    request.request_sha256.as_str(),
+                    fleet_generation,
+                    now_unix_ms,
+                )
+                .expect("exact abort should commit"),
+            super::NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted
+        );
+        let claim = store
+            .networked_worker_dispatch_claim(request.remote_request_id.as_str())
+            .expect("claim should load")
+            .expect("claim should remain auditable");
+        assert_eq!(claim.state, NetworkedWorkerDispatchClaimState::Cancelled);
+        assert_eq!(claim.updated_at_unix_ms, now_unix_ms.saturating_add(1));
+        assert_eq!(claim.completed_at_unix_ms, Some(now_unix_ms.saturating_add(1)));
+        assert_eq!(claim.reconciliation_disposition.as_deref(), Some("payload_not_released"));
+        assert_eq!(
+            claim.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.aborted_before_payload_release.local_audit_persist_failed")
+        );
+        assert_eq!(
+            store
+                .abort_networked_worker_dispatch_before_payload_release(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    request.request_sha256.as_str(),
+                    fleet_generation,
+                    now_unix_ms,
+                )
+                .expect("exact abort replay should classify"),
+            super::NetworkedWorkerDispatchAbortBeforeReleaseOutcome::AlreadyAborted
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_reclaims_oldest_terminal_rows_only() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 12_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-order",
+            "run-claim-order",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-order-first",
+            "node-claim-order-first",
+            "claim-order-first",
+        );
+        let second = dispatch_claim_request(
+            &lease,
+            "remote-claim-order-second",
+            "node-claim-order-second",
+            "claim-order-second",
+        );
+        for (ordinal, request) in [(1_i64, &first), (2_i64, &second)] {
+            store
+                .create_networked_worker_dispatch_claim(request, 2, now_unix_ms)
+                .expect("terminal candidate should create");
+            store
+                .cancel_networked_worker_dispatch_claim(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    "worker.dispatch.test_cancelled",
+                    now_unix_ms.saturating_add(ordinal),
+                )
+                .expect("terminal candidate should cancel");
+        }
+        let third = dispatch_claim_request(
+            &lease,
+            "remote-claim-order-third",
+            "node-claim-order-third",
+            "claim-order-third",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&third, 2, now_unix_ms.saturating_add(3))
+            .expect("one oldest terminal row should be reclaimed");
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let archived: Vec<String> = connection
+            .prepare(
+                "SELECT remote_request_ulid FROM runtime_networked_worker_dispatch_claim_terminal_evidence ORDER BY remote_request_ulid",
+            )
+            .expect("archived identities should prepare")
+            .query_map([], |row| row.get(0))
+            .expect("archived identities should query")
+            .collect::<Result<_, _>>()
+            .expect("archived identities should decode");
+        let active: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT remote_request_ulid, state FROM runtime_networked_worker_dispatch_claims ORDER BY remote_request_ulid",
+            )
+            .expect("active identities should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("active identities should query")
+            .collect::<Result<_, _>>()
+            .expect("active identities should decode");
+        assert_eq!(archived, vec![first.remote_request_id]);
+        assert_eq!(
+            active,
+            vec![
+                (second.remote_request_id, "cancelled".to_owned()),
+                (third.remote_request_id, "queued".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_reclamation_rolls_back_when_authority_rejects_insert() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 15_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-rollback",
+            "run-claim-rollback",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-rollback-first",
+            "node-claim-rollback-first",
+            "claim-rollback-first",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms)
+            .expect("first claim should create");
+        store
+            .cancel_networked_worker_dispatch_claim(
+                first.remote_request_id.as_str(),
+                first.node_request_id.as_str(),
+                "worker.dispatch.test_cancelled",
+                now_unix_ms.saturating_add(1),
+            )
+            .expect("first claim should cancel");
+
+        let mut invalid = dispatch_claim_request(
+            &lease,
+            "remote-claim-rollback-invalid",
+            "node-claim-rollback-invalid",
+            "claim-rollback-invalid",
+        );
+        invalid.lease_id = "lease-authority-mismatch".to_owned();
+        assert!(matches!(
+            store
+                .create_networked_worker_dispatch_claim(&invalid, 1, now_unix_ms.saturating_add(2))
+                .expect_err("authority rejection must roll back prior reclamation"),
+            JournalError::NetworkedWorkerDispatchAuthorityRejected { .. }
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let active_terminal: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claims WHERE remote_request_ulid = ?1 AND state = 'cancelled'",
+                params![first.remote_request_id],
+                |row| row.get(0),
+            )
+            .expect("active terminal claim should count");
+        let archived: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claim_terminal_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal evidence should count");
+        assert_eq!((active_terminal, archived), (1, 0));
+    }
+
+    #[test]
+    fn networked_worker_dispatch_archival_failure_rolls_back_deletion() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 18_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-archive-failure",
+            "run-claim-archive-failure",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-failure-first",
+            "node-claim-archive-failure-first",
+            "claim-archive-failure-first",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms)
+            .expect("first claim should create");
+        store
+            .cancel_networked_worker_dispatch_claim(
+                first.remote_request_id.as_str(),
+                first.node_request_id.as_str(),
+                "worker.dispatch.test_cancelled",
+                now_unix_ms.saturating_add(1),
+            )
+            .expect("first claim should cancel");
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_dispatch_claim_archival
+                    BEFORE INSERT ON runtime_networked_worker_dispatch_claim_terminal_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced dispatch archival failure');
+                    END;
+                "#,
+            )
+            .expect("archival failure trigger should install");
+        drop(connection);
+
+        let second = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-failure-second",
+            "node-claim-archive-failure-second",
+            "claim-archive-failure-second",
+        );
+        assert!(matches!(
+            store
+                .create_networked_worker_dispatch_claim(&second, 1, now_unix_ms.saturating_add(2))
+                .expect_err("archival failure must abort claim creation"),
+            JournalError::Sqlite(_)
+        ));
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let active_terminal: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claims WHERE remote_request_ulid = ?1 AND state = 'cancelled'",
+                params![first.remote_request_id],
+                |row| row.get(0),
+            )
+            .expect("active terminal claim should count");
+        let archived: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_networked_worker_dispatch_claim_terminal_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal evidence should count");
+        assert_eq!((active_terminal, archived), (1, 0));
+    }
+
+    #[test]
+    fn networked_worker_dispatch_terminal_archive_capacity_fails_closed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 16_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-archive-bound",
+            "run-claim-archive-bound",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-bound-first",
+            "node-claim-archive-bound-first",
+            "claim-archive-bound-first",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms)
+            .expect("first claim should create");
+        store
+            .cancel_networked_worker_dispatch_claim(
+                first.remote_request_id.as_str(),
+                first.node_request_id.as_str(),
+                "worker.dispatch.test_cancelled",
+                now_unix_ms.saturating_add(1),
+            )
+            .expect("first claim should cancel");
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    DROP TRIGGER trg_runtime_networked_worker_dispatch_claim_terminal_prevent_update;
+                    DROP TRIGGER trg_runtime_networked_worker_dispatch_claim_terminal_prevent_delete;
+                "#,
+            )
+            .expect("terminal archive guards should disable for capacity fixture");
+        let first_evidence = connection
+            .query_row(
+                r#"
+                    SELECT worker_id, lease_ulid, run_ulid, issued_fleet_generation,
+                           lease_expires_at_unix_ms, capability, request_sha256,
+                           terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                           completed_at_unix_ms
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = ?1
+                "#,
+                params![first.remote_request_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .expect("terminal fixture evidence should load");
+        for index in 0..NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES {
+            connection
+                .execute(
+                    r#"
+                        INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                            remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                            issued_fleet_generation, dispatch_fleet_generation,
+                            revoked_fleet_generation, lease_expires_at_unix_ms,
+                            capability, request_sha256, state, reconciliation_disposition,
+                            terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                            completed_at_unix_ms, schema_version
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9,
+                                  'cancelled', NULL, ?10, ?11, ?12, ?13, 1)
+                    "#,
+                    params![
+                        format!("archive-bound-remote-{index:05}"),
+                        format!("archive-bound-node-{index:05}"),
+                        first_evidence.0,
+                        first_evidence.1,
+                        first_evidence.2,
+                        first_evidence.3,
+                        first_evidence.4,
+                        first_evidence.5,
+                        sha256_hex(format!("archive-bound-{index}").as_bytes()),
+                        first_evidence.7,
+                        first_evidence.8,
+                        first_evidence.9,
+                        first_evidence.10,
+                    ],
+                )
+                .expect("terminal archive capacity fixture should insert");
+        }
+        drop(connection);
+
+        let second = dispatch_claim_request(
+            &lease,
+            "remote-claim-archive-bound-second",
+            "node-claim-archive-bound-second",
+            "claim-archive-bound-second",
+        );
+        assert!(matches!(
+            store
+                .create_networked_worker_dispatch_claim(&second, 1, now_unix_ms.saturating_add(2))
+                .expect_err("full immutable archive must block authority reclamation"),
+            JournalError::NetworkedWorkerDispatchTerminalEvidenceCapacityExceeded {
+                current_entries,
+                requested_entries: 1,
+                max_entries: NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
+            } if current_entries == NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES
+        ));
+        assert_eq!(
+            store
+                .networked_worker_dispatch_claim(first.remote_request_id.as_str())
+                .expect("first claim should load")
+                .expect("first terminal claim should remain active")
+                .state,
+            NetworkedWorkerDispatchClaimState::Cancelled
+        );
+    }
+
+    #[test]
+    fn networked_worker_dispatch_capacity_rejects_unresolved_only_table() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let now_unix_ms = 20_000;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-capacity",
+            "run-claim-capacity",
+            now_unix_ms,
+        );
+        let first = dispatch_claim_request(
+            &lease,
+            "remote-claim-capacity-first",
+            "node-claim-capacity-first",
+            "claim-capacity-first",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&first, 1, now_unix_ms)
+            .expect("first unresolved claim should create");
+        let second = dispatch_claim_request(
+            &lease,
+            "remote-claim-capacity-second",
+            "node-claim-capacity-second",
+            "claim-capacity-second",
+        );
+        assert!(matches!(
+            store
+                .create_networked_worker_dispatch_claim(&second, 1, now_unix_ms.saturating_add(1))
+                .expect_err("unresolved authority must never be reclaimed"),
+            JournalError::NetworkedWorkerDispatchClaimCapacityExceeded {
+                current_entries: 1,
+                max_entries: 1,
+            }
+        ));
+        assert_eq!(
+            store
+                .networked_worker_dispatch_claim(first.remote_request_id.as_str())
+                .expect("first claim should load")
+                .expect("first unresolved claim should remain")
+                .state,
+            NetworkedWorkerDispatchClaimState::Queued
+        );
+    }
+
+    #[test]
+    fn networked_worker_fleet_snapshot_reads_generation_atomically() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let initial = store
+            .load_networked_worker_fleet_snapshot(NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+            .expect("initial fleet snapshot should load");
+        assert_eq!(initial.generation, 0);
+        assert!(initial.records.is_empty());
+
+        let generation = store
+            .commit_networked_worker_expiry_plan(
+                &[],
+                &initial.records,
+                initial.generation,
+                NETWORKED_WORKER_EXPIRY_MAX_ENTRIES,
+                NETWORKED_WORKER_FLEET_MAX_ENTRIES,
+                1,
+            )
+            .expect("empty expiry plan should be a no-op");
+        assert_eq!(generation, 0);
+        assert_eq!(
+            store
+                .load_networked_worker_fleet_snapshot(NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+                .expect("unchanged fleet snapshot should load")
+                .generation,
+            0,
+            "an empty expiry plan must not consume fleet authority"
+        );
+    }
+
+    #[test]
+    fn networked_worker_expiry_outbox_persists_exact_lease_evidence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let event = palyra_workerd::WorkerLifecycleEvent {
+            worker_id: "worker-outbox".to_owned(),
+            state: palyra_common::runtime_contracts::WorkerLifecycleState::Orphaned,
+            run_id: Some("run-outbox".to_owned()),
+            lease_id: Some("lease-outbox".to_owned()),
+            reason_code: "worker.ttl_expired".to_owned(),
+            timestamp_unix_ms: 42_000,
+        };
+        let record = NetworkedWorkerExpiryOutboxRecord::from_event(event.clone())
+            .expect("exact expiry evidence should validate");
+        store
+            .enqueue_networked_worker_expiry_outbox_batch(std::slice::from_ref(&record), 256)
+            .expect("exact expiry evidence should persist");
+        store
+            .enqueue_networked_worker_expiry_outbox_batch(std::slice::from_ref(&record), 256)
+            .expect("exact expiry evidence replay should be idempotent");
+
+        let records =
+            store.list_networked_worker_expiry_outbox(256).expect("expiry evidence should load");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], record);
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        assert_eq!(
+            reopened
+                .list_networked_worker_expiry_outbox(256)
+                .expect("expiry evidence should survive reopen")
+                .len(),
+            1
+        );
+        reopened
+            .remove_networked_worker_expiry_outbox(record.event_id.as_str(), &event)
+            .expect("exact expiry evidence should retire");
+        reopened
+            .remove_networked_worker_expiry_outbox(record.event_id.as_str(), &event)
+            .expect("missing expiry evidence retirement should be idempotent");
+        assert!(reopened
+            .list_networked_worker_expiry_outbox(256)
+            .expect("retired expiry evidence should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn networked_worker_expiry_outbox_batch_is_atomic() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let first_event = palyra_workerd::WorkerLifecycleEvent {
+            worker_id: "worker-outbox-a".to_owned(),
+            state: palyra_common::runtime_contracts::WorkerLifecycleState::Orphaned,
+            run_id: Some("run-outbox-a".to_owned()),
+            lease_id: Some("lease-outbox-a".to_owned()),
+            reason_code: "worker.ttl_expired".to_owned(),
+            timestamp_unix_ms: 42_001,
+        };
+        let second_event = palyra_workerd::WorkerLifecycleEvent {
+            worker_id: "worker-outbox-b".to_owned(),
+            run_id: Some("run-outbox-b".to_owned()),
+            lease_id: Some("lease-outbox-b".to_owned()),
+            timestamp_unix_ms: 42_002,
+            ..first_event.clone()
+        };
+        let first = NetworkedWorkerExpiryOutboxRecord::from_event(first_event)
+            .expect("first expiry evidence should validate");
+        let second = NetworkedWorkerExpiryOutboxRecord::from_event(second_event)
+            .expect("second expiry evidence should validate");
+
+        let error = store
+            .enqueue_networked_worker_expiry_outbox_batch(&[first, second], 1)
+            .expect_err("capacity failure must reject the whole batch");
+        assert!(matches!(
+            error,
+            JournalError::NetworkedWorkerExpiryOutboxCapacityExceeded {
+                current_entries: 2,
+                max_entries: 1,
+            }
+        ));
+        assert!(store
+            .list_networked_worker_expiry_outbox(256)
+            .expect("expiry evidence should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn networked_worker_outbox_and_fleet_loaders_reject_silent_overflow() {
+        const LIMIT: usize = 256;
+
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        for index in 0..=LIMIT {
+            let worker_id = format!("worker-overflow-{index:03}");
+            let run_id = format!("run-overflow-{index:03}");
+            let lease_id = format!("lease-overflow-{index:03}");
+            let event = palyra_workerd::WorkerLifecycleEvent {
+                worker_id: worker_id.clone(),
+                state: palyra_common::runtime_contracts::WorkerLifecycleState::Orphaned,
+                run_id: Some(run_id.clone()),
+                lease_id: Some(lease_id.clone()),
+                reason_code: "worker.ttl_expired".to_owned(),
+                timestamp_unix_ms: 50_000 + i64::try_from(index).expect("index should fit"),
+            };
+            let event_id = palyra_workerd::networked_worker_expiry_event_id(&event)
+                .expect("overflow event identity should validate");
+            connection
+                .execute(
+                    "INSERT INTO runtime_networked_worker_expiry_outbox (event_ulid, worker_id, run_ulid, lease_ulid, event_json, created_at_unix_ms, schema_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        event_id,
+                        worker_id,
+                        run_id,
+                        lease_id,
+                        serde_json::to_string(&event).expect("event should serialize"),
+                        event.timestamp_unix_ms,
+                    ],
+                )
+                .expect("overflow outbox row should insert");
+            connection
+                .execute(
+                    "INSERT INTO runtime_networked_worker_fleet (worker_id, record_json, updated_at_unix_ms, schema_version) VALUES (?1, '{}', 1, 1)",
+                    params![format!("fleet-overflow-{index:03}")],
+                )
+                .expect("overflow fleet row should insert");
+        }
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        assert!(matches!(
+            store
+                .list_networked_worker_expiry_outbox(LIMIT)
+                .expect_err("outbox overflow must fail closed"),
+            JournalError::NetworkedWorkerExpiryOutboxCapacityExceeded {
+                current_entries: 257,
+                max_entries: 256,
+            }
+        ));
+        assert!(matches!(
+            store
+                .list_networked_worker_fleet_records(LIMIT)
+                .expect_err("fleet overflow must fail closed before decoding truncated state"),
+            JournalError::NetworkedWorkerFleetCapacityExceeded {
+                current_entries: 257,
+                max_entries: 256,
+            }
+        ));
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("overflow should produce a bounded compatibility report");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(report.findings.len(), 2);
+        assert!(report.findings.iter().all(|finding| {
+            finding.reason_code == "runtime.compatibility.capacity_exceeded"
+                && finding.blocks_admission
+                && finding.payload_bytes == 257
+        }));
+        store
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("overflow compatibility evidence should persist explicitly");
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let quarantine_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_state_quarantine WHERE reason_code = 'runtime.compatibility.capacity_exceeded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("overflow compatibility evidence should be durable");
+        assert_eq!(quarantine_count, 2);
+    }
+
+    #[test]
+    fn networked_worker_expiry_outbox_rejects_mismatched_event_identity() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let event = palyra_workerd::WorkerLifecycleEvent {
+            worker_id: "worker-outbox-id".to_owned(),
+            state: palyra_common::runtime_contracts::WorkerLifecycleState::Orphaned,
+            run_id: Some("run-outbox-id".to_owned()),
+            lease_id: Some("lease-outbox-id".to_owned()),
+            reason_code: "worker.ttl_expired".to_owned(),
+            timestamp_unix_ms: 42_003,
+        };
+        let record = NetworkedWorkerExpiryOutboxRecord {
+            event_id: "worker-expiry:mismatched".to_owned(),
+            event,
+        };
+
+        store
+            .enqueue_networked_worker_expiry_outbox_batch(std::slice::from_ref(&record), 256)
+            .expect_err("mismatched deterministic identity must fail closed");
+        assert!(store
+            .list_networked_worker_expiry_outbox(256)
+            .expect("expiry evidence should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn planned_child_identity_migration_preserves_foreign_keyed_targets() {
+        let db_path = temp_db_path();
+        {
+            let _store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+        }
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign key posture should load");
+        assert_eq!(foreign_keys, 1);
+        let target_fk_count: i64 = connection
+            .prepare("PRAGMA foreign_key_list(orchestrator_background_tasks)")
+            .expect("background task foreign keys should load")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("background task foreign keys should query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("background task foreign keys should decode")
+            .into_iter()
+            .filter(|column| column == "target_run_ulid")
+            .count() as i64;
+        assert_eq!(target_fk_count, 1);
+        let planned_fk_count: i64 = connection
+            .prepare("PRAGMA foreign_key_list(orchestrator_background_tasks)")
+            .expect("background task foreign keys should reload")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("background task foreign keys should requery")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("background task foreign keys should redecode")
+            .into_iter()
+            .filter(|column| column == "planned_child_run_ulid")
+            .count() as i64;
+        assert_eq!(planned_fk_count, 0);
+    }
+
+    #[test]
+    fn concurrent_shared_runtime_migration_open_serializes_and_applies_once() {
+        let db_path = temp_db_path();
+        create_v44_journal_fixture(db_path.as_path());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_path = db_path.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                JournalStore::open(test_journal_config(worker_path, false))
+                    .expect("concurrent journal open should serialize migration")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            drop(worker.join().expect("migration worker should not panic"));
+        }
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let latest_version = MIGRATIONS.last().expect("migrations should not be empty").version;
+        for version in 45_i64..=latest_version {
+            let applied: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get(0),
+                )
+                .expect("migration marker should load");
+            assert_eq!(applied, 1, "migration v{version} should be recorded once");
+        }
+    }
+
+    #[test]
+    fn runtime_generation_supersede_is_atomic_and_stale_events_are_suppressed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_runtime_generation";
+        let run_id = "run_runtime_generation";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let first = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let second = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::SteerSuperseded,
+        );
+        assert_eq!(first.generation.get(), 1);
+        assert_eq!(second.generation.get(), 2);
+        assert_eq!(
+            store
+                .check_runtime_generation(session_id, RuntimeGenerationLane::Run, first.generation)
+                .expect("generation check should succeed")
+                .disposition,
+            GenerationCheckDisposition::Stale
+        );
+
+        let outcome = store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(
+                    session_id,
+                    run_id,
+                    first.generation,
+                    1,
+                    RuntimeEventName::RunStarted,
+                ),
+            })
+            .expect("stale event should be classified");
+        assert_eq!(outcome, RuntimeEventAppendOutcome::StaleSuppressed);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_generation_leases", [], |row| row.get(0))
+            .expect("generation leases should count");
+        let stale_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_stale_event_diagnostics", [], |row| row.get(0))
+            .expect("stale diagnostics should count");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_events_v2", [], |row| row.get(0))
+            .expect("runtime events should count");
+        assert_eq!(lease_count, 1);
+        assert_eq!(stale_count, 1);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn stale_runtime_projection_commits_diagnostic_without_tape_or_event() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_stale_tape_projection";
+        let run_id = "run_stale_tape_projection";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let first = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::SteerSuperseded,
+        );
+        let tape_request = OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: 0,
+            event_type: "status".to_owned(),
+            payload_json: r#"{"kind":"in_progress"}"#.to_owned(),
+        };
+        let runtime_request = RuntimeEventAppendRequest {
+            lane: RuntimeGenerationLane::Run,
+            envelope: runtime_event(
+                session_id,
+                run_id,
+                first.generation,
+                1,
+                RuntimeEventName::RunStarted,
+            ),
+        };
+
+        let outcome = store
+            .append_orchestrator_tape_event_with_runtime_projection(
+                &tape_request,
+                Some(&runtime_request),
+            )
+            .expect("stale projection should commit its diagnostic");
+        assert_eq!(outcome, Some(RuntimeEventAppendOutcome::StaleSuppressed));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let stale_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_stale_event_diagnostics WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("stale diagnostics should count");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape rows should count");
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime events should count");
+        assert_eq!(stale_count, 1);
+        assert_eq!(tape_count, 0);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn persisted_tape_runtime_event_lookup_uses_exact_deterministic_identity() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "session_exact_tape_runtime_lookup";
+        let run_id = "run_exact_tape_runtime_lookup";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("generation should load")
+            .expect("generation should be active")
+            .generation;
+        let tape_request = OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: 0,
+            event_type: "status".to_owned(),
+            payload_json: r#"{"kind":"in_progress"}"#.to_owned(),
+        };
+        let mut runtime_request = RuntimeEventAppendRequest {
+            lane: RuntimeGenerationLane::Run,
+            envelope: runtime_event(
+                session_id,
+                run_id,
+                generation,
+                0,
+                RuntimeEventName::RunStarted,
+            ),
+        };
+        runtime_request.envelope.event_id =
+            RuntimeEventId::parse(format!("run_stream:{run_id}:0").as_str())
+                .expect("deterministic runtime event id should validate");
+        store
+            .append_orchestrator_tape_event_with_runtime_projection(
+                &tape_request,
+                Some(&runtime_request),
+            )
+            .expect("tape and runtime projection should append");
+
+        let persisted = store
+            .persisted_runtime_event_for_tape_sequence(run_id, 0)
+            .expect("exact runtime projection should load")
+            .expect("exact runtime projection should exist");
+        persisted.validate().expect("persisted V2 envelope should validate");
+        assert_eq!(persisted.event_id, runtime_request.envelope.event_id);
+        assert_eq!(persisted.identities.run_id.as_str(), run_id);
+        assert!(store
+            .persisted_runtime_event_for_tape_sequence(run_id, 1)
+            .expect("wrong sequence should classify")
+            .is_none());
+        assert!(store
+            .persisted_runtime_event_for_tape_sequence("other_runtime_lookup_run", 0)
+            .expect("wrong run should classify")
+            .is_none());
+    }
+
+    #[test]
+    fn committed_steer_between_precheck_and_guarded_mutations_has_zero_callback_effect() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "generation_cas_race_session";
+        let parent_run_id = "generation_cas_race_parent";
+        let task_id = "generation_cas_race_task";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, parent_run_id);
+        let initial_generation = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("precheck should load")
+            .expect("parent generation should be active")
+            .generation;
+        let task = store
+            .create_orchestrator_background_task(&queued_delegation_request(
+                session_id,
+                parent_run_id,
+                task_id,
+                Some(test_child_task_cancellation_context(initial_generation)),
+            ))
+            .expect("delegated task should persist");
+        let task = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task.task_id,
+                expected_revision: task.revision,
+                started_at_unix_ms: 1,
+            })
+            .expect("task should enter running state");
+        let parent_guard = OrchestratorParentGenerationGuard {
+            session_id: session_id.to_owned(),
+            run_id: parent_run_id.to_owned(),
+            expected_generation: initial_generation,
+        };
+
+        // The callback precheck has observed G1. The separate connection must
+        // commit G2 before any guarded mutation is allowed to start.
+        let (steer_tx, steer_rx) = mpsc::sync_channel(0);
+        let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+        let steer_path = db_path.clone();
+        let steer_worker = std::thread::spawn(move || {
+            steer_rx.recv().expect("steer should be released");
+            let steer_store = JournalStore::open(test_journal_config(steer_path, false))
+                .expect("steer store should open");
+            steer_store
+                .supersede_run_runtime_generation(
+                    session_id,
+                    parent_run_id,
+                    "runtime.generation.test_steer",
+                )
+                .expect("steer should supersede generation");
+            committed_tx.send(()).expect("steer commit should signal");
+        });
+        steer_tx.send(()).expect("steer should start");
+        committed_rx.recv().expect("steer should commit before callback mutations");
+
+        assert!(!store
+            .update_orchestrator_run_metadata_if_parent_generation(
+                &OrchestratorRunMetadataUpdateRequest {
+                    run_id: parent_run_id.to_owned(),
+                    parent_run_id: None,
+                    delegation: Some(Some(test_delegation_snapshot())),
+                    merge_result: None,
+                },
+                &parent_guard,
+            )
+            .expect("stale metadata mutation should classify"));
+        let tape_sequence = i64::try_from(
+            store
+                .orchestrator_run_status_snapshot(parent_run_id)
+                .expect("parent snapshot should load")
+                .expect("parent should exist")
+                .tape_events,
+        )
+        .expect("tape sequence should fit");
+        assert!(!store
+            .append_orchestrator_tape_event_if_parent_generation(
+                &OrchestratorTapeAppendRequest {
+                    run_id: parent_run_id.to_owned(),
+                    seq: tape_sequence,
+                    event_type: "child_run_merged".to_owned(),
+                    payload_json: r#"{"stale":true}"#.to_owned(),
+                },
+                &parent_guard,
+            )
+            .expect("stale tape mutation should classify"));
+        assert!(store
+            .update_orchestrator_background_task_from_worker_if_parent_generation(
+                &OrchestratorBackgroundTaskWorkerUpdateRequest {
+                    task_id: task.task_id.clone(),
+                    execution_generation: task.execution_generation,
+                    state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
+                    target_run_id: None,
+                    last_error: None,
+                    result_json: Some(Some(r#"{"stale":true}"#.to_owned())),
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: Some(Some(2)),
+                },
+                &parent_guard,
+            )
+            .expect("stale finalization should classify")
+            .is_none());
+        steer_worker.join().expect("steer worker should not panic");
+
+        let parent = store
+            .orchestrator_run_status_snapshot(parent_run_id)
+            .expect("parent snapshot should load")
+            .expect("parent should exist");
+        assert!(parent.delegation.is_none(), "stale callback must not change metadata");
+        let merge_rows: i64 = store
+            .connection
+            .lock()
+            .expect("journal lock should not be poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'child_run_merged'",
+                params![parent_run_id],
+                |row| row.get(0),
+            )
+            .expect("merge rows should count");
+        assert_eq!(merge_rows, 0, "stale callback must not append a merge event");
+        let durable_task = store
+            .get_orchestrator_background_task(task_id)
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(durable_task.state, AuxiliaryTaskState::Running.as_str());
+        assert!(durable_task.result_json.is_none());
+        assert!(durable_task.completed_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn runtime_generation_activation_is_idempotent_for_same_run() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_generation_retry";
+        let run_id = "run_generation_retry";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let first = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let replay = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        assert_eq!(replay, first);
+    }
+
+    #[test]
+    fn concurrent_generation_reactivation_persists_one_active_lease() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_generation_concurrent_activation";
+        let run_id = "run_generation_concurrent_activation";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        store
+            .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind: RuntimeGenerationTransitionKind::Released,
+                reason_code: "runtime.generation.test_release".to_owned(),
+            })
+            .expect("initial generation should close");
+        drop(store);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for worker_id in 0..2 {
+            let worker_path = db_path.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let worker_store = JournalStore::open(test_journal_config(worker_path, false))
+                    .expect("worker store should open");
+                worker_barrier.wait();
+                worker_store
+                    .activate_runtime_generation(&RuntimeGenerationActivateRequest {
+                        session_id: session_id.to_owned(),
+                        run_id: Some(run_id.to_owned()),
+                        lane: RuntimeGenerationLane::Run,
+                        owner: format!("worker-{worker_id}"),
+                        ttl_ms: 60_000,
+                        transition_kind: RuntimeGenerationTransitionKind::Activated,
+                        reason_code: "runtime.generation.concurrent_reactivate".to_owned(),
+                    })
+                    .expect("concurrent activation should serialize")
+            }));
+        }
+        barrier.wait();
+        let generations = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("activation worker should not panic").generation)
+            .collect::<Vec<_>>();
+        assert_eq!(generations[0], generations[1]);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let lease_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_generation_leases WHERE session_ulid = ?1 AND lane = 'run'",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .expect("active leases should count");
+        assert_eq!(lease_count, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn runtime_generation_lane_has_at_most_one_active_lease(
+            supersede_count in 0_u8..16,
+        ) {
+            let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+                .expect("journal store should open");
+            let session_id = "session_generation_single_lease_property";
+            let run_id = "run_generation_single_lease_property";
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, run_id);
+            for _ in 0..supersede_count {
+                store
+                    .supersede_run_runtime_generation(
+                        session_id,
+                        run_id,
+                        "runtime.generation.property_steer",
+                    )
+                    .expect("steer should supersede generation");
+            }
+            let lease_count: i64 = store
+                .connection
+                .lock()
+                .expect("journal lock should not be poisoned")
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_generation_leases WHERE session_ulid = ?1 AND lane = 'run'",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .expect("active leases should count");
+            prop_assert_eq!(lease_count, 1);
+        }
+    }
+
+    #[test]
+    fn runtime_generation_invalidation_is_idempotent_and_run_scoped() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_generation_close";
+        let run_id = "run_generation_close";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+
+        let mismatch = store
+            .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some("other_run".to_owned()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind: RuntimeGenerationTransitionKind::Cancelled,
+                reason_code: "runtime.generation.cancelled".to_owned(),
+            })
+            .expect("mismatched invalidation should classify");
+        assert_eq!(mismatch, RuntimeGenerationInvalidateOutcome::RunMismatch);
+        let request = RuntimeGenerationInvalidateRequest {
+            session_id: session_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
+            lane: RuntimeGenerationLane::Run,
+            transition_kind: RuntimeGenerationTransitionKind::Cancelled,
+            reason_code: "runtime.generation.cancelled".to_owned(),
+        };
+        assert_eq!(
+            store.invalidate_runtime_generation(&request).expect("generation should invalidate"),
+            RuntimeGenerationInvalidateOutcome::Invalidated
+        );
+        assert_eq!(
+            store
+                .invalidate_runtime_generation(&request)
+                .expect("invalidation replay should be idempotent"),
+            RuntimeGenerationInvalidateOutcome::AlreadyInactive
+        );
+        assert!(store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("active generation lookup should succeed")
+            .is_none());
+
+        let reactivated = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        assert_eq!(reactivated.generation.get(), 2);
+    }
+
+    #[test]
+    fn expired_runtime_generation_has_no_mutation_authority() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_generation_expired";
+        let run_id = "run_generation_expired";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_generation_leases SET expires_at_unix_ms = acquired_at_unix_ms",
+                [],
+            )
+            .expect("generation lease should expire");
+        drop(connection);
+
+        assert!(store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("active generation lookup should succeed")
+            .is_none());
+        let outcome = store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(
+                    session_id,
+                    run_id,
+                    lease.generation,
+                    1,
+                    RuntimeEventName::RunStarted,
+                ),
+            })
+            .expect("expired generation event should be suppressed");
+        assert_eq!(outcome, RuntimeEventAppendOutcome::StaleSuppressed);
+    }
+
+    #[test]
+    fn runtime_event_ledger_rejects_mismatched_run_identity() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_event_run_guard";
+        let run_id = "run_event_owner";
+        let other_run_id = "run_event_other";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+
+        let outcome = store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(
+                    session_id,
+                    other_run_id,
+                    lease.generation,
+                    1,
+                    RuntimeEventName::RunStarted,
+                ),
+            })
+            .expect("mismatched run event should be suppressed");
+        assert_eq!(outcome, RuntimeEventAppendOutcome::StaleSuppressed);
+    }
+
+    #[test]
+    fn runtime_event_ledger_rejects_descriptor_lane_mismatch() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_event_lane";
+        let run_id = "run_event_lane";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+
+        let error = store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Tool,
+                envelope: runtime_event(
+                    session_id,
+                    run_id,
+                    lease.generation,
+                    1,
+                    RuntimeEventName::RunStarted,
+                ),
+            })
+            .expect_err("descriptor lane mismatch must fail closed");
+
+        assert!(
+            matches!(error, JournalError::InvalidArgument(message) if message.contains("requires generation lane run, observed tool"))
+        );
+    }
+
+    #[test]
+    fn runtime_event_ledger_rejects_duplicate_terminal() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_terminal_guard";
+        let run_id = "run_terminal_guard";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+
+        for (sequence, event_name) in
+            [(1, RuntimeEventName::RunCompleted), (2, RuntimeEventName::RunFailed)]
+        {
+            let result = store.append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(session_id, run_id, lease.generation, sequence, event_name),
+            });
+            if sequence == 1 {
+                assert_eq!(
+                    result.expect("first terminal should append"),
+                    RuntimeEventAppendOutcome::Appended { sequence: 1 }
+                );
+            } else {
+                assert!(matches!(result, Err(JournalError::Sqlite(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_event_ledger_allocates_monotonic_host_sequences() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_event_sequence";
+        let run_id = "run_event_sequence";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+
+        for caller_sequence in [42, 1] {
+            let outcome = store
+                .append_runtime_event(&RuntimeEventAppendRequest {
+                    lane: RuntimeGenerationLane::Run,
+                    envelope: runtime_event(
+                        session_id,
+                        run_id,
+                        lease.generation,
+                        caller_sequence,
+                        RuntimeEventName::RunStarted,
+                    ),
+                })
+                .expect("runtime event should append");
+            let expected_sequence = if caller_sequence == 42 { 1 } else { 2 };
+            assert_eq!(
+                outcome,
+                RuntimeEventAppendOutcome::Appended { sequence: expected_sequence }
+            );
+        }
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let sequences = connection
+            .prepare("SELECT sequence, envelope_json FROM runtime_events_v2 ORDER BY sequence ASC")
+            .expect("runtime event query should prepare")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .expect("runtime event query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("runtime event rows should load");
+        assert_eq!(sequences.len(), 2);
+        for (index, (sequence, envelope_json)) in sequences.iter().enumerate() {
+            let expected = i64::try_from(index + 1).expect("small sequence");
+            assert_eq!(*sequence, expected);
+            let envelope: RuntimeEventEnvelopeV2 =
+                serde_json::from_str(envelope_json).expect("event envelope should decode");
+            assert_eq!(envelope.sequence, u64::try_from(expected).expect("positive sequence"));
+        }
+    }
+
+    #[test]
+    fn runtime_event_replay_is_idempotent_and_conflicts_fail_closed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_event_replay";
+        let run_id = "run_event_replay";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let request = RuntimeEventAppendRequest {
+            lane: RuntimeGenerationLane::Run,
+            envelope: runtime_event(
+                session_id,
+                run_id,
+                lease.generation,
+                91,
+                RuntimeEventName::RunStarted,
+            ),
+        };
+
+        assert_eq!(
+            store.append_runtime_event(&request).expect("runtime event should append"),
+            RuntimeEventAppendOutcome::Appended { sequence: 1 }
+        );
+        assert_eq!(
+            store.append_runtime_event(&request).expect("matching replay should be idempotent"),
+            RuntimeEventAppendOutcome::AlreadyAppended { sequence: 1 }
+        );
+
+        let mut conflicting = request.clone();
+        conflicting.envelope.reason_code = "runtime.event.conflicting_replay".to_owned();
+        assert!(matches!(
+            store.append_runtime_event(&conflicting),
+            Err(JournalError::InvalidArgument(message))
+                if message.contains("conflicting durable evidence")
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_events_v2", [], |row| row.get(0))
+            .expect("runtime event count should load");
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn side_effect_prepare_rejects_mismatched_operation_reuse() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_side_effect_prepare";
+        let run_id = "run_side_effect_prepare";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let fence = runtime_side_effect_fence();
+        assert_eq!(
+            store
+                .prepare_side_effect_fence(session_id, run_id, &fence)
+                .expect("new side-effect intent should prepare"),
+            SideEffectRetryDecision::Safe
+        );
+        assert_eq!(
+            store
+                .prepare_side_effect_fence(session_id, run_id, &fence)
+                .expect("matching side-effect intent should be reusable"),
+            SideEffectRetryDecision::Safe
+        );
+
+        let mut mismatched_intent = fence.clone();
+        mismatched_intent.intent_sha256 = "b".repeat(64);
+        assert!(matches!(
+            store.prepare_side_effect_fence(session_id, run_id, &mismatched_intent),
+            Err(JournalError::InvalidArgument(message))
+                if message.contains("different normalized intent")
+        ));
+
+        let mut mismatched_semantics = fence;
+        mismatched_semantics.semantics.tool_name = "palyra.process.run".to_owned();
+        assert!(matches!(
+            store.prepare_side_effect_fence(session_id, run_id, &mismatched_semantics),
+            Err(JournalError::InvalidArgument(message))
+                if message.contains("different tool execution semantics")
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let events = connection
+            .prepare(
+                "SELECT event_name, sequence, envelope_json FROM runtime_events_v2 ORDER BY sequence ASC",
+            )
+            .expect("side-effect runtime event query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("side-effect runtime event query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("side-effect runtime events should load");
+        assert_eq!(events.len(), 1, "intent reuse must not duplicate V2 evidence");
+        assert_eq!(events[0].0, RuntimeEventName::ToolIntentRecorded.as_str());
+        assert_eq!(events[0].1, 1);
+        let envelope: RuntimeEventEnvelopeV2 =
+            serde_json::from_str(events[0].2.as_str()).expect("side-effect event should decode");
+        assert_eq!(envelope.sequence, 1);
+        assert_eq!(envelope.subsystem, RuntimeSubsystem::Tool);
+        assert_eq!(envelope.phase, RuntimeErrorPhase::ToolExecution);
+        assert_eq!(envelope.actor_kind, RuntimeEventActorKind::Tool);
+        assert_eq!(envelope.redaction_class, RuntimeEventRedactionClass::HashOnly);
+        assert_eq!(
+            envelope.identities.tool_execution_id.as_ref(),
+            Some(&mismatched_semantics.tool_execution_id)
+        );
+        assert_eq!(
+            envelope.identities.operation_id.as_ref(),
+            Some(&mismatched_semantics.operation_id)
+        );
+    }
+
+    #[test]
+    fn side_effect_transitions_append_ordered_runtime_events_once() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_side_effect_events";
+        let run_id = "run_side_effect_events";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                fence.observed_generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+        let evidence_sha256 = "b".repeat(64);
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectObserved,
+                fence.observed_generation,
+                "tool.effect.observed",
+                Some(evidence_sha256.clone()),
+            )
+            .expect("side effect should be observed");
+        assert!(matches!(
+            store.transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectObserved,
+                fence.observed_generation,
+                "tool.effect.observed",
+                Some(evidence_sha256),
+            ),
+            Err(JournalError::InvalidArgument(_))
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let events = connection
+            .prepare(
+                "SELECT event_name, sequence, envelope_json FROM runtime_events_v2 ORDER BY sequence ASC",
+            )
+            .expect("side-effect runtime event query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("side-effect runtime event query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("side-effect runtime events should load");
+        assert_eq!(
+            events.iter().map(|event| event.0.as_str()).collect::<Vec<_>>(),
+            vec![
+                RuntimeEventName::ToolIntentRecorded.as_str(),
+                RuntimeEventName::ToolEffectStarted.as_str(),
+                RuntimeEventName::ToolEffectObserved.as_str(),
+            ]
+        );
+        for (index, (_, sequence, envelope_json)) in events.iter().enumerate() {
+            let expected_sequence = i64::try_from(index + 1).expect("small sequence");
+            assert_eq!(*sequence, expected_sequence);
+            let envelope: RuntimeEventEnvelopeV2 = serde_json::from_str(envelope_json.as_str())
+                .expect("side-effect runtime event should decode");
+            assert_eq!(
+                envelope.sequence,
+                u64::try_from(expected_sequence).expect("positive sequence")
+            );
+            assert_eq!(
+                envelope.identities.tool_execution_id.as_ref(),
+                Some(&fence.tool_execution_id)
+            );
+            assert_eq!(envelope.identities.operation_id.as_ref(), Some(&fence.operation_id));
+        }
+        let fence_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fence_events WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence events should count");
+        assert_eq!(fence_event_count, 3, "losing replay must append no evidence");
+    }
+
+    #[test]
+    fn tool_effect_observation_commits_result_evidence_and_fence_atomically() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_tool_effect_commit";
+        let run_id = "run_tool_effect_commit";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        )
+        .generation;
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+
+        let proposal_id = "proposal_tool_effect_commit";
+        let mut identities = palyra_common::runtime_contracts::RuntimeIdentitySetV1::for_run(
+            palyra_common::runtime_contracts::RuntimeTraceId::parse(run_id)
+                .expect("trace id should validate"),
+            palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                .expect("session id should validate"),
+            palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                .expect("run id should validate"),
+            generation,
+        );
+        identities.tool_proposal_id = Some(
+            palyra_common::runtime_contracts::RuntimeToolProposalId::parse(proposal_id)
+                .expect("proposal id should validate"),
+        );
+        identities.tool_execution_id = Some(fence.tool_execution_id.clone());
+        identities.operation_id = Some(fence.operation_id.clone());
+        let runtime_event_for = |seq: i64, event_name: RuntimeEventName| {
+            let descriptor = event_name.descriptor();
+            RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: RuntimeEventEnvelopeV2 {
+                    schema_version: 2,
+                    event_id: RuntimeEventId::parse(format!("tool_effect_commit:{seq}").as_str())
+                        .expect("event id should validate"),
+                    identities: identities.clone(),
+                    sequence: 0,
+                    causal_parent_event_id: None,
+                    subsystem: descriptor.subsystem,
+                    phase: descriptor.phase,
+                    event_name,
+                    reason_code: "runtime.event.test".to_owned(),
+                    actor_kind: descriptor.actor_kind,
+                    retryability: descriptor.retryability,
+                    redaction_class: descriptor.redaction_class,
+                    terminal: descriptor.terminal,
+                    payload: RuntimeEventPayloadRef::Omitted {
+                        reason_code: "runtime.event.test_payload_omitted".to_owned(),
+                        digest_sha256: None,
+                        size_bytes: 2,
+                    },
+                    occurred_at_unix_ms: 1,
+                    extensions: BTreeMap::new(),
+                },
+            }
+        };
+        let request = ToolEffectObservationCommitRequest {
+            operation_id: fence.operation_id.clone(),
+            generation,
+            evidence_sha256: "b".repeat(64),
+            tape_events: vec![
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "tool_result".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 1,
+                    event_type: "tool_attestation".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 2,
+                    event_type: "tool.executed".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+            ],
+        };
+        let runtime_events = vec![
+            Some(runtime_event_for(0, RuntimeEventName::ToolResultObserved)),
+            Some(runtime_event_for(1, RuntimeEventName::ToolAttestationObserved)),
+            None,
+        ];
+        let observed = store
+            .commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                runtime_events.as_slice(),
+            )
+            .expect("tool result evidence and fence should commit");
+        assert_eq!(observed.state, SideEffectFenceState::EffectObserved);
+        assert_eq!(observed.evidence_sha256.as_deref(), Some(request.evidence_sha256.as_str()));
+
+        let connection = Connection::open(&db_path).expect("journal db should reopen");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape events should count");
+        assert_eq!(tape_count, 3);
+        drop(connection);
+        let replay = store
+            .commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                runtime_events.as_slice(),
+            )
+            .expect("matching tool effect observation replay should succeed");
+        assert_eq!(replay, observed);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let replayed_tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("replayed tape events should count");
+        assert_eq!(replayed_tape_count, 3);
+        let runtime_event_names = connection
+            .prepare(
+                "SELECT event_name FROM runtime_events_v2 WHERE run_ulid = ?1 ORDER BY sequence ASC",
+            )
+            .expect("runtime event query should prepare")
+            .query_map(params![run_id], |row| row.get::<_, String>(0))
+            .expect("runtime event query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("runtime events should load");
+        assert_eq!(
+            runtime_event_names,
+            vec![
+                RuntimeEventName::ToolIntentRecorded.as_str(),
+                RuntimeEventName::ToolEffectStarted.as_str(),
+                RuntimeEventName::ToolResultObserved.as_str(),
+                RuntimeEventName::ToolAttestationObserved.as_str(),
+                RuntimeEventName::ToolEffectObserved.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_effect_observation_replay_rejects_mismatched_execution_identity() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_tool_effect_replay_identity";
+        let run_id = "run_tool_effect_replay_identity";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        )
+        .generation;
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+
+        let proposal_id = "proposal_tool_effect_replay_identity";
+        let mut identities = palyra_common::runtime_contracts::RuntimeIdentitySetV1::for_run(
+            palyra_common::runtime_contracts::RuntimeTraceId::parse(run_id)
+                .expect("trace id should validate"),
+            palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                .expect("session id should validate"),
+            palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                .expect("run id should validate"),
+            generation,
+        );
+        identities.tool_proposal_id = Some(
+            palyra_common::runtime_contracts::RuntimeToolProposalId::parse(proposal_id)
+                .expect("proposal id should validate"),
+        );
+        identities.tool_execution_id = Some(fence.tool_execution_id.clone());
+        identities.operation_id = Some(fence.operation_id.clone());
+        let runtime_event_for =
+            |event_id: &str,
+             event_name: RuntimeEventName,
+             event_identities: palyra_common::runtime_contracts::RuntimeIdentitySetV1| {
+                let descriptor = event_name.descriptor();
+                RuntimeEventAppendRequest {
+                    lane: RuntimeGenerationLane::Run,
+                    envelope: RuntimeEventEnvelopeV2 {
+                        schema_version: 2,
+                        event_id: RuntimeEventId::parse(event_id)
+                            .expect("event id should validate"),
+                        identities: event_identities,
+                        sequence: 0,
+                        causal_parent_event_id: None,
+                        subsystem: descriptor.subsystem,
+                        phase: descriptor.phase,
+                        event_name,
+                        reason_code: "runtime.event.test".to_owned(),
+                        actor_kind: descriptor.actor_kind,
+                        retryability: descriptor.retryability,
+                        redaction_class: descriptor.redaction_class,
+                        terminal: descriptor.terminal,
+                        payload: RuntimeEventPayloadRef::Omitted {
+                            reason_code: "runtime.event.test_payload_omitted".to_owned(),
+                            digest_sha256: None,
+                            size_bytes: 2,
+                        },
+                        occurred_at_unix_ms: 1,
+                        extensions: BTreeMap::new(),
+                    },
+                }
+            };
+        let request = ToolEffectObservationCommitRequest {
+            operation_id: fence.operation_id.clone(),
+            generation,
+            evidence_sha256: "b".repeat(64),
+            tape_events: vec![
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "tool_result".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 1,
+                    event_type: "tool_attestation".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 2,
+                    event_type: "tool.executed".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+            ],
+        };
+        let runtime_events = vec![
+            Some(runtime_event_for(
+                "tool_effect_replay_identity:0",
+                RuntimeEventName::ToolResultObserved,
+                identities.clone(),
+            )),
+            Some(runtime_event_for(
+                "tool_effect_replay_identity:1",
+                RuntimeEventName::ToolAttestationObserved,
+                identities.clone(),
+            )),
+            None,
+        ];
+        store
+            .commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                runtime_events.as_slice(),
+            )
+            .expect("initial tool effect observation should commit");
+
+        let mut mismatched_identities = identities;
+        mismatched_identities.tool_execution_id = Some(
+            RuntimeToolExecutionId::parse("execution_tool_effect_replay_mismatch")
+                .expect("mismatched execution id should validate"),
+        );
+        let mismatched_runtime_events = vec![
+            Some(runtime_event_for(
+                "tool_effect_replay_identity:0",
+                RuntimeEventName::ToolResultObserved,
+                mismatched_identities.clone(),
+            )),
+            Some(runtime_event_for(
+                "tool_effect_replay_identity:1",
+                RuntimeEventName::ToolAttestationObserved,
+                mismatched_identities,
+            )),
+            None,
+        ];
+        assert!(matches!(
+            store.commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                mismatched_runtime_events.as_slice(),
+            ),
+            Err(JournalError::ToolSideEffectFencePrecondition { reason, .. })
+                if reason == "tool result event does not match the fenced execution"
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape events should count");
+        let runtime_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime events should count");
+        assert_eq!(tape_count, 3);
+        assert_eq!(runtime_event_count, 5);
+    }
+
+    #[test]
+    fn tool_effect_observation_rejects_conflicting_evidence_and_stale_generation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_tool_effect_conflict";
+        let run_id = "run_tool_effect_conflict";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        )
+        .generation;
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+
+        let proposal_id = "proposal_tool_effect_conflict";
+        let mut identities = palyra_common::runtime_contracts::RuntimeIdentitySetV1::for_run(
+            palyra_common::runtime_contracts::RuntimeTraceId::parse(run_id)
+                .expect("trace id should validate"),
+            palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                .expect("session id should validate"),
+            palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                .expect("run id should validate"),
+            generation,
+        );
+        identities.tool_proposal_id = Some(
+            palyra_common::runtime_contracts::RuntimeToolProposalId::parse(proposal_id)
+                .expect("proposal id should validate"),
+        );
+        identities.tool_execution_id = Some(fence.tool_execution_id.clone());
+        identities.operation_id = Some(fence.operation_id.clone());
+        let runtime_event_for = |event_id: &str, event_name: RuntimeEventName| {
+            let descriptor = event_name.descriptor();
+            RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: RuntimeEventEnvelopeV2 {
+                    schema_version: 2,
+                    event_id: RuntimeEventId::parse(event_id).expect("event id should validate"),
+                    identities: identities.clone(),
+                    sequence: 0,
+                    causal_parent_event_id: None,
+                    subsystem: descriptor.subsystem,
+                    phase: descriptor.phase,
+                    event_name,
+                    reason_code: "runtime.event.test".to_owned(),
+                    actor_kind: descriptor.actor_kind,
+                    retryability: descriptor.retryability,
+                    redaction_class: descriptor.redaction_class,
+                    terminal: descriptor.terminal,
+                    payload: RuntimeEventPayloadRef::Omitted {
+                        reason_code: "runtime.event.test_payload_omitted".to_owned(),
+                        digest_sha256: None,
+                        size_bytes: 2,
+                    },
+                    occurred_at_unix_ms: 1,
+                    extensions: BTreeMap::new(),
+                },
+            }
+        };
+        let request = ToolEffectObservationCommitRequest {
+            operation_id: fence.operation_id.clone(),
+            generation,
+            evidence_sha256: "b".repeat(64),
+            tape_events: vec![
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "tool_result".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 1,
+                    event_type: "tool_attestation".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 2,
+                    event_type: "tool.executed".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+            ],
+        };
+        let runtime_events = vec![
+            Some(runtime_event_for("tool_effect_conflict:0", RuntimeEventName::ToolResultObserved)),
+            Some(runtime_event_for(
+                "tool_effect_conflict:1",
+                RuntimeEventName::ToolAttestationObserved,
+            )),
+            None,
+        ];
+        store
+            .commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                runtime_events.as_slice(),
+            )
+            .expect("initial tool effect observation should commit");
+
+        let mut conflicting_request = request.clone();
+        conflicting_request.evidence_sha256 = "c".repeat(64);
+        assert!(matches!(
+            store.commit_tool_effect_observation_with_runtime_projections(
+                &conflicting_request,
+                runtime_events.as_slice(),
+            ),
+            Err(JournalError::ToolSideEffectFencePrecondition { reason, .. })
+                if reason == "tool effect observation requires the exact started fence"
+        ));
+
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::SteerSuperseded,
+        );
+        assert!(matches!(
+            store.commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                runtime_events.as_slice(),
+            ),
+            Err(JournalError::InvalidArgument(reason))
+                if reason == "side-effect mutation was rejected for a stale runtime generation"
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape events should count");
+        let runtime_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime events should count");
+        assert_eq!(tape_count, 3);
+        assert_eq!(runtime_event_count, 5);
+    }
+
+    #[test]
+    fn tool_effect_observation_rolls_back_partial_result_evidence() {
+        let db_path = temp_db_path();
+        let mut config = test_journal_config(db_path.clone(), false);
+        config.max_payload_bytes = 900;
+        let store = JournalStore::open(config).expect("journal store should open");
+        let session_id = "session_tool_effect_rollback";
+        let run_id = "run_tool_effect_rollback";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        )
+        .generation;
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+        let proposal_id = "proposal_tool_effect_rollback";
+        let mut identities = palyra_common::runtime_contracts::RuntimeIdentitySetV1::for_run(
+            palyra_common::runtime_contracts::RuntimeTraceId::parse(run_id)
+                .expect("trace id should validate"),
+            palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                .expect("session id should validate"),
+            palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                .expect("run id should validate"),
+            generation,
+        );
+        identities.tool_proposal_id = Some(
+            palyra_common::runtime_contracts::RuntimeToolProposalId::parse(proposal_id)
+                .expect("proposal id should validate"),
+        );
+        identities.tool_execution_id = Some(fence.tool_execution_id.clone());
+        identities.operation_id = Some(fence.operation_id.clone());
+        let runtime_event_for = |seq: i64, event_name: RuntimeEventName| {
+            let descriptor = event_name.descriptor();
+            RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: RuntimeEventEnvelopeV2 {
+                    schema_version: 2,
+                    event_id: RuntimeEventId::parse(format!("tool_effect_rollback:{seq}").as_str())
+                        .expect("event id should validate"),
+                    identities: identities.clone(),
+                    sequence: 0,
+                    causal_parent_event_id: None,
+                    subsystem: descriptor.subsystem,
+                    phase: descriptor.phase,
+                    event_name,
+                    reason_code: "runtime.event.test".to_owned(),
+                    actor_kind: descriptor.actor_kind,
+                    retryability: descriptor.retryability,
+                    redaction_class: descriptor.redaction_class,
+                    terminal: descriptor.terminal,
+                    payload: RuntimeEventPayloadRef::Omitted {
+                        reason_code: "runtime.event.test_payload_omitted".to_owned(),
+                        digest_sha256: None,
+                        size_bytes: 2,
+                    },
+                    occurred_at_unix_ms: 1,
+                    extensions: BTreeMap::new(),
+                },
+            }
+        };
+        let request = ToolEffectObservationCommitRequest {
+            operation_id: fence.operation_id.clone(),
+            generation,
+            evidence_sha256: "b".repeat(64),
+            tape_events: vec![
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "tool_result".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 1,
+                    event_type: "tool_attestation".to_owned(),
+                    payload_json: json!({
+                        "proposal_id": proposal_id,
+                        "oversized": "x".repeat(1024),
+                    })
+                    .to_string(),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 2,
+                    event_type: "tool.executed".to_owned(),
+                    payload_json: json!({"proposal_id": proposal_id}).to_string(),
+                },
+            ],
+        };
+        assert!(matches!(
+            store.commit_tool_effect_observation_with_runtime_projections(
+                &request,
+                &[
+                    Some(runtime_event_for(0, RuntimeEventName::ToolResultObserved)),
+                    Some(runtime_event_for(1, RuntimeEventName::ToolAttestationObserved)),
+                    None,
+                ],
+            ),
+            Err(JournalError::PayloadTooLarge { payload_kind: "orchestrator_tape", .. })
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let tape_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("tape events should count");
+        assert_eq!(tape_count, 0);
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_side_effect_fences WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence state should load");
+        assert_eq!(state, SideEffectFenceState::EffectStarted.as_str());
+    }
+
+    #[test]
+    fn concurrent_side_effect_transition_has_one_event_winner() {
+        let db_path = temp_db_path();
+        let store = Arc::new(
+            JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open"),
+        );
+        let session_id = "session_side_effect_concurrent";
+        let run_id = "run_side_effect_concurrent";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_store = Arc::clone(&store);
+            let worker_barrier = Arc::clone(&barrier);
+            let operation_id = fence.operation_id.as_str().to_owned();
+            let generation = fence.observed_generation;
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_store.transition_side_effect_fence(
+                    operation_id.as_str(),
+                    SideEffectFenceState::EffectStarted,
+                    generation,
+                    "tool.effect.started",
+                    None,
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("transition worker should not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_err()).count(), 1);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let runtime_events = connection
+            .prepare("SELECT event_name, sequence FROM runtime_events_v2 ORDER BY sequence ASC")
+            .expect("runtime event query should prepare")
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .expect("runtime event query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("runtime events should load");
+        assert_eq!(
+            runtime_events,
+            vec![
+                (RuntimeEventName::ToolIntentRecorded.as_str().to_owned(), 1),
+                (RuntimeEventName::ToolEffectStarted.as_str().to_owned(), 2),
+            ]
+        );
+        let fence_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fence_events WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence events should count");
+        assert_eq!(fence_event_count, 2);
+    }
+
+    fn make_side_effect_unknown(
+        store: &JournalStore,
+        session_id: &str,
+        run_id: &str,
+    ) -> SideEffectFenceV1 {
+        upsert_orchestrator_session(store, session_id);
+        start_orchestrator_run(store, session_id, run_id);
+        activate_runtime_generation(
+            store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let fence = runtime_side_effect_fence();
+        store
+            .prepare_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                fence.observed_generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect("side effect should start");
+        store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectUnknown,
+                fence.observed_generation,
+                "tool.effect.ack_unknown",
+                None,
+            )
+            .expect("side effect should become unknown");
+        fence
+    }
+
+    fn side_effect_cleanup_outcome(
+        fence: &SideEffectFenceV1,
+        outcome_observed: bool,
+    ) -> SideEffectFenceCleanupOutcomeRequest {
+        SideEffectFenceCleanupOutcomeRequest {
+            operation_id: fence.operation_id.as_str().to_owned(),
+            observed_generation: fence.observed_generation,
+            outcome_observed,
+            reason_code: if outcome_observed {
+                "tool.effect.cleanup_reconciled"
+            } else {
+                "tool.effect.cleanup_unknown"
+            }
+            .to_owned(),
+            evidence_sha256: outcome_observed.then(|| "b".repeat(64)),
+        }
+    }
+
+    fn operator_side_effect_resolution(
+        fence: &SideEffectFenceV1,
+        resolution: SideEffectFenceState,
+    ) -> SideEffectFenceOperatorResolutionRequest {
+        SideEffectFenceOperatorResolutionRequest {
+            operation_id: fence.operation_id.as_str().to_owned(),
+            expected_intent_sha256: fence.intent_sha256.clone(),
+            resolution,
+            reason_code: match resolution {
+                SideEffectFenceState::Reconciled => "tool.effect.operator_reconciled",
+                SideEffectFenceState::Abandoned => "tool.effect.operator_abandoned",
+                _ => "tool.effect.operator_invalid",
+            }
+            .to_owned(),
+            evidence_sha256: "c".repeat(64),
+            actor_id_sha256: "d".repeat(64),
+        }
+    }
+
+    #[test]
+    fn cleanup_owner_reconciles_unknown_effect_without_active_generation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_side_effect_cleanup";
+        let run_id = "run_side_effect_cleanup";
+        let fence = make_side_effect_unknown(&store, session_id, run_id);
+        store
+            .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind: RuntimeGenerationTransitionKind::Released,
+                reason_code: "runtime.generation.test_closed".to_owned(),
+            })
+            .expect("run generation should close");
+        let request = side_effect_cleanup_outcome(&fence, true);
+
+        let resolved = store
+            .record_side_effect_cleanup_outcome(&request)
+            .expect("cleanup-owner reconciliation should persist without active generation");
+        assert_eq!(resolved.state, SideEffectFenceState::Reconciled);
+        assert_eq!(resolved.evidence_sha256.as_deref(), request.evidence_sha256.as_deref());
+        assert_eq!(
+            store
+                .record_side_effect_cleanup_outcome(&request)
+                .expect("matching cleanup reconciliation should replay"),
+            resolved
+        );
+        assert!(store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("generation query should succeed")
+            .is_none());
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let raw = connection
+            .query_row(
+                "SELECT envelope_json FROM runtime_events_v2 WHERE event_name = ?1",
+                params![RuntimeEventName::ToolEffectCleanupReconciled.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("cleanup reconciliation event should exist");
+        let envelope: RuntimeEventEnvelopeV2 =
+            serde_json::from_str(raw.as_str()).expect("cleanup event should decode");
+        assert_eq!(envelope.actor_kind, RuntimeEventActorKind::Host);
+        assert_eq!(envelope.phase, RuntimeErrorPhase::Recovery);
+        assert_eq!(envelope.sequence, 4);
+        assert_eq!(envelope.identities.operation_id.as_ref(), Some(&fence.operation_id));
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE event_name = ?1",
+                params![RuntimeEventName::ToolEffectCleanupReconciled.as_str()],
+                |row| row.get(0),
+            )
+            .expect("cleanup reconciliation events should count");
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn cleanup_owner_unknown_observation_keeps_fence_blocked() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let fence = make_side_effect_unknown(
+            &store,
+            "session_side_effect_cleanup_unknown",
+            "run_side_effect_cleanup_unknown",
+        );
+        let request = side_effect_cleanup_outcome(&fence, false);
+
+        let unchanged = store
+            .record_side_effect_cleanup_outcome(&request)
+            .expect("ambiguous cleanup outcome should append evidence");
+        assert_eq!(unchanged.state, SideEffectFenceState::EffectUnknown);
+        assert_eq!(
+            store
+                .side_effect_retry_decision(fence.operation_id.as_str())
+                .expect("retry decision should load"),
+            Some(SideEffectRetryDecision::ReconciliationRequired)
+        );
+        assert!(matches!(
+            store.record_side_effect_cleanup_outcome(&SideEffectFenceCleanupOutcomeRequest {
+                reason_code: "tool.effect.cleanup_conflict".to_owned(),
+                ..request.clone()
+            }),
+            Err(JournalError::InvalidArgument(message))
+                if message.contains("conflicting durable evidence")
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE event_name = ?1",
+                params![RuntimeEventName::ToolEffectCleanupUnknown.as_str()],
+                |row| row.get(0),
+            )
+            .expect("cleanup unknown events should count");
+        assert_eq!(event_count, 1);
+        let fence_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fence_events WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence events should count");
+        assert_eq!(fence_event_count, 3, "ambiguous cleanup must not mutate the fence");
+    }
+
+    #[test]
+    fn operator_reconciliation_persists_without_active_generation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_side_effect_operator";
+        let run_id = "run_side_effect_operator";
+        let fence = make_side_effect_unknown(&store, session_id, run_id);
+        store
+            .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind: RuntimeGenerationTransitionKind::Released,
+                reason_code: "runtime.generation.test_closed".to_owned(),
+            })
+            .expect("run generation should close");
+
+        let resolved = store
+            .resolve_side_effect_fence_as_operator(&operator_side_effect_resolution(
+                &fence,
+                SideEffectFenceState::Reconciled,
+            ))
+            .expect("operator reconciliation should persist without reviving generation");
+        assert_eq!(resolved.state, SideEffectFenceState::Reconciled);
+        assert_eq!(resolved.evidence_sha256.as_deref(), Some("c".repeat(64).as_str()));
+        assert!(store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("generation query should succeed")
+            .is_none());
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let raw = connection
+            .query_row(
+                "SELECT envelope_json FROM runtime_events_v2 WHERE event_name = ?1",
+                params![RuntimeEventName::ToolEffectReconciled.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("operator runtime event should exist");
+        let envelope: RuntimeEventEnvelopeV2 =
+            serde_json::from_str(raw.as_str()).expect("operator event should decode");
+        assert_eq!(envelope.actor_kind, RuntimeEventActorKind::Operator);
+        assert_eq!(envelope.sequence, 4);
+        assert_eq!(envelope.identities.operation_id.as_ref(), Some(&fence.operation_id));
+        assert_eq!(
+            envelope.payload,
+            RuntimeEventPayloadRef::Inline {
+                metadata: json!({
+                    "state": "reconciled",
+                    "intent_sha256": "a".repeat(64),
+                    "evidence_sha256": "c".repeat(64),
+                    "actor_id_sha256": "d".repeat(64),
+                }),
+            }
+        );
+        let fence_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fence_events WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence events should count");
+        assert_eq!(fence_event_count, 4);
+    }
+
+    #[test]
+    fn operator_abandonment_is_persistent_and_race_safe() {
+        let db_path = temp_db_path();
+        let store = Arc::new(
+            JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open"),
+        );
+        let fence = make_side_effect_unknown(
+            &store,
+            "session_side_effect_operator_race",
+            "run_side_effect_operator_race",
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_store = Arc::clone(&store);
+            let worker_barrier = Arc::clone(&barrier);
+            let request = operator_side_effect_resolution(&fence, SideEffectFenceState::Abandoned);
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_store.resolve_side_effect_fence_as_operator(&request)
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("resolution worker should not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    Err(JournalError::ToolSideEffectFencePrecondition { .. })
+                ))
+                .count(),
+            1
+        );
+
+        drop(store);
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        assert_eq!(
+            reopened
+                .side_effect_retry_decision(fence.operation_id.as_str())
+                .expect("retry decision should load"),
+            Some(SideEffectRetryDecision::Blocked)
+        );
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let resolution_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE event_name = ?1",
+                params![RuntimeEventName::ToolEffectAbandoned.as_str()],
+                |row| row.get(0),
+            )
+            .expect("operator runtime events should count");
+        assert_eq!(resolution_events, 1);
+    }
+
+    #[test]
+    fn operator_resolution_rejects_invalid_input_and_preconditions() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let fence = make_side_effect_unknown(
+            &store,
+            "session_side_effect_operator_invalid",
+            "run_side_effect_operator_invalid",
+        );
+        let mut malformed =
+            operator_side_effect_resolution(&fence, SideEffectFenceState::Reconciled);
+        malformed.evidence_sha256 = "not-a-digest".to_owned();
+        assert!(matches!(
+            store.resolve_side_effect_fence_as_operator(&malformed),
+            Err(JournalError::InvalidArgument(_))
+        ));
+        let mut wrong_digest =
+            operator_side_effect_resolution(&fence, SideEffectFenceState::Reconciled);
+        wrong_digest.expected_intent_sha256 = "e".repeat(64);
+        assert!(matches!(
+            store.resolve_side_effect_fence_as_operator(&wrong_digest),
+            Err(JournalError::ToolSideEffectFencePrecondition { .. })
+        ));
+        let missing = SideEffectFenceOperatorResolutionRequest {
+            operation_id: "operation_missing".to_owned(),
+            ..operator_side_effect_resolution(&fence, SideEffectFenceState::Abandoned)
+        };
+        assert!(matches!(
+            store.resolve_side_effect_fence_as_operator(&missing),
+            Err(JournalError::ToolSideEffectFenceNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_generation_cannot_transition_side_effect_fence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_side_effect_stale";
+        let run_id = "run_side_effect_stale";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        let fence = runtime_side_effect_fence();
+        store
+            .record_side_effect_fence(session_id, run_id, &fence)
+            .expect("side-effect intent should persist");
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::SteerSuperseded,
+        );
+        let error = store
+            .transition_side_effect_fence(
+                fence.operation_id.as_str(),
+                SideEffectFenceState::EffectStarted,
+                fence.observed_generation,
+                "tool.effect.started",
+                None,
+            )
+            .expect_err("stale generation must not start a side effect");
+        assert!(
+            matches!(error, JournalError::InvalidArgument(message) if message.contains("stale runtime generation"))
+        );
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fence_events WHERE operation_ulid = ?1",
+                params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("fence events should count");
+        let runtime_event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime events should count");
+        assert_eq!(event_count, 1, "stale transition must not append evidence");
+        assert_eq!(runtime_event_count, 1, "stale transition must not append V2 evidence");
+    }
+
+    #[test]
+    fn side_effect_unknown_blocks_retry_after_restart() {
+        let db_path = temp_db_path();
+        let session_id = "session_side_effect";
+        let run_id = "run_side_effect";
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, run_id);
+            activate_runtime_generation(
+                &store,
+                session_id,
+                run_id,
+                RuntimeGenerationTransitionKind::Activated,
+            );
+            let fence = runtime_side_effect_fence();
+            store
+                .record_side_effect_fence(session_id, run_id, &fence)
+                .expect("side-effect intent should persist");
+            store
+                .transition_side_effect_fence(
+                    fence.operation_id.as_str(),
+                    SideEffectFenceState::EffectStarted,
+                    RuntimeGeneration::new(1).expect("generation should validate"),
+                    "tool.effect.started",
+                    None,
+                )
+                .expect("side effect should start");
+            store
+                .transition_side_effect_fence(
+                    fence.operation_id.as_str(),
+                    SideEffectFenceState::EffectUnknown,
+                    RuntimeGeneration::new(1).expect("generation should validate"),
+                    "tool.effect.ack_unknown",
+                    None,
+                )
+                .expect("side effect should become unknown");
+        }
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        assert_eq!(
+            reopened
+                .side_effect_retry_decision("operation_journal_test")
+                .expect("retry decision should load"),
+            Some(SideEffectRetryDecision::ReconciliationRequired)
+        );
+    }
+
+    fn persist_process_cleanup_fixture(
+        store: &JournalStore,
+        suffix: &str,
+    ) -> (RuntimeHandleDescriptorV1, ProcessLeaseV1) {
+        let instance_id = RuntimeInstanceId::parse(format!("instance_cleanup_{suffix}").as_str())
+            .expect("instance id should validate");
+        let generation = RuntimeGeneration::new(1).expect("generation should validate");
+        let descriptor = RuntimeHandleDescriptorV1 {
+            schema_version: 1,
+            instance_id: instance_id.clone(),
+            kind: RuntimeHandleKind::Process,
+            session_id: None,
+            run_id: None,
+            generation,
+            owner: "journal-test".to_owned(),
+            state: RuntimeHandleState::Cleaning,
+            resume_metadata_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let lease = ProcessLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse(format!("lease_cleanup_{suffix}").as_str())
+                .expect("lease id should validate"),
+            instance_id,
+            generation,
+            pid: 42,
+            provenance: ProcessProvenance {
+                ownership_kind: ProcessOwnershipKind::UnixProcessGroup,
+                start_token: "123".to_owned(),
+                executable_sha256: "a".repeat(64),
+                owner_nonce: "nonce".to_owned(),
+                ownership_identity_sha256: "b".repeat(64),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 100,
+            verified_at_unix_ms: 1,
+        };
+        store
+            .register_process_handle_and_lease(&descriptor, &lease)
+            .expect("process ownership should persist");
+        (descriptor, lease)
+    }
+
+    fn persist_run_process_cleanup_fixture(
+        store: &JournalStore,
+        suffix: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> (RuntimeHandleDescriptorV1, ProcessLeaseV1) {
+        let (mut descriptor, lease) = persist_process_cleanup_fixture(store, suffix);
+        descriptor.session_id = Some(
+            palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                .expect("session id should validate"),
+        );
+        descriptor.run_id = Some(
+            palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                .expect("run id should validate"),
+        );
+        let raw = serde_json::to_vec(&descriptor).expect("scoped descriptor should serialize");
+        let descriptor_json =
+            super::sanitize_payload(raw.as_slice()).expect("descriptor should sanitize").0;
+        let guard = store.connection.lock().expect("journal connection should lock");
+        guard
+            .execute(
+                r#"
+                    UPDATE runtime_handles
+                    SET session_ulid = ?2, run_ulid = ?3, descriptor_json = ?4
+                    WHERE instance_ulid = ?1
+                "#,
+                params![descriptor.instance_id.as_str(), session_id, run_id, descriptor_json,],
+            )
+            .expect("scoped process ownership should persist");
+        drop(guard);
+        (descriptor, lease)
+    }
+
+    fn process_cleanup_report(
+        suffix: &str,
+        lease: &ProcessLeaseV1,
+        outcome: CleanupOutcome,
+        disposition: CleanupStepDisposition,
+    ) -> CleanupReportV1 {
+        CleanupReportV1 {
+            schema_version: 1,
+            report_id: format!("cleanup_{suffix}"),
+            instance_id: lease.instance_id.clone(),
+            lease_id: Some(lease.lease_id.clone()),
+            outcome,
+            steps: vec![CleanupStepRecord {
+                ordinal: 0,
+                step: CleanupStepKind::VerifyAbsence,
+                disposition,
+                reason_code: "runtime.cleanup.absence_checked".to_owned(),
+                evidence_sha256: (disposition == CleanupStepDisposition::Completed)
+                    .then(|| "c".repeat(64)),
+                completed_at_unix_ms: 2,
+            }],
+            reason_code: "runtime.cleanup.finalized".to_owned(),
+            completed_at_unix_ms: 2,
+        }
+    }
+
+    #[test]
+    fn process_handle_and_lease_registration_is_atomic() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let instance_id = RuntimeInstanceId::parse("instance_cleanup_atomic")
+            .expect("instance id should validate");
+        let descriptor = RuntimeHandleDescriptorV1 {
+            schema_version: 1,
+            instance_id: instance_id.clone(),
+            kind: RuntimeHandleKind::Process,
+            session_id: None,
+            run_id: None,
+            generation: RuntimeGeneration::new(1).expect("generation should validate"),
+            owner: "journal-test".to_owned(),
+            state: RuntimeHandleState::Running,
+            resume_metadata_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let lease = ProcessLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse("lease_cleanup_atomic")
+                .expect("lease id should validate"),
+            instance_id: instance_id.clone(),
+            generation: RuntimeGeneration::new(2).expect("generation should validate"),
+            pid: 42,
+            provenance: ProcessProvenance {
+                ownership_kind: ProcessOwnershipKind::UnixProcessGroup,
+                start_token: "123".to_owned(),
+                executable_sha256: "a".repeat(64),
+                owner_nonce: "nonce".to_owned(),
+                ownership_identity_sha256: "b".repeat(64),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 100,
+            verified_at_unix_ms: 1,
+        };
+        let error = store
+            .register_process_handle_and_lease(&descriptor, &lease)
+            .expect_err("mismatched ownership must fail before persistence");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let handle_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_handles", [], |row| row.get(0))
+            .expect("runtime handles should count");
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_process_leases", [], |row| row.get(0))
+            .expect("process leases should count");
+        assert_eq!(handle_count, 0);
+        assert_eq!(lease_count, 0);
+    }
+
+    #[test]
+    fn active_generation_process_registration_rejects_closed_generation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_closed_process_generation";
+        let run_id = "run_closed_process_generation";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let generation = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        )
+        .generation;
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+        store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: "runtime.terminal.completed".to_owned(),
+                status_message: "completed".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "journal-test".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "done",
+                    "message": "completed",
+                })
+                .to_string(),
+            })
+            .expect("terminal settlement should close the generation");
+
+        let instance_id = RuntimeInstanceId::parse("instance_closed_process_generation")
+            .expect("instance id should validate");
+        let descriptor = RuntimeHandleDescriptorV1 {
+            schema_version: 1,
+            instance_id: instance_id.clone(),
+            kind: RuntimeHandleKind::Process,
+            session_id: Some(
+                palyra_common::runtime_contracts::RuntimeSessionId::parse(session_id)
+                    .expect("session id should validate"),
+            ),
+            run_id: Some(
+                palyra_common::runtime_contracts::RuntimeRunId::parse(run_id)
+                    .expect("run id should validate"),
+            ),
+            generation,
+            owner: "journal-test".to_owned(),
+            state: RuntimeHandleState::Running,
+            resume_metadata_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let lease = ProcessLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse("lease_closed_process_generation")
+                .expect("lease id should validate"),
+            instance_id,
+            generation,
+            pid: 42,
+            provenance: ProcessProvenance {
+                ownership_kind: ProcessOwnershipKind::UnixProcessGroup,
+                start_token: "123".to_owned(),
+                executable_sha256: "a".repeat(64),
+                owner_nonce: "nonce".to_owned(),
+                ownership_identity_sha256: "b".repeat(64),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: i64::MAX,
+            verified_at_unix_ms: 1,
+        };
+        let error = store
+            .register_process_handle_and_lease_for_active_generation(&descriptor, &lease)
+            .expect_err("closed generation must reject process registration");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let handle_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_handles WHERE instance_ulid = ?1",
+                params![descriptor.instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("runtime handles should count");
+        let lease_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_process_leases WHERE lease_ulid = ?1",
+                params![lease.lease_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("process leases should count");
+        assert_eq!(handle_count, 0);
+        assert_eq!(lease_count, 0);
+    }
+
+    #[test]
+    fn cleanup_report_append_is_idempotent() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let instance_id =
+            RuntimeInstanceId::parse("instance_journal_test").expect("instance id should validate");
+        store
+            .upsert_runtime_handle(&RuntimeHandleDescriptorV1 {
+                schema_version: 1,
+                instance_id: instance_id.clone(),
+                kind: RuntimeHandleKind::Process,
+                session_id: None,
+                run_id: None,
+                generation: RuntimeGeneration::new(1).expect("generation should validate"),
+                owner: "journal-test".to_owned(),
+                state: RuntimeHandleState::Cleaning,
+                resume_metadata_json: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            })
+            .expect("runtime handle should persist");
+        let report = CleanupReportV1 {
+            schema_version: 1,
+            report_id: "cleanup_journal_test".to_owned(),
+            instance_id,
+            lease_id: None,
+            outcome: CleanupOutcome::Completed,
+            steps: vec![CleanupStepRecord {
+                ordinal: 0,
+                step: CleanupStepKind::VerifyAbsence,
+                disposition: CleanupStepDisposition::Completed,
+                reason_code: "runtime.cleanup.absence_verified".to_owned(),
+                evidence_sha256: Some("b".repeat(64)),
+                completed_at_unix_ms: 2,
+            }],
+            reason_code: "runtime.cleanup.completed".to_owned(),
+            completed_at_unix_ms: 2,
+        };
+        store.append_cleanup_report(&report).expect("cleanup report should persist");
+        store.append_cleanup_report(&report).expect("cleanup report replay should be idempotent");
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let report_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_cleanup_reports", [], |row| row.get(0))
+            .expect("cleanup reports should count");
+        let step_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_cleanup_steps", [], |row| row.get(0))
+            .expect("cleanup steps should count");
+        assert_eq!(report_count, 1);
+        assert_eq!(step_count, 1);
+    }
+
+    #[test]
+    fn persisted_process_lease_reader_is_bounded_and_validates_joined_ownership() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let (descriptor, lease) = persist_process_cleanup_fixture(&store, "reader");
+
+        assert!(matches!(
+            store.list_persisted_process_leases(0),
+            Err(JournalError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store.list_persisted_process_leases(1_001),
+            Err(JournalError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            store.list_persisted_process_leases(1).expect("process lease should load"),
+            vec![PersistedProcessLeaseRecord {
+                descriptor: descriptor.clone(),
+                lease: lease.clone(),
+            }]
+        );
+        assert!(store
+            .list_persisted_process_leases_after(Some(lease.lease_id.as_str()), 1)
+            .expect("keyset page after the only lease should load")
+            .is_empty());
+        assert!(matches!(
+            store.list_persisted_process_leases_after(Some("invalid lease cursor"), 1),
+            Err(JournalError::InvalidArgument(_))
+        ));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_handles SET descriptor_json = json_set(descriptor_json, '$.generation', 2) WHERE instance_ulid = ?1",
+                params![descriptor.instance_id.as_str()],
+            )
+            .expect("test corruption should persist");
+        assert!(matches!(
+            store.list_persisted_process_leases(1),
+            Err(JournalError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn persisted_process_lease_reader_paginates_without_repeating_retained_rows() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let (_, first) = persist_process_cleanup_fixture(&store, "page_a");
+        let (_, second) = persist_process_cleanup_fixture(&store, "page_b");
+        let (_, third) = persist_process_cleanup_fixture(&store, "page_c");
+
+        let first_page =
+            store.list_persisted_process_leases_after(None, 2).expect("first page should load");
+        assert_eq!(
+            first_page.iter().map(|record| record.lease.lease_id.as_str()).collect::<Vec<_>>(),
+            vec![first.lease_id.as_str(), second.lease_id.as_str()]
+        );
+        let second_page = store
+            .list_persisted_process_leases_after(
+                first_page.last().map(|record| record.lease.lease_id.as_str()),
+                2,
+            )
+            .expect("second page should load");
+        assert_eq!(
+            second_page.iter().map(|record| record.lease.lease_id.as_str()).collect::<Vec<_>>(),
+            vec![third.lease_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn verified_process_cleanup_retires_exact_durable_lease() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let (mut descriptor, lease) = persist_process_cleanup_fixture(&store, "completed");
+        descriptor.state = RuntimeHandleState::Closed;
+        descriptor.updated_at_unix_ms = 2;
+        store
+            .finalize_process_cleanup(
+                &descriptor,
+                &process_cleanup_report(
+                    "completed",
+                    &lease,
+                    CleanupOutcome::Completed,
+                    CleanupStepDisposition::Completed,
+                ),
+            )
+            .expect("verified cleanup should retire the matching lease");
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_process_leases", [], |row| row.get(0))
+            .expect("process leases should count");
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_handles WHERE instance_ulid = ?1",
+                params![descriptor.instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("runtime handle state should load");
+        let report_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_cleanup_reports", [], |row| row.get(0))
+            .expect("cleanup reports should count");
+        assert_eq!(lease_count, 0);
+        assert_eq!(state, RuntimeHandleState::Closed.as_str());
+        assert_eq!(report_count, 1);
+    }
+
+    #[test]
+    fn run_scoped_cleanup_report_event_and_trace_replay_exactly_once() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "cleanup_replay_session";
+        let run_id = "cleanup_replay_run";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let (mut descriptor, lease) =
+            persist_run_process_cleanup_fixture(&store, "replay", session_id, run_id);
+        descriptor.state = RuntimeHandleState::Closed;
+        descriptor.updated_at_unix_ms = 2;
+        let report = process_cleanup_report(
+            "replay",
+            &lease,
+            CleanupOutcome::Completed,
+            CleanupStepDisposition::Completed,
+        );
+
+        store
+            .finalize_process_cleanup(&descriptor, &report)
+            .expect("first cleanup finalization should commit");
+        store
+            .finalize_process_cleanup(&descriptor, &report)
+            .expect("byte-identical cleanup finalization should replay");
+
+        let guard = store.connection.lock().expect("journal connection should lock");
+        let (report_count, step_count, event_count, lease_count): (i64, i64, i64, i64) = guard
+            .query_row(
+                r#"
+                    SELECT
+                        (SELECT COUNT(*) FROM runtime_cleanup_reports WHERE report_ulid = ?1),
+                        (SELECT COUNT(*) FROM runtime_cleanup_steps WHERE report_ulid = ?1),
+                        (SELECT COUNT(*) FROM runtime_events_v2
+                            WHERE event_name = 'runtime.cleanup.completed'
+                              AND run_ulid = ?2),
+                        (SELECT COUNT(*) FROM runtime_process_leases WHERE lease_ulid = ?3)
+                "#,
+                params![report.report_id, run_id, lease.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("cleanup replay evidence should load");
+        drop(guard);
+        assert_eq!((report_count, step_count, event_count, lease_count), (1, 1, 1, 0));
+
+        let trace = store
+            .load_metadata_trace(run_id)
+            .expect("metadata trace should load")
+            .expect("run should have a metadata trace");
+        let cleanup_events = trace.segments[0]
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    MetadataTraceEventDataV1::Recovery(metadata)
+                        if metadata.strategy
+                            == MetadataTraceRecoveryStrategyV1::IdempotencyGuard
+                            && metadata.reason_code == report.reason_code
+                )
+            })
+            .count();
+        assert_eq!(cleanup_events, 1);
+        let diagnostics =
+            store.shared_runtime_diagnostics().expect("cleanup diagnostics should load");
+        assert_eq!(
+            diagnostics.cleanup_reports_by_reason.get(report.reason_code.as_str()),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn unresolved_process_cleanup_retains_durable_lease() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        for (suffix, state, outcome, disposition) in [
+            (
+                "partial",
+                RuntimeHandleState::Orphaned,
+                CleanupOutcome::Partial,
+                CleanupStepDisposition::Failed,
+            ),
+            (
+                "unknown",
+                RuntimeHandleState::Quarantined,
+                CleanupOutcome::Unknown,
+                CleanupStepDisposition::Unknown,
+            ),
+        ] {
+            let (mut descriptor, lease) = persist_process_cleanup_fixture(&store, suffix);
+            descriptor.state = state;
+            descriptor.updated_at_unix_ms = 2;
+            store
+                .finalize_process_cleanup(
+                    &descriptor,
+                    &process_cleanup_report(suffix, &lease, outcome, disposition),
+                )
+                .expect("unresolved cleanup should persist without retiring its lease");
+        }
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_process_leases", [], |row| row.get(0))
+            .expect("process leases should count");
+        let report_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_cleanup_reports", [], |row| row.get(0))
+            .expect("cleanup reports should count");
+        assert_eq!(lease_count, 2);
+        assert_eq!(report_count, 2);
+    }
+
+    #[test]
+    fn mismatched_process_cleanup_ownership_rolls_back_atomically() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let (mut descriptor, lease) = persist_process_cleanup_fixture(&store, "mismatch");
+        descriptor.state = RuntimeHandleState::Closed;
+        descriptor.updated_at_unix_ms = 2;
+        let mut report = process_cleanup_report(
+            "mismatch_lease",
+            &lease,
+            CleanupOutcome::Completed,
+            CleanupStepDisposition::Completed,
+        );
+        report.lease_id = Some(
+            RuntimeLeaseId::parse("lease_cleanup_not_owned")
+                .expect("mismatched lease id should validate"),
+        );
+        let error = store
+            .finalize_process_cleanup(&descriptor, &report)
+            .expect_err("mismatched lease must not be retired");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        report = process_cleanup_report(
+            "mismatch_generation",
+            &lease,
+            CleanupOutcome::Completed,
+            CleanupStepDisposition::Completed,
+        );
+        descriptor.generation = RuntimeGeneration::new(2).expect("generation should validate");
+        let error = store
+            .finalize_process_cleanup(&descriptor, &report)
+            .expect_err("mismatched generation must not retire the lease");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let (state, generation): (String, i64) = connection
+            .query_row(
+                "SELECT state, generation FROM runtime_handles WHERE instance_ulid = ?1",
+                params![descriptor.instance_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("runtime handle should load");
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_process_leases", [], |row| row.get(0))
+            .expect("process leases should count");
+        let report_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_cleanup_reports", [], |row| row.get(0))
+            .expect("cleanup reports should count");
+        assert_eq!(state, RuntimeHandleState::Cleaning.as_str());
+        assert_eq!(generation, 1);
+        assert_eq!(lease_count, 1);
+        assert_eq!(report_count, 0);
+    }
+
+    #[test]
+    fn conflicting_cleanup_report_or_step_replay_preserves_handle_and_lease() {
+        for (suffix, conflict_step_only) in [("report_conflict", false), ("step_conflict", true)] {
+            let db_path = temp_db_path();
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let (mut descriptor, lease) = persist_process_cleanup_fixture(&store, suffix);
+            descriptor.state = RuntimeHandleState::Closed;
+            descriptor.updated_at_unix_ms = 2;
+            let report = process_cleanup_report(
+                suffix,
+                &lease,
+                CleanupOutcome::Completed,
+                CleanupStepDisposition::Completed,
+            );
+            if conflict_step_only {
+                let raw = serde_json::to_vec(&report).expect("cleanup report should serialize");
+                let report_json =
+                    super::sanitize_payload(raw.as_slice()).expect("report should sanitize").0;
+                let guard = store.connection.lock().expect("journal connection should lock");
+                guard
+                    .execute(
+                        r#"
+                            INSERT INTO runtime_cleanup_reports (
+                                report_ulid, instance_ulid, lease_ulid, outcome, reason_code,
+                                report_json, created_at_unix_ms, schema_version
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "#,
+                        params![
+                            report.report_id,
+                            report.instance_id.as_str(),
+                            report.lease_id.as_ref().map(|value| value.as_str()),
+                            report.outcome.as_str(),
+                            report.reason_code,
+                            report_json,
+                            report.completed_at_unix_ms,
+                            i64::from(report.schema_version),
+                        ],
+                    )
+                    .expect("exact report row should persist");
+                let step = &report.steps[0];
+                guard
+                    .execute(
+                        r#"
+                            INSERT INTO runtime_cleanup_steps (
+                                report_ulid, ordinal, step, disposition, reason_code,
+                                evidence_sha256, created_at_unix_ms
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        "#,
+                        params![
+                            report.report_id,
+                            i64::from(step.ordinal),
+                            step.step.as_str(),
+                            step.disposition.as_str(),
+                            "runtime.cleanup.conflicting_step",
+                            step.evidence_sha256,
+                            step.completed_at_unix_ms,
+                        ],
+                    )
+                    .expect("conflicting step row should persist");
+            } else {
+                let mut conflicting = report.clone();
+                conflicting.reason_code = "runtime.cleanup.conflicting_report".to_owned();
+                store
+                    .append_cleanup_report(&conflicting)
+                    .expect("conflicting report fixture should persist");
+            }
+
+            let error = store
+                .finalize_process_cleanup(&descriptor, &report)
+                .expect_err("conflicting cleanup replay must fail closed");
+            assert!(matches!(error, JournalError::InvalidArgument(_)));
+            let guard = store.connection.lock().expect("journal connection should lock");
+            let (state, lease_count, event_count): (String, i64, i64) = guard
+                .query_row(
+                    r#"
+                        SELECT
+                            (SELECT state FROM runtime_handles WHERE instance_ulid = ?1),
+                            (SELECT COUNT(*) FROM runtime_process_leases WHERE lease_ulid = ?2),
+                            (SELECT COUNT(*) FROM runtime_events_v2
+                                WHERE event_name LIKE 'runtime.cleanup.%')
+                    "#,
+                    params![descriptor.instance_id.as_str(), lease.lease_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("rollback evidence should load");
+            assert_eq!(state, RuntimeHandleState::Cleaning.as_str());
+            assert_eq!(lease_count, 1);
+            assert_eq!(event_count, 0);
+        }
+    }
+
+    #[test]
+    fn conflicting_cleanup_event_rolls_back_report_handle_and_lease() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "cleanup_event_conflict_session";
+        let run_id = "cleanup_event_conflict_run";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let (mut descriptor, lease) =
+            persist_run_process_cleanup_fixture(&store, "event_conflict", session_id, run_id);
+        descriptor.state = RuntimeHandleState::Closed;
+        descriptor.updated_at_unix_ms = 2;
+        let report = process_cleanup_report(
+            "event_conflict",
+            &lease,
+            CleanupOutcome::Completed,
+            CleanupStepDisposition::Completed,
+        );
+        let generation = descriptor.generation;
+        let mut identities = palyra_common::runtime_contracts::RuntimeIdentitySetV1::for_run(
+            palyra_common::runtime_contracts::RuntimeTraceId::parse(run_id)
+                .expect("trace id should validate"),
+            descriptor.session_id.clone().expect("session scope should exist"),
+            descriptor.run_id.clone().expect("run scope should exist"),
+            generation,
+        );
+        identities.runtime_instance_id = Some(descriptor.instance_id.clone());
+        let event_name = RuntimeEventName::CleanupCompleted;
+        let event_id = format!(
+            "cleanup:{}",
+            sha256_hex(format!("{}:{}", report.report_id, event_name.as_str()).as_bytes())
+        );
+        let event_descriptor = event_name.descriptor();
+        let conflicting_envelope = RuntimeEventEnvelopeV2 {
+            schema_version: 2,
+            event_id: RuntimeEventId::parse(event_id.as_str())
+                .expect("cleanup event id should validate"),
+            identities,
+            sequence: 0,
+            causal_parent_event_id: None,
+            subsystem: event_descriptor.subsystem,
+            phase: event_descriptor.phase,
+            event_name,
+            reason_code: "runtime.cleanup.conflicting_event".to_owned(),
+            actor_kind: event_descriptor.actor_kind,
+            retryability: event_descriptor.retryability,
+            redaction_class: event_descriptor.redaction_class,
+            terminal: event_descriptor.terminal,
+            payload: RuntimeEventPayloadRef::Omitted {
+                reason_code: "runtime.event.payload_omitted".to_owned(),
+                digest_sha256: None,
+                size_bytes: 0,
+            },
+            occurred_at_unix_ms: report.completed_at_unix_ms,
+            extensions: BTreeMap::new(),
+        };
+        let envelope_json =
+            serde_json::to_string(&conflicting_envelope).expect("event should serialize");
+        let guard = store.connection.lock().expect("journal connection should lock");
+        guard
+            .execute(
+                r#"
+                    INSERT INTO runtime_events_v2 (
+                        event_ulid, session_ulid, run_ulid, lane, generation, sequence,
+                        terminal, event_name, reason_code, envelope_json, created_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, 'process', ?4, 0, 0, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    event_id,
+                    session_id,
+                    run_id,
+                    i64::try_from(generation.get()).expect("generation should fit sqlite"),
+                    event_name.as_str(),
+                    conflicting_envelope.reason_code,
+                    envelope_json,
+                    report.completed_at_unix_ms,
+                ],
+            )
+            .expect("conflicting cleanup event should persist");
+        drop(guard);
+
+        let error = store
+            .finalize_process_cleanup(&descriptor, &report)
+            .expect_err("conflicting cleanup event must roll back the transaction");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        let guard = store.connection.lock().expect("journal connection should lock");
+        let (state, lease_count, report_count, step_count): (String, i64, i64, i64) =
+            guard
+                .query_row(
+                    r#"
+                    SELECT
+                        (SELECT state FROM runtime_handles WHERE instance_ulid = ?1),
+                        (SELECT COUNT(*) FROM runtime_process_leases WHERE lease_ulid = ?2),
+                        (SELECT COUNT(*) FROM runtime_cleanup_reports WHERE report_ulid = ?3),
+                        (SELECT COUNT(*) FROM runtime_cleanup_steps WHERE report_ulid = ?3)
+                "#,
+                    params![
+                        descriptor.instance_id.as_str(),
+                        lease.lease_id.as_str(),
+                        report.report_id,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("rolled-back cleanup state should load");
+        assert_eq!(state, RuntimeHandleState::Cleaning.as_str());
+        assert_eq!((lease_count, report_count, step_count), (1, 0, 0));
+    }
+
+    #[test]
+    fn health_projection_validates_previous_state_transition() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let policy = palyra_common::runtime_contracts::CircuitBreakerPolicy {
+            strike_threshold: 3,
+            cooldown_ms: 1_000,
+            max_probe_concurrency: 1,
+            security_quarantine_auto_clear: false,
+        };
+        let component_id =
+            RuntimeInstanceId::parse("provider_health_test").expect("component id should validate");
+        let health = |state| RuntimeComponentHealthV1 {
+            schema_version: 1,
+            component_id: component_id.clone(),
+            generation: RuntimeGeneration::new(1).expect("generation should validate"),
+            state,
+            authority_class: RuntimeAuthorityClass::ScopedMutation,
+            strike_count: 3,
+            reason_code: "runtime.health.test".to_owned(),
+            first_failure_at_unix_ms: Some(1),
+            last_failure_at_unix_ms: Some(2),
+            expires_at_unix_ms: None,
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            security_quarantine: false,
+            policy: policy.clone(),
+            updated_at_unix_ms: 2,
+        };
+        store
+            .upsert_runtime_component_health(&health(RuntimeHealthState::Quarantined))
+            .expect("initial quarantine should persist");
+        let error = store
+            .upsert_runtime_component_health(&health(RuntimeHealthState::Healthy))
+            .expect_err("quarantine must require a probe before healthy");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        let mut degraded = health(RuntimeHealthState::Degraded);
+        degraded.component_id = RuntimeInstanceId::parse("provider_health_protected")
+            .expect("component id should validate");
+        degraded.strike_count = 1;
+        store
+            .upsert_runtime_component_health(&degraded)
+            .expect("initial degraded health should persist");
+        let mut widened = degraded.clone();
+        widened.authority_class = RuntimeAuthorityClass::PrivilegedMutation;
+        widened.updated_at_unix_ms += 1;
+        let error = store
+            .upsert_runtime_component_health(&widened)
+            .expect_err("health update must not widen durable authority");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn runtime_health_observation_is_exact_and_respects_protected_posture() {
+        let path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(path, false))
+            .expect("journal store should open");
+        let component_id = RuntimeInstanceId::parse("provider:ordinary-observation")
+            .expect("component id should validate");
+        let activation = store
+            .activate_runtime_health_components(
+                &[RuntimeHealthComponentActivation {
+                    component_id: component_id.clone(),
+                    authority_class: RuntimeAuthorityClass::PrivilegedMutation,
+                    fallback_component_id: None,
+                    fallback_authority_class: None,
+                    policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                        strike_threshold: 2,
+                        cooldown_ms: 1_000,
+                        max_probe_concurrency: 1,
+                        security_quarantine_auto_clear: false,
+                    },
+                    reason_code: "runtime.health.test_activated".to_owned(),
+                }],
+                10,
+            )
+            .expect("health should activate");
+        let generation = activation.generations[component_id.as_str()];
+        let observe = |succeeded: bool, reason_code: &str, observed_at_unix_ms: i64| {
+            store.record_runtime_health_observation(&RuntimeHealthObservationRequest {
+                component_id: component_id.clone(),
+                expected_generation: generation,
+                succeeded,
+                reason_code: reason_code.to_owned(),
+                observed_at_unix_ms,
+            })
+        };
+
+        let first = observe(false, "runtime.health.test_failed", 20)
+            .expect("first failure should degrade health");
+        assert_eq!(first.health.state, RuntimeHealthState::Degraded);
+        assert_eq!(first.health.strike_count, 1);
+        let second = observe(false, "runtime.health.test_failed", 30)
+            .expect("threshold failure should enter cooldown");
+        assert_eq!(second.health.state, RuntimeHealthState::Cooldown);
+        assert_eq!(second.health.strike_count, 2);
+        assert_eq!(second.health.expires_at_unix_ms, Some(1_030));
+        let protected = observe(true, "runtime.health.test_succeeded", 40)
+            .expect_err("ordinary success must not recover cooldown");
+        assert!(matches!(protected, JournalError::InvalidArgument(_)));
+
+        let next = store
+            .activate_runtime_health_components(
+                &[RuntimeHealthComponentActivation {
+                    component_id: component_id.clone(),
+                    authority_class: RuntimeAuthorityClass::PrivilegedMutation,
+                    fallback_component_id: None,
+                    fallback_authority_class: None,
+                    policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                        strike_threshold: 2,
+                        cooldown_ms: 1_000,
+                        max_probe_concurrency: 1,
+                        security_quarantine_auto_clear: false,
+                    },
+                    reason_code: "runtime.health.test_reactivated".to_owned(),
+                }],
+                50,
+            )
+            .expect("generation should advance");
+        assert!(next.generations[component_id.as_str()] > generation);
+        let stale = observe(false, "runtime.health.test_stale", 60)
+            .expect_err("stale generation observation must fail closed");
+        assert!(matches!(stale, JournalError::InvalidArgument(_)));
+    }
+
+    fn runtime_health_fixture(
+        component_id: &str,
+        state: RuntimeHealthState,
+        generation: u64,
+        security_quarantine: bool,
+    ) -> RuntimeComponentHealthV1 {
+        RuntimeComponentHealthV1 {
+            schema_version: 1,
+            component_id: RuntimeInstanceId::parse(component_id)
+                .expect("component id should validate"),
+            generation: RuntimeGeneration::new(generation).expect("generation should validate"),
+            state,
+            authority_class: RuntimeAuthorityClass::ScopedMutation,
+            strike_count: 3,
+            reason_code: "runtime.health.test".to_owned(),
+            first_failure_at_unix_ms: Some(1),
+            last_failure_at_unix_ms: Some(2),
+            expires_at_unix_ms: (state == RuntimeHealthState::Cooldown).then_some(100),
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            security_quarantine,
+            policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                strike_threshold: 3,
+                cooldown_ms: 1_000,
+                max_probe_concurrency: 1,
+                security_quarantine_auto_clear: false,
+            },
+            updated_at_unix_ms: 2,
+        }
+    }
+
+    fn runtime_health_probe_lease(
+        health: &RuntimeComponentHealthV1,
+        lease_id: &str,
+        issued_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> HealthProbeLeaseV1 {
+        HealthProbeLeaseV1 {
+            schema_version: 1,
+            lease_id: RuntimeLeaseId::parse(lease_id).expect("lease id should validate"),
+            component_id: health.component_id.clone(),
+            expected_generation: health.generation,
+            authority_class: health.authority_class,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            non_mutating: true,
+        }
+    }
+
+    fn runtime_health_quarantine_clear_request(
+        health: &RuntimeComponentHealthV1,
+        cleared_at_unix_ms: i64,
+        probe_lease: Option<HealthProbeLeaseV1>,
+        probe_evidence_sha256: Option<String>,
+    ) -> RuntimeHealthQuarantineClearRequest {
+        let actor_id = "c".repeat(64);
+        let authorization_evidence_sha256 = "d".repeat(64);
+        let payload_json = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "component_id": health.component_id.as_str(),
+            "expected_generation": health.generation.get(),
+            "actor_id_sha256": actor_id,
+            "authorization_evidence_sha256": authorization_evidence_sha256,
+            "probe_evidence_sha256": probe_evidence_sha256,
+            "reason_code": "runtime.health.operator_clear",
+        }))
+        .expect("quarantine clear audit payload should serialize");
+        RuntimeHealthQuarantineClearRequest {
+            clear: QuarantineClearRequest {
+                schema_version: 1,
+                component_id: health.component_id.clone(),
+                expected_generation: health.generation,
+                actor_id,
+                reason_code: "runtime.health.operator_clear".to_owned(),
+                authorization_evidence_sha256,
+                probe_lease,
+                probe_evidence_sha256,
+            },
+            audit_event: JournalAppendRequest {
+                event_id: format!("runtime-health-clear:{}", Ulid::new()),
+                session_id: "runtime-health-admin-session".to_owned(),
+                run_id: "runtime-health-admin-run".to_owned(),
+                kind: 1,
+                actor: 1,
+                timestamp_unix_ms: cleared_at_unix_ms,
+                payload_json,
+                principal: "operator:runtime-health".to_owned(),
+                device_id: "runtime-health-admin-device".to_owned(),
+                channel: Some("admin".to_owned()),
+            },
+            cleared_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn runtime_health_operator_clear_is_atomic_hash_chained_and_restart_durable() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "plugin:security-quarantine",
+            RuntimeHealthState::Quarantined,
+            7,
+            true,
+        );
+        store.upsert_runtime_component_health(&health).expect("quarantine should persist");
+        let request = runtime_health_quarantine_clear_request(&health, 10, None, None);
+
+        let outcome = store
+            .clear_runtime_component_quarantine(&request)
+            .expect("authorized operator clear should commit");
+        assert_eq!(outcome.health.state, RuntimeHealthState::Degraded);
+        assert_eq!(outcome.health.strike_count, 0);
+        assert!(!outcome.health.security_quarantine);
+        assert_eq!(outcome.health.reason_code, "runtime.health.operator_clear");
+        assert!(outcome.audit_event_sha256.is_some());
+        assert!(!outcome.audit_payload_redacted);
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should reopen");
+        let persisted = reopened
+            .runtime_component_health(health.component_id.as_str())
+            .expect("cleared health should load")
+            .expect("cleared health should remain present");
+        assert_eq!(persisted, outcome.health);
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let (actor, payload_json, hash): (i64, String, Option<String>) = connection
+            .query_row(
+                "SELECT actor, payload_json, hash FROM journal_events WHERE event_ulid = ?1",
+                params![request.audit_event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("quarantine clear audit event should load");
+        assert_eq!(actor, 1, "operator clear audit actor must be user-owned");
+        assert!(hash.is_some());
+        assert!(payload_json.contains(request.clear.actor_id.as_str()));
+        assert!(payload_json.contains(request.clear.authorization_evidence_sha256.as_str()));
+        assert!(!payload_json.contains(request.audit_event.principal.as_str()));
+    }
+
+    #[test]
+    fn runtime_health_operator_clear_rejects_unbound_audit_authorization_digest() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "plugin:unbound-audit",
+            RuntimeHealthState::Quarantined,
+            7,
+            true,
+        );
+        store.upsert_runtime_component_health(&health).expect("quarantine should persist");
+        let mut request = runtime_health_quarantine_clear_request(&health, 10, None, None);
+        let mut payload = serde_json::from_slice::<Value>(&request.audit_event.payload_json)
+            .expect("quarantine clear audit payload should parse");
+        payload["authorization_evidence_sha256"] = Value::String("e".repeat(64));
+        request.audit_event.payload_json =
+            serde_json::to_vec(&payload).expect("mismatched audit payload should serialize");
+
+        let error = store
+            .clear_runtime_component_quarantine(&request)
+            .expect_err("unbound audit authorization evidence must fail closed");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        assert_eq!(
+            store
+                .runtime_component_health(health.component_id.as_str())
+                .expect("health should load")
+                .expect("health should remain present"),
+            health
+        );
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM journal_events WHERE event_ulid = ?1",
+                params![request.audit_event.event_id],
+                |row| row.get(0),
+            )
+            .expect("audit events should count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn runtime_health_operator_clear_redacts_other_sensitive_audit_fields() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "plugin:bounded-audit",
+            RuntimeHealthState::Quarantined,
+            7,
+            true,
+        );
+        store.upsert_runtime_component_health(&health).expect("quarantine should persist");
+        let mut request = runtime_health_quarantine_clear_request(&health, 10, None, None);
+        let mut payload = serde_json::from_slice::<Value>(&request.audit_event.payload_json)
+            .expect("quarantine clear audit payload should parse");
+        payload["token"] = Value::String("must-not-leak".to_owned());
+        request.audit_event.payload_json =
+            serde_json::to_vec(&payload).expect("sensitive audit payload should serialize");
+
+        let outcome = store
+            .clear_runtime_component_quarantine(&request)
+            .expect("bound authorization evidence should permit the clear");
+        assert!(outcome.audit_payload_redacted);
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM journal_events WHERE event_ulid = ?1",
+                params![request.audit_event.event_id],
+                |row| row.get(0),
+            )
+            .expect("quarantine clear audit payload should load");
+        let payload = serde_json::from_str::<Value>(&payload_json)
+            .expect("stored audit payload should parse");
+        assert_eq!(
+            payload.get("authorization_evidence_sha256").and_then(Value::as_str),
+            Some(request.clear.authorization_evidence_sha256.as_str())
+        );
+        assert_eq!(payload.get("token").and_then(Value::as_str), Some("<redacted>"));
+        assert!(!payload_json.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn runtime_health_operator_clear_rejects_stale_generation_without_audit() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should open");
+        let health =
+            runtime_health_fixture("mcp:stale-clear", RuntimeHealthState::Quarantined, 3, false);
+        store.upsert_runtime_component_health(&health).expect("quarantine should persist");
+        let mut request = runtime_health_quarantine_clear_request(&health, 10, None, None);
+        request.clear.expected_generation =
+            RuntimeGeneration::new(2).expect("stale generation should validate");
+
+        let error = store
+            .clear_runtime_component_quarantine(&request)
+            .expect_err("stale operator clear must fail closed");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        assert_eq!(
+            store
+                .runtime_component_health(health.component_id.as_str())
+                .expect("health should load")
+                .expect("health should remain present"),
+            health
+        );
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM journal_events WHERE event_ulid = ?1",
+                params![request.audit_event.event_id],
+                |row| row.get(0),
+            )
+            .expect("audit events should count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn runtime_health_operator_clear_verifies_exact_successful_probe_evidence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, true))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "worker:probe-bound-clear",
+            RuntimeHealthState::Quarantined,
+            4,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("quarantine should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_bound_clear", 100, 200);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.operator_probe".to_owned(),
+                authorization_evidence_sha256: Some("b".repeat(64)),
+                authorized_actor_id_sha256: Some("c".repeat(64)),
+            })
+            .expect("authorized probe should begin");
+        let successful_probe_evidence = "a".repeat(64);
+        let settled = store
+            .settle_runtime_health_probe(&RuntimeHealthProbeSettlementRequest {
+                settlement: HealthProbeSettlementV1 {
+                    schema_version: HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
+                    lease_id: lease.lease_id.clone(),
+                    expected_generation: lease.expected_generation,
+                    result: HealthProbeResult {
+                        schema_version: HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+                        component_id: lease.component_id.clone(),
+                        disposition: HealthProbeDisposition::Passed,
+                        reason_code: "runtime.health.probe_passed".to_owned(),
+                        mutation_attempted: false,
+                        completed_at_unix_ms: 150,
+                    },
+                },
+                probe_evidence_sha256: Some(successful_probe_evidence.clone()),
+            })
+            .expect("successful probe should settle");
+        let mut degraded = settled.health;
+        degraded.state = RuntimeHealthState::Degraded;
+        degraded.strike_count = 1;
+        degraded.reason_code = "runtime.health.worker_failed".to_owned();
+        degraded.first_failure_at_unix_ms = Some(160);
+        degraded.last_failure_at_unix_ms = Some(160);
+        degraded.updated_at_unix_ms = 160;
+        store
+            .upsert_runtime_component_health(&degraded)
+            .expect("post-probe degradation should persist");
+        let mut quarantined = degraded;
+        quarantined.state = RuntimeHealthState::Quarantined;
+        quarantined.strike_count = quarantined.policy.strike_threshold;
+        quarantined.last_failure_at_unix_ms = Some(170);
+        quarantined.updated_at_unix_ms = 170;
+        store
+            .upsert_runtime_component_health(&quarantined)
+            .expect("post-probe quarantine should persist");
+
+        let mismatched = runtime_health_quarantine_clear_request(
+            &quarantined,
+            180,
+            Some(lease.clone()),
+            Some("e".repeat(64)),
+        );
+        assert!(matches!(
+            store
+                .clear_runtime_component_quarantine(&mismatched)
+                .expect_err("mismatched probe evidence must fail closed"),
+            JournalError::InvalidArgument(_)
+        ));
+        assert_eq!(
+            store
+                .runtime_component_health(quarantined.component_id.as_str())
+                .expect("health should load")
+                .expect("health should remain present")
+                .state,
+            RuntimeHealthState::Quarantined
+        );
+
+        let exact = runtime_health_quarantine_clear_request(
+            &quarantined,
+            181,
+            Some(lease),
+            Some(successful_probe_evidence),
+        );
+        let cleared = store
+            .clear_runtime_component_quarantine(&exact)
+            .expect("exact immutable successful probe evidence should authorize clear");
+        assert_eq!(cleared.health.state, RuntimeHealthState::Degraded);
+    }
+
+    #[test]
+    fn runtime_health_activation_preserves_quarantine_and_disabled_posture() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        for (component_id, state, security_quarantine) in [
+            ("provider_activation_quarantined", RuntimeHealthState::Quarantined, true),
+            ("provider_activation_disabled", RuntimeHealthState::Disabled, false),
+        ] {
+            let health = runtime_health_fixture(component_id, state, 4, security_quarantine);
+            store.upsert_runtime_component_health(&health).expect("health should persist");
+            let activated = store
+                .activate_runtime_health_components(
+                    &[RuntimeHealthComponentActivation {
+                        component_id: health.component_id.clone(),
+                        authority_class: health.authority_class,
+                        fallback_component_id: health.fallback_component_id.clone(),
+                        fallback_authority_class: health.fallback_authority_class,
+                        policy: health.policy.clone(),
+                        reason_code: "runtime.health.provider_activated".to_owned(),
+                    }],
+                    10,
+                )
+                .expect("protected health should reactivate without clearing posture");
+            assert_eq!(
+                activated.generations.get(health.component_id.as_str()).map(|value| value.get()),
+                Some(5)
+            );
+            let persisted = store
+                .runtime_component_health(health.component_id.as_str())
+                .expect("reactivated health should load")
+                .expect("reactivated health should remain present");
+            assert_eq!(persisted.generation.get(), 5);
+            assert_eq!(persisted.state, state);
+            assert_eq!(persisted.security_quarantine, security_quarantine);
+            assert_eq!(persisted.strike_count, health.strike_count);
+            assert_eq!(persisted.reason_code, health.reason_code);
+        }
+    }
+
+    #[test]
+    fn runtime_health_activation_rejects_unreconciled_probe_authority() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_activation_probing",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "provider_activation_probe", 100, 200);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease,
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+
+        let error = store
+            .activate_runtime_health_components(
+                &[RuntimeHealthComponentActivation {
+                    component_id: health.component_id.clone(),
+                    authority_class: health.authority_class,
+                    fallback_component_id: None,
+                    fallback_authority_class: None,
+                    policy: health.policy.clone(),
+                    reason_code: "runtime.health.provider_activated".to_owned(),
+                }],
+                150,
+            )
+            .expect_err("activation must not invalidate live probe authority");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        let persisted = store
+            .runtime_component_health(health.component_id.as_str())
+            .expect("probing health should load")
+            .expect("probing health should remain present");
+        assert_eq!(persisted.generation, health.generation);
+        assert_eq!(persisted.state, RuntimeHealthState::Probing);
+    }
+
+    #[test]
+    fn runtime_health_activation_batch_rolls_back_when_one_component_is_invalid() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let valid = runtime_health_fixture(
+            "provider_activation_batch_valid",
+            RuntimeHealthState::Degraded,
+            3,
+            false,
+        );
+        let invalid = runtime_health_fixture(
+            "provider_activation_batch_invalid",
+            RuntimeHealthState::Degraded,
+            5,
+            false,
+        );
+        store.upsert_runtime_component_health(&valid).expect("valid health should persist");
+        store
+            .upsert_runtime_component_health(&invalid)
+            .expect("invalid target health should persist");
+
+        let error = store
+            .activate_runtime_health_components(
+                &[
+                    RuntimeHealthComponentActivation {
+                        component_id: valid.component_id.clone(),
+                        authority_class: valid.authority_class,
+                        fallback_component_id: None,
+                        fallback_authority_class: None,
+                        policy: valid.policy.clone(),
+                        reason_code: "runtime.health.provider_activated".to_owned(),
+                    },
+                    RuntimeHealthComponentActivation {
+                        component_id: invalid.component_id.clone(),
+                        authority_class: RuntimeAuthorityClass::PrivilegedMutation,
+                        fallback_component_id: None,
+                        fallback_authority_class: None,
+                        policy: invalid.policy.clone(),
+                        reason_code: "runtime.health.provider_activated".to_owned(),
+                    },
+                ],
+                10,
+            )
+            .expect_err("one invalid component must roll back the full activation batch");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+        for expected in [&valid, &invalid] {
+            let persisted = store
+                .runtime_component_health(expected.component_id.as_str())
+                .expect("health should load after rollback")
+                .expect("health should remain present after rollback");
+            assert_eq!(persisted.generation, expected.generation);
+            assert_eq!(persisted.state, expected.state);
+        }
+    }
+
+    #[test]
+    fn runtime_health_probe_begin_requires_host_actor_for_quarantine_recovery() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let security_health = runtime_health_fixture(
+            "provider_probe_security_quarantine",
+            RuntimeHealthState::Quarantined,
+            1,
+            true,
+        );
+        store
+            .upsert_runtime_component_health(&security_health)
+            .expect("security quarantine should persist");
+        let security_lease =
+            runtime_health_probe_lease(&security_health, "probe_security_quarantine", 100, 200);
+        let error = store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: security_lease,
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: Some("a".repeat(64)),
+                authorized_actor_id_sha256: Some("c".repeat(64)),
+            })
+            .expect_err("generic probes must not recover security quarantine");
+        assert!(matches!(error, JournalError::InvalidArgument(_)));
+
+        let recoverable_health = runtime_health_fixture(
+            "provider_probe_authorized_quarantine",
+            RuntimeHealthState::Quarantined,
+            1,
+            false,
+        );
+        store
+            .upsert_runtime_component_health(&recoverable_health)
+            .expect("recoverable quarantine should persist");
+        let lease = runtime_health_probe_lease(
+            &recoverable_health,
+            "probe_authorized_quarantine",
+            100,
+            200,
+        );
+        let digest_only_error = store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: Some("b".repeat(64)),
+                authorized_actor_id_sha256: None,
+            })
+            .expect_err("caller-supplied digest alone must not authorize quarantine recovery");
+        assert!(matches!(digest_only_error, JournalError::InvalidArgument(_)));
+
+        let request = RuntimeHealthProbeBeginRequest {
+            lease,
+            reason_code: "runtime.health.probe_started".to_owned(),
+            authorization_evidence_sha256: Some("b".repeat(64)),
+            authorized_actor_id_sha256: Some("c".repeat(64)),
+        };
+        let begun = store
+            .begin_runtime_health_probe(&request)
+            .expect("host-attributed non-security quarantine probe should begin");
+        assert!(!begun.replayed);
+        let replayed = store
+            .begin_runtime_health_probe(&request)
+            .expect("matching host actor should replay the quarantine probe begin");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.health, begun.health);
+        assert_eq!(replayed.lease, begun.lease);
+
+        let mut conflicting_actor = request;
+        conflicting_actor.authorized_actor_id_sha256 = Some("d".repeat(64));
+        assert!(matches!(
+            store
+                .begin_runtime_health_probe(&conflicting_actor)
+                .expect_err("different host actor must conflict with immutable begin evidence"),
+            JournalError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_health_probe_begin_rolls_back_when_projection_update_fails() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_begin_rollback",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_health_probe_begin_projection
+                    BEFORE UPDATE ON runtime_component_health
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced health probe begin projection failure');
+                    END;
+                "#,
+            )
+            .expect("failure trigger should install");
+        drop(connection);
+        let lease = runtime_health_probe_lease(&health, "probe_begin_rollback", 100, 200);
+
+        let error = store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease,
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect_err("failed projection must roll back the entire probe begin");
+        assert!(error.to_string().contains("forced health probe begin projection failure"));
+        assert_eq!(
+            store
+                .runtime_component_health(health.component_id.as_str())
+                .expect("health should load after rollback")
+                .expect("health should remain present after rollback"),
+            health
+        );
+        assert_eq!(
+            store
+                .runtime_health_probe_lease(health.component_id.as_str())
+                .expect("active lease lookup should succeed"),
+            None
+        );
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let begin_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_health_probe_begins", [], |row| row.get(0))
+            .expect("begin evidence should count");
+        assert_eq!(begin_count, 0);
+    }
+
+    #[test]
+    fn runtime_health_probe_settlement_rolls_back_when_terminal_evidence_fails() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_settlement_rollback",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_settlement_rollback", 100, 200);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_health_probe_terminal_evidence
+                    BEFORE INSERT ON runtime_health_probe_terminal_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced health probe terminal evidence failure');
+                    END;
+                "#,
+            )
+            .expect("failure trigger should install");
+        drop(connection);
+        let settlement = HealthProbeSettlementV1 {
+            schema_version: 1,
+            lease_id: lease.lease_id.clone(),
+            expected_generation: lease.expected_generation,
+            result: HealthProbeResult {
+                schema_version: 1,
+                component_id: lease.component_id.clone(),
+                disposition: HealthProbeDisposition::Passed,
+                reason_code: "runtime.health.probe_passed".to_owned(),
+                mutation_attempted: false,
+                completed_at_unix_ms: 150,
+            },
+        };
+
+        let error = store
+            .settle_runtime_health_probe(&RuntimeHealthProbeSettlementRequest {
+                settlement,
+                probe_evidence_sha256: Some("a".repeat(64)),
+            })
+            .expect_err("failed evidence insert must roll back the entire settlement");
+        assert!(error.to_string().contains("forced health probe terminal evidence failure"));
+        let persisted = store
+            .runtime_component_health(health.component_id.as_str())
+            .expect("health should load after rollback")
+            .expect("health should remain present after rollback");
+        assert_eq!(persisted.state, RuntimeHealthState::Probing);
+        assert_eq!(persisted.generation, health.generation);
+        assert_eq!(
+            store
+                .runtime_health_probe_lease(health.component_id.as_str())
+                .expect("active lease lookup should succeed"),
+            Some(lease)
+        );
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let terminal_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_health_probe_terminal_evidence", [], |row| {
+                row.get(0)
+            })
+            .expect("terminal evidence should count");
+        assert_eq!(terminal_count, 0);
+    }
+
+    #[test]
+    fn runtime_health_probe_begin_and_settlement_are_atomic_and_replay_safe() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_restart",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_lease_restart", 100, 200);
+        let begin_request = RuntimeHealthProbeBeginRequest {
+            lease: lease.clone(),
+            reason_code: "runtime.health.probe_started".to_owned(),
+            authorization_evidence_sha256: None,
+            authorized_actor_id_sha256: None,
+        };
+        let begun = store
+            .begin_runtime_health_probe(&begin_request)
+            .expect("exact probe begin should commit");
+        assert!(!begun.replayed);
+        assert_eq!(begun.health.state, RuntimeHealthState::Probing);
+        assert!(
+            store
+                .begin_runtime_health_probe(&begin_request)
+                .expect("matching begin should replay")
+                .replayed
+        );
+        let mut conflicting_begin = begin_request.clone();
+        conflicting_begin.reason_code = "runtime.health.probe_conflict".to_owned();
+        assert!(matches!(
+            store
+                .begin_runtime_health_probe(&conflicting_begin)
+                .expect_err("conflicting begin must fail closed"),
+            JournalError::InvalidArgument(_)
+        ));
+
+        let settlement = HealthProbeSettlementV1 {
+            schema_version: 1,
+            lease_id: lease.lease_id.clone(),
+            expected_generation: lease.expected_generation,
+            result: HealthProbeResult {
+                schema_version: 1,
+                component_id: lease.component_id.clone(),
+                disposition: HealthProbeDisposition::Passed,
+                reason_code: "runtime.health.probe_passed".to_owned(),
+                mutation_attempted: false,
+                completed_at_unix_ms: 150,
+            },
+        };
+        let settlement_request = RuntimeHealthProbeSettlementRequest {
+            settlement: settlement.clone(),
+            probe_evidence_sha256: Some("a".repeat(64)),
+        };
+        let settled = store
+            .settle_runtime_health_probe(&settlement_request)
+            .expect("exact settlement should commit");
+        assert!(!settled.replayed);
+        assert!(settled.health_mutated);
+        assert_eq!(settled.health.state, RuntimeHealthState::Healthy);
+        let replayed = store
+            .settle_runtime_health_probe(&settlement_request)
+            .expect("matching settlement should replay");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.health, settled.health);
+
+        let mut same_generation_update = settled.health.clone();
+        same_generation_update.reason_code = "runtime.health.after_settlement".to_owned();
+        same_generation_update.updated_at_unix_ms = 151;
+        store
+            .upsert_runtime_component_health(&same_generation_update)
+            .expect("same-generation health update should persist");
+        let replay_after_update = store
+            .settle_runtime_health_probe(&settlement_request)
+            .expect("settlement replay should ignore mutable current health");
+        assert!(replay_after_update.replayed);
+        assert_eq!(replay_after_update.health, settled.health);
+
+        store
+            .activate_runtime_health_components(
+                &[RuntimeHealthComponentActivation {
+                    component_id: settled.health.component_id.clone(),
+                    authority_class: settled.health.authority_class,
+                    fallback_component_id: settled.health.fallback_component_id.clone(),
+                    fallback_authority_class: settled.health.fallback_authority_class,
+                    policy: settled.health.policy.clone(),
+                    reason_code: "runtime.health.provider_reactivated".to_owned(),
+                }],
+                152,
+            )
+            .expect("later activation should advance the component generation");
+        let replay_after_activation = store
+            .settle_runtime_health_probe(&settlement_request)
+            .expect("settlement replay should survive later generation activation");
+        assert!(replay_after_activation.replayed);
+        assert_eq!(replay_after_activation.health, settled.health);
+
+        let mut conflicting_settlement = settlement_request.clone();
+        conflicting_settlement.settlement.result.disposition = HealthProbeDisposition::Failed;
+        conflicting_settlement.settlement.result.reason_code =
+            "runtime.health.probe_failed".to_owned();
+        assert!(matches!(
+            store
+                .settle_runtime_health_probe(&conflicting_settlement)
+                .expect_err("conflicting settlement must fail closed"),
+            JournalError::InvalidArgument(_)
+        ));
+        assert_eq!(
+            store
+                .runtime_health_probe_lease(health.component_id.as_str())
+                .expect("settled lease lookup should succeed"),
+            None
+        );
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        for table in ["runtime_health_probe_begins", "runtime_health_probe_terminal_evidence"] {
+            let count: i64 = connection
+                .query_row(format!("SELECT COUNT(*) FROM {table}").as_str(), [], |row| row.get(0))
+                .expect("probe evidence should count");
+            assert_eq!(count, 1, "{table} should contain one immutable record");
+            let update_error = connection
+                .execute(format!("UPDATE {table} SET reason_code = 'tampered'").as_str(), [])
+                .expect_err("probe evidence update must fail");
+            assert!(update_error.to_string().contains("immutable"));
+            let delete_error = connection
+                .execute(format!("DELETE FROM {table}").as_str(), [])
+                .expect_err("probe evidence delete must fail");
+            assert!(delete_error.to_string().contains("immutable"));
+        }
+    }
+
+    #[test]
+    fn runtime_health_probe_late_success_settles_inconclusive_with_actual_time() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_late_success",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_late_success", 100, 200);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.operator_probe".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+        let request = RuntimeHealthProbeSettlementRequest {
+            settlement: HealthProbeSettlementV1 {
+                schema_version: HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
+                lease_id: lease.lease_id,
+                expected_generation: lease.expected_generation,
+                result: HealthProbeResult {
+                    schema_version: HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+                    component_id: lease.component_id,
+                    disposition: HealthProbeDisposition::Passed,
+                    reason_code: "runtime.health.probe_passed".to_owned(),
+                    mutation_attempted: false,
+                    completed_at_unix_ms: 250,
+                },
+            },
+            probe_evidence_sha256: None,
+        };
+
+        let settled = store
+            .settle_runtime_health_probe(&request)
+            .expect("late probe should settle conservatively");
+        assert_eq!(settled.disposition, HealthProbeDisposition::Inconclusive);
+        assert_eq!(settled.health.state, RuntimeHealthState::Quarantined);
+        assert_eq!(settled.health.reason_code, "runtime.health.probe_completed_after_expiry");
+        assert_eq!(settled.completed_at_unix_ms, 250);
+        let replayed = store
+            .settle_runtime_health_probe(&request)
+            .expect("raw late result should replay the canonical settlement");
+        assert!(replayed.replayed);
+        assert_eq!(replayed, RuntimeHealthProbeSettlementOutcome { replayed: true, ..settled });
+    }
+
+    #[test]
+    fn runtime_health_terminal_scalar_mismatch_blocks_admission() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_terminal_scalar_mismatch",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_terminal_scalar_mismatch", 100, 200);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+        store
+            .settle_runtime_health_probe(&RuntimeHealthProbeSettlementRequest {
+                settlement: HealthProbeSettlementV1 {
+                    schema_version: 1,
+                    lease_id: lease.lease_id.clone(),
+                    expected_generation: lease.expected_generation,
+                    result: HealthProbeResult {
+                        schema_version: 1,
+                        component_id: lease.component_id.clone(),
+                        disposition: HealthProbeDisposition::Passed,
+                        reason_code: "runtime.health.probe_passed".to_owned(),
+                        mutation_attempted: false,
+                        completed_at_unix_ms: 150,
+                    },
+                },
+                probe_evidence_sha256: Some("a".repeat(64)),
+            })
+            .expect("settlement should commit");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch("DROP TRIGGER trg_runtime_health_probe_terminal_prevent_update")
+            .expect("immutable trigger should drop for corruption injection");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_health_probe_terminal_evidence
+                    SET result_state = 'quarantined'
+                    WHERE lease_ulid = ?1
+                "#,
+                params![lease.lease_id.as_str()],
+            )
+            .expect("terminal scalar mismatch should inject");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("terminal compatibility should scan exact evidence");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_health_probe_terminal_evidence"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+        }));
+    }
+
+    #[test]
+    fn runtime_component_health_scalar_mismatch_blocks_admission() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_health_scalar_mismatch",
+            RuntimeHealthState::Degraded,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_component_health
+                    SET reason_code = 'runtime.health.scalar_tampered'
+                    WHERE component_ulid = ?1
+                "#,
+                params![health.component_id.as_str()],
+            )
+            .expect("health scalar mismatch should inject");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("health compatibility should scan exact scalar evidence");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_component_health"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+        }));
+        assert!(matches!(
+            reopened
+                .runtime_component_health(health.component_id.as_str())
+                .expect_err("live reads must reject scalar/JSON disagreement"),
+            JournalError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn compatibility_admission_precedes_supported_health_probe_reconciliation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_probe_expired",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_lease_expired", 100, 101);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin before expiry");
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen without maintenance");
+        assert_eq!(
+            reopened
+                .runtime_health_probe_lease(health.component_id.as_str())
+                .expect("expired lease should remain before compatibility admission"),
+            Some(lease.clone())
+        );
+        let compatibility = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility admission should run before maintenance");
+        assert!(compatibility.permits_admission());
+        let reconciled = reopened
+            .reconcile_runtime_health_probes(
+                RuntimeHealthProbeReconciliationMode::Startup,
+                lease.expires_at_unix_ms,
+            )
+            .expect("supported inherited probe should reconcile");
+        assert_eq!(reconciled.settled_inconclusive, 1);
+        assert_eq!(
+            reopened
+                .runtime_component_health(health.component_id.as_str())
+                .expect("health should load")
+                .expect("health should remain present")
+                .state,
+            RuntimeHealthState::Quarantined
+        );
+        assert_eq!(
+            reopened
+                .runtime_health_probe_lease(health.component_id.as_str())
+                .expect("reconciled lease lookup should succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_health_reconciliation_clamps_wall_clock_rollback() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let mut health = runtime_health_fixture(
+            "provider_probe_clock_rollback",
+            RuntimeHealthState::Cooldown,
+            1,
+            false,
+        );
+        health.expires_at_unix_ms = Some(0);
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_clock_rollback", 10, 20);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin");
+
+        let reconciled = store
+            .reconcile_runtime_health_probes(RuntimeHealthProbeReconciliationMode::Startup, 5)
+            .expect("startup reconciliation should survive wall-clock rollback");
+        assert_eq!(reconciled.settled_inconclusive, 1);
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let (completed_at, settled_at, schema_version): (i64, i64, i64) = connection
+            .query_row(
+                r#"
+                    SELECT completed_at_unix_ms, settled_at_unix_ms, schema_version
+                    FROM runtime_health_probe_terminal_evidence
+                    WHERE lease_ulid = ?1
+                "#,
+                params![lease.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("reconciliation terminal evidence should load");
+        assert_eq!(completed_at, lease.issued_at_unix_ms);
+        assert_eq!(settled_at, completed_at);
+        assert_eq!(schema_version, 2);
+    }
+
+    #[test]
+    fn startup_health_probe_reconciliation_drains_bounded_batches() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        for index in 0..257 {
+            let component_id = format!("provider_probe_startup_batch_{index:03}");
+            let health = runtime_health_fixture(
+                component_id.as_str(),
+                RuntimeHealthState::Cooldown,
+                1,
+                false,
+            );
+            store.upsert_runtime_component_health(&health).expect("health should persist");
+            let lease_id = format!("probe_startup_batch_{index:03}");
+            store
+                .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                    lease: runtime_health_probe_lease(&health, lease_id.as_str(), 100, 200),
+                    reason_code: "runtime.health.probe_started".to_owned(),
+                    authorization_evidence_sha256: None,
+                    authorized_actor_id_sha256: None,
+                })
+                .expect("probe should begin");
+        }
+
+        let first = store
+            .reconcile_runtime_health_probes(RuntimeHealthProbeReconciliationMode::Startup, 150)
+            .expect("first startup reconciliation batch should commit");
+        assert_eq!(first.examined, 256);
+        assert_eq!(first.settled_inconclusive, 256);
+        assert!(first.remaining);
+
+        let second = store
+            .reconcile_runtime_health_probes(RuntimeHealthProbeReconciliationMode::Startup, 150)
+            .expect("second startup reconciliation batch should commit");
+        assert_eq!(second.examined, 1);
+        assert_eq!(second.settled_inconclusive, 1);
+        assert!(!second.remaining);
+        let diagnostics =
+            store.shared_runtime_diagnostics().expect("reconciled health diagnostics should load");
+        assert_eq!(diagnostics.active_health_probe_leases, 0);
+        assert_eq!(
+            diagnostics.health_probe_settlements_by_disposition.get("inconclusive"),
+            Some(&257)
+        );
+    }
+
+    #[test]
+    fn expired_future_health_probe_lease_blocks_admission_without_data_loss() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health =
+            runtime_health_fixture("provider_probe_future", RuntimeHealthState::Cooldown, 1, false);
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        let lease = runtime_health_probe_lease(&health, "probe_lease_future", 100, 101);
+        store
+            .begin_runtime_health_probe(&RuntimeHealthProbeBeginRequest {
+                lease: lease.clone(),
+                reason_code: "runtime.health.probe_started".to_owned(),
+                authorization_evidence_sha256: None,
+                authorized_actor_id_sha256: None,
+            })
+            .expect("probe should begin before future-schema injection");
+        drop(store);
+
+        let future_lease_json = format!(
+            r#"{{"schema_version":2,"lease_id":"{}","component_id":"{}","expected_generation":1,"authority_class":"{}","issued_at_unix_ms":100,"expires_at_unix_ms":101,"non_mutating":true}}"#,
+            lease.lease_id.as_str(),
+            lease.component_id.as_str(),
+            lease.authority_class.as_str(),
+        );
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_health_probe_leases
+                    SET lease_json = ?1, issued_at_unix_ms = 100,
+                        expires_at_unix_ms = 101, schema_version = 3
+                    WHERE lease_ulid = ?2
+                "#,
+                params![future_lease_json, lease.lease_id.as_str()],
+            )
+            .expect("future health probe lease fixture should persist");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen without deleting incompatible state");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should inspect future health probe lease");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.contract == "runtime_health_probe_leases")
+            .expect("future health probe lease should produce a finding");
+        assert_eq!(finding.outcome, RuntimeStateCompatibilityOutcome::BlockedNewerSchema);
+        assert_eq!(finding.reason_code, "runtime.compatibility.unsupported_schema");
+        assert_eq!(finding.record_ref_sha256, sha256_hex(lease.lease_id.as_str().as_bytes()));
+        assert!(!serde_json::to_string(&report)
+            .expect("compatibility report should serialize")
+            .contains(lease.lease_id.as_str()));
+        let diagnostics =
+            reopened.shared_runtime_diagnostics().expect("compatibility diagnostics should load");
+        assert_eq!(
+            diagnostics
+                .compatibility_findings_by_reason
+                .get("runtime.compatibility.unsupported_schema"),
+            Some(&1)
+        );
+        assert_eq!(
+            reopened
+                .reap_expired_runtime_health_probe_leases(lease.expires_at_unix_ms)
+                .expect("supported-only reaper should ignore future schema"),
+            0
+        );
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let preserved: (String, i64, i64, i64) = connection
+            .query_row(
+                r#"
+                    SELECT lease_json, issued_at_unix_ms, expires_at_unix_ms, schema_version
+                    FROM runtime_health_probe_leases
+                    WHERE lease_ulid = ?1
+                "#,
+                params![lease.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("future health probe evidence should remain unchanged");
+        assert_eq!(preserved, (future_lease_json, 100, 101, 3));
+    }
+
+    #[test]
+    fn compatibility_report_blocks_future_and_corrupt_child_cancellation_contexts() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "child_context_compatibility_session";
+        let parent_run_id = "child_context_compatibility_parent";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, parent_run_id);
+        let generation = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("parent runtime generation should load")
+            .expect("parent runtime generation should be active")
+            .generation;
+        for task_id in [
+            "future_child_context",
+            "corrupt_child_context",
+            "missing_child_context",
+            "wrong_kind_child_context",
+        ] {
+            store
+                .create_orchestrator_background_task(&queued_delegation_request(
+                    session_id,
+                    parent_run_id,
+                    task_id,
+                    Some(test_child_task_cancellation_context(generation)),
+                ))
+                .expect("delegation context fixture should persist");
+        }
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET cancellation_context_json = '{"schema_version":2}'
+                    WHERE task_ulid = 'future_child_context'
+                "#,
+                [],
+            )
+            .expect("future child context should inject");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET cancellation_context_json = '{'
+                    WHERE task_ulid = 'corrupt_child_context'
+                "#,
+                [],
+            )
+            .expect("corrupt child context should inject");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET cancellation_context_json = NULL
+                    WHERE task_ulid = 'missing_child_context'
+                "#,
+                [],
+            )
+            .expect("missing child context should inject");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET task_kind = 'background_prompt'
+                    WHERE task_ulid = 'wrong_kind_child_context'
+                "#,
+                [],
+            )
+            .expect("wrong-kind child context should inject");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("child context compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "orchestrator_background_tasks"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::BlockedNewerSchema
+        }));
+        let corrupt_findings = report
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.contract == "orchestrator_background_tasks"
+                    && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+            })
+            .count();
+        assert_eq!(corrupt_findings, 3);
+        let report_json = serde_json::to_string(&report).expect("report should serialize");
+        for task_id in [
+            "future_child_context",
+            "corrupt_child_context",
+            "missing_child_context",
+            "wrong_kind_child_context",
+        ] {
+            assert!(!report_json.contains(task_id));
+        }
+    }
+
+    #[test]
+    fn compatibility_report_blocks_invalid_child_session_authority_and_lineage() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "child_session_compatibility_parent";
+        let parent_run_id = "child_session_compatibility_parent_run";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, parent_run_id);
+        let generation = store
+            .active_runtime_generation_for_run(parent_run_id, RuntimeGenerationLane::Run)
+            .expect("parent generation should load")
+            .expect("parent generation should be active")
+            .generation;
+        for task_id in [
+            "missing_child_session_authority",
+            "non_delegation_child_session_authority",
+            "malformed_child_session_authority",
+            "mismatched_child_session_lineage",
+        ] {
+            store
+                .create_orchestrator_background_task(&queued_delegation_request(
+                    session_id,
+                    parent_run_id,
+                    task_id,
+                    Some(test_child_task_cancellation_context(generation)),
+                ))
+                .expect("delegation child-session fixture should persist");
+        }
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET child_session_ulid = NULL
+                    WHERE task_ulid = 'missing_child_session_authority'
+                "#,
+                [],
+            )
+            .expect("missing child-session authority should inject");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET task_kind = 'background_prompt',
+                        delegation_json = NULL,
+                        cancellation_context_json = NULL
+                    WHERE task_ulid = 'non_delegation_child_session_authority'
+                "#,
+                [],
+            )
+            .expect("non-delegation child-session authority should inject");
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("fixture foreign keys should disable");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_background_tasks
+                    SET child_session_ulid = 'invalid child session'
+                    WHERE task_ulid = 'malformed_child_session_authority'
+                "#,
+                [],
+            )
+            .expect("malformed child-session authority should inject");
+        connection
+            .execute(
+                r#"
+                    UPDATE orchestrator_sessions
+                    SET parent_session_ulid = 'wrong_parent_session'
+                    WHERE session_ulid = 'child-session-mismatched_child_session_lineage'
+                "#,
+                [],
+            )
+            .expect("mismatched child-session lineage should inject");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("child-session compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        let corrupt_findings = report
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.contract == "orchestrator_background_tasks"
+                    && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+            })
+            .count();
+        assert_eq!(corrupt_findings, 4);
+        let report_json = serde_json::to_string(&report).expect("report should serialize");
+        for task_id in [
+            "missing_child_session_authority",
+            "non_delegation_child_session_authority",
+            "malformed_child_session_authority",
+            "mismatched_child_session_lineage",
+        ] {
+            assert!(!report_json.contains(task_id));
+        }
+    }
+
+    #[test]
+    fn compatibility_report_blocks_newer_and_corrupt_shared_records() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_compatibility";
+        let run_id = "run_compatibility";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(
+                    session_id,
+                    run_id,
+                    lease.generation,
+                    1,
+                    RuntimeEventName::RunStarted,
+                ),
+            })
+            .expect("runtime event should persist");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    DROP TRIGGER trg_runtime_events_v2_prevent_update;
+                    UPDATE runtime_events_v2
+                    SET envelope_json = '{"schema_version":3}'
+                    WHERE sequence = 1;
+                    INSERT INTO runtime_component_health (
+                        component_ulid, generation, state, reason_code, health_json, updated_at_unix_ms
+                    ) VALUES (
+                        'corrupt_health', 1, 'degraded', 'runtime.health.corrupt', '{', 1
+                    );
+                "#,
+            )
+            .expect("test should inject future and corrupt records");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.outcome.as_str() == "blocked_newer_schema"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.outcome.as_str() == "quarantined_corrupt"));
+        reopened
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("compatibility findings should persist explicitly");
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let quarantine_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_state_quarantine", [], |row| row.get(0))
+            .expect("compatibility findings should be durable");
+        assert_eq!(quarantine_count, 3);
+    }
+
+    #[test]
+    fn compatibility_report_bounds_large_incompatible_state_before_quarantine_commit() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+        let mut connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        let transaction = connection.transaction().expect("fixture transaction should start");
+        for index in 0..palyra_common::runtime_contracts::MAX_RUNTIME_COMPATIBILITY_FINDINGS {
+            transaction
+                .execute(
+                    r#"
+                        INSERT INTO runtime_component_health (
+                            component_ulid, generation, state, reason_code, health_json,
+                            updated_at_unix_ms
+                        ) VALUES (?1, 1, 'degraded', 'runtime.health.corrupt', '{', 1)
+                    "#,
+                    params![format!("corrupt-health-{index:04}")],
+                )
+                .expect("corrupt compatibility fixture should insert");
+        }
+        for index in 0..44 {
+            transaction
+                .execute(
+                    r#"
+                        INSERT INTO runtime_networked_worker_expiry_outbox (
+                            event_ulid, worker_id, run_ulid, lease_ulid, event_json,
+                            created_at_unix_ms, schema_version
+                        ) VALUES (?1, 'worker-bounded', 'run-bounded', ?2, '{}', 1, 1)
+                    "#,
+                    params![
+                        format!("bounded-event-{index:04}"),
+                        format!("bounded-lease-{index:04}")
+                    ],
+                )
+                .expect("later incompatible fixture should insert");
+        }
+        transaction.commit().expect("fixture transaction should commit");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("large incompatible state should produce a bounded blocked report");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(
+            report.findings.len(),
+            palyra_common::runtime_contracts::MAX_RUNTIME_COMPATIBILITY_FINDINGS
+        );
+        let truncation = report
+            .findings
+            .iter()
+            .find(|finding| finding.reason_code == "runtime.compatibility.findings_truncated")
+            .expect("bounded report should expose truncation evidence");
+        assert_eq!(truncation.contract, "runtime_state_compatibility_report");
+        assert!(truncation.blocks_admission);
+        assert_eq!(
+            report.findings.last().map(|finding| finding.reason_code.as_str()),
+            Some("runtime.compatibility.findings_truncated")
+        );
+        store
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("bounded compatibility findings should persist explicitly");
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let quarantine_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_state_quarantine", [], |row| row.get(0))
+            .expect("bounded compatibility findings should be durable");
+        assert_eq!(
+            quarantine_count,
+            i64::try_from(palyra_common::runtime_contracts::MAX_RUNTIME_COMPATIBILITY_FINDINGS)
+                .expect("finding limit should fit sqlite integer")
+        );
+    }
+
+    #[test]
+    fn compatibility_report_blocks_future_append_only_runtime_evidence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let health = runtime_health_fixture(
+            "provider_versioned_event",
+            RuntimeHealthState::Healthy,
+            1,
+            false,
+        );
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    DROP TRIGGER trg_runtime_health_events_prevent_update;
+                    DROP TRIGGER trg_runtime_health_events_prevent_delete;
+                "#,
+            )
+            .expect("future-schema fixture should disable local append-only guards");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_component_health_events
+                    SET schema_version = 2
+                    WHERE component_ulid = ?1
+                "#,
+                params![health.component_id.as_str()],
+            )
+            .expect("future event schema fixture should persist");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("future append-only event should produce a report");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_component_health_events"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::BlockedNewerSchema
+                && finding.reason_code == "runtime.compatibility.unsupported_schema"
+        }));
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let preserved_schema_version: i64 = connection
+            .query_row(
+                r#"
+                    SELECT schema_version
+                    FROM runtime_component_health_events
+                    WHERE component_ulid = ?1
+                "#,
+                params![health.component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("future append-only event should remain preserved");
+        assert_eq!(preserved_schema_version, 2);
+    }
+
+    #[test]
+    fn compatibility_report_blocks_corrupt_and_future_networked_worker_state() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    INSERT INTO runtime_networked_worker_expiry_outbox (
+                        event_ulid, worker_id, run_ulid, lease_ulid, event_json,
+                        created_at_unix_ms, schema_version
+                    ) VALUES (
+                        'worker-expiry:future', 'worker-future', 'run-future', 'lease-future',
+                        '{"worker_id":"worker-future"}', 1, 2
+                    );
+                    INSERT INTO runtime_networked_worker_fleet (
+                        worker_id, record_json, updated_at_unix_ms, schema_version
+                    ) VALUES ('worker-corrupt', '{', 1, 1);
+                "#,
+            )
+            .expect("test should inject incompatible worker state");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("worker compatibility report should build before strict reconstruction");
+
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_expiry_outbox"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::BlockedNewerSchema
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_fleet"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+        }));
+        store
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("worker compatibility findings should persist explicitly");
+        drop(store);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let quarantine_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_state_quarantine WHERE contract_name LIKE 'runtime_networked_worker_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("worker compatibility findings should be durable");
+        assert!(quarantine_count >= 2);
+    }
+
+    #[test]
+    fn compatibility_report_accepts_process_provenance_without_embedded_version() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        persist_process_cleanup_fixture(&store, "compatibility_valid");
+
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("valid process provenance should scan");
+
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn compatibility_report_quarantines_invalid_process_provenance_and_cleanup_step() {
+        const PROVENANCE_SENTINEL: &str = "raw_provenance_payload_must_not_escape";
+        const CLEANUP_SENTINEL: &str = "raw_cleanup_payload_must_not_escape";
+
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let (_descriptor, lease) = persist_process_cleanup_fixture(&store, "compatibility_corrupt");
+        let cleanup_report = process_cleanup_report(
+            "compatibility_corrupt",
+            &lease,
+            CleanupOutcome::Completed,
+            CleanupStepDisposition::Completed,
+        );
+        store.append_cleanup_report(&cleanup_report).expect("cleanup report should persist");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_process_leases SET provenance_json = ?1 WHERE lease_ulid = ?2",
+                params![
+                    json!({"unrecognized_sensitive_field": PROVENANCE_SENTINEL}).to_string(),
+                    lease.lease_id.as_str(),
+                ],
+            )
+            .expect("test should inject invalid process provenance");
+        connection
+            .execute_batch("DROP TRIGGER trg_runtime_cleanup_steps_prevent_update;")
+            .expect("test should permit cleanup-step corruption");
+        connection
+            .execute(
+                r#"
+                    UPDATE runtime_cleanup_steps
+                    SET step = 'pid_only_cleanup', reason_code = ?1, evidence_sha256 = 'not-a-digest'
+                    WHERE report_ulid = ?2
+                "#,
+                params![CLEANUP_SENTINEL, cleanup_report.report_id.as_str()],
+            )
+            .expect("test should inject invalid cleanup evidence");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(report.findings.len(), 2);
+        for finding in &report.findings {
+            assert_eq!(finding.outcome, RuntimeStateCompatibilityOutcome::QuarantinedCorrupt);
+            assert!(finding.blocks_admission);
+            assert_eq!(finding.record_ref_sha256.len(), 64);
+            assert!(finding.record_ref_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_process_leases"
+                && finding.reason_code == "runtime.compatibility.invalid_contract"
+                && finding.payload_bytes > 0
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_cleanup_steps"
+                && finding.reason_code == "runtime.compatibility.invalid_cleanup_step"
+                && finding.payload_bytes == 0
+        }));
+        let serialized_report =
+            serde_json::to_string(&report).expect("compatibility report should serialize");
+        for sensitive in [
+            PROVENANCE_SENTINEL,
+            CLEANUP_SENTINEL,
+            lease.lease_id.as_str(),
+            cleanup_report.report_id.as_str(),
+        ] {
+            assert!(
+                !serialized_report.contains(sensitive),
+                "compatibility findings must not expose raw records or identities"
+            );
+        }
+
+        {
+            let guard = reopened.connection.lock().expect("journal lock should be available");
+            assert_eq!(
+                runtime_state_quarantine_count(&guard),
+                0,
+                "compatibility inspection must not persist quarantine evidence"
+            );
+        }
+        let diagnostics =
+            reopened.shared_runtime_diagnostics().expect("compatibility diagnostics should load");
+        assert_eq!(diagnostics.compatibility_admission, RuntimeStateAdmissionPosture::Blocked);
+        assert_eq!(diagnostics.compatibility_findings_by_reason.values().copied().sum::<u64>(), 2);
+        let repeated = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility scan replay should succeed");
+        assert_eq!(repeated.findings.len(), 2);
+        {
+            let guard = reopened.connection.lock().expect("journal lock should be available");
+            assert_eq!(
+                runtime_state_quarantine_count(&guard),
+                0,
+                "diagnostics and repeated inspection must remain nonmutating"
+            );
+        }
+        reopened
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("compatibility findings should persist explicitly");
+        reopened
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("explicit compatibility persistence should be idempotent");
+        {
+            let guard = reopened.connection.lock().expect("journal lock should be available");
+            assert_eq!(runtime_state_quarantine_count(&guard), 2);
+        }
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let quarantine_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_state_quarantine", [], |row| row.get(0))
+            .expect("compatibility findings should be durable");
+        assert_eq!(quarantine_count, 2);
+        let update_error = connection
+            .execute("UPDATE runtime_state_quarantine SET reason_code = 'tampered'", [])
+            .expect_err("quarantine evidence must remain append-only");
+        assert!(update_error.to_string().contains("runtime_state_quarantine is append-only"));
+    }
+
+    #[test]
+    fn compatibility_report_clears_repaired_active_blockers() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let policy = palyra_common::runtime_contracts::CircuitBreakerPolicy {
+            strike_threshold: 3,
+            cooldown_ms: 1_000,
+            max_probe_concurrency: 1,
+            security_quarantine_auto_clear: false,
+        };
+        let health = RuntimeComponentHealthV1 {
+            schema_version: 1,
+            component_id: RuntimeInstanceId::parse("compatibility_repair")
+                .expect("component id should validate"),
+            generation: RuntimeGeneration::new(1).expect("generation should validate"),
+            state: RuntimeHealthState::Degraded,
+            authority_class: RuntimeAuthorityClass::ReadOnly,
+            strike_count: 1,
+            reason_code: "runtime.health.degraded".to_owned(),
+            first_failure_at_unix_ms: Some(1),
+            last_failure_at_unix_ms: Some(1),
+            expires_at_unix_ms: None,
+            fallback_component_id: None,
+            fallback_authority_class: None,
+            security_quarantine: false,
+            policy,
+            updated_at_unix_ms: 1,
+        };
+        store.upsert_runtime_component_health(&health).expect("health should persist");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    UPDATE runtime_component_health
+                    SET health_json = '{';
+                "#,
+            )
+            .expect("test should inject corrupt health state");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        reopened
+            .persist_runtime_state_quarantine_findings(&report)
+            .expect("blocked compatibility finding should persist explicitly");
+        drop(reopened);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_component_health SET health_json = ?1",
+                params![serde_json::to_string(&health).expect("health should serialize")],
+            )
+            .expect("test should repair health state");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(report.findings.is_empty());
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let historical_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_state_quarantine", [], |row| row.get(0))
+            .expect("historical compatibility findings should count");
+        assert_eq!(historical_count, 1);
+    }
+
+    #[test]
+    fn future_lease_schema_versions_block_admission() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let (_descriptor, lease) = persist_process_cleanup_fixture(&store, "future_schema");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE runtime_process_leases SET schema_version = 2 WHERE lease_ulid = ?1",
+                params![lease.lease_id.as_str()],
+            )
+            .expect("test should inject future process lease schema");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id, channel,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (?1, 'user:test', 'device-test', 'test', 1, 1)
+                "#,
+                params!["session_future_generation_schema"],
+            )
+            .expect("session should persist");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_generation_leases (
+                        session_ulid, lane, lease_ulid, run_ulid, generation, owner,
+                        acquired_at_unix_ms, expires_at_unix_ms, schema_version
+                    ) VALUES (?1, 'run', ?2, NULL, 1, 'test', 1, 100, 2)
+                "#,
+                params!["session_future_generation_schema", "lease_future_generation_schema"],
+            )
+            .expect("test should inject future generation lease schema");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("compatibility report should build");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_process_leases"
+                && finding.observed_schema_version == Some(2)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_generation_leases"
+                && finding.observed_schema_version == Some(2)
+        }));
+    }
+
+    #[test]
     fn compat_response_store_persists_and_safe_deletes_public_view() {
         let db_path = temp_db_path();
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5RA1";
@@ -31501,6 +45018,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -31584,6 +45103,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("foreground run should start");
         store
@@ -31591,7 +45112,7 @@ mod tests {
             .expect("foreground run should complete");
 
         for (run_id, origin_kind) in
-            [(background_run_id, "background"), (delegation_run_id, "delegation")]
+            [(background_run_id, "background"), (delegation_run_id, "background")]
         {
             store
                 .start_orchestrator_run(&OrchestratorRunStartRequest {
@@ -31601,6 +45122,8 @@ mod tests {
                     origin_run_id: Some(foreground_run_id.to_owned()),
                     triggered_by_principal: Some("user:ops".to_owned()),
                     parameter_delta_json: None,
+
+                    delegated_admission: None,
                 })
                 .expect("child run should start");
             store
@@ -31644,6 +45167,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("active foreground run should start");
         store
@@ -31658,6 +45183,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect_err("second foreground run in one session should be rejected");
         match error {
@@ -31681,6 +45208,8 @@ mod tests {
                 origin_run_id: Some(active_run_id.to_owned()),
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("background child run should not replace or block foreground last run");
         store
@@ -31694,6 +45223,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("foreground run should start after active run completes");
     }
@@ -31723,6 +45254,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
 
@@ -31827,6 +45360,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("prior run should start");
         let prior_artifact = store
@@ -31882,6 +45417,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: Some("user:ops".to_owned()),
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("same-device reader run should start");
 
@@ -32476,6 +46013,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn append_reports_duplicate_before_capacity_when_journal_is_full() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig {
+            db_path,
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 1,
+        })
+        .expect("journal store should open");
+        let request = build_request("01ARZ3NDEKTSV4RRFFQ69G5FDB", br#"{"index":0}"#);
+        store.append(&request).expect("initial append should fill the journal");
+
+        let error = store
+            .append(&request)
+            .expect_err("exact replay must reach duplicate handling even at capacity");
+
+        assert!(matches!(
+            error,
+            JournalError::DuplicateEventId { event_id }
+                if event_id == "01ARZ3NDEKTSV4RRFFQ69G5FDB"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn journal_store_open_sets_owner_only_permissions_for_new_storage() {
@@ -32519,6 +46080,45 @@ mod tests {
             JournalError::DuplicateEventId { ref event_id }
                 if event_id == "01ARZ3NDEKTSV4RRFFQ69G5FB6"
         ));
+    }
+
+    #[test]
+    fn event_by_id_loads_exact_event_outside_recent_window() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let target_id = "01ARZ3NDEKTSV4RRFFQ69G5FB6";
+        let target = build_request(target_id, br#"{"kind":"target"}"#);
+        store.append(&target).expect("target append should succeed");
+        for index in 0..501_u64 {
+            let event_id = format!("lookup-filler-{index:03}");
+            let payload = format!(r#"{{"index":{index}}}"#);
+            store
+                .append(&build_request(event_id.as_str(), payload.as_bytes()))
+                .expect("filler append should succeed");
+        }
+
+        assert!(store
+            .recent(500)
+            .expect("recent journal query should succeed")
+            .iter()
+            .all(|event| event.event_id != target_id));
+        let loaded = store
+            .event_by_id(target_id)
+            .expect("exact journal lookup should succeed")
+            .expect("target event should exist");
+        assert_eq!(loaded.event_id, target.event_id);
+        assert_eq!(loaded.session_id, target.session_id);
+        assert_eq!(loaded.run_id, target.run_id);
+        assert_eq!(loaded.kind, target.kind);
+        assert_eq!(loaded.actor, target.actor);
+        assert_eq!(loaded.principal, target.principal);
+        assert_eq!(loaded.device_id, target.device_id);
+        assert_eq!(loaded.channel, target.channel);
+        assert_eq!(
+            store.event_by_id("missing-event").expect("missing lookup should succeed"),
+            None
+        );
     }
 
     #[test]
@@ -32611,6 +46211,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("orchestrator run should start");
         store
@@ -32814,6 +46416,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run start should succeed");
         for seq in 0..5 {
@@ -32854,6 +46458,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run start should succeed");
 
@@ -32899,6 +46505,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run start should succeed");
 
@@ -33624,6 +47232,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -33711,6 +47321,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -33763,6 +47375,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -33819,6 +47433,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -33888,6 +47504,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run should start");
         store
@@ -33965,6 +47583,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("first run start should succeed");
         let duplicate_run = store
@@ -33975,6 +47595,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect_err("duplicate run IDs must be rejected");
         assert!(matches!(
@@ -33983,13 +47605,14 @@ mod tests {
                 if run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAX"
         ));
 
+        let first_tape_request = OrchestratorTapeAppendRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            seq: 7,
+            event_type: "status".to_owned(),
+            payload_json: r#"{"kind":"accepted"}"#.to_owned(),
+        };
         store
-            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
-                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
-                seq: 7,
-                event_type: "status".to_owned(),
-                payload_json: r#"{"kind":"accepted"}"#.to_owned(),
-            })
+            .append_orchestrator_tape_event(&first_tape_request)
             .expect("first tape sequence should succeed");
         let duplicate_tape = store
             .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
@@ -34001,6 +47624,14 @@ mod tests {
             .expect_err("duplicate tape sequence should be rejected");
         assert!(matches!(
             duplicate_tape,
+            JournalError::DuplicateTapeSequence { ref run_id, seq }
+                if run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAX" && seq == 7
+        ));
+        let replay_without_projection = store
+            .append_orchestrator_tape_event_with_runtime_projection(&first_tape_request, None)
+            .expect_err("plain tape replay must retain duplicate-sequence semantics");
+        assert!(matches!(
+            replay_without_projection,
             JournalError::DuplicateTapeSequence { ref run_id, seq }
                 if run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAX" && seq == 7
         ));
@@ -34021,6 +47652,8 @@ mod tests {
                 origin_run_id: None,
                 triggered_by_principal: None,
                 parameter_delta_json: None,
+
+                delegated_admission: None,
             })
             .expect("run start should succeed");
         assert!(
@@ -34044,13 +47677,19 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_cancel_terminalizes_active_run_and_prevents_done_race() {
+    fn orchestrator_cancel_records_intent_until_settlement() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
         start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        activate_runtime_generation(
+            &store,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            RuntimeGenerationTransitionKind::Activated,
+        );
         store
             .update_orchestrator_run_state(
                 "01ARZ3NDEKTSV4RRFFQ69G5FAX",
@@ -34066,33 +47705,349 @@ mod tests {
             })
             .expect("active cancel request should persist");
 
-        let cancelled = store
+        let pending = store
             .orchestrator_run_status_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
             .expect("run snapshot query should succeed")
-            .expect("cancelled run should exist");
-        assert_eq!(cancelled.state, RunLifecycleState::Cancelled.as_str());
-        assert!(cancelled.cancel_requested);
-        assert_eq!(cancelled.cancel_reason.as_deref(), Some("operator_requested"));
-        assert_eq!(cancelled.last_error.as_deref(), Some("operator_requested"));
-        assert!(
-            cancelled.completed_at_unix_ms.is_some(),
-            "cancelled runs should be terminal immediately"
-        );
+            .expect("run should exist");
+        assert_eq!(pending.state, RunLifecycleState::InProgress.as_str());
+        assert!(pending.cancel_requested);
+        assert_eq!(pending.cancel_reason.as_deref(), Some("operator_requested"));
+        assert_eq!(pending.last_error, None);
+        assert_eq!(pending.completed_at_unix_ms, None);
+        assert!(store
+            .active_runtime_generation_for_run(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                RuntimeGenerationLane::Run,
+            )
+            .expect("generation lookup should succeed")
+            .is_some());
 
         store
             .update_orchestrator_run_state(
                 "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-                RunLifecycleState::Done,
-                None,
+                RunLifecycleState::Cancelled,
+                Some("operator_requested"),
             )
-            .expect("late completion updates should be idempotently ignored");
+            .expect("settlement should terminalize cancellation");
 
-        let after_late_done = store
+        let settled = store
             .orchestrator_run_status_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
             .expect("run snapshot query should succeed")
             .expect("cancelled run should still exist");
-        assert_eq!(after_late_done.state, RunLifecycleState::Cancelled.as_str());
-        assert_eq!(after_late_done.completed_at_unix_ms, cancelled.completed_at_unix_ms);
+        assert_eq!(settled.state, RunLifecycleState::Cancelled.as_str());
+        assert_eq!(settled.last_error.as_deref(), Some("operator_requested"));
+        assert!(settled.completed_at_unix_ms.is_some());
+        assert!(store
+            .active_runtime_generation_for_run(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                RuntimeGenerationLane::Run,
+            )
+            .expect("generation lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_settlement_prefers_committed_cancel_over_done() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_cancel_before_done";
+        let run_id = "run_cancel_before_done";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+        store
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: run_id.to_owned(),
+                reason: "operator_requested".to_owned(),
+            })
+            .expect("cancel intent should persist");
+
+        let settlement = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: "runtime.terminal.completed".to_owned(),
+                status_message: "completed".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "run_stream".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "done",
+                    "message": "completed",
+                })
+                .to_string(),
+            })
+            .expect("terminal settlement should succeed");
+
+        assert!(settlement.changed);
+        assert!(settlement.cancellation_won);
+        assert_eq!(settlement.requested_state, RunLifecycleState::Done);
+        assert_eq!(settlement.effective_state, RunLifecycleState::Cancelled);
+        assert_eq!(settlement.runtime_event_sequence, Some(1));
+        assert_eq!(settlement.tape_sequence, Some(0));
+        let snapshot = store
+            .orchestrator_run_status_snapshot(run_id)
+            .expect("run snapshot query should succeed")
+            .expect("run should exist");
+        assert_eq!(snapshot.state, RunLifecycleState::Cancelled.as_str());
+        assert_eq!(snapshot.last_error.as_deref(), Some("operator_requested"));
+        assert!(store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("generation lookup should succeed")
+            .is_none());
+        let lifecycle =
+            store.list_run_lifecycle_events(run_id).expect("lifecycle events should load");
+        assert_eq!(lifecycle.last().map(|event| event.to_state), Some(RunLifecyclePhase::Aborted));
+        let tape = store.orchestrator_tape(run_id).expect("terminal tape should load");
+        assert_eq!(tape.len(), 1);
+        assert_eq!(tape[0].event_type, "status");
+        assert!(tape[0].payload_json.contains("cancelled"));
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let terminal_event: (String, i64, String) = connection
+            .query_row(
+                "SELECT event_name, terminal, envelope_json FROM runtime_events_v2 WHERE run_ulid = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("terminal runtime event should exist");
+        assert_eq!((terminal_event.0.as_str(), terminal_event.1), ("run.cancelled", 1));
+        let envelope: RuntimeEventEnvelopeV2 =
+            serde_json::from_str(terminal_event.2.as_str()).expect("runtime event should decode");
+        let adapter = envelope
+            .extensions
+            .get(palyra_common::runtime_contracts::RUNTIME_EVENT_LEGACY_IDENTITY_ADAPTER_EXTENSION)
+            .expect("legacy identity adapter evidence should persist");
+        assert_eq!(
+            adapter.pointer("/reason_code").and_then(serde_json::Value::as_str),
+            Some("runtime.identity.legacy_adapter_used")
+        );
+        assert_eq!(
+            adapter.pointer("/missing_fields"),
+            Some(&json!(["attempt_id", "operation_id"]))
+        );
+    }
+
+    #[test]
+    fn terminal_settlement_prefers_committed_cancel_over_failed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_cancel_before_failed";
+        let run_id = "run_cancel_before_failed";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+        store
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: run_id.to_owned(),
+                reason: "operator_requested".to_owned(),
+            })
+            .expect("cancel intent should persist");
+
+        let settlement = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Failed,
+                reason_code: "run_stream.provider_failed".to_owned(),
+                status_message: "provider failed after cancel".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "provider_callback".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "failed",
+                    "message": "provider failed after cancel",
+                })
+                .to_string(),
+            })
+            .expect("terminal settlement should succeed");
+
+        assert!(settlement.changed);
+        assert!(settlement.cancellation_won);
+        assert_eq!(settlement.effective_state, RunLifecycleState::Cancelled);
+        let tape = store.orchestrator_tape(run_id).expect("terminal tape should load");
+        let payload: Value = serde_json::from_str(tape[0].payload_json.as_str())
+            .expect("terminal status payload should decode");
+        assert_eq!(payload["kind"], "cancelled");
+        assert_eq!(payload["message"], crate::gateway::CANCELLED_REASON);
+        assert_eq!(payload["reason_code"], "cancelled_by_request");
+        let snapshot = store
+            .orchestrator_run_status_snapshot(run_id)
+            .expect("run snapshot query should succeed")
+            .expect("run should exist");
+        assert_eq!(snapshot.last_error.as_deref(), Some("operator_requested"));
+    }
+
+    #[test]
+    fn terminal_settlement_keeps_done_sticky_before_late_cancel() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_done_before_cancel";
+        let run_id = "run_done_before_cancel";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+
+        let first = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: "runtime.terminal.completed".to_owned(),
+                status_message: "completed".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "run_stream".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "done",
+                    "message": "completed",
+                })
+                .to_string(),
+            })
+            .expect("done settlement should succeed");
+        assert!(first.changed);
+        assert_eq!(first.effective_state, RunLifecycleState::Done);
+
+        let cancel = store
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: run_id.to_owned(),
+                reason: "late_operator_request".to_owned(),
+            })
+            .expect("late cancel should return a no-op snapshot");
+        assert!(!cancel.cancel_requested);
+        assert_eq!(cancel.state, RunLifecycleState::Done.as_str());
+        let replay = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Failed,
+                reason_code: "runtime.terminal.failed".to_owned(),
+                status_message: "late failure".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "late_callback".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "failed",
+                    "message": "late failure",
+                })
+                .to_string(),
+            })
+            .expect("terminal replay should preserve sticky state");
+        assert!(!replay.changed);
+        assert_eq!(replay.requested_state, RunLifecycleState::Failed);
+        assert_eq!(replay.effective_state, RunLifecycleState::Done);
+        assert_eq!(replay.runtime_event_sequence, None);
+        assert_eq!(replay.tape_sequence, None);
+        let snapshot = store
+            .orchestrator_run_status_snapshot(run_id)
+            .expect("run snapshot query should succeed")
+            .expect("run should exist");
+        assert_eq!(snapshot.state, RunLifecycleState::Done.as_str());
+        assert!(!snapshot.cancel_requested);
+        assert_eq!(snapshot.cancel_reason, None);
+        let tape = store.orchestrator_tape(run_id).expect("terminal tape should load");
+        assert_eq!(tape.len(), 1);
+        assert!(tape[0].payload_json.contains("done"));
+    }
+
+    #[test]
+    fn terminal_settlement_keeps_failed_sticky_before_late_done() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "session_failed_before_done";
+        let run_id = "run_failed_before_done";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+
+        let failed = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Failed,
+                reason_code: "run_stream.provider_failed".to_owned(),
+                status_message: "provider failed".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "provider_callback".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "failed",
+                    "message": "provider failed",
+                })
+                .to_string(),
+            })
+            .expect("failed settlement should succeed");
+        assert!(failed.changed);
+        assert_eq!(failed.effective_state, RunLifecycleState::Failed);
+
+        let late_done = store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: "runtime.terminal.completed".to_owned(),
+                status_message: "completed late".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "late_callback".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "done",
+                    "message": "completed late",
+                })
+                .to_string(),
+            })
+            .expect("late done should preserve failed state");
+        assert!(!late_done.changed);
+        assert_eq!(late_done.effective_state, RunLifecycleState::Failed);
+        assert_eq!(store.orchestrator_tape(run_id).expect("tape should load").len(), 1);
     }
 
     #[test]

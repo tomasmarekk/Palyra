@@ -487,6 +487,12 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
     assert_eq!(response.route_key, "channel:cli:conversation:adapter-conv-1");
     assert!(response.session_id.is_some(), "route message should return resolved session id");
     assert!(response.run_id.is_some(), "route message should return canonical run id");
+    let route_run_id = response
+        .run_id
+        .as_ref()
+        .context("route message should return canonical run id")?
+        .ulid
+        .clone();
 
     let outbound = response
         .outputs
@@ -591,6 +597,14 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
         history_event.pointer("/payload/history/record_count").and_then(Value::as_u64),
         Some(1)
     );
+
+    let terminal_evidence =
+        load_runtime_terminal_evidence(&journal_db_path, route_run_id.as_str())?;
+    assert_eq!(terminal_evidence.run_state, "done");
+    assert_eq!(terminal_evidence.terminal_status_count, 2);
+    assert_eq!(terminal_evidence.run_started_runtime_event_count, 1);
+    assert_eq!(terminal_evidence.terminal_runtime_event_count, 1);
+    assert_eq!(terminal_evidence.active_generation_count, 0);
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
@@ -2622,6 +2636,47 @@ async fn grpc_route_message_executes_allowlisted_memory_search_tool() -> Result<
         1,
         "route message tool execution should use exactly one model-provider call"
     );
+    let route_run_id = response
+        .run_id
+        .as_ref()
+        .context("route tool response should include a run id")?
+        .ulid
+        .clone();
+    let connection =
+        Connection::open(&journal_db_path).context("failed to open route tool journal database")?;
+    for event_name in ["tool.result.observed", "tool.attestation.observed"] {
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND event_name = ?2",
+                params![route_run_id, event_name],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("failed to count route runtime event {event_name}"))?;
+        assert_eq!(count, 1, "route tool flow should persist one {event_name} event");
+    }
+    let legacy_execution_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool.executed'",
+            params![route_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to count legacy route tool execution projection")?;
+    assert_eq!(
+        legacy_execution_count, 1,
+        "route tool flow should retain one legacy execution projection for transcript consumers"
+    );
+    let metadata_tool_outcome_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_trace_events WHERE run_ulid = ?1 AND event_kind = 'tool_outcome'",
+            params![route_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to count route metadata-trace tool outcomes")?;
+    assert_eq!(
+        metadata_tool_outcome_count, 1,
+        "atomic route tool results should retain metadata-trace projection parity"
+    );
+    drop(connection);
     let policy_events = load_policy_decision_journal_events(&journal_db_path)?;
     assert!(
         policy_events.iter().any(|payload| {
@@ -2635,6 +2690,303 @@ async fn grpc_route_message_executes_allowlisted_memory_search_tool() -> Result<
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_compact_catalog_searches_describes_and_invokes_target() -> Result<()> {
+    let search_response = openai_tool_call_response(
+        "palyra.tools.search",
+        &serde_json::json!({
+            "query": "echo text",
+            "limit": 3
+        }),
+    )?;
+    let describe_response = openai_tool_call_response(
+        "palyra.tools.describe",
+        &serde_json::json!({
+            "tool_id": "palyra.echo"
+        }),
+    )?;
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(200, search_response),
+            ScriptedOpenAiResponse::immediate(200, describe_response),
+        ])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_catalog_exposure(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            3,
+            750,
+            "compact",
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        execution_backend_preference: String::new(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before compact-catalog test")?;
+
+    let adapter = FakeChannelAdapter::default();
+    let search_route = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "hey @palyra search the compact tool catalog",
+            false,
+            false,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+        )
+        .await?;
+    assert!(search_route.accepted, "compact search route should be accepted");
+    let search_run_id = search_route
+        .run_id
+        .as_ref()
+        .context("compact search route should include a run id")?
+        .ulid
+        .clone();
+    let search_output =
+        search_route.outputs.first().context("compact search route should include output")?;
+    assert!(
+        search_output.text.contains("tool=palyra.tools.search success=true"),
+        "search bridge summary should report success: {}",
+        search_output.text
+    );
+    assert!(
+        search_output.text.contains("palyra.echo"),
+        "search bridge summary should identify the indexed echo tool: {}",
+        search_output.text
+    );
+
+    let describe_route = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "hey @palyra describe the indexed echo tool",
+            false,
+            false,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+        )
+        .await?;
+    assert!(describe_route.accepted, "compact describe route should be accepted");
+    let describe_run_id = describe_route
+        .run_id
+        .as_ref()
+        .context("compact describe route should include a run id")?
+        .ulid
+        .clone();
+    let describe_output =
+        describe_route.outputs.first().context("compact describe route should include output")?;
+    assert!(
+        describe_output.text.contains("tool=palyra.tools.describe success=true"),
+        "describe bridge summary should report success: {}",
+        describe_output.text
+    );
+    assert!(
+        describe_output.text.contains("palyra.echo"),
+        "describe bridge summary should identify the indexed echo tool: {}",
+        describe_output.text
+    );
+
+    let captured_request_bodies =
+        request_bodies.lock().expect("captured request bodies lock should not poison").clone();
+    assert_eq!(captured_request_bodies.len(), 2);
+    for request_body in &captured_request_bodies {
+        let request: Value = serde_json::from_str(request_body.as_str())
+            .context("compact-catalog provider request should be valid JSON")?;
+        let provider_tool_names = request["tools"]
+            .as_array()
+            .context("compact-catalog provider request should include tools")?
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name").or_else(|| tool.get("name")).and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_tool_names,
+            vec!["palyra.tools.describe", "palyra.tools.invoke", "palyra.tools.search"],
+            "compact provider request should expose only catalog bridge tools"
+        );
+    }
+    assert_eq!(request_count.load(Ordering::Relaxed), 2);
+
+    let connection = Connection::open(&journal_db_path)
+        .context("failed to open compact-catalog route journal database")?;
+    let search_payload: String = connection
+        .query_row(
+            "SELECT payload_json FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool.catalog_search'",
+            params![search_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to load compact search tape evidence")?;
+    let search_payload: Value = serde_json::from_str(search_payload.as_str())
+        .context("compact search tape payload should be valid JSON")?;
+    assert_eq!(search_payload["success"], true);
+    assert!(search_payload["result_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == "palyra.echo")));
+    let describe_payload: String = connection
+        .query_row(
+            "SELECT payload_json FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool.catalog_describe'",
+            params![describe_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to load compact describe tape evidence")?;
+    let describe_payload: Value = serde_json::from_str(describe_payload.as_str())
+        .context("compact describe tape payload should be valid JSON")?;
+    assert_eq!(describe_payload["success"], true);
+    let schema_digest = describe_payload["schema_digest"]
+        .as_str()
+        .context("compact describe evidence should include schema digest")?
+        .to_owned();
+    assert_eq!(schema_digest.len(), 64);
+    drop(connection);
+
+    let invoke_response = openai_tool_call_response(
+        "palyra.tools.invoke",
+        &serde_json::json!({
+            "tool_id": "palyra.echo",
+            "schema_digest": schema_digest,
+            "arguments": {
+                "text": "hello compact route"
+            }
+        }),
+    )?;
+    let (invoke_base_url, invoke_request_bodies, invoke_request_count, invoke_server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(200, invoke_response),
+        ])?;
+    let (invoke_child, invoke_admin_port, invoke_grpc_port, invoke_journal_db_path, invoke_config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_catalog_exposure(
+            invoke_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            750,
+            "compact",
+        )?;
+    let _invoke_config_guard = TempFileGuard::new(invoke_config_path);
+    let mut invoke_daemon = ChildGuard::new(invoke_child);
+    wait_for_health(invoke_admin_port, invoke_daemon.child_mut())?;
+    let invoke_endpoint = format!("http://127.0.0.1:{invoke_grpc_port}");
+    let mut invoke_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(invoke_endpoint)
+            .await
+            .context("failed to connect compact invoke gRPC client")?;
+    let mut create_invoke_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        execution_backend_preference: String::new(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_invoke_agent.metadata_mut(), "admin:ops")?;
+    invoke_client
+        .create_agent(create_invoke_agent)
+        .await
+        .context("failed to create route agent before compact invoke test")?;
+    let invoke_route = FakeChannelAdapter::default()
+        .inject_message(&mut invoke_client, "hey @palyra invoke the indexed echo tool", false)
+        .await?;
+    assert!(invoke_route.accepted, "compact invoke route should be accepted");
+    let invoke_run_id = invoke_route
+        .run_id
+        .as_ref()
+        .context("compact invoke route should include a run id")?
+        .ulid
+        .clone();
+    let invoke_output =
+        invoke_route.outputs.first().context("compact invoke route should include output")?;
+    assert!(
+        invoke_output.text.contains("tool=palyra.echo success=true"),
+        "compact invoke should execute the resolved target tool: {}",
+        invoke_output.text
+    );
+    assert!(
+        invoke_output.text.contains("hello compact route"),
+        "compact invoke output should include the echo target result: {}",
+        invoke_output.text
+    );
+    assert_eq!(invoke_request_count.load(Ordering::Relaxed), 1);
+    let invoke_requests = invoke_request_bodies
+        .lock()
+        .expect("compact invoke request bodies lock should not poison")
+        .clone();
+    assert_eq!(invoke_requests.len(), 1);
+    let invoke_provider_request: Value = serde_json::from_str(invoke_requests[0].as_str())
+        .context("compact invoke provider request should be valid JSON")?;
+    let invoke_provider_tool_names = invoke_provider_request["tools"]
+        .as_array()
+        .context("compact invoke provider request should include tools")?
+        .iter()
+        .filter_map(|tool| {
+            tool.pointer("/function/name").or_else(|| tool.get("name")).and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invoke_provider_tool_names,
+        vec!["palyra.tools.describe", "palyra.tools.invoke", "palyra.tools.search"]
+    );
+
+    let invoke_connection = Connection::open(&invoke_journal_db_path)
+        .context("failed to open compact invoke route journal database")?;
+    let lineage_payload: String = invoke_connection
+        .query_row(
+            "SELECT payload_json FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool.catalog_invoke.lineage'",
+            params![invoke_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to load compact invoke lineage evidence")?;
+    let lineage_payload: Value = serde_json::from_str(lineage_payload.as_str())
+        .context("compact invoke lineage payload should be valid JSON")?;
+    assert_eq!(lineage_payload["bridge_tool_name"], "palyra.tools.invoke");
+    assert_eq!(lineage_payload["target_tool_name"], "palyra.echo");
+    assert_eq!(lineage_payload["schema_digest"], schema_digest);
+    let target_proposal_count: i64 = invoke_connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool_proposal' AND json_extract(payload_json, '$.tool_name') = 'palyra.echo'",
+            params![invoke_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to count compact invoke target proposals")?;
+    assert_eq!(target_proposal_count, 1);
+    let bridge_proposal_count: i64 = invoke_connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'tool_proposal' AND json_extract(payload_json, '$.tool_name') = 'palyra.tools.invoke'",
+            params![invoke_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to count compact invoke bridge proposals")?;
+    assert_eq!(bridge_proposal_count, 0);
+
+    server_handle.join().expect("scripted compact catalog server thread should exit");
+    invoke_server_handle.join().expect("scripted compact invoke server thread should exit");
     Ok(())
 }
 
@@ -11648,6 +12000,65 @@ fn sample_run_stream_request() -> common_v1::RunStreamRequest {
     sample_run_stream_request_with_text("hello from grpc integration".to_owned())
 }
 
+struct RuntimeTerminalEvidence {
+    run_state: String,
+    terminal_status_count: i64,
+    run_started_runtime_event_count: i64,
+    terminal_runtime_event_count: i64,
+    active_generation_count: i64,
+}
+
+fn load_runtime_terminal_evidence(
+    journal_db_path: &Path,
+    run_id: &str,
+) -> Result<RuntimeTerminalEvidence> {
+    let connection = Connection::open(journal_db_path).with_context(|| {
+        format!("failed to open journal sqlite db at {}", journal_db_path.display())
+    })?;
+    let run_state = connection
+        .query_row(
+            "SELECT state FROM orchestrator_runs WHERE run_ulid = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .context("failed to load route-message orchestrator state")?;
+    let terminal_status_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1 AND event_type = 'status'",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count route-message lifecycle status rows")?;
+    let run_started_runtime_event_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND event_name = 'run.started'",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count route-message run-start runtime events")?;
+    let terminal_runtime_event_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND terminal = 1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count route-message terminal runtime events")?;
+    let active_generation_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_generation_leases WHERE run_ulid = ?1 AND lane = 'run'",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count active route-message run generations")?;
+    Ok(RuntimeTerminalEvidence {
+        run_state,
+        terminal_status_count,
+        run_started_runtime_event_count,
+        terminal_runtime_event_count,
+        active_generation_count,
+    })
+}
+
 fn load_message_router_journal_events(journal_db_path: &PathBuf) -> Result<Vec<Value>> {
     let connection = Connection::open(journal_db_path).with_context(|| {
         format!("failed to open journal sqlite db at {}", journal_db_path.display())
@@ -12658,13 +13069,33 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
     max_calls_per_run: u32,
     execution_timeout_ms: u64,
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
-    spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_execution_gate_rollout(
+    spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
         openai_base_url,
         openai_api_key,
         allowed_tools,
         max_calls_per_run,
         execution_timeout_ms,
         false,
+        None,
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_catalog_exposure(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    catalog_exposure_mode: &str,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        false,
+        Some(catalog_exposure_mode),
     )
 }
 
@@ -12676,13 +13107,34 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_ex
     execution_timeout_ms: u64,
     execution_gate_rollout_enabled: bool,
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        execution_gate_rollout_enabled,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    execution_gate_rollout_enabled: bool,
+    catalog_exposure_mode: Option<&str>,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_channel_router_config()?;
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
-    let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
+    let command = apply_isolated_daemon_test_env(&mut command, &config_path)
         .args([
             "--bind",
             "127.0.0.1",
@@ -12720,7 +13172,11 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_ex
         )
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(catalog_exposure_mode) = catalog_exposure_mode {
+        command.env("PALYRA_TOOL_CATALOG_EXPOSURE_MODE", catalog_exposure_mode);
+    }
+    let mut child = command
         .spawn()
         .context("failed to start palyrad with channel-router + tool policy config")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;

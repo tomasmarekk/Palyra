@@ -4,7 +4,8 @@
 //! transaction so concurrent producers cannot race on trace identity.
 
 use palyra_common::metadata_trace::{
-    MetadataTraceCapacityLimitV1, MetadataTraceEventDataV1, METADATA_TRACE_MAX_EVENTS,
+    MetadataTraceCapacityLimitV1, MetadataTraceEventDataV1, MetadataTraceEventV1,
+    METADATA_TRACE_MAX_EVENTS,
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -85,6 +86,31 @@ impl JournalStore {
         let Some(event) = project_orchestrator_tape_record(record, context) else {
             return Ok(false);
         };
+        let existing = transaction
+            .query_row(
+                r#"
+                    SELECT run_ulid, event_json
+                    FROM metadata_trace_events
+                    WHERE event_id_sha256 = ?1
+                "#,
+                params![event.event_id_sha256.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_run_id, existing_json)) = existing {
+            let existing_event: MetadataTraceEventV1 = serde_json::from_str(&existing_json)?;
+            if existing_run_id != run_id
+                || existing_event.generation != event.generation
+                || existing_event.stage_duration_ms != event.stage_duration_ms
+                || existing_event.event != event.event
+            {
+                return Err(JournalError::MetadataTraceInvariant {
+                    run_id: run_id.to_owned(),
+                    reason_code: "metadata_trace.projected_event_replay_conflict",
+                });
+            }
+            return Ok(false);
+        }
         if let MetadataTraceEventDataV1::Terminalization(metadata) = &event.event {
             let metadata = metadata.clone();
             drop(transaction);
