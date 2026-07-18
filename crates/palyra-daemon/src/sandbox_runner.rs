@@ -153,6 +153,10 @@ const MAX_PROCESS_PORT_HINTS: usize = 16;
 const MAX_PROCESS_EXECUTABLE_HASH_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAX_LINUX_PROC_STAT_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_PROCESS_COUNT: usize = 65_536;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_PROCESS_GROUP_SNAPSHOT_ATTEMPTS: usize = 3;
 #[cfg(windows)]
 const MAX_WINDOWS_PROCESS_IMAGE_CHARS: usize = 32_768;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
@@ -1712,39 +1716,91 @@ fn verify_live_ownership_anchor(_pid: u32) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxProcessStat {
+    state: u8,
+    process_group_id: libc::pid_t,
+    start_token: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_linux_process_stat(pid: u32) -> io::Result<Option<LinuxProcessStat>> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
     let mut stat = Vec::new();
     match fs::File::open(path) {
-        Ok(file) => file
-            .take(u64::try_from(MAX_LINUX_PROC_STAT_BYTES).unwrap_or(u64::MAX) + 1)
-            .read_to_end(&mut stat)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(file) => {
+            if let Err(error) = file
+                .take(u64::try_from(MAX_LINUX_PROC_STAT_BYTES).unwrap_or(u64::MAX) + 1)
+                .read_to_end(&mut stat)
+            {
+                if linux_process_vanished(&error) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
+        Err(error) if linux_process_vanished(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     if stat.len() > MAX_LINUX_PROC_STAT_BYTES {
         return Err(io::Error::other("Linux process stat exceeded bounded capacity"));
     }
-    let text = std::str::from_utf8(stat.as_slice())
-        .map_err(|_| io::Error::other("Linux process stat was not UTF-8"))?;
-    let command_end = text
-        .rfind(") ")
+    parse_linux_process_stat(pid, stat.as_slice()).map(Some)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_linux_process_stat(expected_pid: u32, stat: &[u8]) -> io::Result<LinuxProcessStat> {
+    let command_start = stat
+        .iter()
+        .position(|byte| *byte == b'(')
+        .ok_or_else(|| io::Error::other("Linux process stat command start missing"))?;
+    let command_end = stat
+        .windows(2)
+        .rposition(|window| window == b") ")
         .ok_or_else(|| io::Error::other("Linux process stat command terminator missing"))?;
-    let fields = text[command_end.saturating_add(2)..].split_whitespace().collect::<Vec<_>>();
-    if fields.len() <= 19 {
-        return Err(io::Error::other("Linux process stat fields missing"));
+    if command_end <= command_start {
+        return Err(io::Error::other("Linux process stat command bounds invalid"));
     }
-    let reported_pid = text[..text.find('(').unwrap_or(0)]
+    let reported_pid = std::str::from_utf8(&stat[..command_start])
+        .map_err(|_| io::Error::other("Linux process stat pid invalid"))?
         .trim()
         .parse::<u32>()
         .map_err(|_| io::Error::other("Linux process stat pid invalid"))?;
-    if reported_pid != pid {
+    if reported_pid != expected_pid {
         return Err(io::Error::other("Linux process stat pid changed"));
+    }
+    let fields = std::str::from_utf8(&stat[command_end.saturating_add(2)..])
+        .map_err(|_| io::Error::other("Linux process stat fields were not UTF-8"))?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if fields.len() <= 19 {
+        return Err(io::Error::other("Linux process stat fields missing"));
+    }
+    let state = fields[0].as_bytes();
+    if state.len() != 1 {
+        return Err(io::Error::other("Linux process stat state invalid"));
+    }
+    let process_group_id = fields[2]
+        .parse::<libc::pid_t>()
+        .map_err(|_| io::Error::other("Linux process stat process group invalid"))?;
+    if process_group_id <= 0 {
+        return Err(io::Error::other("Linux process stat process group invalid"));
     }
     let start_token = fields[19]
         .parse::<u64>()
         .map_err(|_| io::Error::other("Linux process stat start token invalid"))?;
-    Ok(Some(format!("linux:{start_token}")))
+    Ok(LinuxProcessStat { state: state[0], process_group_id, start_token })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
+    Ok(read_linux_process_stat(pid)?.map(|stat| format!("linux:{}", stat.start_token)))
 }
 
 #[cfg(target_os = "macos")]
@@ -10431,12 +10487,119 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
 /// Reports whether an owned Unix process group has any live members.
 ///
 /// # Errors
-/// Returns an error when the group id is invalid or the operating-system probe fails.
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Returns an error when the group id is invalid or the bounded Linux proof cannot stabilize.
+#[cfg(target_os = "linux")]
 pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     let process_group_id = unix_pid_from_u32(pid)?;
+    if !linux_process_group_signal_probe(process_group_id)? {
+        return Ok(false);
+    }
+    // `/proc` enumeration is not atomic. Require the same PID/start-time identities twice so a
+    // live member that forks and exits during one traversal cannot make that traversal decisive.
+    let mut exited_members_candidate = None;
+    for _ in 0..MAX_LINUX_PROCESS_GROUP_SNAPSHOT_ATTEMPTS {
+        match linux_process_group_snapshot(process_group_id)? {
+            LinuxProcessGroupSnapshot::LiveMember => return Ok(true),
+            LinuxProcessGroupSnapshot::ExitedMembers(exited_members) => {
+                if exited_members_candidate.as_ref() == Some(&exited_members) {
+                    return Ok(false);
+                }
+                exited_members_candidate = Some(exited_members);
+            }
+            LinuxProcessGroupSnapshot::NoMembers => {
+                exited_members_candidate = None;
+                if !linux_process_group_signal_probe(process_group_id)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Err(io::Error::other("Linux process-group liveness snapshot did not stabilize"))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxProcessGroupSnapshot {
+    LiveMember,
+    ExitedMembers(Vec<LinuxExitedProcessIdentity>),
+    NoMembers,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LinuxExitedProcessIdentity {
+    pid: u32,
+    start_token: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_snapshot(
+    process_group_id: libc::pid_t,
+) -> io::Result<LinuxProcessGroupSnapshot> {
+    let mut process_count = 0_usize;
+    let mut exited_members = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if linux_process_vanished(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        process_count = process_count.saturating_add(1);
+        if process_count > MAX_LINUX_PROCESS_COUNT {
+            return Err(io::Error::other("Linux process snapshot exceeded bounded capacity"));
+        }
+        let Some(stat) = read_linux_process_stat(pid)? else {
+            continue;
+        };
+        if stat.process_group_id != process_group_id {
+            continue;
+        }
+        if matches!(stat.state, b'Z' | b'X' | b'x') {
+            exited_members.push(LinuxExitedProcessIdentity { pid, start_token: stat.start_token });
+        } else {
+            return Ok(LinuxProcessGroupSnapshot::LiveMember);
+        }
+    }
+    if exited_members.is_empty() {
+        Ok(LinuxProcessGroupSnapshot::NoMembers)
+    } else {
+        exited_members.sort_unstable();
+        Ok(LinuxProcessGroupSnapshot::ExitedMembers(exited_members))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_signal_probe(process_group_id: libc::pid_t) -> io::Result<bool> {
     // Signal 0 probes the owned process group without changing it. A missing group is the only
     // successful cleanup proof; permission and other failures stay fail-closed.
+    // SAFETY: kill(2) with signal 0 has no side effect and the return value is checked.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Reports whether an owned Unix process group has any live members.
+///
+/// # Errors
+/// Returns an error when the group id is invalid or the operating-system probe fails.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
+    let process_group_id = unix_pid_from_u32(pid)?;
+    // Signal 0 is the best available portable Unix probe outside the Linux and Darwin snapshots.
     // SAFETY: kill(2) with signal 0 has no side effect and the return value is checked.
     let result = unsafe { libc::kill(-process_group_id, 0) };
     if result == 0 {
@@ -16675,6 +16838,60 @@ mod tests {
             .expect("test process group should terminate through its exact group id");
         assert!(super::wait_for_process_not_alive(descendant_pid, Duration::from_secs(5)));
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persisted_linux_zombie_only_group_is_absent() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let mut leader = super::ManagedChildGuard::new_reap_only(
+            command.spawn().expect("process-group leader should spawn"),
+        );
+        let group_id = leader.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = super::read_linux_process_stat(group_id)
+                .expect("zombie process stat lookup should work")
+                .expect("unreaped process-group leader should remain visible");
+            if stat.state == b'Z' {
+                break;
+            }
+            assert!(Instant::now() < deadline, "process-group leader should become a zombie");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let process_group_id =
+            super::unix_pid_from_u32(group_id).expect("process-group id should fit pid_t");
+        assert!(
+            super::linux_process_group_signal_probe(process_group_id)
+                .expect("raw process-group probe should work"),
+            "signal-zero must demonstrate why the zombie-aware snapshot is required"
+        );
+        assert!(!super::unix_process_group_is_alive(group_id)
+            .expect("zombie-aware process-group probe should work"));
+
+        let status = leader
+            .wait_for_exit(Duration::from_secs(5))
+            .expect("zombie leader reap should work")
+            .expect("zombie leader should be waitable");
+        assert!(status.success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_process_stat_parser_tracks_state_group_and_start_token() {
+        let mut stat = b"123 (command with ) spaces ".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(b") Z 1 456 456 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 789\n");
+
+        assert_eq!(
+            super::parse_linux_process_stat(123, stat.as_slice())
+                .expect("Linux process stat should parse"),
+            super::LinuxProcessStat { state: b'Z', process_group_id: 456, start_token: 789 }
+        );
     }
 
     #[test]
