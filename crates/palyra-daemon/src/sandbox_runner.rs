@@ -2247,6 +2247,10 @@ impl WindowsBackgroundJob {
         }
         Ok(accounting.ActiveProcesses)
     }
+
+    fn termination_was_requested_and_succeeded(&self) -> bool {
+        self.termination_succeeded.lock().map(|state| *state).unwrap_or(false)
+    }
 }
 
 #[cfg(windows)]
@@ -8380,7 +8384,21 @@ fn spawn_background_process(
         }
     }
     #[cfg(windows)]
-    if let Err(error) = resume_windows_background_child(&child) {
+    if let Err(resume_error) = resume_windows_background_child(&child) {
+        let message = if windows_background_resume_was_superseded(
+            &registration_identity,
+            startup_budget.saturating_sub(started_at.elapsed()),
+        ) {
+            format!(
+                "sandbox background process {pid} startup was superseded by verified Windows job termination before resume acknowledgement: {resume_error}"
+            )
+        } else {
+            format!(
+                "sandbox background process {pid} could not resume after Windows job ownership was established: {resume_error}"
+            )
+        };
+        let error =
+            SandboxProcessRunError { kind: SandboxProcessRunErrorKind::RuntimeFailure, message };
         settle_background_registration_failure(child, &registration_identity)?;
         return Err(error);
     }
@@ -9695,16 +9713,40 @@ where
 }
 
 #[cfg(windows)]
-fn resume_windows_background_child(
-    child: &ManagedChildGuard,
-) -> Result<(), SandboxProcessRunError> {
-    let pid = child.id();
-    resume_suspended_windows_process(pid).map_err(|error| SandboxProcessRunError {
-        kind: SandboxProcessRunErrorKind::RuntimeFailure,
-        message: format!(
-            "sandbox background process {pid} could not resume after Windows job ownership was established: {error}"
-        ),
-    })
+fn resume_windows_background_child(child: &ManagedChildGuard) -> io::Result<()> {
+    resume_suspended_windows_process(child.id())
+}
+
+// A successful exact Job Object termination distinguishes terminal cleanup from a missing
+// CREATE_SUSPENDED hold; only a subsequently inactive ownership domain may supersede startup.
+#[cfg(windows)]
+fn windows_background_resume_was_superseded(
+    identity: &BackgroundProcessIdentity,
+    max_wait: Duration,
+) -> bool {
+    let Some(job) = identity.windows_job.as_deref() else {
+        return false;
+    };
+    if !job.termination_was_requested_and_succeeded() {
+        return false;
+    }
+    let status = wait_for_windows_background_process_inactive(
+        identity.pid,
+        &identity.provenance,
+        job,
+        max_wait,
+    )
+    .ok()
+    .flatten();
+    windows_background_resume_cleanup_is_authoritative(true, status)
+}
+
+#[cfg(windows)]
+fn windows_background_resume_cleanup_is_authoritative(
+    termination_succeeded: bool,
+    status: Option<BackgroundProcessRuntimeStatus>,
+) -> bool {
+    termination_succeeded && status.is_some_and(|status| !status.alive())
 }
 
 #[cfg(windows)]
@@ -12763,6 +12805,26 @@ mod tests {
         .expect("idempotent termination should preserve the successful result");
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resume_cleanup_classification_requires_verified_inactivity() {
+        let inactive = super::BackgroundProcessRuntimeStatus {
+            direct_pid_alive: false,
+            process_tree_alive: false,
+            tracked_process_count: Some(0),
+        };
+        let active = super::BackgroundProcessRuntimeStatus {
+            direct_pid_alive: true,
+            process_tree_alive: true,
+            tracked_process_count: Some(1),
+        };
+
+        assert!(super::windows_background_resume_cleanup_is_authoritative(true, Some(inactive)));
+        assert!(!super::windows_background_resume_cleanup_is_authoritative(false, Some(inactive)));
+        assert!(!super::windows_background_resume_cleanup_is_authoritative(true, Some(active)));
+        assert!(!super::windows_background_resume_cleanup_is_authoritative(true, None));
     }
 
     #[cfg(not(target_os = "macos"))]

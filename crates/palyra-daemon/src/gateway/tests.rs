@@ -13182,8 +13182,9 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
     );
     assert!(
         outcome.success
-            || outcome.error.contains("has no owned Windows job object")
-            || outcome.error.contains("no suspended thread was found"),
+            || outcome.error.contains(
+                "startup was superseded by verified Windows job termination before resume acknowledgement"
+            ),
         "terminal cleanup may win before the runner acknowledgement, but no other failure is valid: {}",
         outcome.error
     );
