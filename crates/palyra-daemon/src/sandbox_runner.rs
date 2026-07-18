@@ -1719,7 +1719,7 @@ fn verify_live_ownership_anchor(_pid: u32) -> io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxProcessStat {
     state: u8,
-    process_group_id: libc::pid_t,
+    process_group_id: Option<libc::pid_t>,
     start_token: u64,
 }
 
@@ -1780,12 +1780,12 @@ fn parse_linux_process_stat(expected_pid: u32, stat: &[u8]) -> io::Result<LinuxP
     if state.len() != 1 {
         return Err(io::Error::other("Linux process stat state invalid"));
     }
-    let process_group_id = fields[2]
+    let reported_process_group_id = fields[2]
         .parse::<libc::pid_t>()
         .map_err(|_| io::Error::other("Linux process stat process group invalid"))?;
-    if process_group_id <= 0 {
-        return Err(io::Error::other("Linux process stat process group invalid"));
-    }
+    // The kernel leaves this field at -1 when an exiting task's sighand cannot be locked, and a
+    // namespace-relative process-group id can be zero. Neither can match an owned positive PGID.
+    let process_group_id = (reported_process_group_id > 0).then_some(reported_process_group_id);
     let start_token = fields[19]
         .parse::<u64>()
         .map_err(|_| io::Error::other("Linux process stat start token invalid"))?;
@@ -10559,7 +10559,7 @@ fn linux_process_group_snapshot(
         let Some(stat) = read_linux_process_stat(pid)? else {
             continue;
         };
-        if stat.process_group_id != process_group_id {
+        if stat.process_group_id != Some(process_group_id) {
             continue;
         }
         if matches!(stat.state, b'Z' | b'X' | b'x') {
@@ -16890,8 +16890,29 @@ mod tests {
         assert_eq!(
             super::parse_linux_process_stat(123, stat.as_slice())
                 .expect("Linux process stat should parse"),
-            super::LinuxProcessStat { state: b'Z', process_group_id: 456, start_token: 789 }
+            super::LinuxProcessStat { state: b'Z', process_group_id: Some(456), start_token: 789 }
         );
+
+        let unavailable_group_stat = b"123 (exiting) X 1 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 790\n";
+        assert_eq!(
+            super::parse_linux_process_stat(123, unavailable_group_stat)
+                .expect("Linux exiting-process stat should parse"),
+            super::LinuxProcessStat { state: b'X', process_group_id: None, start_token: 790 }
+        );
+
+        let namespace_hidden_group_stat =
+            b"123 (running) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 791\n";
+        assert_eq!(
+            super::parse_linux_process_stat(123, namespace_hidden_group_stat)
+                .expect("Linux namespace-hidden process stat should parse"),
+            super::LinuxProcessStat { state: b'S', process_group_id: None, start_token: 791 }
+        );
+
+        let malformed_group_stat =
+            b"123 (malformed) S 1 invalid 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 792\n";
+        let error = super::parse_linux_process_stat(123, malformed_group_stat)
+            .expect_err("nonnumeric Linux process group should fail");
+        assert_eq!(error.to_string(), "Linux process stat process group invalid");
     }
 
     #[test]
