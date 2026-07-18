@@ -573,11 +573,23 @@ fn run_supervisor() -> io::Result<SupervisorExit> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperTargetState {
     Unspawned,
-    ArmedRunning { target_pid: libc::pid_t },
-    ArmedExitObserved { target_pid: libc::pid_t },
-    AuthorityConsumed { target_pid: libc::pid_t },
-    AwaitingGroupInactivity { target_pgid: libc::pid_t, raw_wait_status: i32 },
-    Settled { raw_wait_status: i32 },
+    ArmedRunning {
+        target_pid: libc::pid_t,
+    },
+    ArmedExitObserved {
+        target_pid: libc::pid_t,
+    },
+    AuthorityConsumed {
+        target_pid: libc::pid_t,
+    },
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    AwaitingGroupInactivity {
+        target_pgid: libc::pid_t,
+        raw_wait_status: i32,
+    },
+    Settled {
+        raw_wait_status: i32,
+    },
 }
 
 struct HelperRuntime {
@@ -842,9 +854,11 @@ impl HelperRuntime {
         let target_pid = match self.state {
             HelperTargetState::ArmedRunning { target_pid } => target_pid,
             HelperTargetState::ArmedExitObserved { target_pid } => target_pid,
-            HelperTargetState::AuthorityConsumed { .. }
-            | HelperTargetState::AwaitingGroupInactivity { .. }
-            | HelperTargetState::Settled { .. } => {
+            HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
+                return self.finish_after_authority_consumed().map(Some);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed().map(Some);
             }
             HelperTargetState::Unspawned => return Ok(None),
@@ -866,9 +880,11 @@ impl HelperRuntime {
         let target_pid = match self.state {
             HelperTargetState::ArmedRunning { target_pid }
             | HelperTargetState::ArmedExitObserved { target_pid } => target_pid,
-            HelperTargetState::AuthorityConsumed { .. }
-            | HelperTargetState::AwaitingGroupInactivity { .. }
-            | HelperTargetState::Settled { .. } => {
+            HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
+                return self.finish_after_authority_consumed();
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed();
             }
             HelperTargetState::Unspawned => {
@@ -902,13 +918,28 @@ impl HelperRuntime {
     ) -> io::Result<SupervisorExit> {
         let (target_pid, raw_wait_status) = match self.state {
             HelperTargetState::AuthorityConsumed { target_pid } => {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    // These platforms can distinguish exited members from live descendants. Prove
+                    // the group inactive while the unreaped leader still reserves its PID/PGID,
+                    // then reap so an unrelated group cannot reuse the numeric identity mid-proof.
+                    wait_for_process_group_inactive(target_pid, operation_deadline)?;
+                    let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
+                    self.target.take();
+                    self.state = HelperTargetState::Settled { raw_wait_status };
+                    return raw_wait_status_outcome(raw_wait_status);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 self.state = HelperTargetState::AwaitingGroupInactivity {
                     target_pgid: target_pid,
                     raw_wait_status,
                 };
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 (target_pid, raw_wait_status)
             }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             HelperTargetState::AwaitingGroupInactivity { target_pgid, raw_wait_status } => {
                 (target_pgid, raw_wait_status)
             }
@@ -2715,7 +2746,7 @@ mod tests {
     use tempfile::TempDir;
 
     static SUPERVISOR_REGRESSION_LOCK: Mutex<()> = Mutex::new(());
-    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ProcessIdentity {

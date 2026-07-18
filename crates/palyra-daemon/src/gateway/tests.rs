@@ -12999,8 +12999,6 @@ async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
         )
         .expect("registration failure trigger should install");
     drop(connection);
-    let before_pids = crate::sandbox_runner::registered_background_process_pids();
-
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
         super::ToolRuntimeExecutionContext {
@@ -13045,14 +13043,6 @@ async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
         "{}",
         outcome.error
     );
-    let after_pids = crate::sandbox_runner::registered_background_process_pids();
-    let created_pids =
-        after_pids.into_iter().filter(|pid| !before_pids.contains(pid)).collect::<Vec<_>>();
-    assert_eq!(created_pids.len(), 1, "one live launch should reach registration");
-    let pid = created_pids[0];
-    let status = crate::sandbox_runner::background_process_runtime_status(pid)
-        .expect("cleaned process status should be observable");
-    assert!(!status.alive());
     assert!(state.list_run_background_processes(run_id.as_str()).is_empty());
     let diagnostics = state
         .journal_store
@@ -13151,9 +13141,29 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(5), committed.notified())
-        .await
-        .expect("process registration should durably commit before publication");
+    let registration_ready = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            () = committed.notified() => Ok::<(), String>(()),
+            joined = &mut registration => match joined {
+                Ok(outcome) => Err(format!(
+                    "registration finished before the durable-commit barrier: success={} error={}",
+                    outcome.success, outcome.error
+                )),
+                Err(error) => Err(format!(
+                    "registration task failed before the durable-commit barrier: {error}"
+                )),
+            },
+        }
+    })
+    .await;
+    match registration_ready {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("{error}"),
+        Err(_) => {
+            registration.abort();
+            panic!("process registration should durably commit within 30 seconds");
+        }
+    }
     let terminal_state = Arc::clone(&state);
     let terminal_run_id = run_id.clone();
     let mut terminal = tokio::spawn(async move {

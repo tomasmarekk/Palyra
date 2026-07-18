@@ -3594,6 +3594,19 @@ fn builtin_stop_process_success(
         )?;
     }
     if !registration.active {
+        #[cfg(unix)]
+        let status = if registration.unix_cleanup_acknowledged {
+            // The exact supervisor acknowledgement proves target-group absence. Its own process
+            // can remain as an unreaped zombie until the monitor thread regains the child handle.
+            Some(BackgroundProcessRuntimeStatus {
+                direct_pid_alive: false,
+                process_tree_alive: false,
+                tracked_process_count: Some(0),
+            })
+        } else {
+            background_process_runtime_status(pid).ok()
+        };
+        #[cfg(not(unix))]
         let status = background_process_runtime_status(pid).ok();
         let stop_acknowledgement = status
             .filter(|status| !status.alive())
@@ -10280,11 +10293,15 @@ pub(crate) fn terminate_retained_background_process(
     #[cfg(unix)]
     {
         supervisor_control.terminate()?;
-        if !wait_for_process_not_alive(pid, Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)) {
+        if !wait_for_owned_background_tree_inactive_for_identity(
+            pid,
+            Some(&registration.identity),
+            Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+        )? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "trusted Unix process supervisor {pid} remained alive after acknowledged cleanup"
+                    "trusted Unix process supervisor group {pid} remained active after acknowledged cleanup"
                 ),
             ));
         }
@@ -16299,7 +16316,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("palyra.process.status")
         );
+        #[cfg(windows)]
         assert!(output.pointer("/cleanup/manual_command/command").is_some());
+        #[cfg(unix)]
+        assert_eq!(output.pointer("/cleanup/manual_command"), Some(&serde_json::Value::Null));
+        #[cfg(not(any(unix, windows)))]
+        assert_eq!(
+            output.pointer("/cleanup/manual_command/command").and_then(serde_json::Value::as_str),
+            Some("kill")
+        );
         let provenance: palyra_common::runtime_contracts::ProcessProvenance =
             serde_json::from_value(
                 output
@@ -16872,6 +16897,19 @@ mod tests {
         );
         assert!(!super::unix_process_group_is_alive(group_id)
             .expect("zombie-aware process-group probe should work"));
+        assert!(
+            super::process_id_is_alive(group_id).expect("zombie direct-pid probe should work"),
+            "the unreaped zombie should demonstrate why direct-pid absence is not required"
+        );
+        assert!(
+            super::wait_for_owned_background_tree_inactive_for_identity(
+                group_id,
+                None,
+                Duration::ZERO,
+            )
+            .expect("zombie-aware ownership-domain wait should work"),
+            "acknowledged cleanup may settle before the child owner reaps the supervisor"
+        );
 
         let status = leader
             .wait_for_exit(Duration::from_secs(5))
