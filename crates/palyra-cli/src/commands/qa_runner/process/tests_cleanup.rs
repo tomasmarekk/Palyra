@@ -468,6 +468,33 @@ fn stale_tracked_process_identity_is_never_signaled() {
     assert!(!signal_sent.get());
 }
 
+#[cfg(unix)]
+#[test]
+fn marker_liveness_requires_an_active_non_root_identity() {
+    let root = UnixProcessIdentity { process_id: 100, start_token_high: 10, start_token_low: 1 };
+    let inactive =
+        UnixProcessIdentity { process_id: 101, start_token_high: 10, start_token_low: 2 };
+    let processes = [root, inactive];
+    let mut probes = Vec::new();
+
+    let marker_active =
+        unix_marker_processes_have_active_non_root_with(processes.as_slice(), &root, |identity| {
+            probes.push(*identity);
+            Ok(false)
+        })
+        .expect("inactive marker identity should be handled");
+
+    assert!(!marker_active);
+    assert_eq!(probes, vec![inactive], "the ownership root has a separate liveness check");
+    assert!(unix_marker_processes_have_active_non_root_with(&[inactive], &root, |_| Ok(true))
+        .expect("active marker identity should be handled"));
+    let error = unix_marker_processes_have_active_non_root_with(&[inactive], &root, |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .expect_err("marker liveness lookup errors must remain fail-closed");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn marker_scan_targets_only_unclassified_processes() {

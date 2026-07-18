@@ -346,9 +346,10 @@ impl DaemonProcessTree {
                 self.containment_marker.as_str(),
                 deadline,
             ) {
-                Ok(processes) => {
-                    processes.into_iter().any(|identity| identity != self.root_identity)
-                }
+                Ok(processes) => unix_marker_processes_have_active_non_root(
+                    processes.as_slice(),
+                    &self.root_identity,
+                )?,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
                 Err(error) => return Err(error),
             };
@@ -762,6 +763,37 @@ fn mac_process_metadata_matches_active_identity(
     reported_process_id == u32::try_from(expected.process_id).unwrap_or(u32::MAX)
         && status != MAC_PROCESS_STATUS_ZOMBIE
         && mac_process_identity(expected.process_id, information) == *expected
+}
+
+#[cfg(unix)]
+fn unix_marker_processes_have_active_non_root(
+    processes: &[UnixProcessIdentity],
+    root: &UnixProcessIdentity,
+) -> io::Result<bool> {
+    unix_marker_processes_have_active_non_root_with(
+        processes,
+        root,
+        unix_process_identity_is_active,
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn unix_marker_processes_have_active_non_root_with<IsActive>(
+    processes: &[UnixProcessIdentity],
+    root: &UnixProcessIdentity,
+    mut is_active: IsActive,
+) -> io::Result<bool>
+where
+    IsActive: FnMut(&UnixProcessIdentity) -> io::Result<bool>,
+{
+    // The marker proves tree ownership, not liveness. Rechecking the exact identity prevents a
+    // killed macOS orphan that remains visible as a zombie from manufacturing a cleanup timeout.
+    for identity in processes.iter().filter(|identity| *identity != root) {
+        if is_active(identity)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(unix)]
