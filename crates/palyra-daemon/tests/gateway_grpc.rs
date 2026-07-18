@@ -8800,8 +8800,9 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<()> {
-    // Cache reuse is asserted only after the first stream drains, so keep CI
+    // Cache reuse is asserted only after the first run reaches terminal status, so keep CI
     // scheduler load outside the active-TTL assertion.
+    const RUN_STREAM_TERMINAL_TIMEOUT: Duration = Duration::from_secs(15);
     const TIMEBOXED_APPROVAL_TTL: Duration = Duration::from_secs(30);
     const TIMEBOXED_APPROVAL_EXPIRY_MARGIN: Duration = Duration::from_millis(500);
     let timeboxed_approval_ttl_ms =
@@ -8904,13 +8905,10 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         "first run should produce failed tool result for unsupported tool"
     );
     drop(first_sender);
-    while let Some(event) =
-        tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
-            .await
-            .context("first timeboxed stream did not finish after approval")?
-    {
-        let _event = event.context("failed to drain first timeboxed stream")?;
-    }
+    wait_for_run_stream_done(&mut first_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
+        .await
+        .context("first timeboxed stream did not finish after approval")?;
+    drop(first_response_stream);
 
     let mut second_stream_request =
         tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_ids(
@@ -8960,13 +8958,10 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         saw_second_failed_result,
         "second run should still execute and fail unsupported tool without reprompt"
     );
-    while let Some(event) =
-        tokio::time::timeout(Duration::from_secs(5), second_response_stream.next())
-            .await
-            .context("second timeboxed stream did not finish after cache hit")?
-    {
-        let _event = event.context("failed to drain second timeboxed stream")?;
-    }
+    wait_for_run_stream_done(&mut second_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
+        .await
+        .context("second timeboxed stream did not finish after cache hit")?;
+    drop(second_response_stream);
 
     tokio::time::sleep(TIMEBOXED_APPROVAL_TTL + TIMEBOXED_APPROVAL_EXPIRY_MARGIN).await;
 
@@ -9034,13 +9029,10 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
     );
     assert!(saw_third_failed_result, "third run should complete after approval re-prompt");
     drop(third_sender);
-    while let Some(event) =
-        tokio::time::timeout(Duration::from_secs(5), third_response_stream.next())
-            .await
-            .context("third timeboxed stream did not finish after approval")?
-    {
-        let _event = event.context("failed to drain third timeboxed stream")?;
-    }
+    wait_for_run_stream_done(&mut third_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
+        .await
+        .context("third timeboxed stream did not finish after approval")?;
+    drop(third_response_stream);
 
     let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
     assert_eq!(
@@ -12341,6 +12333,33 @@ async fn wait_for_run_terminal_state(admin_port: u16, run_id: &str) -> Result<St
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("run {run_id} did not reach terminal state; last_state={observed_state:?}")
+}
+
+async fn wait_for_run_stream_done(
+    response_stream: &mut tonic::Streaming<common_v1::RunStreamEvent>,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let event = response_stream
+                .next()
+                .await
+                .context("run stream ended before emitting terminal status")?
+                .context("failed to read run stream event while waiting for terminal status")?;
+            let Some(common_v1::run_stream_event::Body::Status(status)) = event.body else {
+                continue;
+            };
+            match status.kind() {
+                common_v1::stream_status::StatusKind::Done => return Ok(()),
+                common_v1::stream_status::StatusKind::Failed => {
+                    anyhow::bail!("run stream failed before completion: {}", status.message);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("run stream did not emit done status before timeout")?
 }
 
 async fn admin_get_text_with_security_headers_async(
