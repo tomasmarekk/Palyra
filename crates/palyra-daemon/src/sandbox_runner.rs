@@ -13597,7 +13597,7 @@ mod tests {
             .expect("Unix background command should resolve through the trusted path");
 
             assert!(
-                command.get_program().is_absolute(),
+                Path::new(command.get_program()).is_absolute(),
                 "Unix supervisor target must be absolute: {}",
                 command.get_program().to_string_lossy()
             );
