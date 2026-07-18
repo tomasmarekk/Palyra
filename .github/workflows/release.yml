@@ -38,6 +38,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.95.0
+
+      - name: Validate journal migration fixture
+        run: bash scripts/test/check-journal-migration-fixture.sh
+
       - name: Derive release metadata
         id: meta
         shell: pwsh

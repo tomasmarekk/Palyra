@@ -84,6 +84,10 @@ jobs:
         if: matrix.mode != 'build'
         run: cargo test --workspace --locked
 
+      - name: Unix process supervisor topology and protocol regressions
+        if: ${{ matrix.mode == 'test' && (runner.os == 'Linux' || runner.os == 'macOS') }}
+        run: bash scripts/test/run-unix-process-supervisor-regressions.sh
+
   desktop-linux-release-regression:
     name: Desktop / Release regression (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -194,6 +198,9 @@ jobs:
         uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: 1.95.0
+
+      - name: Validate journal migration fixture
+        run: bash scripts/test/check-journal-migration-fixture.sh
 
       - name: Run runtime contract snapshot gates
         run: bash scripts/test/check-runtime-contract-snapshots.sh

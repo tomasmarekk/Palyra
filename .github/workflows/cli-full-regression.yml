@@ -34,6 +34,9 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      - name: Validate journal migration fixture
+        run: bash scripts/test/check-journal-migration-fixture.sh
+
       - name: Run workflow regression matrix
         run: bash scripts/test/run-workflow-regression.sh
 

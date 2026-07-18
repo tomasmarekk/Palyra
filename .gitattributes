@@ -1,4 +1,6 @@
 *.sh text eol=lf
+fixtures/golden/journal_migrations/*.sha256 text eol=lf
+fixtures/golden/journal_migrations/*.sql text eol=lf
 qa/**/*.json text eol=lf
 qa/**/*.md text eol=lf
 qa/**/*.txt text eol=lf
