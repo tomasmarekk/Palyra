@@ -872,7 +872,10 @@ impl HelperRuntime {
                 return self.finish_after_authority_consumed();
             }
             HelperTargetState::Unspawned => {
-                return Err(invalid_input("cleanup helper target has not been spawned"));
+                // A failed pre-spawn setup or a child rejected and reaped before arming owns no
+                // process authority. Report terminal cleanup so the parent can settle the failed
+                // launch instead of retrying an impossible cleanup forever.
+                return Ok(SupervisorExit::Code(INTERNAL_FAILURE_EXIT_CODE));
             }
         };
         // The unreaped exact leader reserves its matching PGID even after a natural exit. Consume
@@ -2900,6 +2903,22 @@ mod tests {
             block_forever();
         }
         std::process::exit(INTERNAL_FAILURE_EXIT_CODE)
+    }
+
+    #[test]
+    fn cleanup_helper_unspawned_state_is_terminally_safe() {
+        let (control, _peer) = UnixStream::pair().expect("helper control pair should open");
+        let mut runtime = HelperRuntime {
+            control,
+            target: None,
+            target_exit_observer: None,
+            state: HelperTargetState::Unspawned,
+        };
+
+        assert_eq!(
+            runtime.cleanup(Duration::ZERO).expect("unspawned cleanup should settle"),
+            SupervisorExit::Code(INTERNAL_FAILURE_EXIT_CODE)
+        );
     }
 
     #[test]
