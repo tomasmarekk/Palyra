@@ -33,6 +33,8 @@ const COMPAT_RESPONSE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const COMPAT_RUN_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMPAT_RUN_EVENTS_PAGE_LIMIT_DEFAULT: usize = 128;
 const COMPAT_RUN_EVENTS_PAGE_LIMIT_MAX: usize = 512;
+const COMPAT_RUN_STOP_SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const COMPAT_RUN_STOP_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 const COMPAT_SSE_CHANNEL_CAPACITY: usize = 32;
 const COMPAT_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const COMPAT_SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1142,8 +1144,49 @@ pub(crate) async fn compat_run_stop_handler(
         })
         .await
         .map_err(runtime_status_response)?;
-    let status =
-        load_compat_run_status_payload(&state, run_id.as_str(), owner_principal.as_str()).await?;
+    let cancel_requested =
+        outcome.effect.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false);
+    let settled_snapshot = if cancel_requested {
+        match state
+            .runtime
+            .wait_for_orchestrator_run(crate::gateway::OrchestratorRunWaitRequest {
+                run_id: snapshot.run_id.clone(),
+                timeout: COMPAT_RUN_STOP_SETTLEMENT_TIMEOUT,
+                poll_interval: COMPAT_RUN_STOP_SETTLEMENT_POLL_INTERVAL,
+                return_on_waiting: false,
+            })
+            .await
+        {
+            Ok(wait_outcome) => {
+                if wait_outcome.snapshot.principal != owner_principal {
+                    return Err(compat_run_not_found_response(run_id.as_str()));
+                }
+                wait_outcome.snapshot
+            }
+            Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
+                load_compat_run_snapshot_for_owner(
+                    &state,
+                    run_id.as_str(),
+                    owner_principal.as_str(),
+                )
+                .await?
+            }
+            Err(error) => return Err(runtime_status_response(error)),
+        }
+    } else {
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?
+    };
+    let stopped = cancel_requested
+        && compat_run_public_status(settled_snapshot.state.as_str()) == "cancelled";
+    // Cancellation intent is durable before terminal settlement, so `stopped`
+    // must describe the observed snapshot rather than the accepted request.
+    let status = build_compat_run_status_payload_for_snapshot(
+        &state,
+        &settled_snapshot,
+        owner_principal.as_str(),
+    )
+    .await?;
     touch_compat_api_token(
         &state,
         token.token_id.as_str(),
@@ -1155,7 +1198,7 @@ pub(crate) async fn compat_run_stop_handler(
     Ok(Json(json!({
         "id": run_id,
         "object": "run.stop",
-        "stopped": outcome.effect.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false),
+        "stopped": stopped,
         "mode": stop_mode,
         "cleanup_policy": cleanup_policy,
         "reason": reason,

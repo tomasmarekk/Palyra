@@ -1784,21 +1784,54 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
     assert_eq!(stop_response.get("object").and_then(Value::as_str), Some("run.stop"));
     assert_eq!(stop_response.get("mode").and_then(Value::as_str), Some("cancel"));
     assert_eq!(stop_response.get("cleanup_policy").and_then(Value::as_str), Some("none"));
-    if stop_response.get("stopped").and_then(Value::as_bool) == Some(true) {
-        assert_eq!(
-            stop_response.pointer("/run/status").and_then(Value::as_str),
-            Some("cancelled"),
-            "accepted stop should publish cancelled run status"
-        );
-    }
+    let stop_requested =
+        stop_response.pointer("/_palyra/effect/cancel_requested").and_then(Value::as_bool)
+            == Some(true);
+    let stop_settled =
+        stop_response.pointer("/run/status").and_then(Value::as_str) == Some("cancelled");
+    assert_eq!(
+        stop_response.pointer("/run/_palyra/cancel_requested").and_then(Value::as_bool),
+        Some(stop_requested),
+        "stop response snapshot must observe the durable cancellation intent"
+    );
+    assert_eq!(
+        stop_response.get("stopped").and_then(Value::as_bool),
+        Some(stop_requested && stop_settled),
+        "stop acknowledgement must require accepted intent and cancelled settlement"
+    );
     let stopped_terminal =
         wait_for_compat_run_terminal(&client, admin_port, token.as_str(), stop_run_id.as_str())?;
     assert!(
-        stopped_terminal
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| matches!(status, "cancelled" | "completed")),
+        stopped_terminal.get("status").and_then(Value::as_str).is_some_and(|status| {
+            status == "cancelled" || (!stop_requested && status == "completed")
+        }),
         "stopped run should be terminal without failing: {stopped_terminal}"
+    );
+    let (repeat_stop_status, repeat_stop_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{stop_run_id}/stop").as_str(),
+        token.as_str(),
+        &json!({ "reason": "integration repeated stop" }),
+    )?;
+    assert_eq!(
+        repeat_stop_status, 200,
+        "repeated terminal stop should remain idempotent: {repeat_stop_response}"
+    );
+    assert_eq!(
+        repeat_stop_response.get("stopped").and_then(Value::as_bool),
+        Some(false),
+        "repeated terminal stop must report that this request changed no state"
+    );
+    assert_eq!(
+        repeat_stop_response.pointer("/_palyra/effect/cancel_requested").and_then(Value::as_bool),
+        Some(false),
+        "repeated terminal stop must remain an explicit no-op"
+    );
+    assert_eq!(
+        repeat_stop_response.pointer("/run/status").and_then(Value::as_str),
+        stopped_terminal.get("status").and_then(Value::as_str),
+        "repeated terminal stop must preserve the settled status"
     );
 
     Ok(())
