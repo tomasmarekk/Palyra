@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
     cell::Cell,
     collections::HashSet,
@@ -452,17 +454,19 @@ pub(crate) fn dispatch_if_requested() {
         finish_supervisor(outcome)
     }
     if mode == OsStr::new(INTERNAL_CLEANUP_HELPER_ARG) {
-        run_cleanup_helper().unwrap_or_else(|_| {
-            // SAFETY: hidden helper failure must not unwind into daemon initialization.
-            unsafe { libc::_exit(INTERNAL_FAILURE_EXIT_CODE) }
-        })
+        finish_hidden_mode(run_cleanup_helper())
     }
     if mode == OsStr::new(INTERNAL_TARGET_LAUNCHER_ARG) {
-        run_target_launcher().unwrap_or_else(|_| {
-            // SAFETY: hidden launcher failure must not unwind into daemon initialization.
-            unsafe { libc::_exit(INTERNAL_FAILURE_EXIT_CODE) }
-        })
+        finish_hidden_mode(run_target_launcher())
     }
+}
+
+fn finish_hidden_mode(result: io::Result<()>) -> ! {
+    let exit_code = if result.is_ok() { 0 } else { INTERNAL_FAILURE_EXIT_CODE };
+    // SAFETY: hidden modes are dedicated subprocesses. They must bypass destructors on both
+    // success and failure so process-global signal handlers and their descriptors remain valid
+    // until the kernel tears down the process.
+    unsafe { libc::_exit(exit_code) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,25 +756,39 @@ impl HelperRuntime {
                 install_inherited_fd(&mut inherited_fd, CONTROL_FD)
             });
         }
-        let child = command.spawn().map_err(|error| HelperStartFailure {
+        let prepared_exit_observer =
+            PreparedExactChildExitObserver::prepare().map_err(|error| HelperStartFailure {
+                stage: EXEC_STAGE_LAUNCHER_SPAWN,
+                errno: error.raw_os_error().unwrap_or(libc::EIO),
+            })?;
+        let mut child = command.spawn().map_err(|error| HelperStartFailure {
             stage: EXEC_STAGE_LAUNCHER_SPAWN,
             errno: error.raw_os_error().unwrap_or(libc::EIO),
         })?;
         // `spawn` keeps the reusable builder and its `pre_exec` capture alive. Release the
         // parent launcher socket before EOF becomes the successful-exec signal.
         drop(command);
-        let target_pid = pid_t_from_u32(child.id()).map_err(|error| HelperStartFailure {
-            stage: EXEC_STAGE_LAUNCHER_READY,
-            errno: error.raw_os_error().unwrap_or(libc::ERANGE),
-        })?;
-        self.state = HelperTargetState::ArmedRunning { target_pid };
-        self.target_exit_observer =
-            Some(ExactChildExitObserver::register(target_pid).map_err(|error| {
-                HelperStartFailure {
+        let target_pid = match pid_t_from_u32(child.id()) {
+            Ok(target_pid) if target_pid > 0 => target_pid,
+            Ok(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HelperStartFailure {
                     stage: EXEC_STAGE_LAUNCHER_READY,
-                    errno: error.raw_os_error().unwrap_or(libc::EIO),
-                }
-            })?);
+                    errno: libc::EINVAL,
+                });
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HelperStartFailure {
+                    stage: EXEC_STAGE_LAUNCHER_READY,
+                    errno: error.raw_os_error().unwrap_or(libc::ERANGE),
+                });
+            }
+        };
+        self.state = HelperTargetState::ArmedRunning { target_pid };
+        self.target_exit_observer = Some(prepared_exit_observer.arm(target_pid));
         let ready = read_frame_expected(&launcher_stream, &[MessageType::Ready], deadline())
             .map_err(|error| HelperStartFailure {
                 stage: EXEC_STAGE_LAUNCHER_READY,
@@ -804,7 +822,6 @@ impl HelperRuntime {
         self.target = Some(child);
         let outcome = await_launcher_exec_outcome(
             &launcher_stream,
-            self.target.as_mut().expect("target child is retained before exec outcome observation"),
             self.target_exit_observer
                 .as_ref()
                 .expect("target exit observer is registered before launch"),
@@ -837,7 +854,7 @@ impl HelperRuntime {
                 .target_exit_observer
                 .as_ref()
                 .ok_or_else(|| io::Error::other("target exit observer is unavailable"))?
-                .has_exited(target_pid)?
+                .has_exited()?
         {
             return Ok(None);
         }
@@ -864,7 +881,10 @@ impl HelperRuntime {
             .target_exit_observer
             .as_ref()
             .ok_or_else(|| io::Error::other("target exit observer is unavailable"))?;
-        signal_exact_reserved_target_group(target_pid, exit_observer)?;
+        if exit_observer.target_pid() != target_pid {
+            return Err(invalid_data("target exit observer authority does not match helper state"));
+        }
+        signal_exact_reserved_target_group(exit_observer)?;
         self.state = HelperTargetState::AuthorityConsumed { target_pid };
         self.finish_after_authority_consumed_deadline(Instant::now() + max_wait)
     }
@@ -909,13 +929,12 @@ impl HelperRuntime {
 
 fn await_launcher_exec_outcome(
     stream: &UnixStream,
-    launcher: &mut Child,
     exit_observer: &ExactChildExitObserver,
 ) -> io::Result<LauncherExecOutcome> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
     match read_exact_deadline_allow_eof(stream, &mut header, deadline())? {
         ExactReadOutcome::Eof => {
-            if exit_observer.has_exited(pid_t_from_u32(launcher.id())?)? {
+            if exit_observer.has_exited()? {
                 return Err(io::Error::other(
                     "target launcher exited before successful exec could be established",
                 ));
@@ -935,57 +954,136 @@ fn await_launcher_exec_outcome(
     }
 }
 
+struct PreparedExactChildExitObserver {
+    #[cfg(target_os = "macos")]
+    signal_read: RawFd,
+    #[cfg(target_os = "macos")]
+    _signal_write: RawFd,
+}
+
 struct ExactChildExitObserver {
+    target_pid: libc::pid_t,
     exit_observed: Cell<bool>,
     #[cfg(target_os = "macos")]
-    queue: OwnedFd,
+    signal_read: RawFd,
+    #[cfg(target_os = "macos")]
+    _signal_write: RawFd,
+}
+
+#[cfg(target_os = "macos")]
+// Supported Darwin targets provide lock-free 32-bit atomics, so the signal handler never enters
+// a library fallback. The descriptor is process-global because the helper has exactly one child.
+static SIGCHLD_NOTIFICATION_FD: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(target_os = "macos")]
+extern "C" fn notify_sigchld(_signal: libc::c_int) {
+    let fd = SIGCHLD_NOTIFICATION_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let notification = 1_u8;
+    // SAFETY: __error and write are async-signal-safe on Darwin. The dedicated helper retains both
+    // pipe ends until `_exit`, so EPIPE and descriptor reuse are impossible. A full pipe already
+    // represents a pending notification; any other write failure violates the observer invariant.
+    unsafe {
+        let errno = libc::__error();
+        let saved_errno = *errno;
+        loop {
+            if libc::write(fd, std::ptr::from_ref(&notification).cast(), 1) == 1 {
+                break;
+            }
+            match *errno {
+                libc::EINTR => continue,
+                libc::EAGAIN => break,
+                _ => libc::_exit(INTERNAL_FAILURE_EXIT_CODE),
+            }
+        }
+        *errno = saved_errno;
+    }
+}
+
+impl PreparedExactChildExitObserver {
+    #[cfg(not(target_os = "macos"))]
+    fn prepare() -> io::Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare() -> io::Result<Self> {
+        let mut pipe_fds = [-1; 2];
+        // SAFETY: pipe_fds provides writable storage for exactly two descriptors.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful pipe descriptors are fresh and uniquely owned here.
+        let signal_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        // SAFETY: successful pipe descriptors are fresh and uniquely owned here.
+        let signal_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        set_fd_cloexec(signal_read.as_raw_fd())?;
+        set_fd_cloexec(signal_write.as_raw_fd())?;
+        set_fd_nonblocking(signal_read.as_raw_fd())?;
+        set_fd_nonblocking(signal_write.as_raw_fd())?;
+
+        if SIGCHLD_NOTIFICATION_FD
+            .compare_exchange(-1, signal_write.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "SIGCHLD exit observer is already installed",
+            ));
+        }
+        // Install before spawning the helper's sole child, eliminating the spawn-to-registration
+        // race. The child restores the default disposition before exec, while this dedicated
+        // helper keeps the handler until it has reaped the exact child.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = notify_sigchld as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
+        // SAFETY: action mask is writable. Blocking maskable signals prevents the single
+        // notification write from being interrupted by an unrelated handler.
+        if unsafe { libc::sigfillset(&mut action.sa_mask) } != 0 {
+            SIGCHLD_NOTIFICATION_FD.store(-1, Ordering::Relaxed);
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: action is fully initialized and the previous disposition is not needed by this
+        // dedicated cleanup-helper process.
+        if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
+            SIGCHLD_NOTIFICATION_FD.store(-1, Ordering::Relaxed);
+            return Err(io::Error::last_os_error());
+        }
+        // These raw descriptors intentionally live until the dedicated helper calls `_exit`.
+        // Closing them from a destructor could race a signal handler that already loaded the fd.
+        Ok(Self {
+            signal_read: signal_read.into_raw_fd(),
+            _signal_write: signal_write.into_raw_fd(),
+        })
+    }
+
+    fn arm(self, target_pid: libc::pid_t) -> ExactChildExitObserver {
+        debug_assert!(target_pid > 0);
+        ExactChildExitObserver {
+            target_pid,
+            exit_observed: Cell::new(false),
+            #[cfg(target_os = "macos")]
+            signal_read: self.signal_read,
+            #[cfg(target_os = "macos")]
+            _signal_write: self._signal_write,
+        }
+    }
 }
 
 impl ExactChildExitObserver {
-    #[cfg(not(target_os = "macos"))]
-    fn register(_target_pid: libc::pid_t) -> io::Result<Self> {
-        Ok(Self { exit_observed: Cell::new(false) })
-    }
-
-    #[cfg(target_os = "macos")]
-    fn register(target_pid: libc::pid_t) -> io::Result<Self> {
-        let target_ident = usize::try_from(target_pid)
-            .map_err(|_| invalid_input("target pid exceeds kqueue identifier range"))?;
-        // SAFETY: kqueue takes no arguments and returns a uniquely owned descriptor on success.
-        let queue_fd = unsafe { libc::kqueue() };
-        if queue_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the successful kqueue result is a fresh descriptor owned by this observer.
-        let queue = unsafe { OwnedFd::from_raw_fd(queue_fd) };
-        set_fd_cloexec(queue.as_raw_fd())?;
-        let change = libc::kevent {
-            ident: target_ident,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // Register before releasing the launch specification. The process filter is evaluated on
-        // registration, so an already-exited but unreaped launcher is still observed without
-        // consuming the PID/PGID reservation needed for exact group cleanup.
-        let result = unsafe {
-            libc::kevent(queue.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
-        };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { exit_observed: Cell::new(false), queue })
+    fn target_pid(&self) -> libc::pid_t {
+        self.target_pid
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+    fn has_exited(&self) -> io::Result<bool> {
         if self.exit_observed.get() {
             return Ok(true);
         }
         let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let target_id = libc::id_t::try_from(target_pid)
+        let target_id = libc::id_t::try_from(self.target_pid)
             .map_err(|_| invalid_input("target pid exceeds waitid range"))?;
         loop {
             // SAFETY: target_pid identifies the helper's exact child, information is writable, and
@@ -1003,7 +1101,7 @@ impl ExactChildExitObserver {
                 // child.
                 let information = unsafe { information.assume_init() };
                 // SAFETY: libc exposes the platform-correct siginfo accessor.
-                let observed = unsafe { information.si_pid() } == target_pid;
+                let observed = unsafe { information.si_pid() } == self.target_pid;
                 self.exit_observed.set(observed);
                 return Ok(observed);
             }
@@ -1016,63 +1114,43 @@ impl ExactChildExitObserver {
     }
 
     #[cfg(target_os = "macos")]
-    fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+    fn has_exited(&self) -> io::Result<bool> {
         if self.exit_observed.get() {
             return Ok(true);
         }
-        let expected_ident = usize::try_from(target_pid)
-            .map_err(|_| invalid_input("target pid exceeds kqueue identifier range"))?;
-        let timeout = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         loop {
-            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
-            // SAFETY: the observer owns a live kqueue descriptor, event is writable, and the zero
-            // timeout makes this a nonblocking poll.
+            let mut notification = 0_u8;
+            // SAFETY: signal_read is a live nonblocking descriptor and notification is writable.
             let result = unsafe {
-                libc::kevent(
-                    self.queue.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    event.as_mut_ptr(),
-                    1,
-                    &timeout,
-                )
+                libc::read(self.signal_read, std::ptr::from_mut(&mut notification).cast(), 1)
             };
+            if result == 1 {
+                self.exit_observed.set(true);
+                return Ok(true);
+            }
             if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SIGCHLD exit observer closed unexpectedly",
+                ));
+            }
+            if result > 1 {
+                return Err(invalid_data("SIGCHLD exit observer returned an invalid byte count"));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
                 return Ok(false);
             }
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(error);
-            }
-            // SAFETY: kevent initialized the single output event when it returned one.
-            let event = unsafe { event.assume_init() };
-            if event.flags & libc::EV_ERROR != 0 {
-                let errno = i32::try_from(event.data)
-                    .map_err(|_| invalid_data("kqueue process error exceeds errno range"))?;
-                if errno == 0 {
-                    return Err(invalid_data("kqueue process event reported an empty error"));
-                }
-                return Err(io::Error::from_raw_os_error(errno));
-            }
-            if event.ident != expected_ident
-                || event.filter != libc::EVFILT_PROC
-                || event.fflags & libc::NOTE_EXIT == 0
-            {
-                return Err(invalid_data("kqueue returned an unexpected target process event"));
-            }
-            self.exit_observed.set(true);
-            return Ok(true);
+            return Err(error);
         }
     }
 }
 
-fn signal_exact_reserved_target_group(
-    target_pid: libc::pid_t,
-    exit_observer: &ExactChildExitObserver,
-) -> io::Result<()> {
+fn signal_exact_reserved_target_group(exit_observer: &ExactChildExitObserver) -> io::Result<()> {
+    let target_pid = exit_observer.target_pid();
     if target_pid <= 0 {
         return Err(invalid_input("target pid must be positive"));
     }
@@ -1082,7 +1160,7 @@ fn signal_exact_reserved_target_group(
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) && exit_observer.has_exited(target_pid)? {
+    if error.raw_os_error() == Some(libc::ESRCH) && exit_observer.has_exited()? {
         Ok(())
     } else {
         Err(error)
@@ -1224,6 +1302,19 @@ fn restore_waitable_sigchld() -> io::Result<()> {
     }
     // SAFETY: the initialized action restores a waitable default SIGCHLD disposition.
     if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut signal_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: signal_set is writable.
+    if unsafe { libc::sigemptyset(&mut signal_set) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: signal_set is initialized and SIGCHLD is a valid signal.
+    if unsafe { libc::sigaddset(&mut signal_set, libc::SIGCHLD) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: unblocking SIGCHLD makes forked target launchers independent of any inherited mask.
+    if unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &signal_set, std::ptr::null_mut()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -2494,6 +2585,20 @@ fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl status flag operations have no pointer arguments.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: flags come from F_GETFL and adding O_NONBLOCK is valid.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn current_pid_t() -> io::Result<libc::pid_t> {
     // SAFETY: getpid has no arguments and always returns the calling process id.
     let pid = unsafe { libc::getpid() };
@@ -2771,16 +2876,10 @@ mod tests {
             finish_supervisor(outcome)
         }
         if mode == OsStr::new(TEST_CLEANUP_HELPER_MODE) {
-            run_cleanup_helper().unwrap_or_else(|_| {
-                // SAFETY: hidden helper test failure must not unwind through the harness.
-                unsafe { libc::_exit(INTERNAL_FAILURE_EXIT_CODE) }
-            })
+            finish_hidden_mode(run_cleanup_helper())
         }
         if mode == OsStr::new(TEST_TARGET_LAUNCHER_MODE) {
-            run_target_launcher().unwrap_or_else(|_| {
-                // SAFETY: hidden launcher test failure must not unwind through the harness.
-                unsafe { libc::_exit(INTERNAL_FAILURE_EXIT_CODE) }
-            })
+            finish_hidden_mode(run_target_launcher())
         }
         if mode == OsStr::new(TEST_TARGET_MODE_BLOCK) {
             run_blocking_target(false)
