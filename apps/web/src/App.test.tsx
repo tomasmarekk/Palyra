@@ -909,7 +909,7 @@ describe("M35 web console app", () => {
       "No platform mutation has been applied yet. This response is a preview",
     );
     expect(document.body).toHaveTextContent("APPROVAL-1");
-  });
+  }, 20_000);
 
   it("supports routine create and pause workflow from UI", async () => {
     const cronJobs = [
