@@ -7,6 +7,7 @@
 #[cfg(test)]
 use std::os::unix::process::ExitStatusExt;
 use std::{
+    cell::Cell,
     collections::HashSet,
     env,
     ffi::{OsStr, OsString},
@@ -859,7 +860,11 @@ impl HelperRuntime {
         };
         // The unreaped exact leader reserves its matching PGID even after a natural exit. Consume
         // that authority exactly once before reaping because live descendants may remain.
-        signal_exact_reserved_target_group(target_pid)?;
+        let exit_observer = self
+            .target_exit_observer
+            .as_ref()
+            .ok_or_else(|| io::Error::other("target exit observer is unavailable"))?;
+        signal_exact_reserved_target_group(target_pid, exit_observer)?;
         self.state = HelperTargetState::AuthorityConsumed { target_pid };
         self.finish_after_authority_consumed_deadline(Instant::now() + max_wait)
     }
@@ -931,6 +936,7 @@ fn await_launcher_exec_outcome(
 }
 
 struct ExactChildExitObserver {
+    exit_observed: Cell<bool>,
     #[cfg(target_os = "macos")]
     queue: OwnedFd,
 }
@@ -938,7 +944,7 @@ struct ExactChildExitObserver {
 impl ExactChildExitObserver {
     #[cfg(not(target_os = "macos"))]
     fn register(_target_pid: libc::pid_t) -> io::Result<Self> {
-        Ok(Self {})
+        Ok(Self { exit_observed: Cell::new(false) })
     }
 
     #[cfg(target_os = "macos")]
@@ -970,11 +976,14 @@ impl ExactChildExitObserver {
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { queue })
+        Ok(Self { exit_observed: Cell::new(false), queue })
     }
 
     #[cfg(not(target_os = "macos"))]
     fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+        if self.exit_observed.get() {
+            return Ok(true);
+        }
         let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         let target_id = libc::id_t::try_from(target_pid)
             .map_err(|_| invalid_input("target pid exceeds waitid range"))?;
@@ -994,7 +1003,9 @@ impl ExactChildExitObserver {
                 // child.
                 let information = unsafe { information.assume_init() };
                 // SAFETY: libc exposes the platform-correct siginfo accessor.
-                return Ok(unsafe { information.si_pid() } == target_pid);
+                let observed = unsafe { information.si_pid() } == target_pid;
+                self.exit_observed.set(observed);
+                return Ok(observed);
             }
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINTR) {
@@ -1006,6 +1017,9 @@ impl ExactChildExitObserver {
 
     #[cfg(target_os = "macos")]
     fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+        if self.exit_observed.get() {
+            return Ok(true);
+        }
         let expected_ident = usize::try_from(target_pid)
             .map_err(|_| invalid_input("target pid exceeds kqueue identifier range"))?;
         let timeout = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -1049,12 +1063,16 @@ impl ExactChildExitObserver {
             {
                 return Err(invalid_data("kqueue returned an unexpected target process event"));
             }
+            self.exit_observed.set(true);
             return Ok(true);
         }
     }
 }
 
-fn signal_exact_reserved_target_group(target_pid: libc::pid_t) -> io::Result<()> {
+fn signal_exact_reserved_target_group(
+    target_pid: libc::pid_t,
+    exit_observer: &ExactChildExitObserver,
+) -> io::Result<()> {
     if target_pid <= 0 {
         return Err(invalid_input("target pid must be positive"));
     }
@@ -1064,7 +1082,7 @@ fn signal_exact_reserved_target_group(target_pid: libc::pid_t) -> io::Result<()>
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) && exact_child_exit_observed(target_pid)? {
+    if error.raw_os_error() == Some(libc::ESRCH) && exit_observer.has_exited(target_pid)? {
         Ok(())
     } else {
         Err(error)
