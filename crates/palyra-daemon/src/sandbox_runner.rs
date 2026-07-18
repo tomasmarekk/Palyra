@@ -4554,6 +4554,7 @@ fn background_process_tree_status(
     Ok((direct_pid_alive, None))
 }
 
+#[cfg(any(test, not(any(unix, windows))))]
 fn wait_for_process_not_alive(pid: u32, max_wait: Duration) -> bool {
     let started_at = Instant::now();
     loop {
