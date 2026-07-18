@@ -6779,14 +6779,17 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
         ScriptedOpenAiResponse::immediate(200, first_response),
         ScriptedOpenAiResponse::delayed(200, delayed_final_response, Duration::from_millis(1_000)),
     ])?;
+    // This scenario qualifies timeout diagnostics, not breaker behavior. A single timed-out
+    // follow-up must not replace the root cause with a circuit-open rejection under load.
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
+        spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.echo",
             2,
             250,
             250,
+            &[("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "2")],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -12740,25 +12743,6 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_retries(
         execution_timeout_ms,
         false,
         max_retries,
-    )
-}
-
-fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
-    openai_base_url: &str,
-    openai_api_key: &str,
-    allowed_tools: &str,
-    max_calls_per_run: u32,
-    execution_timeout_ms: u64,
-    provider_request_timeout_ms: u64,
-) -> Result<(Child, u16, u16, PathBuf)> {
-    spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
-        openai_base_url,
-        openai_api_key,
-        allowed_tools,
-        max_calls_per_run,
-        execution_timeout_ms,
-        provider_request_timeout_ms,
-        &[],
     )
 }
 
