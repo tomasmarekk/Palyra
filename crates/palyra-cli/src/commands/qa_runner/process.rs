@@ -155,7 +155,9 @@ use workspace_diagnostics::load_failure_workspace_projection_with_hook;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const DAEMON_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+// Unix cleanup can require several full process-table and marker scans before proving inactivity.
+// Keep one bounded budget with enough headroom for concurrent cleanup under system load.
+const DAEMON_TERMINATION_TIMEOUT: Duration = Duration::from_secs(15);
 const LOG_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DROP_CLEANUP_ATTEMPTS: usize = 3;

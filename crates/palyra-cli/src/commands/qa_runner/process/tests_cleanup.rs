@@ -366,7 +366,7 @@ fn daemon_tree_cleanup_terminates_a_grandchild() {
     assert!(process_is_alive(parent_id, Duration::from_secs(1)));
     assert!(process_is_alive(grandchild_id, Duration::from_secs(1)));
 
-    assert!(process.terminate_tree(Duration::from_secs(5)));
+    assert!(process.terminate_tree(DAEMON_TERMINATION_TIMEOUT));
     assert!(wait_for_process_exit(parent_id, Duration::from_secs(2)));
     assert!(wait_for_process_exit(grandchild_id, Duration::from_secs(5)));
 }
@@ -382,7 +382,7 @@ fn daemon_tree_cleanup_terminates_a_setsid_grandchild() {
     assert!(process_is_alive(parent_id, Duration::from_secs(1)));
     assert!(process_is_alive(grandchild_id, Duration::from_secs(1)));
 
-    assert!(process.terminate_tree(Duration::from_secs(5)));
+    assert!(process.terminate_tree(DAEMON_TERMINATION_TIMEOUT));
     assert!(wait_for_process_exit(parent_id, Duration::from_secs(2)));
     assert!(wait_for_process_exit(grandchild_id, Duration::from_secs(5)));
 }
@@ -750,7 +750,7 @@ fn liveness_eof_does_not_hide_a_marker_bound_double_fork() {
     assert!(!tree
         .wait_until_inactive(Instant::now() + Duration::from_millis(100))
         .expect("live marker-bound leaf must not be reported inactive"));
-    assert!(process.terminate_tree(Duration::from_secs(5)));
+    assert!(process.terminate_tree(DAEMON_TERMINATION_TIMEOUT));
     assert!(!unix_process_identity_is_active(&orphan_identity)
         .expect("terminated leaf identity should remain observable"));
 }
