@@ -578,6 +578,7 @@ enum HelperTargetState {
 struct HelperRuntime {
     control: UnixStream,
     target: Option<Child>,
+    target_exit_observer: Option<ExactChildExitObserver>,
     state: HelperTargetState,
 }
 
@@ -607,7 +608,12 @@ fn run_cleanup_helper() -> io::Result<()> {
     read_exact_deadline(&control, payload.as_mut_slice(), deadline())?;
     let spec = decode_launch_spec(payload.as_slice())?;
 
-    let mut runtime = HelperRuntime { control, target: None, state: HelperTargetState::Unspawned };
+    let mut runtime = HelperRuntime {
+        control,
+        target: None,
+        target_exit_observer: None,
+        state: HelperTargetState::Unspawned,
+    };
     match runtime.start_target(&spec) {
         Ok(target_pid) => {
             let mut response = [0_u8; 5];
@@ -757,6 +763,13 @@ impl HelperRuntime {
             errno: error.raw_os_error().unwrap_or(libc::ERANGE),
         })?;
         self.state = HelperTargetState::ArmedRunning { target_pid };
+        self.target_exit_observer =
+            Some(ExactChildExitObserver::register(target_pid).map_err(|error| {
+                HelperStartFailure {
+                    stage: EXEC_STAGE_LAUNCHER_READY,
+                    errno: error.raw_os_error().unwrap_or(libc::EIO),
+                }
+            })?);
         let ready = read_frame_expected(&launcher_stream, &[MessageType::Ready], deadline())
             .map_err(|error| HelperStartFailure {
                 stage: EXEC_STAGE_LAUNCHER_READY,
@@ -791,6 +804,9 @@ impl HelperRuntime {
         let outcome = await_launcher_exec_outcome(
             &launcher_stream,
             self.target.as_mut().expect("target child is retained before exec outcome observation"),
+            self.target_exit_observer
+                .as_ref()
+                .expect("target exit observer is registered before launch"),
         )
         .map_err(|error| HelperStartFailure {
             stage: EXEC_STAGE_TARGET_EXEC,
@@ -816,7 +832,11 @@ impl HelperRuntime {
             HelperTargetState::Unspawned => return Ok(None),
         };
         if matches!(self.state, HelperTargetState::ArmedRunning { .. })
-            && !exact_child_exit_observed(target_pid)?
+            && !self
+                .target_exit_observer
+                .as_ref()
+                .ok_or_else(|| io::Error::other("target exit observer is unavailable"))?
+                .has_exited(target_pid)?
         {
             return Ok(None);
         }
@@ -885,11 +905,12 @@ impl HelperRuntime {
 fn await_launcher_exec_outcome(
     stream: &UnixStream,
     launcher: &mut Child,
+    exit_observer: &ExactChildExitObserver,
 ) -> io::Result<LauncherExecOutcome> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
     match read_exact_deadline_allow_eof(stream, &mut header, deadline())? {
         ExactReadOutcome::Eof => {
-            if exact_child_exit_observed(pid_t_from_u32(launcher.id())?)? {
+            if exit_observer.has_exited(pid_t_from_u32(launcher.id())?)? {
                 return Err(io::Error::other(
                     "target launcher exited before successful exec could be established",
                 ));
@@ -909,32 +930,127 @@ fn await_launcher_exec_outcome(
     }
 }
 
-fn exact_child_exit_observed(target_pid: libc::pid_t) -> io::Result<bool> {
-    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    let target_id = libc::id_t::try_from(target_pid)
-        .map_err(|_| invalid_input("target pid exceeds waitid range"))?;
-    loop {
-        // SAFETY: target_pid identifies the helper's exact child, information is writable, and
-        // WNOWAIT deliberately retains the child as the PID/PGID reservation after observation.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                target_id,
-                information.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
+struct ExactChildExitObserver {
+    #[cfg(target_os = "macos")]
+    queue: OwnedFd,
+}
+
+impl ExactChildExitObserver {
+    #[cfg(not(target_os = "macos"))]
+    fn register(_target_pid: libc::pid_t) -> io::Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(target_os = "macos")]
+    fn register(target_pid: libc::pid_t) -> io::Result<Self> {
+        let target_ident = usize::try_from(target_pid)
+            .map_err(|_| invalid_input("target pid exceeds kqueue identifier range"))?;
+        // SAFETY: kqueue takes no arguments and returns a uniquely owned descriptor on success.
+        let queue_fd = unsafe { libc::kqueue() };
+        if queue_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful kqueue result is a fresh descriptor owned by this observer.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue_fd) };
+        set_fd_cloexec(queue.as_raw_fd())?;
+        let change = libc::kevent {
+            ident: target_ident,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
         };
-        if result == 0 {
-            // SAFETY: waitid initializes siginfo_t on success; si_pid==0 denotes no waitable child.
-            let information = unsafe { information.assume_init() };
-            // SAFETY: libc exposes the platform-correct siginfo accessor.
-            return Ok(unsafe { information.si_pid() } == target_pid);
+        // Register before releasing the launch specification. The process filter is evaluated on
+        // registration, so an already-exited but unreaped launcher is still observed without
+        // consuming the PID/PGID reservation needed for exact group cleanup.
+        let result = unsafe {
+            libc::kevent(queue.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            continue;
+        Ok(Self { queue })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let target_id = libc::id_t::try_from(target_pid)
+            .map_err(|_| invalid_input("target pid exceeds waitid range"))?;
+        loop {
+            // SAFETY: target_pid identifies the helper's exact child, information is writable, and
+            // WNOWAIT deliberately retains the child as the PID/PGID reservation after observation.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    target_id,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: waitid initializes siginfo_t on success; si_pid==0 denotes no waitable
+                // child.
+                let information = unsafe { information.assume_init() };
+                // SAFETY: libc exposes the platform-correct siginfo accessor.
+                return Ok(unsafe { information.si_pid() } == target_pid);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
         }
-        return Err(error);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_exited(&self, target_pid: libc::pid_t) -> io::Result<bool> {
+        let expected_ident = usize::try_from(target_pid)
+            .map_err(|_| invalid_input("target pid exceeds kqueue identifier range"))?;
+        let timeout = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        loop {
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            // SAFETY: the observer owns a live kqueue descriptor, event is writable, and the zero
+            // timeout makes this a nonblocking poll.
+            let result = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &timeout,
+                )
+            };
+            if result == 0 {
+                return Ok(false);
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: kevent initialized the single output event when it returned one.
+            let event = unsafe { event.assume_init() };
+            if event.flags & libc::EV_ERROR != 0 {
+                let errno = i32::try_from(event.data)
+                    .map_err(|_| invalid_data("kqueue process error exceeds errno range"))?;
+                if errno == 0 {
+                    return Err(invalid_data("kqueue process event reported an empty error"));
+                }
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            if event.ident != expected_ident
+                || event.filter != libc::EVFILT_PROC
+                || event.fflags & libc::NOTE_EXIT == 0
+            {
+                return Err(invalid_data("kqueue returned an unexpected target process event"));
+            }
+            return Ok(true);
+        }
     }
 }
 
@@ -1265,12 +1381,15 @@ fn finish_cleanup_request(
     acknowledge: bool,
     retry_requires_command: bool,
 ) -> io::Result<SupervisorExit> {
+    // Cleanup normally SIGKILLs the target group, but that mechanical result must not replace the
+    // event that triggered cleanup. The natural-exit path supplies its observed outcome as this
+    // fallback; terminate, timeout, and control-loss paths supply their own authoritative outcome.
     match runtime.perform_cleanup() {
         Ok(()) => {
             if acknowledge {
                 write_frame(control, MessageType::CleanupComplete, &[], deadline())?;
             }
-            Ok(runtime.target_outcome.unwrap_or(fallback_outcome))
+            Ok(fallback_outcome)
         }
         Err(_) => {
             let control_open = if acknowledge {
@@ -1301,7 +1420,7 @@ fn cleanup_retry_loop(
     loop {
         if !control_open {
             if runtime.perform_cleanup().is_ok() {
-                return Ok(runtime.target_outcome.unwrap_or(fallback_outcome));
+                return Ok(fallback_outcome);
             }
             thread::sleep(Duration::from_secs(1));
             continue;
@@ -1310,7 +1429,7 @@ fn cleanup_retry_loop(
             match runtime.perform_cleanup() {
                 Ok(()) => {
                     write_frame(control, MessageType::CleanupComplete, &[], deadline())?;
-                    return Ok(runtime.target_outcome.unwrap_or(fallback_outcome));
+                    return Ok(fallback_outcome);
                 }
                 Err(_) => {
                     thread::sleep(Duration::from_secs(1));
@@ -1325,7 +1444,7 @@ fn cleanup_retry_loop(
                 match runtime.perform_cleanup() {
                     Ok(()) => {
                         write_frame(control, MessageType::CleanupComplete, &[], deadline())?;
-                        return Ok(runtime.target_outcome.unwrap_or(fallback_outcome));
+                        return Ok(fallback_outcome);
                     }
                     Err(_) => {
                         if write_frame(control, MessageType::CleanupFailed, &[], deadline())
@@ -1437,15 +1556,21 @@ fn finish_supervisor(outcome: SupervisorExit) -> ! {
 
 fn mirror_signal(signal: i32) -> ! {
     // SAFETY: signal values come from wait status. Restoring the default disposition, unblocking,
-    // and signalling this single-threaded supervisor reproduces the target's termination status.
+    // and signalling this dedicated supervisor process reproduces the target's termination status.
     unsafe {
         libc::signal(signal, libc::SIG_DFL);
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, signal);
         libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        libc::kill(libc::getpid(), signal);
-        libc::_exit(128_i32.saturating_add(signal));
+        if libc::kill(libc::getpid(), signal) != 0 {
+            libc::_exit(128_i32.saturating_add(signal));
+        }
+        // Darwin can return from kill before scheduling delivery. Never replace a successfully
+        // generated terminal signal with a numeric 128+signal exit status.
+        loop {
+            libc::pause();
+        }
     }
 }
 
