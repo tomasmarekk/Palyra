@@ -13063,7 +13063,32 @@ async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tokio::test(flavor = "multi_thread")]
+struct TestNotificationRelease {
+    notification: Option<Arc<Notify>>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl TestNotificationRelease {
+    fn new(notification: Arc<Notify>) -> Self {
+        Self { notification: Some(notification) }
+    }
+
+    fn notify(&mut self) {
+        if let Some(notification) = self.notification.take() {
+            notification.notify_one();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for TestNotificationRelease {
+    fn drop(&mut self) {
+        self.notify();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_cleanup_waits_for_durable_process_publication() {
     #[cfg(windows)]
     let (command, args) = ("ping.exe", vec!["-t", "0x7f000001"]);
@@ -13090,6 +13115,7 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         .expect("test run should enter in-progress state");
     let committed = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    let mut release_guard = TestNotificationRelease::new(Arc::clone(&release));
     state.set_background_process_registration_publication_barrier(
         Arc::clone(&committed),
         Arc::clone(&release),
@@ -13098,7 +13124,7 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
     let registration_state = Arc::clone(&state);
     let registration_session_id = session_id.clone();
     let registration_run_id = run_id.clone();
-    let registration = tokio::spawn(async move {
+    let mut registration = tokio::spawn(async move {
         super::execute_tool_with_runtime_dispatch(
             &registration_state,
             super::ToolRuntimeExecutionContext {
@@ -13130,7 +13156,7 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         .expect("process registration should durably commit before publication");
     let terminal_state = Arc::clone(&state);
     let terminal_run_id = run_id.clone();
-    let terminal = tokio::spawn(async move {
+    let mut terminal = tokio::spawn(async move {
         let settlement = terminal_state
             .settle_orchestrator_run_terminal(OrchestratorRunTerminalSettlementRequest {
                 run_id: terminal_run_id.clone(),
@@ -13165,9 +13191,23 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         "terminal cleanup must wait while committed process authority is unpublished"
     );
 
-    release.notify_one();
-    let outcome = registration.await.expect("registration task should join");
-    let (settlement, cleanup) = terminal.await.expect("terminal task should join");
+    release_guard.notify();
+    let joined = tokio::time::timeout(Duration::from_secs(120), async {
+        let registration = (&mut registration).await;
+        let terminal = (&mut terminal).await;
+        (registration, terminal)
+    })
+    .await;
+    let (registration, terminal) = match joined {
+        Ok(joined) => joined,
+        Err(_) => {
+            registration.abort();
+            terminal.abort();
+            panic!("registration and terminal cleanup tasks should complete within 120 seconds");
+        }
+    };
+    let outcome = registration.expect("registration task should join");
+    let (settlement, cleanup) = terminal.expect("terminal task should join");
     assert!(settlement.changed);
     assert_eq!(settlement.effective_state, RunLifecycleState::Failed);
     assert!(cleanup.cleanup_warning.is_none(), "cleanup should verify process termination");

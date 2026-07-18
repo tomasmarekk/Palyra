@@ -3913,7 +3913,21 @@ pub(crate) async fn cleanup_run_resources(
     reason: &str,
 ) -> RunCleanupSummary {
     let browser_session_ids = runtime_state.take_run_browser_sessions(run_id);
-    let background_processes = runtime_state.list_run_background_processes(run_id);
+    let (background_processes, background_snapshot_warning) =
+        match runtime_state.list_run_background_processes_for_cleanup(run_id).await {
+            Ok(processes) => (processes, None),
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to load background processes for run cleanup"
+                );
+                (
+                    Vec::new(),
+                    Some(format!("background process cleanup snapshot worker failed: {error}")),
+                )
+            }
+        };
     let detached_resources = runtime_state.take_run_detached_resources(run_id);
     if browser_session_ids.is_empty()
         && background_processes.is_empty()
@@ -3926,7 +3940,7 @@ pub(crate) async fn cleanup_run_resources(
                 "failed to finalize metadata trace after empty run cleanup"
             );
         }
-        return RunCleanupSummary::default();
+        return RunCleanupSummary { cleanup_warning: background_snapshot_warning };
     }
 
     let browser_session_count = browser_session_ids.len();
@@ -4245,9 +4259,18 @@ pub(crate) async fn cleanup_run_resources(
     );
 
     RunCleanupSummary {
-        cleanup_warning: detached_background_cleanup_warning(
-            detached_background_process_outcomes.as_slice(),
+        cleanup_warning: merge_cleanup_warnings(
+            background_snapshot_warning,
+            detached_background_cleanup_warning(detached_background_process_outcomes.as_slice()),
         ),
+    }
+}
+
+fn merge_cleanup_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
     }
 }
 

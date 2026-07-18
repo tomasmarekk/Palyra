@@ -5185,6 +5185,20 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Lists run-owned process leases without blocking an async executor worker on publication.
+    ///
+    /// # Errors
+    /// Returns a join error if the blocking snapshot worker panics or is cancelled at shutdown.
+    pub(crate) async fn list_run_background_processes_for_cleanup(
+        self: &Arc<Self>,
+        run_id: &str,
+    ) -> Result<Vec<RunOwnedBackgroundProcess>, tokio::task::JoinError> {
+        let state = Arc::clone(self);
+        let run_id = run_id.to_owned();
+        tokio::task::spawn_blocking(move || state.list_run_background_processes(run_id.as_str()))
+            .await
+    }
+
     /// Registers a detached background process for terminal handoff reporting
     /// without adding it to terminal cleanup.
     pub(crate) fn record_run_detached_background_process(
