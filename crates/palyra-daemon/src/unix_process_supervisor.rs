@@ -6,8 +6,6 @@
 
 #[cfg(test)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
     cell::Cell,
     collections::HashSet,
@@ -582,7 +580,7 @@ enum HelperTargetState {
     AuthorityConsumed {
         target_pid: libc::pid_t,
     },
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     AwaitingGroupInactivity {
         target_pgid: libc::pid_t,
         raw_wait_status: i32,
@@ -768,11 +766,6 @@ impl HelperRuntime {
                 install_inherited_fd(&mut inherited_fd, CONTROL_FD)
             });
         }
-        let prepared_exit_observer =
-            PreparedExactChildExitObserver::prepare().map_err(|error| HelperStartFailure {
-                stage: EXEC_STAGE_LAUNCHER_SPAWN,
-                errno: error.raw_os_error().unwrap_or(libc::EIO),
-            })?;
         let mut child = command.spawn().map_err(|error| HelperStartFailure {
             stage: EXEC_STAGE_LAUNCHER_SPAWN,
             errno: error.raw_os_error().unwrap_or(libc::EIO),
@@ -800,7 +793,9 @@ impl HelperRuntime {
             }
         };
         self.state = HelperTargetState::ArmedRunning { target_pid };
-        self.target_exit_observer = Some(prepared_exit_observer.arm(target_pid));
+        // WNOWAIT observes an already-exited exact child without reaping it, so registering after
+        // spawn has no lossy notification window and preserves the PID/PGID reservation.
+        self.target_exit_observer = Some(ExactChildExitObserver::new(target_pid));
         let ready = read_frame_expected(&launcher_stream, &[MessageType::Ready], deadline())
             .map_err(|error| HelperStartFailure {
                 stage: EXEC_STAGE_LAUNCHER_READY,
@@ -857,7 +852,7 @@ impl HelperRuntime {
             HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
                 return self.finish_after_authority_consumed().map(Some);
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(target_os = "linux"))]
             HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed().map(Some);
             }
@@ -883,7 +878,7 @@ impl HelperRuntime {
             HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
                 return self.finish_after_authority_consumed();
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(target_os = "linux"))]
             HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed();
             }
@@ -912,16 +907,16 @@ impl HelperRuntime {
         self.finish_after_authority_consumed_deadline(Instant::now() + CLEANUP_WAIT_TIMEOUT)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn finish_after_authority_consumed_deadline(
         &mut self,
         operation_deadline: Instant,
     ) -> io::Result<SupervisorExit> {
         match self.state {
             HelperTargetState::AuthorityConsumed { target_pid } => {
-                // These platforms can distinguish exited members from live descendants. Prove
-                // the group inactive while the unreaped leader still reserves its PID/PGID,
-                // then reap so an unrelated group cannot reuse the numeric identity mid-proof.
+                // Linux can distinguish exited members from live descendants. Prove the group
+                // inactive while the unreaped leader still reserves its PID/PGID, then reap so an
+                // unrelated group cannot reuse the numeric identity mid-proof.
                 wait_for_process_group_inactive(target_pid, operation_deadline)?;
                 let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
                 self.target.take();
@@ -941,13 +936,16 @@ impl HelperRuntime {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     fn finish_after_authority_consumed_deadline(
         &mut self,
         operation_deadline: Instant,
     ) -> io::Result<SupervisorExit> {
         let (target_pid, raw_wait_status) = match self.state {
             HelperTargetState::AuthorityConsumed { target_pid } => {
+                // Non-Linux group probes may not settle while the exited leader remains visible.
+                // Reap only after consuming signal authority; the remaining group check is
+                // read-only, so numeric PGID reuse can delay acknowledgement but cannot mis-signal.
                 let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
                 self.state = HelperTargetState::AwaitingGroupInactivity {
                     target_pgid: target_pid,
@@ -1003,130 +1001,21 @@ fn await_launcher_exec_outcome(
     }
 }
 
-struct PreparedExactChildExitObserver {
-    #[cfg(target_os = "macos")]
-    signal_read: RawFd,
-    #[cfg(target_os = "macos")]
-    _signal_write: RawFd,
-}
-
 struct ExactChildExitObserver {
     target_pid: libc::pid_t,
     exit_observed: Cell<bool>,
-    #[cfg(target_os = "macos")]
-    signal_read: RawFd,
-    #[cfg(target_os = "macos")]
-    _signal_write: RawFd,
-}
-
-#[cfg(target_os = "macos")]
-// Supported Darwin targets provide lock-free 32-bit atomics, so the signal handler never enters
-// a library fallback. The descriptor is process-global because the helper has exactly one child.
-static SIGCHLD_NOTIFICATION_FD: AtomicI32 = AtomicI32::new(-1);
-
-#[cfg(target_os = "macos")]
-extern "C" fn notify_sigchld(_signal: libc::c_int) {
-    let fd = SIGCHLD_NOTIFICATION_FD.load(Ordering::Relaxed);
-    if fd < 0 {
-        return;
-    }
-    let notification = 1_u8;
-    // SAFETY: __error and write are async-signal-safe on Darwin. The dedicated helper retains both
-    // pipe ends until `_exit`, so EPIPE and descriptor reuse are impossible. A full pipe already
-    // represents a pending notification; any other write failure violates the observer invariant.
-    unsafe {
-        let errno = libc::__error();
-        let saved_errno = *errno;
-        loop {
-            if libc::write(fd, std::ptr::from_ref(&notification).cast(), 1) == 1 {
-                break;
-            }
-            match *errno {
-                libc::EINTR => continue,
-                libc::EAGAIN => break,
-                _ => libc::_exit(INTERNAL_FAILURE_EXIT_CODE),
-            }
-        }
-        *errno = saved_errno;
-    }
-}
-
-impl PreparedExactChildExitObserver {
-    #[cfg(not(target_os = "macos"))]
-    fn prepare() -> io::Result<Self> {
-        Ok(Self {})
-    }
-
-    #[cfg(target_os = "macos")]
-    fn prepare() -> io::Result<Self> {
-        let mut pipe_fds = [-1; 2];
-        // SAFETY: pipe_fds provides writable storage for exactly two descriptors.
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful pipe descriptors are fresh and uniquely owned here.
-        let signal_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
-        // SAFETY: successful pipe descriptors are fresh and uniquely owned here.
-        let signal_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
-        set_fd_cloexec(signal_read.as_raw_fd())?;
-        set_fd_cloexec(signal_write.as_raw_fd())?;
-        set_fd_nonblocking(signal_read.as_raw_fd())?;
-        set_fd_nonblocking(signal_write.as_raw_fd())?;
-
-        if SIGCHLD_NOTIFICATION_FD
-            .compare_exchange(-1, signal_write.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "SIGCHLD exit observer is already installed",
-            ));
-        }
-        // Install before spawning the helper's sole child, eliminating the spawn-to-registration
-        // race. The child restores the default disposition before exec, while this dedicated
-        // helper keeps the handler until it has reaped the exact child.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = notify_sigchld as *const () as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
-        // SAFETY: action mask is writable. Blocking maskable signals prevents the single
-        // notification write from being interrupted by an unrelated handler.
-        if unsafe { libc::sigfillset(&mut action.sa_mask) } != 0 {
-            SIGCHLD_NOTIFICATION_FD.store(-1, Ordering::Relaxed);
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: action is fully initialized and the previous disposition is not needed by this
-        // dedicated cleanup-helper process.
-        if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
-            SIGCHLD_NOTIFICATION_FD.store(-1, Ordering::Relaxed);
-            return Err(io::Error::last_os_error());
-        }
-        // These raw descriptors intentionally live until the dedicated helper calls `_exit`.
-        // Closing them from a destructor could race a signal handler that already loaded the fd.
-        Ok(Self {
-            signal_read: signal_read.into_raw_fd(),
-            _signal_write: signal_write.into_raw_fd(),
-        })
-    }
-
-    fn arm(self, target_pid: libc::pid_t) -> ExactChildExitObserver {
-        debug_assert!(target_pid > 0);
-        ExactChildExitObserver {
-            target_pid,
-            exit_observed: Cell::new(false),
-            #[cfg(target_os = "macos")]
-            signal_read: self.signal_read,
-            #[cfg(target_os = "macos")]
-            _signal_write: self._signal_write,
-        }
-    }
 }
 
 impl ExactChildExitObserver {
+    fn new(target_pid: libc::pid_t) -> Self {
+        debug_assert!(target_pid > 0);
+        Self { target_pid, exit_observed: Cell::new(false) }
+    }
+
     fn target_pid(&self) -> libc::pid_t {
         self.target_pid
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn has_exited(&self) -> io::Result<bool> {
         if self.exit_observed.get() {
             return Ok(true);
@@ -1157,41 +1046,6 @@ impl ExactChildExitObserver {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINTR) {
                 continue;
-            }
-            return Err(error);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn has_exited(&self) -> io::Result<bool> {
-        if self.exit_observed.get() {
-            return Ok(true);
-        }
-        loop {
-            let mut notification = 0_u8;
-            // SAFETY: signal_read is a live nonblocking descriptor and notification is writable.
-            let result = unsafe {
-                libc::read(self.signal_read, std::ptr::from_mut(&mut notification).cast(), 1)
-            };
-            if result == 1 {
-                self.exit_observed.set(true);
-                return Ok(true);
-            }
-            if result == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "SIGCHLD exit observer closed unexpectedly",
-                ));
-            }
-            if result > 1 {
-                return Err(invalid_data("SIGCHLD exit observer returned an invalid byte count"));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(false);
             }
             return Err(error);
         }
@@ -2629,20 +2483,6 @@ fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
     }
     // SAFETY: flags come from F_GETFD and adding FD_CLOEXEC is valid.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl status flag operations have no pointer arguments.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: flags come from F_GETFL and adding O_NONBLOCK is valid.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
