@@ -1366,6 +1366,7 @@ fn registered_background_process(
     }
 }
 
+#[cfg(not(unix))]
 fn capture_background_process_provenance(
     pid: u32,
 ) -> Result<ProcessProvenance, SandboxProcessRunError> {
@@ -1543,6 +1544,7 @@ pub(crate) fn verify_persisted_process_provenance(
     )
 }
 
+#[cfg(not(any(unix, windows)))]
 fn verify_process_identity(
     pid: u32,
     expected: &ProcessProvenance,
@@ -1959,12 +1961,14 @@ fn set_background_process_stopped(
     });
 }
 
+#[cfg(test)]
 fn mark_current_background_process_stopped(pid: u32) {
     if let Ok(snapshot) = registered_background_process("palyra.process.run", pid) {
         mark_background_process_stopped(&snapshot.identity);
     }
 }
 
+#[cfg(test)]
 fn mark_current_background_process_stopped_after_unix_cleanup(pid: u32) {
     if let Ok(snapshot) = registered_background_process("palyra.process.run", pid) {
         mark_background_process_stopped_after_unix_cleanup(&snapshot.identity);
@@ -2044,6 +2048,7 @@ pub(crate) fn release_background_process_cleanup_authority(pid: u32, expected: &
     }
 }
 
+#[cfg(test)]
 fn background_process_cleanup_authority_retained(pid: u32) -> bool {
     registered_background_processes()
         .lock()
@@ -2052,6 +2057,7 @@ fn background_process_cleanup_authority_retained(pid: u32) -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(not(unix))]
 fn background_process_cleanup_authority_retained_exact(
     identity: &BackgroundProcessIdentity,
 ) -> bool {
@@ -8258,16 +8264,13 @@ fn spawn_background_process(
         mut child,
         control: unix_supervisor_control,
         supervisor_executable_sha256,
-    } = match spawn_unix_supervised_background_child(
+    } = spawn_unix_supervised_background_child(
         &command,
         policy,
         capabilities,
         lifetime,
         !process_runner_allows_host_access(policy),
-    ) {
-        Ok(supervisor) => supervisor,
-        Err(error) => return Err(error),
-    };
+    )?;
     #[cfg(not(any(unix, windows)))]
     let mut child = {
         configure_child_process_group(&mut command);
@@ -9289,19 +9292,6 @@ fn owned_background_process_tree_is_alive(pid: u32) -> io::Result<bool> {
     ))
 }
 
-fn wait_for_owned_background_tree_inactive(pid: u32, max_wait: Duration) -> io::Result<bool> {
-    let started_at = Instant::now();
-    loop {
-        if !owned_background_process_tree_is_alive(pid)? {
-            return Ok(true);
-        }
-        if started_at.elapsed() >= max_wait {
-            return Ok(false);
-        }
-        thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
-    }
-}
-
 fn terminate_owned_background_process_tree_for_identity(
     pid: u32,
     identity: Option<&BackgroundProcessIdentity>,
@@ -9395,6 +9385,7 @@ fn release_verified_background_process_tracking(pid: u32) {
     }
 }
 
+#[cfg(not(unix))]
 fn settle_background_registration_failure(
     child: ManagedChildGuard,
     identity: &BackgroundProcessIdentity,
@@ -9422,6 +9413,7 @@ fn terminate_background_child(mut child: ManagedChildGuard) -> Result<(), Sandbo
     terminate_background_child_with_identity(&mut child, None)
 }
 
+#[cfg(not(unix))]
 fn terminate_background_child_exact(
     mut child: ManagedChildGuard,
     identity: &BackgroundProcessIdentity,
@@ -10283,17 +10275,6 @@ pub(crate) fn terminate_background_process_tree_exact(
 }
 
 #[cfg(windows)]
-fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    let snapshot = background_process_provenance_snapshot(pid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("background process {pid} has no registered provenance"),
-        )
-    })?;
-    terminate_background_process_tree_exact(pid, &snapshot.provenance)
-}
-
-#[cfg(windows)]
 fn terminate_windows_process_tree(pid: u32) -> io::Result<()> {
     let pid_arg = pid.to_string();
     // taskkill is resolved from the Win32 system directory with a cleared environment so a
@@ -10374,26 +10355,6 @@ pub(crate) fn terminate_background_process_tree_exact(
     terminate_registered_unix_supervisor(pid, expected)
 }
 
-#[cfg(unix)]
-fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    let provenance = registered_background_processes()
-        .lock()
-        .map_err(|error| {
-            io::Error::other(format!(
-                "background process registry lock poisoned for pid {pid}: {error}"
-            ))
-        })?
-        .get(&pid)
-        .map(|process| process.provenance.clone())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("background process {pid} has no registered provenance"),
-            )
-        })?;
-    terminate_background_process_tree_exact(pid, &provenance)
-}
-
 /// Fallback for platforms without a supported termination mechanism: always fails so callers
 /// surface the gap instead of silently believing a process was stopped.
 ///
@@ -10410,17 +10371,6 @@ pub(crate) fn terminate_background_process_tree_exact(
         io::ErrorKind::Unsupported,
         "portable background process termination is unsupported on this platform",
     ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
-    let snapshot = background_process_provenance_snapshot(pid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("background process {pid} has no registered provenance"),
-        )
-    })?;
-    terminate_background_process_tree_exact(pid, &snapshot.provenance)
 }
 
 #[cfg(unix)]

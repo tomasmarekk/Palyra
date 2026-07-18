@@ -625,7 +625,7 @@ fn run_cleanup_helper() -> io::Result<()> {
     }
 
     runtime.control.set_nonblocking(true)?;
-    let mut decoder = HelperCommandDecoder::default();
+    let mut decoder = HelperCommandDecoder;
     loop {
         match runtime.observe_target_exit() {
             Ok(Some(outcome)) => {
@@ -1014,7 +1014,6 @@ fn decode_helper_cleanup_response(response: &[u8; 5]) -> io::Result<SupervisorEx
     }
 }
 
-#[derive(Default)]
 struct HelperCommandDecoder;
 
 enum HelperCommandRead {
