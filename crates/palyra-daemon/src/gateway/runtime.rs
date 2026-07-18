@@ -24,7 +24,7 @@
 //!   flow.
 
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use palyra_common::runtime_contracts::{
     RuntimeCausalLink, RuntimeCausalLinkKind, RuntimeIdentityKind, RuntimeIdentityRef,
@@ -49,7 +49,8 @@ use crate::application::tool_runtime::networked_worker::NetworkedWorkerRemoteDis
 use crate::application::{
     auth::map_auth_profile_error,
     code_intel_runtime::{
-        CodeIntelProviderObservation, CodeIntelRuntime, CodeIntelRuntimeObservationOutcome,
+        CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelProviderRuntimeAuthority,
+        CodeIntelProviderSnapshotAuthority, CodeIntelRuntime, CodeIntelRuntimeAuditEvent,
         CodeIntelRuntimeObservationRequest, CodeIntelRuntimeSnapshot,
         CodeIntelRuntimeSnapshotRequest,
     },
@@ -117,23 +118,24 @@ use crate::journal::{
     ProviderConfigurationAttemptRuntimeAuthority as JournalProviderConfigurationAttemptRuntimeAuthority,
     ProviderConfigurationAttemptStartRequest, RecallArtifactCreateRequest,
     RecallArtifactListFilter, RecallArtifactRecord, RetrievalBranchDiagnostics,
-    RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeHealthComponentActivation,
-    RuntimeHealthObservationRequest, RuntimeHealthProbeBeginRequest,
-    RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
-    RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
-    RuntimeHealthQuarantineClearOutcome, RuntimeHealthQuarantineClearRequest,
-    RuntimeStaleEventDiagnosticRequest, SessionProjectContextStateCopyRequest,
-    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
-    SessionSearchOutcome, SessionSearchRequest, SessionWriteLeaseRecord, SharedRuntimeDiagnostics,
-    SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
-    ToolEffectObservationCommitRequest, ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord,
-    ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest,
-    ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
-    ToolResultArtifactReadRequest, TurnControlAuditEventAppendRequest,
-    TurnControlAuditEventListFilter, TurnControlAuditEventRecord, WorkItemCreateRequest,
-    WorkItemEventRecord, WorkItemListFilter, WorkItemRecord, WorkItemUpdateRequest,
-    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
-    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    RunScopedRuntimeHealthObservationOutcome, RuntimeEventAppendOutcome, RuntimeEventAppendRequest,
+    RuntimeHealthComponentActivation, RuntimeHealthObservationRequest,
+    RuntimeHealthProbeBeginRequest, RuntimeHealthProbeReconciliationMode,
+    RuntimeHealthProbeReconciliationOutcome, RuntimeHealthProbeSettlementOutcome,
+    RuntimeHealthProbeSettlementRequest, RuntimeHealthQuarantineClearOutcome,
+    RuntimeHealthQuarantineClearRequest, RuntimeStaleEventDiagnosticRequest,
+    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
+    SessionProjectContextStateUpsertRequest, SessionSearchOutcome, SessionSearchRequest,
+    SessionWriteLeaseRecord, SharedRuntimeDiagnostics, SideEffectFenceCleanupOutcomeRequest,
+    SideEffectFenceOperatorResolutionRequest, ToolEffectObservationCommitRequest,
+    ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord, ToolJobRetryRequest,
+    ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest, ToolJobTransitionRequest,
+    ToolJobsListFilter, ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
+    TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter,
+    TurnControlAuditEventRecord, WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter,
+    WorkItemRecord, WorkItemUpdateRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
+    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -191,10 +193,11 @@ use palyra_common::runtime_contracts::{
     RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration, RuntimeGenerationLane,
     RuntimeHandleDescriptorV1, RuntimeHandleState, RuntimeIdentitySetV1, RuntimeInstanceId,
     RuntimeLeaseId, RuntimeOperationId, RuntimeOrdinaryAdmissionDecision,
-    RuntimeProbeAdmissionDecision, RuntimeSubsystem, RuntimeToolExecutionId, RuntimeToolProposalId,
-    SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision, StableErrorEnvelope,
-    StaleEventDisposition, ToolResultArtifactRef, HEALTH_PROBE_LEASE_SCHEMA_VERSION,
-    HEALTH_PROBE_RESULT_SCHEMA_VERSION, HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
+    RuntimeProbeAdmissionDecision, RuntimeRunId, RuntimeSessionId, RuntimeSubsystem,
+    RuntimeToolExecutionId, RuntimeToolProposalId, SideEffectFenceState, SideEffectFenceV1,
+    SideEffectRetryDecision, StableErrorEnvelope, StaleEventDisposition, ToolResultArtifactRef,
+    HEALTH_PROBE_LEASE_SCHEMA_VERSION, HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+    HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
 };
 use palyra_common::runtime_preview::{
     RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
@@ -244,12 +247,34 @@ pub(crate) struct NetworkedWorkerArtifactReceipt {
 pub(crate) struct NetworkedWorkerDispatchSettlementIdentity {
     pub(crate) remote_request_id: String,
     pub(crate) delivery_attempt_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) run_generation: RuntimeGeneration,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedNetworkedWorkerLifecycleEvidence {
     commit: crate::journal::NetworkedWorkerLifecycleCommit,
     payload: RuntimeDecisionPayload,
+}
+
+#[derive(Debug)]
+enum NetworkedWorkerResultCompletionOutcome {
+    Completed(WorkerLifecycleEvent),
+    StaleSuppressed,
+}
+
+#[derive(Debug)]
+enum PreparedNetworkedWorkerLifecycleCommitOutcome {
+    Committed { acknowledgement_error: Option<JournalError> },
+    StaleSuppressed,
+}
+
+/// Result of assigning a worker lease under exact run-generation authority.
+#[derive(Debug)]
+pub(crate) enum NetworkedWorkerLeaseAssignmentOutcome {
+    Assigned { lease: Box<WorkerLease> },
+    TransportRejected { reason: String },
+    StaleSuppressed,
 }
 
 fn process_reconciliation_evidence_sha256(
@@ -400,6 +425,15 @@ pub(crate) struct ManagedRuntimeHealthAuthority {
     pub(crate) family: ManagedRuntimeHealthFamily,
     pub(crate) component_id: RuntimeInstanceId,
     pub(crate) generation: RuntimeGeneration,
+}
+
+/// Read-model projection plus final provider authority classifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeIntelRuntimeProjectionOutcome {
+    pub(crate) snapshot: CodeIntelRuntimeSnapshot,
+    pub(crate) audit_events: Vec<CodeIntelRuntimeAuditEvent>,
+    pub(crate) provider_snapshot_authority:
+        BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
 }
 
 /// Redacted bounded inventory exposed to operator diagnostics.
@@ -1256,8 +1290,7 @@ fn provider_lease_deferred_status(
     let reason = provider_lease_pressure_reason(&preview);
     Status::resource_exhausted(format!(
         "model provider capacity is busy for {} on provider '{}' ({reason}); retry shortly or reduce concurrent agent runs",
-        lease_context.task_label,
-        lease_context.provider_id,
+        lease_context.task_label, lease_context.provider_id,
     ))
 }
 
@@ -1269,8 +1302,7 @@ fn provider_lease_timeout_status(
     let reason = provider_lease_pressure_reason(&preview);
     Status::resource_exhausted(format!(
         "model provider capacity is busy for {} on provider '{}' ({reason}); queued for {waited_ms} ms before timing out; retry shortly or reduce concurrent agent runs",
-        lease_context.task_label,
-        lease_context.provider_id,
+        lease_context.task_label, lease_context.provider_id,
     ))
 }
 
@@ -3418,19 +3450,31 @@ impl CapabilityDispatchAuthorizer for GatewayRuntimeState {
             })
     }
 
+    #[cfg(test)]
     fn authorize_networked_worker_result(
         &self,
         remote_request_id: &str,
         node_request_id: &str,
         delivery_attempt_id: &str,
+        run_generation: RuntimeGeneration,
         reporting_worker_id: &str,
         observed_at_unix_ms: i64,
     ) -> Result<crate::node_runtime::NetworkedWorkerResultAuthorizationOutcome, Status> {
+        if self.record_networked_worker_stale_result_if_needed(
+            remote_request_id,
+            node_request_id,
+            delivery_attempt_id,
+            reporting_worker_id,
+            run_generation,
+        ) {
+            return Ok(crate::node_runtime::NetworkedWorkerResultAuthorizationOutcome::Rejected);
+        }
         self.journal_store
             .authorize_networked_worker_result_attempt(
                 remote_request_id,
                 node_request_id,
                 delivery_attempt_id,
+                run_generation,
                 reporting_worker_id,
                 observed_at_unix_ms,
             )
@@ -3446,9 +3490,307 @@ impl CapabilityDispatchAuthorizer for GatewayRuntimeState {
                 map_orchestrator_store_error("authorize networked worker result", error)
             })
     }
+
+    fn commit_networked_worker_result(
+        &self,
+        request: &crate::node_runtime::NetworkedWorkerResultCommitRequest,
+    ) -> Result<crate::node_runtime::NetworkedWorkerResultCommitOutcome, Status> {
+        use crate::journal::NetworkedWorkerDispatchClaimState;
+        use crate::node_runtime::{
+            NetworkedWorkerResultCommitDisposition, NetworkedWorkerResultCommitOutcome,
+        };
+
+        let remote_request = &request.context.request;
+        if request.reporting_worker_id != remote_request.lease.worker_id
+            || request.result.worker_id != request.reporting_worker_id
+            || request.callback_run_generation != remote_request.lease.run_generation
+            || request.result.run_generation != request.callback_run_generation
+        {
+            return Ok(NetworkedWorkerResultCommitOutcome::Rejected);
+        }
+        let validated_result_sha256 = request
+            .result
+            .validated_receipt_sha256(remote_request, request.observed_at_unix_ms)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "networked worker result contract validation failed: {error}"
+                ))
+            })?;
+        let claim = self
+            .journal_store
+            .networked_worker_dispatch_claim(remote_request.request_id.as_str())
+            .map_err(|error| {
+                map_orchestrator_store_error("inspect networked worker callback claim", error)
+            })?;
+        let Some(claim) = claim else {
+            return Ok(NetworkedWorkerResultCommitOutcome::Rejected);
+        };
+        let exact_claim_binding = claim.node_request_id == request.node_request_id
+            && claim.worker_id == request.reporting_worker_id
+            && claim.lease_id == remote_request.lease.lease_id
+            && claim.session_id.as_deref() == Some(remote_request.lease.session_id.as_str())
+            && claim.run_id == remote_request.lease.run_id
+            && claim.run_generation == Some(request.callback_run_generation)
+            && claim.delivery_attempt_id.as_deref() == Some(request.delivery_attempt_id.as_str());
+        if !exact_claim_binding {
+            return Ok(NetworkedWorkerResultCommitOutcome::Rejected);
+        }
+
+        let committed_outcome = |disposition, canonical_observed_at_unix_ms| {
+            NetworkedWorkerResultCommitOutcome::Committed {
+                disposition,
+                canonical_observed_at_unix_ms,
+                validated_result_sha256: validated_result_sha256.clone(),
+            }
+        };
+        match claim.state {
+            NetworkedWorkerDispatchClaimState::Settled => {
+                if claim.validated_result_sha256.as_deref()
+                    != Some(validated_result_sha256.as_str())
+                {
+                    return Ok(NetworkedWorkerResultCommitOutcome::Rejected);
+                }
+                let observed_at_unix_ms = claim.result_observed_at_unix_ms.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "settled networked worker callback is missing observation evidence",
+                    )
+                })?;
+                Ok(committed_outcome(
+                    NetworkedWorkerResultCommitDisposition::ExactReplay,
+                    observed_at_unix_ms,
+                ))
+            }
+            NetworkedWorkerDispatchClaimState::Reconciling => {
+                let settlement_identity = NetworkedWorkerDispatchSettlementIdentity {
+                    remote_request_id: remote_request.request_id.clone(),
+                    delivery_attempt_id: Some(request.delivery_attempt_id.clone()),
+                    session_id: remote_request.lease.session_id.clone(),
+                    run_generation: request.callback_run_generation,
+                };
+                if let Err(error) = self.settle_reconciling_networked_worker_dispatch(
+                    &settlement_identity,
+                    request.reporting_worker_id.as_str(),
+                    &WorkerLeaseIdentity {
+                        lease_id: remote_request.lease.lease_id.clone(),
+                        run_id: remote_request.lease.run_id.clone(),
+                    },
+                    validated_result_sha256.as_str(),
+                    request.observed_at_unix_ms,
+                ) {
+                    let stale = self
+                        .runtime_generation_for_tool_blocking(remote_request.lease.run_id.as_str())?
+                        .is_none_or(|(session_id, generation)| {
+                            session_id != remote_request.lease.session_id
+                                || generation != request.callback_run_generation
+                        });
+                    return if stale {
+                        Ok(NetworkedWorkerResultCommitOutcome::StaleSuppressed)
+                    } else {
+                        Err(error)
+                    };
+                }
+                let settled = self
+                    .journal_store
+                    .networked_worker_dispatch_claim(remote_request.request_id.as_str())
+                    .map_err(|error| {
+                        map_orchestrator_store_error(
+                            "reload reconciled networked worker callback",
+                            error,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "reconciled networked worker callback disappeared",
+                        )
+                    })?;
+                let observed_at_unix_ms = settled.result_observed_at_unix_ms.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "reconciled networked worker callback is missing observation evidence",
+                    )
+                })?;
+                Ok(committed_outcome(
+                    NetworkedWorkerResultCommitDisposition::LateReconciliation,
+                    observed_at_unix_ms,
+                ))
+            }
+            NetworkedWorkerDispatchClaimState::InFlight => {
+                let receipt = NetworkedWorkerArtifactReceipt {
+                    request_id: remote_request.request_id.clone(),
+                    proposal_id: remote_request.proposal_id.clone(),
+                    tool_name: remote_request.tool_name.clone(),
+                    principal: request.context.host.principal.clone(),
+                    device_id: request.context.host.device_id.clone(),
+                    channel: request.context.host.channel.clone(),
+                    session_id: remote_request.lease.session_id.clone(),
+                    run_id: remote_request.lease.run_id.clone(),
+                    input_json_sha256: remote_request.input_json_sha256.clone(),
+                    output_json_sha256: request.result.output_json_sha256.clone(),
+                    output_manifest_sha256: request.result.output_manifest_sha256.clone(),
+                    validated_result_sha256: validated_result_sha256.clone(),
+                    grant_id: remote_request.lease.grant_id.clone(),
+                    required_capabilities: remote_request.lease.required_capabilities.clone(),
+                    workspace_scope: remote_request.lease.workspace_scope.clone(),
+                    log_stream_id: remote_request.lease.artifact_transport.log_stream_id.clone(),
+                    scratch_directory_id: remote_request
+                        .lease
+                        .artifact_transport
+                        .scratch_directory_id
+                        .clone(),
+                    observed_at_unix_ms: request.observed_at_unix_ms,
+                };
+                match self.complete_networked_worker_result_blocking(
+                    request.reporting_worker_id.as_str(),
+                    WorkerLeaseIdentity {
+                        lease_id: remote_request.lease.lease_id.clone(),
+                        run_id: remote_request.lease.run_id.clone(),
+                    },
+                    request.result.cleanup_report.clone(),
+                    receipt,
+                    Some(NetworkedWorkerDispatchSettlementIdentity {
+                        remote_request_id: remote_request.request_id.clone(),
+                        delivery_attempt_id: Some(request.delivery_attempt_id.clone()),
+                        session_id: remote_request.lease.session_id.clone(),
+                        run_generation: request.callback_run_generation,
+                    }),
+                )? {
+                    NetworkedWorkerResultCompletionOutcome::StaleSuppressed => {
+                        Ok(NetworkedWorkerResultCommitOutcome::StaleSuppressed)
+                    }
+                    NetworkedWorkerResultCompletionOutcome::Completed(_) => {
+                        let settled = self
+                            .journal_store
+                            .networked_worker_dispatch_claim(remote_request.request_id.as_str())
+                            .map_err(|error| {
+                                map_orchestrator_store_error(
+                                    "reload committed networked worker callback",
+                                    error,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "committed networked worker callback disappeared",
+                                )
+                            })?;
+                        let observed_at_unix_ms =
+                            settled.result_observed_at_unix_ms.ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "committed networked worker callback is missing observation evidence",
+                                )
+                            })?;
+                        Ok(committed_outcome(
+                            NetworkedWorkerResultCommitDisposition::ActiveCompletion,
+                            observed_at_unix_ms,
+                        ))
+                    }
+                }
+            }
+            NetworkedWorkerDispatchClaimState::Queued
+            | NetworkedWorkerDispatchClaimState::Cancelled
+            | NetworkedWorkerDispatchClaimState::FailedClosed => {
+                Ok(NetworkedWorkerResultCommitOutcome::Rejected)
+            }
+        }
+    }
 }
 
 impl GatewayRuntimeState {
+    fn record_networked_worker_stale_result_if_needed(
+        &self,
+        remote_request_id: &str,
+        node_request_id: &str,
+        delivery_attempt_id: &str,
+        reporting_worker_id: &str,
+        observed_generation: RuntimeGeneration,
+    ) -> bool {
+        let claim = match self.journal_store.networked_worker_dispatch_claim(remote_request_id) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(
+                    remote_request_id,
+                    error = %error,
+                    "failed to inspect networked worker generation authority"
+                );
+                return false;
+            }
+        };
+        if claim.node_request_id != node_request_id
+            || claim.worker_id != reporting_worker_id
+            || claim.delivery_attempt_id.as_deref() != Some(delivery_attempt_id)
+        {
+            return false;
+        }
+        let Some(session_id) = claim.session_id.as_deref() else {
+            return false;
+        };
+        let active = match self.runtime_generation_for_tool_blocking(claim.run_id.as_str()) {
+            Ok(active) => active,
+            Err(error) => {
+                warn!(
+                    remote_request_id,
+                    error = %error.message(),
+                    "failed to inspect active run generation for worker result"
+                );
+                return false;
+            }
+        };
+        let expected_generation = active
+            .as_ref()
+            .filter(|(active_session_id, _)| active_session_id == session_id)
+            .map(|(_, generation)| *generation)
+            .or(claim.run_generation);
+        let stale = claim.run_generation != Some(observed_generation)
+            || active.as_ref().is_none_or(|(active_session_id, active_generation)| {
+                active_session_id != session_id || *active_generation != observed_generation
+            });
+        if !stale {
+            return false;
+        }
+
+        self.managed_runtime_health_stale_suppressions.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.journal_store.record_runtime_stale_event_diagnostic(
+            &RuntimeStaleEventDiagnosticRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(claim.run_id),
+                lane: RuntimeGenerationLane::Run,
+                expected_generation,
+                observed_generation,
+                subsystem: RuntimeSubsystem::Worker,
+                disposition: StaleEventDisposition::PersistedDiagnostic,
+                reason_code: "runtime.worker.stale_result_suppressed".to_owned(),
+            },
+        ) {
+            warn!(
+                remote_request_id,
+                error = %error,
+                "failed to persist stale networked worker result diagnostic"
+            );
+        }
+        true
+    }
+
+    fn record_networked_worker_stale_settlement_if_needed(
+        &self,
+        settlement: &crate::journal::NetworkedWorkerDispatchSettlement,
+    ) {
+        let Ok(Some(claim)) = self
+            .journal_store
+            .networked_worker_dispatch_claim(settlement.remote_request_id.as_str())
+        else {
+            return;
+        };
+        let Some(delivery_attempt_id) = settlement.delivery_attempt_id.as_deref() else {
+            return;
+        };
+        self.record_networked_worker_stale_result_if_needed(
+            settlement.remote_request_id.as_str(),
+            claim.node_request_id.as_str(),
+            delivery_attempt_id,
+            settlement.worker_id.as_str(),
+            settlement.run_generation,
+        );
+    }
+
     // Cache entries expire when the earliest hit TTL lapses, so a cached
     // result can never include an item the journal already considers expired.
     fn cached_memory_search_expires_at(hits: &[MemorySearchHit]) -> Option<i64> {
@@ -3604,8 +3946,8 @@ impl GatewayRuntimeState {
                     managed_health_activation.generations.get(component_id).copied().ok_or_else(
                         || {
                             JournalError::InvalidArgument(format!(
-                            "managed runtime health activation omitted component {component_id}"
-                        ))
+                                "managed runtime health activation omitted component {component_id}"
+                            ))
                         },
                     )?;
                 let family = ManagedRuntimeHealthFamily::from_component_id(component_id)
@@ -6918,13 +7260,14 @@ impl GatewayRuntimeState {
     /// Records a success or failure against authority captured before an effect.
     ///
     /// A late observation is retained as metadata-only stale evidence and
-    /// cannot mutate a replacement generation.
+    /// cannot mutate a replacement generation. Returns `true` only when the
+    /// observation was durably applied to the captured generation.
     pub(crate) fn record_managed_runtime_health_observation(
         &self,
         authority: &ManagedRuntimeHealthAuthority,
         succeeded: bool,
         reason_code: &str,
-    ) {
+    ) -> bool {
         let active = self
             .managed_runtime_health_authorities
             .read()
@@ -6936,7 +7279,7 @@ impl GatewayRuntimeState {
                 authority,
                 active.as_ref().map(|active| active.generation),
             );
-            return;
+            return false;
         }
         match self.journal_store.record_runtime_health_observation(
             &RuntimeHealthObservationRequest {
@@ -6947,7 +7290,7 @@ impl GatewayRuntimeState {
                 observed_at_unix_ms: current_unix_ms(),
             },
         ) {
-            Ok(_) => {}
+            Ok(_) => true,
             Err(JournalError::InvalidArgument(message))
                 if message.contains("stale component generation") =>
             {
@@ -6958,6 +7301,7 @@ impl GatewayRuntimeState {
                     .flatten()
                     .map(|health| health.generation);
                 self.record_managed_runtime_stale_observation(authority, expected);
+                false
             }
             Err(error) => {
                 warn!(
@@ -6966,7 +7310,158 @@ impl GatewayRuntimeState {
                     error = %error,
                     "failed to persist managed runtime health observation"
                 );
+                false
             }
+        }
+    }
+
+    /// Records worker health only while both component and run authority remain exact.
+    ///
+    /// Returns `true` only when the observation was durably applied.
+    pub(crate) fn record_managed_runtime_health_observation_for_run(
+        &self,
+        authority: &ManagedRuntimeHealthAuthority,
+        session_id: &RuntimeSessionId,
+        run_id: &RuntimeRunId,
+        run_generation: RuntimeGeneration,
+        succeeded: bool,
+        reason_code: &str,
+    ) -> bool {
+        if authority.family != ManagedRuntimeHealthFamily::Worker {
+            warn!(
+                component_id = authority.component_id.as_str(),
+                reason_code, "run-scoped worker health observation received non-worker authority"
+            );
+            return false;
+        }
+        let active = self
+            .managed_runtime_health_authorities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(authority.component_id.as_str())
+            .cloned();
+        if active.as_ref().is_none_or(|active| active.generation != authority.generation) {
+            self.record_managed_runtime_stale_observation(
+                authority,
+                active.as_ref().map(|active| active.generation),
+            );
+            return false;
+        }
+        match self.journal_store.record_runtime_health_observation_for_run(
+            &RuntimeHealthObservationRequest {
+                component_id: authority.component_id.clone(),
+                expected_generation: authority.generation,
+                succeeded,
+                reason_code: reason_code.to_owned(),
+                observed_at_unix_ms: current_unix_ms(),
+            },
+            session_id,
+            run_id,
+            run_generation,
+        ) {
+            Ok(RunScopedRuntimeHealthObservationOutcome::Applied(_)) => true,
+            Ok(RunScopedRuntimeHealthObservationOutcome::Stale { expected_generation }) => {
+                self.managed_runtime_health_stale_suppressions.fetch_add(1, Ordering::Relaxed);
+                if let Err(error) = self.journal_store.record_runtime_stale_event_diagnostic(
+                    &RuntimeStaleEventDiagnosticRequest {
+                        session_id: session_id.as_str().to_owned(),
+                        run_id: Some(run_id.as_str().to_owned()),
+                        lane: RuntimeGenerationLane::Run,
+                        expected_generation,
+                        observed_generation: run_generation,
+                        subsystem: RuntimeSubsystem::Worker,
+                        disposition: StaleEventDisposition::PersistedDiagnostic,
+                        reason_code: "runtime.worker.stale_health_observation_suppressed"
+                            .to_owned(),
+                    },
+                ) {
+                    warn!(
+                        component_id = authority.component_id.as_str(),
+                        session_id = session_id.as_str(),
+                        run_id = run_id.as_str(),
+                        error = %error,
+                        "failed to persist stale networked worker health observation"
+                    );
+                }
+                false
+            }
+            Err(JournalError::InvalidArgument(message))
+                if message.contains("stale component generation") =>
+            {
+                let expected = self
+                    .journal_store
+                    .runtime_component_health(authority.component_id.as_str())
+                    .ok()
+                    .flatten()
+                    .map(|health| health.generation);
+                self.record_managed_runtime_stale_observation(authority, expected);
+                false
+            }
+            Err(error) => {
+                warn!(
+                    component_id = authority.component_id.as_str(),
+                    session_id = session_id.as_str(),
+                    run_id = run_id.as_str(),
+                    reason_code,
+                    error = %error,
+                    "failed to persist run-scoped managed runtime health observation"
+                );
+                false
+            }
+        }
+    }
+
+    fn classify_code_intel_runtime_authority(
+        &self,
+        authority: &CodeIntelProviderRuntimeAuthority,
+        language: CodeIntelLanguage,
+    ) -> CodeIntelProviderSnapshotAuthority {
+        let Ok(component_id) =
+            managed_runtime_health_component_id(ManagedRuntimeHealthFamily::Lsp, language.as_str())
+        else {
+            return CodeIntelProviderSnapshotAuthority::Stale;
+        };
+        let captured = ManagedRuntimeHealthAuthority {
+            family: ManagedRuntimeHealthFamily::Lsp,
+            component_id,
+            generation: authority.generation,
+        };
+        let active = self
+            .managed_runtime_health_authorities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(captured.component_id.as_str())
+            .cloned();
+        let durable =
+            match self.journal_store.runtime_component_health(captured.component_id.as_str()) {
+                Ok(durable) => durable,
+                Err(error) => {
+                    warn!(
+                        component_id = captured.component_id.as_str(),
+                        error = %error,
+                        "failed to verify code-intelligence runtime authority"
+                    );
+                    self.record_managed_runtime_stale_observation(
+                        &captured,
+                        active.as_ref().map(|active| active.generation),
+                    );
+                    return CodeIntelProviderSnapshotAuthority::Stale;
+                }
+            };
+        let expected_generation = durable
+            .as_ref()
+            .map(|health| health.generation)
+            .or_else(|| active.as_ref().map(|active| active.generation));
+        let is_current = authority.component_id == captured.component_id
+            && active.as_ref().is_some_and(|active| active.generation == authority.generation)
+            && durable.as_ref().is_some_and(|health| health.generation == authority.generation);
+        if !is_current {
+            self.record_managed_runtime_stale_observation(&captured, expected_generation);
+        }
+        if is_current {
+            CodeIntelProviderSnapshotAuthority::Authoritative
+        } else {
+            CodeIntelProviderSnapshotAuthority::Stale
         }
     }
 
@@ -6975,6 +7470,13 @@ impl GatewayRuntimeState {
         family: ManagedRuntimeHealthFamily,
         raw_ids: impl IntoIterator<Item = String>,
     ) -> Result<(), JournalError> {
+        // LSP generation replacement and read-model projection share this lock
+        // so neither can linearize between the other's authority check and write.
+        let _code_intel_projection_guard = if family == ManagedRuntimeHealthFamily::Lsp {
+            Some(self.code_intel_runtime.lock().unwrap_or_else(|error| error.into_inner()))
+        } else {
+            None
+        };
         let activations = raw_ids
             .into_iter()
             .map(|raw_id| managed_runtime_health_activation(family, raw_id.as_str()))
@@ -14815,22 +15317,105 @@ impl GatewayRuntimeState {
         workspace_root: Option<&str>,
         observations: &[CodeIntelProviderObservation],
         evidence_refs: &[String],
-    ) -> CodeIntelRuntimeObservationOutcome {
+    ) -> CodeIntelRuntimeProjectionOutcome {
+        self.observe_code_intel_runtime_with_dependencies(
+            workspace_root,
+            observations,
+            &[],
+            evidence_refs,
+        )
+    }
+
+    /// Applies current provider observations after revalidating all snapshot dependencies.
+    pub(crate) fn observe_code_intel_runtime_with_dependencies(
+        &self,
+        workspace_root: Option<&str>,
+        observations: &[CodeIntelProviderObservation],
+        dependent_observations: &[CodeIntelProviderObservation],
+        evidence_refs: &[String],
+    ) -> CodeIntelRuntimeProjectionOutcome {
+        let mut runtime = match self.code_intel_runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(poisoned) => {
+                warn!("code-intelligence runtime lock poisoned while applying observations");
+                poisoned.into_inner()
+            }
+        };
+        let mut exact_authority =
+            BTreeMap::<(String, u64), CodeIntelProviderSnapshotAuthority>::new();
+        let mut provider_snapshot_authority = BTreeMap::new();
+        let mut classify = |observation: &CodeIntelProviderObservation| {
+            let classification =
+                if observation.snapshot_authority == CodeIntelProviderSnapshotAuthority::Stale {
+                    CodeIntelProviderSnapshotAuthority::Stale
+                } else {
+                    observation.runtime_authority.as_ref().map_or(
+                        CodeIntelProviderSnapshotAuthority::Authoritative,
+                        |authority| {
+                            let key = (
+                                authority.component_id.as_str().to_owned(),
+                                authority.generation.get(),
+                            );
+                            *exact_authority.entry(key).or_insert_with(|| {
+                                self.classify_code_intel_runtime_authority(
+                                    authority,
+                                    observation.language,
+                                )
+                            })
+                        },
+                    )
+                };
+            provider_snapshot_authority
+                .entry(observation.language)
+                .and_modify(|current| {
+                    if classification == CodeIntelProviderSnapshotAuthority::Stale {
+                        *current = CodeIntelProviderSnapshotAuthority::Stale;
+                    }
+                })
+                .or_insert(classification);
+            classification
+        };
+        for observation in dependent_observations {
+            classify(observation);
+        }
+        let current_observations = observations
+            .iter()
+            .filter_map(|observation| match classify(observation) {
+                CodeIntelProviderSnapshotAuthority::Authoritative => Some(observation.clone()),
+                CodeIntelProviderSnapshotAuthority::Stale => None,
+            })
+            .collect::<Vec<_>>();
+        let has_managed_observations =
+            observations.iter().any(|observation| observation.runtime_authority.is_some());
+        let has_current_managed_observations =
+            current_observations.iter().any(|observation| observation.runtime_authority.is_some());
         let request = CodeIntelRuntimeObservationRequest {
             enabled: self.config.code_intel.enabled,
             workspace_root,
-            observations,
+            observations: current_observations.as_slice(),
             timeout_ms: self.config.code_intel.timeout_ms,
             idle_reap_ms: self.config.code_intel.idle_reap_ms,
             now_unix_ms: current_unix_ms(),
             evidence_refs,
         };
-        match self.code_intel_runtime.lock() {
-            Ok(mut runtime) => runtime.observe(request),
-            Err(poisoned) => {
-                warn!("code-intelligence runtime lock poisoned while applying observations");
-                poisoned.into_inner().observe(request)
+        let outcome = if has_managed_observations && !has_current_managed_observations {
+            crate::application::code_intel_runtime::CodeIntelRuntimeObservationOutcome {
+                snapshot: runtime.snapshot_without_reap(CodeIntelRuntimeSnapshotRequest {
+                    enabled: request.enabled,
+                    workspace_root: request.workspace_root,
+                    timeout_ms: request.timeout_ms,
+                    idle_reap_ms: request.idle_reap_ms,
+                    now_unix_ms: request.now_unix_ms,
+                }),
+                audit_events: Vec::new(),
             }
+        } else {
+            runtime.observe(request)
+        };
+        CodeIntelRuntimeProjectionOutcome {
+            snapshot: outcome.snapshot,
+            audit_events: outcome.audit_events,
+            provider_snapshot_authority,
         }
     }
 
@@ -15199,14 +15784,15 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn commit_prepared_networked_worker_lifecycle_with_authority_changes(
+    fn commit_prepared_networked_worker_lifecycle_with_run_authority(
         &self,
         manager: &mut WorkerFleetManager,
         candidate: &WorkerFleetManager,
         evidence: &[PreparedNetworkedWorkerLifecycleEvidence],
         revocations: &[crate::journal::NetworkedWorkerLeaseRevocation],
         settlement: Option<&crate::journal::NetworkedWorkerDispatchSettlement>,
-    ) -> Result<Option<JournalError>, Status> {
+        run_authority: Option<&crate::journal::NetworkedWorkerRunGenerationAuthority>,
+    ) -> Result<PreparedNetworkedWorkerLifecycleCommitOutcome, Status> {
         let commits = evidence.iter().map(|item| item.commit.clone()).collect::<Vec<_>>();
         let expected_generation = self.worker_fleet_generation.load(Ordering::Relaxed);
         let outcome = match self.journal_store.commit_networked_worker_lifecycle_with_revocations(
@@ -15217,11 +15803,22 @@ impl GatewayRuntimeState {
             current_unix_ms(),
             revocations,
             settlement,
+            run_authority,
         ) {
             Ok(outcome) => outcome,
             Err(error @ JournalError::NetworkedWorkerFleetGenerationConflict { .. }) => {
                 self.counters.journal_persist_failures.fetch_add(1, Ordering::Relaxed);
                 self.reload_networked_worker_fleet_after_conflict(manager)?;
+                return Err(map_orchestrator_store_error(
+                    "commit networked worker lifecycle",
+                    error,
+                ));
+            }
+            Err(error @ JournalError::NetworkedWorkerDispatchSettlementRejected { .. }) => {
+                if let Some(settlement) = settlement {
+                    self.record_networked_worker_stale_settlement_if_needed(settlement);
+                }
+                self.counters.journal_persist_failures.fetch_add(1, Ordering::Relaxed);
                 return Err(map_orchestrator_store_error(
                     "commit networked worker lifecycle",
                     error,
@@ -15235,8 +15832,16 @@ impl GatewayRuntimeState {
                 ));
             }
         };
-        self.worker_fleet_generation.store(outcome.fleet_generation, Ordering::Relaxed);
-        for journal_outcome in outcome.journal_outcomes {
+        let crate::journal::NetworkedWorkerLifecycleCommitOutcome::Committed {
+            fleet_generation,
+            journal_outcomes,
+            acknowledgement_error,
+        } = outcome
+        else {
+            return Ok(PreparedNetworkedWorkerLifecycleCommitOutcome::StaleSuppressed);
+        };
+        self.worker_fleet_generation.store(fleet_generation, Ordering::Relaxed);
+        for journal_outcome in journal_outcomes {
             self.counters.journal_events.fetch_add(1, Ordering::Relaxed);
             if journal_outcome.redacted {
                 self.counters.journal_redacted_events.fetch_add(1, Ordering::Relaxed);
@@ -15253,7 +15858,35 @@ impl GatewayRuntimeState {
         for item in evidence {
             self.observability.record_runtime_decision_event(&item.payload);
         }
-        Ok(outcome.acknowledgement_error)
+        Ok(PreparedNetworkedWorkerLifecycleCommitOutcome::Committed { acknowledgement_error })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn commit_prepared_networked_worker_lifecycle_with_authority_changes(
+        &self,
+        manager: &mut WorkerFleetManager,
+        candidate: &WorkerFleetManager,
+        evidence: &[PreparedNetworkedWorkerLifecycleEvidence],
+        revocations: &[crate::journal::NetworkedWorkerLeaseRevocation],
+        settlement: Option<&crate::journal::NetworkedWorkerDispatchSettlement>,
+    ) -> Result<Option<JournalError>, Status> {
+        match self.commit_prepared_networked_worker_lifecycle_with_run_authority(
+            manager,
+            candidate,
+            evidence,
+            revocations,
+            settlement,
+            None,
+        )? {
+            PreparedNetworkedWorkerLifecycleCommitOutcome::Committed { acknowledgement_error } => {
+                Ok(acknowledgement_error)
+            }
+            PreparedNetworkedWorkerLifecycleCommitOutcome::StaleSuppressed => {
+                Err(Status::internal(
+                    "unfenced networked worker lifecycle commit was unexpectedly suppressed",
+                ))
+            }
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -15425,6 +16058,115 @@ impl GatewayRuntimeState {
         Ok((lease, event))
     }
 
+    /// Assigns the next eligible worker only while the captured run generation remains current.
+    ///
+    /// A superseded generation commits one metadata-only diagnostic and leaves both the durable
+    /// and in-memory fleet unchanged.
+    ///
+    /// # Errors
+    /// Returns `invalid_argument` for mismatched run identity, `failed_precondition` when no worker
+    /// can take the lease, or a mapped journal error when persistence fails.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn assign_next_networked_worker_lease_for_run(
+        self: &Arc<Self>,
+        request: WorkerLeaseRequest,
+        session_id: &str,
+        run_id: &str,
+        generation: RuntimeGeneration,
+    ) -> Result<NetworkedWorkerLeaseAssignmentOutcome, Status> {
+        if session_id.trim().is_empty() || run_id.trim().is_empty() || request.run_id != run_id {
+            return Err(Status::invalid_argument(
+                "networked worker lease assignment run authority is invalid",
+            ));
+        }
+        let Some(dispatcher) = self.networked_worker_remote_dispatcher() else {
+            return Ok(NetworkedWorkerLeaseAssignmentOutcome::TransportRejected {
+                reason: "remote worker transport is not configured".to_owned(),
+            });
+        };
+        // Snapshot fleet ids before consulting Node state. Node callbacks acquire Node locks before
+        // the fleet lock, so preflight must not invert that order. The filtered assignment below
+        // revalidates the live fleet, and dispatch repeats transport readiness before any claim.
+        let worker_ids = match self.worker_fleet.read() {
+            Ok(manager) => manager.durable_records().into_keys().collect::<Vec<_>>(),
+            Err(poisoned) => {
+                warn!("worker fleet lock poisoned while preflighting run-owned lease");
+                poisoned.into_inner().durable_records().into_keys().collect::<Vec<_>>()
+            }
+        };
+        let mut compatible_worker_ids = BTreeSet::new();
+        let mut first_preflight_error = None;
+        for worker_id in worker_ids {
+            match dispatcher
+                .preflight_worker(worker_id.as_str(), request.required_capabilities.as_slice())
+            {
+                Ok(()) => {
+                    compatible_worker_ids.insert(worker_id);
+                }
+                Err(error) => {
+                    first_preflight_error.get_or_insert(error);
+                }
+            }
+        }
+        if compatible_worker_ids.is_empty() {
+            return Ok(NetworkedWorkerLeaseAssignmentOutcome::TransportRejected {
+                reason: first_preflight_error.map_or_else(
+                    || "networked worker fleet has no transport-compatible worker".to_owned(),
+                    |error| error.to_string(),
+                ),
+            });
+        }
+        let policy = self.worker_fleet_policy();
+        let now_unix_ms = current_unix_ms();
+        let mut manager = match self.worker_fleet.write() {
+            Ok(manager) => manager,
+            Err(poisoned) => {
+                warn!("worker fleet lock poisoned while assigning run-owned lease");
+                poisoned.into_inner()
+            }
+        };
+        let mut candidate = manager.clone();
+        let (lease, event) = candidate
+            .assign_next_work_from_candidates(&compatible_worker_ids, request, &policy, now_unix_ms)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "networked worker lease assignment failed: {error}"
+                ))
+            })?;
+        let transition_id = Ulid::new().to_string();
+        let evidence = [self.prepare_networked_worker_lifecycle_evidence(
+            transition_id.as_str(),
+            &event,
+            Value::Null,
+        )?];
+        let authority = crate::journal::NetworkedWorkerRunGenerationAuthority {
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            generation,
+        };
+        match self.commit_prepared_networked_worker_lifecycle_with_run_authority(
+            &mut manager,
+            &candidate,
+            &evidence,
+            &[],
+            None,
+            Some(&authority),
+        )? {
+            PreparedNetworkedWorkerLifecycleCommitOutcome::Committed { acknowledgement_error } => {
+                if let Some(error) = acknowledgement_error {
+                    return Err(map_orchestrator_store_error(
+                        "acknowledge run-owned networked worker lease assignment",
+                        error,
+                    ));
+                }
+                Ok(NetworkedWorkerLeaseAssignmentOutcome::Assigned { lease: Box::new(lease) })
+            }
+            PreparedNetworkedWorkerLifecycleCommitOutcome::StaleSuppressed => {
+                Ok(NetworkedWorkerLeaseAssignmentOutcome::StaleSuppressed)
+            }
+        }
+    }
+
     /// Finalizes a worker's lease and atomically revokes every exact dispatch claim it authorized.
     /// Incomplete cleanup is journaled as a non-recoverable orphan and surfaced as an error so
     /// scoped data leaks need operator action.
@@ -15503,25 +16245,37 @@ impl GatewayRuntimeState {
     #[allow(clippy::result_large_err)]
     pub(crate) fn settle_reconciling_networked_worker_dispatch(
         &self,
-        remote_request_id: &str,
-        delivery_attempt_id: Option<&str>,
+        dispatch_identity: &NetworkedWorkerDispatchSettlementIdentity,
         worker_id: &str,
         lease_identity: &WorkerLeaseIdentity,
         validated_result_sha256: &str,
         observed_at_unix_ms: i64,
     ) -> Result<(), Status> {
         let settlement = crate::journal::NetworkedWorkerDispatchSettlement {
-            remote_request_id: remote_request_id.to_owned(),
+            remote_request_id: dispatch_identity.remote_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease_identity.lease_id.clone(),
+            session_id: dispatch_identity.session_id.clone(),
             run_id: lease_identity.run_id.clone(),
-            delivery_attempt_id: delivery_attempt_id.map(ToOwned::to_owned),
+            run_generation: dispatch_identity.run_generation,
+            delivery_attempt_id: dispatch_identity.delivery_attempt_id.clone(),
             validated_result_sha256: validated_result_sha256.to_owned(),
             observed_at_unix_ms,
         };
-        self.journal_store.settle_networked_worker_dispatch_claim(&settlement).map_err(|error| {
-            map_orchestrator_store_error("settle reconciling networked worker dispatch", error)
-        })
+        match self.journal_store.settle_networked_worker_dispatch_claim(&settlement) {
+            Ok(()) => Ok(()),
+            Err(error @ JournalError::NetworkedWorkerDispatchSettlementRejected { .. }) => {
+                self.record_networked_worker_stale_settlement_if_needed(&settlement);
+                Err(map_orchestrator_store_error(
+                    "settle reconciling networked worker dispatch",
+                    error,
+                ))
+            }
+            Err(error) => Err(map_orchestrator_store_error(
+                "settle reconciling networked worker dispatch",
+                error,
+            )),
+        }
     }
 
     /// Finalizes a verified remote worker result and its artifact receipt in one transaction.
@@ -15544,6 +16298,31 @@ impl GatewayRuntimeState {
         receipt: NetworkedWorkerArtifactReceipt,
         dispatch_settlement: Option<NetworkedWorkerDispatchSettlementIdentity>,
     ) -> Result<WorkerLifecycleEvent, Status> {
+        match self.complete_networked_worker_result_blocking(
+            worker_id,
+            lease_identity,
+            cleanup_report,
+            receipt,
+            dispatch_settlement,
+        )? {
+            NetworkedWorkerResultCompletionOutcome::Completed(event) => Ok(event),
+            NetworkedWorkerResultCompletionOutcome::StaleSuppressed => {
+                Err(Status::failed_precondition(
+                    "networked worker result belongs to a superseded run generation",
+                ))
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn complete_networked_worker_result_blocking(
+        &self,
+        worker_id: &str,
+        lease_identity: WorkerLeaseIdentity,
+        cleanup_report: WorkerCleanupReport,
+        receipt: NetworkedWorkerArtifactReceipt,
+        dispatch_settlement: Option<NetworkedWorkerDispatchSettlementIdentity>,
+    ) -> Result<NetworkedWorkerResultCompletionOutcome, Status> {
         validate_networked_worker_artifact_receipt(worker_id, &lease_identity, &receipt)?;
         let mut expected_receipt_input = receipt.clone();
         let mut settled_dispatch_replay = false;
@@ -15563,7 +16342,9 @@ impl GatewayRuntimeState {
                 if claim.state == crate::journal::NetworkedWorkerDispatchClaimState::Settled {
                     let exact_binding = claim.worker_id == worker_id
                         && claim.lease_id == lease_identity.lease_id
+                        && claim.session_id.as_deref() == Some(identity.session_id.as_str())
                         && claim.run_id == lease_identity.run_id
+                        && claim.run_generation == Some(identity.run_generation)
                         && claim.delivery_attempt_id == identity.delivery_attempt_id
                         && claim.validated_result_sha256.as_deref()
                             == Some(receipt.validated_result_sha256.as_str());
@@ -15642,10 +16423,12 @@ impl GatewayRuntimeState {
                     && record.lease.is_none()
             });
             if exact_receipt && exact_completion && exact_completed_state {
-                return Ok(networked_worker_completed_event_from_receipt(
-                    worker_id,
-                    &lease_identity,
-                    &expected_receipt_input,
+                return Ok(NetworkedWorkerResultCompletionOutcome::Completed(
+                    networked_worker_completed_event_from_receipt(
+                        worker_id,
+                        &lease_identity,
+                        &expected_receipt_input,
+                    ),
                 ));
             }
             return Err(Status::failed_precondition(format!(
@@ -15699,23 +16482,41 @@ impl GatewayRuntimeState {
                 remote_request_id: identity.remote_request_id,
                 worker_id: worker_id.to_owned(),
                 lease_id: lease_identity.lease_id.clone(),
+                session_id: identity.session_id,
                 run_id: lease_identity.run_id.clone(),
+                run_generation: identity.run_generation,
                 delivery_attempt_id: identity.delivery_attempt_id,
                 validated_result_sha256: receipt.validated_result_sha256.clone(),
                 observed_at_unix_ms: receipt.observed_at_unix_ms,
             });
-        let acknowledgement_error = self
-            .commit_prepared_networked_worker_lifecycle_with_authority_changes(
+        let run_authority = settlement.as_ref().map(|settlement| {
+            crate::journal::NetworkedWorkerRunGenerationAuthority {
+                session_id: settlement.session_id.clone(),
+                run_id: settlement.run_id.clone(),
+                generation: settlement.run_generation,
+            }
+        });
+        let acknowledgement_error = match self
+            .commit_prepared_networked_worker_lifecycle_with_run_authority(
                 &mut manager,
                 &candidate,
                 evidence.as_slice(),
                 &[],
                 settlement.as_ref(),
-            )?;
+                run_authority.as_ref(),
+            )? {
+            PreparedNetworkedWorkerLifecycleCommitOutcome::Committed { acknowledgement_error } => {
+                acknowledgement_error
+            }
+            PreparedNetworkedWorkerLifecycleCommitOutcome::StaleSuppressed => {
+                self.managed_runtime_health_stale_suppressions.fetch_add(1, Ordering::Relaxed);
+                return Ok(NetworkedWorkerResultCompletionOutcome::StaleSuppressed);
+            }
+        };
         if let Some(error) = acknowledgement_error {
             return Err(map_orchestrator_store_error("acknowledge networked worker result", error));
         }
-        Ok(outcome.event)
+        Ok(NetworkedWorkerResultCompletionOutcome::Completed(outcome.event))
     }
 
     /// Expires workers past their lease TTL, journaling each event with
@@ -17737,10 +18538,14 @@ pub(crate) mod tests {
         validate_memory_item_content_limits, BrowserServiceRuntimeConfig, CanvasHostRuntimeConfig,
         GatewayJournalConfigSnapshot, GatewayProviderAttemptAdmission,
         GatewayProviderAttemptRuntimeAuthority, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-        HttpFetchRuntimeConfig, MemoryRuntimeConfig, ProviderAttemptFeedback,
-        RunInterruptLatencyCounters,
+        HttpFetchRuntimeConfig, ManagedRuntimeHealthFamily, MemoryRuntimeConfig,
+        ProviderAttemptFeedback, RunInterruptLatencyCounters,
     };
     use crate::agents::AgentRegistry;
+    use crate::application::code_intel_runtime::{
+        CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelProviderSnapshotAuthority,
+        LspClientLifecycleStatus,
+    };
     use crate::application::run_stream::flow_control::{
         RunInterruptLatencyObservation, RunInterruptPhase, RUN_INTERRUPT_LATENCY_MAX_MS,
     };
@@ -17795,6 +18600,215 @@ pub(crate) mod tests {
     };
     use tokio::sync::{mpsc, Notify};
     use tonic::Code;
+
+    #[test]
+    fn stale_lsp_generation_cannot_overwrite_reactivated_read_model() {
+        let state = test_runtime_state_with_code_intel_idle_reap(0);
+        let stale_authority = state
+            .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Lsp, "rust")
+            .expect("initial Rust LSP health authority should admit");
+
+        state
+            .replace_managed_runtime_health_family(
+                ManagedRuntimeHealthFamily::Lsp,
+                ["rust".to_owned()],
+            )
+            .expect("Rust LSP health authority should reactivate");
+        let current_authority = state
+            .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Lsp, "rust")
+            .expect("replacement Rust LSP health authority should admit");
+        assert!(current_authority.generation > stale_authority.generation);
+
+        let current_ready = CodeIntelProviderObservation::from_status_fields(
+            "rust-analyzer",
+            CodeIntelLanguage::Rust,
+            "ready",
+            "rust-analyzer",
+            "code_intel.provider_ready.rust",
+            "repair",
+        )
+        .with_runtime_authority(
+            current_authority.component_id.clone(),
+            current_authority.generation,
+        );
+        let current = state.observe_code_intel_runtime(
+            Some("workspace"),
+            std::slice::from_ref(&current_ready),
+            &[],
+        );
+        assert_eq!(current.snapshot.clients.len(), 1);
+        assert_eq!(
+            current.snapshot.clients[0].runtime_generation,
+            Some(current_authority.generation)
+        );
+
+        let suppressions_before = state
+            .managed_runtime_health_snapshot_sync()
+            .expect("managed runtime health snapshot should load")
+            .stale_suppressions_total;
+        let late_stale = CodeIntelProviderObservation::from_status_fields(
+            "rust-analyzer",
+            CodeIntelLanguage::Rust,
+            "failed",
+            "rust-analyzer",
+            "code_intel.provider_failed.rust",
+            "repair",
+        )
+        .with_runtime_authority(stale_authority.component_id.clone(), stale_authority.generation);
+        let suppressed = state.observe_code_intel_runtime(
+            Some("workspace"),
+            std::slice::from_ref(&late_stale),
+            &[],
+        );
+
+        assert_eq!(suppressed.snapshot, current.snapshot);
+        assert!(suppressed.audit_events.is_empty());
+        assert_eq!(
+            suppressed.provider_snapshot_authority.get(&CodeIntelLanguage::Rust),
+            Some(&CodeIntelProviderSnapshotAuthority::Stale),
+        );
+        assert_eq!(
+            state
+                .managed_runtime_health_snapshot_sync()
+                .expect("managed runtime health snapshot should reload")
+                .stale_suppressions_total,
+            suppressions_before + 1
+        );
+        let diagnostics = state
+            .journal_store
+            .shared_runtime_diagnostics()
+            .expect("shared runtime diagnostics should load");
+        assert_eq!(diagnostics.stale_events_by_subsystem.get("tool"), Some(&1));
+
+        let current_degraded = CodeIntelProviderObservation::from_status_fields(
+            "rust-analyzer",
+            CodeIntelLanguage::Rust,
+            "degraded",
+            "rust-analyzer",
+            "code_intel.provider_degraded.rust",
+            "repair",
+        )
+        .with_runtime_authority(
+            current_authority.component_id.clone(),
+            current_authority.generation,
+        );
+        let applied = state.observe_code_intel_runtime(
+            Some("workspace"),
+            std::slice::from_ref(&current_degraded),
+            &[],
+        );
+        assert_eq!(applied.snapshot.clients.len(), 1);
+        assert_eq!(applied.snapshot.clients[0].status, LspClientLifecycleStatus::Degraded);
+        assert_eq!(
+            applied.snapshot.clients[0].runtime_generation,
+            Some(current_authority.generation)
+        );
+        assert_eq!(applied.snapshot.clients[0].reason_code, "code_intel.provider_degraded.rust");
+    }
+
+    #[test]
+    fn stale_worker_run_health_observation_is_diagnostic_only() {
+        let state = test_runtime_state();
+        let worker_id = "worker-health-generation";
+        state
+            .activate_networked_worker_runtime_health(worker_id)
+            .expect("worker health should activate");
+        let authority = state
+            .admit_managed_runtime_health(ManagedRuntimeHealthFamily::Worker, worker_id)
+            .expect("worker health authority should admit");
+        let session_id = "session_worker_health_gateway";
+        let run_id = "run_worker_health_gateway";
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.to_owned(),
+                session_key: session_id.to_owned(),
+                session_label: None,
+                principal: "user:worker-health-test".to_owned(),
+                device_id: "device:worker-health-test".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("worker health test session should persist");
+        state
+            .journal_store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                origin_kind: "manual".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:worker-health-test".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .expect("worker health test run should persist");
+        let run_generation = state
+            .journal_store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("run generation should load")
+            .expect("run generation should be active")
+            .generation;
+        let session_identity =
+            RuntimeSessionId::parse(session_id).expect("session id should validate");
+        let run_identity = RuntimeRunId::parse(run_id).expect("run id should validate");
+        let health_before_stale = state
+            .journal_store
+            .runtime_component_health(authority.component_id.as_str())
+            .expect("worker health should load")
+            .expect("worker health should exist");
+        let suppressions_before = state
+            .managed_runtime_health_snapshot_sync()
+            .expect("managed runtime health snapshot should load")
+            .stale_suppressions_total;
+
+        state
+            .journal_store
+            .supersede_run_runtime_generation(
+                session_id,
+                run_id,
+                "runtime.generation.test_superseded",
+            )
+            .expect("run generation should supersede");
+        assert!(!state.record_managed_runtime_health_observation_for_run(
+            &authority,
+            &session_identity,
+            &run_identity,
+            run_generation,
+            false,
+            "runtime.health.worker_dispatch_released",
+        ));
+
+        assert_eq!(
+            state
+                .journal_store
+                .runtime_component_health(authority.component_id.as_str())
+                .expect("worker health should reload")
+                .expect("worker health should remain active"),
+            health_before_stale
+        );
+        assert_eq!(
+            state
+                .journal_store
+                .runtime_stale_event_diagnostic_count_for_scope(
+                    session_id,
+                    run_id,
+                    "runtime.worker.stale_health_observation_suppressed",
+                )
+                .expect("stale worker health diagnostic count should load"),
+            1
+        );
+        assert_eq!(
+            state
+                .managed_runtime_health_snapshot_sync()
+                .expect("managed runtime health snapshot should reload")
+                .stale_suppressions_total,
+            suppressions_before + 1
+        );
+        let diagnostics = state
+            .journal_store
+            .shared_runtime_diagnostics()
+            .expect("shared runtime diagnostics should load");
+        assert_eq!(diagnostics.stale_events_by_subsystem.get("worker"), Some(&1));
+    }
 
     #[test]
     fn run_interrupt_latency_snapshot_has_fixed_phases_and_bounded_aggregates() {
@@ -20294,6 +21308,38 @@ pub(crate) mod tests {
         let db_path =
             unique_runtime_test_root("palyra-runtime-feedback-journal").join("events.sqlite3");
         test_runtime_state_for_journal(db_path)
+    }
+
+    fn test_runtime_state_with_code_intel() -> Arc<GatewayRuntimeState> {
+        test_runtime_state_with_code_intel_idle_reap(
+            crate::config::CodeIntelConfig::default().idle_reap_ms,
+        )
+    }
+
+    fn test_runtime_state_with_code_intel_idle_reap(idle_reap_ms: u64) -> Arc<GatewayRuntimeState> {
+        let state_root = unique_runtime_test_root("palyra-runtime-code-intel-state");
+        let db_path = state_root.join("events.sqlite3");
+        let agent_registry = AgentRegistry::open_for_test_state_root(state_root.as_path())
+            .expect("test agent registry should initialize");
+        let journal_store = JournalStore::open(JournalConfig {
+            db_path: db_path.clone(),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("test journal store should initialize");
+        let mut config = test_runtime_config();
+        config.code_intel.enabled = true;
+        config.code_intel.idle_reap_ms = idle_reap_ms;
+
+        GatewayRuntimeState::new(
+            config,
+            GatewayJournalConfigSnapshot { db_path, hash_chain_enabled: false },
+            journal_store,
+            0,
+            agent_registry,
+        )
+        .expect("test runtime state should initialize")
     }
 
     pub(crate) fn test_runtime_state_for_journal(

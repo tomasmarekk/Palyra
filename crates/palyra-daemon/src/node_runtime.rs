@@ -19,7 +19,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
+use palyra_common::{
+    redaction::{redact_auth_error, redact_url_segments_in_text},
+    runtime_contracts::RuntimeGeneration,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
@@ -28,6 +31,7 @@ use tonic::Status;
 use ulid::Ulid;
 
 use palyra_identity::{PairingClientKind, PairingMethod, PairingResult, VerifiedPairing};
+use palyra_workerd::{WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope};
 
 use crate::journal::{
     NetworkedWorkerDeliveryReservationOutcome, NetworkedWorkerDeliveryReservationRequest,
@@ -42,9 +46,9 @@ const DEFAULT_PAIRING_CODE_TTL_MS: u64 = 10 * 60 * 1_000;
 const MIN_PAIRING_CODE_TTL_MS: u64 = 30 * 1_000;
 const MAX_PAIRING_CODE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 pub(crate) const NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY: &str =
-    "protocol:palyra.networked_worker.delivery_fence.v1";
+    "protocol:palyra.networked_worker.delivery_fence.v2";
 pub(crate) const NETWORKED_WORKER_DELIVERY_FENCE_PROTOCOL: &str =
-    "palyra.networked_worker.delivery_fence.v1";
+    "palyra.networked_worker.delivery_fence.v2";
 const NETWORKED_WORKER_DELIVERY_TOKEN_BYTES: usize = 32;
 
 /// How a pairing code is presented to the device being paired.
@@ -203,6 +207,7 @@ pub(crate) struct CapabilityDispatchRecord {
     pub(crate) input_json: Vec<u8>,
     pub(crate) max_payload_bytes: u64,
     pub(crate) networked_worker_reservation: Option<NetworkedWorkerDeliveryReservation>,
+    networked_worker_result_commit_context: Option<NetworkedWorkerResultCommitContext>,
     authority: CapabilityDispatchAuthority,
 }
 
@@ -217,6 +222,7 @@ pub(crate) struct NetworkedWorkerDeliveryReservation {
     pub(crate) lease_id: String,
     pub(crate) run_id: String,
     pub(crate) fleet_generation: u64,
+    pub(crate) run_generation: RuntimeGeneration,
     pub(crate) expires_at_unix_ms: i64,
 }
 
@@ -238,7 +244,9 @@ enum CapabilityDispatchAuthority {
         remote_request_id: String,
         request_sha256: String,
         lease_id: String,
+        session_id: String,
         run_id: String,
+        run_generation: RuntimeGeneration,
         lease_expires_at_unix_ms: i64,
     },
 }
@@ -255,9 +263,57 @@ enum CapabilityRequestAuthorityRecord {
 }
 
 /// Whether a node-returned result matches active durable networked-worker authority.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetworkedWorkerResultAuthorizationOutcome {
     Authorized,
+    Rejected,
+}
+
+/// Host-owned attribution retained beside a raw remote-worker request, never sent on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerHostReceiptContext {
+    pub(crate) principal: String,
+    pub(crate) device_id: String,
+    pub(crate) channel: Option<String>,
+}
+
+/// Volatile callback authority that binds a result to its original request and host attribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerResultCommitContext {
+    pub(crate) request: WorkerRemoteToolRequestEnvelope,
+    pub(crate) host: NetworkedWorkerHostReceiptContext,
+}
+
+/// Fully parsed callback supplied to the durable worker-result commit boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerResultCommitRequest {
+    pub(crate) context: NetworkedWorkerResultCommitContext,
+    pub(crate) result: WorkerRemoteToolResultEnvelope,
+    pub(crate) node_request_id: String,
+    pub(crate) delivery_attempt_id: String,
+    pub(crate) reporting_worker_id: String,
+    pub(crate) callback_run_generation: RuntimeGeneration,
+    pub(crate) observed_at_unix_ms: i64,
+}
+
+/// Durable disposition returned before Node state may project a worker callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkedWorkerResultCommitDisposition {
+    ActiveCompletion,
+    LateReconciliation,
+    ExactReplay,
+}
+
+/// Result of the generation-fenced durable worker callback boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkedWorkerResultCommitOutcome {
+    Committed {
+        disposition: NetworkedWorkerResultCommitDisposition,
+        canonical_observed_at_unix_ms: i64,
+        validated_result_sha256: String,
+    },
+    StaleSuppressed,
     Rejected,
 }
 
@@ -319,14 +375,25 @@ pub(crate) trait CapabilityDispatchAuthorizer: Send + Sync {
     ///
     /// # Errors
     /// Returns a gRPC status when durable claim authority cannot be checked.
+    #[cfg(test)]
     fn authorize_networked_worker_result(
         &self,
         remote_request_id: &str,
         node_request_id: &str,
         delivery_attempt_id: &str,
+        run_generation: RuntimeGeneration,
         reporting_worker_id: &str,
         observed_at_unix_ms: i64,
     ) -> Result<NetworkedWorkerResultAuthorizationOutcome, Status>;
+
+    /// Validates and durably settles an exact worker result before Node state is mutated.
+    ///
+    /// # Errors
+    /// Returns a gRPC status when callback evidence is malformed or durable state cannot commit.
+    fn commit_networked_worker_result(
+        &self,
+        request: &NetworkedWorkerResultCommitRequest,
+    ) -> Result<NetworkedWorkerResultCommitOutcome, Status>;
 }
 
 /// Result a node reports back for a dispatched capability request.
@@ -342,6 +409,8 @@ pub(crate) struct CapabilityExecutionResult {
 pub(crate) struct CapabilityExecutionNotification {
     pub(crate) result: CapabilityExecutionResult,
     pub(crate) delivery_attempt_id: Option<String>,
+    pub(crate) run_generation: Option<RuntimeGeneration>,
+    pub(crate) networked_worker_commit_disposition: Option<NetworkedWorkerResultCommitDisposition>,
     pub(crate) observed_at_unix_ms: i64,
 }
 
@@ -440,8 +509,12 @@ struct NetworkedWorkerInFlightMetadata {
     device_id: String,
     remote_request_id: String,
     delivery_attempt_id: String,
+    run_generation: RuntimeGeneration,
     request_sha256: String,
     payload_released: bool,
+    result_commit_context: Option<NetworkedWorkerResultCommitContext>,
+    committed_observed_at_unix_ms: Option<i64>,
+    committed_result_sha256: Option<String>,
 }
 
 #[derive(Default)]
@@ -912,6 +985,7 @@ impl NodeRuntimeState {
             input_json: input_json.clone(),
             max_payload_bytes,
             networked_worker_reservation: None,
+            networked_worker_result_commit_context: None,
             authority: CapabilityDispatchAuthority::Generic,
         };
         let slot = Arc::new(CapabilityExecutionSlot::default());
@@ -956,6 +1030,45 @@ impl NodeRuntimeState {
         input_json: Vec<u8>,
         max_payload_bytes: u64,
         claim: &NetworkedWorkerDispatchClaim,
+        result_commit_context: NetworkedWorkerResultCommitContext,
+    ) -> Result<CapabilityExecutionReceiver, Status> {
+        self.enqueue_claimed_capability_request_inner(
+            device_id,
+            capability,
+            input_json,
+            max_payload_bytes,
+            claim,
+            Some(result_commit_context),
+        )
+    }
+
+    #[cfg(test)]
+    fn enqueue_claimed_capability_request_for_test(
+        &self,
+        device_id: &str,
+        capability: &str,
+        input_json: Vec<u8>,
+        max_payload_bytes: u64,
+        claim: &NetworkedWorkerDispatchClaim,
+    ) -> Result<CapabilityExecutionReceiver, Status> {
+        self.enqueue_claimed_capability_request_inner(
+            device_id,
+            capability,
+            input_json,
+            max_payload_bytes,
+            claim,
+            None,
+        )
+    }
+
+    fn enqueue_claimed_capability_request_inner(
+        &self,
+        device_id: &str,
+        capability: &str,
+        input_json: Vec<u8>,
+        max_payload_bytes: u64,
+        claim: &NetworkedWorkerDispatchClaim,
+        result_commit_context: Option<NetworkedWorkerResultCommitContext>,
     ) -> Result<CapabilityExecutionReceiver, Status> {
         let now = current_unix_ms()?;
         if claim.node_request_id.is_empty()
@@ -969,6 +1082,16 @@ impl NodeRuntimeState {
                 "networked worker dispatch claim does not match queued payload",
             ));
         }
+        let session_id = claim.session_id.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "networked worker dispatch claim is missing session generation authority",
+            )
+        })?;
+        let run_generation = claim.run_generation.ok_or_else(|| {
+            Status::failed_precondition(
+                "networked worker dispatch claim is missing run generation authority",
+            )
+        })?;
         let request_id = claim.node_request_id.clone();
         let dispatch = CapabilityDispatchRecord {
             request_id: request_id.clone(),
@@ -976,11 +1099,14 @@ impl NodeRuntimeState {
             input_json: input_json.clone(),
             max_payload_bytes,
             networked_worker_reservation: None,
+            networked_worker_result_commit_context: result_commit_context,
             authority: CapabilityDispatchAuthority::NetworkedWorker {
                 remote_request_id: claim.remote_request_id.clone(),
                 request_sha256: claim.request_sha256.clone(),
                 lease_id: claim.lease_id.clone(),
+                session_id,
                 run_id: claim.run_id.clone(),
+                run_generation,
                 lease_expires_at_unix_ms: claim.lease_expires_at_unix_ms,
             },
         };
@@ -1061,7 +1187,9 @@ impl NodeRuntimeState {
                     remote_request_id,
                     request_sha256,
                     lease_id,
+                    session_id: _,
                     run_id,
+                    run_generation,
                     lease_expires_at_unix_ms,
                 } => {
                     let observed_sha256 = sha256_hex(dispatch.input_json.as_slice());
@@ -1110,6 +1238,7 @@ impl NodeRuntimeState {
                                     lease_id: lease_id.clone(),
                                     run_id: run_id.clone(),
                                     fleet_generation,
+                                    run_generation: *run_generation,
                                     expires_at_unix_ms: *lease_expires_at_unix_ms,
                                 });
                                 None
@@ -1267,8 +1396,14 @@ impl NodeRuntimeState {
                             ),
                         },
                         delivery_attempt_id: reservation.delivery_attempt_id.clone(),
+                        run_generation: reservation.run_generation,
                         request_sha256: reservation.request_sha256.clone(),
                         payload_released: false,
+                        result_commit_context: dispatch
+                            .networked_worker_result_commit_context
+                            .clone(),
+                        committed_observed_at_unix_ms: None,
+                        committed_result_sha256: None,
                     },
                 );
                 dispatch.input_json.clear();
@@ -1445,6 +1580,7 @@ impl NodeRuntimeState {
         reporting_device_id: &str,
         request_id: &str,
         delivery_attempt_id: Option<&str>,
+        run_generation: Option<RuntimeGeneration>,
         result: CapabilityExecutionResult,
         authorizer: &dyn CapabilityDispatchAuthorizer,
     ) -> Result<bool, Status> {
@@ -1455,54 +1591,6 @@ impl NodeRuntimeState {
             Status::failed_precondition("capability result request is not active")
         })?;
         authorize_capability_request_owner(request, reporting_device_id)?;
-        let authenticated_delivery_attempt_id =
-            if let CapabilityRequestAuthorityRecord::NetworkedWorker { remote_request_id } =
-                &request.authority
-            {
-                let delivery_attempt_id = delivery_attempt_id.ok_or_else(|| {
-                    Status::invalid_argument("networked worker result missing delivery_attempt_id")
-                })?;
-                let metadata = capabilities
-                    .networked_worker_inflight_by_request_id
-                    .get(request_id)
-                    .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "networked worker result delivery reservation is not active",
-                        )
-                    })?;
-                if metadata.remote_request_id != *remote_request_id
-                    || metadata.device_id != reporting_device_id
-                    || metadata.delivery_attempt_id != delivery_attempt_id
-                    || !metadata.payload_released
-                {
-                    return Err(Status::failed_precondition(
-                        "networked worker result does not match the released delivery attempt",
-                    ));
-                }
-                if !matches!(
-                    authorizer.authorize_networked_worker_result(
-                        remote_request_id,
-                        request_id,
-                        delivery_attempt_id,
-                        reporting_device_id,
-                        now,
-                    )?,
-                    NetworkedWorkerResultAuthorizationOutcome::Authorized
-                ) {
-                    return Err(Status::failed_precondition(
-                        "networked worker result claim is not active for this node",
-                    ));
-                }
-                Some(delivery_attempt_id.to_owned())
-            } else {
-                if delivery_attempt_id.is_some() {
-                    return Err(Status::invalid_argument(
-                        "generic capability result must not include delivery_attempt_id",
-                    ));
-                }
-                None
-            };
-
         if !matches!(
             request.state,
             CapabilityRequestState::Dispatched
@@ -1513,13 +1601,6 @@ impl NodeRuntimeState {
                 "capability result request is not awaiting a result",
             ));
         }
-        let result_state = if result.success {
-            CapabilityRequestState::Succeeded
-        } else {
-            CapabilityRequestState::Failed
-        };
-        let output_summary = summarize_payload_bytes(result.output_json.as_slice());
-        let error = normalize_summary_text(result.error.as_str());
         let Some(slot) = capabilities.result_slots_by_request_id.get(request_id).cloned() else {
             return Ok(false);
         };
@@ -1531,10 +1612,174 @@ impl NodeRuntimeState {
             ));
         }
 
+        let mut canonical_observed_at_unix_ms = now;
+        let mut networked_worker_commit_disposition = None;
+        let (authenticated_delivery_attempt_id, authenticated_run_generation) =
+            if let CapabilityRequestAuthorityRecord::NetworkedWorker { remote_request_id } =
+                &request.authority
+            {
+                let delivery_attempt_id = delivery_attempt_id.ok_or_else(|| {
+                    Status::invalid_argument("networked worker result missing delivery_attempt_id")
+                })?;
+                let run_generation = run_generation.ok_or_else(|| {
+                    Status::invalid_argument("networked worker result missing run_generation")
+                })?;
+                let metadata = capabilities
+                    .networked_worker_inflight_by_request_id
+                    .get(request_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "networked worker result delivery reservation is not active",
+                        )
+                    })?;
+                if metadata.remote_request_id != *remote_request_id
+                    || metadata.device_id != reporting_device_id
+                    || metadata.delivery_attempt_id != delivery_attempt_id
+                    || metadata.run_generation != run_generation
+                    || !metadata.payload_released
+                {
+                    return Err(Status::failed_precondition(
+                        "networked worker result does not match the released delivery attempt",
+                    ));
+                }
+                if let Some(result_commit_context) = metadata.result_commit_context {
+                    if !result.success {
+                        return Err(Status::failed_precondition(
+                            "networked worker callback did not carry a result envelope",
+                        ));
+                    }
+                    let worker_result = serde_json::from_slice::<WorkerRemoteToolResultEnvelope>(
+                        result.output_json.as_slice(),
+                    )
+                    .map_err(|error| {
+                        Status::invalid_argument(format!(
+                            "networked worker callback result envelope is malformed: {error}"
+                        ))
+                    })?;
+                    if worker_result.run_generation != run_generation {
+                        return Err(Status::failed_precondition(
+                            "networked worker callback generations do not match",
+                        ));
+                    }
+                    let validation_observed_at_unix_ms =
+                        metadata.committed_observed_at_unix_ms.unwrap_or(now);
+                    let validated_result_sha256 = worker_result
+                        .validated_receipt_sha256(
+                            &result_commit_context.request,
+                            validation_observed_at_unix_ms,
+                        )
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "networked worker callback failed contract validation: {error}"
+                            ))
+                        })?;
+                    if metadata
+                        .committed_result_sha256
+                        .as_deref()
+                        .is_some_and(|committed| committed != validated_result_sha256)
+                    {
+                        return Err(Status::failed_precondition(
+                            "networked worker callback conflicts with the committed result",
+                        ));
+                    }
+                    match authorizer.commit_networked_worker_result(
+                        &NetworkedWorkerResultCommitRequest {
+                            context: result_commit_context,
+                            result: worker_result,
+                            node_request_id: request_id.to_owned(),
+                            delivery_attempt_id: delivery_attempt_id.to_owned(),
+                            reporting_worker_id: reporting_device_id.to_owned(),
+                            callback_run_generation: run_generation,
+                            observed_at_unix_ms: validation_observed_at_unix_ms,
+                        },
+                    )? {
+                        NetworkedWorkerResultCommitOutcome::Committed {
+                            disposition,
+                            canonical_observed_at_unix_ms: committed_at,
+                            validated_result_sha256: committed_sha256,
+                        } => {
+                            if committed_sha256 != validated_result_sha256
+                                || metadata
+                                    .committed_observed_at_unix_ms
+                                    .is_some_and(|observed| observed != committed_at)
+                            {
+                                return Err(Status::failed_precondition(
+                                    "networked worker callback commit returned conflicting evidence",
+                                ));
+                            }
+                            let active_metadata = capabilities
+                                .networked_worker_inflight_by_request_id
+                                .get_mut(request_id)
+                                .ok_or_else(|| {
+                                    Status::failed_precondition(
+                                        "networked worker callback authority disappeared during commit",
+                                    )
+                                })?;
+                            active_metadata.committed_observed_at_unix_ms = Some(committed_at);
+                            active_metadata.committed_result_sha256 = Some(committed_sha256);
+                            canonical_observed_at_unix_ms = committed_at;
+                            networked_worker_commit_disposition = Some(disposition);
+                        }
+                        NetworkedWorkerResultCommitOutcome::StaleSuppressed => {
+                            return Err(Status::failed_precondition(
+                                "networked worker callback belongs to a superseded run generation",
+                            ));
+                        }
+                        NetworkedWorkerResultCommitOutcome::Rejected => {
+                            return Err(Status::failed_precondition(
+                                "networked worker result claim is not active for this node",
+                            ));
+                        }
+                    }
+                } else {
+                    #[cfg(test)]
+                    {
+                        if !matches!(
+                            authorizer.authorize_networked_worker_result(
+                                remote_request_id,
+                                request_id,
+                                delivery_attempt_id,
+                                run_generation,
+                                reporting_device_id,
+                                now,
+                            )?,
+                            NetworkedWorkerResultAuthorizationOutcome::Authorized
+                        ) {
+                            return Err(Status::failed_precondition(
+                                "networked worker result claim is not active for this node",
+                            ));
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        return Err(Status::internal(
+                            "networked worker callback is missing durable commit context",
+                        ));
+                    }
+                }
+                (Some(delivery_attempt_id.to_owned()), Some(run_generation))
+            } else {
+                if delivery_attempt_id.is_some() || run_generation.is_some() {
+                    return Err(Status::invalid_argument(
+                        "generic capability result must not include delivery_attempt_id or run_generation",
+                    ));
+                }
+                (None, None)
+            };
+
+        let result_state = if result.success {
+            CapabilityRequestState::Succeeded
+        } else {
+            CapabilityRequestState::Failed
+        };
+        let output_summary = summarize_payload_bytes(result.output_json.as_slice());
+        let error = normalize_summary_text(result.error.as_str());
+
         let request_before_completion = request.clone();
         request.state = result_state;
-        request.updated_at_unix_ms = now;
-        request.completed_at_unix_ms = Some(now);
+        request.updated_at_unix_ms = canonical_observed_at_unix_ms;
+        request.completed_at_unix_ms = Some(canonical_observed_at_unix_ms);
         request.output_summary = output_summary;
         request.error = error;
         if let Err(persist_error) = self.persist_locked(&persisted) {
@@ -1545,7 +1790,9 @@ impl NodeRuntimeState {
         *notification_slot = Some(CapabilityExecutionNotification {
             result,
             delivery_attempt_id: authenticated_delivery_attempt_id,
-            observed_at_unix_ms: now,
+            run_generation: authenticated_run_generation,
+            networked_worker_commit_disposition,
+            observed_at_unix_ms: canonical_observed_at_unix_ms,
         });
         drop(notification_slot);
         slot.ready.notify_one();
@@ -2014,7 +2261,8 @@ fn summarize_payload_bytes(payload_json: &[u8]) -> Option<String> {
 /// `request_id`.
 pub(crate) fn parse_capability_result_payload(
     payload_json: &[u8],
-) -> Result<(String, Option<String>, CapabilityExecutionResult), Status> {
+) -> Result<(String, Option<String>, Option<RuntimeGeneration>, CapabilityExecutionResult), Status>
+{
     let value: Value = serde_json::from_slice(payload_json).map_err(|error| {
         Status::invalid_argument(format!("invalid capability result payload: {error}"))
     })?;
@@ -2025,13 +2273,33 @@ pub(crate) fn parse_capability_result_payload(
         .map(str::trim)
         .filter(|candidate| !candidate.is_empty())
         .map(ToOwned::to_owned);
+    let run_generation = value
+        .get("run_generation")
+        .map(|generation| {
+            let generation = generation.as_u64().ok_or_else(|| {
+                Status::invalid_argument(
+                    "capability result run_generation must be an unsigned integer",
+                )
+            })?;
+            RuntimeGeneration::new(generation).map_err(|_| {
+                Status::invalid_argument(
+                    "capability result run_generation must be greater than zero",
+                )
+            })
+        })
+        .transpose()?;
     let success = value.get("success").and_then(Value::as_bool).unwrap_or(false);
     let error = value.get("error").and_then(Value::as_str).unwrap_or_default().to_owned();
     let output_json = value
         .get("output_json")
         .map(|inner| serde_json::to_vec(inner).unwrap_or_default())
         .unwrap_or_default();
-    Ok((request_id, delivery_attempt_id, CapabilityExecutionResult { success, output_json, error }))
+    Ok((
+        request_id,
+        delivery_attempt_id,
+        run_generation,
+        CapabilityExecutionResult { success, output_json, error },
+    ))
 }
 
 /// Extracts the `request_id` from a capability lifecycle event payload.
@@ -2078,6 +2346,7 @@ mod tests {
         NetworkedWorkerDispatchAbortBeforeReleaseOutcome, NetworkedWorkerDispatchCancelOutcome,
         NetworkedWorkerPayloadAcknowledgementOutcome, NetworkedWorkerPayloadReleaseOutcome,
     };
+    use palyra_common::runtime_contracts::RuntimeGeneration;
     use tonic::{Code, Status};
     use ulid::Ulid;
 
@@ -2155,10 +2424,18 @@ mod tests {
             _remote_request_id: &str,
             _node_request_id: &str,
             _delivery_attempt_id: &str,
+            _run_generation: RuntimeGeneration,
             _reporting_worker_id: &str,
             _observed_at_unix_ms: i64,
         ) -> Result<NetworkedWorkerResultAuthorizationOutcome, Status> {
             Ok(self.result_outcome)
+        }
+
+        fn commit_networked_worker_result(
+            &self,
+            _request: &super::NetworkedWorkerResultCommitRequest,
+        ) -> Result<super::NetworkedWorkerResultCommitOutcome, Status> {
+            Ok(super::NetworkedWorkerResultCommitOutcome::Rejected)
         }
     }
     use tempfile::tempdir;
@@ -2258,6 +2535,7 @@ mod tests {
             .complete_capability_request(
                 "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
                 request_id.as_str(),
+                None,
                 None,
                 super::CapabilityExecutionResult {
                     success: true,
@@ -2368,7 +2646,11 @@ mod tests {
             node_request_id: Ulid::new().to_string(),
             worker_id: worker_id.to_owned(),
             lease_id: Ulid::new().to_string(),
+            session_id: Some(Ulid::new().to_string()),
             run_id: Ulid::new().to_string(),
+            run_generation: Some(
+                RuntimeGeneration::new(1).expect("test generation should be valid"),
+            ),
             issued_fleet_generation: 7,
             dispatch_fleet_generation: None,
             revoked_fleet_generation: None,
@@ -2412,7 +2694,9 @@ mod tests {
         let input_json = br#"{"message":"linearize"}"#.to_vec();
         let claim = queued_worker_claim(WORKER_ID, CAPABILITY, input_json.as_slice());
         let mut receiver = runtime
-            .enqueue_claimed_capability_request(WORKER_ID, CAPABILITY, input_json, 4_096, &claim)
+            .enqueue_claimed_capability_request_for_test(
+                WORKER_ID, CAPABILITY, input_json, 4_096, &claim,
+            )
             .expect("claimed payload should queue");
         let authorizer = TestClaimAuthorizer {
             result_outcome: NetworkedWorkerResultAuthorizationOutcome::Authorized,
@@ -2441,6 +2725,7 @@ mod tests {
                 WORKER_ID,
                 dispatch.request_id.as_str(),
                 Some(reservation.delivery_attempt_id.as_str()),
+                Some(reservation.run_generation),
                 super::CapabilityExecutionResult {
                     success: true,
                     output_json: br#"{"status":"ok"}"#.to_vec(),
@@ -2499,7 +2784,9 @@ mod tests {
         let input_json = br#"{"message":"withhold on closed stream"}"#.to_vec();
         let claim = queued_worker_claim(WORKER_ID, CAPABILITY, input_json.as_slice());
         let mut receiver = runtime
-            .enqueue_claimed_capability_request(WORKER_ID, CAPABILITY, input_json, 4_096, &claim)
+            .enqueue_claimed_capability_request_for_test(
+                WORKER_ID, CAPABILITY, input_json, 4_096, &claim,
+            )
             .expect("claimed payload should queue");
         let authorizer = TestClaimAuthorizer::dispatching(
             NetworkedWorkerDispatchAbortBeforeReleaseOutcome::Aborted,
@@ -2563,7 +2850,7 @@ mod tests {
         let input_json = br#"{"message":"never release"}"#.to_vec();
         let claim = queued_worker_claim(WORKER_ID, "tool:palyra.echo", input_json.as_slice());
         let mut receiver = runtime
-            .enqueue_claimed_capability_request(
+            .enqueue_claimed_capability_request_for_test(
                 WORKER_ID,
                 claim.capability.as_str(),
                 input_json,
@@ -2623,7 +2910,7 @@ mod tests {
         let input_json = br#"{"message":"uncertain authority"}"#.to_vec();
         let claim = queued_worker_claim(WORKER_ID, "tool:palyra.echo", input_json.as_slice());
         let mut receiver = runtime
-            .enqueue_claimed_capability_request(
+            .enqueue_claimed_capability_request_for_test(
                 WORKER_ID,
                 claim.capability.as_str(),
                 input_json,
@@ -2703,6 +2990,7 @@ mod tests {
                 OTHER_DEVICE_ID,
                 request_id.as_str(),
                 None,
+                None,
                 super::CapabilityExecutionResult {
                     success: true,
                     output_json: br#"{"status":"forged"}"#.to_vec(),
@@ -2738,6 +3026,7 @@ mod tests {
             .complete_capability_request(
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
+                None,
                 None,
                 super::CapabilityExecutionResult {
                     success: true,
@@ -2792,6 +3081,7 @@ mod tests {
             .complete_capability_request(
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
+                None,
                 None,
                 super::CapabilityExecutionResult {
                     success: true,
@@ -2863,6 +3153,7 @@ mod tests {
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
                 None,
+                None,
                 super::CapabilityExecutionResult {
                     success: false,
                     output_json: Vec::new(),
@@ -2927,6 +3218,7 @@ mod tests {
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
                 None,
+                None,
                 result.clone(),
                 &TestClaimAuthorizer::REJECTING,
             )
@@ -2946,6 +3238,7 @@ mod tests {
             .complete_capability_request(
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
+                None,
                 None,
                 result,
                 &TestClaimAuthorizer::REJECTING,
@@ -2993,6 +3286,7 @@ mod tests {
             .complete_capability_request(
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
+                None,
                 None,
                 super::CapabilityExecutionResult {
                     success: true,
@@ -3055,6 +3349,7 @@ mod tests {
             .complete_capability_request(
                 OWNER_DEVICE_ID,
                 request_id.as_str(),
+                None,
                 None,
                 super::CapabilityExecutionResult {
                     success: true,

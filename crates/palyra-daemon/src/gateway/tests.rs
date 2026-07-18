@@ -239,9 +239,18 @@ struct ValidRemoteWorkerResultDispatcher;
 
 #[async_trait::async_trait]
 impl NetworkedWorkerRemoteDispatcher for ValidRemoteWorkerResultDispatcher {
+    fn preflight_worker(
+        &self,
+        _worker_id: &str,
+        _required_capabilities: &[String],
+    ) -> Result<(), NetworkedWorkerRemoteDispatchError> {
+        Ok(())
+    }
+
     async fn dispatch_remote_tool(
         &self,
         _runtime_state: &Arc<GatewayRuntimeState>,
+        _host_context: crate::node_runtime::NetworkedWorkerHostReceiptContext,
         request: WorkerRemoteToolRequestEnvelope,
         _cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError> {
@@ -261,6 +270,7 @@ impl NetworkedWorkerRemoteDispatcher for ValidRemoteWorkerResultDispatcher {
                     tool_kind: request.tool_kind,
                     worker_id: request.lease.worker_id.clone(),
                     lease_id: request.lease.lease_id.clone(),
+                    run_generation: request.lease.run_generation,
                     success: true,
                     output_json_sha256: super::sha256_hex(output_json.as_bytes()),
                     output_json,
@@ -285,9 +295,18 @@ impl NetworkedWorkerRemoteDispatcher for ValidRemoteWorkerResultDispatcher {
 
 #[async_trait::async_trait]
 impl NetworkedWorkerRemoteDispatcher for InvalidRemoteWorkerResultDispatcher {
+    fn preflight_worker(
+        &self,
+        _worker_id: &str,
+        _required_capabilities: &[String],
+    ) -> Result<(), NetworkedWorkerRemoteDispatchError> {
+        Ok(())
+    }
+
     async fn dispatch_remote_tool(
         &self,
         _runtime_state: &Arc<GatewayRuntimeState>,
+        _host_context: crate::node_runtime::NetworkedWorkerHostReceiptContext,
         request: WorkerRemoteToolRequestEnvelope,
         _cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError> {
@@ -305,6 +324,7 @@ impl NetworkedWorkerRemoteDispatcher for InvalidRemoteWorkerResultDispatcher {
             tool_kind: request.tool_kind,
             worker_id: request.lease.worker_id.clone(),
             lease_id: request.lease.lease_id.clone(),
+            run_generation: request.lease.run_generation,
             success: true,
             output_json_sha256: super::sha256_hex(output_json.as_bytes()),
             output_json,
@@ -2713,6 +2733,35 @@ async fn start_tool_program_test_run(
         })
         .await
         .expect("tool program test run should start");
+}
+
+async fn start_networked_worker_test_run(
+    state: &Arc<GatewayRuntimeState>,
+    session_id: &str,
+    run_id: &str,
+) -> RuntimeGeneration {
+    start_tool_program_test_run(state, session_id, run_id).await;
+    let (active_session_id, generation) = state
+        .runtime_generation_for_run(run_id.to_owned())
+        .await
+        .expect("worker test run generation should load")
+        .expect("worker test run should have an active generation");
+    assert_eq!(active_session_id, session_id);
+    generation
+}
+
+fn networked_worker_settlement_identity(
+    remote_request_id: &str,
+    delivery_attempt_id: Option<&str>,
+    session_id: &str,
+    run_generation: RuntimeGeneration,
+) -> NetworkedWorkerDispatchSettlementIdentity {
+    NetworkedWorkerDispatchSettlementIdentity {
+        remote_request_id: remote_request_id.to_owned(),
+        delivery_attempt_id: delivery_attempt_id.map(ToOwned::to_owned),
+        session_id: session_id.to_owned(),
+        run_generation,
+    }
 }
 
 async fn run_stream_flow_control(
@@ -6214,6 +6263,8 @@ fn recent_journal_snapshot_returns_events_for_admin_surface() {
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_lifecycle_events_are_journaled() {
     let state = build_test_runtime_state(false);
+    let session_id = "session-worker-01";
+    let run_generation = start_networked_worker_test_run(&state, session_id, "run-worker-01").await;
     let register = state
         .register_networked_worker(test_worker_attestation("worker-01"))
         .await
@@ -6234,7 +6285,9 @@ async fn networked_worker_lifecycle_events_are_journaled() {
             node_request_id: Ulid::new().to_string(),
             worker_id: "worker-01".to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: super::sha256_hex(b"worker-lifecycle-queued-dispatch"),
@@ -6249,7 +6302,9 @@ async fn networked_worker_lifecycle_events_are_journaled() {
             node_request_id: inflight_node_request_id.clone(),
             worker_id: "worker-01".to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: inflight_request_sha256.clone(),
@@ -6550,8 +6605,93 @@ async fn networked_worker_assignment_journal_failure_rolls_back_fleet_authority(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_superseded_generation_suppresses_lease_assignment_atomically() {
+    let state = build_test_runtime_state(false);
+    let session_id = "session-worker-stale-assignment";
+    let run_id = "run-worker-stale-assignment";
+    let captured_generation = start_networked_worker_test_run(&state, session_id, run_id).await;
+    state
+        .register_networked_worker(test_worker_attestation("worker-stale-assignment"))
+        .await
+        .expect("worker registration should succeed");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(ValidRemoteWorkerResultDispatcher));
+    let fleet_before = state.worker_fleet_snapshot();
+    let lifecycle_events_before = state.worker_fleet_recent_events();
+    let journal_events_before = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("journal snapshot should load before stale assignment")
+        .events;
+    let health_before = state
+        .managed_runtime_health_snapshot_sync()
+        .expect("worker health snapshot should load before stale assignment");
+
+    let replacement = state
+        .journal_store
+        .supersede_run_runtime_generation(
+            session_id,
+            run_id,
+            "runtime.generation.test_worker_assignment_superseded",
+        )
+        .expect("run generation should supersede");
+    assert!(replacement.generation > captured_generation);
+
+    let outcome = state
+        .assign_next_networked_worker_lease_for_run(
+            test_worker_lease_request(run_id),
+            session_id,
+            run_id,
+            captured_generation,
+        )
+        .await
+        .expect("stale assignment should be suppressed without becoming a storage error");
+    assert!(matches!(outcome, super::NetworkedWorkerLeaseAssignmentOutcome::StaleSuppressed));
+    assert_eq!(state.worker_fleet_snapshot(), fleet_before);
+    assert_eq!(state.worker_fleet_recent_events(), lifecycle_events_before);
+
+    let durable = state
+        .journal_store
+        .load_networked_worker_fleet_snapshot(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
+        .expect("durable worker fleet should load after stale assignment");
+    let worker = durable
+        .records
+        .get("worker-stale-assignment")
+        .expect("registered worker should remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Registered);
+    assert!(worker.lease.is_none());
+    assert_eq!(
+        state
+            .recent_journal_snapshot(100)
+            .await
+            .expect("journal snapshot should load after stale assignment")
+            .events,
+        journal_events_before
+    );
+    assert_eq!(
+        state
+            .journal_store
+            .runtime_stale_event_diagnostic_count_for_scope(
+                session_id,
+                run_id,
+                "runtime.worker.stale_lease_assignment_suppressed",
+            )
+            .expect("stale lease-assignment diagnostic count should load"),
+        1
+    );
+    let health_after = state
+        .managed_runtime_health_snapshot_sync()
+        .expect("worker health snapshot should load after stale assignment");
+    assert_eq!(health_after.components, health_before.components);
+    assert_eq!(health_after.components_by_family, health_before.components_by_family);
+    assert_eq!(health_after.components_by_state, health_before.components_by_state);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_completion_journal_failure_retains_exact_active_lease() {
     let state = build_test_runtime_state(false);
+    let session_id = "session-worker-completion-atomic";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-worker-completion-atomic").await;
     state
         .register_networked_worker(test_worker_attestation("worker-completion-atomic"))
         .await
@@ -6572,7 +6712,9 @@ async fn networked_worker_completion_journal_failure_retains_exact_active_lease(
             node_request_id: node_request_id.clone(),
             worker_id: "worker-completion-atomic".to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -7549,6 +7691,12 @@ async fn networked_worker_operator_actions_are_journaled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
     let state = build_test_runtime_state(false);
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-runtime",
+        "run-networked-worker-runtime",
+    )
+    .await;
     let mut attestation = test_worker_attestation("worker-runtime-01");
     attestation.supported_capabilities = vec!["tool:palyra.fs.read_file".to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -7572,30 +7720,45 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
     .await;
 
     assert!(!outcome.success, "networked worker must not fall back to local execution");
-    assert!(outcome.error.contains("remote dispatch failed"), "{}", outcome.error);
+    assert!(outcome.error.contains("remote preflight failed"), "{}", outcome.error);
     assert!(outcome.error.contains("remote worker transport is not configured"));
     assert_eq!(outcome.attestation.executor, "networked_worker");
     assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_unavailable");
     let worker_snapshot = state.worker_fleet_snapshot();
     assert_eq!(worker_snapshot.active_leases, 0);
-    assert_eq!(worker_snapshot.failed_closed_workers, 1);
+    assert_eq!(worker_snapshot.available_workers, 1);
+    assert_eq!(worker_snapshot.failed_closed_workers, 0);
 
     let snapshot = state
         .recent_journal_snapshot(100)
         .await
         .expect("recent journal snapshot should be returned");
     assert!(
-        snapshot.events.iter().any(|event| {
+        snapshot.events.iter().all(|event| {
             serde_json::from_str::<Value>(event.payload_json.as_str())
                 .ok()
                 .and_then(|payload| {
                     payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
                 })
-                .is_some_and(|reason| reason == "worker.cleanup_failed")
+                .is_none_or(|reason| reason != "worker.cleanup_failed")
         }),
-        "transport-missing path must journal unverified cleanup and fail the worker closed"
+        "transport preflight failure must not acquire a lease or emit cleanup evidence"
     );
 
+    state
+        .update_orchestrator_run_state(
+            "run-networked-worker-runtime".to_owned(),
+            RunLifecycleState::Failed,
+            Some("remote transport unavailable".to_owned()),
+        )
+        .await
+        .expect("failed worker run should terminalize before retry");
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-runtime",
+        "run-networked-worker-runtime-retry",
+    )
+    .await;
     let retry = super::execute_tool_with_runtime_dispatch(
         &state,
         super::ToolRuntimeExecutionContext {
@@ -7614,8 +7777,8 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
     )
     .await;
     assert!(!retry.success);
-    assert!(retry.error.contains("lease assignment failed"), "{}", retry.error);
-    assert_eq!(retry.attestation.sandbox_enforcement, "networked_worker_lease_denied");
+    assert!(retry.error.contains("remote preflight failed"), "{}", retry.error);
+    assert_eq!(retry.attestation.sandbox_enforcement, "networked_worker_remote_unavailable");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7623,6 +7786,12 @@ async fn networked_worker_cancellation_removes_queued_node_dispatch() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-cancel-queued";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-cancel-queued",
+        "run-networked-worker-cancel-queued",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -7690,6 +7859,9 @@ async fn networked_worker_cancellation_removes_queued_node_dispatch() {
 async fn networked_worker_expiry_cancels_queued_dispatch_claim_before_dequeue() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-dispatch-expiry-queued";
+    let session_id = "session-dispatch-expiry";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-dispatch-expiry").await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -7706,7 +7878,9 @@ async fn networked_worker_expiry_cancels_queued_dispatch_claim_before_dequeue() 
             node_request_id: node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: super::sha256_hex(b"dispatch-payload"),
@@ -7744,6 +7918,10 @@ async fn networked_worker_expiry_cancels_queued_dispatch_claim_before_dequeue() 
 async fn networked_worker_revocation_before_payload_release_cancels_reservation() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-dispatch-quarantine-unreleased";
+    let session_id = "session-dispatch-quarantine-unreleased";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-dispatch-quarantine-unreleased")
+            .await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -7764,7 +7942,9 @@ async fn networked_worker_revocation_before_payload_release_cancels_reservation(
             node_request_id: node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -7817,6 +7997,9 @@ async fn networked_worker_revocation_before_payload_release_cancels_reservation(
 async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-dispatch-quarantine-inflight";
+    let session_id = "session-dispatch-quarantine";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-dispatch-quarantine").await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -7837,7 +8020,9 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
             node_request_id: node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -7874,8 +8059,12 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
     let wrong_attempt = Ulid::new().to_string();
     let mismatch = state
         .settle_reconciling_networked_worker_dispatch(
-            remote_request_id.as_str(),
-            Some(wrong_attempt.as_str()),
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                Some(wrong_attempt.as_str()),
+                session_id,
+                run_generation,
+            ),
             worker_id,
             &lease.identity(),
             super::sha256_hex(b"wrong-attempt-result").as_str(),
@@ -7888,8 +8077,12 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
     let validated_result_sha256 = super::sha256_hex(b"verified-late-result");
     state
         .settle_reconciling_networked_worker_dispatch(
-            remote_request_id.as_str(),
-            durable_claim.delivery_attempt_id.as_deref(),
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                durable_claim.delivery_attempt_id.as_deref(),
+                session_id,
+                run_generation,
+            ),
             worker_id,
             &lease.identity(),
             validated_result_sha256.as_str(),
@@ -7912,6 +8105,10 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
 async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl_revocation() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-dispatch-late-result-at-expiry";
+    let session_id = "session-dispatch-late-result-at-expiry";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-dispatch-late-result-at-expiry")
+            .await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -7932,7 +8129,9 @@ async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl
             node_request_id: node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -7965,8 +8164,12 @@ async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl
 
     let at_expiry = state
         .settle_reconciling_networked_worker_dispatch(
-            remote_request_id.as_str(),
-            reconciling.delivery_attempt_id.as_deref(),
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                reconciling.delivery_attempt_id.as_deref(),
+                session_id,
+                run_generation,
+            ),
             worker_id,
             &lease.identity(),
             super::sha256_hex(b"result-at-expiry").as_str(),
@@ -7979,8 +8182,12 @@ async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl
     let validated_result_sha256 = super::sha256_hex(b"pre-expiry-result");
     state
         .settle_reconciling_networked_worker_dispatch(
-            remote_request_id.as_str(),
-            reconciling.delivery_attempt_id.as_deref(),
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                reconciling.delivery_attempt_id.as_deref(),
+                session_id,
+                run_generation,
+            ),
             worker_id,
             &lease.identity(),
             validated_result_sha256.as_str(),
@@ -8012,6 +8219,9 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
         default_test_tool_call_config(),
     );
     let worker_id = "worker-dispatch-restart";
+    let session_id = "session-dispatch-restart";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-dispatch-restart").await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -8029,7 +8239,9 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
             node_request_id: queued_node_request_id,
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: queued_request_sha256,
@@ -8044,7 +8256,9 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
             node_request_id: inflight_node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: inflight_request_sha256.clone(),
@@ -8096,7 +8310,9 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
             remote_request_id: inflight_remote_request_id,
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id,
+            session_id: session_id.to_owned(),
             run_id: lease.run_id,
+            run_generation,
             delivery_attempt_id: None,
             validated_result_sha256: super::sha256_hex(b"rejected-settlement"),
             observed_at_unix_ms: lease.expires_at_unix_ms.saturating_sub(1),
@@ -8109,6 +8325,9 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-result-authority";
     let wrong_worker_id = "worker-result-authority-other";
+    let session_id = "session-result-authority";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-result-authority").await;
     state
         .register_networked_worker(test_worker_attestation(worker_id))
         .await
@@ -8126,7 +8345,9 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
             node_request_id: node_request_id.clone(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -8209,8 +8430,12 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
         .expect("fenced dispatch should retain its delivery attempt");
     state
         .settle_reconciling_networked_worker_dispatch(
-            remote_request_id.as_str(),
-            Some(delivery_attempt_id.as_str()),
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                Some(delivery_attempt_id.as_str()),
+                session_id,
+                run_generation,
+            ),
             worker_id,
             &lease.identity(),
             super::sha256_hex(b"authorized-late-result").as_str(),
@@ -8230,6 +8455,124 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
     );
 }
 
+#[tokio::test]
+async fn networked_worker_stale_run_generation_cannot_settle_dispatch() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-stale-run-generation";
+    let session_id = "session-stale-run-generation";
+    let run_id = "run-stale-run-generation";
+    let run_generation = start_networked_worker_test_run(&state, session_id, run_id).await;
+    state
+        .register_networked_worker(test_worker_attestation(worker_id))
+        .await
+        .expect("worker registration should succeed");
+    let (lease, _) = state
+        .assign_networked_worker_lease(worker_id, test_worker_lease_request(run_id))
+        .await
+        .expect("worker lease assignment should succeed");
+    let remote_request_id = Ulid::new().to_string();
+    let node_request_id = Ulid::new().to_string();
+    let request_sha256 = super::sha256_hex(b"stale-run-generation-payload");
+    state
+        .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
+            remote_request_id: remote_request_id.clone(),
+            node_request_id: node_request_id.clone(),
+            worker_id: worker_id.to_owned(),
+            lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            run_generation,
+            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
+            capability: "tool:palyra.echo".to_owned(),
+            request_sha256: request_sha256.clone(),
+        })
+        .expect("dispatch claim should be created under generation one");
+    assert!(matches!(
+        state
+            .journal_store
+            .begin_networked_worker_dispatch(
+                remote_request_id.as_str(),
+                node_request_id.as_str(),
+                request_sha256.as_str(),
+                lease.expires_at_unix_ms.saturating_sub(2),
+            )
+            .expect("dispatch begin should succeed"),
+        crate::journal::NetworkedWorkerDispatchBeginOutcome::Authorized { .. }
+    ));
+    state
+        .quarantine_networked_worker(worker_id)
+        .await
+        .expect("worker quarantine should move the released claim to reconciliation");
+    let before = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should load")
+        .expect("dispatch claim should remain auditable");
+    assert_eq!(before.state, NetworkedWorkerDispatchClaimState::Reconciling);
+    let suppressions_before = state
+        .managed_runtime_health_snapshot_sync()
+        .expect("managed runtime health snapshot should load")
+        .stale_suppressions_total;
+
+    let replacement = state
+        .journal_store
+        .supersede_run_runtime_generation(
+            session_id,
+            run_id,
+            "runtime.generation.test_worker_superseded",
+        )
+        .expect("run generation should supersede");
+    assert!(replacement.generation > run_generation);
+
+    let stale_settlement = state
+        .settle_reconciling_networked_worker_dispatch(
+            &networked_worker_settlement_identity(
+                remote_request_id.as_str(),
+                before.delivery_attempt_id.as_deref(),
+                session_id,
+                run_generation,
+            ),
+            worker_id,
+            &lease.identity(),
+            super::sha256_hex(b"stale-worker-result").as_str(),
+            lease.expires_at_unix_ms.saturating_sub(1),
+        )
+        .expect_err("superseded run generation must not settle the dispatch");
+    assert_eq!(stale_settlement.code(), Code::FailedPrecondition);
+
+    let after = state
+        .journal_store
+        .networked_worker_dispatch_claim(remote_request_id.as_str())
+        .expect("dispatch claim should reload")
+        .expect("rejected stale claim should remain auditable");
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.validated_result_sha256, before.validated_result_sha256);
+    assert_eq!(after.completed_at_unix_ms, before.completed_at_unix_ms);
+    assert_eq!(
+        state
+            .journal_store
+            .runtime_stale_event_diagnostic_count_for_scope(
+                session_id,
+                run_id,
+                "runtime.worker.stale_result_suppressed",
+            )
+            .expect("worker stale-result diagnostic count should load"),
+        1
+    );
+    assert_eq!(
+        state
+            .managed_runtime_health_snapshot_sync()
+            .expect("managed runtime health snapshot should reload")
+            .stale_suppressions_total,
+        suppressions_before + 1
+    );
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("shared runtime diagnostics should load");
+    assert_eq!(diagnostics.stale_events_by_subsystem.get("worker"), Some(&1));
+}
+
 #[derive(Debug, Clone, Copy)]
 enum NodeWorkerFailureResponse {
     MalformedResult,
@@ -8245,6 +8588,7 @@ async fn dispatch_node_worker_failure_case(
     let state = build_test_runtime_state(false);
     let worker_id = format!("worker-runtime-{suffix}");
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(&state, "session-networked-worker-failure", suffix).await;
     let mut attestation = test_worker_attestation(worker_id.as_str());
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -8334,6 +8678,7 @@ async fn dispatch_node_worker_failure_case(
                                 tool_kind: request.tool_kind,
                                 worker_id: request.lease.worker_id.clone(),
                                 lease_id: request.lease.lease_id.clone(),
+                                run_generation: reservation.run_generation,
                                 success: true,
                                 output_json_sha256: super::sha256_hex(output_json.as_bytes()),
                                 output_json,
@@ -8365,10 +8710,11 @@ async fn dispatch_node_worker_failure_case(
                             worker_id_for_task.as_str(),
                             dispatch.request_id.as_str(),
                             Some(reservation.delivery_attempt_id.as_str()),
+                            Some(reservation.run_generation),
                             result,
                             worker_runtime_state.as_ref(),
                         )
-                        .expect("capability completion should succeed");
+                        .expect_err("invalid worker completion should be rejected");
                 }
                 return (dispatch.request_id, remote_request_id);
             }
@@ -8402,9 +8748,17 @@ async fn dispatch_node_worker_failure_case(
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_node_failures_reconcile_exact_dispatch_claim() {
     for (suffix, response, expected_error) in [
-        ("malformed-result", NodeWorkerFailureResponse::MalformedResult, "malformed result"),
-        ("transport-failure", NodeWorkerFailureResponse::TransportFailure, "transport failed"),
-        ("cleanup-gap", NodeWorkerFailureResponse::CleanupGap, "cleanup verification incomplete"),
+        (
+            "malformed-result",
+            NodeWorkerFailureResponse::MalformedResult,
+            "timed out after payload release",
+        ),
+        (
+            "transport-failure",
+            NodeWorkerFailureResponse::TransportFailure,
+            "timed out after payload release",
+        ),
+        ("cleanup-gap", NodeWorkerFailureResponse::CleanupGap, "timed out after payload release"),
         (
             "result-owner-lost",
             NodeWorkerFailureResponse::DropResultOwner,
@@ -8439,6 +8793,12 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-inflight-timeout";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-inflight-timeout",
+        "run-networked-worker-inflight-timeout",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -8491,7 +8851,12 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
                 let request: WorkerRemoteToolRequestEnvelope =
                     serde_json::from_slice(payload.input_json.as_slice())
                         .expect("remote request envelope should deserialize");
-                return (dispatch.request_id, reservation.delivery_attempt_id.clone(), request);
+                return (
+                    dispatch.request_id,
+                    reservation.delivery_attempt_id.clone(),
+                    reservation.run_generation,
+                    request,
+                );
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -8519,7 +8884,7 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
     )
     .await
     .expect("in-flight timeout must not wait indefinitely");
-    let (node_request_id, delivery_attempt_id, remote_request) =
+    let (node_request_id, delivery_attempt_id, run_generation, remote_request) =
         remote_worker.await.expect("remote worker task should complete");
     let remote_request_id = remote_request.request_id.clone();
 
@@ -8558,6 +8923,7 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
         tool_kind: remote_request.tool_kind,
         worker_id: remote_request.lease.worker_id.clone(),
         lease_id: remote_request.lease.lease_id.clone(),
+        run_generation,
         success: true,
         output_json_sha256: super::sha256_hex(output_json.as_bytes()),
         output_json,
@@ -8577,6 +8943,7 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
             worker_id,
             node_request_id.as_str(),
             Some(delivery_attempt_id.as_str()),
+            Some(run_generation),
             CapabilityExecutionResult {
                 success: true,
                 output_json: serde_json::to_vec(&result)
@@ -8612,10 +8979,88 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_v1_node_is_rejected_before_lease_assignment() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-v1-only";
+    let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-v1-only",
+        "run-networked-worker-v1-only",
+    )
+    .await;
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_root = unique_temp_test_root("palyra-networked-worker-v1-only");
+    let node_runtime = Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id,
+            "test-worker",
+            vec![
+                DeviceCapabilityView { name: required_capability.to_owned(), available: true },
+                DeviceCapabilityView {
+                    name: "protocol:palyra.networked_worker.delivery_fence.v1".to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .expect("legacy worker node should register");
+    state.configure_networked_worker_remote_dispatcher(Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::new(Arc::clone(&node_runtime)),
+    ));
+    let fleet_before = state.worker_fleet_snapshot();
+    let lifecycle_before = state.worker_fleet_recent_events();
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-v1-only",
+            run_id: "run-networked-worker-v1-only",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-v1-only",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success);
+    assert!(
+        outcome.error.contains(crate::node_runtime::NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY),
+        "{}",
+        outcome.error
+    );
+    assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_unavailable");
+    assert_eq!(state.worker_fleet_snapshot(), fleet_before);
+    assert_eq!(state.worker_fleet_recent_events(), lifecycle_before);
+    assert!(node_runtime
+        .capability_requests(Some(worker_id))
+        .expect("node request audit should load")
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-01";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-runtime",
+        "run-networked-worker-runtime",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -8783,6 +9228,7 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
                     tool_kind: request.tool_kind,
                     worker_id: request.lease.worker_id.clone(),
                     lease_id: request.lease.lease_id.clone(),
+                    run_generation: reservation.run_generation,
                     success: true,
                     output_json: output_json.clone(),
                     output_json_sha256: super::sha256_hex(output_json.as_bytes()),
@@ -8798,20 +9244,101 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
                     completed_at_unix_ms: super::current_unix_ms(),
                 };
                 let remote_request_id = request.request_id.clone();
+                let mut mismatched_result = result.clone();
+                mismatched_result.run_generation =
+                    RuntimeGeneration::new(reservation.run_generation.get().saturating_add(1))
+                        .expect("newer test generation should be valid");
+                let mismatch = worker_node_runtime
+                    .complete_capability_request(
+                        worker_id_for_task.as_str(),
+                        dispatch.request_id.as_str(),
+                        Some(reservation.delivery_attempt_id.as_str()),
+                        Some(reservation.run_generation),
+                        CapabilityExecutionResult {
+                            success: true,
+                            output_json: serde_json::to_vec(&mismatched_result)
+                                .expect("mismatched result envelope should serialize"),
+                            error: String::new(),
+                        },
+                        worker_runtime_state.as_ref(),
+                    )
+                    .expect_err("nested stale generation must fail before Node mutation");
+                assert_eq!(mismatch.code(), Code::FailedPrecondition);
+                let uncommitted_claim = worker_runtime_state
+                    .journal_store
+                    .networked_worker_dispatch_claim(remote_request_id.as_str())
+                    .expect("uncommitted callback claim should load")
+                    .expect("uncommitted callback claim should remain auditable");
+                assert_eq!(uncommitted_claim.state, NetworkedWorkerDispatchClaimState::InFlight);
+                assert!(uncommitted_claim.validated_result_sha256.is_none());
+                assert_eq!(worker_runtime_state.worker_fleet_snapshot().active_leases, 1);
+                let uncommitted_node_request = worker_node_runtime
+                    .capability_requests(Some(worker_id_for_task.as_str()))
+                    .expect("Node request audit should load after rejected callback")
+                    .into_iter()
+                    .find(|request| request.request_id == dispatch.request_id)
+                    .expect("Node request should remain auditable after rejected callback");
+                assert!(matches!(
+                    uncommitted_node_request.state,
+                    CapabilityRequestState::Dispatched
+                ));
+
+                let capability_result = CapabilityExecutionResult {
+                    success: true,
+                    output_json: serde_json::to_vec(&result)
+                        .expect("remote result envelope should serialize"),
+                    error: String::new(),
+                };
+                worker_node_runtime.fail_next_result_persist_for_test();
+                let persist_error = worker_node_runtime
+                    .complete_capability_request(
+                        worker_id_for_task.as_str(),
+                        dispatch.request_id.as_str(),
+                        Some(reservation.delivery_attempt_id.as_str()),
+                        Some(reservation.run_generation),
+                        capability_result.clone(),
+                        worker_runtime_state.as_ref(),
+                    )
+                    .expect_err("injected Node projection failure should preserve callback owner");
+                assert_eq!(persist_error.code(), Code::Internal);
+                let committed_claim = worker_runtime_state
+                    .journal_store
+                    .networked_worker_dispatch_claim(remote_request_id.as_str())
+                    .expect("durably committed callback claim should load")
+                    .expect("durably committed callback claim should remain auditable");
+                assert_eq!(committed_claim.state, NetworkedWorkerDispatchClaimState::Settled);
+                assert!(committed_claim.validated_result_sha256.is_some());
+                assert_eq!(worker_runtime_state.worker_fleet_snapshot().active_leases, 0);
+                let journal_events_after_commit = worker_runtime_state
+                    .journal_store
+                    .total_events()
+                    .expect("journal event count should load after callback commit");
+                let node_request = worker_node_runtime
+                    .capability_requests(Some(worker_id_for_task.as_str()))
+                    .expect("Node request audit should reload")
+                    .into_iter()
+                    .find(|request| request.request_id == dispatch.request_id)
+                    .expect("Node request should remain auditable after persist failure");
+                assert!(matches!(node_request.state, CapabilityRequestState::Dispatched));
+
                 worker_node_runtime
                     .complete_capability_request(
                         worker_id_for_task.as_str(),
                         dispatch.request_id.as_str(),
                         Some(reservation.delivery_attempt_id.as_str()),
-                        CapabilityExecutionResult {
-                            success: true,
-                            output_json: serde_json::to_vec(&result)
-                                .expect("remote result envelope should serialize"),
-                            error: String::new(),
-                        },
+                        Some(reservation.run_generation),
+                        capability_result,
                         worker_runtime_state.as_ref(),
                     )
-                    .expect("capability completion should succeed");
+                    .expect("exact callback retry should project the durable result");
+                assert_eq!(
+                    worker_runtime_state
+                        .journal_store
+                        .total_events()
+                        .expect("journal event count should reload after exact retry"),
+                    journal_events_after_commit,
+                    "exact callback retry must append no duplicate lifecycle or artifact evidence"
+                );
                 return (dispatch.request_id, remote_request_id);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -8889,6 +9416,12 @@ async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement(
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-foreground-drop";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-foreground-drop",
+        "run-networked-worker-foreground-drop",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -8977,6 +9510,10 @@ async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement(
         "path": "src/lib.rs"
     }))
     .expect("remote output should serialize");
+    let reservation = dispatch
+        .networked_worker_reservation
+        .as_ref()
+        .expect("worker dispatch should retain delivery identity");
     let result = WorkerRemoteToolResultEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -8986,6 +9523,7 @@ async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement(
         tool_kind: request.tool_kind,
         worker_id: request.lease.worker_id.clone(),
         lease_id: request.lease.lease_id.clone(),
+        run_generation: reservation.run_generation,
         success: true,
         output_json_sha256: super::sha256_hex(output_json.as_bytes()),
         output_json,
@@ -9001,15 +9539,12 @@ async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement(
         completed_at_unix_ms: super::current_unix_ms()
             .min(request.lease.expires_at_unix_ms.saturating_sub(1)),
     };
-    let reservation = dispatch
-        .networked_worker_reservation
-        .as_ref()
-        .expect("worker dispatch should retain delivery identity");
     node_runtime
         .complete_capability_request(
             worker_id,
             dispatch.request_id.as_str(),
             Some(reservation.delivery_attempt_id.as_str()),
+            Some(reservation.run_generation),
             CapabilityExecutionResult {
                 success: true,
                 output_json: serde_json::to_vec(&result)
@@ -9082,6 +9617,8 @@ fn create_released_networked_worker_dispatch_claim(
     state: &GatewayRuntimeState,
     worker_id: &str,
     lease: &WorkerLease,
+    session_id: &str,
+    run_generation: RuntimeGeneration,
     remote_request_id: &str,
     node_request_id: &str,
 ) -> String {
@@ -9092,7 +9629,9 @@ fn create_released_networked_worker_dispatch_claim(
             node_request_id: node_request_id.to_owned(),
             worker_id: worker_id.to_owned(),
             lease_id: lease.lease_id.clone(),
+            session_id: session_id.to_owned(),
             run_id: lease.run_id.clone(),
+            run_generation,
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.fs.read_file".to_owned(),
             request_sha256: request_sha256.clone(),
@@ -9135,6 +9674,10 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-result-replay";
     let required_capability = "tool:palyra.fs.read_file";
+    let session_id = "session-networked-worker-result-replay";
+    let run_generation =
+        start_networked_worker_test_run(&state, session_id, "run-networked-worker-result-replay")
+            .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -9172,6 +9715,8 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
         state.as_ref(),
         worker_id,
         &lease,
+        session_id,
+        run_generation,
         remote_request_id.as_str(),
         node_request_id.as_str(),
     );
@@ -9181,12 +9726,14 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
         remote_request_id.as_str(),
         "proposal-networked-worker-result-replay",
         "palyra.fs.read_file",
-        "session-networked-worker-result-replay",
+        session_id,
         observed_at_unix_ms,
     );
     let settlement = NetworkedWorkerDispatchSettlementIdentity {
         remote_request_id: remote_request_id.clone(),
         delivery_attempt_id: Some(delivery_attempt_id.clone()),
+        session_id: session_id.to_owned(),
+        run_generation,
     };
     let cleanup = WorkerCleanupReport {
         removed_workspace_scope: true,
@@ -9257,6 +9804,8 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
             Some(NetworkedWorkerDispatchSettlementIdentity {
                 remote_request_id: remote_request_id.clone(),
                 delivery_attempt_id: Some(Ulid::new().to_string()),
+                session_id: session_id.to_owned(),
+                run_generation,
             }),
         )
         .await
@@ -9305,6 +9854,13 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-archived-result-replay";
     let required_capability = "tool:palyra.fs.read_file";
+    let session_id = "session-networked-worker-archived-result-replay";
+    let run_generation = start_networked_worker_test_run(
+        &state,
+        session_id,
+        "run-networked-worker-archived-result-replay",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -9343,6 +9899,8 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
         state.as_ref(),
         worker_id,
         &lease,
+        session_id,
+        run_generation,
         remote_request_id.as_str(),
         node_request_id.as_str(),
     );
@@ -9352,12 +9910,14 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
         remote_request_id.as_str(),
         "proposal-networked-worker-archived-result-replay",
         "palyra.fs.read_file",
-        "session-networked-worker-archived-result-replay",
+        session_id,
         observed_at_unix_ms,
     );
     let settlement = NetworkedWorkerDispatchSettlementIdentity {
         remote_request_id: remote_request_id.clone(),
         delivery_attempt_id: Some(delivery_attempt_id),
+        session_id: session_id.to_owned(),
+        run_generation,
     };
     let cleanup = WorkerCleanupReport {
         removed_workspace_scope: true,
@@ -9384,7 +9944,8 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
         .execute(
             r#"
                 INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
-                    remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                    remote_request_ulid, node_request_ulid, worker_id, lease_ulid,
+                    session_ulid, run_ulid, run_generation,
                     issued_fleet_generation, dispatch_fleet_generation, revoked_fleet_generation,
                     lease_expires_at_unix_ms, capability, request_sha256, state,
                     reconciliation_disposition, terminal_reason_code, created_at_unix_ms,
@@ -9395,7 +9956,8 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
                     delivery_disposition, delivery_payload_present,
                     validated_result_sha256, result_observed_at_unix_ms
                 )
-                SELECT remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                SELECT remote_request_ulid, node_request_ulid, worker_id, lease_ulid,
+                       session_ulid, run_ulid, run_generation,
                        issued_fleet_generation, dispatch_fleet_generation, revoked_fleet_generation,
                        lease_expires_at_unix_ms, capability, request_sha256, state,
                        reconciliation_disposition, terminal_reason_code, created_at_unix_ms,
@@ -9448,10 +10010,16 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn networked_worker_artifact_journal_failure_rolls_back_completion_and_receipt() {
+async fn networked_worker_artifact_journal_failure_rolls_back_receipt_and_cleans_lease() {
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-artifact-atomic";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-artifact-atomic",
+        "run-networked-worker-artifact-atomic",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");
@@ -9499,15 +10067,16 @@ async fn networked_worker_artifact_journal_failure_rolls_back_completion_and_rec
         outcome.error
     );
     let fleet = state.worker_fleet_snapshot();
-    assert_eq!(fleet.active_leases, 1);
-    assert_eq!(fleet.busy_workers, 1);
+    assert_eq!(fleet.active_leases, 0);
+    assert_eq!(fleet.busy_workers, 0);
+    assert_eq!(fleet.available_workers, 1);
     let durable = state
         .journal_store
         .list_networked_worker_fleet_records(crate::journal::NETWORKED_WORKER_FLEET_MAX_ENTRIES)
         .expect("durable worker fleet should load");
-    let worker = durable.get(worker_id).expect("assigned worker should remain durable");
-    assert_eq!(worker.state, WorkerLifecycleState::Assigned);
-    assert!(worker.lease.is_some());
+    let worker = durable.get(worker_id).expect("cleaned worker should remain durable");
+    assert_eq!(worker.state, WorkerLifecycleState::Completed);
+    assert!(worker.lease.is_none());
 
     let snapshot = state
         .recent_journal_snapshot(100)
@@ -9521,7 +10090,7 @@ async fn networked_worker_artifact_journal_failure_rolls_back_completion_and_rec
             })
             .is_some_and(|reason| reason == "worker.artifact_transport.attested")
     }));
-    assert!(!snapshot.events.iter().any(|event| {
+    assert!(snapshot.events.iter().any(|event| {
         serde_json::from_str::<Value>(event.payload_json.as_str())
             .ok()
             .and_then(|payload| {
@@ -9543,6 +10112,8 @@ async fn networked_worker_invalid_remote_results_cannot_attest_or_release_author
         let state = build_test_runtime_state(false);
         let worker_id = format!("worker-runtime-{suffix}");
         let required_capability = "tool:palyra.fs.read_file";
+        start_networked_worker_test_run(&state, "session-networked-worker-invalid-result", suffix)
+            .await;
         let mut attestation = test_worker_attestation(worker_id.as_str());
         attestation.supported_capabilities = vec![required_capability.to_owned()];
         state
@@ -9614,6 +10185,12 @@ async fn networked_worker_cleanup_gap_preserves_report_without_artifact_attestat
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-cleanup-gap";
     let required_capability = "tool:palyra.fs.read_file";
+    start_networked_worker_test_run(
+        &state,
+        "session-networked-worker-cleanup-gap",
+        "run-networked-worker-cleanup-gap",
+    )
+    .await;
     let mut attestation = test_worker_attestation(worker_id);
     attestation.supported_capabilities = vec![required_capability.to_owned()];
     state.register_networked_worker(attestation).await.expect("worker registration should succeed");

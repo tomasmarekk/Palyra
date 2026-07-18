@@ -46,7 +46,6 @@ use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
 use palyra_vault::{SecretResolver, Vault};
 use palyra_workerd::{
     WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
-    WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3643,6 +3642,12 @@ fn ssh_worker_capability_is_safe(capability: &str) -> bool {
         )
 }
 
+/// Wire contract for the SSH tunnel transport.
+///
+/// It is versioned independently from generation-bound node worker callbacks.
+const SSH_WORKER_RPC_PROTOCOL: &str = "palyra-worker-rpc/v1";
+const SSH_WORKER_RPC_SCHEMA_VERSION: u32 = 1;
+
 /// SSH worker RPC request sent through an operator-managed tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SshWorkerRpcRequestEnvelope {
@@ -3956,8 +3961,8 @@ fn build_ssh_worker_rpc_request(
         });
     }
     Ok(SshWorkerRpcRequestEnvelope {
-        protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
-        schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        protocol: SSH_WORKER_RPC_PROTOCOL.to_owned(),
+        schema_version: SSH_WORKER_RPC_SCHEMA_VERSION,
         request_id: Ulid::new().to_string(),
         profile_id: profile.profile_id.clone(),
         tunnel_endpoint_sha256: sha256_hex(profile.tunnel_endpoint.as_bytes()),
@@ -4055,8 +4060,8 @@ fn ssh_worker_outcome_from_rpc_result(
     request: &SshWorkerRpcRequestEnvelope,
     result: SshWorkerRpcResultEnvelope,
 ) -> ToolExecutionOutcome {
-    if result.protocol != WORKER_REMOTE_TOOL_PROTOCOL
-        || result.schema_version != WORKER_REMOTE_TOOL_SCHEMA_VERSION
+    if result.protocol != SSH_WORKER_RPC_PROTOCOL
+        || result.schema_version != SSH_WORKER_RPC_SCHEMA_VERSION
         || result.request_id != request.request_id
     {
         return ssh_worker_error_outcome(
@@ -4099,7 +4104,7 @@ fn ssh_worker_outcome_from_rpc_result(
             "status": "cleanup_failed",
             "backend": ExecutionBackendPreference::SshTunnel.as_str(),
             "profile_id": profile.profile_id,
-            "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+            "protocol": SSH_WORKER_RPC_PROTOCOL,
             "reason_code": "ssh_worker.cleanup.incomplete",
             "cleanup_report": cleanup_report.clone(),
         });
@@ -4298,7 +4303,7 @@ fn ssh_worker_bundle_contract_error_outcome(
         "status": "patch_bundle_rejected",
         "backend": ExecutionBackendPreference::SshTunnel.as_str(),
         "profile_id": profile.profile_id,
-        "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+        "protocol": SSH_WORKER_RPC_PROTOCOL,
         "reason_code": "ssh_worker.patch_bundle.contract_invalid",
         "repair_hint": "Return a reviewable patch_bundle writeback with no direct authoritative workspace mutation.",
     });
@@ -4341,7 +4346,7 @@ fn ssh_worker_error_outcome(
         "status": "unavailable",
         "backend": ExecutionBackendPreference::SshTunnel.as_str(),
         "profile_id": profile.profile_id,
-        "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+        "protocol": SSH_WORKER_RPC_PROTOCOL,
         "tunnel_endpoint_sha256": sha256_hex(profile.tunnel_endpoint.as_bytes()),
         "reason_code": reason_code,
         "repair_hint": "Attach an operator-managed palyra-worker-rpc/v1 SSH tunnel profile or select a different execution backend.",
@@ -5277,7 +5282,6 @@ mod tests {
     };
     use palyra_workerd::{
         WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
-        WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
     };
 
     use crate::config::{
@@ -5318,7 +5322,7 @@ mod tests {
         WorkspacePatchBundleRollbackPlan, WorkspacePatchBundleSourceManifest,
         WorkspacePatchBundleSymlinkGuardResult, WorkspacePatchBundleTouchedPath,
         WorkspacePatchBundleVerificationState, WorkspaceStrategyDescriptor, WorkspaceStrategyKind,
-        WorkspaceWritebackMode,
+        WorkspaceWritebackMode, SSH_WORKER_RPC_PROTOCOL, SSH_WORKER_RPC_SCHEMA_VERSION,
     };
 
     const SAFE_DOCKER_IMAGE: &str = "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -5670,8 +5674,8 @@ mod tests {
                 let output_json =
                     serde_json::to_string(&result_json).expect("fake ssh output should serialize");
                 Ok(SshWorkerRpcResultEnvelope {
-                    protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
-                    schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+                    protocol: SSH_WORKER_RPC_PROTOCOL.to_owned(),
+                    schema_version: SSH_WORKER_RPC_SCHEMA_VERSION,
                     request_id: request.request_id,
                     success: true,
                     output_json: output_json.clone(),
@@ -6852,8 +6856,8 @@ mod tests {
         let requests = requests.lock().expect("fake SSH requests");
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(request.protocol, WORKER_REMOTE_TOOL_PROTOCOL);
-        assert_eq!(request.schema_version, WORKER_REMOTE_TOOL_SCHEMA_VERSION);
+        assert_eq!(request.protocol, "palyra-worker-rpc/v1");
+        assert_eq!(request.schema_version, 1);
         assert_eq!(request.tool_name, "palyra.process.run");
         assert_eq!(request.tool_kind, WorkerRemoteToolKind::ProcessRun);
         assert_eq!(request.worker_protocol, "palyra-worker-rpc/v1");
@@ -7008,7 +7012,7 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&outcome.output_json).expect("SSH worker error should be JSON");
         assert_eq!(payload["reason_code"], "runner.unavailable.ssh_tunnel");
-        assert_eq!(payload["protocol"], WORKER_REMOTE_TOOL_PROTOCOL);
+        assert_eq!(payload["protocol"], SSH_WORKER_RPC_PROTOCOL);
         assert!(payload
             .get("tunnel_endpoint_sha256")
             .and_then(serde_json::Value::as_str)

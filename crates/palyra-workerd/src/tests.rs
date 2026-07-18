@@ -15,15 +15,15 @@ use palyra_common::qa_fault_injection::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    networked_worker_lifecycle_event_id, TrustedEndpointHealth, TrustedEndpointPolicy,
-    TrustedEndpointRecord, TrustedEndpointRegistry, TrustedEndpointTransport,
-    TrustedEndpointTrustState, WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport,
-    WorkerFleetManager, WorkerFleetPolicy, WorkerLeaseIdentity, WorkerLeaseRequest,
-    WorkerLifecycleError, WorkerLifecycleEvent, WorkerLifecycleState, WorkerRemoteIdentity,
-    WorkerRemoteLeaseBinding, WorkerRemoteToolContractError, WorkerRemoteToolKind,
-    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer,
-    WorkerRunGrant, WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL,
-    WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    networked_worker_lifecycle_event_id, RuntimeGeneration, TrustedEndpointHealth,
+    TrustedEndpointPolicy, TrustedEndpointRecord, TrustedEndpointRegistry,
+    TrustedEndpointTransport, TrustedEndpointTrustState, WorkerArtifactTransport,
+    WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
+    WorkerLeaseIdentity, WorkerLeaseRequest, WorkerLifecycleError, WorkerLifecycleEvent,
+    WorkerLifecycleState, WorkerRemoteIdentity, WorkerRemoteLeaseBinding,
+    WorkerRemoteToolContractError, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
+    WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer, WorkerRunGrant,
+    WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 
 fn hex_digest(byte: &str) -> String {
@@ -285,7 +285,9 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
         lease: WorkerRemoteLeaseBinding {
             lease_id: "lease-01".to_owned(),
             worker_id: "worker-remote-01".to_owned(),
+            session_id: "session-01".to_owned(),
             run_id: "run-01".to_owned(),
+            run_generation: RuntimeGeneration::new(7).expect("test generation should be valid"),
             grant_id: "grant-01".to_owned(),
             grant_tool_name: tool_name.to_owned(),
             expires_at_unix_ms: 3_000,
@@ -320,6 +322,7 @@ fn remote_result(
         tool_kind: request.tool_kind,
         worker_id: request.lease.worker_id.clone(),
         lease_id: request.lease.lease_id.clone(),
+        run_generation: request.lease.run_generation,
         success: true,
         output_json: output_json.to_owned(),
         output_json_sha256: sha256_hex(output_json.as_bytes()),
@@ -374,6 +377,57 @@ fn remote_request_validates_lease_and_manifest_contract() {
 }
 
 #[test]
+fn remote_wire_schema_rejects_v1_and_missing_run_generation() {
+    let request = remote_request("palyra.fs.read_file");
+    assert_eq!(WORKER_REMOTE_TOOL_PROTOCOL, "palyra-worker-rpc/v2");
+    let mut legacy_protocol_request = request.clone();
+    legacy_protocol_request.protocol = "palyra-worker-rpc/v1".to_owned();
+    assert_eq!(
+        legacy_protocol_request
+            .validate(2_000)
+            .expect_err("protocol v1 requests must not bypass generation binding"),
+        WorkerRemoteToolContractError::UnsupportedProtocol
+    );
+
+    let mut legacy_request = request.clone();
+    legacy_request.schema_version = 1;
+    assert_eq!(
+        legacy_request
+            .validate(2_000)
+            .expect_err("schema v1 requests must not bypass generation binding"),
+        WorkerRemoteToolContractError::UnsupportedProtocol
+    );
+
+    let mut request_json = serde_json::to_value(&request).expect("worker request should serialize");
+    request_json["lease"]
+        .as_object_mut()
+        .expect("lease binding should be an object")
+        .remove("run_generation");
+    let request_error = serde_json::from_value::<WorkerRemoteToolRequestEnvelope>(request_json)
+        .expect_err("requests without run generation must fail deserialization");
+    assert!(request_error.to_string().contains("run_generation"));
+
+    let result = remote_result(&request, r#"{"content":"ok"}"#);
+    let mut legacy_result = result.clone();
+    legacy_result.schema_version = 1;
+    assert_eq!(
+        legacy_result
+            .validate_against_request(&request, 2_000)
+            .expect_err("schema v1 results must not bypass generation binding"),
+        WorkerRemoteToolContractError::UnsupportedProtocol
+    );
+
+    let mut result_json = serde_json::to_value(result).expect("worker result should serialize");
+    result_json
+        .as_object_mut()
+        .expect("worker result should be an object")
+        .remove("run_generation");
+    let result_error = serde_json::from_value::<WorkerRemoteToolResultEnvelope>(result_json)
+        .expect_err("results without run generation must fail deserialization");
+    assert!(result_error.to_string().contains("run_generation"));
+}
+
+#[test]
 fn remote_result_requires_cleanup_and_identity_stability() {
     let request = remote_request("palyra.process.run");
     let result = remote_result(&request, r#"{"schema_version":2,"exit_code":0}"#);
@@ -392,6 +446,34 @@ fn remote_result_requires_cleanup_and_identity_stability() {
         .validate_against_request(&request, 2_000)
         .expect_err("identity drift must fail closed");
     assert!(matches!(error, WorkerRemoteToolContractError::WorkerIdentityMismatch { .. }));
+}
+
+#[test]
+fn remote_result_receipt_digest_is_generation_bound_and_deterministic() {
+    let request = remote_request("palyra.process.run");
+    let result = remote_result(&request, r#"{"schema_version":2,"exit_code":0}"#);
+
+    let first = result
+        .validated_receipt_sha256(&request, 2_000)
+        .expect("matching result should produce a receipt digest");
+    let replay = result
+        .validated_receipt_sha256(&request, 2_000)
+        .expect("matching replay should produce the same receipt digest");
+
+    assert_eq!(first, replay);
+    assert_eq!(first.len(), 64);
+    assert!(first.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+    let mut stale = result;
+    stale.run_generation =
+        RuntimeGeneration::new(request.lease.run_generation.get().saturating_add(1))
+            .expect("next test generation should be valid");
+    assert_eq!(
+        stale
+            .validated_receipt_sha256(&request, 2_000)
+            .expect_err("stale generation must not produce settlement evidence"),
+        WorkerRemoteToolContractError::ResultBindingMismatch
+    );
 }
 
 #[test]
@@ -417,6 +499,15 @@ fn remote_result_rejects_binding_identity_and_digest_mismatches() {
     let error = binding_mismatch
         .validate_against_request(&request, 2_000)
         .expect_err("settlement must reject request binding drift");
+    assert_eq!(error, WorkerRemoteToolContractError::ResultBindingMismatch);
+
+    let mut stale_generation = result.clone();
+    stale_generation.run_generation =
+        RuntimeGeneration::new(request.lease.run_generation.get() + 1)
+            .expect("next test generation should be valid");
+    let error = stale_generation
+        .validate_against_request(&request, 2_000)
+        .expect_err("settlement must reject a stale run generation");
     assert_eq!(error, WorkerRemoteToolContractError::ResultBindingMismatch);
 
     let mut identity_mismatch = result.clone();
@@ -1076,6 +1167,41 @@ fn worker_auto_assignment_matches_required_capabilities() {
     assert_eq!(lease.required_capabilities, vec!["tool:palyra.echo"]);
     assert_eq!(event.state, WorkerLifecycleState::Assigned);
     assert_eq!(manager.recent_events().len(), 2);
+}
+
+#[test]
+fn worker_filtered_assignment_skips_unapproved_candidates_without_mutating_on_empty_set() {
+    let mut manager = WorkerFleetManager::default();
+    let policy = WorkerFleetPolicy::default();
+    manager.register_worker(attestation("worker-filtered-a"), &policy, 2_000).unwrap();
+    manager.register_worker(attestation("worker-filtered-b"), &policy, 2_000).unwrap();
+    let baseline = manager.snapshot();
+    let baseline_events = manager.recent_events();
+
+    let error = manager
+        .assign_next_work_from_candidates(
+            &std::collections::BTreeSet::new(),
+            lease_request("run-filtered-empty", 500),
+            &policy,
+            2_500,
+        )
+        .expect_err("an empty compatibility set must not assign a worker");
+    assert_eq!(error, WorkerLifecycleError::NoAvailableWorker);
+    assert_eq!(manager.snapshot(), baseline);
+    assert_eq!(manager.recent_events(), baseline_events);
+
+    let candidates = std::collections::BTreeSet::from(["worker-filtered-b".to_owned()]);
+    let (lease, event) = manager
+        .assign_next_work_from_candidates(
+            &candidates,
+            lease_request("run-filtered-selected", 500),
+            &policy,
+            2_500,
+        )
+        .expect("the first fleet-eligible approved worker should receive the lease");
+    assert_eq!(lease.worker_id, "worker-filtered-b");
+    assert_eq!(event.worker_id, "worker-filtered-b");
+    assert_eq!(manager.snapshot().active_leases, 1);
 }
 
 #[test]

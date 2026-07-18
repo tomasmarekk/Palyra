@@ -9,11 +9,12 @@ use std::{
     path::Path,
 };
 
+use palyra_common::runtime_contracts::{RuntimeGeneration, RuntimeInstanceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Schema version for code-intelligence runtime snapshots and journal payloads.
-pub(crate) const CODE_INTEL_RUNTIME_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CODE_INTEL_RUNTIME_SCHEMA_VERSION: u32 = 2;
 /// Journal event emitted when an LSP provider becomes available for a workspace.
 pub(crate) const CODE_INTEL_PROVIDER_STARTED_EVENT: &str = "code_intel.provider.started";
 /// Journal event emitted when an LSP provider is unavailable or degraded.
@@ -203,6 +204,22 @@ pub(crate) struct CodeIntelProviderObservation {
     pub(crate) binary_label: String,
     pub(crate) reason_code: String,
     pub(crate) repair_hint: String,
+    pub(crate) runtime_authority: Option<CodeIntelProviderRuntimeAuthority>,
+    pub(crate) snapshot_authority: CodeIntelProviderSnapshotAuthority,
+}
+
+/// Exact managed-health identity captured before a provider observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeIntelProviderRuntimeAuthority {
+    pub(crate) component_id: RuntimeInstanceId,
+    pub(crate) generation: RuntimeGeneration,
+}
+
+/// Authority classification applied before provider data reaches a public projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeIntelProviderSnapshotAuthority {
+    Authoritative,
+    Stale,
 }
 
 impl CodeIntelProviderObservation {
@@ -222,7 +239,31 @@ impl CodeIntelProviderObservation {
             binary_label: binary_label(binary),
             reason_code: non_empty_or_default(reason_code, "code_intel.provider_unknown"),
             repair_hint: non_empty_or_default(repair_hint, "Inspect code-intelligence runtime."),
+            runtime_authority: None,
+            snapshot_authority: CodeIntelProviderSnapshotAuthority::Authoritative,
         }
+    }
+
+    /// Attaches the exact managed-health authority captured before provider work.
+    #[must_use]
+    pub(crate) fn with_runtime_authority(
+        mut self,
+        component_id: RuntimeInstanceId,
+        generation: RuntimeGeneration,
+    ) -> Self {
+        self.runtime_authority =
+            Some(CodeIntelProviderRuntimeAuthority { component_id, generation });
+        self
+    }
+
+    /// Carries capture-time authority into the final projection fence.
+    #[must_use]
+    pub(crate) fn with_snapshot_authority(
+        mut self,
+        snapshot_authority: CodeIntelProviderSnapshotAuthority,
+    ) -> Self {
+        self.snapshot_authority = snapshot_authority;
+        self
     }
 }
 
@@ -282,6 +323,8 @@ pub(crate) struct LspServerHandle {
     pub(crate) language: CodeIntelLanguage,
     pub(crate) provider: String,
     pub(crate) binary_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_generation: Option<RuntimeGeneration>,
     pub(crate) status: LspClientLifecycleStatus,
     pub(crate) reason_code: String,
     pub(crate) repair_hint: String,
@@ -418,8 +461,8 @@ impl CodeIntelRuntime {
         &mut self,
         request: CodeIntelRuntimeObservationRequest<'_>,
     ) -> CodeIntelRuntimeObservationOutcome {
-        self.reap_stale(request.now_unix_ms, request.idle_reap_ms);
         if !request.enabled {
+            self.reap_stale(request.now_unix_ms, request.idle_reap_ms);
             return CodeIntelRuntimeObservationOutcome {
                 snapshot: self.snapshot_from_state(CodeIntelRuntimeSnapshotRequest {
                     enabled: false,
@@ -432,8 +475,30 @@ impl CodeIntelRuntime {
             };
         }
 
+        let applicable_observations = request
+            .observations
+            .iter()
+            .filter(|observation| {
+                let key = CodeIntelClientKey::new(request.workspace_root, observation.language);
+                provider_observation_can_replace(self.handles.get(&key), observation)
+            })
+            .collect::<Vec<_>>();
+        if !request.observations.is_empty() && applicable_observations.is_empty() {
+            return CodeIntelRuntimeObservationOutcome {
+                snapshot: self.snapshot_from_state(CodeIntelRuntimeSnapshotRequest {
+                    enabled: true,
+                    workspace_root: request.workspace_root,
+                    timeout_ms: request.timeout_ms,
+                    idle_reap_ms: request.idle_reap_ms,
+                    now_unix_ms: request.now_unix_ms,
+                }),
+                audit_events: Vec::new(),
+            };
+        }
+
+        self.reap_stale(request.now_unix_ms, request.idle_reap_ms);
         let mut audit_events = Vec::new();
-        for observation in request.observations {
+        for observation in applicable_observations {
             let key = CodeIntelClientKey::new(request.workspace_root, observation.language);
             let previous = self.handles.get(&key).cloned();
             let status = self.lifecycle_status_for(&key, observation);
@@ -444,6 +509,10 @@ impl CodeIntelRuntime {
                 language: observation.language,
                 provider: observation.provider.clone(),
                 binary_label: observation.binary_label.clone(),
+                runtime_generation: observation
+                    .runtime_authority
+                    .as_ref()
+                    .map(|authority| authority.generation),
                 status,
                 reason_code: lifecycle_reason_code(&key, observation, status),
                 repair_hint: lifecycle_repair_hint(observation, status),
@@ -475,6 +544,17 @@ impl CodeIntelRuntime {
             now_unix_ms: request.now_unix_ms,
         });
         CodeIntelRuntimeObservationOutcome { snapshot, audit_events }
+    }
+
+    /// Returns a snapshot without applying idle reaping.
+    ///
+    /// Stale-only callbacks use this path so they cannot delete the current
+    /// generation's handle merely because their own work completed late.
+    pub(crate) fn snapshot_without_reap(
+        &self,
+        request: CodeIntelRuntimeSnapshotRequest<'_>,
+    ) -> CodeIntelRuntimeSnapshot {
+        self.snapshot_from_state(request)
     }
 
     /// Returns a current snapshot and reaps expired idle/cache entries.
@@ -614,6 +694,19 @@ impl CodeIntelRuntime {
         });
         self.broken_server_cache.retain(|_, entry| entry.retry_after_unix_ms > now_unix_ms);
     }
+}
+
+fn provider_observation_can_replace(
+    previous: Option<&LspServerHandle>,
+    observation: &CodeIntelProviderObservation,
+) -> bool {
+    let Some(previous_generation) = previous.and_then(|handle| handle.runtime_generation) else {
+        return true;
+    };
+    observation
+        .runtime_authority
+        .as_ref()
+        .is_some_and(|authority| authority.generation >= previous_generation)
 }
 
 fn audit_event_for_transition(
@@ -843,6 +936,82 @@ mod tests {
             .any(|event| event == CODE_INTEL_DIAGNOSTICS_DELTA_EVENT));
         assert_eq!(outcome.audit_events.len(), 1);
         assert_eq!(outcome.audit_events[0].event_type, CODE_INTEL_PROVIDER_STARTED_EVENT);
+    }
+
+    #[test]
+    fn older_generation_cannot_replace_newer_lsp_handle() {
+        let mut runtime = CodeIntelRuntime::new();
+        let current_generation = RuntimeGeneration::new(2).expect("current generation");
+        let stale_generation = RuntimeGeneration::new(1).expect("stale generation");
+        let component_id =
+            RuntimeInstanceId::parse("lsp:rust").expect("test LSP component id should be valid");
+        let current_observation =
+            observation(CodeIntelLanguage::Rust, "ready", "code_intel.provider_ready.rust")
+                .with_runtime_authority(component_id.clone(), current_generation);
+        let current = runtime.observe(CodeIntelRuntimeObservationRequest {
+            enabled: true,
+            workspace_root: Some("workspace"),
+            observations: std::slice::from_ref(&current_observation),
+            timeout_ms: 2_000,
+            idle_reap_ms: 60_000,
+            now_unix_ms: 100,
+            evidence_refs: &[],
+        });
+
+        let stale_observation =
+            observation(CodeIntelLanguage::Rust, "failed", "code_intel.provider_failed.rust")
+                .with_runtime_authority(component_id, stale_generation);
+        let stale = runtime.observe(CodeIntelRuntimeObservationRequest {
+            enabled: true,
+            workspace_root: Some("workspace"),
+            observations: std::slice::from_ref(&stale_observation),
+            timeout_ms: 2_000,
+            idle_reap_ms: 60_000,
+            now_unix_ms: 200,
+            evidence_refs: &[],
+        });
+
+        assert_eq!(stale.snapshot, current.snapshot);
+        assert!(stale.audit_events.is_empty());
+        assert_eq!(stale.snapshot.clients[0].runtime_generation, Some(current_generation));
+    }
+
+    #[test]
+    fn stale_only_observe_does_not_reap_current_handle() {
+        let mut runtime = CodeIntelRuntime::new();
+        let current_generation = RuntimeGeneration::new(2).expect("current generation");
+        let stale_generation = RuntimeGeneration::new(1).expect("stale generation");
+        let component_id =
+            RuntimeInstanceId::parse("lsp:rust").expect("test LSP component id should be valid");
+        let current_observation =
+            observation(CodeIntelLanguage::Rust, "ready", "code_intel.provider_ready.rust")
+                .with_runtime_authority(component_id.clone(), current_generation);
+        let current = runtime.observe(CodeIntelRuntimeObservationRequest {
+            enabled: true,
+            workspace_root: Some("workspace"),
+            observations: std::slice::from_ref(&current_observation),
+            timeout_ms: 2_000,
+            idle_reap_ms: 10,
+            now_unix_ms: 100,
+            evidence_refs: &[],
+        });
+
+        let stale_observation =
+            observation(CodeIntelLanguage::Rust, "failed", "code_intel.provider_failed.rust")
+                .with_runtime_authority(component_id, stale_generation);
+        let stale = runtime.observe(CodeIntelRuntimeObservationRequest {
+            enabled: true,
+            workspace_root: Some("workspace"),
+            observations: std::slice::from_ref(&stale_observation),
+            timeout_ms: 2_000,
+            idle_reap_ms: 10,
+            now_unix_ms: 1_000,
+            evidence_refs: &[],
+        });
+
+        assert_eq!(stale.snapshot, current.snapshot);
+        assert!(stale.audit_events.is_empty());
+        assert_eq!(stale.snapshot.clients[0].runtime_generation, Some(current_generation));
     }
 
     #[test]

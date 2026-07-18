@@ -924,6 +924,128 @@ pub(super) const MIGRATION_70_SQL: &str = r#"
         CHECK (schema_version > 0);
 "#;
 
+/// Migration 71: durable run-generation authority for networked-worker callbacks.
+///
+/// Existing rows remain readable for reconciliation, but nullable legacy bindings can never
+/// authorize a new callback through the generation-fenced result path.
+pub(super) const MIGRATION_71_SQL: &str = r#"
+    ALTER TABLE runtime_networked_worker_dispatch_claims
+        ADD COLUMN session_ulid TEXT;
+    ALTER TABLE runtime_networked_worker_dispatch_claims
+        ADD COLUMN run_generation INTEGER CHECK (
+            run_generation IS NULL OR run_generation > 0
+        );
+    ALTER TABLE runtime_networked_worker_dispatch_claim_terminal_evidence
+        ADD COLUMN session_ulid TEXT;
+    ALTER TABLE runtime_networked_worker_dispatch_claim_terminal_evidence
+        ADD COLUMN run_generation INTEGER CHECK (
+            run_generation IS NULL OR run_generation > 0
+        );
+
+    -- Preserve any impossible queued delivery evidence so the compatibility scan can quarantine it.
+    UPDATE runtime_networked_worker_dispatch_claims
+    SET state = 'reconciling',
+        reconciliation_disposition = 'legacy_missing_run_generation',
+        terminal_reason_code = 'worker.dispatch.legacy_missing_run_generation',
+        delivery_attempt_ulid = NULL,
+        delivery_token_sha256 = NULL,
+        delivery_reserved_at_unix_ms = NULL,
+        payload_released_at_unix_ms = NULL,
+        payload_release_fleet_generation = NULL,
+        payload_acknowledged_at_unix_ms = NULL,
+        delivery_disposition = 'legacy_unfenced_unknown',
+        delivery_payload_present = NULL
+    WHERE state = 'queued'
+      AND schema_version = 3
+      AND dispatch_fleet_generation IS NULL
+      AND revoked_fleet_generation IS NULL
+      AND reconciliation_disposition IS NULL
+      AND terminal_reason_code IS NULL
+      AND completed_at_unix_ms IS NULL
+      AND delivery_attempt_ulid IS NULL
+      AND delivery_token_sha256 IS NULL
+      AND delivery_reserved_at_unix_ms IS NULL
+      AND payload_released_at_unix_ms IS NULL
+      AND payload_release_fleet_generation IS NULL
+      AND payload_acknowledged_at_unix_ms IS NULL
+      AND delivery_disposition IS NULL
+      AND delivery_payload_present IN (0, 1)
+      AND validated_result_sha256 IS NULL
+      AND result_observed_at_unix_ms IS NULL;
+
+    -- Migrate only an exact v70 in-flight shape. Existing reconciling rows retain their original
+    -- disposition and reason, while malformed in-flight evidence remains visible to quarantine.
+    UPDATE runtime_networked_worker_dispatch_claims
+    SET state = 'reconciling',
+        reconciliation_disposition = 'legacy_missing_run_generation',
+        terminal_reason_code = 'worker.dispatch.legacy_missing_run_generation'
+    WHERE state = 'in_flight'
+      AND schema_version = 3
+      AND dispatch_fleet_generation IS NOT NULL
+      AND issued_fleet_generation <= dispatch_fleet_generation
+      AND revoked_fleet_generation IS NULL
+      AND reconciliation_disposition IS NULL
+      AND terminal_reason_code IS NULL
+      AND completed_at_unix_ms IS NULL
+      AND created_at_unix_ms >= 0
+      AND updated_at_unix_ms >= created_at_unix_ms
+      AND lease_expires_at_unix_ms > created_at_unix_ms
+      AND length(remote_request_ulid) BETWEEN 1 AND 128
+      AND remote_request_ulid = trim(remote_request_ulid)
+      AND remote_request_ulid NOT GLOB '*[^-A-Za-z0-9_./:]*'
+      AND length(node_request_ulid) BETWEEN 1 AND 128
+      AND node_request_ulid = trim(node_request_ulid)
+      AND node_request_ulid NOT GLOB '*[^-A-Za-z0-9_./:]*'
+      AND length(lease_ulid) BETWEEN 1 AND 128
+      AND lease_ulid = trim(lease_ulid)
+      AND lease_ulid NOT GLOB '*[^-A-Za-z0-9_./:]*'
+      AND length(run_ulid) BETWEEN 1 AND 128
+      AND run_ulid = trim(run_ulid)
+      AND run_ulid NOT GLOB '*[^-A-Za-z0-9_./:]*'
+      AND length(worker_id) BETWEEN 1 AND 128
+      AND worker_id = trim(worker_id)
+      AND worker_id NOT GLOB '*[^-A-Za-z0-9_.:]*'
+      AND length(capability) BETWEEN 1 AND 256
+      AND capability = trim(capability)
+      AND capability NOT GLOB '*[^-A-Za-z0-9_.:]*'
+      AND length(request_sha256) = 64
+      AND request_sha256 NOT GLOB '*[^0-9A-Fa-f]*'
+      AND length(delivery_attempt_ulid) BETWEEN 1 AND 128
+      AND delivery_attempt_ulid = trim(delivery_attempt_ulid)
+      AND delivery_attempt_ulid NOT GLOB '*[^-A-Za-z0-9_./:]*'
+      AND length(delivery_token_sha256) = 64
+      AND delivery_token_sha256 NOT GLOB '*[^0-9A-Fa-f]*'
+      AND delivery_reserved_at_unix_ms BETWEEN created_at_unix_ms AND updated_at_unix_ms
+      AND validated_result_sha256 IS NULL
+      AND result_observed_at_unix_ms IS NULL
+      AND (
+            (
+                delivery_disposition = 'reserved_unreleased'
+                AND payload_released_at_unix_ms IS NULL
+                AND payload_release_fleet_generation IS NULL
+                AND payload_acknowledged_at_unix_ms IS NULL
+                AND delivery_payload_present = 1
+            )
+            OR (
+                delivery_disposition = 'released_unacknowledged'
+                AND payload_released_at_unix_ms BETWEEN
+                    delivery_reserved_at_unix_ms AND updated_at_unix_ms
+                AND payload_release_fleet_generation = dispatch_fleet_generation
+                AND payload_acknowledged_at_unix_ms IS NULL
+                AND delivery_payload_present = 0
+            )
+            OR (
+                delivery_disposition = 'acknowledged'
+                AND payload_released_at_unix_ms BETWEEN
+                    delivery_reserved_at_unix_ms AND updated_at_unix_ms
+                AND payload_release_fleet_generation = dispatch_fleet_generation
+                AND payload_acknowledged_at_unix_ms BETWEEN
+                    payload_released_at_unix_ms AND updated_at_unix_ms
+                AND delivery_payload_present = 0
+            )
+      );
+"#;
+
 /// Current durable schema for networked-worker dispatch claims.
 const NETWORKED_WORKER_DISPATCH_CLAIM_SCHEMA_VERSION: u32 = 3;
 const RUNTIME_CLEANUP_REPORT_ROW_SCHEMA_VERSION: u32 = 1;
@@ -975,6 +1097,15 @@ pub struct RuntimeHealthObservationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeHealthObservationOutcome {
     pub health: RuntimeComponentHealthV1,
+}
+
+/// Result of an ordinary health observation fenced by one exact run generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunScopedRuntimeHealthObservationOutcome {
+    /// The run fence matched and the health observation was durably applied.
+    Applied(RuntimeHealthObservationOutcome),
+    /// The run fence changed before the health observation could be applied.
+    Stale { expected_generation: Option<RuntimeGeneration> },
 }
 
 /// Exact request to begin one host-owned non-mutating health probe.
@@ -1099,7 +1230,9 @@ pub struct NetworkedWorkerDispatchClaim {
     pub node_request_id: String,
     pub worker_id: String,
     pub lease_id: String,
+    pub session_id: Option<String>,
     pub run_id: String,
+    pub run_generation: Option<RuntimeGeneration>,
     pub issued_fleet_generation: u64,
     pub dispatch_fleet_generation: Option<u64>,
     pub revoked_fleet_generation: Option<u64>,
@@ -1131,7 +1264,9 @@ pub struct NetworkedWorkerDispatchClaimCreateRequest {
     pub node_request_id: String,
     pub worker_id: String,
     pub lease_id: String,
+    pub session_id: String,
     pub run_id: String,
+    pub run_generation: RuntimeGeneration,
     pub lease_expires_at_unix_ms: i64,
     pub capability: String,
     pub request_sha256: String,
@@ -1196,6 +1331,7 @@ pub enum NetworkedWorkerPayloadAcknowledgementOutcome {
 }
 
 /// Whether a node-returned result matches the exact active durable dispatch claim.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkedWorkerResultAuthorizationOutcome {
     Authorized,
@@ -1242,7 +1378,9 @@ pub struct NetworkedWorkerDispatchSettlement {
     pub remote_request_id: String,
     pub worker_id: String,
     pub lease_id: String,
+    pub session_id: String,
     pub run_id: String,
+    pub run_generation: RuntimeGeneration,
     pub delivery_attempt_id: Option<String>,
     pub validated_result_sha256: String,
     /// Host-observed receipt time; worker-supplied clocks never authorize settlement.
@@ -1957,50 +2095,11 @@ impl JournalStore {
         &self,
         request: &RuntimeStaleEventDiagnosticRequest,
     ) -> Result<(), JournalError> {
-        if request.session_id.trim().is_empty()
-            || request.reason_code.trim().is_empty()
-            || request.run_id.as_deref().is_some_and(|run_id| run_id.trim().is_empty())
-        {
-            return Err(JournalError::InvalidArgument(
-                "runtime stale-event diagnostic request is invalid".to_owned(),
-            ));
-        }
+        validate_runtime_stale_event_diagnostic_request(request)?;
         let now = current_unix_ms()?;
-        let diagnostic_id = Ulid::new().to_string();
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            r#"
-                INSERT INTO runtime_stale_event_diagnostics (
-                    diagnostic_ulid, session_ulid, run_ulid, lane, expected_generation,
-                    observed_generation, subsystem, disposition, reason_code, payload_sha256,
-                    payload_bytes, created_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 0, ?10)
-            "#,
-            params![
-                diagnostic_id,
-                request.session_id,
-                request.run_id,
-                request.lane.as_str(),
-                request
-                    .expected_generation
-                    .map(|generation| i64::try_from(generation.get()).unwrap_or(i64::MAX)),
-                i64::try_from(request.observed_generation.get()).unwrap_or(i64::MAX),
-                request.subsystem.as_str(),
-                request.disposition.as_str(),
-                request.reason_code,
-                now,
-            ],
-        )?;
-        if let Some(run_id) = request.run_id.as_deref() {
-            super::metadata_trace::append_stale_suppression_metadata_trace_tx(
-                &transaction,
-                run_id,
-                diagnostic_id.as_str(),
-                request.reason_code.as_str(),
-                now,
-            )?;
-        }
+        record_runtime_stale_event_diagnostic_tx(&transaction, request, now)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3156,6 +3255,44 @@ impl JournalStore {
         Ok(outcome)
     }
 
+    /// Records one health observation only while an exact run generation remains authoritative.
+    ///
+    /// The run fence and component-health update share one immediate transaction,
+    /// so a concurrent steer cannot land between authorization and mutation.
+    pub fn record_runtime_health_observation_for_run(
+        &self,
+        request: &RuntimeHealthObservationRequest,
+        session_id: &RuntimeSessionId,
+        run_id: &RuntimeRunId,
+        run_generation: RuntimeGeneration,
+    ) -> Result<RunScopedRuntimeHealthObservationOutcome, JournalError> {
+        validate_reason_code(request.reason_code.as_str())?;
+        if request.observed_at_unix_ms < 0 {
+            return Err(JournalError::InvalidArgument(
+                "runtime health observation timestamp is invalid".to_owned(),
+            ));
+        }
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (generation_matches, expected_generation) = runtime_generation_fence_matches_tx(
+            &transaction,
+            session_id.as_str(),
+            run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            run_generation,
+        )?;
+        let outcome = if generation_matches {
+            RunScopedRuntimeHealthObservationOutcome::Applied(record_runtime_health_observation_tx(
+                &transaction,
+                request,
+            )?)
+        } else {
+            RunScopedRuntimeHealthObservationOutcome::Stale { expected_generation }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Upserts a validated component-health projection and records the transition.
     ///
     /// This bootstrap/test compatibility path cannot roll back the durable generation
@@ -3772,6 +3909,18 @@ impl JournalStore {
                 max_entries,
             });
         }
+        let (generation_matches, _) = runtime_generation_fence_matches_tx(
+            &transaction,
+            request.session_id.as_str(),
+            request.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            request.run_generation,
+        )?;
+        if !generation_matches {
+            return Err(JournalError::NetworkedWorkerDispatchAuthorityRejected {
+                remote_request_id: request.remote_request_id.clone(),
+            });
+        }
         let (fleet_generation, fleet_schema_version) = transaction.query_row(
             r#"
                 SELECT generation, schema_version
@@ -3839,10 +3988,11 @@ impl JournalStore {
                     revoked_fleet_generation, lease_expires_at_unix_ms,
                     capability, request_sha256, state,
                     reconciliation_disposition, terminal_reason_code, created_at_unix_ms,
-                    updated_at_unix_ms, completed_at_unix_ms, schema_version
+                    updated_at_unix_ms, completed_at_unix_ms, schema_version,
+                    session_ulid, run_generation
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, 'queued',
-                    NULL, NULL, ?10, ?10, NULL, 3
+                    NULL, NULL, ?10, ?10, NULL, 3, ?11, ?12
                 )
             "#,
             params![
@@ -3856,6 +4006,12 @@ impl JournalStore {
                 request.capability,
                 request.request_sha256,
                 created_at_unix_ms,
+                request.session_id,
+                i64::try_from(request.run_generation.get()).map_err(|_| {
+                    JournalError::InvalidArgument(
+                        "networked worker run generation exceeds sqlite integer range".to_owned(),
+                    )
+                })?,
             ],
         )?;
         transaction.execute(
@@ -4094,10 +4250,14 @@ impl JournalStore {
         let Some(delivery_attempt_id) = claim.delivery_attempt_id.as_deref() else {
             return Ok(NetworkedWorkerResultAuthorizationOutcome::Rejected);
         };
+        let Some(run_generation) = claim.run_generation else {
+            return Ok(NetworkedWorkerResultAuthorizationOutcome::Rejected);
+        };
         self.authorize_networked_worker_result_attempt(
             remote_request_id,
             node_request_id,
             delivery_attempt_id,
+            run_generation,
             reporting_worker_id,
             current_unix_ms()?,
         )
@@ -4107,11 +4267,13 @@ impl JournalStore {
     ///
     /// # Errors
     /// Returns [`JournalError`] when lookup metadata is malformed or SQLite cannot inspect state.
+    #[cfg(test)]
     pub fn authorize_networked_worker_result_attempt(
         &self,
         remote_request_id: &str,
         node_request_id: &str,
         delivery_attempt_id: &str,
+        run_generation: RuntimeGeneration,
         reporting_worker_id: &str,
         observed_at_unix_ms: i64,
     ) -> Result<NetworkedWorkerResultAuthorizationOutcome, JournalError> {
@@ -4142,6 +4304,7 @@ impl JournalStore {
         if claim.node_request_id != node_request_id
             || claim.worker_id != reporting_worker_id
             || claim.delivery_attempt_id.as_deref() != Some(delivery_attempt_id)
+            || claim.run_generation != Some(run_generation)
             || claim.payload_released_at_unix_ms.is_none()
             || claim.lease_expires_at_unix_ms <= observed_at_unix_ms
         {
@@ -4151,6 +4314,19 @@ impl JournalStore {
             &claim,
             NetworkedWorkerDispatchClaimEvidenceLocation::Active,
         )?;
+        let Some(session_id) = claim.session_id.as_deref() else {
+            return Ok(NetworkedWorkerResultAuthorizationOutcome::Rejected);
+        };
+        let (generation_matches, _) = runtime_generation_fence_matches_tx(
+            &guard,
+            session_id,
+            claim.run_id.as_str(),
+            RuntimeGenerationLane::Run,
+            run_generation,
+        )?;
+        if !generation_matches {
+            return Ok(NetworkedWorkerResultAuthorizationOutcome::Rejected);
+        }
         Ok(
             if matches!(
                 claim.state,
@@ -4641,10 +4817,14 @@ impl JournalStore {
                 hydrate_networked_worker_dispatch_claim,
             )
             .optional()?;
-        if active.is_some() {
-            return Ok(active);
+        if let Some(claim) = active {
+            validate_networked_worker_dispatch_claim_evidence(
+                &claim,
+                NetworkedWorkerDispatchClaimEvidenceLocation::Active,
+            )?;
+            return Ok(Some(claim));
         }
-        guard
+        let archived = guard
             .query_row(
                 format!(
                     "{NETWORKED_WORKER_DISPATCH_CLAIM_TERMINAL_SELECT} WHERE remote_request_ulid = ?1"
@@ -4653,8 +4833,14 @@ impl JournalStore {
                 params![remote_request_id],
                 hydrate_networked_worker_dispatch_claim,
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(claim) = archived.as_ref() {
+            validate_networked_worker_dispatch_claim_evidence(
+                claim,
+                NetworkedWorkerDispatchClaimEvidenceLocation::TerminalArchive,
+            )?;
+        }
+        Ok(archived)
     }
 
     /// Cancels claims whose process-local payload was provably never released before restart.
@@ -5619,6 +5805,7 @@ fn validate_networked_worker_dispatch_claim_create_request(
     validate_runtime_identity(request.node_request_id.as_str(), "node request id")?;
     validate_worker_id(request.worker_id.as_str())?;
     validate_runtime_identity(request.lease_id.as_str(), "lease id")?;
+    validate_runtime_identity(request.session_id.as_str(), "session id")?;
     validate_runtime_identity(request.run_id.as_str(), "run id")?;
     validate_capability(request.capability.as_str())?;
     validate_sha256(request.request_sha256.as_str())?;
@@ -5727,7 +5914,9 @@ fn networked_worker_dispatch_claim_matches_create(
     claim.node_request_id == request.node_request_id
         && claim.worker_id == request.worker_id
         && claim.lease_id == request.lease_id
+        && claim.session_id.as_deref() == Some(request.session_id.as_str())
         && claim.run_id == request.run_id
+        && claim.run_generation == Some(request.run_generation)
         && claim.lease_expires_at_unix_ms == request.lease_expires_at_unix_ms
         && claim.capability == request.capability
         && claim.request_sha256 == request.request_sha256
@@ -5761,10 +5950,48 @@ fn validate_networked_worker_dispatch_claim_evidence(
             "networked worker dispatch claim schema version is unsupported".to_owned(),
         ));
     }
+    let has_session_authority = claim.session_id.is_some();
+    let has_generation_authority = claim.run_generation.is_some();
+    if has_session_authority != has_generation_authority {
+        return Err(JournalError::InvalidArgument(
+            "networked worker dispatch claim has partial run generation authority".to_owned(),
+        ));
+    }
+    let legacy_missing_run_generation = claim.state
+        == NetworkedWorkerDispatchClaimState::Reconciling
+        && claim.reconciliation_disposition.as_deref() == Some("legacy_missing_run_generation")
+        && !has_session_authority;
+    // Migration 71 leaves already-reconciling v70 audit rows unchanged; their missing authority
+    // keeps callbacks fail-closed without erasing the original disposition or reason.
+    let legacy_reconciling_without_run_generation = claim.schema_version == 3
+        && claim.state == NetworkedWorkerDispatchClaimState::Reconciling
+        && !has_session_authority
+        && matches!(
+            claim.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation" | "lease_revoked" | "legacy_unfenced_unknown")
+        );
+    if claim.reconciliation_disposition.as_deref() == Some("legacy_missing_run_generation")
+        && !legacy_missing_run_generation
+    {
+        return Err(JournalError::InvalidArgument(
+            "networked worker dispatch claim has invalid legacy run generation posture".to_owned(),
+        ));
+    }
+    if location == NetworkedWorkerDispatchClaimEvidenceLocation::Active
+        && !has_session_authority
+        && !legacy_reconciling_without_run_generation
+    {
+        return Err(JournalError::InvalidArgument(
+            "active networked worker dispatch claim is missing run generation authority".to_owned(),
+        ));
+    }
     validate_runtime_identity(claim.remote_request_id.as_str(), "remote request id")?;
     validate_runtime_identity(claim.node_request_id.as_str(), "node request id")?;
     validate_worker_id(claim.worker_id.as_str())?;
     validate_runtime_identity(claim.lease_id.as_str(), "lease id")?;
+    if let Some(session_id) = claim.session_id.as_deref() {
+        validate_runtime_identity(session_id, "session id")?;
+    }
     validate_runtime_identity(claim.run_id.as_str(), "run id")?;
     validate_capability(claim.capability.as_str())?;
     validate_sha256(claim.request_sha256.as_str())?;
@@ -5796,7 +6023,7 @@ fn validate_networked_worker_dispatch_claim_evidence(
             ));
         }
     } else {
-        validate_networked_worker_delivery_evidence(claim)?;
+        validate_networked_worker_delivery_evidence(claim, legacy_missing_run_generation)?;
         if claim.schema_version == 2 && has_validated_result_evidence {
             return Err(JournalError::InvalidArgument(
                 "schema 2 networked worker dispatch claim contains validated-result evidence"
@@ -5851,6 +6078,7 @@ fn validate_networked_worker_dispatch_claim_evidence(
                     Some("legacy_unfenced_unknown") => {
                         claim.delivery_disposition.as_deref() == Some("legacy_unfenced_unknown")
                     }
+                    Some("legacy_missing_run_generation") => true,
                     _ => false,
                 }
                 && claim
@@ -5961,6 +6189,7 @@ fn validate_networked_worker_validated_result_evidence(
 
 fn validate_networked_worker_delivery_evidence(
     claim: &NetworkedWorkerDispatchClaim,
+    legacy_missing_run_generation: bool,
 ) -> Result<(), JournalError> {
     let valid = match claim.delivery_disposition.as_deref() {
         None => {
@@ -5988,14 +6217,16 @@ fn validate_networked_worker_delivery_evidence(
                 }
         }
         Some("reserved_unreleased") => {
-            matches!(
+            (matches!(
                 claim.state,
                 NetworkedWorkerDispatchClaimState::InFlight
                     | NetworkedWorkerDispatchClaimState::Cancelled
-            ) && claim
-                .delivery_attempt_id
-                .as_deref()
-                .is_some_and(|id| validate_runtime_identity(id, "delivery attempt id").is_ok())
+            ) || (claim.state == NetworkedWorkerDispatchClaimState::Reconciling
+                && legacy_missing_run_generation))
+                && claim
+                    .delivery_attempt_id
+                    .as_deref()
+                    .is_some_and(|id| validate_runtime_identity(id, "delivery attempt id").is_ok())
                 && claim
                     .delivery_token_sha256
                     .as_deref()
@@ -6011,12 +6242,25 @@ fn validate_networked_worker_delivery_evidence(
                         claim.delivery_payload_present == Some(true)
                     }
                     NetworkedWorkerDispatchClaimState::Cancelled => {
-                        claim.reconciliation_disposition.as_deref() == Some("payload_not_released")
-                            && claim.revoked_fleet_generation.is_some()
-                            && claim.delivery_payload_present == Some(false)
+                        match claim.reconciliation_disposition.as_deref() {
+                            Some("payload_not_released") => {
+                                claim.revoked_fleet_generation.is_some()
+                                    && claim.delivery_payload_present == Some(false)
+                            }
+                            Some("payload_lost_on_restart") => {
+                                claim.revoked_fleet_generation.is_none()
+                                    && claim.delivery_payload_present == Some(false)
+                            }
+                            _ => false,
+                        }
+                    }
+                    NetworkedWorkerDispatchClaimState::Reconciling => {
+                        // Migration 71 preserves an unreleased reservation for audit only when the
+                        // legacy row has no callback authority to consume it.
+                        legacy_missing_run_generation
+                            && claim.delivery_payload_present == Some(true)
                     }
                     NetworkedWorkerDispatchClaimState::Queued
-                    | NetworkedWorkerDispatchClaimState::Reconciling
                     | NetworkedWorkerDispatchClaimState::Settled
                     | NetworkedWorkerDispatchClaimState::FailedClosed => false,
                 }
@@ -6114,13 +6358,36 @@ fn hydrate_networked_worker_dispatch_claim(
         ));
     }
     let payload_release_fleet_generation = row.get::<_, Option<i64>>(22)?;
+    let run_generation = row.get::<_, Option<i64>>(29)?;
     Ok(NetworkedWorkerDispatchClaim {
         schema_version,
         remote_request_id: row.get(0)?,
         node_request_id: row.get(1)?,
         worker_id: row.get(2)?,
         lease_id: row.get(3)?,
+        session_id: row.get(28)?,
         run_id: row.get(4)?,
+        run_generation: run_generation
+            .map(|generation| {
+                u64::try_from(generation)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            29,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })
+                    .and_then(|generation| {
+                        RuntimeGeneration::new(generation).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                29,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })
+                    })
+            })
+            .transpose()?,
         issued_fleet_generation: u64::try_from(issued_fleet_generation).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 5,
@@ -6193,7 +6460,8 @@ const NETWORKED_WORKER_DISPATCH_CLAIM_COLUMNS: &str = r#"
     delivery_attempt_ulid, delivery_token_sha256, delivery_reserved_at_unix_ms,
     payload_released_at_unix_ms, payload_release_fleet_generation,
     payload_acknowledged_at_unix_ms, delivery_disposition, delivery_payload_present,
-    validated_result_sha256, result_observed_at_unix_ms
+    validated_result_sha256, result_observed_at_unix_ms,
+    session_ulid, run_generation
 "#;
 
 const NETWORKED_WORKER_DISPATCH_CLAIM_SELECT: &str = r#"
@@ -6205,7 +6473,8 @@ const NETWORKED_WORKER_DISPATCH_CLAIM_SELECT: &str = r#"
            delivery_attempt_ulid, delivery_token_sha256, delivery_reserved_at_unix_ms,
            payload_released_at_unix_ms, payload_release_fleet_generation,
            payload_acknowledged_at_unix_ms, delivery_disposition, delivery_payload_present,
-           validated_result_sha256, result_observed_at_unix_ms
+           validated_result_sha256, result_observed_at_unix_ms,
+           session_ulid, run_generation
     FROM runtime_networked_worker_dispatch_claims
 "#;
 
@@ -6218,7 +6487,8 @@ const NETWORKED_WORKER_DISPATCH_CLAIM_TERMINAL_SELECT: &str = r#"
            delivery_attempt_ulid, delivery_token_sha256, delivery_reserved_at_unix_ms,
            payload_released_at_unix_ms, payload_release_fleet_generation,
            payload_acknowledged_at_unix_ms, delivery_disposition, delivery_payload_present,
-           validated_result_sha256, result_observed_at_unix_ms
+           validated_result_sha256, result_observed_at_unix_ms,
+           session_ulid, run_generation
     FROM runtime_networked_worker_dispatch_claim_terminal_evidence
 "#;
 
@@ -6355,6 +6625,7 @@ fn settle_networked_worker_dispatch_claim_tx(
     validate_runtime_identity(settlement.remote_request_id.as_str(), "remote request id")?;
     validate_worker_id(settlement.worker_id.as_str())?;
     validate_runtime_identity(settlement.lease_id.as_str(), "lease id")?;
+    validate_runtime_identity(settlement.session_id.as_str(), "session id")?;
     validate_runtime_identity(settlement.run_id.as_str(), "run id")?;
     if let Some(delivery_attempt_id) = settlement.delivery_attempt_id.as_deref() {
         validate_runtime_identity(delivery_attempt_id, "delivery attempt id")?;
@@ -6392,6 +6663,25 @@ fn settle_networked_worker_dispatch_claim_tx(
         &claim,
         NetworkedWorkerDispatchClaimEvidenceLocation::Active,
     )?;
+    if claim.session_id.as_deref() != Some(settlement.session_id.as_str())
+        || claim.run_generation != Some(settlement.run_generation)
+    {
+        return Err(JournalError::NetworkedWorkerDispatchSettlementRejected {
+            remote_request_id: settlement.remote_request_id.clone(),
+        });
+    }
+    let (generation_matches, _) = runtime_generation_fence_matches_tx(
+        transaction,
+        settlement.session_id.as_str(),
+        settlement.run_id.as_str(),
+        RuntimeGenerationLane::Run,
+        settlement.run_generation,
+    )?;
+    if !generation_matches {
+        return Err(JournalError::NetworkedWorkerDispatchSettlementRejected {
+            remote_request_id: settlement.remote_request_id.clone(),
+        });
+    }
     let delivery_attempt_matches = match claim.delivery_attempt_id.as_deref() {
         Some(claim_delivery_attempt_id) => {
             settlement.delivery_attempt_id.as_deref() == Some(claim_delivery_attempt_id)
@@ -6419,6 +6709,8 @@ fn settle_networked_worker_dispatch_claim_tx(
               AND state = ?9
               AND lease_expires_at_unix_ms > ?3
               AND schema_version = 3
+              AND session_ulid = ?11
+              AND run_generation = ?12
               AND (
                     (?10 IS NULL AND delivery_attempt_ulid IS NULL)
                     OR delivery_attempt_ulid = ?10
@@ -6435,6 +6727,13 @@ fn settle_networked_worker_dispatch_claim_tx(
             settlement.run_id,
             permitted_state,
             settlement.delivery_attempt_id,
+            settlement.session_id,
+            i64::try_from(settlement.run_generation.get()).map_err(|_| {
+                JournalError::InvalidArgument(
+                    "networked worker settlement generation exceeds sqlite integer range"
+                        .to_owned(),
+                )
+            })?,
         ],
     )?;
     if updated != 1 {
@@ -7271,6 +7570,61 @@ fn record_provider_attempt_stale_diagnostic_tx(
         reason_code,
         now,
     )?;
+    Ok(())
+}
+
+fn validate_runtime_stale_event_diagnostic_request(
+    request: &RuntimeStaleEventDiagnosticRequest,
+) -> Result<(), JournalError> {
+    if request.session_id.trim().is_empty()
+        || request.reason_code.trim().is_empty()
+        || request.run_id.as_deref().is_some_and(|run_id| run_id.trim().is_empty())
+    {
+        return Err(JournalError::InvalidArgument(
+            "runtime stale-event diagnostic request is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Appends one metadata-only stale-event diagnostic inside the caller's transaction.
+pub(super) fn record_runtime_stale_event_diagnostic_tx(
+    connection: &Connection,
+    request: &RuntimeStaleEventDiagnosticRequest,
+    now: i64,
+) -> Result<(), JournalError> {
+    validate_runtime_stale_event_diagnostic_request(request)?;
+    let diagnostic_id = Ulid::new().to_string();
+    connection.execute(
+        r#"
+            INSERT INTO runtime_stale_event_diagnostics (
+                diagnostic_ulid, session_ulid, run_ulid, lane, expected_generation,
+                observed_generation, subsystem, disposition, reason_code, payload_sha256,
+                payload_bytes, created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 0, ?10)
+        "#,
+        params![
+            diagnostic_id,
+            request.session_id,
+            request.run_id,
+            request.lane.as_str(),
+            request.expected_generation.map(runtime_generation_sql).transpose()?,
+            runtime_generation_sql(request.observed_generation)?,
+            request.subsystem.as_str(),
+            request.disposition.as_str(),
+            request.reason_code,
+            now,
+        ],
+    )?;
+    if let Some(run_id) = request.run_id.as_deref() {
+        super::metadata_trace::append_stale_suppression_metadata_trace_tx(
+            connection,
+            run_id,
+            diagnostic_id.as_str(),
+            request.reason_code.as_str(),
+            now,
+        )?;
+    }
     Ok(())
 }
 

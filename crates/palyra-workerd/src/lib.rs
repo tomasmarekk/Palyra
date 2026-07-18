@@ -12,7 +12,7 @@ use palyra_common::qa_fault_injection::{
     QaFaultProbeError, QaFaultProbeHandle, QaFaultRecoveryClass,
 };
 /// Canonical worker lifecycle states, re-exported from `palyra-common` runtime contracts.
-pub use palyra_common::runtime_contracts::WorkerLifecycleState;
+pub use palyra_common::runtime_contracts::{RuntimeGeneration, WorkerLifecycleState};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -262,10 +262,10 @@ impl WorkerCleanupReport {
 }
 
 /// Wire protocol identifier for remote worker tool execution envelopes.
-pub const WORKER_REMOTE_TOOL_PROTOCOL: &str = "palyra-worker-rpc/v1";
+pub const WORKER_REMOTE_TOOL_PROTOCOL: &str = "palyra-worker-rpc/v2";
 /// Schema version for [`WorkerRemoteToolRequestEnvelope`] and
 /// [`WorkerRemoteToolResultEnvelope`].
-pub const WORKER_REMOTE_TOOL_SCHEMA_VERSION: u32 = 1;
+pub const WORKER_REMOTE_TOOL_SCHEMA_VERSION: u32 = 2;
 
 /// Capability strings trusted for the initial networked-worker remote tool subset.
 pub const WORKER_REMOTE_TOOL_CAPABILITIES: &[&str] = &[
@@ -416,7 +416,9 @@ impl WorkerRemoteWorkspaceTransfer {
 pub struct WorkerRemoteLeaseBinding {
     pub lease_id: String,
     pub worker_id: String,
+    pub session_id: String,
     pub run_id: String,
+    pub run_generation: RuntimeGeneration,
     pub grant_id: String,
     pub grant_tool_name: String,
     pub expires_at_unix_ms: i64,
@@ -426,12 +428,20 @@ pub struct WorkerRemoteLeaseBinding {
     pub artifact_transport: WorkerArtifactTransport,
 }
 
-impl From<&WorkerLease> for WorkerRemoteLeaseBinding {
-    fn from(lease: &WorkerLease) -> Self {
+impl WorkerRemoteLeaseBinding {
+    /// Copies an assigned lease together with the host-issued run generation.
+    #[must_use]
+    pub fn from_lease(
+        lease: &WorkerLease,
+        session_id: String,
+        run_generation: RuntimeGeneration,
+    ) -> Self {
         Self {
             lease_id: lease.lease_id.clone(),
             worker_id: lease.worker_id.clone(),
+            session_id,
             run_id: lease.run_id.clone(),
+            run_generation,
             grant_id: lease.grant.grant_id.clone(),
             grant_tool_name: lease.grant.tool_name.clone(),
             expires_at_unix_ms: lease.expires_at_unix_ms,
@@ -483,6 +493,10 @@ impl WorkerRemoteToolRequestEnvelope {
         validate_required_string(self.proposal_id.as_str(), "proposal_id")?;
         validate_required_string(self.tool_name.as_str(), "tool_name")?;
         validate_required_string(self.input_json.as_str(), "input_json")?;
+        validate_required_string(self.lease.lease_id.as_str(), "lease_id")?;
+        validate_required_string(self.lease.worker_id.as_str(), "worker_id")?;
+        validate_required_string(self.lease.session_id.as_str(), "session_id")?;
+        validate_required_string(self.lease.run_id.as_str(), "run_id")?;
         validate_sha256_hex(self.input_json_sha256.as_str(), "input_json_sha256")?;
         if sha256_hex(self.input_json.as_bytes()) != self.input_json_sha256 {
             return Err(WorkerRemoteToolContractError::DigestMismatch {
@@ -550,6 +564,8 @@ pub struct WorkerRemoteToolResultEnvelope {
     pub tool_kind: WorkerRemoteToolKind,
     pub worker_id: String,
     pub lease_id: String,
+    /// Host-issued run generation copied from the request lease binding.
+    pub run_generation: RuntimeGeneration,
     pub success: bool,
     pub output_json: String,
     pub output_json_sha256: String,
@@ -581,6 +597,46 @@ impl WorkerRemoteToolResultEnvelope {
         self.validate_result_contract(request)
     }
 
+    /// Validates the result and derives the host-side receipt digest used for durable settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same contract errors as [`Self::validate_against_request`], including malformed
+    /// digest fields or a result that is not bound to the exact generation-bearing request.
+    pub fn validated_receipt_sha256(
+        &self,
+        request: &WorkerRemoteToolRequestEnvelope,
+        observed_at_unix_ms: i64,
+    ) -> Result<String, WorkerRemoteToolContractError> {
+        self.validate_against_request(request, observed_at_unix_ms)?;
+        let request_sha256 =
+            decode_sha256(request.input_json_sha256.as_str(), "input_json_sha256")?;
+        let output_json_sha256 =
+            decode_sha256(self.output_json_sha256.as_str(), "output_json_sha256")?;
+        let output_manifest_sha256 =
+            decode_sha256(self.output_manifest_sha256.as_str(), "output_manifest_sha256")?;
+
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest as _;
+        hasher.update(b"palyra.networked_worker.validated_result.v1\0");
+        update_length_prefixed(&mut hasher, request.request_id.as_bytes());
+        hasher.update(request_sha256);
+        hasher.update([u8::from(self.success)]);
+        hasher.update(output_json_sha256);
+        hasher.update(output_manifest_sha256);
+        hasher.update(self.run_generation.get().to_be_bytes());
+        match self.error.as_deref() {
+            Some(error) => {
+                hasher.update([1]);
+                update_length_prefixed(&mut hasher, error.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(self.completed_at_unix_ms.to_be_bytes());
+        hasher.update(b"cleanup_verified");
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     fn validate_result_contract(
         &self,
         request: &WorkerRemoteToolRequestEnvelope,
@@ -599,6 +655,7 @@ impl WorkerRemoteToolResultEnvelope {
             || self.tool_name != request.tool_name
             || self.tool_kind != request.tool_kind
             || self.lease_id != request.lease.lease_id
+            || self.run_generation != request.lease.run_generation
         {
             return Err(WorkerRemoteToolContractError::ResultBindingMismatch);
         }
@@ -693,6 +750,16 @@ fn validate_sha256_hex(
     } else {
         Err(WorkerRemoteToolContractError::InvalidSha256Digest { field })
     }
+}
+
+fn decode_sha256(
+    value: &str,
+    field: &'static str,
+) -> Result<[u8; 32], WorkerRemoteToolContractError> {
+    validate_sha256_hex(value, field)?;
+    let bytes = hex::decode(value)
+        .map_err(|_| WorkerRemoteToolContractError::InvalidSha256Digest { field })?;
+    bytes.try_into().map_err(|_| WorkerRemoteToolContractError::InvalidSha256Digest { field })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1500,13 +1567,47 @@ impl WorkerFleetManager {
         policy: &WorkerFleetPolicy,
         now_unix_ms: i64,
     ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
+        self.assign_next_work_matching(request, policy, now_unix_ms, None)
+    }
+
+    /// Leases the first eligible worker whose id is present in `candidate_worker_ids`.
+    ///
+    /// Transport owners use this after a read-only compatibility preflight so an incompatible
+    /// endpoint cannot acquire durable fleet authority. Assignment still repeats every normal
+    /// attestation, lifecycle, heartbeat, capability, and fault-injection gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::InvalidLeaseRequest`] or
+    /// [`WorkerLifecycleError::TtlExceeded`] for a malformed request, and
+    /// [`WorkerLifecycleError::NoAvailableWorker`] when no allowed worker passes every fleet gate.
+    pub fn assign_next_work_from_candidates(
+        &mut self,
+        candidate_worker_ids: &BTreeSet<String>,
+        request: WorkerLeaseRequest,
+        policy: &WorkerFleetPolicy,
+        now_unix_ms: i64,
+    ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
+        self.assign_next_work_matching(request, policy, now_unix_ms, Some(candidate_worker_ids))
+    }
+
+    fn assign_next_work_matching(
+        &mut self,
+        request: WorkerLeaseRequest,
+        policy: &WorkerFleetPolicy,
+        now_unix_ms: i64,
+        candidate_worker_ids: Option<&BTreeSet<String>>,
+    ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
         validate_lease_request(&request, policy, now_unix_ms)?;
         // A released barrier participant must durably consume its release before
         // another participant's winning lease changes worker availability.
         self.reject_activated_qa_fault("worker.claim.before_effect", request.run_id.as_str())?;
         let Some(worker_id) = self.workers.iter().find_map(|(worker_id, worker)| {
-            worker_record_can_accept(worker, &request, policy, now_unix_ms)
-                .then(|| worker_id.clone())
+            candidate_worker_ids
+                .is_none_or(|candidates| candidates.contains(worker_id))
+                .then_some(worker)
+                .filter(|worker| worker_record_can_accept(worker, &request, policy, now_unix_ms))
+                .map(|_| worker_id.clone())
         }) else {
             return Err(WorkerLifecycleError::NoAvailableWorker);
         };

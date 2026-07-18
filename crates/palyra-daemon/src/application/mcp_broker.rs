@@ -1325,7 +1325,7 @@ impl McpBroker {
                 false,
                 error.reason_code.as_str(),
             ),
-        }
+        };
         result
     }
 
@@ -1397,7 +1397,7 @@ impl McpBroker {
                 false,
                 error.reason_code.as_str(),
             ),
-        }
+        };
         result
     }
 

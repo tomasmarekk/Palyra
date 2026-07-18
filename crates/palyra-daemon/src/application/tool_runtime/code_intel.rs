@@ -28,8 +28,8 @@ use tokio::{
 use crate::{
     agents::AgentResolveRequest,
     application::code_intel_runtime::{
-        CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelRuntimeSnapshot,
-        CODE_INTEL_REDACTION_LEVEL,
+        CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelProviderSnapshotAuthority,
+        CodeIntelRuntimeSnapshot, CODE_INTEL_REDACTION_LEVEL,
     },
     application::tool_runtime::workspace_scope::{
         relative_path_should_use_active_root, session_active_workspace_root,
@@ -273,6 +273,8 @@ impl LspProcessManager {
                 repair_hint:
                     "Set tool_call.code_intel.enabled=true to enable post-write diagnostics."
                         .to_owned(),
+                managed_health_authority: None,
+                managed_health_snapshot_authority: None,
             })
             .collect()
     }
@@ -439,6 +441,10 @@ pub(crate) struct CodeIntelProviderStatus {
     pub binary: String,
     pub reason_code: String,
     pub repair_hint: String,
+    #[serde(skip)]
+    managed_health_authority: Option<ManagedRuntimeHealthAuthority>,
+    #[serde(skip)]
+    managed_health_snapshot_authority: Option<CodeIntelProviderSnapshotAuthority>,
 }
 
 /// Diagnostics captured at one point in time.
@@ -570,7 +576,7 @@ pub(crate) async fn capture_diagnostic_snapshot_with_managed_health(
             }
         }
     }
-    let snapshot = capture_diagnostic_snapshot_with_health_blocks(
+    let mut snapshot = capture_diagnostic_snapshot_with_health_blocks(
         config,
         workspace_roots,
         files_touched,
@@ -578,13 +584,17 @@ pub(crate) async fn capture_diagnostic_snapshot_with_managed_health(
     )
     .await;
     for (language, authority) in authorities {
-        let status = snapshot.provider_status.iter().find(|status| status.language == language);
-        let succeeded = status.is_some_and(|status| {
+        let Some(status) =
+            snapshot.provider_status.iter_mut().find(|status| status.language == language)
+        else {
+            continue;
+        };
+        let succeeded = {
             status.status == "ready"
                 || status.status == "skipped"
                 || status.reason_code.starts_with("code_intel.provider_registry_only.")
-        });
-        runtime_state.record_managed_runtime_health_observation(
+        };
+        let observation_applied = runtime_state.record_managed_runtime_health_observation(
             &authority,
             succeeded,
             if succeeded {
@@ -593,6 +603,12 @@ pub(crate) async fn capture_diagnostic_snapshot_with_managed_health(
                 "runtime.health.lsp_observation_failed"
             },
         );
+        status.managed_health_authority = Some(authority);
+        status.managed_health_snapshot_authority = Some(if observation_applied {
+            CodeIntelProviderSnapshotAuthority::Authoritative
+        } else {
+            CodeIntelProviderSnapshotAuthority::Stale
+        });
     }
     snapshot
 }
@@ -889,16 +905,122 @@ pub(crate) fn provider_runtime_observations(
         .provider_status
         .iter()
         .map(|status| {
-            CodeIntelProviderObservation::from_status_fields(
+            let mut observation = CodeIntelProviderObservation::from_status_fields(
                 status.provider.as_str(),
                 status.language,
                 status.status.as_str(),
                 status.binary.as_str(),
                 status.reason_code.as_str(),
                 status.repair_hint.as_str(),
-            )
+            );
+            if let Some(authority) = status.managed_health_authority.as_ref() {
+                observation = observation
+                    .with_runtime_authority(authority.component_id.clone(), authority.generation);
+            }
+            if let Some(snapshot_authority) = status.managed_health_snapshot_authority {
+                observation = observation.with_snapshot_authority(snapshot_authority);
+            }
+            observation
         })
         .collect()
+}
+
+/// Returns capture-time authority classifications for managed provider data.
+#[must_use]
+pub(crate) fn provider_snapshot_authority(
+    snapshot: &DiagnosticSnapshot,
+) -> BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority> {
+    snapshot
+        .provider_status
+        .iter()
+        .filter_map(|status| {
+            status.managed_health_snapshot_authority.map(|authority| (status.language, authority))
+        })
+        .collect()
+}
+
+/// Merges provider classifications while preserving stale-wins semantics.
+pub(crate) fn merge_provider_snapshot_authority(
+    target: &mut BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
+    source: &BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
+) {
+    for (language, authority) in source {
+        target
+            .entry(*language)
+            .and_modify(|current| {
+                if *authority == CodeIntelProviderSnapshotAuthority::Stale {
+                    *current = CodeIntelProviderSnapshotAuthority::Stale;
+                }
+            })
+            .or_insert(*authority);
+    }
+}
+
+/// Removes stale provider data before a diagnostics snapshot is serialized or compared.
+#[must_use]
+pub(crate) fn project_authoritative_diagnostic_snapshot(
+    mut snapshot: DiagnosticSnapshot,
+    authority_by_language: &BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
+) -> DiagnosticSnapshot {
+    let stale_languages = authority_by_language
+        .iter()
+        .filter_map(|(language, authority)| {
+            (*authority == CodeIntelProviderSnapshotAuthority::Stale).then_some(*language)
+        })
+        .collect::<BTreeSet<_>>();
+    if stale_languages.is_empty() {
+        return snapshot;
+    }
+
+    snapshot.provider_status.retain(|status| !stale_languages.contains(&status.language));
+    snapshot.items.retain(|item| !stale_languages.contains(&item.language));
+    snapshot.reason_codes.retain(|reason_code| {
+        !stale_languages
+            .iter()
+            .any(|language| reason_code_belongs_to_language(reason_code, *language))
+    });
+    snapshot.truncated =
+        snapshot.reason_codes.iter().any(|reason_code| reason_code.ends_with(".output_truncated"));
+    snapshot.degraded = snapshot.truncated
+        || snapshot
+            .provider_status
+            .iter()
+            .any(|status| status.status != "ready" && status.status != "skipped")
+        || snapshot
+            .reason_codes
+            .iter()
+            .any(|reason_code| !is_provider_snapshot_success_reason(reason_code));
+    snapshot
+}
+
+/// Applies one stale-language mask to both sides of a workspace-patch comparison.
+#[must_use]
+pub(crate) fn project_workspace_patch_diagnostic_pair(
+    before: DiagnosticSnapshot,
+    after: DiagnosticSnapshot,
+    authority_by_language: &BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
+) -> (DiagnosticSnapshot, DiagnosticSnapshot) {
+    (
+        project_authoritative_diagnostic_snapshot(before, authority_by_language),
+        project_authoritative_diagnostic_snapshot(after, authority_by_language),
+    )
+}
+
+fn reason_code_belongs_to_language(reason_code: &str, language: CodeIntelLanguage) -> bool {
+    let language = language.as_str();
+    let language_prefix = format!("code_intel.{language}.");
+    let language_suffix = format!(".{language}");
+    reason_code.starts_with(language_prefix.as_str())
+        || reason_code.ends_with(language_suffix.as_str())
+}
+
+fn is_provider_snapshot_success_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT
+            | CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT
+            | CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT
+    )
 }
 
 /// Inserts code-intelligence runtime lifecycle details into the diagnostics
@@ -1389,13 +1511,30 @@ async fn code_intel_diagnostics_output(
         observations.as_slice(),
         &["tool:palyra.code.diagnostics".to_owned()],
     );
-    Ok(json!({
+    Ok(project_code_intel_diagnostics_output(
+        snapshot,
+        runtime.snapshot,
+        &runtime.provider_snapshot_authority,
+        &workspace.runtime_cwd_hints,
+    ))
+}
+
+fn project_code_intel_diagnostics_output(
+    snapshot: DiagnosticSnapshot,
+    runtime_snapshot: CodeIntelRuntimeSnapshot,
+    runtime_authority: &BTreeMap<CodeIntelLanguage, CodeIntelProviderSnapshotAuthority>,
+    runtime_cwd_hints: &[RuntimeCwdHint],
+) -> Value {
+    let mut authority = provider_snapshot_authority(&snapshot);
+    merge_provider_snapshot_authority(&mut authority, runtime_authority);
+    let snapshot = project_authoritative_diagnostic_snapshot(snapshot, &authority);
+    json!({
         "schema_version": CODE_INTEL_SCHEMA_VERSION,
         "snapshot": snapshot,
-        "runtime": runtime.snapshot,
-        "runtime_cwd_hints": &workspace.runtime_cwd_hints,
+        "runtime": runtime_snapshot,
+        "runtime_cwd_hints": runtime_cwd_hints,
         "redaction_level": CODE_INTEL_REDACTION_LEVEL,
-    }))
+    })
 }
 
 fn code_intel_symbols_output(
@@ -3936,6 +4075,8 @@ fn provider_status_for_descriptor(
             binary: descriptor.binary_label,
             reason_code: format!("code_intel.provider_skipped.{}", descriptor.language.as_str()),
             repair_hint: "No touched file uses this language provider.".to_owned(),
+            managed_health_authority: None,
+            managed_health_snapshot_authority: None,
         };
     }
     if descriptor.integration == LanguageServerIntegration::RegistryOnly {
@@ -3951,6 +4092,8 @@ fn provider_status_for_descriptor(
             repair_hint:
                 "Provider is registered for routing and semantic fallback; external diagnostics are not executed by this rollout."
                     .to_owned(),
+            managed_health_authority: None,
+            managed_health_snapshot_authority: None,
         };
     }
     if executable_is_available(descriptor.binary.as_str()) {
@@ -3961,6 +4104,8 @@ fn provider_status_for_descriptor(
             binary: descriptor.binary_label,
             reason_code: format!("code_intel.provider_ready.{}", descriptor.language.as_str()),
             repair_hint: "Provider binary was found in the configured path.".to_owned(),
+            managed_health_authority: None,
+            managed_health_snapshot_authority: None,
         }
     } else {
         CodeIntelProviderStatus {
@@ -3979,6 +4124,8 @@ fn provider_status_for_descriptor(
                     ),
                 )
             ),
+            managed_health_authority: None,
+            managed_health_snapshot_authority: None,
         }
     }
 }
@@ -4143,6 +4290,102 @@ mod tests {
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.reason_codes, vec!["code_intel.disabled"]);
         assert_eq!(snapshot.provider_status.len(), CodeIntelLanguage::ALL.len());
+    }
+
+    #[test]
+    fn direct_diagnostics_late_generation_suppresses_raw_provider_data() {
+        let snapshot = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/lib.rs".to_owned(), "apps/web/src/app.ts".to_owned()],
+            provider_status: vec![
+                CodeIntelProviderStatus {
+                    provider: "rust-analyzer".to_owned(),
+                    language: CodeIntelLanguage::Rust,
+                    status: "failed".to_owned(),
+                    binary: "rust-analyzer".to_owned(),
+                    reason_code: "code_intel.rust.stale-secret-reason".to_owned(),
+                    repair_hint: "stale-secret-repair".to_owned(),
+                    managed_health_authority: None,
+                    managed_health_snapshot_authority: Some(
+                        CodeIntelProviderSnapshotAuthority::Authoritative,
+                    ),
+                },
+                CodeIntelProviderStatus {
+                    provider: "typescript-language-server".to_owned(),
+                    language: CodeIntelLanguage::TypeScript,
+                    status: "ready".to_owned(),
+                    binary: "typescript-language-server".to_owned(),
+                    reason_code: CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT.to_owned(),
+                    repair_hint: "current provider".to_owned(),
+                    managed_health_authority: None,
+                    managed_health_snapshot_authority: Some(
+                        CodeIntelProviderSnapshotAuthority::Authoritative,
+                    ),
+                },
+            ],
+            items: vec![
+                CodeDiagnostic {
+                    language: CodeIntelLanguage::Rust,
+                    path: "src/lib.rs".to_owned(),
+                    line: 1,
+                    column: 1,
+                    severity: DiagnosticSeverity::Error,
+                    code: Some("stale-secret-code".to_owned()),
+                    message: "stale-secret-message".to_owned(),
+                    source: "stale-secret-provider".to_owned(),
+                },
+                CodeDiagnostic {
+                    language: CodeIntelLanguage::TypeScript,
+                    path: "apps/web/src/app.ts".to_owned(),
+                    line: 2,
+                    column: 1,
+                    severity: DiagnosticSeverity::Warning,
+                    code: Some("TS1".to_owned()),
+                    message: "current warning".to_owned(),
+                    source: TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE.to_owned(),
+                },
+            ],
+            truncated: false,
+            degraded: true,
+            reason_codes: vec![
+                "code_intel.rust.stale-secret-reason".to_owned(),
+                CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT.to_owned(),
+            ],
+        };
+        let runtime_snapshot = {
+            let mut runtime = crate::application::code_intel_runtime::CodeIntelRuntime::new();
+            runtime.snapshot(
+                crate::application::code_intel_runtime::CodeIntelRuntimeSnapshotRequest {
+                    enabled: true,
+                    workspace_root: Some("workspace"),
+                    timeout_ms: 2_000,
+                    idle_reap_ms: 60_000,
+                    now_unix_ms: 100,
+                },
+            )
+        };
+        let runtime_authority = BTreeMap::from([
+            (CodeIntelLanguage::Rust, CodeIntelProviderSnapshotAuthority::Stale),
+            (CodeIntelLanguage::TypeScript, CodeIntelProviderSnapshotAuthority::Authoritative),
+        ]);
+
+        let output = project_code_intel_diagnostics_output(
+            snapshot,
+            runtime_snapshot,
+            &runtime_authority,
+            &[],
+        );
+
+        assert_eq!(output["snapshot"]["provider_status"].as_array().map(Vec::len), Some(1));
+        assert_eq!(output["snapshot"]["provider_status"][0]["language"], "type_script");
+        assert_eq!(output["snapshot"]["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(output["snapshot"]["items"][0]["language"], "type_script");
+        assert_eq!(output["snapshot"]["degraded"], false);
+        let serialized =
+            serde_json::to_string(&output).expect("direct diagnostics should serialize");
+        assert!(!serialized.contains("stale-secret"));
     }
 
     #[test]

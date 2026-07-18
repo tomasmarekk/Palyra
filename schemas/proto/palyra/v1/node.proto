@@ -204,8 +204,10 @@ message NetworkedWorkerDeliveryReservation {
   palyra.common.v1.CanonicalId run_id = 9;
   uint64 fleet_generation = 10;
   uint64 expires_at_unix_ms = 11;
+  // Shared run write generation captured before dispatch and echoed by the callback.
+  uint64 run_generation = 12;
 
-  reserved 12 to 20;
+  reserved 13 to 20;
 }
 
 message FetchNetworkedWorkerPayloadRequest {

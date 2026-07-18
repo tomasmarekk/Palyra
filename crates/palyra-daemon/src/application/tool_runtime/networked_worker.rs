@@ -11,7 +11,9 @@ use std::{sync::Arc, time::Duration};
 
 use palyra_common::{
     redaction::{redact_auth_error, redact_url_segments_in_text},
-    runtime_contracts::REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
+    runtime_contracts::{
+        RuntimeGeneration, RuntimeRunId, RuntimeSessionId, REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
+    },
 };
 use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
@@ -33,7 +35,9 @@ use crate::{
     node_runtime::{
         CapabilityDispatchAuthorizer, CapabilityExecutionNotification, CapabilityExecutionReceiver,
         CapabilityExecutionResult, CapabilityRequestStopOutcome, CapabilityRequestTimeoutOutcome,
-        NodeRuntimeState, RegisteredNodeRecord, NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY,
+        NetworkedWorkerHostReceiptContext, NetworkedWorkerResultCommitContext,
+        NetworkedWorkerResultCommitDisposition, NodeRuntimeState, RegisteredNodeRecord,
+        NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY,
     },
     tool_protocol::{
         build_tool_execution_outcome, build_tool_execution_outcome_with_manifest,
@@ -121,6 +125,17 @@ pub(crate) enum NetworkedWorkerRemoteDispatchOutcome {
 /// Dispatches a validated remote worker tool envelope to an actual worker transport.
 #[async_trait::async_trait]
 pub(crate) trait NetworkedWorkerRemoteDispatcher: Send + Sync {
+    /// Verifies that `worker_id` can speak the exact transport contract before a lease is issued.
+    ///
+    /// # Errors
+    /// Returns a fail-closed transport error when the worker is missing, stale, incompatible, or
+    /// does not currently advertise every required capability.
+    fn preflight_worker(
+        &self,
+        worker_id: &str,
+        required_capabilities: &[String],
+    ) -> Result<(), NetworkedWorkerRemoteDispatchError>;
+
     /// Executes `request` remotely and returns the worker result envelope.
     ///
     /// # Errors
@@ -130,6 +145,7 @@ pub(crate) trait NetworkedWorkerRemoteDispatcher: Send + Sync {
     async fn dispatch_remote_tool(
         &self,
         runtime_state: &Arc<GatewayRuntimeState>,
+        host_context: NetworkedWorkerHostReceiptContext,
         request: WorkerRemoteToolRequestEnvelope,
         cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError>;
@@ -204,9 +220,29 @@ impl NodeRuntimeNetworkedWorkerDispatcher {
 
 #[async_trait::async_trait]
 impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
+    fn preflight_worker(
+        &self,
+        worker_id: &str,
+        required_capabilities: &[String],
+    ) -> Result<(), NetworkedWorkerRemoteDispatchError> {
+        let node = self
+            .node_runtime
+            .node(worker_id)
+            .map_err(|error| {
+                NetworkedWorkerRemoteDispatchError::WorkerUnavailable(error.to_string())
+            })?
+            .ok_or_else(|| {
+                NetworkedWorkerRemoteDispatchError::WorkerUnavailable(format!(
+                    "node runtime has no registered worker node for worker_id={worker_id}"
+                ))
+            })?;
+        ensure_node_is_ready_for_remote_worker(&node, required_capabilities)
+    }
+
     async fn dispatch_remote_tool(
         &self,
         runtime_state: &Arc<GatewayRuntimeState>,
+        host_context: NetworkedWorkerHostReceiptContext,
         request: WorkerRemoteToolRequestEnvelope,
         cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<NetworkedWorkerRemoteDispatchOutcome, NetworkedWorkerRemoteDispatchError> {
@@ -222,7 +258,7 @@ impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
                     "node runtime has no registered worker node for worker_id={worker_id}"
                 ))
             })?;
-        ensure_node_is_ready_for_remote_worker(&node, &request)?;
+        ensure_node_is_ready_for_remote_worker(&node, &request.lease.required_capabilities)?;
 
         let payload = serde_json::to_vec(&request).map_err(|error| {
             NetworkedWorkerRemoteDispatchError::MalformedResult(format!(
@@ -245,7 +281,9 @@ impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
             node_request_id: request_id.clone(),
             worker_id: request.lease.worker_id.clone(),
             lease_id: request.lease.lease_id.clone(),
+            session_id: request.lease.session_id.clone(),
             run_id: request.lease.run_id.clone(),
+            run_generation: request.lease.run_generation,
             lease_expires_at_unix_ms: request.lease.expires_at_unix_ms,
             capability: capability.clone(),
             request_sha256: sha256_hex(payload.as_slice()),
@@ -259,6 +297,7 @@ impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
             payload,
             self.max_payload_bytes,
             &claim,
+            NetworkedWorkerResultCommitContext { request: request.clone(), host: host_context },
         ) {
             Ok(receiver) => receiver,
             Err(error) => {
@@ -499,9 +538,21 @@ fn capability_notification_to_dispatch_outcome(
             "networked worker result notification missing delivery attempt identity".to_owned(),
         )
     })?;
+    let run_generation = notification.run_generation.ok_or_else(|| {
+        NetworkedWorkerRemoteDispatchError::MalformedResult(
+            "networked worker result notification missing run generation".to_owned(),
+        )
+    })?;
+    let result = remote_result_from_node_capability_result(notification.result)?;
+    if result.run_generation != run_generation {
+        return Err(NetworkedWorkerRemoteDispatchError::MalformedResult(
+            "networked worker result generation does not match the authenticated callback"
+                .to_owned(),
+        ));
+    }
     Ok(NetworkedWorkerRemoteDispatchOutcome::Completed(Box::new(
         NetworkedWorkerRemoteDispatchResult {
-            result: remote_result_from_node_capability_result(notification.result)?,
+            result,
             delivery_attempt_id: Some(delivery_attempt_id),
             observed_at_unix_ms: notification.observed_at_unix_ms,
         },
@@ -589,11 +640,93 @@ async fn execute_networked_worker_tool_owned(
             "networked_worker_fail_closed",
         );
     }
+    let (generation_session_id, run_generation) =
+        match runtime_state.runtime_generation_for_tool_blocking(context.run_id) {
+            Ok(Some(authority)) => authority,
+            Ok(None) => {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    "networked worker dispatch requires an active run generation".to_owned(),
+                    "networked_worker_stale_generation",
+                );
+            }
+            Err(error) => {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!("networked worker generation lookup failed: {}", error.message()),
+                    "networked_worker_stale_generation",
+                );
+            }
+        };
+    let generation_session_id = match RuntimeSessionId::parse(generation_session_id.as_str()) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!("networked worker session identity is invalid: {error}"),
+                "networked_worker_stale_generation",
+            );
+        }
+    };
+    let run_identity = match RuntimeRunId::parse(context.run_id) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!("networked worker run identity is invalid: {error}"),
+                "networked_worker_stale_generation",
+            );
+        }
+    };
+    if generation_session_id.as_str() != context.session_id {
+        return networked_worker_failure_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            "networked worker run generation belongs to a different session".to_owned(),
+            "networked_worker_stale_generation",
+        );
+    }
 
     let request =
         build_worker_lease_request(runtime_state, context, proposal_id, tool_name, input_json);
-    let (lease, _) = match runtime_state.assign_next_networked_worker_lease(request).await {
-        Ok(assignment) => assignment,
+    let lease = match runtime_state
+        .assign_next_networked_worker_lease_for_run(
+            request,
+            generation_session_id.as_str(),
+            run_identity.as_str(),
+            run_generation,
+        )
+        .await
+    {
+        Ok(crate::gateway::NetworkedWorkerLeaseAssignmentOutcome::Assigned { lease }) => *lease,
+        Ok(crate::gateway::NetworkedWorkerLeaseAssignmentOutcome::TransportRejected { reason }) => {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!("networked worker remote preflight failed: {reason}"),
+                "networked_worker_remote_unavailable",
+            );
+        }
+        Ok(crate::gateway::NetworkedWorkerLeaseAssignmentOutcome::StaleSuppressed) => {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                "networked worker lease assignment was suppressed after run supersession"
+                    .to_owned(),
+                "networked_worker_stale_generation",
+            );
+        }
         Err(error) => {
             return networked_worker_failure_outcome(
                 proposal_id,
@@ -638,8 +771,11 @@ async fn execute_networked_worker_tool_owned(
         match runtime_state.networked_worker_attestation(lease.worker_id.as_str()) {
             Some(attestation) => attestation,
             None => {
-                runtime_state.record_managed_runtime_health_observation(
+                runtime_state.record_managed_runtime_health_observation_for_run(
                     &health_authority,
+                    &generation_session_id,
+                    &run_identity,
+                    run_generation,
                     false,
                     "runtime.health.worker_attestation_missing",
                 );
@@ -672,11 +808,16 @@ async fn execute_networked_worker_tool_owned(
         input_json,
         &lease,
         &worker_attestation,
+        generation_session_id.as_str().to_owned(),
+        run_generation,
     ) {
         Ok(request) => request,
         Err(error) => {
-            runtime_state.record_managed_runtime_health_observation(
+            runtime_state.record_managed_runtime_health_observation_for_run(
                 &health_authority,
+                &generation_session_id,
+                &run_identity,
+                run_generation,
                 false,
                 "runtime.health.worker_request_invalid",
             );
@@ -702,6 +843,7 @@ async fn execute_networked_worker_tool_owned(
     };
     let dispatch_outcome = match dispatch_networked_worker_remote_tool(
         runtime_state,
+        context,
         &remote_request,
         cancellation_requested,
     )
@@ -709,8 +851,11 @@ async fn execute_networked_worker_tool_owned(
     {
         Ok(result) => result,
         Err(error) => {
-            runtime_state.record_managed_runtime_health_observation(
+            runtime_state.record_managed_runtime_health_observation_for_run(
                 &health_authority,
+                &generation_session_id,
+                &run_identity,
+                run_generation,
                 false,
                 "runtime.health.worker_dispatch_unavailable",
             );
@@ -737,8 +882,11 @@ async fn execute_networked_worker_tool_owned(
     let dispatch_result = match dispatch_outcome {
         NetworkedWorkerRemoteDispatchOutcome::Completed(result) => *result,
         NetworkedWorkerRemoteDispatchOutcome::Released(released) => {
-            runtime_state.record_managed_runtime_health_observation(
+            runtime_state.record_managed_runtime_health_observation_for_run(
                 &health_authority,
+                &generation_session_id,
+                &run_identity,
+                run_generation,
                 false,
                 "runtime.health.worker_dispatch_released",
             );
@@ -778,8 +926,11 @@ async fn execute_networked_worker_tool_owned(
 
     let validation = remote_result.validate_against_request(&remote_request, observed_at_unix_ms);
     if let Err(error) = &validation {
-        runtime_state.record_managed_runtime_health_observation(
+        runtime_state.record_managed_runtime_health_observation_for_run(
             &health_authority,
+            &generation_session_id,
+            &run_identity,
+            run_generation,
             false,
             "runtime.health.worker_result_invalid",
         );
@@ -836,43 +987,38 @@ async fn execute_networked_worker_tool_owned(
         );
     }
 
-    let validated_result_sha256 = match validated_networked_worker_result_sha256(
-        remote_request.request_id.as_str(),
-        remote_request.input_json_sha256.as_str(),
-        &remote_result,
-    ) {
-        Ok(digest) => digest,
-        Err(error) => {
-            runtime_state.record_managed_runtime_health_observation(
-                &health_authority,
-                false,
-                "runtime.health.worker_receipt_invalid",
-            );
-            if let Err(cleanup_error) =
-                record_unverified_networked_worker_cleanup(runtime_state, &lease).await
-            {
+    let validated_result_sha256 =
+        match remote_result.validated_receipt_sha256(&remote_request, observed_at_unix_ms) {
+            Ok(digest) => digest,
+            Err(error) => {
+                runtime_state.record_managed_runtime_health_observation_for_run(
+                    &health_authority,
+                    &generation_session_id,
+                    &run_identity,
+                    run_generation,
+                    false,
+                    "runtime.health.worker_receipt_invalid",
+                );
+                if let Err(cleanup_error) =
+                    record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+                {
+                    return networked_worker_failure_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        format!("networked worker cleanup failed: {}", cleanup_error.message()),
+                        "networked_worker_cleanup_failed",
+                    );
+                }
                 return networked_worker_failure_outcome(
                     proposal_id,
                     tool_name,
                     input_json,
-                    format!("networked worker cleanup failed: {}", cleanup_error.message()),
-                    "networked_worker_cleanup_failed",
+                    format!("networked worker result receipt failed: {error}"),
+                    "networked_worker_result_receipt_failed",
                 );
             }
-            return networked_worker_failure_outcome(
-                proposal_id,
-                tool_name,
-                input_json,
-                format!("networked worker result receipt failed: {error}"),
-                "networked_worker_result_receipt_failed",
-            );
-        }
-    };
-    runtime_state.record_managed_runtime_health_observation(
-        &health_authority,
-        true,
-        "runtime.health.worker_dispatch_succeeded",
-    );
+        };
     let receipt = crate::gateway::NetworkedWorkerArtifactReceipt {
         request_id: remote_result.request_id.clone(),
         proposal_id: proposal_id.to_owned(),
@@ -902,10 +1048,42 @@ async fn execute_networked_worker_tool_owned(
             Some(crate::gateway::NetworkedWorkerDispatchSettlementIdentity {
                 remote_request_id: remote_request.request_id.clone(),
                 delivery_attempt_id,
+                session_id: remote_request.lease.session_id.clone(),
+                run_generation: remote_result.run_generation,
             }),
         )
         .await
     {
+        let dispatch_settled = runtime_state
+            .journal_store
+            .networked_worker_dispatch_claim(remote_request.request_id.as_str())
+            .ok()
+            .flatten()
+            .is_some_and(|claim| {
+                claim.state == crate::journal::NetworkedWorkerDispatchClaimState::Settled
+            });
+        if !dispatch_settled {
+            if let Err(cleanup_error) = runtime_state
+                .complete_networked_worker_lease(
+                    lease.worker_id.as_str(),
+                    lease.identity(),
+                    remote_result.cleanup_report.clone(),
+                )
+                .await
+            {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!(
+                        "networked worker result commit and cleanup failed: {}; {}",
+                        error.message(),
+                        cleanup_error.message()
+                    ),
+                    "networked_worker_cleanup_failed",
+                );
+            }
+        }
         return networked_worker_failure_outcome(
             proposal_id,
             tool_name,
@@ -914,6 +1092,14 @@ async fn execute_networked_worker_tool_owned(
             "networked_worker_result_commit_failed",
         );
     }
+    runtime_state.record_managed_runtime_health_observation_for_run(
+        &health_authority,
+        &generation_session_id,
+        &run_identity,
+        run_generation,
+        true,
+        "runtime.health.worker_dispatch_succeeded",
+    );
 
     networked_worker_outcome_from_validated_remote_result(&remote_request, remote_result)
 }
@@ -924,6 +1110,8 @@ fn build_worker_remote_tool_request(
     input_json: &[u8],
     lease: &WorkerLease,
     worker_attestation: &WorkerAttestation,
+    session_id: String,
+    run_generation: RuntimeGeneration,
 ) -> Result<WorkerRemoteToolRequestEnvelope, String> {
     let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name).ok_or_else(|| {
         format!(
@@ -945,7 +1133,7 @@ fn build_worker_remote_tool_request(
         tool_kind,
         input_json: input_json_text,
         input_json_sha256: sha256_hex(input_json),
-        lease: WorkerRemoteLeaseBinding::from(lease),
+        lease: WorkerRemoteLeaseBinding::from_lease(lease, session_id, run_generation),
         worker_identity: WorkerRemoteIdentity::from(worker_attestation),
         workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(workspace_manifest_sha256),
     };
@@ -957,6 +1145,7 @@ fn build_worker_remote_tool_request(
 
 async fn dispatch_networked_worker_remote_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
     request: &WorkerRemoteToolRequestEnvelope,
     cancellation_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<NetworkedWorkerRemoteDispatchOutcome, String> {
@@ -965,7 +1154,16 @@ async fn dispatch_networked_worker_remote_tool(
         .ok_or(NetworkedWorkerRemoteDispatchError::Unconfigured)
         .map_err(|error| error.to_string())?;
     dispatcher
-        .dispatch_remote_tool(runtime_state, request.clone(), cancellation_requested)
+        .dispatch_remote_tool(
+            runtime_state,
+            NetworkedWorkerHostReceiptContext {
+                principal: context.principal.to_owned(),
+                device_id: context.device_id.to_owned(),
+                channel: context.channel.map(ToOwned::to_owned),
+            },
+            request.clone(),
+            cancellation_requested,
+        )
         .await
         .map_err(|error| error.to_string())
 }
@@ -977,6 +1175,31 @@ fn spawn_networked_worker_late_result_owner(
     mut released: NetworkedWorkerReleasedDispatch,
     health_authority: ManagedRuntimeHealthAuthority,
 ) {
+    let session_id = match RuntimeSessionId::parse(request.lease.session_id.as_str()) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            warn!(
+                request_id = request.request_id.as_str(),
+                error = %error,
+                reason_code = "worker.late_result_invalid_session_identity",
+                "networked worker late result owner failed closed"
+            );
+            return;
+        }
+    };
+    let run_id = match RuntimeRunId::parse(request.lease.run_id.as_str()) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            warn!(
+                request_id = request.request_id.as_str(),
+                error = %error,
+                reason_code = "worker.late_result_invalid_run_identity",
+                "networked worker late result owner failed closed"
+            );
+            return;
+        }
+    };
+    let run_generation = request.lease.run_generation;
     tokio::spawn(async move {
         let notification = released.receiver.recv().await;
         let Some(delivery_attempt_id) = notification.delivery_attempt_id.as_deref() else {
@@ -984,6 +1207,15 @@ fn spawn_networked_worker_late_result_owner(
                 request_id = request.request_id.as_str(),
                 node_request_id = released.node_request_id.as_str(),
                 reason_code = "worker.late_result_missing_delivery_attempt",
+                "networked worker late result failed closed"
+            );
+            return;
+        };
+        let Some(callback_run_generation) = notification.run_generation else {
+            warn!(
+                request_id = request.request_id.as_str(),
+                node_request_id = released.node_request_id.as_str(),
+                reason_code = "worker.late_result_missing_run_generation",
                 "networked worker late result failed closed"
             );
             return;
@@ -1000,6 +1232,15 @@ fn spawn_networked_worker_late_result_owner(
                 return;
             }
         };
+        if result.run_generation != callback_run_generation {
+            warn!(
+                request_id = request.request_id.as_str(),
+                node_request_id = released.node_request_id.as_str(),
+                reason_code = "worker.late_result_stale_generation",
+                "networked worker late result failed closed"
+            );
+            return;
+        }
         if result.validate_against_request(&request, notification.observed_at_unix_ms).is_err() {
             warn!(
                 request_id = request.request_id.as_str(),
@@ -1009,30 +1250,44 @@ fn spawn_networked_worker_late_result_owner(
             );
             return;
         }
-        let validated_result_sha256 = match validated_networked_worker_result_sha256(
-            request.request_id.as_str(),
-            request.input_json_sha256.as_str(),
-            &result,
+        let validated_result_sha256 =
+            match result.validated_receipt_sha256(&request, notification.observed_at_unix_ms) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    warn!(
+                        request_id = request.request_id.as_str(),
+                        node_request_id = released.node_request_id.as_str(),
+                        reason_code = "worker.late_result_digest_failed",
+                        "networked worker late result failed closed"
+                    );
+                    return;
+                }
+            };
+        if matches!(
+            notification.networked_worker_commit_disposition,
+            Some(
+                NetworkedWorkerResultCommitDisposition::LateReconciliation
+                    | NetworkedWorkerResultCommitDisposition::ExactReplay
+            )
         ) {
-            Ok(digest) => digest,
-            Err(_) => {
-                warn!(
-                    request_id = request.request_id.as_str(),
-                    node_request_id = released.node_request_id.as_str(),
-                    reason_code = "worker.late_result_digest_failed",
-                    "networked worker late result failed closed"
-                );
-                return;
-            }
+            runtime_state.record_managed_runtime_health_observation_for_run(
+                &health_authority,
+                &session_id,
+                &run_id,
+                run_generation,
+                true,
+                "runtime.health.worker_late_result_succeeded",
+            );
+            return;
+        }
+        let settlement_identity = crate::gateway::NetworkedWorkerDispatchSettlementIdentity {
+            remote_request_id: request.request_id.clone(),
+            delivery_attempt_id: Some(delivery_attempt_id.to_owned()),
+            session_id: request.lease.session_id.clone(),
+            run_generation: result.run_generation,
         };
-        runtime_state.record_managed_runtime_health_observation(
-            &health_authority,
-            true,
-            "runtime.health.worker_late_result_succeeded",
-        );
         if let Err(error) = runtime_state.settle_reconciling_networked_worker_dispatch(
-            request.request_id.as_str(),
-            Some(delivery_attempt_id),
+            &settlement_identity,
             lease.worker_id.as_str(),
             &lease.identity(),
             validated_result_sha256.as_str(),
@@ -1045,7 +1300,16 @@ fn spawn_networked_worker_late_result_owner(
                 status_code = ?error.code(),
                 "networked worker late result settlement failed closed"
             );
+            return;
         }
+        runtime_state.record_managed_runtime_health_observation_for_run(
+            &health_authority,
+            &session_id,
+            &run_id,
+            run_generation,
+            true,
+            "runtime.health.worker_late_result_succeeded",
+        );
     });
 }
 
@@ -1297,7 +1561,7 @@ fn remote_tool_kind_uses_read_only_workspace(tool_kind: WorkerRemoteToolKind) ->
 
 fn ensure_node_is_ready_for_remote_worker(
     node: &RegisteredNodeRecord,
-    request: &WorkerRemoteToolRequestEnvelope,
+    required_capabilities: &[String],
 ) -> Result<(), NetworkedWorkerRemoteDispatchError> {
     let now = current_unix_ms();
     let node_age_ms = now.saturating_sub(node.last_seen_at_unix_ms);
@@ -1319,12 +1583,11 @@ fn ensure_node_is_ready_for_remote_worker(
         )));
     }
 
-    let required_capability = request.tool_kind.required_capability();
-    if !node
-        .capabilities
-        .iter()
-        .any(|capability| capability.available && capability.name == required_capability)
-    {
+    if let Some(required_capability) = required_capabilities.iter().find(|required_capability| {
+        !node.capabilities.iter().any(|capability| {
+            capability.available && capability.name == required_capability.as_str()
+        })
+    }) {
         return Err(NetworkedWorkerRemoteDispatchError::WorkerUnavailable(format!(
             "worker node {} does not advertise required capability {required_capability}",
             node.device_id
@@ -1390,48 +1653,6 @@ fn networked_worker_failure_outcome(
     )
 }
 
-fn validated_networked_worker_result_sha256(
-    request_id: &str,
-    request_sha256: &str,
-    result: &WorkerRemoteToolResultEnvelope,
-) -> Result<String, String> {
-    let request_sha256 = decode_sha256(request_sha256, "request_sha256")?;
-    let output_json_sha256 =
-        decode_sha256(result.output_json_sha256.as_str(), "output_json_sha256")?;
-    let output_manifest_sha256 =
-        decode_sha256(result.output_manifest_sha256.as_str(), "output_manifest_sha256")?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"palyra.networked_worker.validated_result.v1\0");
-    update_result_receipt_field(&mut hasher, request_id.as_bytes())?;
-    hasher.update(request_sha256);
-    hasher.update([u8::from(result.success)]);
-    hasher.update(output_json_sha256);
-    hasher.update(output_manifest_sha256);
-    match result.error.as_deref() {
-        Some(error) => {
-            hasher.update([1]);
-            update_result_receipt_field(&mut hasher, error.as_bytes())?;
-        }
-        None => hasher.update([0]),
-    }
-    hasher.update(result.completed_at_unix_ms.to_be_bytes());
-    hasher.update(b"cleanup_verified");
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn decode_sha256(value: &str, field: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(value).map_err(|_| format!("{field} is not hexadecimal"))?;
-    bytes.try_into().map_err(|_| format!("{field} is not exactly 32 bytes"))
-}
-
-fn update_result_receipt_field(hasher: &mut Sha256, value: &[u8]) -> Result<(), String> {
-    let length = u64::try_from(value.len())
-        .map_err(|_| "validated result receipt field exceeds supported length".to_owned())?;
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
-    Ok(())
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1444,6 +1665,7 @@ mod tests {
         networked_worker_outcome_from_remote_result, networked_worker_supports_tool,
         networked_worker_tool_capability, remote_tool_kind_uses_read_only_workspace, sha256_hex,
     };
+    use palyra_common::runtime_contracts::RuntimeGeneration;
     use palyra_workerd::{
         WorkerArtifactTransport, WorkerCleanupReport, WorkerRemoteIdentity,
         WorkerRemoteLeaseBinding, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
@@ -1488,6 +1710,7 @@ mod tests {
                 tool_kind: request.tool_kind,
                 worker_id: request.lease.worker_id.clone(),
                 lease_id: request.lease.lease_id.clone(),
+                run_generation: request.lease.run_generation,
                 success: true,
                 output_json_sha256: sha256_hex(output_json.as_bytes()),
                 output_json,
@@ -1532,7 +1755,9 @@ mod tests {
             lease: WorkerRemoteLeaseBinding {
                 lease_id: format!("lease-{}", tool_kind.as_str()),
                 worker_id: "worker-remote-01".to_owned(),
+                session_id: "session-remote-01".to_owned(),
                 run_id: "run-remote-01".to_owned(),
+                run_generation: RuntimeGeneration::new(7).expect("test generation should be valid"),
                 grant_id: format!("grant-{}", tool_kind.as_str()),
                 grant_tool_name: tool_name.to_owned(),
                 expires_at_unix_ms: 3_000,

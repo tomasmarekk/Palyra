@@ -343,17 +343,34 @@ pub(super) async fn execute_workspace_patch_mutation(
         outcome.files_touched.as_slice(),
     )
     .await;
+    let baseline_observations = code_intel::provider_runtime_observations(&diagnostic_baseline);
+    let provider_observations = code_intel::provider_runtime_observations(&diagnostic_after);
+    let code_intel_evidence_refs = code_intel_evidence_refs(proposal_id, mutation_id.as_str());
+    let code_intel_runtime = runtime_state.observe_code_intel_runtime_with_dependencies(
+        diagnostic_after.workspace_root.as_deref(),
+        provider_observations.as_slice(),
+        baseline_observations.as_slice(),
+        code_intel_evidence_refs.as_slice(),
+    );
+    let mut provider_authority = code_intel::provider_snapshot_authority(&diagnostic_baseline);
+    code_intel::merge_provider_snapshot_authority(
+        &mut provider_authority,
+        &code_intel::provider_snapshot_authority(&diagnostic_after),
+    );
+    code_intel::merge_provider_snapshot_authority(
+        &mut provider_authority,
+        &code_intel_runtime.provider_snapshot_authority,
+    );
+    let (diagnostic_baseline, diagnostic_after) =
+        code_intel::project_workspace_patch_diagnostic_pair(
+            diagnostic_baseline,
+            diagnostic_after,
+            &provider_authority,
+        );
     let diagnostic_delta = code_intel::diagnostic_delta(
         &runtime_state.config.code_intel,
         &diagnostic_baseline,
         &diagnostic_after,
-    );
-    let code_intel_evidence_refs = code_intel_evidence_refs(proposal_id, mutation_id.as_str());
-    let provider_observations = code_intel::provider_runtime_observations(&diagnostic_after);
-    let code_intel_runtime = runtime_state.observe_code_intel_runtime(
-        diagnostic_after.workspace_root.as_deref(),
-        provider_observations.as_slice(),
-        code_intel_evidence_refs.as_slice(),
     );
     record_code_intel_runtime_journal_events(
         runtime_state,
@@ -911,7 +928,7 @@ async fn record_code_intel_language_snapshot_journal_event(
     snapshot: &code_intel::DiagnosticSnapshot,
     evidence_refs: &[String],
 ) {
-    if !snapshot.reason_codes.iter().any(|code| code == event_type) {
+    if !code_intel_language_snapshot_is_recordable(snapshot, event_type) {
         return;
     }
     let provider_status =
@@ -948,6 +965,13 @@ async fn record_code_intel_language_snapshot_journal_event(
         }),
     )
     .await;
+}
+
+fn code_intel_language_snapshot_is_recordable(
+    snapshot: &code_intel::DiagnosticSnapshot,
+    event_type: &str,
+) -> bool {
+    snapshot.reason_codes.iter().any(|code| code == event_type)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1493,9 +1517,10 @@ fn workspace_patch_preflight_failure_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::application::{
+        code_intel_runtime::{CodeIntelLanguage, CodeIntelProviderSnapshotAuthority},
         project_facts::{
             ProjectCodingPosture, ProjectCommandHint, ProjectCommandKind, ProjectFactsDecision,
             ProjectFactsSnapshot, ProjectLanguageFamily, ProjectTouchedPathFact,
@@ -1507,8 +1532,9 @@ mod tests {
 
     use super::{
         append_apply_patch_verification_status_output, assess_workspace_mutation_risk,
-        select_project_facts_workspace_root, verification_states_for_project_facts,
-        ApplyPatchVerificationStatusContext, WorkspaceMutationRiskLevel,
+        code_intel_language_snapshot_is_recordable, select_project_facts_workspace_root,
+        verification_states_for_project_facts, ApplyPatchVerificationStatusContext,
+        WorkspaceMutationRiskLevel,
     };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
     use serde_json::json;
@@ -1730,5 +1756,69 @@ mod tests {
             .expect("reason codes should be an array")
             .iter()
             .any(|code| code == "verification.not_required_after_patch"));
+    }
+
+    #[test]
+    fn workspace_patch_late_generation_has_zero_evidence_delta() {
+        let before = code_intel::DiagnosticSnapshot {
+            schema_version: 1,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/lib.rs".to_owned()],
+            provider_status: Vec::new(),
+            items: Vec::new(),
+            truncated: false,
+            degraded: false,
+            reason_codes: Vec::new(),
+        };
+        let after = code_intel::DiagnosticSnapshot {
+            items: vec![code_intel::CodeDiagnostic {
+                language: CodeIntelLanguage::Rust,
+                path: "src/lib.rs".to_owned(),
+                line: 1,
+                column: 1,
+                severity: code_intel::DiagnosticSeverity::Error,
+                code: Some("stale-secret-code".to_owned()),
+                message: "stale-secret-message".to_owned(),
+                source: "stale-secret-provider".to_owned(),
+            }],
+            reason_codes: vec![code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT.to_owned()],
+            ..before.clone()
+        };
+        let authority =
+            BTreeMap::from([(CodeIntelLanguage::Rust, CodeIntelProviderSnapshotAuthority::Stale)]);
+
+        let (before, after) =
+            code_intel::project_workspace_patch_diagnostic_pair(before, after, &authority);
+        let config = crate::config::CodeIntelConfig {
+            enabled: true,
+            ..crate::config::CodeIntelConfig::default()
+        };
+        let delta = code_intel::diagnostic_delta(&config, &before, &after);
+        let mut output = json!({});
+        code_intel::append_diagnostics_output(&mut output, delta.clone());
+        code_intel::append_patch_impact_output(
+            &mut output,
+            &[PathBuf::from("missing-workspace")],
+            &[attestation("src/lib.rs", "update")],
+            &before,
+            &after,
+            &delta,
+        );
+
+        assert_eq!(delta.new_errors, 0);
+        assert_eq!(delta.new_warnings, 0);
+        assert!(delta.items.is_empty());
+        assert!(delta.provider_status.is_empty());
+        assert!(!code_intel_language_snapshot_is_recordable(
+            &after,
+            code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+        ));
+        assert_eq!(output["patch_impact_analysis"]["diagnostics_before_count"], 0);
+        assert_eq!(output["patch_impact_analysis"]["diagnostics_after_count"], 0);
+        assert_eq!(output["patch_impact_analysis"]["new_errors"], 0);
+        let serialized =
+            serde_json::to_string(&output).expect("workspace patch evidence should serialize");
+        assert!(!serialized.contains("stale-secret"));
     }
 }

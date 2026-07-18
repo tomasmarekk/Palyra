@@ -294,7 +294,7 @@ impl NodeRpcServiceImpl {
         let networked_worker_reservation =
             dispatch.networked_worker_reservation.map(|reservation| {
                 node_v1::NetworkedWorkerDeliveryReservation {
-                    v: 1,
+                    v: 2,
                     request_id: Some(common_v1::CanonicalId { ulid: reservation.request_id }),
                     delivery_attempt_id: Some(common_v1::CanonicalId {
                         ulid: reservation.delivery_attempt_id,
@@ -307,6 +307,7 @@ impl NodeRpcServiceImpl {
                     run_id: Some(common_v1::CanonicalId { ulid: reservation.run_id }),
                     fleet_generation: reservation.fleet_generation,
                     expires_at_unix_ms: u64::try_from(reservation.expires_at_unix_ms).unwrap_or(0),
+                    run_generation: reservation.run_generation.get(),
                 }
             });
         node_v1::NodeCapabilityDispatch {
@@ -756,7 +757,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                         break;
                     }
                 } else if message.event_name == "capability.result" {
-                    let (request_id, delivery_attempt_id, result) =
+                    let (request_id, delivery_attempt_id, run_generation, result) =
                         match node_runtime::parse_capability_result_payload(&message.payload_json) {
                             Ok(result) => result,
                             Err(error) => {
@@ -768,6 +769,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                         device_id.as_str(),
                         request_id.as_str(),
                         delivery_attempt_id.as_deref(),
+                        run_generation,
                         result,
                         runtime.as_ref(),
                     ) {

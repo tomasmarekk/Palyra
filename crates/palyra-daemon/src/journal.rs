@@ -41,8 +41,8 @@ use palyra_common::runtime_contracts::{
     RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration,
     RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
     RuntimeStateCompatibilityFinding, RuntimeStateCompatibilityOutcome,
-    RuntimeStateCompatibilityReport, StableErrorEnvelope, ToolResultArtifactRef,
-    ToolResultSensitivity, ToolResultVisibility,
+    RuntimeStateCompatibilityReport, RuntimeSubsystem, StableErrorEnvelope, StaleEventDisposition,
+    ToolResultArtifactRef, ToolResultSensitivity, ToolResultVisibility,
 };
 use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use rusqlite::{
@@ -84,8 +84,6 @@ mod retrieval_index_status;
 mod shared_runtime;
 pub(crate) mod state_health;
 
-#[cfg(test)]
-pub use shared_runtime::NetworkedWorkerDispatchBeginOutcome;
 use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
 pub use shared_runtime::{
     NetworkedWorkerDeliveryReservationOutcome, NetworkedWorkerDeliveryReservationRequest,
@@ -95,9 +93,8 @@ pub use shared_runtime::{
     NetworkedWorkerExpiryOutboxRecord, NetworkedWorkerLeaseRevocation,
     NetworkedWorkerPayloadAcknowledgementOutcome, NetworkedWorkerPayloadAcknowledgementRequest,
     NetworkedWorkerPayloadReleaseOutcome, NetworkedWorkerPayloadReleaseRequest,
-    NetworkedWorkerResultAuthorizationOutcome, PersistedProcessLeaseRecord,
-    ProviderAttemptCompletionOutcome, ProviderAttemptCompletionRequest,
-    ProviderAttemptRuntimeAuthority, ProviderAttemptStartRequest,
+    PersistedProcessLeaseRecord, ProviderAttemptCompletionOutcome,
+    ProviderAttemptCompletionRequest, ProviderAttemptRuntimeAuthority, ProviderAttemptStartRequest,
     ProviderConfigurationAttemptCompletionOutcome, ProviderConfigurationAttemptCompletionRequest,
     ProviderConfigurationAttemptRuntimeAuthority, ProviderConfigurationAttemptStartRequest,
     RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeGenerationInvalidateRequest,
@@ -105,14 +102,19 @@ pub use shared_runtime::{
     SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
 };
 #[cfg(test)]
-pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInvalidateOutcome};
-pub(crate) use shared_runtime::{
-    RuntimeHealthActivationOutcome, RuntimeHealthComponentActivation,
-    RuntimeHealthObservationRequest, RuntimeHealthProbeReconciliationMode,
-    RuntimeHealthProbeReconciliationOutcome, RuntimeHealthProbeSettlementOutcome,
-    RuntimeHealthProbeSettlementRequest, RuntimeHealthQuarantineClearOutcome,
-    RuntimeHealthQuarantineClearRequest, ToolEffectObservationCommitOutcome,
+pub use shared_runtime::{
+    NetworkedWorkerDispatchBeginOutcome, NetworkedWorkerResultAuthorizationOutcome,
 };
+pub(crate) use shared_runtime::{
+    RunScopedRuntimeHealthObservationOutcome, RuntimeHealthActivationOutcome,
+    RuntimeHealthComponentActivation, RuntimeHealthObservationRequest,
+    RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
+    RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
+    RuntimeHealthQuarantineClearOutcome, RuntimeHealthQuarantineClearRequest,
+    ToolEffectObservationCommitOutcome,
+};
+#[cfg(test)]
+pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInvalidateOutcome};
 pub(crate) use shared_runtime::{RuntimeHealthProbeBeginOutcome, RuntimeHealthProbeBeginRequest};
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
@@ -1538,12 +1540,23 @@ pub(crate) struct NetworkedWorkerLifecycleCommit {
     pub event: palyra_workerd::WorkerLifecycleEvent,
 }
 
-/// Atomic worker lifecycle commit result, including any post-commit acknowledgement failure.
+/// Exact run-generation authority checked atomically before a worker lease transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkedWorkerRunGenerationAuthority {
+    pub session_id: String,
+    pub run_id: String,
+    pub generation: RuntimeGeneration,
+}
+
+/// Atomic worker lifecycle commit result.
 #[derive(Debug)]
-pub(crate) struct NetworkedWorkerLifecycleCommitOutcome {
-    pub fleet_generation: u64,
-    pub journal_outcomes: Vec<JournalAppendOutcome>,
-    pub acknowledgement_error: Option<JournalError>,
+pub(crate) enum NetworkedWorkerLifecycleCommitOutcome {
+    Committed {
+        fleet_generation: u64,
+        journal_outcomes: Vec<JournalAppendOutcome>,
+        acknowledgement_error: Option<JournalError>,
+    },
+    StaleSuppressed,
 }
 
 /// Result of appending one journal event (redaction flag and hash-chain links).
@@ -7223,6 +7236,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "shared_runtime_cleanup_and_quarantine_versions",
         sql: shared_runtime::MIGRATION_70_SQL,
     },
+    Migration {
+        version: 71,
+        name: "networked_worker_run_generation_authority",
+        sql: shared_runtime::MIGRATION_71_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -10281,6 +10299,10 @@ impl JournalStore {
     /// Atomically appends worker lifecycle evidence, revokes exact dispatch claims, and replaces
     /// the durable fleet snapshot.
     ///
+    /// When run authority is supplied, the same write transaction checks it before any lifecycle
+    /// or fleet mutation. A mismatch persists one metadata-only diagnostic and returns
+    /// [`NetworkedWorkerLifecycleCommitOutcome::StaleSuppressed`].
+    ///
     /// # Errors
     /// Returns [`JournalError`] when the fleet, lifecycle evidence, or exact revocation is invalid,
     /// journal capacity is exhausted, an event id conflicts, redaction fails, or SQLite cannot
@@ -10295,12 +10317,23 @@ impl JournalStore {
         updated_at_unix_ms: i64,
         revocations: &[NetworkedWorkerLeaseRevocation],
         settlement: Option<&NetworkedWorkerDispatchSettlement>,
+        run_authority: Option<&NetworkedWorkerRunGenerationAuthority>,
     ) -> Result<NetworkedWorkerLifecycleCommitOutcome, JournalError> {
         self.ensure_hash_chain_writes_allowed()?;
         if commits.is_empty() {
             return Err(JournalError::InvalidArgument(
                 "networked worker lifecycle commit requires evidence".to_owned(),
             ));
+        }
+        if let Some(authority) = run_authority {
+            if authority.session_id.trim().is_empty()
+                || authority.run_id.trim().is_empty()
+                || commits.iter().any(|commit| commit.request.run_id != authority.run_id)
+            {
+                return Err(JournalError::InvalidArgument(
+                    "networked worker lifecycle run authority is invalid".to_owned(),
+                ));
+            }
         }
         shared_runtime::validate_networked_worker_fleet_snapshot(
             fleet,
@@ -10332,6 +10365,34 @@ impl JournalStore {
         let created_at_unix_ms = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(authority) = run_authority {
+            let (generation_matches, expected_generation) =
+                shared_runtime::runtime_generation_fence_matches_tx(
+                    &transaction,
+                    authority.session_id.as_str(),
+                    authority.run_id.as_str(),
+                    RuntimeGenerationLane::Run,
+                    authority.generation,
+                )?;
+            if !generation_matches {
+                shared_runtime::record_runtime_stale_event_diagnostic_tx(
+                    &transaction,
+                    &RuntimeStaleEventDiagnosticRequest {
+                        session_id: authority.session_id.clone(),
+                        run_id: Some(authority.run_id.clone()),
+                        lane: RuntimeGenerationLane::Run,
+                        expected_generation,
+                        observed_generation: authority.generation,
+                        subsystem: RuntimeSubsystem::Worker,
+                        disposition: StaleEventDisposition::PersistedDiagnostic,
+                        reason_code: "runtime.worker.stale_lease_assignment_suppressed".to_owned(),
+                    },
+                    created_at_unix_ms,
+                )?;
+                transaction.commit()?;
+                return Ok(NetworkedWorkerLifecycleCommitOutcome::StaleSuppressed);
+            }
+        }
         let current_events: i64 =
             transaction.query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))?;
         let current_events = current_events.max(0) as usize;
@@ -10436,7 +10497,7 @@ impl JournalStore {
                 break;
             }
         }
-        Ok(NetworkedWorkerLifecycleCommitOutcome {
+        Ok(NetworkedWorkerLifecycleCommitOutcome::Committed {
             fleet_generation,
             journal_outcomes: outcomes,
             acknowledgement_error,
@@ -32528,11 +32589,11 @@ mod tests {
             RuntimeEventRedactionClass, RuntimeGeneration, RuntimeGenerationLane,
             RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1, RuntimeHandleKind,
             RuntimeHandleState, RuntimeHealthState, RuntimeIdempotencyClass, RuntimeIdentityKind,
-            RuntimeInstanceId, RuntimeLeaseId, RuntimeOperationId, RuntimeStateAdmissionPosture,
-            RuntimeStateCompatibilityOutcome, RuntimeSubsystem, RuntimeToolExecutionId,
-            SideEffectFenceState, SideEffectFenceV1, SideEffectRestartPolicy,
-            SideEffectRetryDecision, ToolExecutionSemantics, ToolResultSensitivity,
-            ToolResultVisibility, HEALTH_PROBE_RESULT_SCHEMA_VERSION,
+            RuntimeInstanceId, RuntimeLeaseId, RuntimeOperationId, RuntimeRunId, RuntimeSessionId,
+            RuntimeStateAdmissionPosture, RuntimeStateCompatibilityOutcome, RuntimeSubsystem,
+            RuntimeToolExecutionId, SideEffectFenceState, SideEffectFenceV1,
+            SideEffectRestartPolicy, SideEffectRetryDecision, ToolExecutionSemantics,
+            ToolResultSensitivity, ToolResultVisibility, HEALTH_PROBE_RESULT_SCHEMA_VERSION,
             HEALTH_PROBE_SETTLEMENT_SCHEMA_VERSION,
         },
     };
@@ -32586,7 +32647,8 @@ mod tests {
         ProviderAttemptCompletionRequest, ProviderAttemptStartRequest,
         ProviderConfigurationAttemptCompletionOutcome,
         ProviderConfigurationAttemptCompletionRequest, ProviderConfigurationAttemptStartRequest,
-        RecallArtifactCreateRequest, RecallArtifactListFilter, RuntimeEventAppendOutcome,
+        RecallArtifactCreateRequest, RecallArtifactListFilter,
+        RunScopedRuntimeHealthObservationOutcome, RuntimeEventAppendOutcome,
         RuntimeEventAppendRequest, RuntimeGenerationActivateRequest,
         RuntimeGenerationInvalidateOutcome, RuntimeGenerationInvalidateRequest,
         RuntimeHealthComponentActivation, RuntimeHealthObservationRequest,
@@ -35878,6 +35940,19 @@ mod tests {
         run_id: &str,
         now_unix_ms: i64,
     ) -> palyra_workerd::WorkerLease {
+        let session_id = format!("session-{run_id}");
+        upsert_orchestrator_session(store, session_id.as_str());
+        store
+            .start_orchestrator_run(&super::OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: session_id.clone(),
+                origin_kind: "manual".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("system:test".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .expect("worker authority run should start");
         let attestation = palyra_workerd::WorkerAttestation {
             worker_id: worker_id.to_owned(),
             image_digest_sha256: "a".repeat(64),
@@ -35929,7 +36004,7 @@ mod tests {
                 &[NetworkedWorkerLifecycleCommit {
                     request: JournalAppendRequest {
                         event_id: format!("worker-test-authority:{}", Ulid::new()),
-                        session_id: format!("session-{run_id}"),
+                        session_id,
                         run_id: run_id.to_owned(),
                         kind: 0,
                         actor: 0,
@@ -35954,6 +36029,7 @@ mod tests {
                 now_unix_ms,
                 &[],
                 None,
+                None,
             )
             .expect("worker fleet authority should persist");
         lease
@@ -35970,7 +36046,10 @@ mod tests {
             node_request_id: node_request_id.to_owned(),
             worker_id: lease.worker_id.clone(),
             lease_id: lease.lease_id.clone(),
+            session_id: format!("session-{}", lease.run_id),
             run_id: lease.run_id.clone(),
+            run_generation: RuntimeGeneration::new(1)
+                .expect("initial test run generation should be valid"),
             lease_expires_at_unix_ms: lease.expires_at_unix_ms,
             capability: "tool:palyra.echo".to_owned(),
             request_sha256: sha256_hex(payload_label.as_bytes()),
@@ -37515,6 +37594,685 @@ mod tests {
     }
 
     #[test]
+    fn networked_worker_generation_migration_preserves_legacy_rows_fail_closed() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 70);
+        let connection = Connection::open(db_path.clone()).expect("v70 journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-active', 'node-v70-active', 'worker-v70',
+                        'lease-v70-active', 'run-v70-active', 0, NULL, NULL, 100,
+                        'tool:palyra.echo', ?1, 'queued', NULL, NULL, 10, 10, NULL, 3, 0
+                    )
+                "#,
+                params![sha256_hex(b"v70-active")],
+            )
+            .expect("legacy active dispatch claim should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_attempt_ulid,
+                        delivery_token_sha256, delivery_reserved_at_unix_ms,
+                        payload_released_at_unix_ms, payload_release_fleet_generation,
+                        payload_acknowledged_at_unix_ms, delivery_disposition,
+                        delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-unreleased', 'node-v70-unreleased', 'worker-v70',
+                        'lease-v70-unreleased', 'run-v70-unreleased', 0, 0, NULL, 100,
+                        'tool:palyra.echo', ?1, 'in_flight', NULL, NULL, 10, 11, NULL, 3,
+                        'delivery-v70-unreleased', ?2, 11, NULL, NULL, NULL,
+                        'reserved_unreleased', 1
+                    )
+                "#,
+                params![sha256_hex(b"v70-unreleased"), sha256_hex(b"v70-delivery-token"),],
+            )
+            .expect("legacy unreleased dispatch claim should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_attempt_ulid,
+                        delivery_token_sha256, delivery_reserved_at_unix_ms,
+                        payload_released_at_unix_ms, payload_release_fleet_generation,
+                        payload_acknowledged_at_unix_ms, delivery_disposition,
+                        delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-revoked', 'node-v70-revoked', 'worker-v70',
+                        'lease-v70-revoked', 'run-v70-revoked', 0, 0, 1, 100,
+                        'tool:palyra.echo', ?1, 'reconciling', 'lease_revoked',
+                        'worker.dispatch.lease_revoked', 10, 13, NULL, 3,
+                        'delivery-v70-revoked', ?2, 11, 12, 0, NULL,
+                        'released_unacknowledged', 0
+                    )
+                "#,
+                params![sha256_hex(b"v70-revoked"), sha256_hex(b"v70-revoked-delivery-token"),],
+            )
+            .expect("legacy revoked dispatch claim should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-terminal', 'node-v70-terminal', 'worker-v70',
+                        'lease-v70-terminal', 'run-v70-terminal', 0, NULL, NULL, 100,
+                        'tool:palyra.echo', ?1, 'cancelled', NULL,
+                        'worker.dispatch.legacy_cancelled', 10, 20, 20, 3, NULL
+                    )
+                "#,
+                params![sha256_hex(b"v70-terminal")],
+            )
+            .expect("legacy terminal dispatch evidence should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v70 database should upgrade through migration 71");
+        let startup = store.startup_runtime_state_compatibility_report();
+        assert_eq!(startup.findings.len(), 1);
+        assert_eq!(startup.findings[0].observed_schema_version, Some(70));
+        assert_eq!(startup.findings[0].outcome, RuntimeStateCompatibilityOutcome::Migrated);
+
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("migrated legacy claims should remain inspectable");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(report.findings.is_empty());
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    "remote-v70-active",
+                    "node-v70-active",
+                    "worker-v70",
+                )
+                .expect("legacy callback authorization should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    "remote-v70-revoked",
+                    "node-v70-revoked",
+                    "worker-v70",
+                )
+                .expect("legacy revoked callback authorization should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    "remote-v70-unreleased",
+                    "node-v70-unreleased",
+                    "worker-v70",
+                )
+                .expect("legacy unreleased callback authorization should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        let active = store
+            .networked_worker_dispatch_claim("remote-v70-active")
+            .expect("legacy active claim should load")
+            .expect("legacy active claim should remain available for reconciliation");
+        assert_eq!(active.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(
+            active.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation")
+        );
+        assert_eq!(
+            active.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.legacy_missing_run_generation")
+        );
+        assert_eq!(active.session_id, None);
+        assert_eq!(active.run_generation, None);
+        let unreleased = store
+            .networked_worker_dispatch_claim("remote-v70-unreleased")
+            .expect("legacy unreleased claim should load")
+            .expect("legacy unreleased claim should remain available for reconciliation");
+        assert_eq!(unreleased.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(
+            unreleased.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation")
+        );
+        assert_eq!(
+            unreleased.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.legacy_missing_run_generation")
+        );
+        assert_eq!(unreleased.session_id, None);
+        assert_eq!(unreleased.run_generation, None);
+        assert_eq!(unreleased.dispatch_fleet_generation, Some(0));
+        assert_eq!(unreleased.delivery_attempt_id.as_deref(), Some("delivery-v70-unreleased"));
+        let expected_delivery_token_sha256 = sha256_hex(b"v70-delivery-token");
+        assert_eq!(
+            unreleased.delivery_token_sha256.as_deref(),
+            Some(expected_delivery_token_sha256.as_str())
+        );
+        assert_eq!(unreleased.delivery_reserved_at_unix_ms, Some(11));
+        assert_eq!(unreleased.payload_released_at_unix_ms, None);
+        assert_eq!(unreleased.payload_release_fleet_generation, None);
+        assert_eq!(unreleased.payload_acknowledged_at_unix_ms, None);
+        assert_eq!(unreleased.delivery_disposition.as_deref(), Some("reserved_unreleased"));
+        assert_eq!(unreleased.delivery_payload_present, Some(true));
+        let revoked = store
+            .networked_worker_dispatch_claim("remote-v70-revoked")
+            .expect("legacy revoked claim should load")
+            .expect("legacy revoked claim should remain auditable");
+        assert_eq!(revoked.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(revoked.reconciliation_disposition.as_deref(), Some("lease_revoked"));
+        assert_eq!(revoked.terminal_reason_code.as_deref(), Some("worker.dispatch.lease_revoked"));
+        assert_eq!(revoked.session_id, None);
+        assert_eq!(revoked.run_generation, None);
+        assert_eq!(revoked.dispatch_fleet_generation, Some(0));
+        assert_eq!(revoked.revoked_fleet_generation, Some(1));
+        assert_eq!(revoked.delivery_attempt_id.as_deref(), Some("delivery-v70-revoked"));
+        assert_eq!(revoked.delivery_reserved_at_unix_ms, Some(11));
+        assert_eq!(revoked.payload_released_at_unix_ms, Some(12));
+        assert_eq!(revoked.payload_release_fleet_generation, Some(0));
+        assert_eq!(revoked.payload_acknowledged_at_unix_ms, None);
+        assert_eq!(revoked.delivery_disposition.as_deref(), Some("released_unacknowledged"));
+        assert_eq!(revoked.delivery_payload_present, Some(false));
+        let terminal = store
+            .networked_worker_dispatch_claim("remote-v70-terminal")
+            .expect("legacy terminal evidence should load")
+            .expect("legacy terminal evidence should remain auditable");
+        assert_eq!(terminal.session_id, None);
+        assert_eq!(terminal.run_generation, None);
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("migration 71 database should reopen idempotently");
+        assert!(reopened.startup_runtime_state_compatibility_report().findings.is_empty());
+        let reopened_active = reopened
+            .networked_worker_dispatch_claim("remote-v70-active")
+            .expect("reopened legacy active claim should load")
+            .expect("reopened legacy active claim should remain reconcilable");
+        assert_eq!(reopened_active.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(
+            reopened_active.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation")
+        );
+        assert_eq!(reopened_active.session_id, None);
+        assert_eq!(reopened_active.run_generation, None);
+        let reopened_unreleased = reopened
+            .networked_worker_dispatch_claim("remote-v70-unreleased")
+            .expect("reopened legacy unreleased claim should load")
+            .expect("reopened legacy unreleased claim should remain reconcilable");
+        assert_eq!(reopened_unreleased, unreleased);
+        let reopened_revoked = reopened
+            .networked_worker_dispatch_claim("remote-v70-revoked")
+            .expect("reopened legacy revoked claim should load")
+            .expect("reopened legacy revoked claim should remain auditable");
+        assert_eq!(reopened_revoked, revoked);
+        drop(reopened);
+
+        let connection = Connection::open(db_path).expect("migrated journal db should reopen");
+        let applied: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 71 AND name = 'networked_worker_run_generation_authority'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration 71 marker should load");
+        assert_eq!(applied, 1);
+        for table in [
+            "runtime_networked_worker_dispatch_claims",
+            "runtime_networked_worker_dispatch_claim_terminal_evidence",
+        ] {
+            for column in ["session_ulid", "run_generation"] {
+                assert!(
+                    table_has_column(&connection, table, column),
+                    "{table} should contain {column} after migration 71"
+                );
+            }
+        }
+        let active_authority: (Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT session_ulid, run_generation FROM runtime_networked_worker_dispatch_claims WHERE remote_request_ulid = 'remote-v70-active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy active authority should load");
+        let terminal_authority: (Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT session_ulid, run_generation FROM runtime_networked_worker_dispatch_claim_terminal_evidence WHERE remote_request_ulid = 'remote-v70-terminal'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy terminal authority should load");
+        let unreleased_authority: (Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT session_ulid, run_generation FROM runtime_networked_worker_dispatch_claims WHERE remote_request_ulid = 'remote-v70-unreleased'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy unreleased authority should load");
+        assert_eq!(active_authority, (None, None));
+        assert_eq!(terminal_authority, (None, None));
+        assert_eq!(unreleased_authority, (None, None));
+    }
+
+    #[test]
+    fn networked_worker_generation_migration_preserves_suspicious_queued_evidence() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 70);
+        let connection = Connection::open(db_path.clone()).expect("v70 journal db should reopen");
+        let delivery_token_sha256 = sha256_hex(b"v70-suspicious-delivery-token");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_attempt_ulid,
+                        delivery_token_sha256, delivery_reserved_at_unix_ms,
+                        payload_released_at_unix_ms, payload_release_fleet_generation,
+                        payload_acknowledged_at_unix_ms, delivery_disposition,
+                        delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-suspicious', 'node-v70-suspicious', 'worker-v70',
+                        'lease-v70-suspicious', 'run-v70-suspicious', 0, 0, NULL, 100,
+                        'tool:palyra.echo', ?1, 'queued', NULL, NULL, 10, 13, NULL, 3,
+                        'delivery-v70-suspicious', ?2, 11, 12, 0, 13, 'acknowledged', 0
+                    )
+                "#,
+                params![sha256_hex(b"v70-suspicious"), delivery_token_sha256.as_str()],
+            )
+            .expect("suspicious legacy queued dispatch claim should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v70 database with suspicious evidence should remain inspectable");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("suspicious queued evidence should be compatibility-scanned");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.observed_schema_version == Some(3)
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+                && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+                && finding.blocks_admission
+        }));
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    "remote-v70-suspicious",
+                    "node-v70-suspicious",
+                    "worker-v70",
+                )
+                .expect("suspicious callback authorization should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        drop(store);
+
+        let connection =
+            Connection::open(db_path.clone()).expect("migrated journal db should open");
+        let identity_evidence: (String, Option<i64>, Option<String>, Option<String>) = connection
+            .query_row(
+                r#"
+                    SELECT state, dispatch_fleet_generation, delivery_attempt_ulid,
+                           delivery_token_sha256
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = 'remote-v70-suspicious'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("suspicious queued identity evidence should load");
+        let delivery_timestamps: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                r#"
+                    SELECT delivery_reserved_at_unix_ms, payload_released_at_unix_ms,
+                           payload_release_fleet_generation, payload_acknowledged_at_unix_ms
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = 'remote-v70-suspicious'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("suspicious queued delivery timestamps should load");
+        let delivery_posture: (Option<String>, Option<i64>, Option<String>, Option<i64>) =
+            connection
+                .query_row(
+                    r#"
+                    SELECT delivery_disposition, delivery_payload_present,
+                           session_ulid, run_generation
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = 'remote-v70-suspicious'
+                "#,
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("suspicious queued delivery posture should load");
+        assert_eq!(
+            identity_evidence,
+            (
+                "queued".to_owned(),
+                Some(0),
+                Some("delivery-v70-suspicious".to_owned()),
+                Some(delivery_token_sha256),
+            )
+        );
+        assert_eq!(delivery_timestamps, (Some(11), Some(12), Some(0), Some(13)));
+        assert_eq!(delivery_posture, (Some("acknowledged".to_owned()), Some(0), None, None));
+        let applied: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 71", [], |row| {
+                row.get(0)
+            })
+            .expect("migration 71 marker should load");
+        assert_eq!(applied, 1);
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("quarantined migration database should reopen idempotently");
+        let reopened_report = reopened
+            .runtime_state_compatibility_report()
+            .expect("reopened suspicious evidence should remain compatibility-scanned");
+        assert_eq!(reopened_report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(reopened_report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+                && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+        }));
+    }
+
+    #[test]
+    fn networked_worker_generation_migration_preserves_suspicious_in_flight_evidence() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 70);
+        let connection = Connection::open(db_path.clone()).expect("v70 journal db should reopen");
+        let delivery_token_sha256 = sha256_hex(b"v70-suspicious-in-flight-delivery-token");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_attempt_ulid,
+                        delivery_token_sha256, delivery_reserved_at_unix_ms,
+                        payload_released_at_unix_ms, payload_release_fleet_generation,
+                        payload_acknowledged_at_unix_ms, delivery_disposition,
+                        delivery_payload_present
+                    ) VALUES (
+                        'remote-v70-suspicious-in-flight',
+                        'node-v70-suspicious-in-flight',
+                        'worker-v70',
+                        'lease-v70-suspicious-in-flight',
+                        'run-v70-suspicious-in-flight',
+                        0, 0, 1, 100,
+                        'tool:palyra.echo', ?1, 'in_flight', NULL, NULL, 10, 11, NULL, 3,
+                        'delivery-v70-suspicious-in-flight', ?2, 11, NULL, NULL, NULL,
+                        'reserved_unreleased', 1
+                    )
+                "#,
+                params![sha256_hex(b"v70-suspicious-in-flight"), delivery_token_sha256.as_str(),],
+            )
+            .expect("suspicious legacy in-flight dispatch claim should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v70 database with suspicious in-flight evidence should remain inspectable");
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("suspicious in-flight evidence should be compatibility-scanned");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.observed_schema_version == Some(3)
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+                && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+                && finding.blocks_admission
+        }));
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    "remote-v70-suspicious-in-flight",
+                    "node-v70-suspicious-in-flight",
+                    "worker-v70",
+                )
+                .expect("suspicious in-flight callback authorization should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        drop(store);
+
+        let connection =
+            Connection::open(db_path.clone()).expect("migrated journal db should open");
+        type StateEvidence = (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+        let state_evidence: StateEvidence = connection
+            .query_row(
+                r#"
+                    SELECT state, dispatch_fleet_generation, revoked_fleet_generation,
+                           reconciliation_disposition, terminal_reason_code,
+                           session_ulid, run_generation
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = 'remote-v70-suspicious-in-flight'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("suspicious in-flight state evidence should load");
+        type DeliveryEvidence = (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        );
+        let delivery_evidence: DeliveryEvidence = connection
+            .query_row(
+                r#"
+                    SELECT delivery_attempt_ulid, delivery_token_sha256,
+                           delivery_reserved_at_unix_ms, payload_released_at_unix_ms,
+                           payload_release_fleet_generation, payload_acknowledged_at_unix_ms,
+                           delivery_disposition, delivery_payload_present
+                    FROM runtime_networked_worker_dispatch_claims
+                    WHERE remote_request_ulid = 'remote-v70-suspicious-in-flight'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("suspicious in-flight delivery evidence should load");
+        assert_eq!(
+            state_evidence,
+            ("in_flight".to_owned(), Some(0), Some(1), None, None, None, None,)
+        );
+        assert_eq!(
+            delivery_evidence,
+            (
+                Some("delivery-v70-suspicious-in-flight".to_owned()),
+                Some(delivery_token_sha256),
+                Some(11),
+                None,
+                None,
+                None,
+                Some("reserved_unreleased".to_owned()),
+                Some(1),
+            )
+        );
+        let applied: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 71", [], |row| {
+                row.get(0)
+            })
+            .expect("migration 71 marker should load");
+        assert_eq!(applied, 1);
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("quarantined in-flight migration database should reopen idempotently");
+        let reopened_report = reopened
+            .runtime_state_compatibility_report()
+            .expect("reopened suspicious in-flight evidence should remain compatibility-scanned");
+        assert_eq!(reopened_report.admission, RuntimeStateAdmissionPosture::Blocked);
+        assert!(reopened_report.findings.iter().any(|finding| {
+            finding.contract == "runtime_networked_worker_dispatch_claims"
+                && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+                && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+        }));
+    }
+
+    #[test]
+    fn networked_worker_generation_authority_pairing_and_legacy_posture_are_exact() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        drop(store);
+
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claims (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_disposition,
+                        delivery_payload_present, session_ulid, run_generation
+                    ) VALUES (
+                        'remote-v71-mislabeled', 'node-v71-mislabeled', 'worker-v71',
+                        'lease-v71-mislabeled', 'run-v71-mislabeled', 0, NULL, NULL, 100,
+                        'tool:palyra.echo', ?1, 'reconciling',
+                        'legacy_missing_run_generation',
+                        'worker.dispatch.legacy_missing_run_generation',
+                        10, 10, NULL, 3, 'legacy_unfenced_unknown', NULL,
+                        'session-v71-mislabeled', 1
+                    )
+                "#,
+                params![sha256_hex(b"v71-mislabeled")],
+            )
+            .expect("mislabeled current dispatch claim should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present,
+                        session_ulid, run_generation
+                    ) VALUES (
+                        'remote-v71-partial', 'node-v71-partial', 'worker-v71',
+                        'lease-v71-partial', 'run-v71-partial', 0, NULL, NULL, 100,
+                        'tool:palyra.echo', ?1, 'cancelled', NULL,
+                        'worker.dispatch.test_cancelled', 10, 20, 20, 3, 0,
+                        'session-v71-partial', NULL
+                    )
+                "#,
+                params![sha256_hex(b"v71-partial")],
+            )
+            .expect("partial terminal dispatch authority should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_networked_worker_dispatch_claim_terminal_evidence (
+                        remote_request_ulid, node_request_ulid, worker_id, lease_ulid, run_ulid,
+                        issued_fleet_generation, dispatch_fleet_generation,
+                        revoked_fleet_generation, lease_expires_at_unix_ms,
+                        capability, request_sha256, state, reconciliation_disposition,
+                        terminal_reason_code, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms, schema_version, delivery_payload_present,
+                        session_ulid, run_generation
+                    ) VALUES (
+                        'remote-v71-generation-only', 'node-v71-generation-only', 'worker-v71',
+                        'lease-v71-generation-only', 'run-v71-generation-only',
+                        0, NULL, NULL, 100, 'tool:palyra.echo', ?1, 'cancelled', NULL,
+                        'worker.dispatch.test_cancelled', 10, 20, 20, 3, 0, NULL, 1
+                    )
+                "#,
+                params![sha256_hex(b"v71-generation-only")],
+            )
+            .expect("generation-only terminal dispatch authority should insert");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("malformed generation authority should remain inspectable");
+        let report = reopened
+            .runtime_state_compatibility_report()
+            .expect("generation authority compatibility should scan exact evidence");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Blocked);
+        let invalid_dispatch_findings = report
+            .findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.contract.as_str(),
+                    "runtime_networked_worker_dispatch_claims"
+                        | "runtime_networked_worker_dispatch_claim_terminal_evidence"
+                ) && finding.outcome == RuntimeStateCompatibilityOutcome::QuarantinedCorrupt
+                    && finding.reason_code == "runtime.compatibility.invalid_exact_evidence"
+                    && finding.blocks_admission
+            })
+            .count();
+        assert_eq!(invalid_dispatch_findings, 3);
+        assert!(reopened.networked_worker_dispatch_claim("remote-v71-mislabeled").is_err());
+        assert!(reopened.networked_worker_dispatch_claim("remote-v71-partial").is_err());
+        assert!(reopened.networked_worker_dispatch_claim("remote-v71-generation-only").is_err());
+    }
+
+    #[test]
     fn runtime_health_lifecycle_migration_backfills_heads_without_inventing_evidence() {
         let db_path = temp_db_path();
         create_journal_fixture_through(db_path.as_path(), 62);
@@ -38418,13 +39176,23 @@ mod tests {
         drop(connection);
 
         let store = JournalStore::open(test_journal_config(db_path.clone(), false))
-            .expect("migration 61 should apply");
+            .expect("worker dispatch migrations should apply");
         let active = store
             .networked_worker_dispatch_claim("remote-migration-61-active")
             .expect("migrated active claim should load")
             .expect("migrated active claim should remain auditable");
         assert_eq!(active.schema_version, 3);
-        assert_eq!(active.state, NetworkedWorkerDispatchClaimState::Queued);
+        assert_eq!(active.state, NetworkedWorkerDispatchClaimState::Reconciling);
+        assert_eq!(
+            active.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation")
+        );
+        assert_eq!(
+            active.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.legacy_missing_run_generation")
+        );
+        assert_eq!(active.session_id, None);
+        assert_eq!(active.run_generation, None);
         assert!(active.validated_result_sha256.is_none());
         assert!(active.result_observed_at_unix_ms.is_none());
         let terminal = store
@@ -38432,6 +39200,8 @@ mod tests {
             .expect("terminal claim should load")
             .expect("terminal claim should remain auditable");
         assert_eq!(terminal.schema_version, 2);
+        assert_eq!(terminal.session_id, None);
+        assert_eq!(terminal.run_generation, None);
         assert!(terminal.validated_result_sha256.is_none());
         assert!(terminal.result_observed_at_unix_ms.is_none());
         drop(store);
@@ -38474,15 +39244,19 @@ mod tests {
         drop(connection);
 
         let reopened = JournalStore::open(test_journal_config(db_path, false))
-            .expect("migration 61 reopen should be idempotent");
+            .expect("worker dispatch migration reopen should be idempotent");
+        let reopened_active = reopened
+            .networked_worker_dispatch_claim("remote-migration-61-active")
+            .expect("reopened active claim should load")
+            .expect("reopened active claim should remain auditable");
+        assert_eq!(reopened_active.schema_version, 3);
+        assert_eq!(reopened_active.state, NetworkedWorkerDispatchClaimState::Reconciling);
         assert_eq!(
-            reopened
-                .networked_worker_dispatch_claim("remote-migration-61-active")
-                .expect("reopened active claim should load")
-                .expect("reopened active claim should remain auditable")
-                .schema_version,
-            3
+            reopened_active.reconciliation_disposition.as_deref(),
+            Some("legacy_missing_run_generation")
         );
+        assert_eq!(reopened_active.session_id, None);
+        assert_eq!(reopened_active.run_generation, None);
     }
 
     #[test]
@@ -38775,7 +39549,9 @@ mod tests {
                 remote_request_id: request.remote_request_id.clone(),
                 worker_id: request.worker_id.clone(),
                 lease_id: request.lease_id.clone(),
+                session_id: request.session_id.clone(),
                 run_id: request.run_id.clone(),
+                run_generation: request.run_generation,
                 delivery_attempt_id: None,
                 validated_result_sha256: super::sha256_hex(b"rejected-settlement"),
                 observed_at_unix_ms: now_unix_ms.saturating_add(2),
@@ -38908,6 +39684,111 @@ mod tests {
                 .expect("exact abort replay should classify"),
             super::NetworkedWorkerDispatchAbortBeforeReleaseOutcome::AlreadyAborted
         );
+    }
+
+    #[test]
+    fn networked_worker_restart_reconciliation_preserves_unreleased_reservation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let now_unix_ms = 11_500;
+        let lease = seed_networked_worker_dispatch_authority(
+            &store,
+            "worker-claim-restart",
+            "run-claim-restart",
+            now_unix_ms,
+        );
+        let request = dispatch_claim_request(
+            &lease,
+            "remote-claim-restart",
+            "node-claim-restart",
+            "claim-restart-payload",
+        );
+        store
+            .create_networked_worker_dispatch_claim(&request, 1, now_unix_ms)
+            .expect("dispatch claim should create");
+        let delivery_attempt_id = "delivery-claim-restart".to_owned();
+        let delivery_token_sha256 = super::sha256_hex(b"claim-restart-delivery-token");
+        let fleet_generation = match store
+            .reserve_networked_worker_delivery(&super::NetworkedWorkerDeliveryReservationRequest {
+                remote_request_id: request.remote_request_id.clone(),
+                node_request_id: request.node_request_id.clone(),
+                request_sha256: request.request_sha256.clone(),
+                delivery_attempt_id: delivery_attempt_id.clone(),
+                delivery_token_sha256: delivery_token_sha256.clone(),
+                observed_at_unix_ms: now_unix_ms.saturating_add(1),
+            })
+            .expect("dispatch should reserve")
+        {
+            super::NetworkedWorkerDeliveryReservationOutcome::Authorized { fleet_generation } => {
+                fleet_generation
+            }
+            super::NetworkedWorkerDeliveryReservationOutcome::Rejected => {
+                panic!("exact dispatch authority should be accepted")
+            }
+        };
+
+        assert_eq!(
+            store
+                .reconcile_networked_worker_dispatch_claims_after_restart(
+                    4,
+                    now_unix_ms.saturating_add(2),
+                )
+                .expect("restart reconciliation should commit"),
+            1
+        );
+        let cancelled = store
+            .networked_worker_dispatch_claim(request.remote_request_id.as_str())
+            .expect("restart-cancelled claim should validate")
+            .expect("restart-cancelled claim should remain auditable");
+        assert_eq!(cancelled.state, NetworkedWorkerDispatchClaimState::Cancelled);
+        assert_eq!(
+            cancelled.reconciliation_disposition.as_deref(),
+            Some("payload_lost_on_restart")
+        );
+        assert_eq!(
+            cancelled.terminal_reason_code.as_deref(),
+            Some("worker.dispatch.cancelled_after_restart")
+        );
+        assert_eq!(cancelled.dispatch_fleet_generation, Some(fleet_generation));
+        assert_eq!(cancelled.delivery_attempt_id.as_deref(), Some(delivery_attempt_id.as_str()));
+        assert_eq!(
+            cancelled.delivery_token_sha256.as_deref(),
+            Some(delivery_token_sha256.as_str())
+        );
+        assert_eq!(cancelled.delivery_reserved_at_unix_ms, Some(now_unix_ms.saturating_add(1)));
+        assert_eq!(cancelled.delivery_disposition.as_deref(), Some("reserved_unreleased"));
+        assert_eq!(cancelled.delivery_payload_present, Some(false));
+        assert_eq!(cancelled.completed_at_unix_ms, Some(now_unix_ms.saturating_add(2)));
+        assert_eq!(
+            store
+                .authorize_networked_worker_result(
+                    request.remote_request_id.as_str(),
+                    request.node_request_id.as_str(),
+                    request.worker_id.as_str(),
+                )
+                .expect("restart-cancelled callback should remain inspectable"),
+            super::NetworkedWorkerResultAuthorizationOutcome::Rejected
+        );
+        let report = store
+            .runtime_state_compatibility_report()
+            .expect("restart-cancelled claim should scan");
+        assert_eq!(report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(report.findings.is_empty());
+        drop(store);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("restart-cancelled journal should reopen");
+        let reopened_claim = reopened
+            .networked_worker_dispatch_claim(request.remote_request_id.as_str())
+            .expect("reopened restart-cancelled claim should validate")
+            .expect("reopened restart-cancelled claim should remain auditable");
+        assert_eq!(reopened_claim, cancelled);
+        let reopened_report = reopened
+            .runtime_state_compatibility_report()
+            .expect("reopened restart-cancelled claim should scan");
+        assert_eq!(reopened_report.admission, RuntimeStateAdmissionPosture::Ready);
+        assert!(reopened_report.findings.is_empty());
     }
 
     #[test]
@@ -42589,6 +43470,119 @@ mod tests {
         let stale = observe(false, "runtime.health.test_stale", 60)
             .expect_err("stale generation observation must fail closed");
         assert!(matches!(stale, JournalError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn run_scoped_health_observation_has_zero_mutation_after_generation_supersession() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
+        let session_id = "session_worker_health_generation";
+        let run_id = "run_worker_health_generation";
+        let session_identity =
+            RuntimeSessionId::parse(session_id).expect("session id should validate");
+        let run_identity = RuntimeRunId::parse(run_id).expect("run id should validate");
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let run_generation = store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("run generation should load")
+            .expect("run generation should be active")
+            .generation;
+
+        let component_id = RuntimeInstanceId::parse("worker:run-scoped-health")
+            .expect("component id should validate");
+        let activation = store
+            .activate_runtime_health_components(
+                &[RuntimeHealthComponentActivation {
+                    component_id: component_id.clone(),
+                    authority_class: RuntimeAuthorityClass::PrivilegedMutation,
+                    fallback_component_id: None,
+                    fallback_authority_class: None,
+                    policy: palyra_common::runtime_contracts::CircuitBreakerPolicy {
+                        strike_threshold: 3,
+                        cooldown_ms: 1_000,
+                        max_probe_concurrency: 1,
+                        security_quarantine_auto_clear: false,
+                    },
+                    reason_code: "runtime.health.worker_activated".to_owned(),
+                }],
+                10,
+            )
+            .expect("worker health should activate");
+        let component_generation = activation.generations[component_id.as_str()];
+        let applied = store
+            .record_runtime_health_observation_for_run(
+                &RuntimeHealthObservationRequest {
+                    component_id: component_id.clone(),
+                    expected_generation: component_generation,
+                    succeeded: false,
+                    reason_code: "runtime.health.worker_dispatch_unavailable".to_owned(),
+                    observed_at_unix_ms: 20,
+                },
+                &session_identity,
+                &run_identity,
+                run_generation,
+            )
+            .expect("current run health observation should classify");
+        assert!(matches!(applied, RunScopedRuntimeHealthObservationOutcome::Applied(_)));
+        let health_before_stale = store
+            .runtime_component_health(component_id.as_str())
+            .expect("worker health should load")
+            .expect("worker health should exist");
+        assert_eq!(health_before_stale.state, RuntimeHealthState::Degraded);
+
+        let replacement = store
+            .supersede_run_runtime_generation(
+                session_id,
+                run_id,
+                "runtime.generation.test_superseded",
+            )
+            .expect("run generation should supersede");
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        let events_before_stale: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_component_health_events WHERE component_ulid = ?1",
+                params![component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("worker health events should count");
+
+        let stale = store
+            .record_runtime_health_observation_for_run(
+                &RuntimeHealthObservationRequest {
+                    component_id: component_id.clone(),
+                    expected_generation: component_generation,
+                    succeeded: true,
+                    reason_code: "runtime.health.worker_dispatch_succeeded".to_owned(),
+                    observed_at_unix_ms: 30,
+                },
+                &session_identity,
+                &run_identity,
+                run_generation,
+            )
+            .expect("stale run health observation should classify");
+        assert_eq!(
+            stale,
+            RunScopedRuntimeHealthObservationOutcome::Stale {
+                expected_generation: Some(replacement.generation),
+            }
+        );
+        assert_eq!(
+            store
+                .runtime_component_health(component_id.as_str())
+                .expect("worker health should reload")
+                .expect("worker health should remain active"),
+            health_before_stale
+        );
+        let events_after_stale: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_component_health_events WHERE component_ulid = ?1",
+                params![component_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("worker health events should recount");
+        assert_eq!(events_after_stale, events_before_stale);
     }
 
     fn runtime_health_fixture(
