@@ -4570,6 +4570,12 @@ fn wait_for_process_not_alive(pid: u32, max_wait: Duration) -> bool {
     }
 }
 
+/// Waits for an ownership-root PID to be reaped in cross-module regression tests.
+#[cfg(test)]
+pub(crate) fn wait_for_background_process_reap_for_test(pid: u32, max_wait: Duration) -> bool {
+    wait_for_process_not_alive(pid, max_wait)
+}
+
 fn parse_builtin_pid_arg(command: &str, args: &[String]) -> Result<u32, SandboxProcessRunError> {
     let pid_arg = match args {
         [pid] => pid.as_str(),

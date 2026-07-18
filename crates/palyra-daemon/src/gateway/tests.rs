@@ -12683,6 +12683,20 @@ async fn start_registered_background_process_for_reconciliation_test(
 }
 
 #[cfg(not(target_os = "macos"))]
+fn assert_reconciled_background_process_inactive(root: u32) {
+    let status = crate::sandbox_runner::background_process_runtime_status(root)
+        .expect("committed ownership-domain status should remain observable");
+    assert!(!status.process_tree_alive(), "committed ownership domain remained active: {status:?}");
+    assert!(
+        crate::sandbox_runner::wait_for_background_process_reap_for_test(
+            root,
+            Duration::from_secs(5),
+        ),
+        "committed ownership-root supervisor {root} was not reaped"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_completed_registration_outcome_settles_committed_root() {
     let (state, _session_id, run_id, _runner_outcome, process, prepared) =
@@ -12800,9 +12814,7 @@ async fn missing_run_registry_still_settles_stored_committed_root() {
 
     assert!(error.message().contains("missing from run cleanup ownership"), "{}", error.message());
     assert!(error.message().contains("terminated and durably finalized"), "{}", error.message());
-    assert!(!crate::sandbox_runner::background_process_runtime_status(root)
-        .expect("committed root status should remain observable")
-        .alive());
+    assert_reconciled_background_process_inactive(root);
     assert!(state
         .journal_store
         .list_persisted_process_leases(1)
@@ -12835,9 +12847,7 @@ async fn conflicting_run_registry_still_settles_stored_committed_root() {
         error.message()
     );
     assert!(error.message().contains("terminated and durably finalized"), "{}", error.message());
-    assert!(!crate::sandbox_runner::background_process_runtime_status(root)
-        .expect("committed root status should remain observable")
-        .alive());
+    assert_reconciled_background_process_inactive(root);
     assert!(state
         .journal_store
         .list_persisted_process_leases(1)
