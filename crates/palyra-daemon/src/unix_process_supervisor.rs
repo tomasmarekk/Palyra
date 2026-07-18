@@ -64,7 +64,11 @@ const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_STRING_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENTS: usize = 512;
 const MAX_ENVIRONMENT_ENTRIES: usize = 64;
+#[cfg(not(test))]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+// Full process-tree regression tests can start slowly on saturated CI hosts.
+#[cfg(test)]
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INTERNAL_FAILURE_EXIT_CODE: i32 = 70;
@@ -2477,7 +2481,8 @@ mod tests {
 
     impl SupervisorFixture {
         fn spawn(fail_next_cleanup: bool) -> Self {
-            let guard = SUPERVISOR_REGRESSION_LOCK.lock().expect("regression lock poisoned");
+            let guard =
+                SUPERVISOR_REGRESSION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let markers = tempfile::tempdir().expect("marker directory should be created");
             let current_executable = env::current_exe().expect("test executable should resolve");
             let (mut command, control) = UnixProcessSupervisorControl::prepare(current_executable)
