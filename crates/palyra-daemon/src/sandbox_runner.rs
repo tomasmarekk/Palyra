@@ -10811,10 +10811,12 @@ fn build_process_command(
     let prepend_path = resolve_process_prepend_path_entries(policy, input, workspace_root, cwd)?;
     let path_access_mode = process_runner_effective_path_access_mode(policy);
     let allow_cwd_resolution = process_runner_allows_cwd_process_resolution(policy);
+    // Unix supervisors freeze an immutable launch spec before durable registration, so a
+    // background target cannot defer executable resolution until exec.
+    let require_trusted_resolution = !prepend_path.is_empty() || (cfg!(unix) && input.background);
     if process_runner_allows_host_access(policy) {
         let host_roots = host_access_roots();
         let trusted_path = host_access_path();
-        let require_trusted_resolution = !prepend_path.is_empty();
         let program = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
             resolve_tier_b_process_program(
                 input.command.as_str(),
@@ -10893,7 +10895,7 @@ fn build_process_command(
         input.command.as_str(),
         cwd,
         OsStr::new(sandbox_process_path()),
-        !prepend_path.is_empty(),
+        require_trusted_resolution,
         allow_cwd_resolution,
     )?;
     let mut command = build_tier_b_process_command(program.as_path(), scoped_args.as_slice(), cwd)?;
@@ -13564,6 +13566,42 @@ mod tests {
 
         assert_eq!(args[0], canonical_workspace.to_string_lossy());
         assert_eq!(args[1], format!("--config={expected_script}"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_process_command_resolves_unix_background_program_absolutely() {
+        let workspace = unique_temp_dir("workspace-unix-background-program");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let mut input = process_runner_input("sh", &["-c", "exit 0"], Some(1_000));
+        input.background = true;
+        let policies = [
+            sandbox_policy_with_allowed_executables(
+                canonical_workspace.clone(),
+                vec!["sh".to_owned()],
+            ),
+            unrestricted_os_policy(canonical_workspace.clone()),
+        ];
+
+        for policy in policies {
+            let command = build_process_command(
+                &policy,
+                &input,
+                canonical_workspace.as_path(),
+                canonical_workspace.as_path(),
+            )
+            .expect("Unix background command should resolve through the trusted path");
+
+            assert!(
+                command.get_program().is_absolute(),
+                "Unix supervisor target must be absolute: {}",
+                command.get_program().to_string_lossy()
+            );
+        }
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }

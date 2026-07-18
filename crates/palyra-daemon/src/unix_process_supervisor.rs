@@ -514,7 +514,7 @@ fn run_supervisor() -> io::Result<SupervisorExit> {
         return Ok(SupervisorExit::Code(0));
     }
 
-    let target_pid = match runtime.cleanup_helper_mut()?.start_target(&spec, CLEANUP_WAIT_TIMEOUT) {
+    let target_pid = match runtime.cleanup_helper_mut()?.start_target(&spec, CONTROL_TIMEOUT) {
         Ok(target_pid) => target_pid,
         Err(failure) => {
             let payload = encode_exec_failure(failure.stage, failure.errno);
