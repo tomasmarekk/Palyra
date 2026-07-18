@@ -1820,15 +1820,14 @@ fn current_process_executable_path(pid: u32) -> io::Result<PathBuf> {
 fn current_process_executable_path(pid: u32) -> io::Result<PathBuf> {
     let process_id = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "macOS pid exceeds i32"))?;
-    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE];
+    let buffer_size = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
+        .map_err(|_| io::Error::other("macOS process path buffer size is invalid"))?;
+    let buffer_size_u32 = u32::try_from(buffer_size)
+        .map_err(|_| io::Error::other("macOS process path buffer size exceeds u32"))?;
+    let mut buffer = vec![0_u8; buffer_size];
     // SAFETY: buffer is writable for the provided length and process_id is positive.
-    let written = unsafe {
-        macos_proc_pidpath(
-            process_id,
-            buffer.as_mut_ptr().cast(),
-            u32::try_from(buffer.len()).unwrap_or(u32::MAX),
-        )
-    };
+    let written =
+        unsafe { macos_proc_pidpath(process_id, buffer.as_mut_ptr().cast(), buffer_size_u32) };
     if written <= 0 {
         return Err(io::Error::last_os_error());
     }
