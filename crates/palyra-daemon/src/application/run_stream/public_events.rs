@@ -290,7 +290,7 @@ fn public_status_event_name(
 }
 
 fn is_progress_heartbeat(message: &str) -> bool {
-    message.starts_with("waiting for ") || message.starts_with("progress:agent_loop.phase_waiting")
+    message.starts_with("waiting for ") || message.starts_with("progress:")
 }
 
 fn public_status_reason_code(
@@ -525,6 +525,22 @@ mod tests {
 
         let public_event = public_runtime_event_from_run_stream_event(&event, context("evt_1"))
             .expect("waiting status should map to heartbeat");
+
+        assert_eq!(public_event.event, PublicRuntimeEventName::Heartbeat);
+        assert_eq!(public_event.payload["status"], "alive");
+        assert!(public_event.payload.get("delta").is_none());
+        assert!(public_event.payload.get("token").is_none());
+    }
+
+    #[test]
+    fn run_stream_lifecycle_progress_maps_to_token_free_heartbeat() {
+        let event = run_event(common_v1::run_stream_event::Body::Status(common_v1::StreamStatus {
+            kind: common_v1::stream_status::StatusKind::InProgress as i32,
+            message: "progress:agent_loop.started".to_owned(),
+        }));
+
+        let public_event = public_runtime_event_from_run_stream_event(&event, context("evt_1"))
+            .expect("lifecycle progress should map to heartbeat");
 
         assert_eq!(public_event.event, PublicRuntimeEventName::Heartbeat);
         assert_eq!(public_event.payload["status"], "alive");

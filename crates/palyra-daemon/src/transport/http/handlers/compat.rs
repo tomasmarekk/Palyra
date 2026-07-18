@@ -3881,12 +3881,7 @@ fn build_compat_chat_streaming_response(
                 return;
             }
         };
-        let public_event_generation =
-            state.runtime.runtime_generation_for_run(run_id.clone()).await.ok().flatten().and_then(
-                |(generation_session_id, generation)| {
-                    (generation_session_id == session_id).then_some(generation)
-                },
-            );
+        let mut public_event_generation = None;
 
         let mut keepalive = tokio::time::interval(COMPAT_SSE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3903,6 +3898,17 @@ fn build_compat_chat_streaming_response(
                     };
                     match item {
                 Ok(event) => {
+                    if public_event_generation.is_none() {
+                        public_event_generation = state
+                            .runtime
+                            .persisted_runtime_generation_for_run(run_id.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|(generation_session_id, generation)| {
+                                (generation_session_id == session_id).then_some(generation)
+                            });
+                    }
                     public_event_sequence = public_event_sequence.saturating_add(1);
                     let public_event_id =
                         crate::application::run_stream::public_events::run_stream_public_event_id(
@@ -4422,12 +4428,7 @@ fn build_compat_responses_streaming_response(
                 return;
             }
         };
-        let public_event_generation =
-            state.runtime.runtime_generation_for_run(run_id.clone()).await.ok().flatten().and_then(
-                |(generation_session_id, generation)| {
-                    (generation_session_id == session_id).then_some(generation)
-                },
-            );
+        let mut public_event_generation = None;
 
         let mut keepalive = tokio::time::interval(Duration::from_secs(15));
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4444,6 +4445,17 @@ fn build_compat_responses_streaming_response(
                     };
                     match item {
                         Ok(event) => {
+                            if public_event_generation.is_none() {
+                                public_event_generation = state
+                                    .runtime
+                                    .persisted_runtime_generation_for_run(run_id.clone())
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|(generation_session_id, generation)| {
+                                        (generation_session_id == session_id).then_some(generation)
+                                    });
+                            }
                             public_event_sequence = public_event_sequence.saturating_add(1);
                             let public_event_id =
                                 crate::application::run_stream::public_events::run_stream_public_event_id(

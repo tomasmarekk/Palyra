@@ -12361,66 +12361,6 @@ impl JournalStore {
             },
             now,
         )?;
-        let (identities, legacy_identity_adapter) =
-            palyra_common::runtime_contracts::RuntimeIdentitySetV1::from_legacy_run(
-                session_id.as_str(),
-                request.run_id.as_str(),
-                active_generation.generation,
-            )
-            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
-        let event_name = runtime_terminal_event_name(effective_state).ok_or_else(|| {
-            JournalError::InvalidArgument(
-                "terminal settlement selected a nonterminal event".to_owned(),
-            )
-        })?;
-        let descriptor = event_name.descriptor();
-        let mut runtime_event_envelope = RuntimeEventEnvelopeV2 {
-            schema_version: 2,
-            event_id: RuntimeEventId::parse(format!("run_terminal:{}", Ulid::new()).as_str())
-                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
-            identities,
-            sequence: 0,
-            causal_parent_event_id: None,
-            subsystem: descriptor.subsystem,
-            phase: descriptor.phase,
-            event_name,
-            reason_code: settlement_reason_code.to_owned(),
-            actor_kind: descriptor.actor_kind,
-            retryability: descriptor.retryability,
-            redaction_class: descriptor.redaction_class,
-            terminal: descriptor.terminal,
-            payload: RuntimeEventPayloadRef::Inline {
-                metadata: json!({
-                    "state": effective_state.as_str(),
-                    "requested_state": request.requested_state.as_str(),
-                    "cancellation_won": cancellation_won,
-                }),
-            },
-            occurred_at_unix_ms: now,
-            extensions: BTreeMap::new(),
-        };
-        runtime_event_envelope
-            .record_legacy_identity_adapter(legacy_identity_adapter)
-            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
-        let runtime_event = RuntimeEventAppendRequest {
-            lane: RuntimeGenerationLane::Run,
-            envelope: runtime_event_envelope,
-        };
-        let runtime_event_sequence = match append_runtime_event_tx(
-            &transaction,
-            self.config.max_payload_bytes,
-            &runtime_event,
-            now,
-        )? {
-            RuntimeEventAppendOutcome::Appended { sequence }
-            | RuntimeEventAppendOutcome::AlreadyAppended { sequence } => sequence,
-            RuntimeEventAppendOutcome::StaleSuppressed => {
-                return Err(JournalError::InvalidArgument(format!(
-                    "orchestrator run {} lost generation authority during terminal settlement",
-                    request.run_id
-                )));
-            }
-        };
         let mut tape_sequence = next_orchestrator_tape_seq(&transaction, request.run_id.as_str())?;
         let summary_tape_sequence =
             request.terminal_summary_payload_json.as_ref().map(|_| tape_sequence);
@@ -12485,6 +12425,69 @@ impl JournalStore {
             },
             now,
         )?;
+        let (identities, legacy_identity_adapter) =
+            palyra_common::runtime_contracts::RuntimeIdentitySetV1::from_legacy_run(
+                session_id.as_str(),
+                request.run_id.as_str(),
+                active_generation.generation,
+            )
+            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+        let event_name = runtime_terminal_event_name(effective_state).ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "terminal settlement selected a nonterminal event".to_owned(),
+            )
+        })?;
+        let descriptor = event_name.descriptor();
+        let mut runtime_event_envelope = RuntimeEventEnvelopeV2 {
+            schema_version: 2,
+            // Replay joins canonical authority to this exact terminal tape row.
+            event_id: RuntimeEventId::parse(
+                format!("run_stream:{}:{tape_sequence}", request.run_id).as_str(),
+            )
+            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
+            identities,
+            sequence: 0,
+            causal_parent_event_id: None,
+            subsystem: descriptor.subsystem,
+            phase: descriptor.phase,
+            event_name,
+            reason_code: settlement_reason_code.to_owned(),
+            actor_kind: descriptor.actor_kind,
+            retryability: descriptor.retryability,
+            redaction_class: descriptor.redaction_class,
+            terminal: descriptor.terminal,
+            payload: RuntimeEventPayloadRef::Inline {
+                metadata: json!({
+                    "state": effective_state.as_str(),
+                    "requested_state": request.requested_state.as_str(),
+                    "cancellation_won": cancellation_won,
+                }),
+            },
+            occurred_at_unix_ms: now,
+            extensions: BTreeMap::new(),
+        };
+        runtime_event_envelope
+            .record_legacy_identity_adapter(legacy_identity_adapter)
+            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?;
+        let runtime_event = RuntimeEventAppendRequest {
+            lane: RuntimeGenerationLane::Run,
+            envelope: runtime_event_envelope,
+        };
+        let runtime_event_sequence = match append_runtime_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &runtime_event,
+            now,
+        )? {
+            RuntimeEventAppendOutcome::Appended { sequence }
+            | RuntimeEventAppendOutcome::AlreadyAppended { sequence } => sequence,
+            RuntimeEventAppendOutcome::StaleSuppressed => {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} lost generation authority during terminal settlement",
+                    request.run_id
+                )));
+            }
+        };
         let transition_kind = if effective_state == RunLifecycleState::Cancelled {
             RuntimeGenerationTransitionKind::Cancelled
         } else {
@@ -48808,6 +48811,15 @@ mod tests {
         assert_eq!(tape.len(), 1);
         assert_eq!(tape[0].event_type, "status");
         assert!(tape[0].payload_json.contains("cancelled"));
+        let projected_terminal = store
+            .persisted_runtime_event_for_tape_sequence(run_id, tape[0].seq)
+            .expect("terminal runtime projection lookup should succeed")
+            .expect("terminal tape row should retain its canonical runtime projection");
+        assert_eq!(projected_terminal.event_name, RuntimeEventName::RunCancelled);
+        assert_eq!(
+            projected_terminal.event_id.as_str(),
+            format!("run_stream:{run_id}:{}", tape[0].seq)
+        );
         let connection = Connection::open(db_path).expect("journal db should reopen");
         let terminal_event: (String, i64, String) = connection
             .query_row(
