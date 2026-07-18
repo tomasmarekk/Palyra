@@ -17,7 +17,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -31,6 +31,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::collections::HashSet;
 
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
@@ -1990,6 +1993,8 @@ pub(crate) fn register_background_process_for_test(
         },
         BackgroundLifetimeMode::RunOwned,
         provenance,
+        None,
+        #[cfg(unix)]
         None,
     )
     .map(|_| ())
@@ -8212,6 +8217,9 @@ fn spawn_background_process(
         registration_fence,
         fault_injection,
     } = request;
+    #[cfg(unix)]
+    let command = build_process_command(policy, input, workspace_root, cwd)?;
+    #[cfg(not(unix))]
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     let capabilities = BackgroundProcessHandleCapabilities::from_input(input);
     #[cfg(windows)]
@@ -8376,7 +8384,8 @@ fn spawn_background_process(
     }
     #[cfg(unix)]
     let (released_child, unix_supervisor_control, target_pid) =
-        match release_unix_supervised_background_target(child, unix_supervisor_control) {
+        match release_unix_supervised_background_target(child, Arc::clone(&unix_supervisor_control))
+        {
             Ok(released) => (released.child, released.control, released.target_pid),
             Err((child, error)) => {
                 terminate_unix_supervised_background_child(
@@ -12206,9 +12215,10 @@ mod tests {
         validate_process_termination_scope, validate_runtime_egress_enforcement,
         BackgroundLifetimeMode, EgressEnforcementMode, ManagedChildGuard, PathAccessMode,
         ProcessCompletionState, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
-        ProcessSuccessOutputJsonInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
-        SandboxProcessRunnerTier, StreamCapture, MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS,
-        NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV, PROCESS_PROGRESS_MIN_ELAPSED_MS,
+        ProcessSuccessOutputJsonInput, SandboxProcessRunError, SandboxProcessRunErrorKind,
+        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
+        MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS, NODE_DISABLE_COMPILE_CACHE_ENV,
+        PALYRA_OS_FILE_ROOTS_ENV, PROCESS_PROGRESS_MIN_ELAPSED_MS,
     };
     #[cfg(not(target_os = "macos"))]
     use super::{
@@ -16135,6 +16145,8 @@ mod tests {
             input.effective_lifetime_mode(),
             provenance.clone(),
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("registry should accept stdin-capable metadata without a pipe");
         let snapshot = super::registered_background_process("palyra.process.status", pid)
@@ -16172,6 +16184,8 @@ mod tests {
             },
             BackgroundLifetimeMode::RunOwned,
             provenance,
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("test process identity should register");
@@ -16216,6 +16230,8 @@ mod tests {
             },
             BackgroundLifetimeMode::RunOwned,
             provenance.clone(),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("test process identity should register");
@@ -16337,6 +16353,8 @@ mod tests {
             BackgroundLifetimeMode::RunOwned,
             first.clone(),
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("first process identity should register");
         super::retain_background_process_cleanup_authority(pid, &first)
@@ -16348,6 +16366,8 @@ mod tests {
             capabilities,
             BackgroundLifetimeMode::RunOwned,
             provenance("replacement"),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect_err("retained cleanup authority must reserve the exact pid slot");
@@ -16386,6 +16406,8 @@ mod tests {
             BackgroundLifetimeMode::RunOwned,
             provenance("first"),
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("first process identity should register");
         super::mark_current_background_process_stopped(pid);
@@ -16394,6 +16416,8 @@ mod tests {
             capabilities,
             BackgroundLifetimeMode::RunOwned,
             provenance("second"),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("inactive pid slot should accept a new exact identity");
@@ -16446,6 +16470,8 @@ mod tests {
             BackgroundLifetimeMode::RunOwned,
             provenance("first"),
             None,
+            #[cfg(unix)]
+            None,
         )
         .expect("first process identity should register");
         super::mark_background_process_stopped(&first);
@@ -16454,6 +16480,8 @@ mod tests {
             capabilities,
             BackgroundLifetimeMode::RunOwned,
             provenance("second"),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("replacement process identity should register");
@@ -16503,6 +16531,8 @@ mod tests {
             },
             BackgroundLifetimeMode::RunOwned,
             provenance.clone(),
+            None,
+            #[cfg(unix)]
             None,
         )
         .expect("test provenance should register");
