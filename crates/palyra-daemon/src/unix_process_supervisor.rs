@@ -580,7 +580,7 @@ enum HelperTargetState {
     AuthorityConsumed {
         target_pid: libc::pid_t,
     },
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     AwaitingGroupInactivity {
         target_pgid: libc::pid_t,
         raw_wait_status: i32,
@@ -852,7 +852,7 @@ impl HelperRuntime {
             HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
                 return self.finish_after_authority_consumed().map(Some);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed().map(Some);
             }
@@ -878,7 +878,7 @@ impl HelperRuntime {
             HelperTargetState::AuthorityConsumed { .. } | HelperTargetState::Settled { .. } => {
                 return self.finish_after_authority_consumed();
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             HelperTargetState::AwaitingGroupInactivity { .. } => {
                 return self.finish_after_authority_consumed();
             }
@@ -907,16 +907,16 @@ impl HelperRuntime {
         self.finish_after_authority_consumed_deadline(Instant::now() + CLEANUP_WAIT_TIMEOUT)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn finish_after_authority_consumed_deadline(
         &mut self,
         operation_deadline: Instant,
     ) -> io::Result<SupervisorExit> {
         match self.state {
             HelperTargetState::AuthorityConsumed { target_pid } => {
-                // Linux can distinguish exited members from live descendants. Prove the group
-                // inactive while the unreaped leader still reserves its PID/PGID, then reap so an
-                // unrelated group cannot reuse the numeric identity mid-proof.
+                // These platforms can distinguish exited members from live descendants. Prove
+                // the group inactive while the unreaped leader still reserves its PID/PGID,
+                // then reap so an unrelated group cannot reuse the numeric identity mid-proof.
                 wait_for_process_group_inactive(target_pid, operation_deadline)?;
                 let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
                 self.target.take();
@@ -936,16 +936,13 @@ impl HelperRuntime {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn finish_after_authority_consumed_deadline(
         &mut self,
         operation_deadline: Instant,
     ) -> io::Result<SupervisorExit> {
         let (target_pid, raw_wait_status) = match self.state {
             HelperTargetState::AuthorityConsumed { target_pid } => {
-                // Non-Linux group probes may not settle while the exited leader remains visible.
-                // Reap only after consuming signal authority; the remaining group check is
-                // read-only, so numeric PGID reuse can delay acknowledgement but cannot mis-signal.
                 let raw_wait_status = reap_exact_target(target_pid, operation_deadline)?;
                 self.state = HelperTargetState::AwaitingGroupInactivity {
                     target_pgid: target_pid,
