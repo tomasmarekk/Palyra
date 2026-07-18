@@ -749,6 +749,9 @@ impl HelperRuntime {
             stage: EXEC_STAGE_LAUNCHER_SPAWN,
             errno: error.raw_os_error().unwrap_or(libc::EIO),
         })?;
+        // `spawn` keeps the reusable builder and its `pre_exec` capture alive. Release the
+        // parent launcher socket before EOF becomes the successful-exec signal.
+        drop(command);
         let target_pid = pid_t_from_u32(child.id()).map_err(|error| HelperStartFailure {
             stage: EXEC_STAGE_LAUNCHER_READY,
             errno: error.raw_os_error().unwrap_or(libc::ERANGE),
