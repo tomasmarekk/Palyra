@@ -8800,6 +8800,13 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<()> {
+    // Cache reuse is asserted only after the first stream drains, so keep CI
+    // scheduler load outside the active-TTL assertion.
+    const TIMEBOXED_APPROVAL_TTL: Duration = Duration::from_secs(30);
+    const TIMEBOXED_APPROVAL_EXPIRY_MARGIN: Duration = Duration::from_millis(500);
+    let timeboxed_approval_ttl_ms =
+        i64::try_from(TIMEBOXED_APPROVAL_TTL.as_millis()).expect("test TTL should fit i64");
+
     let response_body = openai_tool_call_response(
         "custom.noop",
         &serde_json::json!({
@@ -8875,7 +8882,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                             true,
                             "allow_timeboxed",
                             common_v1::ApprovalDecisionScope::Timeboxed as i32,
-                            2_000,
+                            timeboxed_approval_ttl_ms,
                         ))
                         .await
                         .context("failed to send first timeboxed approval response")?;
@@ -8961,7 +8968,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         let _event = event.context("failed to drain second timeboxed stream")?;
     }
 
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    tokio::time::sleep(TIMEBOXED_APPROVAL_TTL + TIMEBOXED_APPROVAL_EXPIRY_MARGIN).await;
 
     let (third_sender, third_receiver) = tokio_mpsc::channel(4);
     third_sender
