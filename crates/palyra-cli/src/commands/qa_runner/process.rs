@@ -127,21 +127,23 @@ use journal_snapshot::{
 };
 #[cfg(all(test, windows))]
 use process_tree::attach_windows_daemon_process_tree_with;
-#[cfg(all(test, target_os = "macos"))]
-use process_tree::mac_process_baseline_with;
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 use process_tree::parse_linux_process_stat;
+#[cfg(all(test, unix, not(target_os = "macos")))]
+use process_tree::unix_close;
 #[cfg(all(test, unix))]
 use process_tree::wait_for_child_exit;
 #[cfg(all(test, unix))]
 use process_tree::{
-    acquire_unix_process_tree_marker_scan, unix_close, unix_descendant_liveness_closed,
+    acquire_unix_process_tree_marker_scan, unix_descendant_liveness_closed,
     unix_identity_matching_roots, unix_marker_processes_have_active_non_root_with,
     unix_other_tree_processes_with_registry, unix_preexisting_process_groups,
     unix_process_disappeared, unix_process_identity_is_active, unix_process_requires_marker_scan,
     unix_process_table, unix_recursive_descendants, unix_setsid, unix_signal_process_identity_with,
     UNIX_ESRCH, UNIX_SIGKILL,
 };
+#[cfg(all(test, target_os = "macos"))]
+use process_tree::{mac_marker_error_means_inactive_with, mac_process_baseline_with};
 #[cfg(test)]
 use startup::{
     acquire_startup_cleanup_admission_with, configure_isolated_environment,
@@ -361,12 +363,17 @@ struct DaemonProcessTree {
 }
 
 struct DaemonProcessTreePreparation {
-    // The write end deliberately survives exec and is inherited by descendants. EOF is only one
-    // necessary cleanup signal; the identity-bound marker scan independently covers closefrom.
+    // The child-owned write end deliberately survives exec and is inherited by descendants. The
+    // parent retains only this reader; identity-bound marker scans independently cover descendants
+    // that deliberately close inherited descriptors.
     #[cfg(unix)]
     descendant_liveness_read: fs::File,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     descendant_liveness_write: fs::File,
+    // Darwin cannot create an anonymous pipe with CLOEXEC atomically. The private FIFO keeps the
+    // path alive until the target child opens the only writer from its pre-exec callback.
+    #[cfg(target_os = "macos")]
+    descendant_liveness_fifo_root: TempDir,
     #[cfg(unix)]
     containment_marker: String,
     // Exact identities captured before marker injection cannot belong to this tree. Keeping the

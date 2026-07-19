@@ -390,10 +390,37 @@ fn daemon_tree_cleanup_terminates_a_setsid_grandchild() {
 #[cfg(unix)]
 #[test]
 fn unrelated_exec_cannot_retain_daemon_liveness_ownership() {
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::PermissionsExt;
+
     let mut command = Command::new("sleep");
     command.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
     let preparation =
         configure_daemon_process_tree(&mut command).expect("target process tree should configure");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        preparation
+            .descendant_liveness_fifo_root
+            .path()
+            .metadata()
+            .expect("Darwin liveness directory should remain live")
+            .permissions()
+            .mode()
+            & 0o077,
+        0,
+        "the Darwin liveness FIFO directory must remain owner-only regardless of umask",
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        unix_descendant_liveness_closed(&Mutex::new(
+            preparation
+                .descendant_liveness_read
+                .try_clone()
+                .expect("Darwin liveness reader should clone"),
+        ))
+        .expect("Darwin liveness reader should be observable"),
+        "the parent must not own a Darwin liveness writer before target spawn",
+    );
     let mut unrelated = Command::new("sleep")
         .arg("30")
         .stdout(Stdio::null())
@@ -736,6 +763,30 @@ fn mac_baseline_leaves_protected_processes_unclassified() {
     })
     .expect_err("non-permission lookup errors must remain fatal");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_marker_einval_requires_an_inactive_exact_identity() {
+    let expected =
+        UnixProcessIdentity { process_id: 43, start_token_high: 10, start_token_low: 20 };
+    let invalid_argument = io::Error::from_raw_os_error(libc::EINVAL);
+
+    assert!(mac_marker_error_means_inactive_with(&invalid_argument, &expected, |_| Ok(false))
+        .expect("an inactive exact identity should explain Darwin EINVAL"),);
+    assert!(!mac_marker_error_means_inactive_with(&invalid_argument, &expected, |_| Ok(true))
+        .expect("an active exact identity must preserve Darwin EINVAL"),);
+    assert!(!mac_marker_error_means_inactive_with(
+        &io::Error::from_raw_os_error(libc::EACCES),
+        &expected,
+        |_| panic!("non-EINVAL errors must not probe process liveness"),
+    )
+    .expect("permission errors should remain fatal"),);
+    let error = mac_marker_error_means_inactive_with(&invalid_argument, &expected, |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .expect_err("identity lookup failures must remain fail-closed");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 }
 
 #[cfg(unix)]

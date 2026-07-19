@@ -158,11 +158,12 @@ fn test_process_with_escaped_grandchild(pid_path: &Path, detached: bool) -> Owne
     test_process_with_escape_mode(pid_path, if detached { "detached" } else { "launcher" })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 const PROCESS_TREE_LIVENESS_FD_ENV: &str = "PALYRA_QA_TEST_PROCESS_TREE_LIVENESS_FD";
 
 #[cfg(unix)]
 fn test_process_with_escape_mode(pid_path: &Path, mode: &str) -> OwnedDaemonProcess {
+    #[cfg(not(target_os = "macos"))]
     use std::os::fd::AsRawFd;
 
     const HELPER_TEST: &str = "commands::qa_runner::process::tests::unix_process_tree_helper";
@@ -176,6 +177,7 @@ fn test_process_with_escape_mode(pid_path: &Path, mode: &str) -> OwnedDaemonProc
         .stderr(Stdio::null());
     let preparation = configure_daemon_process_tree(&mut command)
         .expect("escaped-grandchild process tree should configure");
+    #[cfg(not(target_os = "macos"))]
     command.env(
         PROCESS_TREE_LIVENESS_FD_ENV,
         preparation.descendant_liveness_write.as_raw_fd().to_string(),
@@ -208,20 +210,33 @@ fn unix_process_tree_helper() {
         thread::sleep(Duration::from_secs(30));
         return;
     }
+    #[cfg(target_os = "macos")]
+    if mode == "sleep_close_fds" {
+        close_test_process_non_stdio_descriptors();
+        fs::write(pid_path.as_path(), std::process::id().to_string())
+            .expect("escaped helper pid should be recorded");
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
     assert!(matches!(
         mode.as_str(),
         "launcher" | "detached" | "detached_close_fds" | "intermediate_close_fds"
     ));
+    #[cfg(target_os = "macos")]
+    let child_mode = if mode == "intermediate_close_fds" { "sleep_close_fds" } else { "sleep" };
+    #[cfg(not(target_os = "macos"))]
+    let child_mode = "sleep";
     let mut child = Command::new(std::env::current_exe().expect("test executable path"));
     child
         .args(["--exact", HELPER_TEST, "--nocapture"])
         .env(
             "PALYRA_QA_PROCESS_TREE_HELPER_MODE",
-            if mode == "detached_close_fds" { "intermediate_close_fds" } else { "sleep" },
+            if mode == "detached_close_fds" { "intermediate_close_fds" } else { child_mode },
         )
         .env("PALYRA_QA_TEST_PID_PATH", pid_path.as_os_str())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(not(target_os = "macos"))]
     if mode == "intermediate_close_fds" {
         let liveness_file_descriptor = std::env::var(PROCESS_TREE_LIVENESS_FD_ENV)
             .expect("process-tree liveness descriptor should be configured")
@@ -238,7 +253,8 @@ fn unix_process_tree_helper() {
                 }
             });
         }
-    } else {
+    }
+    if mode != "intermediate_close_fds" {
         // SAFETY: setsid(2) is async-signal-safe and the closure performs no allocation or locks.
         unsafe {
             child.pre_exec(|| {
@@ -258,6 +274,23 @@ fn unix_process_tree_helper() {
     let _ = wait_for_recorded_process_id(pid_path.as_path(), Duration::from_secs(5));
     if mode == "launcher" {
         thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn close_test_process_non_stdio_descriptors() {
+    let descriptors = fs::read_dir("/dev/fd")
+        .expect("test process descriptor directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|descriptor| *descriptor > 2)
+        .collect::<Vec<_>>();
+    for descriptor in descriptors {
+        // SAFETY: close(2) accepts every integer descriptor; this isolated helper deliberately
+        // releases all inherited non-stdio resources before it records readiness.
+        unsafe {
+            libc::close(descriptor);
+        }
     }
 }
 

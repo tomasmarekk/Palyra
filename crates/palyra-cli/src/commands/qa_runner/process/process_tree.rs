@@ -88,6 +88,7 @@ fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> bool {
 pub(super) fn configure_daemon_process_tree(
     command: &mut Command,
 ) -> Result<DaemonProcessTreePreparation> {
+    #[cfg(not(target_os = "macos"))]
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -97,21 +98,38 @@ pub(super) fn configure_daemon_process_tree(
     let preexisting_processes = unix_process_baseline(baseline_deadline)
         .context("qa.runner.daemon_process_baseline_failed")?;
     let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
-    // Keep the potentially expensive system-wide baseline outside this section. From pipe
-    // creation through root registration, no other managed root may fork through Darwin's
-    // non-atomic pipe-plus-fcntl setup window or race marker discovery.
+    // Keep the potentially expensive system-wide baseline outside this section. Until root
+    // registration completes, no other managed launch may race marker discovery. Linux creates
+    // its pipe with CLOEXEC atomically; the Darwin parent never creates a writer.
     let launch_guard =
         UNIX_PROCESS_TREE_COORDINATION.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(not(target_os = "macos"))]
     let (descendant_liveness_read, descendant_liveness_write) =
         unix_descendant_liveness_pipe().context("qa.runner.daemon_liveness_pipe_failed")?;
+    #[cfg(not(target_os = "macos"))]
     let descendant_liveness_write_fd = descendant_liveness_write.as_raw_fd();
-    // A distinct session prevents descendants from joining a pre-launch process group. It also
-    // forces the fork/exec path so only this child can make the liveness writer inheritable.
-    // SAFETY: fcntl(2) and setsid(2) are async-signal-safe, and the closure performs no allocation
-    // or locking.
+    #[cfg(target_os = "macos")]
+    let (descendant_liveness_read, descendant_liveness_fifo_root, descendant_liveness_fifo_path) =
+        mac_descendant_liveness_fifo().context("qa.runner.daemon_liveness_fifo_failed")?;
+    // A distinct session prevents descendants from joining a pre-launch process group. Linux can
+    // create the inherited writer atomically with CLOEXEC. Darwin instead creates its writer only
+    // after fork, where unrelated parent threads can no longer inherit it.
+    //
+    // SAFETY: open(2), fcntl(2), and setsid(2) are async-signal-safe, and the selected closure
+    // performs no allocation or locking.
     unsafe {
+        #[cfg(not(target_os = "macos"))]
         command.pre_exec(move || {
             unix_clear_fd_cloexec(descendant_liveness_write_fd)?;
+            if unix_setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+        #[cfg(target_os = "macos")]
+        command.pre_exec(move || {
+            mac_open_descendant_liveness_writer(descendant_liveness_fifo_path.as_c_str())?;
             if unix_setsid() == -1 {
                 Err(io::Error::last_os_error())
             } else {
@@ -122,7 +140,10 @@ pub(super) fn configure_daemon_process_tree(
     command.env(QA_PROCESS_TREE_MARKER_ENV, containment_marker.as_str());
     Ok(DaemonProcessTreePreparation {
         descendant_liveness_read,
+        #[cfg(not(target_os = "macos"))]
         descendant_liveness_write,
+        #[cfg(target_os = "macos")]
+        descendant_liveness_fifo_root,
         containment_marker,
         preexisting_processes,
         launch_guard,
@@ -153,12 +174,18 @@ pub(super) fn attach_daemon_process_tree(
 ) -> std::result::Result<OwnedDaemonProcess, Box<AttachDaemonProcessFailure>> {
     let DaemonProcessTreePreparation {
         descendant_liveness_read,
+        #[cfg(not(target_os = "macos"))]
         descendant_liveness_write,
+        #[cfg(target_os = "macos")]
+        descendant_liveness_fifo_root,
         containment_marker,
         preexisting_processes,
         launch_guard,
     } = preparation;
+    #[cfg(not(target_os = "macos"))]
     drop(descendant_liveness_write);
+    #[cfg(target_os = "macos")]
+    drop(descendant_liveness_fifo_root);
     let process_group_id = match i32::try_from(child.id()) {
         Ok(process_group_id) => process_group_id,
         Err(error) => {
@@ -490,7 +517,7 @@ unsafe extern "C" {
     fn unix_getuid() -> u32;
     #[link_name = "setsid"]
     pub(super) fn unix_setsid() -> i32;
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     #[link_name = "close"]
     pub(super) fn unix_close(file_descriptor: i32) -> i32;
 }
@@ -598,7 +625,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_descendant_liveness_pipe() -> io::Result<(fs::File, fs::File)> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -618,7 +645,7 @@ fn unix_descendant_liveness_pipe() -> io::Result<(fs::File, fs::File)> {
     let write = unsafe { fs::File::from_raw_fd(descriptors[1]) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // Darwin has no pipe2(2); fallback targets set CLOEXEC before any other setup work.
+        // Fallback targets without pipe2(2) set CLOEXEC before any other setup work.
         unix_set_fd_cloexec(read.as_raw_fd())?;
         unix_set_fd_cloexec(write.as_raw_fd())?;
     }
@@ -634,17 +661,67 @@ fn unix_descendant_liveness_pipe() -> io::Result<(fs::File, fs::File)> {
     Ok((read, write))
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(target_os = "macos")]
+fn mac_descendant_liveness_fifo() -> io::Result<(fs::File, TempDir, std::ffi::CString)> {
+    use std::os::{
+        fd::FromRawFd,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
+    };
+
+    let root = tempfile::Builder::new()
+        .prefix("palyra-qa-liveness-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let path = root.path().join("descendant-liveness");
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "liveness path contains NUL"))?;
+    // SAFETY: the path is NUL-terminated and its private parent directory is live.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // O_CLOEXEC is applied by open(2), so an unrelated Darwin spawn cannot inherit this read end.
+    // Inheriting a reader would not retain liveness, but avoiding it also bounds descriptor use.
+    // SAFETY: the path is NUL-terminated and identifies the FIFO created immediately above.
+    let read_descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if read_descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open(2) returned a new owned descriptor, transferred exactly once to File.
+    let read = unsafe { fs::File::from_raw_fd(read_descriptor) };
+    Ok((read, root, path))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_open_descendant_liveness_writer(path: &std::ffi::CStr) -> io::Result<()> {
+    // The writer is intentionally created without CLOEXEC in the post-fork child. It remains open
+    // through exec and is inherited only by descendants of this target process.
+    // SAFETY: the path is NUL-terminated and the parent keeps its private FIFO and reader live.
+    let descriptor =
+        unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW) };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // No Rust owner is constructed: successful exec transfers descriptor lifetime to the target;
+    // any later pre-exec failure exits the child and lets the kernel close it.
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
 fn unix_set_fd_cloexec(file_descriptor: i32) -> io::Result<()> {
     unix_update_fd_cloexec(file_descriptor, true)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_clear_fd_cloexec(file_descriptor: i32) -> io::Result<()> {
     unix_update_fd_cloexec(file_descriptor, false)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_update_fd_cloexec(file_descriptor: i32, enabled: bool) -> io::Result<()> {
     // SAFETY: F_GETFD reads flags from the live descriptor and takes no variadic argument.
     let flags = unsafe { libc::fcntl(file_descriptor, libc::F_GETFD) };
@@ -785,6 +862,35 @@ fn mac_process_metadata_matches_active_identity(
     reported_process_id == u32::try_from(expected.process_id).unwrap_or(u32::MAX)
         && status != MAC_PROCESS_STATUS_ZOMBIE
         && mac_process_identity(expected.process_id, information) == *expected
+}
+
+#[cfg(target_os = "macos")]
+fn mac_marker_error_means_inactive(
+    error: &io::Error,
+    expected: &UnixProcessIdentity,
+) -> io::Result<bool> {
+    mac_marker_error_means_inactive_with(error, expected, unix_process_identity_is_active)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn mac_marker_error_means_inactive_with<IsActive>(
+    error: &io::Error,
+    expected: &UnixProcessIdentity,
+    mut is_active: IsActive,
+) -> io::Result<bool>
+where
+    IsActive: FnMut(&UnixProcessIdentity) -> io::Result<bool>,
+{
+    if unix_process_disappeared(error) {
+        return Ok(true);
+    }
+    if error.raw_os_error() != Some(libc::EINVAL) {
+        return Ok(false);
+    }
+    // KERN_PROCARGS2 reports EINVAL when the snapshotted process disappeared or no longer has a
+    // user stack. Accept it only after the exact pid/unique-id/id-version identity is inactive;
+    // malformed requests and lookup failures remain fatal.
+    Ok(!is_active(expected)?)
 }
 
 #[cfg(unix)]
@@ -1259,11 +1365,8 @@ fn unix_marker_processes(
         )
     }) {
         ensure_unix_cleanup_before_deadline(deadline)?;
-        let (has_marker, bytes_read) = unix_process_has_marker(
-            snapshot.identity.process_id,
-            assignment.as_slice(),
-            deadline,
-        )
+        let (has_marker, bytes_read) =
+            unix_process_has_marker(&snapshot.identity, assignment.as_slice(), deadline)
         .map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1475,11 +1578,12 @@ where
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn unix_process_has_marker(
-    process_id: i32,
+    expected: &UnixProcessIdentity,
     assignment: &[u8],
     deadline: Instant,
 ) -> io::Result<(bool, usize)> {
     ensure_unix_cleanup_before_deadline(deadline)?;
+    let process_id = expected.process_id;
     let path = PathBuf::from(format!("/proc/{process_id}/environ"));
     let mut bytes = match read_bounded_process_file(path.as_path(), MAX_UNIX_PROCESS_ENV_BYTES) {
         Ok(bytes) => bytes,
@@ -1494,7 +1598,7 @@ fn unix_process_has_marker(
 
 #[cfg(target_os = "macos")]
 fn unix_process_has_marker(
-    process_id: i32,
+    expected: &UnixProcessIdentity,
     assignment: &[u8],
     deadline: Instant,
 ) -> io::Result<(bool, usize)> {
@@ -1502,6 +1606,7 @@ fn unix_process_has_marker(
     const KERN_PROCARGS2: i32 = 49;
 
     ensure_unix_cleanup_before_deadline(deadline)?;
+    let process_id = expected.process_id;
     let mut name = [CTL_KERN, KERN_PROCARGS2, process_id];
     let mut bytes = vec![0_u8; MAX_UNIX_PROCESS_ENV_BYTES];
     let mut length = bytes.len();
@@ -1519,7 +1624,11 @@ fn unix_process_has_marker(
     {
         bytes.fill(0);
         let error = io::Error::last_os_error();
-        return if unix_process_disappeared(&error) { Ok((false, 0)) } else { Err(error) };
+        return if mac_marker_error_means_inactive(&error, expected)? {
+            Ok((false, 0))
+        } else {
+            Err(error)
+        };
     }
     if length > bytes.len() {
         bytes.fill(0);
@@ -1532,7 +1641,7 @@ fn unix_process_has_marker(
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
 fn unix_process_has_marker(
-    _process_id: i32,
+    _expected: &UnixProcessIdentity,
     _assignment: &[u8],
     _deadline: Instant,
 ) -> io::Result<(bool, usize)> {
