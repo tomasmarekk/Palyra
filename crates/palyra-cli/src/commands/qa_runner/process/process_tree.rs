@@ -88,13 +88,30 @@ fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> bool {
 pub(super) fn configure_daemon_process_tree(
     command: &mut Command,
 ) -> Result<DaemonProcessTreePreparation> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
+    let baseline_deadline = Instant::now()
+        .checked_add(DAEMON_TERMINATION_TIMEOUT)
+        .ok_or_else(|| anyhow::anyhow!("qa.runner.daemon_process_baseline_deadline_invalid"))?;
+    let preexisting_processes = unix_process_baseline(baseline_deadline)
+        .context("qa.runner.daemon_process_baseline_failed")?;
+    let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
+    // Keep the potentially expensive system-wide baseline outside this section. From pipe
+    // creation through root registration, no other managed root may fork through Darwin's
+    // non-atomic pipe-plus-fcntl setup window or race marker discovery.
+    let launch_guard =
+        UNIX_PROCESS_TREE_COORDINATION.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (descendant_liveness_read, descendant_liveness_write) =
+        unix_descendant_liveness_pipe().context("qa.runner.daemon_liveness_pipe_failed")?;
+    let descendant_liveness_write_fd = descendant_liveness_write.as_raw_fd();
     // A distinct session prevents descendants from joining a pre-launch process group. It also
-    // forces the fork/exec path so Apple posix_spawn cannot close the liveness descriptor.
-    // SAFETY: setsid(2) is async-signal-safe and the closure performs no allocation or locking.
+    // forces the fork/exec path so only this child can make the liveness writer inheritable.
+    // SAFETY: fcntl(2) and setsid(2) are async-signal-safe, and the closure performs no allocation
+    // or locking.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            unix_clear_fd_cloexec(descendant_liveness_write_fd)?;
             if unix_setsid() == -1 {
                 Err(io::Error::last_os_error())
             } else {
@@ -102,19 +119,6 @@ pub(super) fn configure_daemon_process_tree(
             }
         });
     }
-    let (descendant_liveness_read, descendant_liveness_write) =
-        unix_descendant_liveness_pipe().context("qa.runner.daemon_liveness_pipe_failed")?;
-    let baseline_deadline = Instant::now()
-        .checked_add(DAEMON_TERMINATION_TIMEOUT)
-        .ok_or_else(|| anyhow::anyhow!("qa.runner.daemon_process_baseline_deadline_invalid"))?;
-    let preexisting_processes = unix_process_baseline(baseline_deadline)
-        .context("qa.runner.daemon_process_baseline_failed")?;
-    let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
-    // Only marker injection through root registration needs to exclude marker scans. Keeping the
-    // process-table baseline outside this section avoids charging unrelated cleanup deadlines for
-    // a potentially expensive system-wide enumeration.
-    let launch_guard =
-        UNIX_PROCESS_TREE_COORDINATION.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     command.env(QA_PROCESS_TREE_MARKER_ENV, containment_marker.as_str());
     Ok(DaemonProcessTreePreparation {
         descendant_liveness_read,
@@ -479,27 +483,9 @@ const MAX_UNIX_PROCESS_ENV_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
 const MAX_UNIX_PROCESS_ENV_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 #[cfg(unix)]
-const UNIX_F_GETFL: i32 = 3;
-#[cfg(unix)]
-const UNIX_F_SETFL: i32 = 4;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const UNIX_O_NONBLOCK: i32 = 0x0000_0800;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const UNIX_O_NONBLOCK: i32 = 0x0000_0004;
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))
-))]
-const UNIX_O_NONBLOCK: i32 = 0x0000_0800;
-
-#[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "kill"]
     fn unix_kill(process_id: i32, signal: i32) -> i32;
-    #[link_name = "pipe"]
-    fn unix_pipe(file_descriptors: *mut i32) -> i32;
-    #[link_name = "fcntl"]
-    fn unix_fcntl(file_descriptor: i32, command: i32, ...) -> i32;
     #[link_name = "getuid"]
     fn unix_getuid() -> u32;
     #[link_name = "setsid"]
@@ -617,24 +603,60 @@ fn unix_descendant_liveness_pipe() -> io::Result<(fs::File, fs::File)> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let mut descriptors = [-1_i32; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: `descriptors` provides exactly two writable file-descriptor slots.
-    if unsafe { unix_pipe(descriptors.as_mut_ptr()) } != 0 {
+    let pipe_result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: `descriptors` provides exactly two writable file-descriptor slots.
+    let pipe_result = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
+    if pipe_result != 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: pipe(2) returned two new owned descriptors, transferred exactly once to `File`.
     let read = unsafe { fs::File::from_raw_fd(descriptors[0]) };
     // SAFETY: pipe(2) returned two new owned descriptors, transferred exactly once to `File`.
     let write = unsafe { fs::File::from_raw_fd(descriptors[1]) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Darwin has no pipe2(2); fallback targets set CLOEXEC before any other setup work.
+        unix_set_fd_cloexec(read.as_raw_fd())?;
+        unix_set_fd_cloexec(write.as_raw_fd())?;
+    }
     // SAFETY: F_GETFL reads flags from the live descriptor and takes no variadic argument.
-    let flags = unsafe { unix_fcntl(read.as_raw_fd(), UNIX_F_GETFL) };
+    let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
     if flags == -1 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: F_SETFL consumes one integer flag argument for the live descriptor.
-    if unsafe { unix_fcntl(read.as_raw_fd(), UNIX_F_SETFL, flags | UNIX_O_NONBLOCK) } == -1 {
+    if unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok((read, write))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn unix_set_fd_cloexec(file_descriptor: i32) -> io::Result<()> {
+    unix_update_fd_cloexec(file_descriptor, true)
+}
+
+#[cfg(unix)]
+fn unix_clear_fd_cloexec(file_descriptor: i32) -> io::Result<()> {
+    unix_update_fd_cloexec(file_descriptor, false)
+}
+
+#[cfg(unix)]
+fn unix_update_fd_cloexec(file_descriptor: i32, enabled: bool) -> io::Result<()> {
+    // SAFETY: F_GETFD reads flags from the live descriptor and takes no variadic argument.
+    let flags = unsafe { libc::fcntl(file_descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let updated_flags = if enabled { flags | libc::FD_CLOEXEC } else { flags & !libc::FD_CLOEXEC };
+    // SAFETY: F_SETFD consumes one integer flag argument for the live descriptor.
+    if unsafe { libc::fcntl(file_descriptor, libc::F_SETFD, updated_flags) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

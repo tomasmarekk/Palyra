@@ -3004,6 +3004,7 @@ dependencies = [
  "crossterm",
  "ed25519-dalek",
  "futures",
+ "libc",
  "palyra-auth",
  "palyra-common",
  "palyra-connectors",

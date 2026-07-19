@@ -389,6 +389,46 @@ fn daemon_tree_cleanup_terminates_a_setsid_grandchild() {
 
 #[cfg(unix)]
 #[test]
+fn unrelated_exec_cannot_retain_daemon_liveness_ownership() {
+    let mut command = Command::new("sleep");
+    command.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
+    let preparation =
+        configure_daemon_process_tree(&mut command).expect("target process tree should configure");
+    let mut unrelated = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("unrelated process should start between preparation and target spawn");
+    let unrelated_id = unrelated.id();
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = unrelated.kill();
+            let _ = unrelated.wait();
+            panic!("target process should start: {error}");
+        }
+    };
+    let mut process = match attach_daemon_process_tree(child, preparation) {
+        Ok(process) => process,
+        Err(failure) => {
+            let _ = unrelated.kill();
+            let _ = unrelated.wait();
+            panic!("target process should have tree ownership: {:#}", failure.error);
+        }
+    };
+
+    let cleanup_verified = process.terminate_tree(DAEMON_TERMINATION_TIMEOUT);
+    let unrelated_remained_alive = process_is_alive(unrelated_id, Duration::from_secs(1));
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+
+    assert!(cleanup_verified, "an unrelated exec must not retain the daemon liveness writer");
+    assert!(unrelated_remained_alive, "target cleanup must not terminate the unrelated process");
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_process_enumeration_rejects_an_expired_cleanup_deadline() {
     let started = Instant::now();
     let error = unix_process_table(Instant::now())
