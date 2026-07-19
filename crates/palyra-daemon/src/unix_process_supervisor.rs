@@ -329,6 +329,10 @@ impl UnixProcessSupervisorControl {
     /// Returns an error when the terminate frame cannot be delivered, the response is malformed,
     /// cleanup fails, or the bounded acknowledgement deadline expires.
     pub(crate) fn terminate(&self) -> io::Result<()> {
+        self.terminate_with_delivery_observer(|| {})
+    }
+
+    fn terminate_with_delivery_observer(&self, after_delivery: impl FnOnce()) -> io::Result<()> {
         let mut inner = lock_parent_control(&self.inner)?;
         if inner.state == ParentState::Terminated {
             return Ok(());
@@ -350,7 +354,7 @@ impl UnixProcessSupervisorControl {
         if let Err(write_error) =
             write_frame(&inner.stream, MessageType::Terminate, &[], operation_deadline)
         {
-            return match read_frame_expected(
+            return match read_frame_expected_poll_deadline(
                 &inner.stream,
                 &[MessageType::CleanupComplete],
                 operation_deadline,
@@ -367,7 +371,8 @@ impl UnixProcessSupervisorControl {
                 }
             };
         }
-        let frame = match read_frame_expected(
+        after_delivery();
+        let frame = match read_frame_expected_poll_deadline(
             &inner.stream,
             &[MessageType::CleanupComplete, MessageType::CleanupFailed],
             operation_deadline,
@@ -2300,6 +2305,25 @@ fn read_frame_expected(
     Ok(Frame { kind, payload })
 }
 
+// Darwin rejects socket-timeout changes after both directions close even when pre-close bytes
+// remain queued. Polling drains a terminate acknowledgement under the same deadline without
+// setsockopt, whether the peer closes before or immediately after command delivery.
+fn read_frame_expected_poll_deadline(
+    stream: &UnixStream,
+    expected: &[MessageType],
+    operation_deadline: Instant,
+) -> io::Result<Frame> {
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    read_exact_poll_deadline(stream, &mut header, operation_deadline)?;
+    let (kind, payload_len) = decode_frame_header(&header)?;
+    if !expected.contains(&kind) {
+        return Err(invalid_data("supervisor protocol message is invalid for current state"));
+    }
+    let mut payload = vec![0_u8; payload_len];
+    read_exact_poll_deadline(stream, payload.as_mut_slice(), operation_deadline)?;
+    Ok(Frame { kind, payload })
+}
+
 fn decode_buffered_frame(buffer: &[u8]) -> io::Result<Option<(usize, Frame)>> {
     if buffer.len() < FRAME_HEADER_LEN {
         return Ok(None);
@@ -2422,6 +2446,77 @@ fn read_exact_deadline(
         }
     }
     Ok(())
+}
+
+fn read_exact_poll_deadline(
+    stream: &UnixStream,
+    buffer: &mut [u8],
+    operation_deadline: Instant,
+) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        wait_for_readable(stream.as_raw_fd(), operation_deadline)?;
+        let mut reader = stream;
+        match reader.read(&mut buffer[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "supervisor control closed",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_readable(fd: RawFd, operation_deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = remaining_timeout(operation_deadline)?;
+        let timeout_ms = poll_timeout_ms(remaining);
+        let mut descriptor = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: descriptor points to one initialized pollfd for the duration of this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "supervisor control descriptor is invalid",
+                ));
+            }
+            if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+            continue;
+        }
+        if ready == 0 {
+            if Instant::now() >= operation_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "supervisor control read timed out",
+                ));
+            }
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn poll_timeout_ms(timeout: Duration) -> libc::c_int {
+    let rounded_up = timeout
+        .as_millis()
+        .saturating_add(u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000)))
+        .max(1);
+    libc::c_int::try_from(rounded_up).unwrap_or(libc::c_int::MAX)
 }
 
 fn write_all_deadline(
@@ -2602,7 +2697,7 @@ mod tests {
     use std::{
         fs,
         process::ExitStatus,
-        sync::{Mutex, MutexGuard},
+        sync::{mpsc, Mutex, MutexGuard},
     };
     use tempfile::TempDir;
 
@@ -2904,6 +2999,70 @@ mod tests {
         assert!(!process_group_is_active(target.process_group).unwrap());
         assert!(fixture.marker("cleanup-helper.reaped").exists());
         assert!(fixture.wait_supervisor().success());
+    }
+
+    #[test]
+    fn terminate_consumes_queued_cleanup_acknowledgement_after_peer_close() {
+        let (parent, peer) = UnixStream::pair().expect("control pair should be created");
+        write_frame(&peer, MessageType::CleanupComplete, &[], deadline())
+            .expect("cleanup acknowledgement should be queued");
+        drop(peer);
+        let control = UnixProcessSupervisorControl {
+            inner: Mutex::new(ParentControlInner { stream: parent, state: ParentState::Started }),
+        };
+
+        control.terminate().expect("queued acknowledgement should settle termination");
+        control.terminate().expect("settled termination should remain idempotent");
+
+        assert_eq!(
+            control.inner.lock().expect("control lock should be available").state,
+            ParentState::Terminated
+        );
+    }
+
+    #[test]
+    fn terminate_drains_acknowledgement_after_successful_delivery_and_peer_close() {
+        let (parent, peer) = UnixStream::pair().expect("control pair should be created");
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        let responder = thread::spawn(move || {
+            read_frame_expected(&peer, &[MessageType::Terminate], deadline())
+                .expect("terminate command should be delivered");
+            write_frame(&peer, MessageType::CleanupComplete, &[], deadline())
+                .expect("cleanup acknowledgement should be queued");
+            drop(peer);
+            closed_sender.send(()).expect("peer close should be reported");
+        });
+        let control = UnixProcessSupervisorControl {
+            inner: Mutex::new(ParentControlInner { stream: parent, state: ParentState::Started }),
+        };
+
+        control
+            .terminate_with_delivery_observer(|| {
+                closed_receiver
+                    .recv_timeout(TEST_WAIT_TIMEOUT)
+                    .expect("peer should close before acknowledgement read");
+            })
+            .expect("delivered termination should drain its acknowledgement");
+        responder.join().expect("control responder should exit cleanly");
+
+        assert_eq!(
+            control.inner.lock().expect("control lock should be available").state,
+            ParentState::Terminated
+        );
+    }
+
+    #[test]
+    fn delivery_failure_fallback_rejects_truncated_cleanup_acknowledgement() {
+        let (parent, mut peer) = UnixStream::pair().expect("control pair should be created");
+        peer.write_all(&[PROTOCOL_VERSION, MessageType::CleanupComplete as u8])
+            .expect("partial acknowledgement should be queued");
+        drop(peer);
+
+        let error =
+            read_frame_expected_poll_deadline(&parent, &[MessageType::CleanupComplete], deadline())
+                .expect_err("partial acknowledgement should fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
