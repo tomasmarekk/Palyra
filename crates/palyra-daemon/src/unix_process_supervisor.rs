@@ -2902,7 +2902,7 @@ mod tests {
         let mut fixture = SupervisorFixture::spawn(true);
         fixture.start_target(TEST_TARGET_MODE_BLOCK);
         let target = fixture.target_identity.expect("target identity should be recorded");
-        signal_test_process_group(target.process_group).expect("target group should terminate");
+        signal_test_process(target.pid).expect("exact target should terminate");
         wait_for_marker(fixture.marker("cleanup-fault-consumed"), TEST_WAIT_TIMEOUT)
             .expect("natural-exit cleanup retry should consume the injected failure");
 
@@ -2990,6 +2990,20 @@ mod tests {
     fn assert_anchor(identity: ProcessIdentity) {
         assert_eq!(identity.pid, identity.process_group);
         assert_eq!(identity.pid, identity.session);
+    }
+
+    fn signal_test_process(process_id: libc::pid_t) -> io::Result<()> {
+        if process_id <= 0 {
+            return Err(invalid_input("test process id must be positive"));
+        }
+        // This regression needs an exact child-exit event, not group-delivery semantics. Unlike
+        // teardown, a vanished identity is a failed precondition and must not count as success.
+        // SAFETY: tests verify the full PID/PGID/SID identity immediately before this call.
+        if unsafe { libc::kill(process_id, libc::SIGKILL) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     fn signal_test_process_group(process_group: libc::pid_t) -> io::Result<()> {
