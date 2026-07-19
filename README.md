@@ -7,15 +7,6 @@ This repository is currently in the development phase.
 
 ![Banner](https://i.imgur.com/qy02cLe.gif)
 
-## Development Roadmap
-
-| Stage | Component | Technology | Progress | Status |
-| :---: | --- | --- | --- | --- |
-| `01` | **Back-end** | `Rust` | `██████████████████░░` **90%** | Finalization |
-| `02` | **CLI** | `Rust` | `███████████████████░` **95%** | Finalization |
-| `03` | **TUI** | `Rust` + `Ratatui` | `█░░░░░░░░░░░░░░░░░░░` **5%** | Initial development |
-| `04` | **Desktop App** | `Rust` + `TypeScript` + `Tauri` | `░░░░░░░░░░░░░░░░░░░░` **0%** | Planned |
-
 ## License
 
 Palyra is open source under the [GNU Affero General Public License v3.0 only](./LICENSE)
