@@ -10650,25 +10650,29 @@ pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
 
     for _ in 0..MAX_MACOS_PROCESS_GROUP_SNAPSHOT_ATTEMPTS {
         process_ids.fill(0);
-        // SAFETY: `process_ids` is a writable buffer of exactly `buffer_size` bytes and the
-        // positive group id was validated to fit Darwin pid_t.
-        let count = unsafe {
-            macos_proc_listpgrppids(process_group_id, process_ids.as_mut_ptr().cast(), buffer_size)
+        // libproc collapses a failed __proc_info call into a zero result. Clear and capture the
+        // thread-local errno around the call so an authoritative empty snapshot remains distinct
+        // from a hidden operating-system error.
+        // SAFETY: __error returns this thread's writable errno slot, and `process_ids` is a writable
+        // buffer of exactly `buffer_size` bytes for the validated positive Darwin process group.
+        let (raw_count, error_number) = unsafe {
+            let error_slot = libc::__error();
+            *error_slot = 0;
+            let count = macos_proc_listpgrppids(
+                process_group_id,
+                process_ids.as_mut_ptr().cast(),
+                buffer_size,
+            );
+            (count, *error_slot)
         };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let count = usize::try_from(count)
-            .map_err(|_| io::Error::other("macOS process-group count is invalid"))?;
-        if count >= process_ids.len() {
-            return Err(io::Error::other("bounded macOS process-group capacity exceeded"));
-        }
-        if count == 0 {
-            if !macos_process_group_signal_probe(process_group_id)? {
-                return Ok(false);
-            }
-            continue;
-        }
+        let count = match classify_macos_process_group_list_result(
+            raw_count,
+            error_number,
+            process_ids.len(),
+        )? {
+            MacosProcessGroupListResult::Empty => return Ok(false),
+            MacosProcessGroupListResult::Members(count) => count,
+        };
 
         let mut snapshot_changed = false;
         for process_id in process_ids.iter().copied().take(count) {
@@ -10725,20 +10729,32 @@ pub(crate) fn unix_process_group_is_alive(pid: u32) -> io::Result<bool> {
     Err(io::Error::other("macOS process-group liveness snapshot did not stabilize"))
 }
 
-#[cfg(target_os = "macos")]
-fn macos_process_group_signal_probe(process_group_id: libc::pid_t) -> io::Result<bool> {
-    // SAFETY: signal 0 does not affect the target group; the validated positive pid_t can be
-    // negated safely and all error returns are handled.
-    let result = unsafe { libc::kill(-process_group_id, 0) };
-    if result == 0 {
-        return Ok(true);
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosProcessGroupListResult {
+    Empty,
+    Members(usize),
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_process_group_list_result(
+    raw_count: i32,
+    error_number: i32,
+    capacity: usize,
+) -> io::Result<MacosProcessGroupListResult> {
+    if raw_count <= 0 {
+        if raw_count == 0 && error_number == 0 {
+            return Ok(MacosProcessGroupListResult::Empty);
+        }
+        let error_number = if error_number == 0 { libc::EIO } else { error_number };
+        return Err(io::Error::from_raw_os_error(error_number));
     }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(error),
+    let count = usize::try_from(raw_count)
+        .map_err(|_| io::Error::other("macOS process-group count is invalid"))?;
+    if count >= capacity {
+        return Err(io::Error::other("bounded macOS process-group capacity exceeded"));
     }
+    Ok(MacosProcessGroupListResult::Members(count))
 }
 
 #[cfg(target_os = "macos")]
@@ -16923,6 +16939,99 @@ mod tests {
             .expect("zombie leader reap should work")
             .expect("zombie leader should be waitable");
         assert!(status.success());
+    }
+
+    #[test]
+    fn macos_process_group_list_result_distinguishes_empty_snapshots_from_errors() {
+        assert_eq!(
+            super::classify_macos_process_group_list_result(0, 0, 16)
+                .expect("a successful empty libproc result should classify"),
+            super::MacosProcessGroupListResult::Empty
+        );
+        assert_eq!(
+            super::classify_macos_process_group_list_result(1, libc::EPERM, 16)
+                .expect("a positive libproc result should ignore stale errno"),
+            super::MacosProcessGroupListResult::Members(1)
+        );
+        assert_eq!(
+            super::classify_macos_process_group_list_result(0, libc::ESRCH, 16)
+                .expect_err("a zero libproc result with ESRCH must fail closed")
+                .raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(
+            super::classify_macos_process_group_list_result(0, libc::ENOENT, 16)
+                .expect_err("a zero libproc result with ENOENT must fail closed")
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            super::classify_macos_process_group_list_result(0, libc::EPERM, 16)
+                .expect_err("a zero libproc result with errno must fail closed")
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            super::classify_macos_process_group_list_result(-1, 0, 16)
+                .expect_err("a negative libproc result must fail closed")
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(super::classify_macos_process_group_list_result(16, 0, 16)
+            .expect_err("a full libproc buffer must remain ambiguous")
+            .to_string()
+            .contains("capacity"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persisted_macos_signaled_zombie_only_group_is_absent() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -KILL $$"]).process_group(0);
+        let mut leader = super::ManagedChildGuard::new(
+            command.spawn().expect("process-group leader should spawn"),
+        );
+        let group_id = leader.id();
+        let process_id =
+            super::unix_pid_from_u32(group_id).expect("process-group id should fit pid_t");
+        let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .expect("macOS process information size should fit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            // SAFETY: `information` is the exact writable PROC_PIDTBSDINFO ABI buffer and the
+            // unreaped child PID remains reserved until this test explicitly waits for it.
+            let read = unsafe {
+                super::macos_proc_pidinfo(
+                    process_id,
+                    libc::PROC_PIDTBSDINFO,
+                    super::MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
+                    information.as_mut_ptr().cast(),
+                    information_size,
+                )
+            };
+            if read == information_size {
+                // SAFETY: proc_pidinfo reported that it initialized the complete fixed-size
+                // structure.
+                let information = unsafe { information.assume_init() };
+                if information.pbi_status == libc::SZOMB {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "process-group leader should become a zombie");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!super::unix_process_group_is_alive(group_id)
+            .expect("macOS zombie-aware process-group probe should work"));
+
+        let status = leader
+            .wait_for_exit(Duration::from_secs(5))
+            .expect("zombie leader reap should work")
+            .expect("zombie leader should be waitable");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

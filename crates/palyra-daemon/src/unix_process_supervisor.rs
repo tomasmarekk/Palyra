@@ -1061,10 +1061,19 @@ fn signal_exact_reserved_target_group(exit_observer: &ExactChildExitObserver) ->
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) && exit_observer.has_exited()? {
-        Ok(())
-    } else {
-        Err(error)
+        return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM)
+        && exit_observer.has_exited()?
+        && !process_group_is_active(target_pid)?
+    {
+        // Darwin excludes zombies from group signal delivery and can report EPERM when the retained
+        // group has no signalable live member. The zombie-aware libproc snapshot must independently
+        // prove that no live descendant remains before cleanup consumes authority.
+        return Ok(());
+    }
+    Err(error)
 }
 
 fn reap_exact_target(target_pid: libc::pid_t, operation_deadline: Instant) -> io::Result<i32> {
