@@ -163,21 +163,16 @@ mod platform {
     #[derive(Debug, Clone, Copy)]
     pub(super) struct LinuxBubblewrapBackend;
 
-    impl TierCBackend for LinuxBubblewrapBackend {
-        fn kind(&self) -> TierCBackendKind {
-            TierCBackendKind::LinuxBubblewrap
-        }
-
-        fn capabilities(&self) -> TierCBackendCapabilities {
-            TierCBackendCapabilities { runtime_network_isolation: true, host_allowlists: false }
-        }
-
-        fn build_command_plan(
+    impl LinuxBubblewrapBackend {
+        /// Renders a plan after the production caller has verified that `bwrap` can be spawned.
+        ///
+        /// Separating rendering from the host probe lets unit tests pin the argv contract
+        /// without depending on the runner's installed packages.
+        pub(super) fn build_command_plan_after_binary_check(
             &self,
             policy: &TierCPolicy,
             request: &TierCCommandRequest,
         ) -> Result<TierCCommandPlan, TierCBackendError> {
-            ensure_binary_available("bwrap", self.kind().as_str())?;
             // bwrap can only unshare the network namespace entirely; it cannot filter
             // egress per host, so non-empty allowlists must fail closed.
             if !policy.allowed_egress_hosts.is_empty() || !policy.allowed_dns_suffixes.is_empty() {
@@ -240,6 +235,25 @@ mod platform {
             args.push(request.command.clone());
             args.extend(request.args.iter().cloned());
             Ok(TierCCommandPlan { backend: self.kind(), program: "bwrap".to_owned(), args })
+        }
+    }
+
+    impl TierCBackend for LinuxBubblewrapBackend {
+        fn kind(&self) -> TierCBackendKind {
+            TierCBackendKind::LinuxBubblewrap
+        }
+
+        fn capabilities(&self) -> TierCBackendCapabilities {
+            TierCBackendCapabilities { runtime_network_isolation: true, host_allowlists: false }
+        }
+
+        fn build_command_plan(
+            &self,
+            policy: &TierCPolicy,
+            request: &TierCCommandRequest,
+        ) -> Result<TierCCommandPlan, TierCBackendError> {
+            ensure_binary_available("bwrap", self.kind().as_str())?;
+            self.build_command_plan_after_binary_check(policy, request)
         }
     }
 
@@ -479,13 +493,13 @@ fn ensure_binary_available(binary: &str, backend: &'static str) -> Result<(), Ti
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::platform::LinuxBubblewrapBackend;
     use super::{
         build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
         current_backend_kind, TierCBackendError, TierCBackendKind, TierCCommandRequest,
         TierCPolicy,
     };
-    #[cfg(target_os = "linux")]
-    use super::{platform::LinuxBubblewrapBackend, TierCBackend};
 
     fn sample_policy() -> TierCPolicy {
         TierCPolicy {
@@ -532,8 +546,8 @@ mod tests {
         let policy = sample_policy();
         let request = TierCCommandRequest { command: "uname".to_owned(), args: Vec::new() };
         let plan = backend
-            .build_command_plan(&policy, &request)
-            .expect("direct Linux backend planning should not require bwrap to be installed");
+            .build_command_plan_after_binary_check(&policy, &request)
+            .expect("Linux argv rendering should not depend on bwrap being installed");
 
         assert!(
             !plan.args.iter().any(|arg| arg == "--new-session"),
