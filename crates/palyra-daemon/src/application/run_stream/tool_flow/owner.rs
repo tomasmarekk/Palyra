@@ -977,9 +977,14 @@ mod live_owner_tests {
     const TOOL_FLOW_SOURCE: &str = include_str!("../tool_flow.rs");
 
     fn production_owner_source() -> &'static str {
-        OWNER_SOURCE
-            .split_once("#[cfg(test)]\nmod live_owner_tests")
-            .map_or(OWNER_SOURCE, |(production, _)| production)
+        production_owner_source_from(OWNER_SOURCE)
+    }
+
+    fn production_owner_source_from(source: &str) -> &str {
+        // The LF before `mod` is present in both LF and CRLF source text.
+        source
+            .split_once("\nmod live_owner_tests {")
+            .map_or(source, |(production, _)| production)
     }
 
     #[test]
@@ -1024,6 +1029,18 @@ mod live_owner_tests {
                 !production.contains(unsafe_construct),
                 "live tool owner must remain safe Rust: found {unsafe_construct:?}"
             );
+        }
+    }
+
+    #[test]
+    fn production_source_boundary_accepts_lf_and_crlf() {
+        for source in [
+            "fn production() {}\n#[cfg(test)]\nmod live_owner_tests { unsafe {} }",
+            "fn production() {}\r\n#[cfg(test)]\r\nmod live_owner_tests { unsafe {} }",
+        ] {
+            let production = production_owner_source_from(source);
+            assert!(production.contains("fn production() {}"));
+            assert!(!production.contains("unsafe {"));
         }
     }
 
