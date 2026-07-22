@@ -111,11 +111,7 @@ export function validateQaLabWorkflow(ciWorkflow) {
     if (!normalized.includes(`qa gate --suite ${suite}`)) {
       errors.push(`qa-lab must execute ${suite} through qa gate`);
     }
-    if (
-      !step.includes(
-        "PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad",
-      )
-    ) {
+    if (!step.includes("PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad")) {
       errors.push(`qa-lab must bind ${suite} to its built palyrad binary`);
     }
     if (
@@ -175,9 +171,7 @@ export function validateRuntimeShadowRolloutGates(manifest, repoRoot) {
     errors.push("missing runtime_kernel_v2_authoritative promotion gate");
   } else {
     if (authoritativeGate.release_stage !== "main_qualification") {
-      errors.push(
-        "runtime_kernel_v2_authoritative release_stage must remain main_qualification",
-      );
+      errors.push("runtime_kernel_v2_authoritative release_stage must remain main_qualification");
     }
     if (authoritativeGate.required_qa_suite !== AUTHORITATIVE_SUITE) {
       errors.push(

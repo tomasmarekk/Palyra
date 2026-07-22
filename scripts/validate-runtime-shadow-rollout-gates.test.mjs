@@ -81,9 +81,7 @@ test("qa-lab directly gates shadow and authoritative suites with its built daemo
   );
   assert.ok(
     validateQaLabWorkflow(previewOnly).some((error) =>
-      error.includes(
-        "qa-lab must directly execute qa/suites/runtime_kernel_v2_shadow.yaml",
-      ),
+      error.includes("qa-lab must directly execute qa/suites/runtime_kernel_v2_shadow.yaml"),
     ),
   );
 });
