@@ -48,6 +48,7 @@ fn no_tool_environment_uses_an_empty_allowlist() {
         &mut command,
         QaDaemonEnvironment {
             allowed_tools: allowed_tools.as_str(),
+            policy_profile: "qa_no_tools",
             state_root: root.path(),
             identity_root: &root.path().join("identity"),
             config_path: &root.path().join("palyra.toml"),
@@ -74,6 +75,96 @@ fn no_tool_environment_uses_an_empty_allowlist() {
     assert_eq!(
         command_env(&command, "PALYRA_QA_PROVIDER_BINDING_SHA256"),
         Some(OsStr::new(&"b".repeat(64)))
+    );
+}
+
+#[test]
+fn explicit_shadow_profile_binds_closed_runtime_environment_to_qa_execution() {
+    let root = tempfile::tempdir().expect("environment root should exist");
+    let mut command = Command::new("palyrad");
+    let provider = QaDaemonProviderEnvironment::Deterministic {
+        provider_fixture: root.path().join("provider.yaml"),
+    };
+    let execution_digest = "a".repeat(64);
+    configure_isolated_environment(
+        &mut command,
+        QaDaemonEnvironment {
+            allowed_tools: "",
+            policy_profile: "runtime_kernel_v2_shadow_explicit",
+            state_root: root.path(),
+            identity_root: &root.path().join("identity"),
+            config_path: &root.path().join("palyra.toml"),
+            vault_dir: &root.path().join("vault"),
+            provider: &provider,
+            execution_key_digest: execution_digest.as_str(),
+            provider_binding_sha256: &"b".repeat(64),
+            admin_token: "test-token",
+            principal: "admin:test",
+            fault_launch: None,
+        },
+    );
+
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_PROFILE"),
+        Some(OsStr::new("v2_shadow"))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_QA_RUNTIME_KERNEL_SHADOW_EXPLICIT_BINDING"),
+        Some(OsStr::new(execution_digest.as_str()))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY"),
+        Some(OsStr::new("migrate_at_safe_boundary"))
+    );
+    assert_eq!(command_env(&command, "PALYRA_TOOL_CALL_ALLOWED_TOOLS"), Some(OsStr::new("")));
+}
+
+#[test]
+fn authoritative_v2_profile_binds_closed_runtime_environment_to_qa_execution() {
+    let root = tempfile::tempdir().expect("environment root should exist");
+    let mut command = Command::new("palyrad");
+    let provider = QaDaemonProviderEnvironment::Deterministic {
+        provider_fixture: root.path().join("provider.yaml"),
+    };
+    let execution_digest = "a".repeat(64);
+    configure_isolated_environment(
+        &mut command,
+        QaDaemonEnvironment {
+            allowed_tools: "",
+            policy_profile: "runtime_kernel_v2_authoritative_cancel",
+            state_root: root.path(),
+            identity_root: &root.path().join("identity"),
+            config_path: &root.path().join("palyra.toml"),
+            vault_dir: &root.path().join("vault"),
+            provider: &provider,
+            execution_key_digest: execution_digest.as_str(),
+            provider_binding_sha256: &"b".repeat(64),
+            admin_token: "test-token",
+            principal: "admin:test",
+            fault_launch: None,
+        },
+    );
+
+    assert_eq!(command_env(&command, "PALYRA_RUNTIME_KERNEL_PROFILE"), Some(OsStr::new("v2")));
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_CANARY_BASIS_POINTS"),
+        Some(OsStr::new("0"))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS"),
+        Some(OsStr::new("0"))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX"),
+        Some(OsStr::new(execution_digest.as_str()))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY"),
+        Some(OsStr::new("migrate_at_safe_boundary"))
+    );
+    assert_eq!(
+        command_env(&command, "PALYRA_RUNTIME_KERNEL_ROLLBACK_POLICY"),
+        Some(OsStr::new("finish_read_only_suspend_mutating"))
     );
 }
 

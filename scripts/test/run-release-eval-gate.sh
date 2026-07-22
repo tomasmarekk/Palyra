@@ -37,3 +37,24 @@ CARGO_BIN="$(resolve_cargo)"
 "$CARGO_BIN" run -p palyra-cli --example run_release_eval_gate --locked -- \
   --manifest fixtures/golden/release_eval_inventory.json \
   --report-dir target/release-artifacts/release-evals
+
+"$CARGO_BIN" build -p palyra-daemon --bin palyrad --locked
+if [[ -z "${PALYRA_QA_PALYRAD_BIN:-}" ]]; then
+  if [[ -x "$ROOT_DIR/target/debug/palyrad.exe" ]]; then
+    PALYRA_QA_PALYRAD_BIN="$ROOT_DIR/target/debug/palyrad.exe"
+  else
+    PALYRA_QA_PALYRAD_BIN="$ROOT_DIR/target/debug/palyrad"
+  fi
+fi
+PALYRA_QA_PALYRAD_BIN="$PALYRA_QA_PALYRAD_BIN" \
+  "$CARGO_BIN" run -p palyra-cli --locked -- qa gate \
+  --suite qa/suites/runtime_kernel_v2_shadow.yaml \
+  --output-json target/qa-lab/runtime-kernel-v2-shadow/report.json \
+  --output-markdown target/qa-lab/runtime-kernel-v2-shadow/report.md \
+  --json
+PALYRA_QA_PALYRAD_BIN="$PALYRA_QA_PALYRAD_BIN" \
+  "$CARGO_BIN" run -p palyra-cli --locked -- qa gate \
+  --suite qa/suites/runtime_kernel_v2_authoritative.yaml \
+  --output-json target/qa-lab/runtime-kernel-v2-authoritative/report.json \
+  --output-markdown target/qa-lab/runtime-kernel-v2-authoritative/report.md \
+  --json

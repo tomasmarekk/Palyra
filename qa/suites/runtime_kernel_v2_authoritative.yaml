@@ -1,0 +1,67 @@
+schema_version: 3
+id: runtime_kernel_v2_authoritative
+mode: promotion
+scenario_roots:
+  - qa/scenarios/runtime_kernel_v2
+expected_scenario_ids:
+  - runtime_kernel_v2.authoritative_approval
+  - runtime_kernel_v2.authoritative_cancellation
+  - runtime_kernel_v2.authoritative_compaction
+  - runtime_kernel_v2.authoritative_text
+  - runtime_kernel_v2.authoritative_tool
+include_tags:
+  - runtime_kernel_v2_authoritative
+  - promotion_gate
+allow_provider_modes:
+  - mock
+allow_runner_modes:
+  - fixture
+allow_live_providers: false
+resume:
+  enabled: false
+  reuse_passed: false
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: true
+available_capabilities:
+  - agent_run
+  - approvals
+  - cancellation
+  - context_compaction
+  - qa_lab
+  - runtime_kernel_v2_authoritative
+  - workspace_context
+capability_skips: []
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: text_delivery
+      label: Text and delivery
+      areas: [text]
+      labels: [runtime_kernel_v2_authoritative, text_only]
+      required: true
+    - id: tool_authority
+      label: Tool authority
+      areas: [tools]
+      labels: [runtime_kernel_v2_authoritative, read_only]
+      required: true
+    - id: approval_authority
+      label: Approval authority
+      areas: [approvals]
+      labels: [runtime_kernel_v2_authoritative, approval_denied]
+      required: true
+    - id: cancellation
+      label: Cancellation
+      areas: [workflow]
+      labels: [runtime_kernel_v2_authoritative, cancellation]
+      required: true
+    - id: compaction
+      label: Compaction
+      areas: [workflow]
+      labels: [runtime_kernel_v2_authoritative, context_compaction]
+      required: true

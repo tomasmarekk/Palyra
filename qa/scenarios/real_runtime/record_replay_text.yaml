@@ -39,7 +39,7 @@ expect:
       min_count: 1
   tool_calls: []
   runtime_path:
-    runtime_contract_version: runtime-contracts.v13
+    runtime_contract_version: runtime-contracts.v14
     provider_lane: record_replay
     attempt_owner: embedded_run_stream
     harness_id: embedded_run_stream

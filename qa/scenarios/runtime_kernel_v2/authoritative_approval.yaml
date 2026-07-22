@@ -1,41 +1,45 @@
-# Verifies that a real mutating tool proposal reaches the production approval gate.
-# The explicit denial must be journaled and leave the copied workspace unchanged.
+# Qualifies denial at the authoritative V2 approval boundary without mutation.
 schema_version: 5
-id: real_runtime.mutation_approval_denied
-title: Explicitly denied mutation through the real runtime
+id: runtime_kernel_v2.authoritative_approval
+title: Authoritative RuntimeKernelV2 approval denial
 area: approvals
 mode:
   runner: fixture
   deterministic: true
 runner:
-  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  provider_fixture: qa/fixtures/runtime_kernel_v2_authoritative.yaml
   workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
-  policy_profile: qa_approval_denied
+  policy_profile: runtime_kernel_v2_authoritative_approval_denied
 requires:
   model: text
   capabilities:
     - agent_run
     - qa_lab
     - approvals
+    - runtime_kernel_v2_authoritative
     - workspace_context
   tools:
     - palyra.fs.apply_patch
   fixtures:
-    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/runtime_kernel_v2_authoritative.yaml
     - qa/fixtures/sandbox_workspaces/repo_basic
 steps:
   - id: prompt
     action: user_prompt
-    prompt: "Propose the QA mutation that must be denied."
+    prompt: "Propose the authoritative V2 mutation."
   - id: deny_mutation
     action: approval_decision
-    proposal_id: qa-real-denied-patch
+    proposal_id: qa-v2-denied-patch
     decision: deny
 expect:
   terminal_state: completed
   final_answer:
-    equals: "The requested mutation was denied; no file changed."
+    equals: "RuntimeKernelV2 preserved the denied workspace."
   events:
+    - event_type: runtime.authority.selected
+      min_count: 1
+    - event_type: status
+      min_count: 1
     - event_type: tool.call.started
       min_count: 1
     - event_type: approval.required
@@ -44,42 +48,46 @@ expect:
       min_count: 1
     - event_type: tool.call.completed
       min_count: 1
+    - event_type: message.replied
+      min_count: 1
     - event_type: run.completed
       min_count: 1
   tool_calls:
     - name: palyra.fs.apply_patch
       min_count: 1
+      max_count: 1
       success: false
   runtime_path:
     runtime_contract_version: runtime-contracts.v14
     provider_lane: fixture
-    attempt_owner: embedded_run_stream
-    harness_id: embedded_run_stream
-    context_engine_id: legacy_provider_input
+    attempt_owner: runtime_kernel_v2.embedded
+    harness_id: runtime_kernel_v2.embedded
+    context_engine_id: runtime_kernel_v2.preassembled_context
     max_fallback_count: 0
     allowed_fallback_reason_codes: []
 forbidden:
   tool_calls: []
   events:
     - run.failed
+    - run.cancelled
+    - runtime.shadow.differential
     - secret.exposed
   artifacts:
-    - src/denied.txt
+    - src/v2-denied.txt
   claims:
     - mutation applied
 artifacts:
-  - path: qa/reports/real_runtime/mutation_approval_denied.evidence.json
+  - path: qa/reports/runtime_kernel_v2/authoritative_approval.evidence.json
     kind: evidence
     required: true
 maturity:
   labels:
     - p0
-    - release_smoke
-    - real_runtime
-    - nightly
     - deterministic
+    - real_runtime
+    - runtime_kernel_v2_authoritative
+    - promotion_gate
     - approval_denied
-    - baseline_replay
 timeout:
   run_ms: 45000
   step_ms: 15000

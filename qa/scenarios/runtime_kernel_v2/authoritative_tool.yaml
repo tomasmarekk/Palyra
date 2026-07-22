@@ -1,51 +1,59 @@
-# Exercises a real read-only tool call against an isolated copied workspace.
-# The fixture contains no credentials and is removed with the scenario daemon.
+# Qualifies one read-only tool through the authoritative V2 tool authority.
 schema_version: 5
-id: real_runtime.read_only_tool
-title: Read-only tool through the real runtime
+id: runtime_kernel_v2.authoritative_tool
+title: Authoritative RuntimeKernelV2 read-only tool
 area: tools
 mode:
   runner: fixture
   deterministic: true
 runner:
-  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  provider_fixture: qa/fixtures/runtime_kernel_v2_authoritative.yaml
   workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
-  policy_profile: qa_read_only
+  policy_profile: runtime_kernel_v2_authoritative_read_only
 requires:
   model: text
   capabilities:
     - agent_run
     - qa_lab
+    - runtime_kernel_v2_authoritative
     - workspace_context
   tools:
     - palyra.fs.read_file
   fixtures:
-    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/runtime_kernel_v2_authoritative.yaml
     - qa/fixtures/sandbox_workspaces/repo_basic
 steps:
   - id: prompt
     action: user_prompt
-    prompt: "Inspect the QA workspace fixture with the read-only tool."
+    prompt: "Inspect the authoritative V2 workspace."
 expect:
   terminal_state: completed
   final_answer:
-    equals: "The workspace fixture contains initial sandbox content."
+    equals: "RuntimeKernelV2 returned the exact workspace content."
   events:
+    - event_type: runtime.authority.selected
+      min_count: 1
+    - event_type: status
+      min_count: 1
     - event_type: tool.call.started
       min_count: 1
     - event_type: tool.call.completed
+      min_count: 1
+    - event_type: message.replied
       min_count: 1
     - event_type: run.completed
       min_count: 1
   tool_calls:
     - name: palyra.fs.read_file
       min_count: 1
+      max_count: 1
+      success: true
   runtime_path:
     runtime_contract_version: runtime-contracts.v14
     provider_lane: fixture
-    attempt_owner: embedded_run_stream
-    harness_id: embedded_run_stream
-    context_engine_id: legacy_provider_input
+    attempt_owner: runtime_kernel_v2.embedded
+    harness_id: runtime_kernel_v2.embedded
+    context_engine_id: runtime_kernel_v2.preassembled_context
     max_fallback_count: 0
     allowed_fallback_reason_codes: []
 forbidden:
@@ -54,23 +62,24 @@ forbidden:
   events:
     - approval.required
     - run.failed
+    - run.cancelled
+    - runtime.shadow.differential
     - secret.exposed
   artifacts: []
   claims:
     - mutation performed
 artifacts:
-  - path: qa/reports/real_runtime/read_only_tool.evidence.json
+  - path: qa/reports/runtime_kernel_v2/authoritative_tool.evidence.json
     kind: evidence
     required: true
 maturity:
   labels:
     - p0
-    - release_smoke
-    - real_runtime
-    - nightly
     - deterministic
+    - real_runtime
+    - runtime_kernel_v2_authoritative
+    - promotion_gate
     - read_only
-    - baseline_replay
 timeout:
   run_ms: 45000
   step_ms: 15000

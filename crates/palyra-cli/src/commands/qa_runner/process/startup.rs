@@ -34,6 +34,7 @@ pub(super) fn start_daemon(
         &mut command,
         QaDaemonEnvironment {
             allowed_tools: launch.allowed_tools.as_str(),
+            policy_profile: launch.policy_profile.as_str(),
             state_root: launch.state_root.as_path(),
             identity_root: launch.identity_root.as_path(),
             config_path: launch.config_path.as_path(),
@@ -241,6 +242,29 @@ pub(super) fn configure_isolated_environment(
         .env("PALYRA_QA_EXECUTION_KEY_DIGEST", environment.execution_key_digest)
         .env("PALYRA_QA_PROVIDER_BINDING_SHA256", environment.provider_binding_sha256)
         .env("RUST_LOG", "info");
+    match environment.policy_profile {
+        "runtime_kernel_v2_shadow_explicit" => {
+            command
+                .env("PALYRA_RUNTIME_KERNEL_PROFILE", "v2_shadow")
+                .env("PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS", "1")
+                .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", environment.execution_key_digest)
+                .env("PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY", "migrate_at_safe_boundary")
+                .env(
+                    "PALYRA_QA_RUNTIME_KERNEL_SHADOW_EXPLICIT_BINDING",
+                    environment.execution_key_digest,
+                );
+        }
+        profile if is_runtime_kernel_v2_authoritative_profile(profile) => {
+            command
+                .env("PALYRA_RUNTIME_KERNEL_PROFILE", "v2")
+                .env("PALYRA_RUNTIME_KERNEL_CANARY_BASIS_POINTS", "0")
+                .env("PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS", "0")
+                .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", environment.execution_key_digest)
+                .env("PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY", "migrate_at_safe_boundary")
+                .env("PALYRA_RUNTIME_KERNEL_ROLLBACK_POLICY", "finish_read_only_suspend_mutating");
+        }
+        _ => {}
+    }
     if let Some(fault_launch) = environment.fault_launch {
         command
             .env(QA_FAULT_LAUNCH_PATH_ENV, fault_launch.launch_relative_path.as_os_str())
@@ -328,6 +352,39 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
         "qa_no_tools" => {
             anyhow::bail!("qa.runner.policy_profile_mismatch: qa_no_tools cannot expose tools")
         }
+        "runtime_kernel_v2_shadow_explicit" if manifest.requires.tools.is_empty() => Ok(()),
+        "runtime_kernel_v2_shadow_explicit" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: runtime_kernel_v2_shadow_explicit cannot expose tools"
+        ),
+        "runtime_kernel_v2_authoritative_no_tools"
+        | "runtime_kernel_v2_authoritative_cancel"
+        | "runtime_kernel_v2_authoritative_compaction"
+            if manifest.requires.tools.is_empty() =>
+        {
+            Ok(())
+        }
+        "runtime_kernel_v2_authoritative_no_tools"
+        | "runtime_kernel_v2_authoritative_cancel"
+        | "runtime_kernel_v2_authoritative_compaction" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: authoritative V2 no-tool profiles cannot expose tools"
+        ),
+        "runtime_kernel_v2_authoritative_read_only"
+            if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS) =>
+        {
+            Ok(())
+        }
+        "runtime_kernel_v2_authoritative_read_only" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: authoritative V2 read-only profile requires explicit workspace read tools"
+        ),
+        "runtime_kernel_v2_authoritative_approval_denied"
+            if has_exact_tools(&manifest.requires.tools, QA_APPROVAL_MUTATION_TOOLS)
+                && approval_steps_deny_only(manifest) =>
+        {
+            Ok(())
+        }
+        "runtime_kernel_v2_authoritative_approval_denied" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: authoritative V2 approval profile requires only the mutation tool and explicit deny decisions"
+        ),
         "qa_read_only" if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS) => {
             Ok(())
         }
@@ -345,10 +402,7 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
         ),
         "qa_fault_mutation"
             if manifest.fault_injection.is_some()
-                && has_single_allowed_tool(
-                    &manifest.requires.tools,
-                    QA_FAULT_MUTATION_TOOLS,
-                )
+                && has_single_allowed_tool(&manifest.requires.tools, QA_FAULT_MUTATION_TOOLS)
                 && approval_steps_allow_only(manifest) =>
         {
             Ok(())
@@ -370,6 +424,17 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
             "qa.runner.unsupported_policy_profile: unsupported fixture policy profile"
         ),
     }
+}
+
+fn is_runtime_kernel_v2_authoritative_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        "runtime_kernel_v2_authoritative_no_tools"
+            | "runtime_kernel_v2_authoritative_read_only"
+            | "runtime_kernel_v2_authoritative_approval_denied"
+            | "runtime_kernel_v2_authoritative_cancel"
+            | "runtime_kernel_v2_authoritative_compaction"
+    )
 }
 
 fn has_exact_tool_subset(tools: &[String], allowed: &[&str]) -> bool {

@@ -310,8 +310,8 @@ jobs:
           cache: true
           run-install: true
 
-      - name: Vite+ check
-        run: vp check apps/web apps/desktop/ui apps/browser-extension scripts
+      - name: JS and rollout contract check
+        run: npm run js:check
 
       - name: Rustfmt check
         run: cargo fmt --all --check
@@ -376,6 +376,22 @@ jobs:
           test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
           mkdir -p artifacts/qa-lab/baseline-replay
           cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/baseline_replay.yaml --output-json artifacts/qa-lab/baseline-replay/baseline-replay.json --output-markdown artifacts/qa-lab/baseline-replay/baseline-replay.md --json
+
+      - name: Run RuntimeKernelV2 shadow gate
+        env:
+          PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad
+        run: |
+          test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
+          mkdir -p artifacts/qa-lab/runtime-kernel-v2-shadow
+          cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/runtime_kernel_v2_shadow.yaml --output-json artifacts/qa-lab/runtime-kernel-v2-shadow/report.json --output-markdown artifacts/qa-lab/runtime-kernel-v2-shadow/report.md --json
+
+      - name: Run authoritative RuntimeKernelV2 gate
+        env:
+          PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad
+        run: |
+          test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
+          mkdir -p artifacts/qa-lab/runtime-kernel-v2-authoritative
+          cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/runtime_kernel_v2_authoritative.yaml --output-json artifacts/qa-lab/runtime-kernel-v2-authoritative/report.json --output-markdown artifacts/qa-lab/runtime-kernel-v2-authoritative/report.md --json
 
       - name: Upload QA Lab reports
         if: ${{ always() }}

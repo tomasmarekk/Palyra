@@ -1,0 +1,36 @@
+schema_version: 2
+id: runtime_kernel_v2_shadow
+mode: promotion
+scenario_roots:
+  - qa/scenarios/runtime_kernel_v2
+include_tags:
+  - runtime_kernel_v2_shadow
+  - promotion_gate
+allow_provider_modes:
+  - mock
+allow_runner_modes:
+  - fixture
+allow_live_providers: false
+resume:
+  enabled: false
+  reuse_passed: false
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: true
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - runtime_kernel_v2_shadow
+capability_skips: []
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: shadow_authority
+      label: Shadow authority
+      areas: [security]
+      labels: [runtime_kernel_v2_shadow, promotion_gate]

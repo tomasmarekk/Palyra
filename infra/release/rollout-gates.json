@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-04-16",
+  "updated_at": "2026-07-22",
   "release_scope": "mobile_companion_localization_hardening",
   "success_metrics": [
     {
@@ -49,6 +49,30 @@
       "source": "mobile and desktop voice telemetry",
       "target": ">= 90% transcript-review completion after recording stop",
       "operator_action_on_breach": "keep voice note and voice overlay behind explicit opt-in"
+    },
+    {
+      "metric_id": "runtime_shadow_selected_observations_total",
+      "source": "runtime shadow differential diagnostics",
+      "target": ">= 1000 before promotion review",
+      "operator_action_on_breach": "continue deterministic shadow sampling without widening runtime authority"
+    },
+    {
+      "metric_id": "runtime_shadow_invariant_violation_total",
+      "source": "runtime shadow differential diagnostics",
+      "target": "= 0",
+      "operator_action_on_breach": "block RuntimeKernelV2 promotion and investigate the differential evidence"
+    },
+    {
+      "metric_id": "runtime_shadow_context_safety_invariant_violation_total",
+      "source": "runtime shadow differential diagnostics",
+      "target": "= 0",
+      "operator_action_on_breach": "block RuntimeKernelV2 promotion and inspect context safety construction"
+    },
+    {
+      "metric_id": "runtime_shadow_side_effect_denials_total",
+      "source": "runtime shadow differential diagnostics",
+      "target": "= 0",
+      "operator_action_on_breach": "block RuntimeKernelV2 promotion and remove the shadow side-effect attempt"
     }
   ],
   "gates": [
@@ -139,6 +163,55 @@
       "exit_criteria": [
         "rollback_success_rate meets target for two release cuts",
         "no missing audit links for restore and support flows"
+      ]
+    },
+    {
+      "feature_id": "runtime_kernel_v2_shadow",
+      "release_stage": "shadow",
+      "runtime_controls": [
+        "runtime_kernel.profile=v2_shadow",
+        "deterministic identity-hash sampling",
+        "explicit session enrollment"
+      ],
+      "required_qa_suite": "qa/suites/runtime_kernel_v2_shadow.yaml",
+      "entry_criteria": [
+        "legacy remains the authoritative runtime for every shadow observation",
+        "shadow receives no provider, tool, approval, delivery, or journal authority",
+        "runtime_kernel_v2_shadow QA suite passes with metadata-only differential evidence"
+      ],
+      "exit_criteria": [
+        "runtime_shadow_selected_observations_total meets its minimum evidence target",
+        "expected and benign classifications remain stable across the promotion window",
+        "all invariant and shadow side-effect metrics remain at zero"
+      ],
+      "promotion_blockers": [
+        "runtime_shadow_invariant_violation_total>0",
+        "runtime_shadow_context_safety_invariant_violation_total>0",
+        "runtime_shadow_side_effect_denials_total>0",
+        "runtime_kernel_v2_shadow_qa_suite_not_green"
+      ]
+    },
+    {
+      "feature_id": "runtime_kernel_v2_authoritative",
+      "release_stage": "main_qualification",
+      "runtime_controls": [
+        "runtime_kernel.profile=v2",
+        "generation-pinned V2 authority",
+        "zero hidden legacy fallback"
+      ],
+      "required_qa_suite": "qa/suites/runtime_kernel_v2_authoritative.yaml",
+      "entry_criteria": [
+        "text, tool, approval, cancellation, and compaction lanes execute through an isolated real daemon",
+        "every lane persists exact RuntimeKernelV2 authority and ownership evidence",
+        "terminal, delivery, tool, and approval boundaries remain exact with zero hidden fallback"
+      ],
+      "exit_criteria": [
+        "runtime_kernel_v2_authoritative QA suite passes in required CI",
+        "runtime_kernel_v2_authoritative QA suite passes in the release evaluation gate",
+        "no lane reports legacy ownership, fallback, unauthorized delivery, or unauthorized mutation"
+      ],
+      "promotion_blockers": [
+        "runtime_kernel_v2_authoritative_qa_suite_not_green"
       ]
     }
   ]

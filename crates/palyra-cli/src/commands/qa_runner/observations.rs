@@ -17,6 +17,8 @@ use palyra_common::{
     qa_scenarios::{
         QaScenarioApprovalDecision, QaScenarioManifest, QaScenarioStep, QaScenarioStepAction,
     },
+    redaction::redact_diagnostic_text,
+    runtime_contracts::RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE,
 };
 use palyra_control_plane::{
     ApprovalDecisionRequest, ConsoleLoginRequest, ControlPlaneClient, ControlPlaneClientConfig,
@@ -38,6 +40,7 @@ const MAX_WORKSPACE_ARTIFACTS: usize = 256;
 const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 const TAPE_PAGE_SIZE: usize = 256;
+const AUTHORITATIVE_COMPACTION_SEED_TURNS: usize = 5;
 const CONTROL_PLANE_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) struct QaScenarioObservations {
@@ -177,6 +180,7 @@ struct StreamObservations {
     tool_names_by_proposal: BTreeMap<String, String>,
     tool_calls: Vec<QaToolCallEvidence>,
     approval_cursor: usize,
+    cancellation_requested: bool,
     event_count: usize,
 }
 
@@ -192,6 +196,16 @@ pub(super) async fn collect_scenario_observations(
     let session_id = deadline.run_step(create_session(&client, manifest)).await?;
     sandbox.record_session_id(session_id.as_str());
     let stream_path = format!("console/v1/chat/sessions/{session_id}/messages/stream");
+    if uses_authoritative_v2_compaction_profile(manifest) {
+        seed_authoritative_v2_compaction_history(
+            &mut client,
+            sandbox,
+            session_id.as_str(),
+            stream_path.as_str(),
+            deadline,
+        )
+        .await?;
+    }
     let message = json!({
         "text": prompt,
         "session_label": format!("QA: {}", manifest.id),
@@ -221,6 +235,9 @@ pub(super) async fn collect_scenario_observations(
         .iter()
         .filter(|step| step.action == QaScenarioStepAction::ApprovalDecision)
         .collect::<Vec<_>>();
+    let cancel_after_admission =
+        manifest.runner.as_ref().and_then(|runner| runner.policy_profile())
+            == Some("runtime_kernel_v2_authoritative_cancel");
     deadline
         .run_step(async {
             while let Some(line) =
@@ -234,6 +251,7 @@ pub(super) async fn collect_scenario_observations(
                     &mut client,
                     &line,
                     approval_steps.as_slice(),
+                    cancel_after_admission,
                     &mut observed,
                     &mut observation_budget,
                     deadline,
@@ -295,6 +313,114 @@ pub(super) async fn collect_scenario_observations(
         ..QaEvidenceBuildInput::default()
     };
     Ok(QaScenarioObservations { run_id, session_id, terminal_state, terminal_observed, evidence })
+}
+
+fn uses_authoritative_v2_compaction_profile(manifest: &QaScenarioManifest) -> bool {
+    manifest.runner.as_ref().and_then(|runner| runner.policy_profile())
+        == Some("runtime_kernel_v2_authoritative_compaction")
+}
+
+async fn seed_authoritative_v2_compaction_history(
+    client: &mut ControlPlaneClient,
+    sandbox: &mut QaDaemonSandbox,
+    session_id: &str,
+    stream_path: &str,
+    deadline: QaRunDeadline,
+) -> Result<()> {
+    let launch_cwd = sandbox.workspace().to_string_lossy().into_owned();
+    for turn in 1..=AUTHORITATIVE_COMPACTION_SEED_TURNS {
+        let message = json!({
+            "text": format!(
+                "Seed authoritative V2 compaction history turn {turn}: preserve deterministic continuity."
+            ),
+            "session_label": "QA: runtime_kernel_v2.authoritative_compaction",
+            "allow_sensitive_tools": false,
+            "origin_kind": "qa_fixture",
+            "parameter_delta": {
+                "cli_context": {
+                    "launch_cwd": launch_cwd,
+                    "workspace_roots": [],
+                    "env": {},
+                }
+            },
+            "attachments": [],
+        });
+        let limits = NdjsonStreamLimits::new(MAX_STREAM_BUFFER_BYTES, MAX_ERROR_BODY_BYTES);
+        let mut stream = deadline
+            .run_step(async {
+                client
+                    .post_ndjson_stream(stream_path.to_owned(), &message, limits)
+                    .await
+                    .context("qa.runner.compaction_seed_stream_open_failed")
+            })
+            .await?;
+        let mut run_id = None;
+        let mut complete_status = None;
+        let mut event_count = 0usize;
+        deadline
+            .run_step(async {
+                while let Some(line) = stream
+                    .next_value()
+                    .await
+                    .context("qa.runner.compaction_seed_stream_decode_failed")?
+                {
+                    event_count = event_count.saturating_add(1);
+                    if event_count > MAX_STREAM_EVENTS {
+                        anyhow::bail!("qa.runner.compaction_seed_event_limit_exceeded");
+                    }
+                    match line.get("type").and_then(Value::as_str) {
+                        Some("meta") => {
+                            set_consistent_identity(
+                                &mut run_id,
+                                required_string(
+                                    &line,
+                                    "/run_id",
+                                    "qa.runner.compaction_seed_run_id_missing",
+                                )?,
+                                "qa.runner.compaction_seed_run_id_changed",
+                            )?;
+                            if required_string(
+                                &line,
+                                "/session_id",
+                                "qa.runner.compaction_seed_session_id_missing",
+                            )? != session_id
+                            {
+                                anyhow::bail!("qa.runner.compaction_seed_session_id_changed");
+                            }
+                        }
+                        Some("event") => {}
+                        Some("complete") => {
+                            complete_status = Some(
+                                line.get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_owned(),
+                            );
+                        }
+                        Some("error") => {
+                            let diagnostic = line
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(redact_diagnostic_text)
+                                .unwrap_or_else(|| "unstructured runtime stream error".to_owned());
+                            anyhow::bail!(
+                                "qa.runner.compaction_seed_runtime_stream_error: {diagnostic}"
+                            )
+                        }
+                        _ => anyhow::bail!("qa.runner.compaction_seed_unknown_stream_line"),
+                    }
+                }
+                Result::<()>::Ok(())
+            })
+            .await?;
+        let run_id = run_id.context("qa.runner.compaction_seed_run_id_missing")?;
+        let status = deadline.run_step(load_run_status(client, run_id.as_str())).await?;
+        if canonical_terminal_state(&status, complete_status.as_deref()) != "completed" {
+            anyhow::bail!("qa.runner.compaction_seed_not_completed");
+        }
+        sandbox.record_run_id(run_id.as_str());
+    }
+    Ok(())
 }
 
 /// Reloads durable run evidence after an expected daemon restart.
@@ -386,6 +512,7 @@ async fn process_stream_line(
     client: &mut ControlPlaneClient,
     line: &Value,
     approval_steps: &[&QaScenarioStep],
+    cancel_after_admission: bool,
     observed: &mut StreamObservations,
     observation_budget: &mut QaObservationBudget,
     deadline: QaRunDeadline,
@@ -409,6 +536,7 @@ async fn process_stream_line(
                 client,
                 line,
                 approval_steps,
+                cancel_after_admission,
                 observed,
                 observation_budget,
                 deadline,
@@ -420,8 +548,29 @@ async fn process_stream_line(
             observed.complete_status =
                 Some(line.get("status").and_then(Value::as_str).unwrap_or("unknown").to_owned());
         }
-        Some("error") => anyhow::bail!("qa.runner.runtime_stream_error"),
+        Some("error") => {
+            observation_budget.consume_serialized(line)?;
+            let diagnostic = line
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("runtime returned an unstructured stream error");
+            anyhow::bail!("qa.runner.runtime_stream_error: {diagnostic}")
+        }
         _ => anyhow::bail!("qa.runner.unknown_stream_line"),
+    }
+    Ok(())
+}
+
+async fn request_run_cancellation(client: &ControlPlaneClient, run_id: &str) -> Result<()> {
+    let response = client
+        .post_json_value(
+            format!("console/v1/sessions/runs/{run_id}/abort"),
+            &json!({"reason": "qa_authoritative_v2_cancel_after_admission"}),
+        )
+        .await
+        .context("qa.runner.run_cancel_failed")?;
+    if required_string(&response, "/run_id", "qa.runner.run_cancel_id_missing")? != run_id {
+        anyhow::bail!("qa.runner.run_cancel_id_mismatch");
     }
     Ok(())
 }
@@ -430,6 +579,7 @@ async fn process_runtime_event(
     client: &mut ControlPlaneClient,
     line: &Value,
     approval_steps: &[&QaScenarioStep],
+    cancel_after_admission: bool,
     observed: &mut StreamObservations,
     observation_budget: &mut QaObservationBudget,
     deadline: QaRunDeadline,
@@ -449,7 +599,17 @@ async fn process_runtime_event(
             payload: public_event.clone(),
         });
     }
-    match event.get("event_type").and_then(Value::as_str) {
+    let event_type = event.get("event_type").and_then(Value::as_str);
+    if should_request_authoritative_v2_cancellation(
+        event,
+        cancel_after_admission,
+        observed.cancellation_requested,
+    ) {
+        let run_id = observed.run_id.as_deref().context("qa.runner.stream_run_id_missing")?;
+        deadline.run_step(request_run_cancellation(client, run_id)).await?;
+        observed.cancellation_requested = true;
+    }
+    match event_type {
         Some("model_token") => {
             if let Some(token) = event.pointer("/model_token/token").and_then(Value::as_str) {
                 push_bounded_text(&mut observed.final_answer, token)?;
@@ -498,6 +658,18 @@ async fn process_runtime_event(
         _ => {}
     }
     Ok(())
+}
+
+fn should_request_authoritative_v2_cancellation(
+    event: &Value,
+    cancel_after_admission: bool,
+    cancellation_requested: bool,
+) -> bool {
+    cancel_after_admission
+        && !cancellation_requested
+        && event.get("event_type").and_then(Value::as_str) == Some("status")
+        && event.pointer("/status/message").and_then(Value::as_str)
+            == Some(RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE)
 }
 
 async fn decide_approval(
@@ -906,10 +1078,17 @@ mod tests {
             }
         });
 
-        let error =
-            process_runtime_event(&mut client, &line, &[], &mut observed, &mut budget, deadline)
-                .await
-                .expect_err("missing success must fail after the payload is accounted");
+        let error = process_runtime_event(
+            &mut client,
+            &line,
+            &[],
+            false,
+            &mut observed,
+            &mut budget,
+            deadline,
+        )
+        .await
+        .expect_err("missing success must fail after the payload is accounted");
 
         assert_eq!(error.to_string(), "qa.runner.tool_result_success_missing");
         assert!(budget.consumed_bytes > 0);
@@ -932,14 +1111,35 @@ mod tests {
             }
         });
 
-        let error =
-            process_runtime_event(&mut client, &line, &[], &mut observed, &mut budget, deadline)
-                .await
-                .expect_err("an uncorrelated tool result must not acquire a synthetic tool name");
+        let error = process_runtime_event(
+            &mut client,
+            &line,
+            &[],
+            false,
+            &mut observed,
+            &mut budget,
+            deadline,
+        )
+        .await
+        .expect_err("an uncorrelated tool result must not acquire a synthetic tool name");
 
         assert_eq!(error.to_string(), "qa.runner.tool_result_proposal_unknown");
         assert!(budget.consumed_bytes > 0);
         assert!(observed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn authoritative_v2_cancellation_uses_the_provider_effect_boundary() {
+        let provider_started = json!({
+            "event_type": "status",
+            "status": {"message": RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE},
+        });
+        let tape_only_selection = json!({"event_type": "runtime.authority.selected"});
+
+        assert!(should_request_authoritative_v2_cancellation(&provider_started, true, false));
+        assert!(!should_request_authoritative_v2_cancellation(&provider_started, false, false));
+        assert!(!should_request_authoritative_v2_cancellation(&provider_started, true, true));
+        assert!(!should_request_authoritative_v2_cancellation(&tape_only_selection, true, false));
     }
 
     #[test]

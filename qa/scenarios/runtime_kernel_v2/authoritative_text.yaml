@@ -1,0 +1,74 @@
+# Qualifies exact text and delivery through the authoritative V2 daemon path.
+schema_version: 5
+id: runtime_kernel_v2.authoritative_text
+title: Authoritative RuntimeKernelV2 text and delivery
+area: text
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/runtime_kernel_v2_authoritative.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: runtime_kernel_v2_authoritative_no_tools
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - runtime_kernel_v2_authoritative
+  tools: []
+  fixtures:
+    - qa/fixtures/runtime_kernel_v2_authoritative.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Return the authoritative RuntimeKernelV2 response."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "RuntimeKernelV2 owned the exact deterministic response."
+  events:
+    - event_type: runtime.authority.selected
+      min_count: 1
+    - event_type: status
+      min_count: 1
+    - event_type: message.replied
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v14
+    provider_lane: fixture
+    attempt_owner: runtime_kernel_v2.embedded
+    harness_id: runtime_kernel_v2.embedded
+    context_engine_id: runtime_kernel_v2.preassembled_context
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - run.failed
+    - run.cancelled
+    - approval.required
+    - runtime.shadow.differential
+    - secret.exposed
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/runtime_kernel_v2/authoritative_text.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - deterministic
+    - real_runtime
+    - runtime_kernel_v2_authoritative
+    - promotion_gate
+    - text_only
+timeout:
+  run_ms: 30000
+  step_ms: 10000

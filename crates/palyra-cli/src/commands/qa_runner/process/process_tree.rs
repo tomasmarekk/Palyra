@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct QaDaemonEnvironment<'a> {
     pub(super) allowed_tools: &'a str,
+    pub(super) policy_profile: &'a str,
     pub(super) state_root: &'a Path,
     pub(super) identity_root: &'a Path,
     pub(super) config_path: &'a Path,

@@ -1,0 +1,111 @@
+# Credential-free turns for authoritative RuntimeKernelV2 qualification.
+# Tool-result matchers precede prompt matchers because fixture selection is first-match.
+schema_version: 1
+id: qa.mock.provider.runtime-kernel-v2-authoritative
+turns:
+  - id: read_only_after_tool_result
+    match:
+      tool_result_call_id: qa-v2-read
+      tool_result_success: true
+    behavior:
+      kind: text
+      text: "RuntimeKernelV2 returned the exact workspace content."
+      finish_reason: stop
+      prompt_tokens: 9
+      completion_tokens: 7
+      latency_ms: 2
+  - id: denied_mutation_after_tool_result
+    match:
+      tool_result_call_id: qa-v2-denied-patch
+      tool_result_success: false
+    behavior:
+      kind: text
+      text: "RuntimeKernelV2 preserved the denied workspace."
+      finish_reason: stop
+      prompt_tokens: 10
+      completion_tokens: 7
+      latency_ms: 2
+  - id: exact_text
+    match:
+      prompt_contains:
+        - return the authoritative runtimekernelv2 response
+    behavior:
+      kind: text
+      deltas:
+        - "RuntimeKernelV2 owned "
+        - "the exact deterministic response."
+      finish_reason: stop
+      prompt_tokens: 8
+      completion_tokens: 7
+      latency_ms: 2
+  - id: read_only_tool
+    match:
+      prompt_contains:
+        - inspect the authoritative v2 workspace
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-v2-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: src/app.txt
+            max_bytes: 4096
+      prompt_tokens: 8
+      completion_tokens: 8
+      latency_ms: 2
+  - id: denied_mutation
+    match:
+      prompt_contains:
+        - propose the authoritative v2 mutation
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-v2-denied-patch
+          tool_name: palyra.fs.apply_patch
+          input_json:
+            patch: "*** Begin Patch\n*** Add File: src/v2-denied.txt\n+must-not-exist\n*** End Patch\n"
+      prompt_tokens: 9
+      completion_tokens: 11
+      latency_ms: 2
+  - id: cancellation
+    match:
+      prompt_contains:
+        - wait for authoritative v2 cancellation
+    behavior:
+      kind: text
+      text: "This response must not cross the cancellation boundary."
+      finish_reason: stop
+      prompt_tokens: 8
+      completion_tokens: 9
+      latency_ms: 500
+  - id: compaction_after_apply
+    match:
+      prompt_contains:
+        - session_compaction_summary
+        - exercise the authoritative v2 compaction boundary
+    behavior:
+      kind: text
+      text: "RuntimeKernelV2 compacted context and completed the retry."
+      finish_reason: stop
+      prompt_tokens: 11
+      completion_tokens: 8
+      latency_ms: 2
+  - id: compaction
+    match:
+      prompt_contains:
+        - exercise the authoritative v2 compaction boundary
+    behavior:
+      kind: context_overflow
+      error_message: "fixture context window exceeded"
+      latency_ms: 2
+  - id: compaction_seed
+    match:
+      prompt_contains:
+        - seed authoritative v2 compaction history turn
+    behavior:
+      kind: text
+      text: "RuntimeKernelV2 retained the deterministic compaction seed."
+      finish_reason: stop
+      prompt_tokens: 9
+      completion_tokens: 7
+      latency_ms: 1

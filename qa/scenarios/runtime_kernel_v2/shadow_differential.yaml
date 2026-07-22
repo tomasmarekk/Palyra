@@ -1,37 +1,38 @@
-# Exercises exact text projection through the production daemon and journal path.
-# The evidence artifact remains separate from the bounded gate result descriptor.
+# Promotion evidence for the production shadow observer. M024 must bind the
+# policy profile to explicit enrollment before this gate can turn green.
 schema_version: 5
-id: real_runtime.text_exact
-title: Exact fixture text through the real runtime
-area: text
+id: runtime_kernel_v2.shadow_differential
+title: Legacy-authoritative RuntimeKernelV2 shadow differential
+area: security
 mode:
   runner: fixture
   deterministic: true
 runner:
-  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  provider_fixture: qa/fixtures/runtime_kernel_v2_shadow.yaml
   workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
-  policy_profile: qa_no_tools
+  policy_profile: runtime_kernel_v2_shadow_explicit
 requires:
   model: text
   capabilities:
     - agent_run
     - qa_lab
+    - runtime_kernel_v2_shadow
   tools: []
   fixtures:
-    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/runtime_kernel_v2_shadow.yaml
     - qa/fixtures/sandbox_workspaces/repo_basic
 steps:
   - id: prompt
     action: user_prompt
-    prompt: "Return the exact deterministic QA response."
+    prompt: "Compare the legacy and V2 shadow plans, then return the fixture response."
 expect:
   terminal_state: completed
   final_answer:
-    equals: "The deterministic QA response is exact."
+    equals: "The authoritative legacy run completed while V2 stayed observe-only."
   events:
     - event_type: run.started
       min_count: 1
-    - event_type: model.delta
+    - event_type: runtime.shadow.differential
       min_count: 1
     - event_type: run.completed
       min_count: 1
@@ -49,22 +50,24 @@ forbidden:
     - "*"
   events:
     - run.failed
+    - approval.requested
+    - runtime.shadow.provider_requested
+    - runtime.shadow.tool_requested
+    - runtime.shadow.delivery_requested
     - secret.exposed
   artifacts: []
   claims: []
 artifacts:
-  - path: qa/reports/real_runtime/text_exact.evidence.json
+  - path: qa/reports/runtime_kernel_v2/shadow_differential.evidence.json
     kind: evidence
     required: true
 maturity:
   labels:
     - p0
-    - release_smoke
-    - real_runtime
-    - nightly
     - deterministic
-    - text_only
-    - baseline_replay
+    - real_runtime
+    - runtime_kernel_v2_shadow
+    - promotion_gate
 timeout:
   run_ms: 30000
   step_ms: 10000

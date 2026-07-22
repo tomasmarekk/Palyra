@@ -15,6 +15,19 @@ const FAULT_DELIVERY_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/fault_injection/delivery_effect_before_ack.yaml");
 const PROVIDER_RECOVERY_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/real_runtime/malformed_stream_recovery.yaml");
+const RUNTIME_KERNEL_SHADOW_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/shadow_differential.yaml");
+const RUNTIME_KERNEL_V2_TEXT_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_text.yaml");
+const RUNTIME_KERNEL_V2_TOOL_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_tool.yaml");
+const RUNTIME_KERNEL_V2_APPROVAL_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_approval.yaml");
+const RUNTIME_KERNEL_V2_CANCEL_SCENARIO: &str = include_str!(
+    "../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_cancellation.yaml"
+);
+const RUNTIME_KERNEL_V2_COMPACTION_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_compaction.yaml");
 
 fn parse_scenario(source: &str) -> QaScenarioManifest {
     palyra_common::qa_scenarios::parse_qa_scenario_manifest_yaml(source)
@@ -338,6 +351,7 @@ fn test_sandbox() -> (QaDaemonSandbox, PathBuf) {
                 admin_token: "test-only-token".to_owned(),
                 principal: "user:test".to_owned(),
                 allowed_tools: String::new(),
+                policy_profile: "qa_no_tools".to_owned(),
                 expected_runtime_contract_version: PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION
                     .to_owned(),
                 expected_git_hash: "test".to_owned(),

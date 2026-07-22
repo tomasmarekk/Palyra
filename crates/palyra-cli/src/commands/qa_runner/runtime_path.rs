@@ -5,16 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use palyra_common::{
     qa_evidence::{QaRunTapeEvent, QaToolCallEvidence},
     qa_runtime_path::{
-        McpTransportInvocationEvent, McpTransportInvocationMode, ProviderLaneAttestationEvent,
-        ProviderRouteChangeEvent, RuntimeFallbackEvidence, RuntimePathComponentEvidence,
-        RuntimePathEvidence, MCP_TRANSPORT_INVOCATION_EVENT, PROVIDER_LANE_ATTESTATION_EVENT,
+        ContextEngineBindingEvent, McpTransportInvocationEvent, McpTransportInvocationMode,
+        ProviderLaneAttestationEvent, ProviderRouteChangeEvent, RuntimeFallbackEvidence,
+        RuntimePathComponentEvidence, RuntimePathEvidence, CONTEXT_ENGINE_BINDING_EVENT,
+        MCP_TRANSPORT_INVOCATION_EVENT, PROVIDER_LANE_ATTESTATION_EVENT,
         PROVIDER_ROUTE_CHANGE_EVENT, PROVIDER_ROUTE_CHANGE_EVIDENCE_TRUNCATED_EVENT,
         QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION,
+    },
+    runtime_contracts::{
+        RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID,
+        RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION,
     },
 };
 use serde_json::{Map, Value};
 
 const RUNTIME_PATH_SUMMARY_EVENT: &str = "run.runtime_path_summary";
+const RUNTIME_AUTHORITY_EVENT: &str = "runtime.authority.selected";
 const HARNESS_SELECTION_EVENT: &str = "harness.selection";
 const CONTEXT_ENGINE_PLAN_EVENT: &str = "context.engine.plan";
 const RUNNER_EXECUTION_KEY_SOURCE: &str = "runner.execution_key";
@@ -86,11 +92,18 @@ pub(super) fn extract_runtime_path_evidence(
         complete = false;
         push_unique(&mut reason_codes, "qa.runner.runtime_path_attempt_owner_missing");
     }
+    let authoritative_v2 = authoritative_v2_selected(
+        tape_events,
+        &mut complete,
+        &mut source_events,
+        &mut reason_codes,
+    );
 
     let harness = extract_harness(
         tape_events,
         attempt_owner.as_str(),
         harness_state,
+        authoritative_v2,
         &mut complete,
         &mut source_events,
         &mut reason_codes,
@@ -98,6 +111,7 @@ pub(super) fn extract_runtime_path_evidence(
     let context_engine = extract_context_engine(
         tape_events,
         context_state,
+        authoritative_v2,
         &mut complete,
         &mut source_events,
         &mut reason_codes,
@@ -152,11 +166,23 @@ fn extract_harness(
     tape_events: &[QaRunTapeEvent],
     attempt_owner: &str,
     rollout_state: Option<&str>,
+    authoritative_v2: bool,
     complete: &mut bool,
     source_events: &mut Vec<String>,
     reason_codes: &mut Vec<String>,
 ) -> RuntimePathComponentEvidence {
     let selections = matching_events(tape_events, HARNESS_SELECTION_EVENT);
+    if authoritative_v2 {
+        if attempt_owner != "runtime_kernel_v2.embedded" || !selections.is_empty() {
+            *complete = false;
+            push_unique(reason_codes, "qa.runner.runtime_path_v2_authority_mismatch");
+        }
+        return RuntimePathComponentEvidence {
+            id: "runtime_kernel_v2.embedded".to_owned(),
+            source_event: RUNTIME_AUTHORITY_EVENT.to_owned(),
+            reason_code: "runtime_path.harness.runtime_kernel_v2_selected".to_owned(),
+        };
+    }
     match (rollout_state, selections.as_slice()) {
         (Some("disabled"), []) if attempt_owner == "embedded_run_stream" => {
             RuntimePathComponentEvidence {
@@ -210,13 +236,56 @@ fn extract_harness(
     }
 }
 
+fn authoritative_v2_selected(
+    tape_events: &[QaRunTapeEvent],
+    complete: &mut bool,
+    source_events: &mut Vec<String>,
+    reason_codes: &mut Vec<String>,
+) -> bool {
+    let events = matching_events(tape_events, RUNTIME_AUTHORITY_EVENT);
+    match events.as_slice() {
+        [event] if valid_v2_authority_event(&event.payload) => {
+            push_unique(source_events, RUNTIME_AUTHORITY_EVENT);
+            true
+        }
+        [] | [_] => false,
+        _ => {
+            *complete = false;
+            push_unique(reason_codes, "qa.runner.runtime_path_authority_selection_duplicate");
+            false
+        }
+    }
+}
+
+fn valid_v2_authority_event(payload: &Value) -> bool {
+    payload.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && string_field(payload, "route") == Some("v2")
+        && payload
+            .pointer("/authority/profile")
+            .and_then(Value::as_str)
+            .is_some_and(|profile| profile == "v2")
+        && payload
+            .pointer("/authority/selected_runtime")
+            .and_then(Value::as_str)
+            .is_some_and(|authority| authority == "v2")
+}
+
 fn extract_context_engine(
     tape_events: &[QaRunTapeEvent],
     rollout_state: Option<&str>,
+    authoritative_v2: bool,
     complete: &mut bool,
     source_events: &mut Vec<String>,
     reason_codes: &mut Vec<String>,
 ) -> RuntimePathComponentEvidence {
+    if authoritative_v2 {
+        return extract_authoritative_v2_context_engine(
+            tape_events,
+            complete,
+            source_events,
+            reason_codes,
+        );
+    }
     let plans = matching_events(tape_events, CONTEXT_ENGINE_PLAN_EVENT);
     match (rollout_state, plans.as_slice()) {
         (Some("disabled"), []) => RuntimePathComponentEvidence {
@@ -262,6 +331,54 @@ fn extract_context_engine(
                 reason_code: "runtime_path.context.unproven".to_owned(),
             }
         }
+    }
+}
+
+fn extract_authoritative_v2_context_engine(
+    tape_events: &[QaRunTapeEvent],
+    complete: &mut bool,
+    source_events: &mut Vec<String>,
+    reason_codes: &mut Vec<String>,
+) -> RuntimePathComponentEvidence {
+    let events = matching_events(tape_events, CONTEXT_ENGINE_BINDING_EVENT);
+    let [event] = events.as_slice() else {
+        *complete = false;
+        push_unique(
+            reason_codes,
+            if events.is_empty() {
+                "qa.runner.runtime_path_v2_context_binding_missing"
+            } else {
+                "qa.runner.runtime_path_v2_context_binding_duplicate"
+            },
+        );
+        return RuntimePathComponentEvidence {
+            id: "unobserved".to_owned(),
+            source_event: RUNNER_EXECUTION_KEY_SOURCE.to_owned(),
+            reason_code: "runtime_path.context.v2_binding_unproven".to_owned(),
+        };
+    };
+    let Ok(binding) = serde_json::from_value::<ContextEngineBindingEvent>(event.payload.clone())
+    else {
+        *complete = false;
+        push_unique(reason_codes, "qa.runner.runtime_path_v2_context_binding_invalid");
+        return RuntimePathComponentEvidence {
+            id: "unobserved".to_owned(),
+            source_event: CONTEXT_ENGINE_BINDING_EVENT.to_owned(),
+            reason_code: "runtime_path.context.v2_binding_invalid".to_owned(),
+        };
+    };
+    let valid_shape = binding.validate_shape().is_ok();
+    let exact_adapter = binding.engine_id == RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID
+        && binding.engine_version == RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION;
+    if !valid_shape || !exact_adapter {
+        *complete = false;
+        push_unique(reason_codes, "qa.runner.runtime_path_v2_context_binding_mismatch");
+    }
+    push_unique(source_events, CONTEXT_ENGINE_BINDING_EVENT);
+    RuntimePathComponentEvidence {
+        id: binding.engine_id,
+        source_event: CONTEXT_ENGINE_BINDING_EVENT.to_owned(),
+        reason_code: "runtime_path.context.v2_preassembled_bound".to_owned(),
     }
 }
 
@@ -625,14 +742,19 @@ mod tests {
     use palyra_common::{
         qa_evidence::{QaRunTapeEvent, QaToolCallEvidence},
         qa_runtime_path::{
-            evaluate_no_hidden_fallback, qa_provider_binding_sha256, McpTransportInvocationEvent,
-            McpTransportInvocationMode, ProviderLaneAttestationEvent, ProviderRouteChangeEvent,
-            MCP_TRANSPORT_INVOCATION_EVENT, MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
-            PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION,
-            PROVIDER_ROUTE_CHANGE_EVENT, PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION,
-            QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+            evaluate_no_hidden_fallback, qa_provider_binding_sha256, ContextEngineBindingEvent,
+            McpTransportInvocationEvent, McpTransportInvocationMode, ProviderLaneAttestationEvent,
+            ProviderRouteChangeEvent, CONTEXT_ENGINE_BINDING_EVENT, MCP_TRANSPORT_INVOCATION_EVENT,
+            MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION, PROVIDER_LANE_ATTESTATION_EVENT,
+            PROVIDER_LANE_ATTESTATION_EVENT_SCHEMA_VERSION, PROVIDER_ROUTE_CHANGE_EVENT,
+            PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION, QA_PROVIDER_FIXTURE_MATERIALIZATION,
+            QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
         },
         qa_scenarios::parse_qa_scenario_manifest_yaml,
+        runtime_contracts::{
+            RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID,
+            RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION,
+        },
     };
     use serde_json::json;
 
@@ -723,6 +845,43 @@ mod tests {
             seq,
             event_type: PROVIDER_ROUTE_CHANGE_EVENT.to_owned(),
             payload: serde_json::to_value(payload).expect("provider route evidence should encode"),
+        }
+    }
+
+    fn authoritative_v2_event(seq: i64) -> QaRunTapeEvent {
+        QaRunTapeEvent {
+            seq,
+            event_type: "runtime.authority.selected".to_owned(),
+            payload: json!({
+                "schema_version": 1,
+                "route": "v2",
+                "authority": {
+                    "schema_version": 1,
+                    "profile": "v2",
+                    "generation": 1,
+                    "disposition": "selected",
+                    "selected_runtime": "v2",
+                    "shadow_evaluation_enabled": false,
+                    "reason": "v2_profile_selected",
+                    "reason_code": "runtime.selection.v2_profile_selected"
+                }
+            }),
+        }
+    }
+
+    fn authoritative_v2_context_binding_event(seq: i64) -> QaRunTapeEvent {
+        QaRunTapeEvent {
+            seq,
+            event_type: CONTEXT_ENGINE_BINDING_EVENT.to_owned(),
+            payload: serde_json::to_value(ContextEngineBindingEvent {
+                schema_version:
+                    palyra_common::qa_runtime_path::CONTEXT_ENGINE_BINDING_EVENT_SCHEMA_VERSION,
+                event_name: CONTEXT_ENGINE_BINDING_EVENT.to_owned(),
+                engine_id: RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID.to_owned(),
+                engine_version: RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION.to_owned(),
+                projection_epoch: 7,
+            })
+            .expect("context binding evidence should encode"),
         }
     }
 
@@ -853,6 +1012,62 @@ mod tests {
         let mismatches = evaluate_no_hidden_fallback(&expectation, &evidence)
             .expect("manifest and extracted evidence should evaluate");
         assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn authoritative_v2_path_requires_exact_persisted_authority() {
+        let evidence = extract(
+            &[
+                authoritative_v2_event(1),
+                authoritative_v2_context_binding_event(2),
+                summary("disabled", "disabled", "runtime_kernel_v2.embedded"),
+            ],
+            &[],
+        );
+
+        assert!(evidence.complete, "{evidence:#?}");
+        assert_eq!(evidence.attempt_owner, "runtime_kernel_v2.embedded");
+        assert_eq!(evidence.harness.id, "runtime_kernel_v2.embedded");
+        assert_eq!(evidence.harness.source_event, "runtime.authority.selected");
+        assert_eq!(evidence.context_engine.id, RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID);
+        assert_eq!(evidence.context_engine.source_event, CONTEXT_ENGINE_BINDING_EVENT);
+        assert_eq!(evidence.fallback_count, 0);
+
+        let missing_binding = extract(
+            &[
+                authoritative_v2_event(1),
+                summary("disabled", "disabled", "runtime_kernel_v2.embedded"),
+            ],
+            &[],
+        );
+        assert!(!missing_binding.complete);
+        assert!(missing_binding
+            .reason_codes
+            .contains(&"qa.runner.runtime_path_v2_context_binding_missing".to_owned()));
+
+        let mut mismatched_binding = authoritative_v2_context_binding_event(2);
+        mismatched_binding.payload["engine_id"] = json!("default_context_engine");
+        let mismatched_evidence = extract(
+            &[
+                authoritative_v2_event(1),
+                mismatched_binding,
+                summary("disabled", "disabled", "runtime_kernel_v2.embedded"),
+            ],
+            &[],
+        );
+        assert!(!mismatched_evidence.complete);
+        assert!(mismatched_evidence
+            .reason_codes
+            .contains(&"qa.runner.runtime_path_v2_context_binding_mismatch".to_owned()));
+
+        let mut invalid = authoritative_v2_event(1);
+        invalid.payload["authority"]["selected_runtime"] = json!("legacy");
+        let invalid_evidence =
+            extract(&[invalid, summary("disabled", "disabled", "runtime_kernel_v2.embedded")], &[]);
+        assert!(!invalid_evidence.complete);
+        assert!(invalid_evidence
+            .reason_codes
+            .contains(&"qa.runner.runtime_path_harness_unproven".to_owned()));
     }
 
     #[test]

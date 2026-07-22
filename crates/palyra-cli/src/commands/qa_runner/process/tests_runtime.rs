@@ -176,6 +176,52 @@ fn no_tool_profiles_reject_every_tool_allowlist() {
 }
 
 #[test]
+fn explicit_runtime_kernel_shadow_profile_is_closed_and_tool_free() {
+    let mut manifest = parse_scenario(RUNTIME_KERNEL_SHADOW_SCENARIO);
+    validate_policy_profile(&manifest)
+        .expect("the dedicated shadow scenario should pass closed profile validation");
+
+    manifest.requires.tools.push("palyra.fs.read_file".to_owned());
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let unsupported =
+        parse_scenario_with_policy_profile(RUNTIME_KERNEL_SHADOW_SCENARIO, "v2_shadow");
+    assert!(validate_policy_profile(&unsupported).is_err());
+}
+
+#[test]
+fn authoritative_runtime_kernel_v2_profiles_preserve_exact_authority_boundaries() {
+    for source in [
+        RUNTIME_KERNEL_V2_TEXT_SCENARIO,
+        RUNTIME_KERNEL_V2_CANCEL_SCENARIO,
+        RUNTIME_KERNEL_V2_COMPACTION_SCENARIO,
+    ] {
+        let mut manifest = parse_scenario(source);
+        validate_policy_profile(&manifest)
+            .expect("authoritative V2 no-tool profile should remain closed");
+        manifest.requires.tools.push("palyra.fs.read_file".to_owned());
+        assert!(validate_policy_profile(&manifest).is_err());
+    }
+
+    let mut read_only = parse_scenario(RUNTIME_KERNEL_V2_TOOL_SCENARIO);
+    validate_policy_profile(&read_only)
+        .expect("authoritative V2 read-only profile should accept its exact tool");
+    read_only.requires.tools.push("palyra.fs.apply_patch".to_owned());
+    assert!(validate_policy_profile(&read_only).is_err());
+
+    let mut approval = parse_scenario(RUNTIME_KERNEL_V2_APPROVAL_SCENARIO);
+    validate_policy_profile(&approval)
+        .expect("authoritative V2 approval profile should accept deny-only mutation authority");
+    let decision = approval
+        .steps
+        .iter_mut()
+        .find(|step| step.action == QaScenarioStepAction::ApprovalDecision)
+        .expect("approval qualification should contain its deny decision");
+    decision.decision = Some(QaScenarioApprovalDecision::Allow);
+    assert!(validate_policy_profile(&approval).is_err());
+}
+
+#[test]
 fn read_only_profile_requires_a_unique_explicit_read_tool_subset() {
     let mut manifest = parse_scenario(READ_ONLY_SCENARIO);
     assert!(validate_policy_profile(&manifest).is_ok());

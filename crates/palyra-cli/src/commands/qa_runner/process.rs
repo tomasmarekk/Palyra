@@ -278,6 +278,7 @@ struct QaDaemonLaunchContext {
     admin_token: String,
     principal: String,
     allowed_tools: String,
+    policy_profile: String,
     expected_runtime_contract_version: String,
     expected_git_hash: String,
     fault: Option<QaRunnerFaultContext>,
@@ -635,6 +636,12 @@ impl QaDaemonSandbox {
                 admin_token,
                 principal,
                 allowed_tools: manifest.requires.tools.join(","),
+                policy_profile: manifest
+                    .runner
+                    .as_ref()
+                    .and_then(|runner| runner.policy_profile())
+                    .unwrap_or("qa_restricted")
+                    .to_owned(),
                 expected_runtime_contract_version: prepared.runtime_contract_version.clone(),
                 expected_git_hash: prepared.expected_palyrad_git_hash.clone(),
                 fault,

@@ -3,11 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "license": "AGPL-3.0-only",
-  "packageManager": "npm@10.9.3",
-  "engines": {
-    "node": ">=22.18.0",
-    "npm": ">=10.9.3 <12"
-  },
   "workspaces": [
     "apps/web",
     "apps/desktop/ui",
@@ -18,7 +13,8 @@
     "js:fmt": "vp fmt apps/web apps/desktop/ui apps/browser-extension scripts",
     "js:clean": "node ./scripts/js-artifacts.mjs clean-all",
     "js:lint": "vp run lint:web && vp run lint:desktop-ui && vp run lint:browser-extension && vp run lint:tooling",
-    "js:check": "vp check apps/web apps/desktop/ui apps/browser-extension scripts",
+    "js:check": "npm run runtime-shadow:check && vp check apps/web apps/desktop/ui apps/browser-extension scripts",
+    "runtime-shadow:check": "node ./scripts/validate-runtime-shadow-rollout-gates.mjs && node --test ./scripts/validate-runtime-shadow-rollout-gates.test.mjs",
     "web:build": "vp run @palyra/web#build",
     "web:clean": "vp run @palyra/web#clean",
     "web:dev": "vp run @palyra/web#dev",
@@ -46,5 +42,10 @@
     "picomatch": "4.0.4",
     "vite": "npm:@voidzero-dev/vite-plus-core@0.1.16",
     "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.16"
-  }
+  },
+  "engines": {
+    "node": ">=22.18.0",
+    "npm": ">=10.9.3 <12"
+  },
+  "packageManager": "npm@10.9.3"
 }

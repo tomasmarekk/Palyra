@@ -1,0 +1,17 @@
+# Credential-free response used by the RuntimeKernelV2 shadow promotion pack.
+schema_version: 1
+id: qa.mock.provider.runtime-kernel-v2-shadow
+turns:
+  - id: shadow_text
+    match:
+      prompt_contains:
+        - compare the legacy and v2 shadow plans
+    behavior:
+      kind: text
+      deltas:
+        - "The authoritative legacy run "
+        - "completed while V2 stayed observe-only."
+      finish_reason: stop
+      prompt_tokens: 12
+      completion_tokens: 11
+      latency_ms: 2
