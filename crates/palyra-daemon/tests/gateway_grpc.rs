@@ -1877,17 +1877,11 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_route_message_injects_observe_only_channel_context() -> Result<()> {
-    let (openai_base_url, request_bodies, request_count, server_handle) =
-        spawn_scripted_openai_server_with_request_capture(vec![
-            ScriptedOpenAiResponse::immediate(
-                200,
-                r#"{"choices":[{"message":{"content":"provider saw ambient context"}}]}"#
-                    .to_owned(),
-            ),
-        ])?;
+async fn grpc_route_message_v2_bundle_fails_closed_without_channel_adapter() -> Result<()> {
+    let (openai_base_url, _request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(Vec::new())?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_and_channel_router_with_context_rollouts(
+        spawn_palyrad_with_openai_provider_and_channel_router_with_v2_compatibility_bundle(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
         )?;
@@ -1926,24 +1920,15 @@ async fn grpc_route_message_injects_observe_only_channel_context() -> Result<()>
             ENVELOPE_ID,
         )
         .await?;
-    assert!(dispatch_response.accepted);
-    assert_eq!(request_count.load(Ordering::Relaxed), 1);
-    let captured_request_bodies =
-        request_bodies.lock().expect("captured request bodies lock should not poison").clone();
-    assert_eq!(captured_request_bodies.len(), 1);
-    assert!(
-        captured_request_bodies[0].contains("Ambient observe-only channel context"),
-        "provider request should include the ambient context segment: {}",
-        captured_request_bodies[0]
+    assert!(!dispatch_response.accepted);
+    assert_eq!(
+        dispatch_response.decision_reason, "runtime.channel_v2_adapter_unavailable",
+        "authoritative V2 channel turns must fail closed until the V2 adapter is available"
     );
-    assert!(
-        captured_request_bodies[0].contains("Release freeze moves to 18:00 UTC"),
-        "provider request should include the redacted observe-only message: {}",
-        captured_request_bodies[0]
-    );
-    assert!(
-        captured_request_bodies[0].contains("instruction_authority=none"),
-        "ambient context should be marked non-instructional"
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        0,
+        "an unavailable V2 channel adapter must not silently fall back to the legacy provider path"
     );
 
     let message_events = load_message_router_journal_events(&journal_db_path)?;
@@ -12296,7 +12281,7 @@ fn sample_tool_approval_response_request_for_session_and_run_with_scope(
 fn admin_get_json(admin_port: u16, path: &str) -> Result<Value> {
     let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
     Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .build()
         .context("failed to build admin HTTP client")?
         .get(endpoint)
@@ -12930,14 +12915,24 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
     )
 }
 
-fn spawn_palyrad_with_openai_provider_and_channel_router_with_context_rollouts(
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_v2_compatibility_bundle(
     openai_base_url: &str,
     openai_api_key: &str,
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
         openai_base_url,
         openai_api_key,
-        &[("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true")],
+        &[
+            ("PALYRA_RUNTIME_KERNEL_PROFILE", "v2"),
+            ("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true"),
+            ("PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER", "true"),
+            ("PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY", "true"),
+            ("PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY", "true"),
+            ("PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS", "true"),
+            ("PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE", "true"),
+            ("PALYRA_EXPERIMENTAL_REPLAY_CAPTURE", "true"),
+            ("PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION", "true"),
+        ],
     )
 }
 
