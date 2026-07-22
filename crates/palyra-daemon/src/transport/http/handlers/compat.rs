@@ -5058,7 +5058,8 @@ fn build_compat_runtime_capabilities(
             structured_outputs_supported,
             "preview",
             (!structured_outputs_supported).then_some("model_json_mode_disabled"),
-            (!structured_outputs_supported).then_some("Select a chat model with json_mode support."),
+            (!structured_outputs_supported)
+                .then_some("Select a chat model with json_mode support."),
             &["POST /v1/chat/completions", "POST /v1/responses"],
             json!({
                 "source": "provider_capabilities.json_mode",
@@ -5088,7 +5089,11 @@ fn build_compat_runtime_capabilities(
             "preview",
             None,
             None,
-            &["POST /v1/responses", "GET /v1/responses/{response_id}", "DELETE /v1/responses/{response_id}"],
+            &[
+                "POST /v1/responses",
+                "GET /v1/responses/{response_id}",
+                "DELETE /v1/responses/{response_id}",
+            ],
             json!({ "response_store": true, "idempotency": true, "sse": true }),
         ),
         compat_runtime_capability_json(
@@ -5153,7 +5158,9 @@ fn build_compat_runtime_capabilities(
             false,
             "planned",
             Some("not_exposed_on_compat_api"),
-            Some("Use native Palyra tool/runtime surfaces until MCP is published on the compat facade."),
+            Some(
+                "Use native Palyra tool/runtime surfaces until MCP is published on the compat facade.",
+            ),
             &[],
             Value::Null,
         ),
@@ -5162,7 +5169,9 @@ fn build_compat_runtime_capabilities(
             false,
             "planned",
             Some("not_exposed_on_compat_api"),
-            Some("Use native Palyra delegation surfaces until subagents are published on the compat facade."),
+            Some(
+                "Use native Palyra delegation surfaces until subagents are published on the compat facade.",
+            ),
             &[],
             Value::Null,
         ),

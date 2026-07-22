@@ -199,6 +199,46 @@ fn preferred_runtime_context_and_provider_events_copy_only_allowlisted_metadata(
 }
 
 #[test]
+fn shadow_differential_projection_is_closed_and_rejects_forged_posture() {
+    let payload = json!({
+        "schema_version": 1,
+        "event_name": "runtime.shadow.differential",
+        "redaction_level": "metadata_only",
+        "authoritative_runtime": "legacy",
+        "shadow_side_effect_free": true,
+        "enrollment": "deterministic_sample",
+        "enrollment_reason_code": "runtime.shadow.enrollment.deterministic_sample",
+        "classification": "benign",
+        "reason_code": "runtime.shadow.differential_benign",
+        "runtime_selection": "match",
+        "context_segments": "match",
+        "context_safety": "match",
+        "token_budget": "benign_difference",
+        "tool_catalog": "match",
+        "policy_input": "match",
+        "phase_plan": "match",
+        "promotion_blocked": false,
+        "sampling_identity": SECRET_SENTINEL,
+        "raw_prompt_diff": SECRET_SENTINEL,
+    });
+    let event = project("runtime.shadow.differential", payload.clone())
+        .expect("valid shadow metadata should project");
+    let MetadataTraceEventDataV1::RuntimeShadowDifferential(metadata) = &event.event else {
+        panic!("shadow tape event must project to the typed differential variant");
+    };
+    assert_eq!(
+        metadata.classification,
+        palyra_common::metadata_trace::MetadataTraceShadowClassificationV1::Benign
+    );
+    assert!(!metadata.promotion_blocked);
+    assert_projection_excludes_hostile_content(&event);
+
+    let mut forged = payload;
+    forged["promotion_blocked"] = json!(true);
+    assert!(project("runtime.shadow.differential", forged).is_none());
+}
+
+#[test]
 fn preferred_provider_event_hashes_route_ids_and_requires_prehashed_auth_profile() {
     let payload = json!({
         "provider_id": "openai_compatible",

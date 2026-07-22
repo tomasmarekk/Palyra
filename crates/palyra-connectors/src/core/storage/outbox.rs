@@ -12,13 +12,50 @@ use rusqlite::{params, OptionalExtension};
 use super::super::protocol::OutboundMessageRequest;
 use super::records::parse_outbox_row;
 use super::{
-    next_outbox_claim_token, ConnectorStore, ConnectorStoreError, OutboxEnqueueOutcome,
-    OutboxEntryRecord, OUTBOX_CLAIM_LEASE_MS,
+    next_outbox_claim_token, ConnectorStore, ConnectorStoreError, OutboxDeliverySnapshot,
+    OutboxEffectState, OutboxEnqueueOutcome, OutboxEntryRecord, OUTBOX_CLAIM_LEASE_MS,
 };
 
 const OUTBOX_EXPIRED_AFTER_EFFECT_REASON: &str = "outbox.claim_expired_after_effect_started";
 
 impl ConnectorStore {
+    /// Returns the payload-free state of one deterministic outbox envelope.
+    ///
+    /// # Errors
+    /// Returns a storage error when the lookup or persisted effect-state decode fails.
+    pub fn outbox_delivery_snapshot(
+        &self,
+        connector_id: &str,
+        envelope_id: &str,
+    ) -> Result<Option<OutboxDeliverySnapshot>, ConnectorStoreError> {
+        let connection = self.connection.lock().map_err(|_| ConnectorStoreError::PoisonedLock)?;
+        connection
+            .query_row(
+                r#"
+                    SELECT status, effect_state, native_message_id
+                    FROM outbox
+                    WHERE connector_id = ?1 AND envelope_id = ?2
+                "#,
+                params![connector_id, envelope_id],
+                |row| {
+                    let status = row.get::<_, String>(0)?;
+                    let effect_state = row.get::<_, String>(1)?;
+                    Ok((status, effect_state, row.get::<_, Option<String>>(2)?))
+                },
+            )
+            .optional()?
+            .map(|(status, effect_state, native_message_id)| {
+                Ok(OutboxDeliverySnapshot {
+                    connector_id: connector_id.to_owned(),
+                    envelope_id: envelope_id.to_owned(),
+                    status,
+                    effect_state: OutboxEffectState::parse(effect_state.as_str())?,
+                    native_message_id,
+                })
+            })
+            .transpose()
+    }
+
     /// Enqueues the payload unless its `(connector_id, envelope_id)` pair is
     /// already present, making enqueue retries idempotent.
     ///

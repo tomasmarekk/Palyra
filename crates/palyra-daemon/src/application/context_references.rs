@@ -799,7 +799,7 @@ fn validate_workspace_relative_git_target(raw_target: &str) -> Result<PathBuf, S
             Component::ParentDir => {
                 return Err(Status::invalid_argument(
                     "context reference cannot use parent-directory traversal",
-                ))
+                ));
             }
             Component::Normal(value) => {
                 let normalized = value.to_string_lossy();

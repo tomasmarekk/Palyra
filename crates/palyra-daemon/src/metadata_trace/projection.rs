@@ -6,11 +6,13 @@
 use palyra_common::metadata_trace::{
     ApprovalMetadataV1, CapacityReachedMetadataV1, ContextAssembledMetadataV1,
     DeliveryIntentMetadataV1, MetadataTraceApprovalDecisionV1, MetadataTraceCapacityLimitV1,
-    MetadataTraceDeliveryRouteV1, MetadataTraceDeliveryStateV1, MetadataTraceEventDataV1,
-    MetadataTraceEventV1, MetadataTraceProviderAttemptOutcomeV1, MetadataTraceRecoveryStrategyV1,
-    MetadataTraceRouteClassV1, MetadataTraceSchemaHashV1, MetadataTraceTerminalOutcomeV1,
-    MetadataTraceToolGateDecisionV1, MetadataTraceToolOutcomeV1, ProviderAttemptMetadataV1,
-    RecoveryMetadataV1, RuntimeSelectedMetadataV1, TerminalizationMetadataV1, ToolGateMetadataV1,
+    MetadataTraceDeliveryRouteV1, MetadataTraceDeliveryStateV1, MetadataTraceDifferentialOutcomeV1,
+    MetadataTraceEventDataV1, MetadataTraceEventV1, MetadataTraceProviderAttemptOutcomeV1,
+    MetadataTraceRecoveryStrategyV1, MetadataTraceRouteClassV1, MetadataTraceSchemaHashV1,
+    MetadataTraceShadowClassificationV1, MetadataTraceShadowEnrollmentV1,
+    MetadataTraceTerminalOutcomeV1, MetadataTraceToolGateDecisionV1, MetadataTraceToolOutcomeV1,
+    ProviderAttemptMetadataV1, RecoveryMetadataV1, RuntimeSelectedMetadataV1,
+    RuntimeShadowDifferentialMetadataV1, TerminalizationMetadataV1, ToolGateMetadataV1,
     ToolOutcomeMetadataV1, METADATA_TRACE_MAX_ATTEMPTS, METADATA_TRACE_MAX_CONTEXT_ITEMS,
     METADATA_TRACE_MAX_SCHEMA_HASHES, METADATA_TRACE_MAX_STAGE_DURATION_MS,
 };
@@ -50,6 +52,7 @@ pub(crate) fn project_orchestrator_tape_record(
     let payload = payload.as_object()?;
     let projected = match record.event_type.as_str() {
         "harness.selection" | "metadata.runtime_selected" => project_runtime_selected(payload),
+        "runtime.shadow.differential" => project_runtime_shadow_differential(payload),
         "context.assembled" => project_context_assembled(payload),
         "provider.attempt.completed" => project_provider_attempt_completed(payload),
         "provider.lane.attested" => project_provider_lane_attested(payload),
@@ -133,6 +136,99 @@ fn build_event(
     };
     event.validate_shape().ok()?;
     Some(event)
+}
+
+fn project_runtime_shadow_differential(payload: &Map<String, Value>) -> Option<ProjectedEvent> {
+    if payload.get("schema_version")?.as_u64()? != 1
+        || payload.get("event_name")?.as_str()? != "runtime.shadow.differential"
+        || payload.get("redaction_level")?.as_str()? != "metadata_only"
+        || payload.get("authoritative_runtime")?.as_str()? != "legacy"
+        || !payload.get("shadow_side_effect_free")?.as_bool()?
+    {
+        return None;
+    }
+    let (enrollment, expected_enrollment_reason) = match payload.get("enrollment")?.as_str()? {
+        "deterministic_sample" => (
+            MetadataTraceShadowEnrollmentV1::DeterministicSample,
+            "runtime.shadow.enrollment.deterministic_sample",
+        ),
+        "explicit_session" => (
+            MetadataTraceShadowEnrollmentV1::ExplicitSession,
+            "runtime.shadow.enrollment.explicit_session",
+        ),
+        _ => return None,
+    };
+    if payload.get("enrollment_reason_code")?.as_str()? != expected_enrollment_reason {
+        return None;
+    }
+    let (classification, expected_reason_code, expected_promotion_blocked) = match payload
+        .get("classification")?
+        .as_str()?
+    {
+        "expected" => (
+            MetadataTraceShadowClassificationV1::Expected,
+            "runtime.shadow.differential_expected",
+            false,
+        ),
+        "benign" => (
+            MetadataTraceShadowClassificationV1::Benign,
+            "runtime.shadow.differential_benign",
+            false,
+        ),
+        "risky" => {
+            (MetadataTraceShadowClassificationV1::Risky, "runtime.shadow.differential_risky", false)
+        }
+        "invariant_violation" => (
+            MetadataTraceShadowClassificationV1::InvariantViolation,
+            "runtime.shadow.differential_invariant_violation",
+            true,
+        ),
+        _ => return None,
+    };
+    let reason_code = required_reason_code(payload, "reason_code")?;
+    let promotion_blocked = payload.get("promotion_blocked")?.as_bool()?;
+    if reason_code != expected_reason_code || promotion_blocked != expected_promotion_blocked {
+        return None;
+    }
+    let runtime_selection = differential_outcome(payload, "runtime_selection")?;
+    let context_segments = differential_outcome(payload, "context_segments")?;
+    let context_safety = differential_outcome(payload, "context_safety")?;
+    let token_budget = differential_outcome(payload, "token_budget")?;
+    let tool_catalog = differential_outcome(payload, "tool_catalog")?;
+    let policy_input = differential_outcome(payload, "policy_input")?;
+    let phase_plan = differential_outcome(payload, "phase_plan")?;
+    Some(ProjectedEvent {
+        event: MetadataTraceEventDataV1::RuntimeShadowDifferential(
+            RuntimeShadowDifferentialMetadataV1 {
+                enrollment,
+                classification,
+                reason_code,
+                runtime_selection,
+                context_segments,
+                context_safety,
+                token_budget,
+                tool_catalog,
+                policy_input,
+                phase_plan,
+                promotion_blocked,
+                shadow_side_effect_free: true,
+            },
+        ),
+        stage_duration_ms: None,
+    })
+}
+
+fn differential_outcome(
+    payload: &Map<String, Value>,
+    field: &str,
+) -> Option<MetadataTraceDifferentialOutcomeV1> {
+    match payload.get(field)?.as_str()? {
+        "match" => Some(MetadataTraceDifferentialOutcomeV1::Match),
+        "benign_difference" => Some(MetadataTraceDifferentialOutcomeV1::BenignDifference),
+        "risky_difference" => Some(MetadataTraceDifferentialOutcomeV1::RiskyDifference),
+        "invariant_violation" => Some(MetadataTraceDifferentialOutcomeV1::InvariantViolation),
+        _ => None,
+    }
 }
 
 fn project_runtime_selected(payload: &Map<String, Value>) -> Option<ProjectedEvent> {

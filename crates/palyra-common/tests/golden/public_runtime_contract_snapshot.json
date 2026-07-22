@@ -3782,6 +3782,19 @@
           "retryability": "requires_operator_review",
           "subsystem": "runtime_kernel",
           "terminal": false
+        },
+        {
+          "actor_kind": "host",
+          "generation_lane": "run",
+          "name": "runtime.finalization.started",
+          "phase": "finalization",
+          "redaction_class": "metadata_only",
+          "required_identity_fields": [
+            "attempt_id"
+          ],
+          "retryability": "not_retryable",
+          "subsystem": "runtime_kernel",
+          "terminal": false
         }
       ],
       "event_names": [
@@ -3931,6 +3944,10 @@
         },
         {
           "canonical": "runtime.compatibility.blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "runtime.finalization.started",
           "deprecated_aliases": []
         }
       ],
@@ -4499,7 +4516,7 @@
     },
     "snapshot_version": "runtime-contracts.shared_runtime.v3"
   },
-  "snapshot_version": "runtime-contracts.v13",
+  "snapshot_version": "runtime-contracts.v14",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

@@ -37,8 +37,9 @@ pub use records::{
     ChannelIngressEnqueueOutcome, ChannelIngressRecord, ChannelIngressStatus, ConnectorEventRecord,
     ConnectorInstanceRecord, ConnectorQueueSnapshot, DeadLetterRecord, DeliveryIntentDraft,
     DeliveryIntentRecord, DeliveryIntentRetryOutcome, DeliveryIntentStatus,
-    IngressBlockedLaneSnapshot, OutboxEffectState, OutboxEnqueueOutcome, OutboxEntryRecord,
-    OutboxReconciliationEvidence, OutboxReconciliationOutcome, OutboxUnknownRecord,
+    IngressBlockedLaneSnapshot, OutboxDeliverySnapshot, OutboxEffectState, OutboxEnqueueOutcome,
+    OutboxEntryRecord, OutboxReconciliationEvidence, OutboxReconciliationOutcome,
+    OutboxUnknownRecord,
 };
 
 /// Handle to the connector sqlite database; cheap to share behind an `Arc`.

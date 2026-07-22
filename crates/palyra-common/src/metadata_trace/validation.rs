@@ -430,6 +430,7 @@ impl MetadataTraceEventDataV1 {
         match self {
             Self::RunStarted(_) => Ok(()),
             Self::RuntimeSelected(metadata) => metadata.validate_shape_at(path),
+            Self::RuntimeShadowDifferential(metadata) => metadata.validate_shape_at(path),
             Self::ContextAssembled(metadata) => metadata.validate_shape_at(path),
             Self::ProviderAttempt(metadata) => metadata.validate_shape_at(path),
             Self::ToolGate(metadata) => {
@@ -496,6 +497,90 @@ impl MetadataTraceEventDataV1 {
             }
             Self::CapacityReached(metadata) => metadata.validate_shape_at(path),
         }
+    }
+}
+
+impl RuntimeShadowDifferentialMetadataV1 {
+    fn validate_shape_at(&self, path: &str) -> Result<(), MetadataTraceValidationError> {
+        validate_reason_code(self.reason_code.as_str(), format!("{path}.metadata.reason_code"))?;
+        let valid_dimensions = matches!(
+            self.runtime_selection,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::RiskyDifference
+        ) && matches!(
+            self.context_segments,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::RiskyDifference
+        ) && matches!(
+            self.context_safety,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::InvariantViolation
+        ) && matches!(
+            self.token_budget,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::BenignDifference
+                | MetadataTraceDifferentialOutcomeV1::RiskyDifference
+        ) && matches!(
+            self.tool_catalog,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::RiskyDifference
+        ) && matches!(
+            self.policy_input,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::InvariantViolation
+        ) && matches!(
+            self.phase_plan,
+            MetadataTraceDifferentialOutcomeV1::Match
+                | MetadataTraceDifferentialOutcomeV1::InvariantViolation
+        );
+        let derived_classification = [
+            self.runtime_selection,
+            self.context_segments,
+            self.context_safety,
+            self.token_budget,
+            self.tool_catalog,
+            self.policy_input,
+            self.phase_plan,
+        ]
+        .into_iter()
+        .max()
+        .map(|outcome| match outcome {
+            MetadataTraceDifferentialOutcomeV1::Match => {
+                MetadataTraceShadowClassificationV1::Expected
+            }
+            MetadataTraceDifferentialOutcomeV1::BenignDifference => {
+                MetadataTraceShadowClassificationV1::Benign
+            }
+            MetadataTraceDifferentialOutcomeV1::RiskyDifference => {
+                MetadataTraceShadowClassificationV1::Risky
+            }
+            MetadataTraceDifferentialOutcomeV1::InvariantViolation => {
+                MetadataTraceShadowClassificationV1::InvariantViolation
+            }
+        });
+        let expected_reason = match self.classification {
+            MetadataTraceShadowClassificationV1::Expected => "runtime.shadow.differential_expected",
+            MetadataTraceShadowClassificationV1::Benign => "runtime.shadow.differential_benign",
+            MetadataTraceShadowClassificationV1::Risky => "runtime.shadow.differential_risky",
+            MetadataTraceShadowClassificationV1::InvariantViolation => {
+                "runtime.shadow.differential_invariant_violation"
+            }
+        };
+        let expected_blocked =
+            matches!(self.classification, MetadataTraceShadowClassificationV1::InvariantViolation);
+        if !valid_dimensions
+            || derived_classification != Some(self.classification)
+            || self.reason_code != expected_reason
+            || self.promotion_blocked != expected_blocked
+            || !self.shadow_side_effect_free
+        {
+            return Err(validation_error(
+                "metadata_trace_shadow_differential_invalid",
+                format!("{path}.metadata"),
+                "shadow classification, reason, promotion posture, and authority proof must agree",
+            ));
+        }
+        Ok(())
     }
 }
 

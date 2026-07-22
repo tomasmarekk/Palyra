@@ -12,9 +12,9 @@
 //! and config import/export fixtures pin them, so changing a value here is a
 //! behavioral (and security-posture) change, not a refactor.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use palyra_common::{
     default_identity_store_root, feature_rollouts::FeatureRolloutSetting,
     runtime_preview::RuntimePreviewMode, secret_refs::SecretRef,
@@ -276,6 +276,205 @@ impl GatewayBindProfile {
 pub struct DaemonConfig {
     pub bind_addr: String,
     pub port: u16,
+    pub runtime_kernel: RuntimeKernelConfig,
+}
+
+/// Closed profile controlling the complete runtime implementation bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKernelProfile {
+    Legacy,
+    V2Shadow,
+    V2Canary,
+    V2,
+}
+
+impl RuntimeKernelProfile {
+    /// Parses one canonical runtime profile.
+    ///
+    /// # Errors
+    /// Fails when `raw` does not name a supported closed profile.
+    pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "v2_shadow" | "v2-shadow" => Ok(Self::V2Shadow),
+            "v2_canary" | "v2-canary" => Ok(Self::V2Canary),
+            "v2" => Ok(Self::V2),
+            _ => anyhow::bail!("{source_name} must be one of: legacy | v2_shadow | v2_canary | v2"),
+        }
+    }
+
+    /// Returns the canonical config representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V2Shadow => "v2_shadow",
+            Self::V2Canary => "v2_canary",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+/// Identity class used inside keyed deterministic rollout sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKernelSamplingIdentity {
+    Session,
+    Principal,
+}
+
+impl RuntimeKernelSamplingIdentity {
+    /// Parses a rollout sampling identity class.
+    ///
+    /// # Errors
+    /// Fails when `raw` is neither `session` nor `principal`.
+    pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "session" => Ok(Self::Session),
+            "principal" => Ok(Self::Principal),
+            _ => anyhow::bail!("{source_name} must be one of: session | principal"),
+        }
+    }
+}
+
+/// Existing-session behavior after a runtime profile change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingSessionMigrationPolicy {
+    KeepPinned,
+    MigrateAtSafeBoundary,
+}
+
+impl ExistingSessionMigrationPolicy {
+    /// Parses an existing-session migration policy.
+    ///
+    /// # Errors
+    /// Fails when `raw` does not name a supported migration policy.
+    pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "keep_pinned" | "keep-pinned" => Ok(Self::KeepPinned),
+            "migrate_at_safe_boundary" | "migrate-at-safe-boundary" => {
+                Ok(Self::MigrateAtSafeBoundary)
+            }
+            _ => anyhow::bail!(
+                "{source_name} must be one of: keep_pinned | migrate_at_safe_boundary"
+            ),
+        }
+    }
+}
+
+/// Authority-preserving behavior when an operator rolls V2 back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKernelRollbackPolicy {
+    FinishReadOnlySuspendMutating,
+    SuspendAllAtSafeBoundary,
+}
+
+impl RuntimeKernelRollbackPolicy {
+    /// Parses an active-run rollback policy.
+    ///
+    /// # Errors
+    /// Fails when `raw` does not name a supported rollback policy.
+    pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "finish_read_only_suspend_mutating" | "finish-read-only-suspend-mutating" => {
+                Ok(Self::FinishReadOnlySuspendMutating)
+            }
+            "suspend_all_at_safe_boundary" | "suspend-all-at-safe-boundary" => {
+                Ok(Self::SuspendAllAtSafeBoundary)
+            }
+            _ => anyhow::bail!(
+                "{source_name} must be one of: finish_read_only_suspend_mutating | suspend_all_at_safe_boundary"
+            ),
+        }
+    }
+
+    /// Returns the canonical config representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FinishReadOnlySuspendMutating => "finish_read_only_suspend_mutating",
+            Self::SuspendAllAtSafeBoundary => "suspend_all_at_safe_boundary",
+        }
+    }
+}
+
+/// Validated 32-byte deployment sampling key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeKernelSamplingKey([u8; 32]);
+
+impl fmt::Debug for RuntimeKernelSamplingKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeKernelSamplingKey([redacted])")
+    }
+}
+
+impl RuntimeKernelSamplingKey {
+    /// Parses exactly 32 bytes encoded as lowercase or uppercase hexadecimal.
+    ///
+    /// # Errors
+    /// Fails without echoing the value when the key is not exactly 64 hex characters.
+    pub fn parse_hex(raw: &str, source_name: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.len() != 64 || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("{source_name} must contain exactly 32 bytes encoded as hexadecimal");
+        }
+        let decoded = hex::decode(trimmed)
+            .with_context(|| format!("{source_name} must contain valid hexadecimal"))?;
+        let bytes = <[u8; 32]>::try_from(decoded.as_slice())
+            .map_err(|_| anyhow::anyhow!("{source_name} must contain exactly 32 bytes"))?;
+        Ok(Self(bytes))
+    }
+
+    /// Borrows the key for immediate domain-separated hashing.
+    #[must_use]
+    pub const fn expose_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Configured source for deployment-stable sampling key material.
+#[derive(Clone, PartialEq, Eq)]
+pub enum RuntimeKernelSamplingKeySource {
+    Inline(RuntimeKernelSamplingKey),
+    SecretRef(SecretRef),
+}
+
+impl fmt::Debug for RuntimeKernelSamplingKeySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(_) => {
+                formatter.write_str("RuntimeKernelSamplingKeySource::Inline([redacted])")
+            }
+            Self::SecretRef(_) => {
+                formatter.write_str("RuntimeKernelSamplingKeySource::SecretRef([redacted])")
+            }
+        }
+    }
+}
+
+/// Validated runtime-kernel rollout configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeKernelConfig {
+    pub profile: RuntimeKernelProfile,
+    pub canary_basis_points: u16,
+    pub shadow_sample_basis_points: u16,
+    pub sampling_identity: RuntimeKernelSamplingIdentity,
+    pub sampling_key_source: Option<RuntimeKernelSamplingKeySource>,
+    pub existing_session_policy: ExistingSessionMigrationPolicy,
+    pub rollback_policy: RuntimeKernelRollbackPolicy,
+}
+
+impl Default for RuntimeKernelConfig {
+    fn default() -> Self {
+        Self {
+            profile: RuntimeKernelProfile::Legacy,
+            canary_basis_points: 0,
+            shadow_sample_basis_points: 0,
+            sampling_identity: RuntimeKernelSamplingIdentity::Session,
+            sampling_key_source: None,
+            existing_session_policy: ExistingSessionMigrationPolicy::KeepPinned,
+            rollback_policy: RuntimeKernelRollbackPolicy::FinishReadOnlySuspendMutating,
+        }
+    }
 }
 
 /// Gateway transport (gRPC/QUIC) binds, exposure profile, and response
@@ -1002,7 +1201,11 @@ pub struct StorageConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self { bind_addr: DEFAULT_BIND_ADDR.to_owned(), port: DEFAULT_PORT }
+        Self {
+            bind_addr: DEFAULT_BIND_ADDR.to_owned(),
+            port: DEFAULT_PORT,
+            runtime_kernel: RuntimeKernelConfig::default(),
+        }
     }
 }
 

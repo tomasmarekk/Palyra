@@ -96,6 +96,16 @@ pub struct OutboxEnqueueOutcome {
     pub created: bool,
 }
 
+/// Payload-free current state of one deterministic outbox envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxDeliverySnapshot {
+    pub connector_id: String,
+    pub envelope_id: String,
+    pub status: String,
+    pub effect_state: OutboxEffectState,
+    pub native_message_id: Option<String>,
+}
+
 /// Operator-safe view of an outbox row whose platform outcome is uncertain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxUnknownRecord {

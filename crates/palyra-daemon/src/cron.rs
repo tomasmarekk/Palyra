@@ -49,6 +49,7 @@ use ulid::Ulid;
 
 use crate::{
     access_control::{AccessRegistry, FEATURE_ROUTINES_AUTOMATION},
+    application::run_stream::admission_ingress::register_cron_ingress,
     config::MemoryRetentionConfig,
     gateway::{
         proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1},
@@ -739,7 +740,9 @@ pub fn normalize_schedule(
             let expression = match schedule.spec {
                 Some(cron_v1::schedule::Spec::Cron(cron)) => cron.expression,
                 _ => {
-                    return Err(Status::invalid_argument("schedule.cron is required for type=CRON"))
+                    return Err(Status::invalid_argument(
+                        "schedule.cron is required for type=CRON",
+                    ));
                 }
             };
             let expression = expression.trim();
@@ -764,7 +767,7 @@ pub fn normalize_schedule(
                 _ => {
                     return Err(Status::invalid_argument(
                         "schedule.every is required for type=EVERY",
-                    ))
+                    ));
                 }
             };
             let interval_ms = i64::try_from(every.interval_ms)
@@ -1882,10 +1885,7 @@ async fn record_misfire_review_required(
     let message = format!(
         "cron misfire requires review: action={}, operator_action={}, missed_runs={}, oldest_missed_at={:?}, reference={reference_unix_ms}",
         recovery_plan.action.as_str(),
-        audit_payload
-            .get("operator_action")
-            .and_then(Value::as_str)
-            .unwrap_or("manual_review"),
+        audit_payload.get("operator_action").and_then(Value::as_str).unwrap_or("manual_review"),
         recovery_plan.missed_runs,
         recovery_plan.oldest_missed_at_unix_ms
     );
@@ -3710,6 +3710,20 @@ async fn execute_single_job_attempt(
         job.owner_principal.as_str(),
         job.channel.as_str(),
     )?;
+    let proof_channel =
+        if job.channel.trim().is_empty() { DEFAULT_CRON_CHANNEL } else { job.channel.trim() };
+    register_cron_ingress(
+        stream_request.metadata_mut(),
+        job.owner_principal.as_str(),
+        SCHEDULER_DEVICE_ID,
+        Some(proof_channel),
+        session_id.as_str(),
+        orchestrator_run_id.as_str(),
+        None,
+    )
+    .map_err(|error| {
+        Status::internal(format!("failed to seal scheduler RunStream ingress: {error}"))
+    })?;
 
     let mut stream = client
         .run_stream(stream_request)

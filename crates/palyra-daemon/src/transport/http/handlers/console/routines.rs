@@ -2679,7 +2679,7 @@ fn schedule_payload_with_max_runs(
         Some(0) => {
             return Err(runtime_status_response(tonic::Status::invalid_argument(
                 "max_runs must be greater than zero",
-            )))
+            )));
         }
         Some(value) => Some(value),
         None => existing_job.and_then(cron::max_runs_for_job),

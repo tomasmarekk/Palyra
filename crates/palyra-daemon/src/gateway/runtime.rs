@@ -269,6 +269,12 @@ enum PreparedNetworkedWorkerLifecycleCommitOutcome {
     StaleSuppressed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSettlementAuthority {
+    CancellationAware,
+    Exact,
+}
+
 /// Result of assigning a worker lease under exact run-generation authority.
 #[derive(Debug)]
 pub(crate) enum NetworkedWorkerLeaseAssignmentOutcome {
@@ -446,6 +452,25 @@ pub(crate) struct ManagedRuntimeHealthSnapshot {
     pub(crate) components_by_family: BTreeMap<String, u64>,
     pub(crate) components_by_state: BTreeMap<String, u64>,
     pub(crate) stale_suppressions_total: u64,
+}
+
+/// Reload-fenced provider registry, epoch, and exact durable health evidence.
+///
+/// The gateway holds the provider runtime read lock while capturing every
+/// field, so a provider reload cannot combine candidates from one
+/// configuration with health authorities from another.
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayProviderSelectionSnapshot {
+    pub(crate) observed_at_unix_ms: i64,
+    pub(crate) configuration_epoch: RuntimeGeneration,
+    pub(crate) status: ProviderStatusSnapshot,
+    pub(crate) health_authority_by_provider: BTreeMap<String, ProviderAttemptHealthAuthority>,
+    pub(crate) health_records: Vec<RuntimeComponentHealthV1>,
+    pub(crate) embedded_harness_descriptors:
+        Vec<crate::application::agent_harness::AgentHarnessDescriptor>,
+    pub(crate) context_engine_registry:
+        crate::application::context_engine::ContextEngineRegistrySnapshot,
+    pub(crate) build_version: String,
 }
 
 pub(crate) fn managed_runtime_health_component_id(
@@ -1248,7 +1273,7 @@ pub struct GatewayJournalConfigSnapshot {
 /// Externally constructed collaborators injected into
 /// [`GatewayRuntimeState::new_with_provider`].
 #[rustfmt::skip]
-pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime }
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime, pub(crate) runtime_kernel_dispatcher: Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher> }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProviderHealthAuthorityKey {
@@ -1318,6 +1343,112 @@ enum GatewayProviderAttemptRuntimeAuthority {
     Configuration(JournalProviderConfigurationAttemptRuntimeAuthority),
 }
 
+/// Cancellation-safe owner of one durably started provider effect.
+///
+/// Provider futures are cancellation points. If an outer deadline drops the
+/// future after start evidence was committed, this guard closes the exact
+/// attempt as outcome-unknown before releasing its authority. Successful,
+/// failed, and stale settlements disarm the guard explicitly.
+struct GatewayProviderAttemptRuntimeAuthorityGuard {
+    runtime_state: Arc<GatewayRuntimeState>,
+    authority: GatewayProviderAttemptRuntimeAuthority,
+    provider_id: String,
+    model_id: String,
+    settled: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Clone for GatewayProviderAttemptRuntimeAuthorityGuard {
+    fn clone(&self) -> Self {
+        Self {
+            runtime_state: Arc::clone(&self.runtime_state),
+            authority: self.authority.clone(),
+            provider_id: self.provider_id.clone(),
+            model_id: self.model_id.clone(),
+            settled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for GatewayProviderAttemptRuntimeAuthorityGuard {
+    fn drop(&mut self) {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let result = settle_gateway_provider_attempt(
+            &self.runtime_state,
+            self.authority.clone(),
+            self.provider_id.clone(),
+            self.model_id.clone(),
+            "outcome_unknown",
+            Some("provider_future_cancelled_before_settlement".to_owned()),
+        );
+        if let Err(error) = result {
+            self.runtime_state.counters.journal_persist_failures.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                provider_id = self.provider_id.as_str(),
+                model_id = self.model_id.as_str(),
+                error = %error,
+                "failed to settle cancelled provider attempt as outcome-unknown"
+            );
+        }
+    }
+}
+
+fn settle_gateway_provider_attempt(
+    runtime_state: &GatewayRuntimeState,
+    authority: GatewayProviderAttemptRuntimeAuthority,
+    provider_id: String,
+    model_id: String,
+    outcome: &str,
+    error_class: Option<String>,
+) -> Result<ProviderAttemptCompletionDisposition, JournalError> {
+    match authority {
+        GatewayProviderAttemptRuntimeAuthority::Run(authority) => runtime_state
+            .journal_store
+            .complete_provider_attempt(&ProviderAttemptCompletionRequest {
+                authority,
+                provider_id,
+                model_id,
+                outcome: outcome.to_owned(),
+                error_class,
+            })
+            .map(|outcome| match outcome {
+                ProviderAttemptCompletionOutcome::Appended { .. } => {
+                    ProviderAttemptCompletionDisposition::Appended
+                }
+                ProviderAttemptCompletionOutcome::AlreadyAppended { .. } => {
+                    ProviderAttemptCompletionDisposition::AlreadyAppended
+                }
+                ProviderAttemptCompletionOutcome::StaleSuppressed => {
+                    ProviderAttemptCompletionDisposition::StaleSuppressed
+                }
+            }),
+        GatewayProviderAttemptRuntimeAuthority::Configuration(authority) => runtime_state
+            .journal_store
+            .complete_provider_configuration_attempt(
+                &ProviderConfigurationAttemptCompletionRequest {
+                    authority,
+                    provider_id,
+                    model_id,
+                    outcome: outcome.to_owned(),
+                    error_class,
+                },
+            )
+            .map(|outcome| match outcome {
+                ProviderConfigurationAttemptCompletionOutcome::Appended => {
+                    ProviderAttemptCompletionDisposition::Appended
+                }
+                ProviderConfigurationAttemptCompletionOutcome::AlreadyAppended => {
+                    ProviderAttemptCompletionDisposition::AlreadyAppended
+                }
+                ProviderConfigurationAttemptCompletionOutcome::StaleSuppressed => {
+                    ProviderAttemptCompletionDisposition::StaleSuppressed
+                }
+            }),
+    }
+}
+
 fn provider_probe_error_is_ambiguous(error: &ProviderError) -> bool {
     matches!(
         error.classification().class,
@@ -1325,6 +1456,13 @@ fn provider_probe_error_is_ambiguous(error: &ProviderError) -> bool {
             | ProviderFailureClass::ProviderUnavailable
             | ProviderFailureClass::NetworkUnavailable
             | ProviderFailureClass::ProviderTimeout
+    )
+}
+
+fn provider_failure_affects_candidate_health(error: &ProviderError) -> bool {
+    !matches!(
+        error.classification().class,
+        ProviderFailureClass::ContextOverflow | ProviderFailureClass::ContextWindowExceeded
     )
 }
 
@@ -1390,6 +1528,7 @@ impl GatewayProviderAttemptAdmission {
             max_wait_ms: self.lease_context.max_wait_ms,
             session_id: self.lease_context.session_id.clone(),
             run_id: self.lease_context.run_id.clone(),
+            runtime_authority: self.lease_context.runtime_authority.clone(),
             diagnostic_scope_id: self.lease_context.diagnostic_scope_id.clone(),
         }
     }
@@ -1459,6 +1598,11 @@ impl GatewayProviderAttemptAdmission {
                 self.runtime_state.record_auth_profile_success_for_attribution(&attribution);
             }
             ProviderAttemptFeedback::Failure(binding, error) => {
+                // Context pressure belongs to this request, not the provider or
+                // credential. Penalizing shared health would block the compacted retry.
+                if !provider_failure_affects_candidate_health(&error) {
+                    return;
+                }
                 self.record_shared_health_observation(
                     &binding,
                     false,
@@ -1676,6 +1820,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
             }
             let runtime_state = Arc::clone(&self.runtime_state);
             let expected_configuration_epoch = self.expected_configuration_epoch;
+            let runtime_authority = self.lease_context.runtime_authority.clone();
             let attempt_id = binding.attempt_id.clone();
             let provider_id = binding.provider_id.clone();
             let model_id = binding.model_id.clone();
@@ -1706,6 +1851,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                             run_id,
                             attempt_id,
                             expected_configuration_epoch,
+                            runtime_authority,
                             provider_id,
                             model_id,
                         })
@@ -1748,7 +1894,13 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                 reason_code: "provider_attempt_runtime_start_worker_panicked".to_owned(),
                 retryable: true,
             })??;
-            Ok(Box::new(authority) as Box<dyn ProviderAttemptRuntimeAuthority>)
+            Ok(Box::new(GatewayProviderAttemptRuntimeAuthorityGuard {
+                runtime_state: Arc::clone(&self.runtime_state),
+                authority,
+                provider_id: binding.provider_id.clone(),
+                model_id: binding.model_id.clone(),
+                settled: Arc::new(AtomicBool::new(false)),
+            }) as Box<dyn ProviderAttemptRuntimeAuthority>)
         })
     }
 
@@ -1758,21 +1910,22 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
         authority: Box<dyn ProviderAttemptRuntimeAuthority>,
     ) -> ProviderAttemptCompletionFuture<'a> {
         Box::pin(async move {
-            let authority = authority
+            let authority_guard = authority
                 .as_ref()
                 .as_any()
-                .downcast_ref::<GatewayProviderAttemptRuntimeAuthority>()
-                .cloned()
+                .downcast_ref::<GatewayProviderAttemptRuntimeAuthorityGuard>()
                 .ok_or_else(|| ProviderAttemptAdmissionError::RuntimeAuthority {
                     safe_message: "provider attempt completion authority is invalid".to_owned(),
                     reason_code: "provider_attempt_runtime_authority_invalid".to_owned(),
                     retryable: false,
                 })?;
+            let exact_authority = authority_guard.authority.clone();
+            let settled = Arc::clone(&authority_guard.settled);
             let runtime_state = Arc::clone(&self.runtime_state);
             let provider_id = binding.provider_id.clone();
             let model_id = binding.model_id.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let outcome = match authority {
+                let outcome = match exact_authority {
                     GatewayProviderAttemptRuntimeAuthority::Run(authority) => runtime_state
                         .journal_store
                         .complete_provider_attempt(&ProviderAttemptCompletionRequest {
@@ -1831,6 +1984,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                 reason_code: "provider_attempt_runtime_completion_worker_panicked".to_owned(),
                 retryable: true,
             })??;
+            settled.store(true, Ordering::Release);
             if outcome == ProviderAttemptCompletionDisposition::Appended {
                 self.feedback
                     .lock()
@@ -1848,22 +2002,23 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
         error: &'a ProviderError,
     ) -> ProviderAttemptCompletionFuture<'a> {
         Box::pin(async move {
-            let authority = authority
+            let authority_guard = authority
                 .as_ref()
                 .as_any()
-                .downcast_ref::<GatewayProviderAttemptRuntimeAuthority>()
-                .cloned()
+                .downcast_ref::<GatewayProviderAttemptRuntimeAuthorityGuard>()
                 .ok_or_else(|| ProviderAttemptAdmissionError::RuntimeAuthority {
                     safe_message: "provider attempt completion authority is invalid".to_owned(),
                     reason_code: "provider_attempt_runtime_authority_invalid".to_owned(),
                     retryable: false,
                 })?;
+            let exact_authority = authority_guard.authority.clone();
+            let settled = Arc::clone(&authority_guard.settled);
             let runtime_state = Arc::clone(&self.runtime_state);
             let provider_id = binding.provider_id.clone();
             let model_id = binding.model_id.clone();
             let error_class = error.classification().class.as_str().to_owned();
             let outcome = tokio::task::spawn_blocking(move || {
-                let outcome = match authority {
+                let outcome = match exact_authority {
                     GatewayProviderAttemptRuntimeAuthority::Run(authority) => runtime_state
                         .journal_store
                         .complete_provider_attempt(&ProviderAttemptCompletionRequest {
@@ -1922,6 +2077,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                 reason_code: "provider_attempt_runtime_completion_worker_panicked".to_owned(),
                 retryable: true,
             })??;
+            settled.store(true, Ordering::Release);
             if outcome == ProviderAttemptCompletionDisposition::Appended {
                 self.feedback
                     .lock()
@@ -2374,6 +2530,10 @@ pub struct GatewayRuntimeState {
     pub(crate) journal_config: GatewayJournalConfigSnapshot,
     pub(crate) counters: RuntimeCounters,
     feature_usage: FeatureUsageRegistry,
+    runtime_kernel_dispatcher:
+        Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher>,
+    runtime_shadow_diagnostics:
+        crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics,
     pub(crate) journal_store: JournalStore,
     pub(crate) fault_injection: QaFaultRuntime,
     revoked_certificate_count: usize,
@@ -2618,6 +2778,7 @@ pub struct GatewayStatusSnapshot {
     pub tool_call_policy: ToolCallPolicySnapshot,
     pub counters: CountersSnapshot,
     pub agents: AgentRuntimeSnapshot,
+    pub runtime_kernel: Value,
     pub request_context: RequestContext,
 }
 
@@ -3839,7 +4000,7 @@ impl GatewayRuntimeState {
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
-        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection };
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection, runtime_kernel_dispatcher: Arc::new(crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::legacy_default().expect("legacy runtime dispatcher should initialize")) };
         Self::new_with_provider(
             config,
             journal_config,
@@ -3868,7 +4029,7 @@ impl GatewayRuntimeState {
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
         #[rustfmt::skip]
-        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection } = dependencies;
+        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection, runtime_kernel_dispatcher } = dependencies;
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
@@ -4082,6 +4243,9 @@ impl GatewayRuntimeState {
                 canvas_denied: AtomicU64::new(0),
             },
             feature_usage: FeatureUsageRegistry::new(),
+            runtime_kernel_dispatcher,
+            runtime_shadow_diagnostics:
+                crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics::default(),
             journal_store,
             fault_injection,
             revoked_certificate_count,
@@ -4178,6 +4342,39 @@ impl GatewayRuntimeState {
     /// Returns aggregate rollout usage for the bounded process-local run window.
     pub(crate) fn feature_usage_snapshot(&self) -> FeatureUsageSnapshot {
         self.feature_usage.snapshot()
+    }
+
+    /// Records one identity-free V2 shadow sampling or differential outcome.
+    pub(crate) fn record_runtime_shadow_observation(
+        &self,
+        result: &crate::application::runtime_kernel_v2::shadow::ShadowObservationResult,
+    ) {
+        self.runtime_shadow_diagnostics.record_observation(result);
+    }
+
+    /// Records an attempted shadow side-effect service acquisition.
+    #[cfg(test)]
+    pub(crate) fn record_runtime_shadow_authority_denial(
+        &self,
+        denial: crate::application::runtime_kernel_v2::shadow::ShadowAuthorityDenied,
+    ) {
+        self.runtime_shadow_diagnostics.record_authority_denial(denial);
+    }
+
+    /// Records one bounded production shadow observation failure.
+    pub(crate) fn record_runtime_shadow_failure(
+        &self,
+        failure: crate::runtime_diagnostics::shadow_differential::RuntimeShadowFailureKind,
+    ) {
+        self.runtime_shadow_diagnostics.record_failure(failure);
+    }
+
+    /// Returns the fixed-cardinality process-local shadow diagnostics snapshot.
+    pub(crate) fn runtime_shadow_diagnostics_snapshot(
+        &self,
+    ) -> crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnosticsSnapshotV1
+    {
+        self.runtime_shadow_diagnostics.snapshot()
     }
 
     /// Freezes retained rollout evidence after the durable run transition succeeds.
@@ -6826,6 +7023,14 @@ impl GatewayRuntimeState {
 
     // Status snapshots and model provider execution.
 
+    /// Returns the daemon-wide runtime dispatcher.
+    #[must_use]
+    pub(crate) fn runtime_kernel_dispatcher(
+        &self,
+    ) -> &crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher {
+        self.runtime_kernel_dispatcher.as_ref()
+    }
+
     /// Assembles the full gateway status document. Performs synchronous
     /// journal reads; call [`Self::status_snapshot_async`] from async code.
     pub fn status_snapshot(
@@ -6891,6 +7096,13 @@ impl GatewayRuntimeState {
             tool_call_policy: tool_policy_snapshot(&self.config.tool_call),
             counters: self.counters.snapshot(),
             agents: agents_runtime,
+            runtime_kernel: serde_json::to_value(self.runtime_kernel_dispatcher.diagnostics())
+                .unwrap_or_else(|_| {
+                    json!({
+                        "status": "unavailable",
+                        "reason_code": "runtime.kernel.diagnostics_serialization_failed",
+                    })
+                }),
             request_context: context,
         }
     }
@@ -7987,6 +8199,64 @@ impl GatewayRuntimeState {
         self.provider_leases.snapshot()
     }
 
+    /// Captures one reload-fenced provider-selection snapshot.
+    ///
+    /// # Errors
+    /// Fails closed when an active provider has no durable health record or
+    /// when its durable generation no longer matches the runtime authority.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn provider_selection_snapshot(
+        &self,
+    ) -> Result<GatewayProviderSelectionSnapshot, Status> {
+        let runtime = self.model_provider.read().unwrap_or_else(|error| error.into_inner());
+        let status = runtime.provider.status_snapshot();
+        let embedded_harness_descriptors =
+            crate::application::agent_harness::AgentHarnessRegistry::with_embedded_default()
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "runtime.selection.embedded_harness_unavailable: {error}"
+                    ))
+                })?
+                .list();
+        let context_engine_registry =
+            crate::application::context_engine::ContextEngineRegistry::production_default()
+                .snapshot();
+        let mut health_records = Vec::with_capacity(runtime.health_authority_by_provider.len());
+        for (provider_id, authority) in &runtime.health_authority_by_provider {
+            let health = self
+                .journal_store
+                .runtime_component_health(authority.component_id.as_str())
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "runtime.selection.provider_health_read_failed: provider={provider_id} error={error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "runtime.selection.provider_health_missing: provider={provider_id}"
+                    ))
+                })?;
+            if health.generation != authority.generation {
+                return Err(Status::failed_precondition(format!(
+                    "runtime.selection.provider_health_generation_changed: provider={provider_id}"
+                )));
+            }
+            health_records.push(health);
+        }
+        health_records
+            .sort_by(|left, right| left.component_id.as_str().cmp(right.component_id.as_str()));
+        Ok(GatewayProviderSelectionSnapshot {
+            observed_at_unix_ms: current_unix_ms(),
+            configuration_epoch: runtime.configuration_epoch,
+            status,
+            health_authority_by_provider: runtime.health_authority_by_provider.clone(),
+            health_records,
+            embedded_harness_descriptors,
+            context_engine_registry,
+            build_version: self.build.version.clone(),
+        })
+    }
+
     /// Feeds a credential health signal (success, rate limit, quota, auth,
     /// transient) into the lease manager's cooldown logic.
     pub fn record_provider_credential_feedback(&self, request: ProviderCredentialFeedbackRequest) {
@@ -8078,6 +8348,18 @@ impl GatewayRuntimeState {
                 Err(map_provider_error(error))
             }
         }
+    }
+
+    /// Returns QA-only binding evidence for the currently installed provider.
+    ///
+    /// The caller must retain or publish the result only after the matching
+    /// provider effect starts. A configuration swap still invalidates the
+    /// generation-pinned V2 provider authority before its result can settle.
+    pub(crate) fn qa_model_provider_lane_attestation(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<palyra_common::qa_runtime_path::ProviderLaneAttestationEvent> {
+        self.current_model_provider_runtime().provider.qa_lane_attestation_for_request(request)
     }
 
     /// Completes a model request under provider lease admission.
@@ -8355,6 +8637,7 @@ impl GatewayRuntimeState {
             max_wait_ms: 30_000,
             session_id: None,
             run_id: None,
+            runtime_authority: None,
             diagnostic_scope_id: None,
         };
         let candidate_admission = GatewayProviderAttemptAdmission {
@@ -9707,26 +9990,33 @@ impl GatewayRuntimeState {
     fn settle_orchestrator_run_terminal_blocking(
         &self,
         request: &OrchestratorRunTerminalSettlementRequest,
+        authority: TerminalSettlementAuthority,
     ) -> Result<OrchestratorRunTerminalSettlement, Status> {
-        self.journal_store.settle_orchestrator_run_terminal(request).map_err(|error| {
-            map_orchestrator_store_error("settle orchestrator run terminal", error)
-        })
+        match authority {
+            TerminalSettlementAuthority::Exact => self
+                .journal_store
+                .settle_orchestrator_run_terminal_exact(request)
+                .map_err(|error| {
+                    map_orchestrator_store_error("settle exact orchestrator run terminal", error)
+                }),
+            TerminalSettlementAuthority::CancellationAware => {
+                self.journal_store.settle_orchestrator_run_terminal(request).map_err(|error| {
+                    map_orchestrator_store_error("settle orchestrator run terminal", error)
+                })
+            }
+        }
     }
 
-    /// Atomically settles a run terminal state and applies terminal accounting
-    /// only when this call owns the durable transition.
-    ///
-    /// # Errors
-    /// Returns the mapped journal error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
-    pub async fn settle_orchestrator_run_terminal(
+    async fn settle_orchestrator_run_terminal_with_authority(
         self: &Arc<Self>,
         request: OrchestratorRunTerminalSettlementRequest,
+        authority: TerminalSettlementAuthority,
     ) -> Result<OrchestratorRunTerminalSettlement, Status> {
         let run_id = request.run_id.clone();
         let state_ref = Arc::clone(self);
         let settlement = tokio::task::spawn_blocking(move || {
-            state_ref.settle_orchestrator_run_terminal_blocking(&request)
+            state_ref.settle_orchestrator_run_terminal_blocking(&request, authority)
         })
         .await
         .map_err(|_| Status::internal("orchestrator run settlement worker panicked"))??;
@@ -9754,6 +10044,42 @@ impl GatewayRuntimeState {
             self.orchestrator_run_notify.notify_waiters();
         }
         Ok(settlement)
+    }
+
+    /// Atomically settles a run terminal state and applies terminal accounting
+    /// only when this call owns the durable transition.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn settle_orchestrator_run_terminal(
+        self: &Arc<Self>,
+        request: OrchestratorRunTerminalSettlementRequest,
+    ) -> Result<OrchestratorRunTerminalSettlement, Status> {
+        self.settle_orchestrator_run_terminal_with_authority(
+            request,
+            TerminalSettlementAuthority::CancellationAware,
+        )
+        .await
+    }
+
+    /// Converges the outer run lifecycle to an authoritative kernel outcome.
+    ///
+    /// Pending cancellation remains recorded but cannot replace the supplied
+    /// outcome. An already-terminal run must have the same outcome.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn settle_orchestrator_run_terminal_exact(
+        self: &Arc<Self>,
+        request: OrchestratorRunTerminalSettlementRequest,
+    ) -> Result<OrchestratorRunTerminalSettlement, Status> {
+        self.settle_orchestrator_run_terminal_with_authority(
+            request,
+            TerminalSettlementAuthority::Exact,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
@@ -18551,9 +18877,9 @@ pub(crate) mod tests {
         shared_runtime_event_for_tape, sign_canvas_hmac_sha256,
         validate_memory_item_content_limits, BrowserServiceRuntimeConfig, CanvasHostRuntimeConfig,
         GatewayJournalConfigSnapshot, GatewayProviderAttemptAdmission,
-        GatewayProviderAttemptRuntimeAuthority, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-        HttpFetchRuntimeConfig, ManagedRuntimeHealthFamily, MemoryRuntimeConfig,
-        ProviderAttemptFeedback, RunInterruptLatencyCounters,
+        GatewayProviderAttemptRuntimeAuthorityGuard, GatewayRuntimeConfigSnapshot,
+        GatewayRuntimeState, HttpFetchRuntimeConfig, ManagedRuntimeHealthFamily,
+        MemoryRuntimeConfig, ProviderAttemptFeedback, RunInterruptLatencyCounters,
     };
     use crate::agents::AgentRegistry;
     use crate::application::code_intel_runtime::{
@@ -19313,6 +19639,7 @@ pub(crate) mod tests {
                 max_wait_ms: 30_000,
                 session_id: Some("session-1".to_owned()),
                 run_id: Some("run-1".to_owned()),
+                runtime_authority: None,
                 diagnostic_scope_id: None,
             },
             ProviderLeasePreviewSnapshot {
@@ -19499,6 +19826,47 @@ pub(crate) mod tests {
         assert_eq!(health.reason_code, "runtime.health.provider_call_failed");
     }
 
+    #[test]
+    fn context_window_failure_does_not_poison_provider_health_before_retry() {
+        let state = test_runtime_state();
+        let _ = state.configure_model_provider(Arc::new(RateLimitedFailoverModelProvider));
+        let admission = test_provider_attempt_admission(&state);
+        let binding = admission
+            .bind_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:primary-profile",
+                "gpt-4o-mini",
+            )
+            .expect("provider attempt should bind");
+        let authority = binding.health_authority.clone();
+        let context_window_error = ProviderError::RequestFailed {
+            message: "request context window exceeded".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: crate::model_provider::ProviderFailureClassification::new(
+                crate::model_provider::ProviderFailureClass::ContextWindowExceeded,
+                crate::model_provider::ProviderFailureAction::UserActionRequired,
+                None,
+                Some("test_context_window_exceeded".to_owned()),
+            ),
+        };
+
+        admission.apply_feedback(ProviderAttemptFeedback::Failure(binding, context_window_error));
+
+        let health = state
+            .journal_store
+            .runtime_component_health(authority.component_id.as_str())
+            .expect("provider health should load")
+            .expect("provider health should exist");
+        assert_eq!(health.generation, authority.generation);
+        assert_eq!(health.state, RuntimeHealthState::Healthy);
+        assert_eq!(health.strike_count, 0);
+        assert!(
+            state.provider_lease_snapshot().credential_feedback.is_empty(),
+            "request-local context pressure must not penalize a credential"
+        );
+    }
+
     #[tokio::test]
     async fn duplicate_provider_success_applies_mutable_feedback_once() {
         let (state, auth_registry) = test_runtime_state_with_auth_profile();
@@ -19576,6 +19944,38 @@ pub(crate) mod tests {
             .expect("auth profile runtime state should exist");
         assert!(auth_record.last_success_unix_ms.is_some());
         assert_eq!(auth_record.failure_count, 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_started_provider_authority_settles_outcome_unknown() {
+        let state = test_runtime_state();
+        let _ = state.configure_model_provider(Arc::new(RateLimitedFailoverModelProvider));
+        let mut admission = test_provider_attempt_admission(&state);
+        admission.lease_context.run_id = None;
+        let binding = admission
+            .bind_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:primary-profile",
+                "gpt-4o-mini",
+            )
+            .expect("provider attempt should bind");
+        let _permit = admission.acquire(&binding).await.expect("provider attempt should acquire");
+        let authority =
+            admission.record_started(&binding).await.expect("provider attempt should record start");
+
+        drop(authority);
+
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("test journal query connection should open");
+        let completion = connection
+            .query_row(
+                "SELECT outcome, error_class FROM runtime_provider_attempt_completions WHERE attempt_ulid = ?1",
+                rusqlite::params![binding.attempt_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .expect("dropped started attempt should have durable completion evidence");
+        assert_eq!(completion.0, "outcome_unknown");
+        assert_eq!(completion.1.as_deref(), Some("provider_future_cancelled_before_settlement"));
     }
 
     #[tokio::test]
@@ -19915,6 +20315,7 @@ pub(crate) mod tests {
                         max_wait_ms: 30_000,
                         session_id: Some(session_id.to_owned()),
                         run_id: None,
+                        runtime_authority: None,
                         diagnostic_scope_id: Some(task_id.to_owned()),
                     },
                 )
@@ -20081,6 +20482,7 @@ pub(crate) mod tests {
                         max_wait_ms: 30_000,
                         session_id: Some(session_id.to_owned()),
                         run_id: Some(run_id.to_owned()),
+                        runtime_authority: None,
                         diagnostic_scope_id: None,
                     },
                 )
@@ -20759,6 +21161,7 @@ pub(crate) mod tests {
             max_wait_ms: 30_000,
             session_id: Some("session-1".to_owned()),
             run_id: Some("run-1".to_owned()),
+            runtime_authority: None,
             diagnostic_scope_id: None,
         }
     }
@@ -20784,13 +21187,14 @@ pub(crate) mod tests {
 
     fn gateway_provider_attempt_authority(
         authority: Box<dyn crate::model_provider::ProviderAttemptRuntimeAuthority>,
-    ) -> GatewayProviderAttemptRuntimeAuthority {
-        authority
+    ) -> GatewayProviderAttemptRuntimeAuthorityGuard {
+        let guard = authority
             .as_ref()
             .as_any()
-            .downcast_ref::<GatewayProviderAttemptRuntimeAuthority>()
-            .expect("gateway provider attempt should return journal authority")
-            .clone()
+            .downcast_ref::<GatewayProviderAttemptRuntimeAuthorityGuard>()
+            .expect("gateway provider attempt should return guarded journal authority");
+        guard.settled.store(true, Ordering::Release);
+        guard.clone()
     }
 
     pub(crate) fn start_test_orchestrator_run(

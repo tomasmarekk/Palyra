@@ -27,8 +27,9 @@ use crate::delegation::DelegationSnapshot;
 
 use super::{
     append_or_replay_orchestrator_tape_event_tx, compute_hash, current_unix_ms, redact_value,
-    sanitize_payload, JournalAppendRequest, JournalError, JournalStore,
-    OrchestratorTapeAppendRequest, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
+    runtime_kernel::ensure_runtime_rollback_allows_new_side_effect_tx, sanitize_payload,
+    JournalAppendRequest, JournalError, JournalStore, OrchestratorTapeAppendRequest,
+    NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
     NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES, NETWORKED_WORKER_EXPIRY_MAX_ENTRIES,
     NETWORKED_WORKER_FLEET_MAX_ENTRIES,
 };
@@ -1046,6 +1047,54 @@ pub(super) const MIGRATION_71_SQL: &str = r#"
       );
 "#;
 
+/// Migration 77: honest completion evidence for cancelled runless provider effects.
+///
+/// SQLite cannot widen a CHECK constraint in place. Rebuilding the child table preserves
+/// every immutable v69 completion while retaining its foreign key, index, and append-only
+/// triggers. The only contract change is the additional `outcome_unknown` value.
+pub(super) const MIGRATION_77_SQL: &str = r#"
+    CREATE TABLE runtime_provider_attempt_completions_v77 (
+        attempt_ulid TEXT PRIMARY KEY,
+        configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+        provider_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (
+            outcome IN ('success', 'failure', 'outcome_unknown')
+        ),
+        error_class TEXT,
+        completed_at_unix_ms INTEGER NOT NULL CHECK (completed_at_unix_ms >= 0),
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY(attempt_ulid) REFERENCES runtime_provider_attempt_starts(attempt_ulid)
+    );
+
+    INSERT INTO runtime_provider_attempt_completions_v77 (
+        attempt_ulid, configuration_epoch, provider_id, model_id,
+        outcome, error_class, completed_at_unix_ms, schema_version
+    )
+    SELECT
+        attempt_ulid, configuration_epoch, provider_id, model_id,
+        outcome, error_class, completed_at_unix_ms, schema_version
+    FROM runtime_provider_attempt_completions;
+
+    DROP TABLE runtime_provider_attempt_completions;
+    ALTER TABLE runtime_provider_attempt_completions_v77
+        RENAME TO runtime_provider_attempt_completions;
+
+    CREATE INDEX idx_runtime_provider_attempt_completions_epoch
+        ON runtime_provider_attempt_completions(
+            configuration_epoch,
+            completed_at_unix_ms ASC
+        );
+    CREATE TRIGGER trg_runtime_provider_attempt_completions_prevent_update
+    BEFORE UPDATE ON runtime_provider_attempt_completions BEGIN
+        SELECT RAISE(ABORT, 'runtime_provider_attempt_completions is append-only');
+    END;
+    CREATE TRIGGER trg_runtime_provider_attempt_completions_prevent_delete
+    BEFORE DELETE ON runtime_provider_attempt_completions BEGIN
+        SELECT RAISE(ABORT, 'runtime_provider_attempt_completions is append-only');
+    END;
+"#;
+
 /// Current durable schema for networked-worker dispatch claims.
 const NETWORKED_WORKER_DISPATCH_CLAIM_SCHEMA_VERSION: u32 = 3;
 const RUNTIME_CLEANUP_REPORT_ROW_SCHEMA_VERSION: u32 = 1;
@@ -1435,6 +1484,36 @@ pub struct ProviderAttemptRuntimeAuthority {
     pub started_event_id: RuntimeEventId,
 }
 
+/// Exact Provider lane pre-acquired for one authoritative kernel Run lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeProviderLaneAuthority {
+    run_lease: GenerationLeaseV1,
+    provider_lease: GenerationLeaseV1,
+    configuration_epoch: RuntimeGeneration,
+}
+
+impl RuntimeProviderLaneAuthority {
+    pub(super) fn from_journal(
+        run_lease: GenerationLeaseV1,
+        provider_lease: GenerationLeaseV1,
+        configuration_epoch: RuntimeGeneration,
+    ) -> Self {
+        Self { run_lease, provider_lease, configuration_epoch }
+    }
+
+    /// Returns the exact active Run parent verified during acquisition.
+    #[must_use]
+    pub(crate) const fn run_lease(&self) -> &GenerationLeaseV1 {
+        &self.run_lease
+    }
+
+    /// Returns the exact Provider lease used by the phase contract.
+    #[must_use]
+    pub(crate) const fn provider_lease(&self) -> &GenerationLeaseV1 {
+        &self.provider_lease
+    }
+}
+
 /// Request to start one concrete provider effect under the Provider lane.
 #[derive(Debug, Clone)]
 pub struct ProviderAttemptStartRequest {
@@ -1446,6 +1525,8 @@ pub struct ProviderAttemptStartRequest {
     pub attempt_id: RuntimeAttemptId,
     /// Exact durable provider-configuration epoch captured with the in-memory runtime.
     pub expected_configuration_epoch: RuntimeGeneration,
+    /// Exact pre-acquired V2 authority; legacy callers leave this absent.
+    pub(crate) runtime_authority: Option<RuntimeProviderLaneAuthority>,
     /// Bounded provider identifier; never a credential or secret.
     pub provider_id: String,
     /// Bounded model identifier.
@@ -1461,7 +1542,7 @@ pub struct ProviderAttemptCompletionRequest {
     pub provider_id: String,
     /// Model identifier that must match the started candidate.
     pub model_id: String,
-    /// Closed outcome vocabulary: `success` or `failure`.
+    /// Closed outcome vocabulary: `success`, `failure`, or `outcome_unknown`.
     pub outcome: String,
     /// Optional bounded provider failure class; raw error text is forbidden.
     pub error_class: Option<String>,
@@ -1509,7 +1590,7 @@ pub struct ProviderConfigurationAttemptCompletionRequest {
     pub provider_id: String,
     /// Model identifier that must match the immutable start record.
     pub model_id: String,
-    /// Closed outcome vocabulary: `success` or `failure`.
+    /// Closed outcome vocabulary: `success`, `failure`, or `outcome_unknown`.
     pub outcome: String,
     /// Optional bounded provider failure class; raw error text is forbidden.
     pub error_class: Option<String>,
@@ -1689,6 +1770,18 @@ impl JournalStore {
                 "provider attempt was superseded before effect start".to_owned(),
             ));
         }
+        if let Some(authority) = request.runtime_authority.as_ref() {
+            if authority.configuration_epoch != configuration_epoch
+                || authority.run_lease != active_run
+                || authority.run_lease.session_id.as_str() != request.session_id
+                || authority.run_lease.run_id.as_ref().map(RuntimeRunId::as_str)
+                    != Some(request.run_id.as_str())
+            {
+                return Err(JournalError::InvalidArgument(
+                    "provider attempt pre-acquired runtime authority is stale".to_owned(),
+                ));
+            }
+        }
         let lease = match load_generation_tx(
             &transaction,
             request.session_id.as_str(),
@@ -1702,7 +1795,12 @@ impl JournalStore {
                     .as_ref()
                     .is_some_and(|active_run_id| active_run_id.as_str() == request.run_id)
                     && provider_generation_owner_epoch(lease.owner.as_str())?
-                        == configuration_epoch =>
+                        == configuration_epoch
+                    && request
+                        .runtime_authority
+                        .as_ref()
+                        .is_none_or(|authority| authority.provider_lease.eq(&lease))
+                    && lease.expires_at_unix_ms <= active_run.expires_at_unix_ms =>
             {
                 lease
             }
@@ -1711,17 +1809,24 @@ impl JournalStore {
                     "provider attempt conflicts with active provider authority".to_owned(),
                 ));
             }
-            None => activate_or_refresh_generation_tx(
-                &transaction,
-                request.session_id.as_str(),
-                Some(request.run_id.as_str()),
-                RuntimeGenerationLane::Provider,
-                provider_generation_owner(configuration_epoch).as_str(),
-                active_run.expires_at_unix_ms.saturating_sub(now),
-                RuntimeGenerationTransitionKind::Activated,
-                "runtime.generation.provider_configuration_bound",
-                now,
-            )?,
+            None => {
+                if request.runtime_authority.is_some() {
+                    return Err(JournalError::InvalidArgument(
+                        "provider attempt pre-acquired lane is no longer active".to_owned(),
+                    ));
+                }
+                activate_or_refresh_generation_tx(
+                    &transaction,
+                    request.session_id.as_str(),
+                    Some(request.run_id.as_str()),
+                    RuntimeGenerationLane::Provider,
+                    provider_generation_owner(configuration_epoch).as_str(),
+                    active_run.expires_at_unix_ms.saturating_sub(now),
+                    RuntimeGenerationTransitionKind::Activated,
+                    "runtime.generation.provider_configuration_bound",
+                    now,
+                )?
+            }
         };
         let started_event_id = provider_attempt_event_id(&request.attempt_id, "started")?;
         let event = provider_attempt_runtime_event(
@@ -1828,10 +1933,11 @@ impl JournalStore {
             provider_attempt_event_id(&request.authority.attempt_id, "completed")?,
             Some(request.authority.started_event_id.clone()),
             RuntimeEventName::ProviderAttemptCompleted,
-            if request.outcome == "success" {
-                "provider.attempt.succeeded"
-            } else {
-                "provider.attempt.failed"
+            match request.outcome.as_str() {
+                "success" => "provider.attempt.succeeded",
+                "failure" => "provider.attempt.failed",
+                "outcome_unknown" => "provider.attempt.outcome_unknown",
+                _ => unreachable!("provider attempt outcome was validated before event creation"),
             },
             request.provider_id.as_str(),
             request.model_id.as_str(),
@@ -2441,6 +2547,11 @@ impl JournalStore {
             validate_matching_side_effect_intent(session_id, run_id, fence, &existing)?;
             return Ok(existing.fence.retry_decision());
         }
+        ensure_runtime_rollback_allows_new_side_effect_tx(
+            &transaction,
+            run_id,
+            fence.observed_generation,
+        )?;
         insert_side_effect_fence_tx(&transaction, session_id, run_id, fence)?;
         append_side_effect_runtime_event_tx(
             &transaction,
@@ -2471,6 +2582,11 @@ impl JournalStore {
             run_id,
             fence.observed_generation,
             current_unix_ms()?,
+        )?;
+        ensure_runtime_rollback_allows_new_side_effect_tx(
+            &transaction,
+            run_id,
+            fence.observed_generation,
         )?;
         insert_side_effect_fence_tx(&transaction, session_id, run_id, fence)?;
         append_side_effect_runtime_event_tx(
@@ -7094,11 +7210,21 @@ pub(super) fn active_runtime_generation_tx(
     }))
 }
 
+pub(super) fn active_runtime_generation_for_session_lane_tx(
+    connection: &Connection,
+    session_id: &str,
+    lane: RuntimeGenerationLane,
+    now: i64,
+) -> Result<Option<GenerationLeaseV1>, JournalError> {
+    Ok(load_generation_tx(connection, session_id, lane)?
+        .filter(|lease| now < lease.expires_at_unix_ms))
+}
+
 const PROVIDER_ATTEMPT_METADATA_MAX_BYTES: usize = 128;
 const PROVIDER_CONFIGURATION_SINGLETON_KEY: &str = "model_provider";
 const PROVIDER_GENERATION_OWNER_PREFIX: &str = "provider_configuration_epoch:";
 
-fn provider_generation_owner(epoch: RuntimeGeneration) -> String {
+pub(super) fn provider_generation_owner(epoch: RuntimeGeneration) -> String {
     format!("{PROVIDER_GENERATION_OWNER_PREFIX}{}", epoch.get())
 }
 
@@ -7116,7 +7242,7 @@ fn provider_generation_owner_epoch(owner: &str) -> Result<RuntimeGeneration, Jou
     RuntimeGeneration::new(epoch).map_err(|error| JournalError::InvalidArgument(error.to_string()))
 }
 
-fn current_provider_configuration_epoch_tx(
+pub(super) fn current_provider_configuration_epoch_tx(
     connection: &Connection,
 ) -> Result<Option<RuntimeGeneration>, JournalError> {
     let row = connection
@@ -7243,11 +7369,12 @@ fn validate_provider_attempt_outcome(
     outcome: &str,
     error_class: Option<&str>,
 ) -> Result<(), JournalError> {
-    if !matches!(outcome, "success" | "failure")
+    if !matches!(outcome, "success" | "failure" | "outcome_unknown")
         || error_class.is_some_and(|value| {
             value.trim().is_empty() || value.len() > PROVIDER_ATTEMPT_METADATA_MAX_BYTES
         })
         || (outcome == "success" && error_class.is_some())
+        || (outcome == "outcome_unknown" && error_class.is_none())
     {
         return Err(JournalError::InvalidArgument(
             "provider attempt completion metadata is invalid".to_owned(),
@@ -7380,7 +7507,7 @@ pub(super) fn activate_or_refresh_run_generation_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn activate_or_refresh_generation_tx(
+pub(super) fn activate_or_refresh_generation_tx(
     connection: &Connection,
     session_id: &str,
     run_id: Option<&str>,
@@ -7942,6 +8069,35 @@ pub(super) fn invalidate_provider_generation_for_run_tx(
         },
         now,
     )
+}
+
+pub(super) fn invalidate_runtime_kernel_child_generations_for_run_tx(
+    connection: &Connection,
+    session_id: &str,
+    run_id: &str,
+    transition_kind: RuntimeGenerationTransitionKind,
+    now: i64,
+) -> Result<(), JournalError> {
+    for (lane, reason_code) in [
+        (RuntimeGenerationLane::Harness, "runtime.generation.kernel_harness_run_terminal"),
+        (RuntimeGenerationLane::Tool, "runtime.generation.kernel_tool_run_terminal"),
+        (RuntimeGenerationLane::Delivery, "runtime.generation.kernel_delivery_run_terminal"),
+    ] {
+        // A mismatched lane belongs to a newer or concurrent run and must remain
+        // untouched. Exact run-owned lanes are released before their Run parent.
+        let _ = invalidate_runtime_generation_tx(
+            connection,
+            &RuntimeGenerationInvalidateRequest {
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                lane,
+                transition_kind,
+                reason_code: reason_code.to_owned(),
+            },
+            now,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn invalidate_runtime_generation_tx(

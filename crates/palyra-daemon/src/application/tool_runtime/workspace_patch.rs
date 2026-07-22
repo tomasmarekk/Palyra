@@ -1409,7 +1409,9 @@ fn workspace_patch_recovery_hint(error: &WorkspacePatchError) -> &'static str {
         WorkspacePatchError::SuspiciousPartialReplace { .. } => {
             "Read the current file and retry with Update File hunks, or use Replace File with the complete intended file content."
         }
-        _ => "Inspect the patch error and retry with a smaller complete patch that preserves workspace-relative paths.",
+        _ => {
+            "Inspect the patch error and retry with a smaller complete patch that preserves workspace-relative paths."
+        }
     }
 }
 

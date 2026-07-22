@@ -892,8 +892,7 @@ pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
     ToolCatalogEntry {
         tool_name: "palyra.fs.os_file",
         title: "OS file operation",
-        description:
-            "Reads or mutates approved user-owned OS paths with resolved-path audit metadata.",
+        description: "Reads or mutates approved user-owned OS paths with resolved-path audit metadata.",
         category: "filesystem",
         risk_level: ApprovalRiskLevel::Critical,
         recommend_always_allow: false,
@@ -1021,8 +1020,7 @@ pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
     ToolCatalogEntry {
         tool_name: "palyra.browser.storage",
         title: "Browser storage",
-        description:
-            "Reads browser cookie/localStorage names and value metadata with secret values withheld.",
+        description: "Reads browser cookie/localStorage names and value metadata with secret values withheld.",
         category: "browser",
         risk_level: ApprovalRiskLevel::Medium,
         recommend_always_allow: false,

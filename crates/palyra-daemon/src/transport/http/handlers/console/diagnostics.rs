@@ -278,6 +278,7 @@ pub(crate) async fn console_diagnostics_handler(
     let trace_export = crate::runtime_diagnostics::build_trace_exporter_contract();
     let diagnostics_timeline =
         crate::runtime_diagnostics::build_diagnostics_timeline_contract(generated_at_unix_ms);
+    let runtime_shadow_differential = collect_console_runtime_shadow_diagnostics(&state);
     let run_runtime_path = crate::runtime_diagnostics::build_run_runtime_path_summary(
         &state.runtime.config.feature_rollouts,
         None,
@@ -317,6 +318,21 @@ pub(crate) async fn console_diagnostics_handler(
         }),
     );
     let feature_usage = state.runtime.feature_usage_snapshot();
+    let diagnostics_timeline_payload =
+        serialize_console_runtime_diagnostics_component("timeline", &diagnostics_timeline)
+            .map_err(runtime_status_response)?;
+    let trace_export_payload =
+        serialize_console_runtime_diagnostics_component("trace_export", &trace_export)
+            .map_err(runtime_status_response)?;
+    let run_runtime_path_payload =
+        serialize_console_runtime_diagnostics_component("run_runtime_path", &run_runtime_path)
+            .map_err(runtime_status_response)?;
+    let shutdown_forensics_payload =
+        serialize_console_runtime_diagnostics_component("shutdown_forensics", &shutdown_forensics)
+            .map_err(runtime_status_response)?;
+    let support_runtime_payload =
+        serialize_console_runtime_diagnostics_component("support_runtime", &support_runtime)
+            .map_err(runtime_status_response)?;
 
     Ok(Json(json!({
         "contract": contract_descriptor(),
@@ -327,13 +343,15 @@ pub(crate) async fn console_diagnostics_handler(
         "metrics_catalog": metrics_catalog,
         "opentelemetry": otel_spans,
         "trace_export": trace_export.clone(),
-        "runtime_diagnostics": {
-            "timeline": diagnostics_timeline,
-            "trace_export": trace_export,
-            "run_runtime_path": run_runtime_path.clone(),
-            "shutdown_forensics": shutdown_forensics,
-            "support_runtime": support_runtime,
-        },
+        "runtime_diagnostics": build_console_runtime_diagnostics_payload(
+            diagnostics_timeline_payload,
+            trace_export_payload,
+            run_runtime_path_payload,
+            shutdown_forensics_payload,
+            support_runtime_payload,
+            runtime_shadow_differential,
+        ),
+        "runtime_kernel": status_snapshot.runtime_kernel.clone(),
         "run_runtime_path": run_runtime_path,
         "connector_delivery": connector_delivery,
         "runtime_watchdog": runtime_watchdog,
@@ -423,6 +441,41 @@ pub(crate) async fn console_diagnostics_handler(
             }
         },
     })))
+}
+
+fn collect_console_runtime_shadow_diagnostics(state: &AppState) -> Value {
+    crate::runtime_diagnostics::shadow_differential::build_shadow_differential_diagnostics(
+        state.runtime.runtime_shadow_diagnostics_snapshot(),
+    )
+}
+
+fn serialize_console_runtime_diagnostics_component<T: serde::Serialize>(
+    component: &str,
+    value: &T,
+) -> Result<Value, tonic::Status> {
+    serde_json::to_value(value).map_err(|error| {
+        tonic::Status::internal(format!(
+            "failed to serialize diagnostics {component} payload: {error}"
+        ))
+    })
+}
+
+fn build_console_runtime_diagnostics_payload(
+    timeline: Value,
+    trace_export: Value,
+    run_runtime_path: Value,
+    shutdown_forensics: Value,
+    support_runtime: Value,
+    runtime_shadow_differential: Value,
+) -> Value {
+    json!({
+        "timeline": timeline,
+        "trace_export": trace_export,
+        "run_runtime_path": run_runtime_path,
+        "shutdown_forensics": shutdown_forensics,
+        "support_runtime": support_runtime,
+        "runtime_kernel_v2_shadow": runtime_shadow_differential,
+    })
 }
 
 fn build_session_write_leases_diagnostics(
@@ -2672,7 +2725,9 @@ fn config_ref_item_guidance(
                 "exec" => {
                     "Fix the command so it returns a value within the configured timeout, or move this ref to vault."
                 }
-                _ => "Write the missing value into the referenced vault scope/key or update the ref.",
+                _ => {
+                    "Write the missing value into the referenced vault scope/key or update the ref."
+                }
             };
             (if required { "blocking" } else { "warning" }, Some(advice.to_owned()))
         }
@@ -3834,7 +3889,7 @@ pub(crate) fn control_plane_auth_profile_from_proto(
         None => {
             return Err(runtime_status_response(tonic::Status::internal(
                 "auth profile credential kind is missing",
-            )))
+            )));
         }
     };
     Ok(control_plane::AuthProfileView {
@@ -6335,6 +6390,8 @@ mod context_engine_trace_diagnostics_tests {
 
 #[cfg(test)]
 mod connector_observability_tests;
+#[cfg(test)]
+mod runtime_shadow_diagnostics_tests;
 
 #[cfg(test)]
 mod config_ref_health_tests {

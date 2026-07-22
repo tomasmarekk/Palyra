@@ -14,6 +14,10 @@ pub const QA_RUNTIME_PATH_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MCP_TRANSPORT_INVOCATION_EVENT: &str = "mcp.transport.invocation";
 /// Current schema version for [`McpTransportInvocationEvent`].
 pub const MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION: u32 = 1;
+/// Canonical tape event emitted after an authoritative context-engine binding is verified.
+pub const CONTEXT_ENGINE_BINDING_EVENT: &str = "runtime.context_engine.bound";
+/// Current schema version for [`ContextEngineBindingEvent`].
+pub const CONTEXT_ENGINE_BINDING_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Canonical tape event emitted after a provider adapter serves a QA run turn.
 pub const PROVIDER_LANE_ATTESTATION_EVENT: &str = "provider.lane.attested";
 /// Current schema version for [`ProviderLaneAttestationEvent`].
@@ -39,6 +43,62 @@ const MAX_PROVIDER_BASE_URL_BYTES: usize = 2_048;
 const MAX_SOURCE_EVENTS: usize = 32;
 const MAX_REASON_CODES: usize = 64;
 const MAX_FALLBACKS: usize = 32;
+
+/// Metadata-only proof of the context-engine implementation bound to a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEngineBindingEvent {
+    /// Version of this event payload.
+    pub schema_version: u32,
+    /// Canonical event name duplicated inside the payload for fail-closed decoding.
+    pub event_name: String,
+    /// Exact registered engine implementation selected for execution.
+    pub engine_id: String,
+    /// Exact registered implementation version.
+    pub engine_version: String,
+    /// Immutable context projection epoch selected for the run.
+    pub projection_epoch: u64,
+}
+
+impl ContextEngineBindingEvent {
+    /// Validates event identity and bounded context-engine metadata.
+    ///
+    /// # Errors
+    /// Returns [`QaRuntimePathValidationError`] when the event is malformed or unbounded.
+    pub fn validate_shape(&self) -> Result<(), QaRuntimePathValidationError> {
+        if self.schema_version != CONTEXT_ENGINE_BINDING_EVENT_SCHEMA_VERSION {
+            return Err(validation_error(
+                "unsupported_context_engine_binding_schema_version",
+                "$.schema_version",
+                format!(
+                    "expected schema version {CONTEXT_ENGINE_BINDING_EVENT_SCHEMA_VERSION}, got {}",
+                    self.schema_version
+                ),
+            ));
+        }
+        if self.event_name != CONTEXT_ENGINE_BINDING_EVENT {
+            return Err(validation_error(
+                "context_engine_binding_event_name_mismatch",
+                "$.event_name",
+                format!("expected '{CONTEXT_ENGINE_BINDING_EVENT}'"),
+            ));
+        }
+        validate_slug_token(self.engine_id.as_str(), "$.engine_id", MAX_METADATA_TOKEN_BYTES)?;
+        validate_version_token(
+            self.engine_version.as_str(),
+            "$.engine_version",
+            MAX_RUNTIME_VERSION_BYTES,
+        )?;
+        if self.projection_epoch == 0 {
+            return Err(validation_error(
+                "context_engine_binding_projection_epoch_invalid",
+                "$.projection_epoch",
+                "projection epoch must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Metadata-only proof produced by the provider adapter that served a QA turn.
 ///

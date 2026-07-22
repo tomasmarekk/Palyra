@@ -752,7 +752,9 @@ async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_rep
         .and_then(Value::as_array)
         .expect("list_dir entries should be present");
     assert!(
-        entries.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some("slow-report.js")),
+        entries
+            .iter()
+            .any(|entry| entry.get("name").and_then(Value::as_str) == Some("slow-report.js")),
         "top-level discovery should list launch workspace files, not reports-only contents: {payload}"
     );
     assert!(
@@ -1096,8 +1098,8 @@ fn spawn_redirect_http_server(location: &str) -> (String, thread::JoinHandle<()>
             listener.accept().expect("redirect test listener should accept request");
         read_http_request(&mut stream);
         let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         stream.write_all(response.as_bytes()).expect("redirect test response should write");
         stream.flush().expect("redirect test response should flush");
     });
@@ -1121,10 +1123,10 @@ fn spawn_static_http_server_with_content_type(
             listener.accept().expect("static test listener should accept request");
         read_http_request(&mut stream);
         let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
+            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
         stream.write_all(response.as_bytes()).expect("static test response should write");
         stream.flush().expect("static test response should flush");
     });
@@ -4439,9 +4441,9 @@ async fn prepare_model_provider_input_fallback_mode_returns_raw_input_when_tape_
         .await
         .expect("memory search should succeed");
     assert!(
-            !hits.is_empty(),
-            "seeded memory must produce at least one auto-inject candidate for fallback-path validation"
-        );
+        !hits.is_empty(),
+        "seeded memory must produce at least one auto-inject candidate for fallback-path validation"
+    );
 
     let mut tape_seq = 1_i64;
     let prepared = prepare_model_provider_input(
@@ -5462,10 +5464,10 @@ fn request_context_with_resolved_route_channel_overrides_existing_channel() {
     assert_eq!(resolved.principal, context.principal);
     assert_eq!(resolved.device_id, context.device_id);
     assert_eq!(
-            resolved.channel.as_deref(),
-            Some("discord:ops"),
-            "route context should use the normalized routed channel for downstream policy/memory scoping"
-        );
+        resolved.channel.as_deref(),
+        Some("discord:ops"),
+        "route context should use the normalized routed channel for downstream policy/memory scoping"
+    );
 }
 
 #[test]
@@ -15163,9 +15165,9 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_pending_record_acros
     let second_approval_id =
         second_resolution.expect("expected a fresh pending approval for second route");
     assert_ne!(
-            second_approval_id, first_approval_id,
-            "route retries should create a fresh approval record instead of reusing prior pending state"
-        );
+        second_approval_id, first_approval_id,
+        "route retries should create a fresh approval record instead of reusing prior pending state"
+    );
 
     let (records, _) = state
         .list_approval_records(

@@ -23,8 +23,7 @@ const TOOL_RESULT_ARTIFACT_TRUNCATION_RESERVE_BYTES: usize = 2 * 1024;
 // these projection contracts stay unit-tested until a parser backend calls them.
 #[allow(dead_code)]
 const PDF_EXTRACTION_SCHEMA_VERSION: u64 = 1;
-const TOOL_RESULT_ARTIFACT_TRUNCATION_MESSAGE: &str =
-    "Original tool output exceeded the journal artifact payload limit; this artifact stores a bounded UTF-8 prefix.";
+const TOOL_RESULT_ARTIFACT_TRUNCATION_MESSAGE: &str = "Original tool output exceeded the journal artifact payload limit; this artifact stores a bounded UTF-8 prefix.";
 // Must stay byte-identical to the denial reason emitted by the journal's
 // artifact read path; the preview retry below matches on it by substring.
 const SENSITIVE_FULL_READ_DENIED_REASON: &str = "sensitive_full_read_denied";

@@ -401,11 +401,15 @@ mod tests {
         );
         assert_eq!(
             payload.pointer("/connector/last_error").and_then(Value::as_str),
-            Some("failed to load Discord token from vault ref 'global/discord_bot_token': secret not found")
+            Some(
+                "failed to load Discord token from vault ref 'global/discord_bot_token': secret not found"
+            )
         );
         assert_eq!(
             payload.pointer("/operations/last_auth_failure").and_then(Value::as_str),
-            Some("failed to load Discord token from vault ref 'global/discord_bot_token': secret not found")
+            Some(
+                "failed to load Discord token from vault ref 'global/discord_bot_token': secret not found"
+            )
         );
     }
 }

@@ -221,6 +221,8 @@ pub(crate) struct ProviderLeaseExecutionContext {
     pub max_wait_ms: u64,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Exact RuntimeKernelV2 Provider authority when this is a V2 phase.
+    pub runtime_authority: Option<crate::journal::RuntimeProviderLaneAuthority>,
     /// Optional metadata-only correlation for provider-generation diagnostics
     /// when the execution is not attached to an orchestrator run.
     pub diagnostic_scope_id: Option<String>,

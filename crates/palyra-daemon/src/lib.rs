@@ -2515,6 +2515,32 @@ pub async fn run() -> Result<()> {
     validate_admin_auth_config(&auth)?;
     let model_provider = build_model_provider(&loaded.model_provider)
         .context("failed to initialize model provider runtime")?;
+    let v2_availability =
+        production_runtime_kernel_v2_availability(&model_provider.status_snapshot());
+    let (runtime_kernel_dispatcher, runtime_kernel_secret_audit) =
+        build_runtime_kernel_dispatcher(&loaded, &secret_resolver, v2_availability)?;
+    if let Some(access_audit) = runtime_kernel_secret_audit {
+        record_secret_access_journal_event(&journal_store, &access_audit)
+            .context("failed to audit runtime-kernel sampling secret access")?;
+    }
+    if matches!(
+        loaded.daemon.runtime_kernel.profile,
+        config::RuntimeKernelProfile::Legacy | config::RuntimeKernelProfile::V2Shadow
+    ) {
+        let report: journal::runtime_kernel::RuntimeRollbackActuationReportV1 = journal_store
+            .request_runtime_kernel_profile_downgrade(loaded.daemon.runtime_kernel.rollback_policy)
+            .context("failed to apply runtime-kernel profile downgrade policy")?;
+        info!(
+            profile = loaded.daemon.runtime_kernel.profile.as_str(),
+            rollback_policy = loaded.daemon.runtime_kernel.rollback_policy.as_str(),
+            evaluated = report.evaluated,
+            finish_allowed = report.finish_allowed,
+            suspension_pending = report.suspension_pending,
+            suspended = report.suspended,
+            replayed = report.replayed,
+            "runtime-kernel profile downgrade scan completed"
+        );
+    }
     let agent_registry = agents::AgentRegistry::open(identity_runtime.store_root.as_path())
         .context("failed to initialize agent registry state")?;
     ensure_local_default_agent(&agent_registry, &loaded)
@@ -2738,6 +2764,7 @@ pub async fn run() -> Result<()> {
             external_retrieval_index,
             conversation_bindings,
             fault_injection: qa_fault_runtime,
+            runtime_kernel_dispatcher,
         },
     )
     .context("failed to initialize gateway runtime state")?;
@@ -3166,6 +3193,7 @@ pub async fn run() -> Result<()> {
         &loaded,
         &identity_runtime,
         runtime.clone(),
+        Arc::clone(&channels),
         auth.clone(),
         Arc::clone(&auth_runtime),
         grpc_url,
@@ -4101,6 +4129,122 @@ fn resolve_provider_secret_from_secret_ref(
     ))
 }
 
+/// Builds the host-owned runtime dispatcher from merged config and audited key material.
+///
+/// Secret-reference bytes are consumed only by the dispatcher constructor and
+/// never copied into `LoadedConfig`, logs, diagnostics, or journal payloads.
+/// Inline key material keeps the config layer's existing redacted-debug posture.
+fn build_runtime_kernel_dispatcher(
+    loaded: &config::LoadedConfig,
+    resolver: &SecretResolver<'_>,
+    v2_availability: application::runtime_kernel_v2::selection::V2RuntimeAvailability,
+) -> Result<(
+    Arc<application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher>,
+    Option<SecretAccessAuditRecord>,
+)> {
+    use application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher;
+
+    let mut resolved_secret = None;
+    let mut audit = None;
+    if let Some(config::RuntimeKernelSamplingKeySource::SecretRef(secret_ref)) =
+        loaded.daemon.runtime_kernel.sampling_key_source.as_ref()
+    {
+        let resolution = resolver.resolve(secret_ref).map_err(|error| {
+            anyhow::anyhow!("failed to resolve runtime-kernel sampling key: {}", error.message)
+        })?;
+        let resolved_at_unix_ms = resolution.metadata.resolved_at_unix_ms;
+        resolved_secret = Some(resolution.require_bytes().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to resolve runtime-kernel sampling key bytes: {}",
+                error.message
+            )
+        })?);
+        audit = Some(SecretAccessAuditRecord {
+            action: "runtime_kernel.sampling_key.resolve".to_owned(),
+            config_path: "runtime_kernel.sampling_key_secret_ref".to_owned(),
+            secret_id: secret_ref.fingerprint(),
+            source_kind: secret_ref.source_kind().to_owned(),
+            resolved_at_unix_ms,
+        });
+    }
+
+    let dispatcher = RuntimeKernelDispatcher::resolve(
+        &loaded.daemon.runtime_kernel,
+        &loaded.feature_rollouts,
+        resolved_secret.as_ref().map(|secret| secret.as_ref()),
+        runtime_kernel_explicit_shadow_enrollment(loaded)?,
+        v2_availability,
+    )
+    .context("failed to initialize runtime-kernel dispatcher")?;
+    Ok((Arc::new(dispatcher), audit))
+}
+
+fn production_runtime_kernel_v2_availability(
+    provider_status: &model_provider::ProviderStatusSnapshot,
+) -> application::runtime_kernel_v2::selection::V2RuntimeAvailability {
+    use application::runtime_kernel_v2::selection::{
+        V2RuntimeAvailability, V2UnavailabilityReason,
+    };
+
+    let mut selected_chat_routes = provider_status
+        .route_selection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.role == "chat" && candidate.selected);
+    let provider_ready = selected_chat_routes.next().is_some_and(|candidate| {
+        candidate.capability_state == "eligible"
+            && !candidate.provider_id.trim().is_empty()
+            && !candidate.model_id.trim().is_empty()
+            && !candidate.credential_id.trim().is_empty()
+    }) && selected_chat_routes.next().is_none();
+    let harness_ready = application::agent_harness::AgentHarnessRegistry::with_embedded_default()
+        .is_ok_and(|registry| registry.list().iter().any(|descriptor| descriptor.embedded_default));
+    let context_snapshot =
+        application::context_engine::ContextEngineRegistry::production_default().snapshot();
+    let context_ready = context_snapshot.engines.iter().any(|descriptor| {
+        descriptor.engine_id == context_snapshot.selected_engine_id
+            && !descriptor.version.trim().is_empty()
+    });
+
+    if provider_ready && harness_ready && context_ready {
+        V2RuntimeAvailability::Ready
+    } else {
+        warn!(
+            provider_ready,
+            harness_ready,
+            context_ready,
+            "runtime-kernel V2 dependencies are not ready; authoritative V2 admission remains blocked"
+        );
+        V2RuntimeAvailability::Unavailable(V2UnavailabilityReason::NotReady)
+    }
+}
+
+fn runtime_kernel_explicit_shadow_enrollment(loaded: &config::LoadedConfig) -> Result<bool> {
+    const ENV_NAME: &str = "PALYRA_QA_RUNTIME_KERNEL_SHADOW_EXPLICIT_BINDING";
+
+    let Some(binding) = std::env::var_os(ENV_NAME) else {
+        return Ok(false);
+    };
+    let binding = binding
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{ENV_NAME} contains non-unicode data"))?;
+    let execution_key_digest = loaded
+        .model_provider
+        .qa_execution_key_digest
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{ENV_NAME} requires QA execution metadata"))?;
+    if loaded.qa_lab.mode != palyra_common::runtime_preview::RuntimePreviewMode::PreviewOnly
+        || loaded.model_provider.qa_provider_binding_sha256.is_none()
+        || loaded.daemon.runtime_kernel.profile != config::RuntimeKernelProfile::V2Shadow
+        || binding != execution_key_digest
+    {
+        anyhow::bail!(
+            "{ENV_NAME} requires qa_lab preview_only, bound QA provider metadata, and the v2_shadow profile"
+        );
+    }
+    Ok(true)
+}
+
 /// Hydrates the admin auth/connector tokens and the browser-service token
 /// from their secret refs, returning an audit record per resolution.
 fn resolve_admin_and_browser_secret_refs(
@@ -4227,6 +4371,20 @@ pub(crate) fn build_configured_secrets_state(
         loaded.admin.connector_token_secret_ref.as_ref(),
         "admin_auth",
         "admin.connector_token_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    let runtime_kernel_sampling_secret =
+        match loaded.daemon.runtime_kernel.sampling_key_source.as_ref() {
+            Some(config::RuntimeKernelSamplingKeySource::SecretRef(secret_ref)) => Some(secret_ref),
+            Some(config::RuntimeKernelSamplingKeySource::Inline(_)) | None => None,
+        };
+    collect_configured_secret_record(
+        &mut secrets,
+        runtime_kernel_sampling_secret,
+        "runtime_kernel",
+        "runtime_kernel.sampling_key_secret_ref",
         resolver,
         snapshot_generation,
         resolution_scope,
@@ -4677,10 +4835,11 @@ mod tests {
         enforce_remote_bind_guard, finalize_discord_onboarding_plan, find_hashed_secret_map_key,
         load_installed_skills_index, loopback_grpc_url, mint_console_relay_token,
         mint_console_secret_token, normalize_discord_token, parse_offline_env_flag,
-        prune_console_relay_tokens, redact_console_diagnostics_value,
-        resolve_discord_intents_from_flags, resolve_model_provider_secret,
-        resolve_runtime_state_root_with_override, runtime_status_response,
-        sanitize_http_error_message, sha256_hex, spawn_networked_worker_expiry_loop_with_interval,
+        production_runtime_kernel_v2_availability, prune_console_relay_tokens,
+        redact_console_diagnostics_value, resolve_discord_intents_from_flags,
+        resolve_model_provider_secret, resolve_runtime_state_root_with_override,
+        runtime_status_response, sanitize_http_error_message, sha256_hex,
+        spawn_networked_worker_expiry_loop_with_interval,
         spawn_process_lease_reconciliation_loop_with_interval,
         spawn_runtime_health_reconciliation_loop_with_interval, summarize_discord_inbound_monitor,
         validate_admin_auth_config, validate_canvas_http_canvas_id,
@@ -4699,7 +4858,8 @@ mod tests {
     use crate::gateway::{tests::build_test_runtime_state, GatewayAuthConfig};
     use crate::model_provider::{
         ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
-        ModelProviderKind, ProviderRegistryEntryConfig,
+        ModelProviderKind, ProviderRegistryEntryConfig, ProviderRouteCandidateTrace,
+        ProviderRouteSelectionTrace,
     };
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
@@ -4718,6 +4878,50 @@ mod tests {
         let auth_registry = AuthProfileRegistry::open(identity_store_root.as_path())
             .expect("auth profile registry should initialize");
         (tempdir, auth_registry, vault)
+    }
+
+    fn ready_v2_provider_status() -> crate::model_provider::ProviderStatusSnapshot {
+        let runtime = build_test_runtime_state(false);
+        let mut status = runtime.model_provider_status_snapshot();
+        status.route_selection = ProviderRouteSelectionTrace {
+            default_model_id: Some("deterministic-v2".to_owned()),
+            failover_enabled: false,
+            generated_at_unix_ms: 1,
+            selected_provider_id: Some("deterministic".to_owned()),
+            selected_model_id: Some("deterministic-v2".to_owned()),
+            candidates: vec![ProviderRouteCandidateTrace {
+                provider_id: "deterministic".to_owned(),
+                credential_id: "credential:deterministic".to_owned(),
+                model_id: "deterministic-v2".to_owned(),
+                role: "chat".to_owned(),
+                capability_state: "eligible".to_owned(),
+                health_state: "healthy".to_owned(),
+                selected: true,
+                reason_code: "selected".to_owned(),
+            }],
+        };
+        status
+    }
+
+    #[test]
+    fn runtime_kernel_v2_becomes_ready_only_for_complete_production_dependencies() {
+        assert_eq!(
+            production_runtime_kernel_v2_availability(&ready_v2_provider_status()),
+            crate::application::runtime_kernel_v2::selection::V2RuntimeAvailability::Ready
+        );
+    }
+
+    #[test]
+    fn runtime_kernel_v2_stays_not_ready_without_unique_selected_provider_route() {
+        let mut status = ready_v2_provider_status();
+        status.route_selection.candidates[0].selected = false;
+
+        assert_eq!(
+            production_runtime_kernel_v2_availability(&status),
+            crate::application::runtime_kernel_v2::selection::V2RuntimeAvailability::Unavailable(
+                crate::application::runtime_kernel_v2::selection::V2UnavailabilityReason::NotReady,
+            )
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

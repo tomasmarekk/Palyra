@@ -539,14 +539,14 @@ pub(crate) async fn evaluate_tool_proposal_security(
                     "delegation policy lookup failed; proposal will be denied safely"
                 );
                 Some(ToolDecision {
-                        allowed: false,
-                        reason: format!(
-                            "delegation policy lookup failed; reason_code=delegation.lookup_failed; status_code={:?}",
-                            error.code()
-                        ),
-                        approval_required: false,
-                        policy_enforced: true,
-                    })
+                    allowed: false,
+                    reason: format!(
+                        "delegation policy lookup failed; reason_code=delegation.lookup_failed; status_code={:?}",
+                        error.code()
+                    ),
+                    approval_required: false,
+                    policy_enforced: true,
+                })
             }
         };
     }

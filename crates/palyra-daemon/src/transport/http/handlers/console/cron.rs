@@ -78,7 +78,7 @@ pub(crate) async fn console_cron_create_handler(
         Some(_) => {
             return Err(runtime_status_response(tonic::Status::permission_denied(
                 "owner_principal must match authenticated session principal",
-            )))
+            )));
         }
     };
     let channel = payload

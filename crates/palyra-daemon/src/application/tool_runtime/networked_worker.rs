@@ -160,9 +160,13 @@ pub(crate) enum NetworkedWorkerRemoteDispatchError {
     WorkerUnavailable(String),
     #[error("remote worker request was rejected: {0}")]
     RequestRejected(String),
-    #[error("remote worker dispatch timed out for request_id={request_id}; cancelled_before_dispatch={cancelled_before_dispatch}")]
+    #[error(
+        "remote worker dispatch timed out for request_id={request_id}; cancelled_before_dispatch={cancelled_before_dispatch}"
+    )]
     Timeout { request_id: String, cancelled_before_dispatch: bool },
-    #[error("remote worker dispatch cancelled for request_id={request_id}; cancelled_before_dispatch={cancelled_before_dispatch}")]
+    #[error(
+        "remote worker dispatch cancelled for request_id={request_id}; cancelled_before_dispatch={cancelled_before_dispatch}"
+    )]
     Cancelled { request_id: String, cancelled_before_dispatch: bool },
     #[error(
         "remote worker dispatch state transition failed for request_id={request_id}: {message}"

@@ -16,7 +16,8 @@ use std::{
 };
 
 use palyra_common::runtime_contracts::{
-    CancellationScopeKind, QueueMode, RuntimeActorKind, RuntimeActorRef, RuntimeTerminalOutcome,
+    CancellationScopeKind, QueueMode, RuntimeActorKind, RuntimeActorRef, RuntimeSessionId,
+    RuntimeTerminalOutcome,
 };
 use palyra_common::{runtime_preview::RuntimePreviewCapability, CANONICAL_PROTOCOL_MAJOR};
 use serde_json::json;
@@ -48,7 +49,15 @@ use crate::{
             rematerialize_provider_input, MemoryPromptFailureMode,
             PrepareModelProviderInputRequest,
         },
-        run_stream::flow_control::RunStreamFlowControl,
+        run_admission::{
+            AdmissionCaller, RunAdmissionCommand, RunAdmissionController,
+            RunAdmissionControllerOutcome,
+        },
+        run_stream::{
+            admission_ingress::{admission_environment, channel_ingress},
+            flow_control::RunStreamFlowControl,
+        },
+        runtime_kernel_v2::selection::{RuntimeAuthority, RuntimeAuthorityProgressEvidence},
         service_authorization::authorize_message_action,
         session_queue::SessionQueueSafeBoundary,
         tool_registry::{
@@ -66,7 +75,8 @@ use crate::{
         truncate_with_ellipsis, GatewayRuntimeState, SessionQueueAdmissionRequest,
     },
     journal::{
-        MemorySource, OrchestratorRunStartRequest, OrchestratorRunTerminalSettlement,
+        run_admission::JournalRunAdmissionSessionSelector, MemorySource,
+        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlement,
         OrchestratorRunTerminalSettlementRequest, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
@@ -92,6 +102,7 @@ use super::response::{
 const MAX_ROUTE_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
 /// Route-message runs keep a surface-owned 15-minute wall-clock budget.
 const ROUTE_MESSAGE_WALL_CLOCK_BUDGET_MS: u64 = 15 * 60 * 1_000;
+const CHANNEL_V2_ADAPTER_UNAVAILABLE: &str = "runtime.channel_v2_adapter_unavailable";
 
 fn route_message_status_tape_payload(state: RunLifecycleState, message: &str) -> String {
     match state {
@@ -360,8 +371,9 @@ pub(crate) async fn handle_routed_route_message(
             reset_session: false,
         })
         .await?;
-    let previous_run_id_for_context = resolved_session.session.last_run_id.clone();
-    let session_id = resolved_session.session.session_id;
+    let session = resolved_session.session;
+    let previous_run_id_for_context = session.last_run_id.clone();
+    let session_id = session.session_id.clone();
     let run_id = Ulid::new().to_string();
     let binding_kind = if plan.reply_thread_id.as_deref().is_some_and(|value| !value.is_empty()) {
         ConversationBindingKind::Thread
@@ -593,17 +605,129 @@ pub(crate) async fn handle_routed_route_message(
             queue_depth: queue_outcome.observed_queue_depth.min(u32::MAX as u64) as u32,
         });
     }
-    runtime_state
-        .start_orchestrator_run(OrchestratorRunStartRequest {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            origin_kind: "manual".to_owned(),
-            origin_run_id: None,
-            triggered_by_principal: Some(route_request_context.principal.clone()),
-            parameter_delta_json: None,
-            delegated_admission: None,
-        })
-        .await?;
+    let typed_session_id = RuntimeSessionId::parse(session_id.as_str()).map_err(|error| {
+        Status::failed_precondition(format!(
+            "route-message session_id is not a runtime identity: {error}"
+        ))
+    })?;
+    let dispatcher = runtime_state.runtime_kernel_dispatcher();
+    let authority_intent = dispatcher
+        .resolve_authority_intent(
+            &runtime_state.journal_store,
+            &typed_session_id,
+            Some(route_request_context.principal.as_str()),
+            resolved_session.created,
+            true,
+            RuntimeAuthorityProgressEvidence::pristine(),
+        )
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "route-message runtime authority could not be resolved: {error}"
+            ))
+        })?;
+    match authority_intent.selected_runtime() {
+        Some(RuntimeAuthority::Legacy) => {
+            dispatcher
+                .pin_non_v2_session_authority(
+                    &runtime_state.journal_store,
+                    &typed_session_id,
+                    &authority_intent,
+                )
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "route-message legacy runtime authority could not be pinned: {error}"
+                    ))
+                })?;
+            runtime_state
+                .start_orchestrator_run(OrchestratorRunStartRequest {
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    origin_kind: "manual".to_owned(),
+                    origin_run_id: None,
+                    triggered_by_principal: Some(route_request_context.principal.clone()),
+                    parameter_delta_json: None,
+                    delegated_admission: None,
+                })
+                .await?;
+        }
+        Some(RuntimeAuthority::V2) => {
+            let environment =
+                admission_environment(runtime_state, &route_request_context, &session)
+                    .await?
+                    .with_ingress_block(CHANNEL_V2_ADAPTER_UNAVAILABLE.to_owned());
+            let verified = channel_ingress().issue(
+                dispatcher,
+                AdmissionCaller::authenticated(
+                    route_request_context.principal.clone(),
+                    route_request_context.device_id.clone(),
+                    route_request_context.channel.clone(),
+                ),
+                environment,
+                authority_intent,
+                None,
+            );
+            let outcome = RunAdmissionController::new(&runtime_state.journal_store)
+                .admit(RunAdmissionCommand::from_verified(
+                    Ulid::new().to_string(),
+                    format!("route_message:{session_id}"),
+                    format!("route_message:{envelope_id}"),
+                    run_id.clone(),
+                    run_id.clone(),
+                    Ulid::new().to_string(),
+                    JournalRunAdmissionSessionSelector {
+                        session_id: Some(session_id.clone()),
+                        session_key: None,
+                        session_label: None,
+                        require_existing: true,
+                        reset_session: false,
+                    },
+                    verified,
+                ))
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "route-message runtime admission failed: {error}"
+                    ))
+                })?;
+            let RunAdmissionControllerOutcome::Rejected { journal } = outcome else {
+                return Err(Status::failed_precondition(
+                    "route-message V2 adapter block did not reject admission",
+                ));
+            };
+            if journal.reason_code != CHANNEL_V2_ADAPTER_UNAVAILABLE {
+                return Err(Status::failed_precondition(
+                    "route-message V2 adapter block returned unexpected admission evidence",
+                ));
+            }
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: journal.reason_code,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: None,
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
+        None => {
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: "runtime.channel_authority_blocked".to_owned(),
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: None,
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
+    }
     let (generation_session_id, generation) =
         runtime_state.runtime_generation_for_run(run_id.clone()).await?.ok_or_else(|| {
             Status::failed_precondition(
@@ -946,6 +1070,7 @@ pub(crate) async fn handle_routed_route_message(
                 max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
                 session_id: Some(session_id.clone()),
                 run_id: Some(run_id.clone()),
+                runtime_authority: None,
                 diagnostic_scope_id: Some(provider_attempt.scope_id.as_str().to_owned()),
             },
         ));

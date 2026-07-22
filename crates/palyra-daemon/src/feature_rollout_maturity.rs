@@ -73,8 +73,7 @@ const SECURITY_ACCEPTANCE: &[&str] = &[
     "security audit output remains redacted",
     "high-risk pattern scan covers new public posture fields",
 ];
-const ROLLOUT_PROMOTION_GATE: &str =
-    "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update";
+const ROLLOUT_PROMOTION_GATE: &str = "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update";
 
 const NO_DEPRECATED_ALIASES: &[&str] = &[];
 const NO_STABLE_DEPENDENCIES: &[FeatureRolloutFlag] = &[];
@@ -372,7 +371,9 @@ impl FeatureRolloutMaturity {
             Self::GatedProduction => {
                 "keep explicit gate; require green release hardening evidence before stable promotion"
             }
-            Self::Stable => "eligible for default-on only after release hardening and inventory drift review",
+            Self::Stable => {
+                "eligible for default-on only after release hardening and inventory drift review"
+            }
             Self::Deprecated => "keep disabled by default and document replacement or removal path",
             Self::Blocked => "cannot be enabled by default until listed blockers are cleared",
         }
@@ -948,7 +949,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: RUNTIME_PREVIEW_TESTS,
         public_api_exposure: RUNTIME_PREVIEW_EXPOSURE,
-        activation_blockers: &["queue depth and merge-window limits must remain bounded in preview controls"],
+        activation_blockers: &[
+            "queue depth and merge-window limits must remain bounded in preview controls",
+        ],
         acceptance_criteria: RUNTIME_PREVIEW_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1186,7 +1189,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: CORE_VISIBILITY_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["model-visible plan state must remain scoped to diagnostic-safe fields"],
+        activation_blockers: &[
+            "model-visible plan state must remain scoped to diagnostic-safe fields",
+        ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1198,7 +1203,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: CORE_VISIBILITY_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["judge outcomes must stay advisory and replay-visible until acceptance gates land"],
+        activation_blockers: &[
+            "judge outcomes must stay advisory and replay-visible until acceptance gates land",
+        ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1210,7 +1217,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: CORE_VISIBILITY_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["verification evidence must remain redacted and durable before stable rollout"],
+        activation_blockers: &[
+            "verification evidence must remain redacted and durable before stable rollout",
+        ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1222,7 +1231,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: CORE_VISIBILITY_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["draft projection must not expose hidden transcript or secret material"],
+        activation_blockers: &[
+            "draft projection must not expose hidden transcript or secret material",
+        ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1234,7 +1245,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::GatedProduction,
         required_tests: COMPACTION_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["compaction decisions must be replay-safe and expose bounded evidence"],
+        activation_blockers: &[
+            "compaction decisions must be replay-safe and expose bounded evidence",
+        ],
         acceptance_criteria: COMPACTION_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1260,7 +1273,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: SECURITY_TESTS,
         public_api_exposure: OBSERVABILITY_EXPOSURE,
-        activation_blockers: &["attack-surface audit output must remain redacted and policy-aligned"],
+        activation_blockers: &[
+            "attack-surface audit output must remain redacted and policy-aligned",
+        ],
         acceptance_criteria: SECURITY_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
@@ -1447,14 +1462,12 @@ impl fmt::Display for FeatureRolloutMaturityValidationError {
             Self::MissingPromotionManifestEntry { flag } => {
                 write!(f, "feature rollout {flag} is missing promotion manifest evidence")
             }
-            Self::LegacyProjectionMismatch {
-                flag,
-                descriptor_maturity,
-                manifest_maturity,
-            } => write!(
-                f,
-                "feature rollout {flag} projects legacy maturity {manifest_maturity} but descriptor declares {descriptor_maturity}"
-            ),
+            Self::LegacyProjectionMismatch { flag, descriptor_maturity, manifest_maturity } => {
+                write!(
+                    f,
+                    "feature rollout {flag} projects legacy maturity {manifest_maturity} but descriptor declares {descriptor_maturity}"
+                )
+            }
         }
     }
 }
@@ -2222,11 +2235,11 @@ mod tests {
         assert!(safety["inactive_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("non-authoritative")));
-        assert!(safety["activation_blockers"].as_array().is_some_and(|blockers| blockers
-            .iter()
-            .any(|blocker| {
+        assert!(safety["activation_blockers"].as_array().is_some_and(|blockers| {
+            blockers.iter().any(|blocker| {
                 blocker.as_str().is_some_and(|value| value.contains("cannot activate"))
-            })));
+            })
+        }));
 
         let progress =
             diagnostics.get("progress_drafts").expect("progress rollout diagnostics must exist");

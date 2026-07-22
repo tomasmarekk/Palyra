@@ -8,6 +8,7 @@
 //! counterparts and their secure defaults.
 
 pub(crate) mod load;
+pub(crate) mod runtime_kernel;
 pub(crate) mod schema;
 
 pub use load::load_config;

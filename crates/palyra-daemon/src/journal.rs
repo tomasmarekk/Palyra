@@ -81,6 +81,9 @@ use crate::{
 
 mod metadata_trace;
 mod retrieval_index_status;
+pub(crate) mod run_admission;
+pub(crate) mod runtime_finalization;
+pub(crate) mod runtime_kernel;
 mod shared_runtime;
 pub(crate) mod state_health;
 
@@ -111,7 +114,7 @@ pub(crate) use shared_runtime::{
     RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
     RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
     RuntimeHealthQuarantineClearOutcome, RuntimeHealthQuarantineClearRequest,
-    ToolEffectObservationCommitOutcome,
+    RuntimeProviderLaneAuthority, ToolEffectObservationCommitOutcome,
 };
 #[cfg(test)]
 pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInvalidateOutcome};
@@ -1896,6 +1899,12 @@ pub struct OrchestratorRunTerminalSettlement {
     pub runtime_event_sequence: Option<u64>,
     pub summary_tape_sequence: Option<i64>,
     pub tape_sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestratorTerminalAuthority {
+    CancellationAware,
+    Exact,
 }
 
 /// Runs force-failed by startup orphan recovery.
@@ -4872,6 +4881,20 @@ pub enum JournalError {
     MetadataTraceInvariant { run_id: String, reason_code: &'static str },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
     SessionIdentityMismatch { session_id: String },
+    #[error(
+        "run admission idempotency key {idempotency_key} in scope {idempotency_scope} conflicts with durable request evidence"
+    )]
+    RunAdmissionIdempotencyConflict { idempotency_scope: String, idempotency_key: String },
+    #[error("run admission request is invalid: {reason}")]
+    InvalidRunAdmission { reason: String },
+    #[error(
+        "run admission queue capacity reached for session {session_id} ({pending_depth} >= {maximum_depth})"
+    )]
+    RunAdmissionQueueCapacityExceeded { session_id: String, pending_depth: u64, maximum_depth: u64 },
+    #[error("run admission evidence hook failed: {reason}")]
+    RunAdmissionEvidenceHook { reason: String },
+    #[error("run admission durable evidence is invalid: {reason}")]
+    InvalidRunAdmissionEvidence { reason: String },
     #[error("background task not found: {task_id}")]
     BackgroundTaskNotFound { task_id: String },
     #[error(
@@ -4971,6 +4994,76 @@ pub enum JournalError {
         "networked worker fleet generation conflict: expected {expected_generation}, found {actual_generation}"
     )]
     NetworkedWorkerFleetGenerationConflict { expected_generation: u64, actual_generation: u64 },
+    #[error("runtime kernel snapshot is invalid")]
+    InvalidRuntimeKernelSnapshot,
+    #[error("prepared runtime kernel transition is invalid")]
+    InvalidPreparedRuntimeKernelTransition,
+    #[error("runtime kernel JSON is not canonical for {payload_kind}")]
+    InvalidRuntimeKernelJson { payload_kind: &'static str },
+    #[error("runtime kernel head is invalid for run {run_id}")]
+    InvalidRuntimeKernelHead { run_id: String },
+    #[error("runtime kernel ledger is invalid for run {run_id}")]
+    InvalidRuntimeKernelLedger { run_id: String },
+    #[error("runtime kernel head is not initialized for run {run_id}")]
+    RuntimeKernelHeadNotFound { run_id: String },
+    #[error("runtime kernel head initialization conflicts for run {run_id}")]
+    RuntimeKernelInitializationConflict { run_id: String },
+    #[error("runtime kernel run identity conflicts for run {run_id}")]
+    RuntimeKernelRunIdentityConflict { run_id: String },
+    #[error("runtime kernel generation {generation} is not active for run {run_id}")]
+    RuntimeKernelGenerationInactive { run_id: String, generation: u64 },
+    #[error("runtime kernel child lane {lane} authority rejected for run {run_id}: {reason_code}")]
+    RuntimeKernelChildLaneAuthorityRejected {
+        run_id: String,
+        lane: String,
+        reason_code: &'static str,
+    },
+    #[error("runtime kernel head compare-and-set conflict for run {run_id}")]
+    RuntimeKernelHeadConflict { run_id: String },
+    #[error(
+        "runtime kernel idempotency key {idempotency_key} conflicts with durable request evidence for run {run_id}"
+    )]
+    RuntimeKernelIdempotencyConflict { run_id: String, idempotency_key: String },
+    #[error(
+        "runtime kernel replay evidence is missing for idempotency key {idempotency_key} on run {run_id}"
+    )]
+    RuntimeKernelReplayEvidenceMissing { run_id: String, idempotency_key: String },
+    #[error(
+        "runtime kernel event sequence conflicts for run {run_id}: expected {expected_sequence}, found {actual_sequence}"
+    )]
+    RuntimeKernelEventSequenceConflict {
+        run_id: String,
+        expected_sequence: u64,
+        actual_sequence: u64,
+    },
+    #[error("runtime kernel generation {generation} exceeds the SQLite integer range")]
+    InvalidRuntimeKernelGeneration { generation: u64 },
+    #[error("runtime kernel revision or sequence {value} exceeds the SQLite integer range")]
+    RuntimeKernelRevisionOutOfRange { value: u64 },
+    #[error("runtime kernel rollback request is invalid for run {run_id}: {reason}")]
+    InvalidRuntimeRollbackRequest { run_id: String, reason: String },
+    #[error(
+        "runtime kernel rollback active set exceeds its bound ({current_entries} > {max_entries})"
+    )]
+    RuntimeRollbackCapacityExceeded { current_entries: usize, max_entries: usize },
+    #[error(
+        "runtime kernel rollback denies a new side effect for run {run_id} generation {generation}"
+    )]
+    RuntimeRollbackNewSideEffectDenied { run_id: String, generation: u64 },
+    #[error("runtime final output descriptor is invalid: {reason}")]
+    InvalidRuntimeFinalOutput { reason: String },
+    #[error("runtime final output conflicts with committed artifact for run {run_id}")]
+    RuntimeFinalOutputConflict { run_id: String },
+    #[error("runtime final output was not found for run {run_id} generation {generation}")]
+    RuntimeFinalOutputNotFound { run_id: String, generation: u64 },
+    #[error("runtime delivery intent is invalid: {reason}")]
+    InvalidRuntimeDeliveryIntent { reason: String },
+    #[error("runtime delivery intent conflicts with committed evidence: {intent_id}")]
+    RuntimeDeliveryIntentConflict { intent_id: String },
+    #[error("runtime delivery is not allowed for hidden final output: {artifact_id}")]
+    RuntimeDeliveryNotVisible { artifact_id: String },
+    #[error("runtime finalization authority is stale for run {run_id}")]
+    RuntimeFinalizationAuthorityStale { run_id: String },
     #[error("memory embedding vector dimensions must be greater than 0")]
     InvalidMemoryVectorDimensions,
     #[error("journal sqlite operation failed: {0}")]
@@ -7240,6 +7333,36 @@ const MIGRATIONS: &[Migration] = &[
         version: 71,
         name: "networked_worker_run_generation_authority",
         sql: shared_runtime::MIGRATION_71_SQL,
+    },
+    Migration {
+        version: 72,
+        name: "runtime_kernel_v2_journal_boundary",
+        sql: runtime_kernel::MIGRATION_72_SQL,
+    },
+    Migration {
+        version: 73,
+        name: "runtime_run_admission_boundary",
+        sql: run_admission::MIGRATION_73_SQL,
+    },
+    Migration {
+        version: 74,
+        name: "runtime_single_finalization_and_delivery_boundary",
+        sql: runtime_finalization::MIGRATION_74_SQL,
+    },
+    Migration {
+        version: 75,
+        name: "runtime_session_authority_pin_history",
+        sql: run_admission::MIGRATION_75_SQL,
+    },
+    Migration {
+        version: 76,
+        name: "runtime_kernel_profile_rollback_requests",
+        sql: runtime_kernel::MIGRATION_76_SQL,
+    },
+    Migration {
+        version: 77,
+        name: "provider_attempt_outcome_unknown",
+        sql: shared_runtime::MIGRATION_77_SQL,
     },
 ];
 
@@ -9533,6 +9656,48 @@ fn runtime_terminal_event_name(state: RunLifecycleState) -> Option<RuntimeEventN
         | RunLifecycleState::Accepted
         | RunLifecycleState::InProgress => None,
     }
+}
+
+fn exact_runtime_terminal_sequence_tx(
+    connection: &Connection,
+    session_id: &str,
+    run_id: &str,
+    generation: RuntimeGeneration,
+    expected_event_name: RuntimeEventName,
+) -> Result<Option<u64>, JournalError> {
+    let existing = connection
+        .query_row(
+            r#"
+                SELECT run_ulid, event_name, sequence
+                FROM runtime_events_v2
+                WHERE session_ulid = ?1
+                  AND lane = ?2
+                  AND generation = ?3
+                  AND terminal = 1
+            "#,
+            params![
+                session_id,
+                RuntimeGenerationLane::Run.as_str(),
+                i64::try_from(generation.get()).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+        )
+        .optional()?;
+    let Some((existing_run_id, existing_event_name, sequence)) = existing else {
+        return Ok(None);
+    };
+    if existing_run_id != run_id || existing_event_name != expected_event_name.as_str() {
+        return Err(JournalError::InvalidArgument(format!(
+            "authoritative kernel terminal event contradicts requested {} outcome",
+            expected_event_name.as_str()
+        )));
+    }
+    let sequence = u64::try_from(sequence).map_err(|_| {
+        JournalError::InvalidArgument(
+            "authoritative kernel terminal event has invalid sequence".to_owned(),
+        )
+    })?;
+    Ok(Some(sequence))
 }
 
 fn valid_terminal_reason_code(reason_code: &str) -> bool {
@@ -12210,6 +12375,37 @@ impl JournalStore {
         &self,
         request: &OrchestratorRunTerminalSettlementRequest,
     ) -> Result<OrchestratorRunTerminalSettlement, JournalError> {
+        self.settle_orchestrator_run_terminal_with_authority(
+            request,
+            OrchestratorTerminalAuthority::CancellationAware,
+        )
+    }
+
+    /// Atomically converges a run to a terminal outcome already committed by
+    /// an authoritative runtime kernel.
+    ///
+    /// A pending cancellation intent remains durable evidence but cannot
+    /// replace the kernel outcome. Repeating the same outcome is idempotent;
+    /// a different existing terminal outcome is rejected as a contradiction.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], [`JournalError::InvalidArgument`],
+    /// or [`JournalError`] on storage failure.
+    pub fn settle_orchestrator_run_terminal_exact(
+        &self,
+        request: &OrchestratorRunTerminalSettlementRequest,
+    ) -> Result<OrchestratorRunTerminalSettlement, JournalError> {
+        self.settle_orchestrator_run_terminal_with_authority(
+            request,
+            OrchestratorTerminalAuthority::Exact,
+        )
+    }
+
+    fn settle_orchestrator_run_terminal_with_authority(
+        &self,
+        request: &OrchestratorRunTerminalSettlementRequest,
+        authority: OrchestratorTerminalAuthority,
+    ) -> Result<OrchestratorRunTerminalSettlement, JournalError> {
         if !request.requested_state.is_terminal()
             || !valid_terminal_reason_code(request.reason_code.as_str())
             || request.status_message.trim().is_empty()
@@ -12254,6 +12450,16 @@ impl JournalStore {
                 ))
             })?;
         if current_state.is_terminal() {
+            if authority == OrchestratorTerminalAuthority::Exact
+                && current_state != request.requested_state
+            {
+                return Err(JournalError::InvalidArgument(format!(
+                    "orchestrator run {} already has terminal state {} which contradicts authoritative outcome {}",
+                    request.run_id,
+                    current_state.as_str(),
+                    request.requested_state.as_str(),
+                )));
+            }
             let defer_metadata_trace_terminalization =
                 run_has_nonterminal_process_handles_tx(&transaction, request.run_id.as_str())?;
             transaction.commit()?;
@@ -12279,7 +12485,8 @@ impl JournalStore {
                 tape_sequence: None,
             });
         }
-        let cancellation_won = cancel_requested
+        let cancellation_won = authority == OrchestratorTerminalAuthority::CancellationAware
+            && cancel_requested
             && matches!(
                 request.requested_state,
                 RunLifecycleState::Done | RunLifecycleState::Failed
@@ -12473,26 +12680,47 @@ impl JournalStore {
             lane: RuntimeGenerationLane::Run,
             envelope: runtime_event_envelope,
         };
-        let runtime_event_sequence = match append_runtime_event_tx(
-            &transaction,
-            self.config.max_payload_bytes,
-            &runtime_event,
-            now,
-        )? {
-            RuntimeEventAppendOutcome::Appended { sequence }
-            | RuntimeEventAppendOutcome::AlreadyAppended { sequence } => sequence,
-            RuntimeEventAppendOutcome::StaleSuppressed => {
-                return Err(JournalError::InvalidArgument(format!(
-                    "orchestrator run {} lost generation authority during terminal settlement",
-                    request.run_id
-                )));
-            }
+        let existing_kernel_terminal = if authority == OrchestratorTerminalAuthority::Exact {
+            exact_runtime_terminal_sequence_tx(
+                &transaction,
+                session_id.as_str(),
+                request.run_id.as_str(),
+                active_generation.generation,
+                event_name,
+            )?
+        } else {
+            None
+        };
+        let runtime_event_sequence = match existing_kernel_terminal {
+            Some(sequence) => sequence,
+            None => match append_runtime_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &runtime_event,
+                now,
+            )? {
+                RuntimeEventAppendOutcome::Appended { sequence }
+                | RuntimeEventAppendOutcome::AlreadyAppended { sequence } => sequence,
+                RuntimeEventAppendOutcome::StaleSuppressed => {
+                    return Err(JournalError::InvalidArgument(format!(
+                        "orchestrator run {} lost generation authority during terminal settlement",
+                        request.run_id
+                    )));
+                }
+            },
         };
         let transition_kind = if effective_state == RunLifecycleState::Cancelled {
             RuntimeGenerationTransitionKind::Cancelled
         } else {
             RuntimeGenerationTransitionKind::Released
         };
+        shared_runtime::invalidate_runtime_kernel_child_generations_for_run_tx(
+            &transaction,
+            session_id.as_str(),
+            request.run_id.as_str(),
+            transition_kind,
+            now,
+        )?;
         let provider_invalidation = shared_runtime::invalidate_provider_generation_for_run_tx(
             &transaction,
             session_id.as_str(),
@@ -32873,6 +33101,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 attempt_id: attempt_id.clone(),
                 expected_configuration_epoch: configuration_epoch,
+                runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
             })
@@ -32991,6 +33220,7 @@ mod tests {
                 attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PC3")
                     .expect("attempt identity should validate"),
                 expected_configuration_epoch: stale_epoch,
+                runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
             })
@@ -33019,6 +33249,7 @@ mod tests {
                 attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PD3")
                     .expect("attempt identity should validate"),
                 expected_configuration_epoch: configuration_epoch,
+                runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
             })
@@ -33093,6 +33324,7 @@ mod tests {
                 attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB3")
                     .expect("first attempt identity should validate"),
                 expected_configuration_epoch: configuration_epoch,
+                runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
             })
@@ -33132,6 +33364,7 @@ mod tests {
                 attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB4")
                     .expect("stale attempt identity should validate"),
                 expected_configuration_epoch: configuration_epoch,
+                runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
             })
@@ -33143,6 +33376,7 @@ mod tests {
                 attempt_id: RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PB5")
                     .expect("concurrent attempt identity should validate"),
                 expected_configuration_epoch: configuration_epoch,
+                runtime_authority: None,
                 provider_id: "anthropic-primary".to_owned(),
                 model_id: "claude-sonnet".to_owned(),
             })
@@ -37522,6 +37756,154 @@ mod tests {
             })
             .expect("migration marker should load");
         assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn provider_attempt_outcome_unknown_migration_preserves_append_only_evidence() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(db_path.as_path(), 76);
+        let connection = Connection::open(db_path.clone()).expect("v76 journal db should open");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_provider_attempt_starts (
+                        attempt_ulid, configuration_epoch, provider_id, model_id,
+                        started_at_unix_ms, schema_version
+                    ) VALUES (?1, 1, 'openai-primary', 'gpt-4o-mini', 10, 1)
+                "#,
+                params!["01ARZ3NDEKTSV4RRFFQ69G5P77"],
+            )
+            .expect("legacy provider attempt start should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_provider_attempt_completions (
+                        attempt_ulid, configuration_epoch, provider_id, model_id,
+                        outcome, error_class, completed_at_unix_ms, schema_version
+                    ) VALUES (?1, 1, 'openai-primary', 'gpt-4o-mini', 'success', NULL, 11, 1)
+                "#,
+                params!["01ARZ3NDEKTSV4RRFFQ69G5P77"],
+            )
+            .expect("legacy provider completion should insert");
+        drop(connection);
+
+        drop(
+            JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("v76 journal should upgrade through migration 77"),
+        );
+        let connection = Connection::open(db_path.clone()).expect("v77 journal db should reopen");
+        let preserved: (i64, String, String, Option<String>, i64) = connection
+            .query_row(
+                r#"
+                    SELECT configuration_epoch, provider_id, outcome, error_class, schema_version
+                    FROM runtime_provider_attempt_completions
+                    WHERE attempt_ulid = ?1
+                "#,
+                params!["01ARZ3NDEKTSV4RRFFQ69G5P77"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("legacy provider completion should survive the table rebuild");
+        assert_eq!(preserved, (1, "openai-primary".to_owned(), "success".to_owned(), None, 1));
+
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_provider_attempt_starts (
+                        attempt_ulid, configuration_epoch, provider_id, model_id,
+                        started_at_unix_ms, schema_version
+                    ) VALUES (?1, 1, 'openai-primary', 'gpt-4o-mini', 12, 1)
+                "#,
+                params!["01ARZ3NDEKTSV4RRFFQ69G5P78"],
+            )
+            .expect("cancelled provider attempt start should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_provider_attempt_completions (
+                        attempt_ulid, configuration_epoch, provider_id, model_id,
+                        outcome, error_class, completed_at_unix_ms, schema_version
+                    ) VALUES (
+                        ?1, 1, 'openai-primary', 'gpt-4o-mini',
+                        'outcome_unknown', 'provider_future_cancelled_before_settlement', 13, 1
+                    )
+                "#,
+                params!["01ARZ3NDEKTSV4RRFFQ69G5P78"],
+            )
+            .expect("migration 77 should accept honest ambiguous completion evidence");
+        assert!(connection
+            .execute(
+                "UPDATE runtime_provider_attempt_completions SET error_class = 'rewritten'",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                r#"
+                    INSERT INTO runtime_provider_attempt_completions (
+                        attempt_ulid, configuration_epoch, provider_id, model_id,
+                        outcome, error_class, completed_at_unix_ms, schema_version
+                    ) VALUES (
+                        '01ARZ3NDEKTSV4RRFFQ69G5P79', 1, 'openai-primary',
+                        'gpt-4o-mini', 'cancelled', 'cancelled', 14, 1
+                    )
+                "#,
+                [],
+            )
+            .is_err());
+        let foreign_key: (String, String, String) = connection
+            .query_row(
+                "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list('runtime_provider_attempt_completions')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("completion foreign key should survive the table rebuild");
+        assert_eq!(
+            foreign_key,
+            (
+                "runtime_provider_attempt_starts".to_owned(),
+                "attempt_ulid".to_owned(),
+                "attempt_ulid".to_owned(),
+            )
+        );
+        let supporting_objects: i64 = connection
+            .query_row(
+                r#"
+                    SELECT COUNT(*) FROM sqlite_schema
+                    WHERE (
+                        type = 'index'
+                        AND name = 'idx_runtime_provider_attempt_completions_epoch'
+                    ) OR (
+                        type = 'trigger'
+                        AND name IN (
+                            'trg_runtime_provider_attempt_completions_prevent_update',
+                            'trg_runtime_provider_attempt_completions_prevent_delete'
+                        )
+                    )
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("completion index and append-only triggers should remain installed");
+        assert_eq!(supporting_objects, 3);
+        drop(connection);
+
+        drop(
+            JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("migration 77 should remain idempotent on repeated open"),
+        );
+        let connection = Connection::open(db_path).expect("reopened v77 journal should load");
+        let completion_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_provider_attempt_completions", [], |row| {
+                row.get(0)
+            })
+            .expect("provider completion count should load");
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 77", [], |row| {
+                row.get(0)
+            })
+            .expect("migration 77 marker should load");
+        assert_eq!(completion_count, 2);
+        assert_eq!(migration_count, 1);
     }
 
     #[test]
@@ -48904,6 +49286,111 @@ mod tests {
             .expect("run snapshot query should succeed")
             .expect("run should exist");
         assert_eq!(snapshot.last_error.as_deref(), Some("operator_requested"));
+    }
+
+    #[test]
+    fn exact_terminal_settlement_ignores_late_cancel_and_rejects_contradiction() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        let session_id = "session_exact_kernel_terminal";
+        let run_id = "run_exact_kernel_terminal";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let run_lease = activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+        store
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: run_id.to_owned(),
+                reason: "cancel_after_kernel_terminal_commit".to_owned(),
+            })
+            .expect("late cancel intent should persist before outer convergence");
+        let kernel_terminal = store
+            .append_runtime_event(&RuntimeEventAppendRequest {
+                lane: RuntimeGenerationLane::Run,
+                envelope: runtime_event(
+                    session_id,
+                    run_id,
+                    run_lease.generation,
+                    1,
+                    RuntimeEventName::RunCompleted,
+                ),
+            })
+            .expect("authoritative kernel terminal should append");
+        assert_eq!(kernel_terminal, RuntimeEventAppendOutcome::Appended { sequence: 1 });
+
+        let request = OrchestratorRunTerminalSettlementRequest {
+            run_id: run_id.to_owned(),
+            requested_state: RunLifecycleState::Done,
+            reason_code: "runtime.terminal.completed".to_owned(),
+            status_message: "completed".to_owned(),
+            actor: RuntimeActorRef {
+                kind: RuntimeActorKind::System,
+                id: "runtime_kernel_v2.embedded".to_owned(),
+            },
+            terminal_summary_payload_json: None,
+            terminal_tape_events: Vec::new(),
+            terminal_status_payload_json: json!({
+                "kind": "done",
+                "message": "completed",
+            })
+            .to_string(),
+        };
+        let first = store
+            .settle_orchestrator_run_terminal_exact(&request)
+            .expect("authoritative kernel outcome should settle exactly");
+        assert!(first.changed);
+        assert!(!first.cancellation_won);
+        assert_eq!(first.effective_state, RunLifecycleState::Done);
+        assert_eq!(first.runtime_event_sequence, Some(1));
+
+        let replay = store
+            .settle_orchestrator_run_terminal_exact(&request)
+            .expect("same authoritative outcome should be idempotent");
+        assert!(!replay.changed);
+        assert_eq!(replay.effective_state, RunLifecycleState::Done);
+        assert_eq!(store.orchestrator_tape(run_id).expect("tape should load").len(), 1);
+        let terminal_event_count = store
+            .connection
+            .lock()
+            .expect("journal lock")
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events_v2 WHERE run_ulid = ?1 AND terminal = 1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("terminal count");
+        assert_eq!(terminal_event_count, 1);
+
+        let contradiction = store
+            .settle_orchestrator_run_terminal_exact(&OrchestratorRunTerminalSettlementRequest {
+                requested_state: RunLifecycleState::Failed,
+                reason_code: "runtime.terminal.failed".to_owned(),
+                status_message: "failed".to_owned(),
+                terminal_status_payload_json: json!({
+                    "kind": "failed",
+                    "message": "failed",
+                })
+                .to_string(),
+                ..request
+            })
+            .expect_err("different authoritative terminal outcome must be rejected");
+        assert!(
+            contradiction.to_string().contains("contradicts authoritative outcome failed"),
+            "unexpected contradiction error: {contradiction}"
+        );
+        let snapshot = store
+            .orchestrator_run_status_snapshot(run_id)
+            .expect("run snapshot query should succeed")
+            .expect("run should exist");
+        assert_eq!(snapshot.state, RunLifecycleState::Done.as_str());
+        assert!(snapshot.cancel_requested);
     }
 
     #[test]

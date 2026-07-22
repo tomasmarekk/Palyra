@@ -18,6 +18,8 @@ use palyra_common::runtime_contracts::runtime_error_contract_snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub(crate) mod shadow_differential;
+
 #[cfg(test)]
 use crate::{
     application::{

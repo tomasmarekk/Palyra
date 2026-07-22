@@ -705,12 +705,7 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
         ProviderError::InvalidEmbeddingsRequest { message } => {
             Status::invalid_argument(format!("embeddings request invalid: {message}"))
         }
-        ProviderError::RequestFailed {
-            message,
-            retryable,
-            retry_count,
-            classification,
-        } => {
+        ProviderError::RequestFailed { message, retryable, retry_count, classification } => {
             let status_message = format!(
                 "model provider request failed after {retry_count} retries (retryable={retryable}, class={}, action={}): {message}",
                 classification.class.as_str(),
@@ -740,13 +735,13 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
                 Status::internal(status_message)
             }
         }
-        ProviderError::InvalidResponse { message, retry_count, classification } => Status::internal(
-            format!(
+        ProviderError::InvalidResponse { message, retry_count, classification } => {
+            Status::internal(format!(
                 "model provider response invalid after {retry_count} retries (class={}, action={}): {message}",
                 classification.class.as_str(),
                 classification.recommended_action.as_str(),
-            ),
-        ),
+            ))
+        }
         ProviderError::StatePoisoned => Status::internal("model provider state lock poisoned"),
     }
 }

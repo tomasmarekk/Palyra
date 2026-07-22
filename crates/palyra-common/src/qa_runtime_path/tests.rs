@@ -66,6 +66,26 @@ fn mcp_transport_invocation_event_round_trips_with_exact_identity() {
 }
 
 #[test]
+fn context_engine_binding_requires_nonzero_bounded_identity() {
+    let event = ContextEngineBindingEvent {
+        schema_version: CONTEXT_ENGINE_BINDING_EVENT_SCHEMA_VERSION,
+        event_name: CONTEXT_ENGINE_BINDING_EVENT.to_owned(),
+        engine_id: crate::runtime_contracts::RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID
+            .to_owned(),
+        engine_version:
+            crate::runtime_contracts::RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION
+                .to_owned(),
+        projection_epoch: 7,
+    };
+
+    event.validate_shape().expect("canonical context binding should validate");
+    let mut invalid = event;
+    invalid.projection_epoch = 0;
+    let error = invalid.validate_shape().expect_err("zero projection epoch must fail closed");
+    assert_eq!(error.code, "context_engine_binding_projection_epoch_invalid");
+}
+
+#[test]
 fn provider_lane_attestation_binds_exact_fixture_bytes() {
     let materialized_input_sha256 = "a".repeat(64);
     let provider_binding_sha256 = qa_provider_binding_sha256(

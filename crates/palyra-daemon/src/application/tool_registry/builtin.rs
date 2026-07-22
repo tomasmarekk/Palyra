@@ -207,7 +207,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                 &["query"],
                 vec![
                     ("query", json!({"type":"string","maxLength":8192})),
-                    ("channel", json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."})),
+                    (
+                        "channel",
+                        json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."}),
+                    ),
                     (
                         "session_id",
                         json!({"type":"string","description":"Optional exact session id. Do not ask users for this for 'previous session' or 'last time'; omit it for principal cross-session recall."}),
@@ -236,17 +239,23 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             object_schema(
                 &["query"],
                 vec![
-                    ("query", json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."})),
-                    ("channel", json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."})),
+                    (
+                        "query",
+                        json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."}),
+                    ),
+                    (
+                        "channel",
+                        json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."}),
+                    ),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":24})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     ("window_before", json!({"type":"integer","minimum":0,"maximum":8})),
                     ("window_after", json!({"type":"integer","minimum":0,"maximum":8})),
+                    ("max_windows_per_session", json!({"type":"integer","minimum":1,"maximum":8})),
                     (
-                        "max_windows_per_session",
-                        json!({"type":"integer","minimum":1,"maximum":8}),
+                        "include_current_session",
+                        json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."}),
                     ),
-                    ("include_current_session", json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."})),
                     ("include_archived", json!({"type":"boolean"})),
                 ],
                 false,
@@ -260,17 +269,20 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             object_schema(
                 &["query"],
                 vec![
-                    ("query", json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."})),
+                    (
+                        "query",
+                        json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."}),
+                    ),
                     ("channel", json!({"type":"string"})),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":24})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     ("window_before", json!({"type":"integer","minimum":0,"maximum":8})),
                     ("window_after", json!({"type":"integer","minimum":0,"maximum":8})),
+                    ("max_windows_per_session", json!({"type":"integer","minimum":1,"maximum":8})),
                     (
-                        "max_windows_per_session",
-                        json!({"type":"integer","minimum":1,"maximum":8}),
+                        "include_current_session",
+                        json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."}),
                     ),
-                    ("include_current_session", json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."})),
                     ("include_archived", json!({"type":"boolean"})),
                 ],
                 false,
@@ -284,7 +296,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             object_schema(
                 &["content_text"],
                 vec![
-                    ("content_text", json!({"type":"string","maxLength":8192,"description":"Memory content to retain. For corrections, include the corrected durable statement only and provide the obsolete values in replaces_terms."})),
+                    (
+                        "content_text",
+                        json!({"type":"string","maxLength":8192,"description":"Memory content to retain. For corrections, include the corrected durable statement only and provide the obsolete values in replaces_terms."}),
+                    ),
                     (
                         "category",
                         json!({"type":"string","enum":["fact","preference","procedure","constraint","decision","correction","transient_runtime_fact"],"description":"Structured lifecycle category. Set this explicitly instead of relying on natural-language wording."}),
@@ -293,7 +308,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "replaces_terms",
                         json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Workspace/project memory applies these terms only with category=correction."}),
                     ),
-                    ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
+                    (
+                        "scope",
+                        json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."}),
+                    ),
                     (
                         "workspace_path",
                         json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to the active launch workspace's project memory for workspace/project scope; without an active root, workspace falls back to MEMORY.md and project falls back to projects/default/MEMORY.md. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
@@ -330,7 +348,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             object_schema(
                 &["content_text"],
                 vec![
-                    ("content_text", json!({"type":"string","maxLength":8192,"description":"Memory content to retain. For corrections, include the corrected durable statement only and provide the obsolete values in replaces_terms."})),
+                    (
+                        "content_text",
+                        json!({"type":"string","maxLength":8192,"description":"Memory content to retain. For corrections, include the corrected durable statement only and provide the obsolete values in replaces_terms."}),
+                    ),
                     (
                         "category",
                         json!({"type":"string","enum":["fact","preference","procedure","constraint","decision","correction","transient_runtime_fact"],"description":"Structured lifecycle category. Set this explicitly instead of relying on natural-language wording."}),
@@ -339,7 +360,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "replaces_terms",
                         json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Workspace/project memory applies these terms only with category=correction."}),
                     ),
-                    ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
+                    (
+                        "scope",
+                        json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."}),
+                    ),
                     (
                         "workspace_path",
                         json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to the active launch workspace's project memory for workspace/project scope; without an active root, workspace falls back to MEMORY.md and project falls back to projects/default/MEMORY.md. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
@@ -735,7 +759,10 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             object_schema(
                 &["query"],
                 vec![
-                    ("query", json!({"type":"string","maxLength":512,"description":"Literal text to search for, such as an old identifier during a rename. This is not a regular expression."})),
+                    (
+                        "query",
+                        json!({"type":"string","maxLength":512,"description":"Literal text to search for, such as an old identifier during a rename. This is not a regular expression."}),
+                    ),
                     (
                         "path",
                         json!({"type":"string","description":"Optional file or directory path relative to the workspace root. Omit for the active workspace root. /workspace and workspace/ are accepted virtual workspace aliases."}),
@@ -978,9 +1005,18 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("execution_mode", json!({"type":"string","enum":["serial","parallel"]})),
                     ("group_id", json!({"type":"string"})),
                     ("model_profile", json!({"type":"string"})),
-                    ("memory_scope", json!({"type":"string","enum":["none","parent_session","parent_session_and_workspace","workspace_only"]})),
-                    ("tool_allowlist", json!({"type":"array","items":{"type":"string"},"maxItems":64})),
-                    ("skill_allowlist", json!({"type":"array","items":{"type":"string"},"maxItems":64})),
+                    (
+                        "memory_scope",
+                        json!({"type":"string","enum":["none","parent_session","parent_session_and_workspace","workspace_only"]}),
+                    ),
+                    (
+                        "tool_allowlist",
+                        json!({"type":"array","items":{"type":"string"},"maxItems":64}),
+                    ),
+                    (
+                        "skill_allowlist",
+                        json!({"type":"array","items":{"type":"string"},"maxItems":64}),
+                    ),
                     ("approval_required", json!({"type":"boolean"})),
                     ("max_concurrent_children", json!({"type":"integer","minimum":1})),
                     ("max_children_per_parent", json!({"type":"integer","minimum":1})),

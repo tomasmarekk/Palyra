@@ -71,16 +71,11 @@ const BROWSER_CALLER_PRINCIPAL_HEADER: &str = "x-palyra-principal";
 // calling agent can self-correct without operator help. Tests and fixtures
 // pin the exact wording; treat these strings as frozen.
 const BROWSER_SELECTOR_RECOVERY_HINT: &str = "selector_not_found: call palyra.browser.observe with include_dom_snapshot=true and include_accessibility_tree=true, choose a selector from observed ids, names, labels, roles, or visible text, then retry once with that grounded selector; do not keep guessing selectors";
-const BROWSER_WAIT_FOR_INPUT_RECOVERY_HINT: &str =
-    "wait_for_input_required: pass either selector or text; when unsure, call palyra.browser.observe first and wait for a visible text snippet or observed selector";
-const BROWSER_WAIT_FOR_TIMEOUT_RECOVERY_HINT: &str =
-    "wait_for_timeout: call palyra.browser.observe to inspect the current step/state before retrying with a grounded selector or visible text";
-const BROWSER_SESSION_CLOSED_RECOVERY_HINT: &str =
-    "browser_session_closed: create a new browser session with palyra.browser.session.create and retry the browser operation with the new session_id";
-const BROWSER_RUNTIME_RECOVERY_HINT: &str =
-    "browser_runtime_unavailable: inspect `palyra browser status`; if browserd was restarted, recreate the browser session and retry the browser operation";
-const BROWSER_STATIC_HTML_RUNTIME_WARNING: &str =
-    "simulated_browser_engine_static_html_only: this browserd engine fetches static HTML and does not execute JavaScript, module scripts, app hydration, or subresource-driven UI state; use a Chromium browserd engine before claiming JS UI validation";
+const BROWSER_WAIT_FOR_INPUT_RECOVERY_HINT: &str = "wait_for_input_required: pass either selector or text; when unsure, call palyra.browser.observe first and wait for a visible text snippet or observed selector";
+const BROWSER_WAIT_FOR_TIMEOUT_RECOVERY_HINT: &str = "wait_for_timeout: call palyra.browser.observe to inspect the current step/state before retrying with a grounded selector or visible text";
+const BROWSER_SESSION_CLOSED_RECOVERY_HINT: &str = "browser_session_closed: create a new browser session with palyra.browser.session.create and retry the browser operation with the new session_id";
+const BROWSER_RUNTIME_RECOVERY_HINT: &str = "browser_runtime_unavailable: inspect `palyra browser status`; if browserd was restarted, recreate the browser session and retry the browser operation";
+const BROWSER_STATIC_HTML_RUNTIME_WARNING: &str = "simulated_browser_engine_static_html_only: this browserd engine fetches static HTML and does not execute JavaScript, module scripts, app hydration, or subresource-driven UI state; use a Chromium browserd engine before claiming JS UI validation";
 
 fn browser_max_redirects_from_payload(payload: &serde_json::Map<String, Value>) -> u32 {
     payload
@@ -89,10 +84,8 @@ fn browser_max_redirects_from_payload(payload: &serde_json::Map<String, Value>) 
         .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
         .unwrap_or(3)
 }
-const BROWSER_UNKNOWN_RUNTIME_WARNING: &str =
-    "browser_runtime_capabilities_unknown: browserd did not report JavaScript/subresource capabilities; do not treat title, URL, or fetched HTML alone as JS UI validation";
-const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
-    "browser_tool_input_error: inspect the error field, fix the browser tool input or session state, and retry";
+const BROWSER_UNKNOWN_RUNTIME_WARNING: &str = "browser_runtime_capabilities_unknown: browserd did not report JavaScript/subresource capabilities; do not treat title, URL, or fetched HTML alone as JS UI validation";
+const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str = "browser_tool_input_error: inspect the error field, fix the browser tool input or session state, and retry";
 /// Hard cap on upload file size; the file body travels inline in the gRPC
 /// request, so this also bounds request memory.
 const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -3492,7 +3485,9 @@ pub(crate) async fn execute_browser_tool(
                     input_json,
                     false,
                     b"{}".to_vec(),
-                    format!("{BROWSER_DIALOG_TOOL_NAME} action must be inspect, accept, dismiss, or respond"),
+                    format!(
+                        "{BROWSER_DIALOG_TOOL_NAME} action must be inspect, accept, dismiss, or respond"
+                    ),
                 );
             }
             let output = json!({

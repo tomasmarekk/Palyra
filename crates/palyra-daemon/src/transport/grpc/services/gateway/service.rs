@@ -42,11 +42,15 @@ use crate::{
         conversation_bindings::ConversationBindingResolveRequest,
         route_message::orchestration::handle_routed_route_message,
         run_stream::{
+            admission_ingress::{consume_run_stream_ingress, RunStreamAdmissionIngress},
             flow_control::run_stream_response_backpressure_policy,
             orchestration::{
                 finalize_run_stream_after_provider_response, process_run_stream_message,
                 RunStreamMessageProcessingOutcome, RunStreamPostProviderOutcome,
             },
+        },
+        runtime_kernel_v2::{
+            dispatcher::RunStreamRuntimeDispatch, finalization::DeliveryOutboxPort,
         },
         service_authorization::{authorize_agent_management_action, authorize_message_action},
     },
@@ -89,6 +93,34 @@ pub struct GatewayServiceImpl {
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
     node_runtime: Arc<NodeRuntimeState>,
+    delivery_outbox: Arc<dyn DeliveryOutboxPort>,
+}
+
+#[cfg(test)]
+struct TestUnavailableDeliveryOutbox;
+
+#[cfg(test)]
+impl DeliveryOutboxPort for TestUnavailableDeliveryOutbox {
+    fn inspect(
+        &self,
+        _connector_id: &str,
+        _envelope_id: &str,
+    ) -> Result<
+        crate::application::runtime_kernel_v2::finalization::DeliveryOutboxState,
+        crate::application::runtime_kernel_v2::finalization::FinalizationHostError,
+    > {
+        Ok(crate::application::runtime_kernel_v2::finalization::DeliveryOutboxState::Missing)
+    }
+
+    fn enqueue(
+        &self,
+        _request: &palyra_connectors::OutboundMessageRequest,
+    ) -> Result<(), crate::application::runtime_kernel_v2::finalization::FinalizationHostError>
+    {
+        Err(
+            crate::application::runtime_kernel_v2::finalization::FinalizationHostError::InvalidDeliveryMetadata,
+        )
+    }
 }
 
 fn command_route_response(
@@ -409,14 +441,31 @@ async fn record_channel_turn_dispatch_response(
 }
 
 impl GatewayServiceImpl {
-    /// Creates a gateway service bound to runtime state, auth, and node state.
+    /// Creates a gateway service bound to runtime state and the canonical connector outbox.
+    #[must_use]
+    pub(crate) fn new_with_delivery_outbox(
+        state: Arc<GatewayRuntimeState>,
+        auth: GatewayAuthConfig,
+        node_runtime: Arc<NodeRuntimeState>,
+        delivery_outbox: Arc<dyn DeliveryOutboxPort>,
+    ) -> Self {
+        Self { state, auth, node_runtime, delivery_outbox }
+    }
+
+    /// Creates a gateway service with an inert outbox for tests that never commit delivery.
+    #[cfg(test)]
     #[must_use]
     pub fn new(
         state: Arc<GatewayRuntimeState>,
         auth: GatewayAuthConfig,
         node_runtime: Arc<NodeRuntimeState>,
     ) -> Self {
-        Self { state, auth, node_runtime }
+        Self::new_with_delivery_outbox(
+            state,
+            auth,
+            node_runtime,
+            Arc::new(TestUnavailableDeliveryOutbox),
+        )
     }
 
     fn authorize_rpc(
@@ -2088,6 +2137,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             ));
         }
         let context = self.authorize_rpc(request.metadata(), "RunStream")?;
+        let pending_admission_ingress = consume_run_stream_ingress(request.metadata())
+            .map_err(|error| Status::permission_denied(error.to_string()))?;
         self.state.counters.run_stream_requests.fetch_add(1, Ordering::Relaxed);
 
         let mut stream = request.into_inner();
@@ -2095,6 +2146,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         let (sender, receiver) = mpsc::channel(response_backpressure.capacity);
         let context_for_stream = context.clone();
         let state_for_stream = self.state.clone();
+        let delivery_outbox_for_stream = Arc::clone(&self.delivery_outbox);
 
         tokio::spawn(async move {
             let mut active_session_id = None::<String>;
@@ -2112,6 +2164,9 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut active_flow_control = None;
             let mut active_attempt_owner = None::<String>;
             let mut active_terminal_tape_events = Vec::new();
+            let mut runtime_dispatch = RunStreamRuntimeDispatch::Uninitialized;
+            let mut pending_admission_ingress = Some(pending_admission_ingress);
+            let mut admission_ingress = None::<RunStreamAdmissionIngress>;
 
             let mut pending_item = None::<Result<common_v1::RunStreamRequest, Status>>;
             loop {
@@ -2161,10 +2216,32 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     let _ = sender.send(Err(status)).await;
                     return;
                 }
+                if admission_ingress.is_none() {
+                    let Some(pending) = pending_admission_ingress.take() else {
+                        let status =
+                            Status::internal("run-stream admission ingress proof was lost");
+                        let _ = sender.send(Err(status)).await;
+                        return;
+                    };
+                    match pending.bind_first_message(&context_for_stream, &message) {
+                        Ok(bound) => admission_ingress = Some(bound),
+                        Err(error) => {
+                            let status = Status::permission_denied(error.to_string());
+                            let _ = sender.send(Err(status)).await;
+                            return;
+                        }
+                    }
+                }
+                let Some(admission_ingress) = admission_ingress.as_ref() else {
+                    let status = Status::internal("run-stream admission ingress is unavailable");
+                    let _ = sender.send(Err(status)).await;
+                    return;
+                };
                 let outcome = match process_run_stream_message(
                     &sender,
                     &mut stream,
                     &state_for_stream,
+                    Arc::clone(&delivery_outbox_for_stream),
                     &context_for_stream,
                     &mut active_session_id,
                     &mut active_run_id,
@@ -2181,6 +2258,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &mut active_flow_control,
                     &mut active_attempt_owner,
                     &mut active_terminal_tape_events,
+                    admission_ingress,
+                    &mut runtime_dispatch,
                     message,
                 )
                 .await

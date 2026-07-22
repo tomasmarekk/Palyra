@@ -891,6 +891,18 @@ pub trait ModelProvider: Send + Sync {
         request: ProviderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>;
 
+    /// Prepares bounded QA-only evidence for the binding this provider would use.
+    ///
+    /// Callers must publish this evidence only after the corresponding provider
+    /// effect actually starts. Production providers return `None` unless they
+    /// can derive the binding without exposing endpoint or credential material.
+    fn qa_lane_attestation_for_request(
+        &self,
+        _request: &ProviderRequest,
+    ) -> Option<ProviderLaneAttestationEvent> {
+        None
+    }
+
     /// Whether this provider can acquire authority independently for every
     /// internal registry candidate, including failover candidates.
     fn uses_candidate_attempt_admission(&self) -> bool {
@@ -1952,6 +1964,24 @@ impl ModelProvider for RegistryBackedModelProvider {
             request,
             Arc::new(UnrestrictedProviderAttemptAdmission),
         )
+    }
+
+    fn qa_lane_attestation_for_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<ProviderLaneAttestationEvent> {
+        let model = self.candidate_order(request).ok()?.into_iter().next()?;
+        let runtime = self.providers.get(model.provider_id.as_str())?;
+        let existing = runtime.provider.qa_lane_attestation_for_request(request);
+        qa_registry_provider_lane_attestation(
+            request.qa_attestation_context.as_ref(),
+            existing,
+            &self.config,
+            model,
+            runtime,
+        )
+        .ok()
+        .flatten()
     }
 
     fn uses_candidate_attempt_admission(&self) -> bool {
@@ -3650,6 +3680,23 @@ impl ModelProvider for DeterministicProvider {
                 ),
             })
         })
+    }
+
+    fn qa_lane_attestation_for_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<ProviderLaneAttestationEvent> {
+        let model_id = request
+            .model_override
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("deterministic");
+        qa_provider_lane_attestation(
+            request.qa_attestation_context.as_ref(),
+            "deterministic-primary",
+            model_id,
+            self.qa_mock_fixture.as_ref(),
+        )
     }
 
     fn transcribe_audio<'a>(

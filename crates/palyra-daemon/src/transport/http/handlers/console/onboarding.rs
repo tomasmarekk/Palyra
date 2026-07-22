@@ -332,10 +332,7 @@ fn build_onboarding_steps(
             "Model verification",
             "Connection verification is blocked until provider auth and model selection are complete.",
             control_plane::OnboardingStepStatus::Blocked,
-            Some(console_path_action(
-                "Open model diagnostics",
-                "/#/control/access?panel=models",
-            )),
+            Some(console_path_action("Open model diagnostics", "/#/control/access?panel=models")),
             StepPresentation::required(Some("blocked".to_owned())).with_blocked(Some(
                 blocked_reason(
                     "provider_not_ready",
@@ -387,10 +384,7 @@ fn build_onboarding_steps(
             "Discord channel",
             "Discord onboarding is optional here, but the shared step is ready when you want a first external channel.",
             control_plane::OnboardingStepStatus::Todo,
-            Some(console_path_action(
-                "Configure Discord",
-                "/#/control/channels",
-            )),
+            Some(console_path_action("Configure Discord", "/#/control/channels")),
             StepPresentation::optional(None),
         )
     };

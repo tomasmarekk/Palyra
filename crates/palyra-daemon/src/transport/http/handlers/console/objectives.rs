@@ -2341,17 +2341,18 @@ fn parse_delivery(
     mode: Option<&str>,
     channel: Option<String>,
 ) -> Result<RoutineDeliveryConfig, Response> {
-    let mode =
-        match mode.map(str::trim).filter(|value| !value.is_empty()) {
-            None => RoutineDeliveryMode::SameChannel,
-            Some("same_channel") => RoutineDeliveryMode::SameChannel,
-            Some("specific_channel") => RoutineDeliveryMode::SpecificChannel,
-            Some("local_only") => RoutineDeliveryMode::LocalOnly,
-            Some("logs_only") => RoutineDeliveryMode::LogsOnly,
-            Some(_) => return Err(runtime_status_response(tonic::Status::invalid_argument(
+    let mode = match mode.map(str::trim).filter(|value| !value.is_empty()) {
+        None => RoutineDeliveryMode::SameChannel,
+        Some("same_channel") => RoutineDeliveryMode::SameChannel,
+        Some("specific_channel") => RoutineDeliveryMode::SpecificChannel,
+        Some("local_only") => RoutineDeliveryMode::LocalOnly,
+        Some("logs_only") => RoutineDeliveryMode::LogsOnly,
+        Some(_) => {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
                 "delivery_mode must be one of same_channel|specific_channel|local_only|logs_only",
-            ))),
-        };
+            )));
+        }
+    };
     let delivery_channel =
         channel.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
     if mode == RoutineDeliveryMode::SpecificChannel && delivery_channel.is_none() {
@@ -2429,7 +2430,7 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, R
         Some(_) => {
             return Err(runtime_status_response(tonic::Status::invalid_argument(
                 "approval_mode must be one of none|before_enable|before_first_run",
-            )))
+            )));
         }
     };
     Ok(RoutineApprovalPolicy { mode })

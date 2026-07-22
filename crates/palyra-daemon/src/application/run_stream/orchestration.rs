@@ -26,7 +26,7 @@ use palyra_common::{
         classify_agent_harness_terminal, AgentHarnessAttemptClassification,
         AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
         AgentHarnessSelectionMode, CancellationContextV1, CancellationReason, QueuedInputState,
-        RuntimeTerminalOutcome,
+        RuntimeErrorPhase, RuntimeSessionId, RuntimeTerminalOutcome,
     },
     runtime_preview::RuntimePreviewMode,
 };
@@ -38,6 +38,7 @@ use tokio::{
 };
 use tonic::{Code, Status, Streaming};
 use tracing::{debug, warn, Instrument};
+use ulid::Ulid;
 
 use crate::{
     application::agent_harness::{
@@ -62,6 +63,22 @@ use crate::{
         ProviderTurnRecoveryInput, ProviderTurnRecoveryState, PROVIDER_CANCELLATION_CLOSURE_EVENT,
         PROVIDER_CONTEXT_PRESSURE_EVENT, PROVIDER_TURN_RECOVERY_EVENT,
     },
+    application::run_admission::{
+        AdmissionCaller, RunAdmissionCommand, RunAdmissionController, RunAdmissionControllerOutcome,
+    },
+    application::runtime_kernel_v2::{
+        dispatcher::{RunStreamRuntimeDispatch, RuntimeDispatchDecision},
+        finalization::DeliveryOutboxPort,
+        production_services::context_assembly::v2_context_retained_token_estimate,
+        runtime_selection::SealedToolCatalogSelectionV1,
+        selection::{RuntimeAuthority, RuntimeAuthorityProgressEvidence},
+        shadow::{
+            RuntimeDifferentialError, ShadowCandidatePlanInputsV1, ShadowCandidatePlannerV1,
+            ShadowComparisonPlansV1, ShadowContextSegmentSemanticV1,
+            ShadowInstructionTrustSemanticV1, ShadowPlanSemanticInputsV1,
+            ShadowSelectionSemanticV1, ShadowToolCatalogSemanticV1, ShadowV2PreContextInputV1,
+        },
+    },
     application::tool_governance::{
         project_harness_tool_surface, BeforeFinalizeBudget, BeforeFinalizeDecision,
         BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
@@ -75,16 +92,17 @@ use crate::{
     gateway::{
         canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort,
         is_provider_reconfigured_status, non_empty, record_message_router_journal_event,
-        security_requests_json_mode, truncate_with_ellipsis, GatewayRuntimeConfigSnapshot,
-        GatewayRuntimeState, ManagedRuntimeHealthFamily, CANCELLED_REASON,
+        security_requests_json_mode, truncate_with_ellipsis, GatewayProviderSelectionSnapshot,
+        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, ManagedRuntimeHealthFamily,
+        CANCELLED_REASON,
     },
     journal::{
-        DelegatedRunAdmissionV1, MemorySource, OrchestratorCancelRequest,
-        OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
-        OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
-        OrchestratorRunTerminalSettlement, OrchestratorRunTerminalSettlementRequest,
-        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest,
-        OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
+        run_admission::JournalRunAdmissionSessionSelector, DelegatedRunAdmissionV1, MemorySource,
+        OrchestratorCancelRequest, OrchestratorQueuedInputRecord,
+        OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
+        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlement,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionResolveRequest,
+        OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
     },
     model_provider::{
         assemble_canonical_tool_calls, bounded_provider_turn_output_for_persistence,
@@ -93,7 +111,8 @@ use crate::{
         tool_repair_audit_events_for_decision, validate_canonical_provider_stream,
         ProviderAttemptSummary, ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason,
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
+        ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegmentKind,
+        ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderRouteCandidateTrace,
         ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
         QaProviderAttestationContext, TerminalOutcomeClass, TerminalOutcomeClassification,
         ToolCallAssemblyPolicy, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
@@ -111,10 +130,13 @@ use crate::{
     self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
     tool_protocol::ToolRequestContext,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
-    usage_governance::{plan_usage_routing, RoutingTaskClass, UsageRoutingPlanRequest},
+    usage_governance::{
+        plan_usage_routing, RoutingDecision, RoutingTaskClass, UsageRoutingPlanRequest,
+    },
 };
 
 use super::{
+    admission_ingress::{admission_environment, RunStreamAdmissionIngress},
     agent_loop::{
         AgentLoopTerminationReason, AgentRunLoopState, FinalizationVerificationReport,
         FinalizationVerificationStatus, RunProgressAttempt, RunProgressController,
@@ -133,6 +155,9 @@ use super::{
         RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
+
+#[path = "orchestration/v2_driver.rs"]
+mod v2_driver;
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
@@ -805,7 +830,7 @@ fn apply_background_budget_guard(
     budget_tokens: u64,
     consumed_tokens: u64,
 ) -> Result<BackgroundBudgetGuardDecision, String> {
-    let estimated_input_tokens = estimate_provider_request_input_tokens(request);
+    let estimated_input_tokens = runtime_kernel_provider_request_input_tokens(request);
     let committed_tokens = consumed_tokens.saturating_add(estimated_input_tokens);
     if committed_tokens >= budget_tokens {
         return Err(format!(
@@ -835,7 +860,7 @@ fn background_budget_overrun_message(budget_tokens: u64, consumed_tokens: u64) -
     })
 }
 
-fn estimate_provider_request_input_tokens(request: &ProviderRequest) -> u64 {
+pub(crate) fn runtime_kernel_provider_request_input_tokens(request: &ProviderRequest) -> u64 {
     let message_tokens = request
         .effective_messages()
         .iter()
@@ -844,6 +869,255 @@ fn estimate_provider_request_input_tokens(request: &ProviderRequest) -> u64 {
     let vision_tokens =
         u64::try_from(request.vision_inputs.len()).unwrap_or(u64::MAX).saturating_mul(256);
     message_tokens.saturating_add(vision_tokens)
+}
+
+struct RunStreamShadowComparisonInput<'a> {
+    routing: &'a RoutingDecision,
+    gateway: &'a GatewayProviderSelectionSnapshot,
+    legacy: LegacyShadowPlanObservation<'a>,
+    v2_pre_context: ShadowV2PreContextInputV1,
+    v2_catalog: &'a ModelVisibleToolCatalogSnapshot,
+}
+
+#[derive(Clone, Copy)]
+struct LegacyShadowPlanObservation<'a> {
+    request: &'a ProviderRequest,
+    instruction_trust_summary:
+        Option<&'a crate::application::instruction_compiler::InstructionTrustSummary>,
+    catalog: &'a ModelVisibleToolCatalogSnapshot,
+}
+
+fn run_stream_shadow_comparison_plans(
+    generation: palyra_common::runtime_contracts::RuntimeGeneration,
+    input: RunStreamShadowComparisonInput<'_>,
+) -> Result<ShadowComparisonPlansV1, RuntimeDifferentialError> {
+    let authoritative_semantics = legacy_shadow_plan_semantics(
+        ShadowSelectionSemanticV1::new(
+            input.routing.provider_id.clone(),
+            input.routing.actual_model_id.clone(),
+            input.routing.credential_id.clone(),
+            input.routing.health_state.clone(),
+        )?,
+        input.legacy,
+        &input.v2_pre_context,
+    )?;
+    let candidate = v2_shadow_candidate_plan(
+        generation,
+        input.gateway,
+        input.v2_pre_context,
+        input.v2_catalog,
+    )?;
+    let mut authoritative_phase_plan = vec![
+        RuntimeErrorPhase::Admission,
+        RuntimeErrorPhase::RuntimeSelection,
+        RuntimeErrorPhase::ContextAssembly,
+        RuntimeErrorPhase::ProviderCall,
+    ];
+    if input.legacy.catalog.exposed_tool_count > 0 {
+        authoritative_phase_plan.extend([
+            RuntimeErrorPhase::ToolGate,
+            RuntimeErrorPhase::Approval,
+            RuntimeErrorPhase::ToolExecution,
+            RuntimeErrorPhase::ResultProjection,
+            RuntimeErrorPhase::Compaction,
+        ]);
+    }
+    authoritative_phase_plan.extend([
+        RuntimeErrorPhase::Verification,
+        RuntimeErrorPhase::Finalization,
+        RuntimeErrorPhase::DeliveryIntent,
+    ]);
+    let authoritative = authoritative_semantics
+        .into_authoritative_snapshot(generation, authoritative_phase_plan)?;
+    let candidate = ShadowCandidatePlannerV1::new(candidate);
+    ShadowComparisonPlansV1::new(authoritative, candidate)
+}
+
+fn selected_v2_shadow_route_semantics(
+    route_selection: &ProviderRouteSelectionTrace,
+) -> Result<ShadowSelectionSemanticV1, RuntimeDifferentialError> {
+    let mut selected_routes = route_selection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.role == "chat" && candidate.selected);
+    let selected_route = selected_routes.next().ok_or(RuntimeDifferentialError::InvalidPlan)?;
+    if selected_routes.next().is_some() {
+        return Err(RuntimeDifferentialError::InvalidPlan);
+    }
+    ShadowSelectionSemanticV1::new(
+        selected_route.provider_id.clone(),
+        selected_route.model_id.clone(),
+        selected_route.credential_id.clone(),
+        selected_route.health_state.clone(),
+    )
+}
+
+fn legacy_shadow_plan_semantics(
+    selection: ShadowSelectionSemanticV1,
+    input: LegacyShadowPlanObservation<'_>,
+    pre_context: &ShadowV2PreContextInputV1,
+) -> Result<ShadowPlanSemanticInputsV1, RuntimeDifferentialError> {
+    let context_segments = input
+        .request
+        .prompt_segments
+        .iter()
+        .map(|segment| {
+            ShadowContextSegmentSemanticV1::new(
+                shadow_prompt_segment_kind(segment.kind).to_owned(),
+                segment.content_hash.clone(),
+                u64::try_from(segment.byte_len)
+                    .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+                segment.trust_label.clone(),
+                shadow_prompt_cache_hint(segment.cache_hint).to_owned(),
+                segment.invalidation_reason.clone(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let instruction_trust = input
+        .instruction_trust_summary
+        .map(|summary| {
+            ShadowInstructionTrustSemanticV1::new(
+                u32::try_from(summary.selected_blocks)
+                    .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+                u32::try_from(summary.untrusted_blocks)
+                    .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+                summary.mixed_trust,
+                summary.highest_safety_action.as_str().to_owned(),
+                u32::try_from(summary.prompt_injection_finding_count)
+                    .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+            )
+        })
+        .transpose()?;
+    let catalog_semantics = ShadowToolCatalogSemanticV1::new(
+        input.catalog.catalog_hash.clone(),
+        input.catalog.exposure_mode.as_str().to_owned(),
+        u32::try_from(input.catalog.exposed_tool_count)
+            .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+    )?;
+    let max_output_tokens = input
+        .request
+        .max_output_tokens
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| RuntimeDifferentialError::InvalidPlan)?;
+    let policy = pre_context
+        .plan_policy_with_host_limits(input.request.budget_profile.clone(), max_output_tokens)?;
+    ShadowPlanSemanticInputsV1::new(
+        selection,
+        context_segments,
+        input.request.instruction_hash.clone(),
+        instruction_trust,
+        runtime_kernel_provider_request_input_tokens(input.request),
+        catalog_semantics,
+        policy,
+    )
+}
+
+fn v2_shadow_candidate_plan(
+    generation: palyra_common::runtime_contracts::RuntimeGeneration,
+    gateway: &GatewayProviderSelectionSnapshot,
+    pre_context: ShadowV2PreContextInputV1,
+    catalog: &ModelVisibleToolCatalogSnapshot,
+) -> Result<ShadowCandidatePlanInputsV1, RuntimeDifferentialError> {
+    let route_selection = &gateway.status.route_selection;
+    let (selected_route, selected_provider_kind) = selected_v2_shadow_catalog_binding(gateway)?;
+    if !gateway.health_authority_by_provider.contains_key(selected_route.provider_id.as_str())
+        || !gateway
+            .embedded_harness_descriptors
+            .iter()
+            .any(|descriptor| descriptor.embedded_default)
+        || !gateway.context_engine_registry.engines.iter().any(|descriptor| {
+            descriptor.engine_id == gateway.context_engine_registry.selected_engine_id
+        })
+    {
+        return Err(RuntimeDifferentialError::InvalidPlan);
+    }
+    if !shadow_catalog_matches_selected_v2_route(
+        catalog.provider_kind.as_str(),
+        catalog.provider_model_id.as_deref(),
+        selected_provider_kind,
+        selected_route.model_id.as_str(),
+    ) {
+        return Err(RuntimeDifferentialError::InvalidPlan);
+    }
+
+    let sealed_catalog = SealedToolCatalogSelectionV1::from_registry_snapshot(
+        catalog,
+        gateway.configuration_epoch.get(),
+    )
+    .map_err(|_| RuntimeDifferentialError::InvalidPlan)?;
+    let catalog_semantics = ShadowToolCatalogSemanticV1::new(
+        sealed_catalog.catalog_hash().as_str().to_owned(),
+        catalog.exposure_mode.as_str().to_owned(),
+        u32::try_from(catalog.exposed_tool_count)
+            .map_err(|_| RuntimeDifferentialError::InvalidPlan)?,
+    )?;
+    Ok(ShadowCandidatePlanInputsV1::from_pre_context(
+        generation,
+        selected_v2_shadow_route_semantics(route_selection)?,
+        pre_context,
+        catalog_semantics,
+    ))
+}
+
+fn selected_v2_shadow_catalog_binding(
+    gateway: &GatewayProviderSelectionSnapshot,
+) -> Result<(&ProviderRouteCandidateTrace, &str), RuntimeDifferentialError> {
+    let mut selected_routes = gateway
+        .status
+        .route_selection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.role == "chat" && candidate.selected);
+    let selected_route = selected_routes.next().ok_or(RuntimeDifferentialError::InvalidPlan)?;
+    if selected_routes.next().is_some() || selected_route.capability_state != "eligible" {
+        return Err(RuntimeDifferentialError::InvalidPlan);
+    }
+
+    let mut selected_providers = gateway
+        .status
+        .registry
+        .providers
+        .iter()
+        .filter(|provider| provider.provider_id == selected_route.provider_id);
+    let selected_provider =
+        selected_providers.next().ok_or(RuntimeDifferentialError::InvalidPlan)?;
+    if selected_providers.next().is_some() || !selected_provider.enabled {
+        return Err(RuntimeDifferentialError::InvalidPlan);
+    }
+    Ok((selected_route, selected_provider.kind.as_str()))
+}
+
+fn shadow_catalog_matches_selected_v2_route(
+    catalog_provider_kind: &str,
+    catalog_model_id: Option<&str>,
+    selected_provider_kind: &str,
+    selected_model_id: &str,
+) -> bool {
+    catalog_provider_kind == selected_provider_kind && catalog_model_id == Some(selected_model_id)
+}
+
+const fn shadow_prompt_segment_kind(kind: ProviderPromptSegmentKind) -> &'static str {
+    match kind {
+        ProviderPromptSegmentKind::System => "system",
+        ProviderPromptSegmentKind::Tool => "tool",
+        ProviderPromptSegmentKind::Policy => "policy",
+        ProviderPromptSegmentKind::Project => "project",
+        ProviderPromptSegmentKind::Memory => "memory",
+        ProviderPromptSegmentKind::Session => "session",
+        ProviderPromptSegmentKind::Tail => "tail",
+        ProviderPromptSegmentKind::CurrentTurn => "current_turn",
+    }
+}
+
+const fn shadow_prompt_cache_hint(hint: ProviderPromptCacheHint) -> &'static str {
+    match hint {
+        ProviderPromptCacheHint::LongLived => "long_lived",
+        ProviderPromptCacheHint::ShortLived => "short_lived",
+        ProviderPromptCacheHint::Volatile => "volatile",
+        ProviderPromptCacheHint::Sensitive => "sensitive",
+        ProviderPromptCacheHint::Disabled => "disabled",
+    }
 }
 
 fn estimate_provider_message_input_tokens(message: &ProviderMessage) -> u64 {
@@ -1494,6 +1768,7 @@ async fn build_run_stream_tool_catalog_snapshot(
     provider_kind: &str,
     provider_model_id: Option<&str>,
     _remaining_tool_budget: u32,
+    created_at_unix_ms: i64,
     allow_test_delay: bool,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     maybe_delay_run_stream_phase_for_tests(RunLoopPhase::ToolCatalogSnapshot, allow_test_delay)
@@ -1515,7 +1790,7 @@ async fn build_run_stream_tool_catalog_snapshot(
         provider_model_id,
         surface: ToolExposureSurface::RunStream,
         remaining_tool_budget: None,
-        created_at_unix_ms: current_unix_ms(),
+        created_at_unix_ms,
     }))
 }
 
@@ -1688,6 +1963,7 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
     provider_kind: &str,
     provider_model_id: Option<&str>,
     remaining_tool_budget: u32,
+    created_at_unix_ms: i64,
     tape_seq: &mut i64,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     let snapshot = build_run_stream_tool_catalog_snapshot(
@@ -1698,6 +1974,7 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
         provider_kind,
         provider_model_id,
         remaining_tool_budget,
+        created_at_unix_ms,
         false,
     )
     .await?;
@@ -1743,6 +2020,34 @@ async fn append_agent_loop_tape_event(
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_runtime_authority_decision(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    decision: &RuntimeDispatchDecision,
+) -> Result<(), Status> {
+    let route = match decision {
+        RuntimeDispatchDecision::Legacy { .. } => "legacy",
+        RuntimeDispatchDecision::LegacyWithShadow { .. } => "legacy_with_shadow",
+        RuntimeDispatchDecision::V2 { .. } => "v2",
+        RuntimeDispatchDecision::Blocked { .. } => "blocked",
+    };
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        "runtime.authority.selected",
+        json!({
+            "schema_version": 1,
+            "route": route,
+            "authority": decision.authority(),
+        })
+        .to_string(),
+    )
+    .await
 }
 
 #[allow(clippy::result_large_err)]
@@ -2667,16 +2972,38 @@ async fn persist_accepted_final_reply(
     tape_seq: &mut i64,
     reply_text: &str,
 ) -> Result<(), Status> {
-    persist_run_stream_reply_text(
+    persist_run_stream_reply_text(runtime_state, run_id, tape_seq, reply_text).await?;
+    persist_accepted_final_reply_side_effects(
         runtime_state,
         request_context,
         session_id_for_message,
         run_id,
-        tape_seq,
         reply_text,
     )
-    .await?;
+    .await;
+    Ok(())
+}
+
+async fn persist_accepted_final_reply_side_effects(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id_for_message: &str,
+    run_id: &str,
+    reply_text: &str,
+) {
     if !reply_text.trim().is_empty() {
+        let _ = record_message_router_journal_event(
+            runtime_state,
+            request_context,
+            session_id_for_message,
+            run_id,
+            "message.replied",
+            common_v1::journal_event::EventActor::System as i32,
+            json!({
+                "reply_preview": REDACTED,
+            }),
+        )
+        .await;
         ingest_memory_best_effort(
             runtime_state,
             request_context.principal.as_str(),
@@ -2690,7 +3017,6 @@ async fn persist_accepted_final_reply(
         )
         .await;
     }
-    Ok(())
 }
 
 /// Processes one client `RunStreamRequest` by running the full agent loop.
@@ -2721,6 +3047,7 @@ pub(crate) async fn process_run_stream_message(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     stream: &mut Streaming<common_v1::RunStreamRequest>,
     runtime_state: &Arc<GatewayRuntimeState>,
+    delivery_outbox: Arc<dyn DeliveryOutboxPort>,
     request_context: &RequestContext,
     active_session_id: &mut Option<String>,
     active_run_id: &mut Option<String>,
@@ -2737,6 +3064,8 @@ pub(crate) async fn process_run_stream_message(
     active_flow_control: &mut Option<RunStreamFlowControl>,
     active_attempt_owner: &mut Option<String>,
     active_terminal_tape_events: &mut Vec<OrchestratorTerminalTapeEvent>,
+    admission_ingress: &RunStreamAdmissionIngress,
+    runtime_dispatch: &mut RunStreamRuntimeDispatch,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     let harness_enabled = runtime_state.config.feature_rollouts.agent_harness_runtime.enabled;
@@ -2745,6 +3074,7 @@ pub(crate) async fn process_run_stream_message(
         sender,
         stream,
         runtime_state,
+        delivery_outbox,
         request_context,
         active_session_id,
         active_run_id,
@@ -2760,6 +3090,8 @@ pub(crate) async fn process_run_stream_message(
         active_approval_cache_generation,
         active_flow_control,
         &mut lifecycle,
+        admission_ingress,
+        runtime_dispatch,
         message,
     )
     .await;
@@ -2863,6 +3195,7 @@ async fn process_run_stream_message_inner(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     stream: &mut Streaming<common_v1::RunStreamRequest>,
     runtime_state: &Arc<GatewayRuntimeState>,
+    delivery_outbox: Arc<dyn DeliveryOutboxPort>,
     request_context: &RequestContext,
     active_session_id: &mut Option<String>,
     active_run_id: &mut Option<String>,
@@ -2878,6 +3211,8 @@ async fn process_run_stream_message_inner(
     active_approval_cache_generation: &mut Option<u64>,
     active_flow_control: &mut Option<RunStreamFlowControl>,
     harness_lifecycle: &mut Option<RunStreamHarnessLifecycle>,
+    admission_ingress: &RunStreamAdmissionIngress,
+    runtime_dispatch: &mut RunStreamRuntimeDispatch,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     let session_id = canonical_id(message.session_id, "session_id")?;
@@ -2903,8 +3238,14 @@ async fn process_run_stream_message_inner(
             })?)
         };
     let origin_kind = non_empty(message.origin_kind.clone()).unwrap_or_else(|| "manual".to_owned());
+    let payload_claims_delegation = origin_kind.trim().eq_ignore_ascii_case("delegation");
+    if payload_claims_delegation != admission_ingress.is_delegation() {
+        return Err(Status::permission_denied(
+            "run-stream delegation origin does not match host-sealed ingress",
+        ));
+    }
     let delegated_admission = delegated_run_admission(
-        origin_kind.as_str(),
+        if admission_ingress.is_delegation() { "delegation" } else { "non_delegation" },
         session_id.as_str(),
         message.origin_run_id.as_ref().map(|value| value.ulid.as_str()),
         parameter_delta_json.as_deref(),
@@ -2943,21 +3284,177 @@ async fn process_run_stream_message_inner(
                 "resolved session_id does not match RunStream session_id",
             ));
         }
-        runtime_state
-            .start_orchestrator_run(OrchestratorRunStartRequest {
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                origin_kind: origin_kind.clone(),
-                origin_run_id: message.origin_run_id.as_ref().map(|value| value.ulid.clone()),
-                triggered_by_principal: Some(request_context.principal.clone()),
-                parameter_delta_json: parameter_delta_json.clone(),
-                delegated_admission: delegated_admission.clone(),
-            })
-            .await?;
-        let (_, generation) =
-            runtime_state.runtime_generation_for_run(run_id.clone()).await?.ok_or_else(|| {
-                Status::aborted("run cancellation scope requires an active host generation")
+        let typed_session_id = RuntimeSessionId::parse(session_id.as_str()).map_err(|error| {
+            Status::invalid_argument(format!("session_id is not a runtime identity: {error}"))
+        })?;
+        let dispatcher = runtime_state.runtime_kernel_dispatcher();
+        let authority_intent = dispatcher
+            .resolve_authority_intent(
+                &runtime_state.journal_store,
+                &typed_session_id,
+                Some(request_context.principal.as_str()),
+                resolved_session.created,
+                true,
+                RuntimeAuthorityProgressEvidence::pristine(),
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "runtime authority could not be resolved: {error}"
+                ))
             })?;
+        let generation = match authority_intent.selected_runtime() {
+            Some(RuntimeAuthority::Legacy) => {
+                dispatcher
+                    .pin_non_v2_session_authority(
+                        &runtime_state.journal_store,
+                        &typed_session_id,
+                        &authority_intent,
+                    )
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "legacy runtime authority could not be pinned: {error}"
+                        ))
+                    })?;
+                runtime_state
+                    .start_orchestrator_run(OrchestratorRunStartRequest {
+                        run_id: run_id.clone(),
+                        session_id: session_id.clone(),
+                        origin_kind: origin_kind.clone(),
+                        origin_run_id: message
+                            .origin_run_id
+                            .as_ref()
+                            .map(|value| value.ulid.clone()),
+                        triggered_by_principal: Some(request_context.principal.clone()),
+                        parameter_delta_json: parameter_delta_json.clone(),
+                        delegated_admission: delegated_admission.clone(),
+                    })
+                    .await?;
+                let (_, generation) = runtime_state
+                    .runtime_generation_for_run(run_id.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        Status::aborted("run cancellation scope requires an active host generation")
+                    })?;
+                let authority = authority_intent.bind_generation(generation).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "legacy runtime authority generation binding failed: {error}"
+                    ))
+                })?;
+                let decision = dispatcher.dispatch_decision(authority).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "legacy runtime dispatch decision failed: {error}"
+                    ))
+                })?;
+                append_runtime_authority_decision(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &decision,
+                )
+                .await?;
+                *runtime_dispatch = RunStreamRuntimeDispatch::Active {
+                    decision,
+                    v2_admission: None,
+                    shadow_observation_completed: false,
+                };
+                generation
+            }
+            Some(RuntimeAuthority::V2) => {
+                let environment = admission_environment(
+                    runtime_state,
+                    request_context,
+                    &resolved_session.session,
+                )
+                .await?;
+                let verified = admission_ingress.issue(
+                    dispatcher,
+                    AdmissionCaller::authenticated(
+                        request_context.principal.clone(),
+                        request_context.device_id.clone(),
+                        request_context.channel.clone(),
+                    ),
+                    environment,
+                    authority_intent,
+                    None,
+                );
+                let outcome = RunAdmissionController::new(&runtime_state.journal_store)
+                    .admit(RunAdmissionCommand::from_verified(
+                        Ulid::new().to_string(),
+                        format!("run_stream:{session_id}"),
+                        run_id.clone(),
+                        Ulid::new().to_string(),
+                        run_id.clone(),
+                        Ulid::new().to_string(),
+                        JournalRunAdmissionSessionSelector {
+                            session_id: Some(session_id.clone()),
+                            session_key: None,
+                            session_label: None,
+                            require_existing: true,
+                            reset_session: false,
+                        },
+                        verified,
+                    ))
+                    .map_err(|error| {
+                        Status::failed_precondition(format!("runtime admission failed: {error}"))
+                    })?;
+                let token = match outcome {
+                    RunAdmissionControllerOutcome::Admitted { token, .. } => token,
+                    RunAdmissionControllerOutcome::Rejected { journal } => {
+                        *runtime_dispatch = RunStreamRuntimeDispatch::AdmissionClosed;
+                        return Err(Status::permission_denied(format!(
+                            "runtime admission rejected: {}",
+                            journal.reason_code
+                        )));
+                    }
+                    RunAdmissionControllerOutcome::Queued { journal } => {
+                        *runtime_dispatch = RunStreamRuntimeDispatch::AdmissionClosed;
+                        return Err(Status::aborted(format!(
+                            "runtime admission queued: {}",
+                            journal.reason_code
+                        )));
+                    }
+                };
+                if token.run_id() != run_id {
+                    *runtime_dispatch = RunStreamRuntimeDispatch::AdmissionClosed;
+                    return Err(Status::aborted(
+                        "runtime admission returned a different run identity",
+                    ));
+                }
+                let generation = token.run_lease().generation;
+                let decision = dispatcher
+                    .dispatch_decision(token.authority_decision().clone())
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "V2 runtime dispatch decision failed: {error}"
+                        ))
+                    })?;
+                if !matches!(decision, RuntimeDispatchDecision::V2 { .. }) {
+                    *runtime_dispatch = RunStreamRuntimeDispatch::AdmissionClosed;
+                    return Err(Status::failed_precondition(
+                        "V2 admission did not grant V2 runtime authority",
+                    ));
+                }
+                append_runtime_authority_decision(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &decision,
+                )
+                .await?;
+                *runtime_dispatch = RunStreamRuntimeDispatch::Active {
+                    decision,
+                    v2_admission: Some(token),
+                    shadow_observation_completed: false,
+                };
+                generation
+            }
+            None => {
+                *runtime_dispatch = RunStreamRuntimeDispatch::AdmissionClosed;
+                return Err(Status::failed_precondition(
+                    "runtime authority selection blocked this run",
+                ));
+            }
+        };
         *active_flow_control = Some(if let Some(admission) = delegated_admission.as_ref() {
             RunStreamFlowControl::from_delegated_child(
                 generation,
@@ -3119,6 +3616,26 @@ async fn process_run_stream_message_inner(
     let mut lease_provider_id = routing_decision.provider_id.clone();
     let mut lease_provider_kind = routing_decision.provider_kind.clone();
     let mut lease_credential_id = routing_decision.credential_id.clone();
+    let shadow_context_request = ProviderRequest::from_input_text(
+        input_text.clone(),
+        json_mode_requested,
+        build_provider_image_inputs(
+            input_content.attachments.as_slice(),
+            &runtime_state.config.media,
+        ),
+        provider_model_override.clone(),
+    );
+    let mut v2_shadow_pre_context = ShadowV2PreContextInputV1::new(
+        crate::sha256_hex(input_text.as_bytes()),
+        u64::try_from(input_text.len()).unwrap_or(u64::MAX),
+        u32::try_from(shadow_context_request.vision_inputs.len()).unwrap_or(u32::MAX),
+        v2_context_retained_token_estimate(&shadow_context_request),
+        json_mode_requested,
+        message.allow_sensitive_tools,
+        *remaining_tool_budget,
+    )
+    .ok();
+    let first_turn_catalog_created_at_unix_ms = current_unix_ms();
     let mut first_turn_tool_catalog_snapshot = Some(
         build_and_record_run_stream_tool_catalog_snapshot(
             runtime_state,
@@ -3128,6 +3645,7 @@ async fn process_run_stream_message_inner(
             lease_provider_kind.as_str(),
             provider_model_override.as_deref().or(Some(routing_decision.actual_model_id.as_str())),
             *remaining_tool_budget,
+            first_turn_catalog_created_at_unix_ms,
             tape_seq,
         )
         .await?,
@@ -3209,6 +3727,140 @@ async fn process_run_stream_message_inner(
         let mut messages = prepared_provider_input.provider_messages.clone();
         messages.push(ProviderMessage::user_text(base_provider_request.input_text.clone()));
         base_provider_request.messages = messages;
+    }
+    if let RunStreamRuntimeDispatch::Active { decision, shadow_observation_completed, .. } =
+        runtime_dispatch
+    {
+        if decision.authority().selected_runtime() == Some(RuntimeAuthority::Legacy)
+            && decision.authority().shadow_evaluation_enabled()
+            && !*shadow_observation_completed
+        {
+            // One decision owns the entire stream, so consume the observation
+            // slot before any fallible planning or recording work can yield.
+            *shadow_observation_completed = true;
+            let shadow_gateway_snapshot = {
+                let runtime_state = Arc::clone(runtime_state);
+                tokio::task::spawn_blocking(move || runtime_state.provider_selection_snapshot())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            };
+            let v2_shadow_catalog = if let Some((selected_route, selected_provider_kind)) =
+                shadow_gateway_snapshot
+                    .as_ref()
+                    .and_then(|gateway| selected_v2_shadow_catalog_binding(gateway).ok())
+            {
+                build_run_stream_tool_catalog_snapshot(
+                    runtime_state,
+                    request_context,
+                    session_id_for_message.as_str(),
+                    run_id.as_str(),
+                    selected_provider_kind,
+                    Some(selected_route.model_id.as_str()),
+                    *remaining_tool_budget,
+                    first_turn_catalog_created_at_unix_ms,
+                    false,
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
+            let comparison = match (
+                shadow_gateway_snapshot.as_ref(),
+                first_turn_tool_catalog_snapshot.as_ref(),
+                v2_shadow_pre_context.take(),
+                v2_shadow_catalog.as_ref(),
+            ) {
+                (Some(gateway), Some(legacy_catalog), Some(pre_context), Some(v2_catalog)) => {
+                    run_stream_shadow_comparison_plans(
+                        decision.authority().generation(),
+                        RunStreamShadowComparisonInput {
+                            routing: &routing_decision,
+                            gateway,
+                            legacy: LegacyShadowPlanObservation {
+                                request: &base_provider_request,
+                                instruction_trust_summary: prepared_provider_input
+                                    .instruction_trust_summary
+                                    .as_ref(),
+                                catalog: legacy_catalog,
+                            },
+                            v2_pre_context: pre_context,
+                            v2_catalog,
+                        },
+                    )
+                    .ok()
+                }
+                _ => None,
+            };
+            let _ =
+                crate::runtime_diagnostics::shadow_differential::observe_and_record_runtime_shadow(
+                    runtime_state,
+                    runtime_state.runtime_kernel_dispatcher(),
+                    run_id.as_str(),
+                    tape_seq,
+                    session_id_for_message.as_bytes(),
+                    decision,
+                    comparison,
+                )
+                .await;
+        }
+    }
+    let v2_admission = match runtime_dispatch {
+        RunStreamRuntimeDispatch::Active { decision, v2_admission, .. }
+            if decision
+                .authority()
+                .selected_runtime()
+                .is_some_and(|authority| authority == RuntimeAuthority::V2) =>
+        {
+            Some(*v2_admission.take().ok_or_else(|| {
+                Status::failed_precondition(
+                    "authoritative V2 admission was already consumed for this run generation",
+                )
+            })?)
+        }
+        RunStreamRuntimeDispatch::Active { decision, .. }
+            if decision
+                .authority()
+                .selected_runtime()
+                .is_some_and(|authority| authority == RuntimeAuthority::Legacy) =>
+        {
+            None
+        }
+        RunStreamRuntimeDispatch::Active { .. }
+        | RunStreamRuntimeDispatch::AdmissionClosed
+        | RunStreamRuntimeDispatch::Uninitialized => {
+            return Err(Status::failed_precondition(
+                "run stream has no executable runtime authority",
+            ));
+        }
+    };
+    if let Some(admission) = v2_admission {
+        let tool_catalog = first_turn_tool_catalog_snapshot.take().ok_or_else(|| {
+            Status::internal("V2 runtime requires the admitted tool-catalog snapshot")
+        })?;
+        return v2_driver::drive_authoritative_v2(v2_driver::AuthoritativeV2DriverInput {
+            sender,
+            stream,
+            runtime_state,
+            delivery_outbox,
+            request_context,
+            run_state,
+            session_id: session_id_for_message.as_str(),
+            run_id: run_id.as_str(),
+            base_provider_request,
+            tool_catalog,
+            remaining_tool_budget,
+            allow_sensitive_tools: message.allow_sensitive_tools,
+            approval_cache_generation: *active_approval_cache_generation,
+            flow_control: active_flow_control.as_ref().ok_or_else(|| {
+                Status::internal("V2 runtime requires an active flow-control scope")
+            })?,
+            tape_seq,
+            model_token_tape_events,
+            admission,
+        })
+        .await;
     }
     let mut loop_state = AgentRunLoopState::new(
         base_provider_request.effective_messages(),
@@ -3393,6 +4045,7 @@ async fn process_run_stream_message_inner(
                         .as_deref()
                         .or(Some(routing_decision.actual_model_id.as_str())),
                     0,
+                    current_unix_ms(),
                     true,
                 ),
             )
@@ -3664,6 +4317,7 @@ async fn process_run_stream_message_inner(
                     max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
                     session_id: Some(session_id_for_message.clone()),
                     run_id: Some(run_id.clone()),
+                    runtime_authority: None,
                     diagnostic_scope_id: Some(provider_diagnostic_scope_id),
                 },
                 cancellation: provider_cancellation,
@@ -6310,8 +6964,6 @@ const TERMINAL_TOOL_AUTHORIZATION_ERROR_MARKERS: &[&str] = &[
 #[allow(clippy::result_large_err)]
 async fn persist_run_stream_reply_text(
     runtime_state: &Arc<GatewayRuntimeState>,
-    request_context: &RequestContext,
-    session_id: &str,
     run_id: &str,
     tape_seq: &mut i64,
     reply_text: &str,
@@ -6332,20 +6984,6 @@ async fn persist_run_stream_reply_text(
         })
         .await?;
     *tape_seq += 1;
-
-    let _ = record_message_router_journal_event(
-        runtime_state,
-        request_context,
-        session_id,
-        run_id,
-        "message.replied",
-        common_v1::journal_event::EventActor::System as i32,
-        json!({
-            "reply_preview": REDACTED,
-        }),
-    )
-    .await;
-
     Ok(())
 }
 
@@ -6544,6 +7182,7 @@ mod tests {
         run_stream_harness_selection_payload, run_stream_harness_started_payload,
         run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
         run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+        selected_v2_shadow_route_semantics, shadow_catalog_matches_selected_v2_route,
         should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
         tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
         tool_followup_timeout_partial_summary, tool_result_to_provider_message,
@@ -6570,6 +7209,12 @@ mod tests {
         cancellation::transition_run_stream_to_cancelled, flow_control::RunStreamFlowControl,
         tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     };
+    use crate::application::runtime_kernel_v2::shadow::{
+        compare_shadow_comparison_plans_for_test, RuntimeDifferentialClassification,
+        ShadowCandidatePlanInputsV1, ShadowCandidatePlannerV1, ShadowComparisonPlansV1,
+        ShadowContextSegmentSemanticV1, ShadowPlanSemanticInputsV1, ShadowPolicySemanticV1,
+        ShadowSelectionSemanticV1, ShadowToolCatalogSemanticV1, ShadowV2PreContextInputV1,
+    };
     use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
     use crate::gateway::tests::build_test_runtime_state;
     use crate::journal::{
@@ -6590,8 +7235,8 @@ mod tests {
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
         AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
         CancellationContextV1, CancellationReason, CancellationScopeKind, QueuedInputState,
-        RuntimeGeneration, RuntimeGenerationLane, RuntimeGenerationTransitionKind,
-        RuntimeOperationId, RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
+        RuntimeErrorPhase, RuntimeGeneration, RuntimeGenerationLane,
+        RuntimeGenerationTransitionKind, RuntimeOperationId, RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
     };
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use serde_json::{json, Value};
@@ -6768,6 +7413,7 @@ mod tests {
                         max_wait_ms: 30_000,
                         session_id: Some(session_id.to_owned()),
                         run_id: Some(run_id.to_owned()),
+                        runtime_authority: None,
                         diagnostic_scope_id: None,
                     },
                     cancellation: flow_control
@@ -7001,6 +7647,92 @@ mod tests {
             selected,
             reason_code: "test".to_owned(),
         }
+    }
+
+    #[test]
+    fn shadow_catalog_binding_rejects_legacy_provider_identity() {
+        assert!(shadow_catalog_matches_selected_v2_route(
+            "anthropic",
+            Some("claude-sonnet"),
+            "anthropic",
+            "claude-sonnet",
+        ));
+        assert!(!shadow_catalog_matches_selected_v2_route(
+            "openai",
+            Some("gpt-5"),
+            "anthropic",
+            "claude-sonnet",
+        ));
+        assert!(!shadow_catalog_matches_selected_v2_route(
+            "anthropic",
+            Some("gpt-5"),
+            "anthropic",
+            "claude-sonnet",
+        ));
+    }
+
+    #[test]
+    fn shadow_candidate_selection_route_difference_is_risky() {
+        let generation = RuntimeGeneration::new(7).expect("test generation is non-zero");
+        let authoritative_selection = ShadowSelectionSemanticV1::new(
+            "legacy-provider".to_owned(),
+            "legacy-model".to_owned(),
+            "credential:legacy-provider".to_owned(),
+            "healthy".to_owned(),
+        )
+        .expect("legacy selection semantics should validate");
+        let candidate_selection =
+            selected_v2_shadow_route_semantics(&route_selection_with_fallback(false))
+                .expect("V2 selection semantics should validate");
+        let authoritative_semantics = ShadowPlanSemanticInputsV1::new(
+            authoritative_selection,
+            vec![ShadowContextSegmentSemanticV1::new(
+                "current_turn".to_owned(),
+                "b".repeat(64),
+                0,
+                "untrusted".to_owned(),
+                "volatile".to_owned(),
+                None,
+            )
+            .expect("legacy context semantics should validate")],
+            None,
+            None,
+            512,
+            ShadowToolCatalogSemanticV1::new("a".repeat(64), "direct".to_owned(), 0)
+                .expect("catalog semantics should validate"),
+            ShadowPolicySemanticV1::new(false, false, 0, None, None)
+                .expect("policy semantics should validate"),
+        )
+        .expect("authoritative semantics should validate");
+        let authoritative = authoritative_semantics
+            .into_authoritative_snapshot(
+                generation,
+                vec![
+                    RuntimeErrorPhase::Admission,
+                    RuntimeErrorPhase::RuntimeSelection,
+                    RuntimeErrorPhase::ContextAssembly,
+                    RuntimeErrorPhase::ProviderCall,
+                    RuntimeErrorPhase::Verification,
+                    RuntimeErrorPhase::Finalization,
+                    RuntimeErrorPhase::DeliveryIntent,
+                ],
+            )
+            .expect("authoritative plan should validate");
+        let candidate =
+            ShadowCandidatePlannerV1::new(ShadowCandidatePlanInputsV1::from_pre_context(
+                generation,
+                candidate_selection,
+                ShadowV2PreContextInputV1::new("b".repeat(64), 0, 0, 512, false, false, 0)
+                    .expect("candidate pre-context input should validate"),
+                ShadowToolCatalogSemanticV1::new("a".repeat(64), "direct".to_owned(), 0)
+                    .expect("catalog semantics should validate"),
+            ));
+        let comparison = ShadowComparisonPlansV1::new(authoritative, candidate)
+            .expect("comparison should validate");
+        let report = compare_shadow_comparison_plans_for_test(comparison)
+            .expect("comparison should execute");
+
+        assert_eq!(report.classification(), RuntimeDifferentialClassification::Risky);
     }
 
     fn harness_lifecycle() -> RunStreamHarnessLifecycle {

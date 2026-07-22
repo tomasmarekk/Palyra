@@ -55,6 +55,18 @@
       "type": "string",
       "enum": ["primary", "fallback", "fixture", "record_replay", "live"]
     },
+    "shadow_enrollment": {
+      "type": "string",
+      "enum": ["deterministic_sample", "explicit_session"]
+    },
+    "shadow_classification": {
+      "type": "string",
+      "enum": ["expected", "benign", "risky", "invariant_violation"]
+    },
+    "differential_outcome": {
+      "type": "string",
+      "enum": ["match", "benign_difference", "risky_difference", "invariant_violation"]
+    },
     "provider_attempt_outcome": {
       "type": "string",
       "enum": ["started", "succeeded", "retryable_failure", "terminal_failure", "cancelled"]
@@ -125,6 +137,38 @@
           "maxItems": 8,
           "items": { "$ref": "#/$defs/schema_hash" }
         }
+      }
+    },
+    "runtime_shadow_differential_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enrollment",
+        "classification",
+        "reason_code",
+        "runtime_selection",
+        "context_segments",
+        "context_safety",
+        "token_budget",
+        "tool_catalog",
+        "policy_input",
+        "phase_plan",
+        "promotion_blocked",
+        "shadow_side_effect_free"
+      ],
+      "properties": {
+        "enrollment": { "$ref": "#/$defs/shadow_enrollment" },
+        "classification": { "$ref": "#/$defs/shadow_classification" },
+        "reason_code": { "$ref": "#/$defs/reason_code" },
+        "runtime_selection": { "$ref": "#/$defs/differential_outcome" },
+        "context_segments": { "$ref": "#/$defs/differential_outcome" },
+        "context_safety": { "$ref": "#/$defs/differential_outcome" },
+        "token_budget": { "$ref": "#/$defs/differential_outcome" },
+        "tool_catalog": { "$ref": "#/$defs/differential_outcome" },
+        "policy_input": { "$ref": "#/$defs/differential_outcome" },
+        "phase_plan": { "$ref": "#/$defs/differential_outcome" },
+        "promotion_blocked": { "type": "boolean" },
+        "shadow_side_effect_free": { "const": true }
       }
     },
     "context_assembled_metadata": {
@@ -254,6 +298,15 @@
           "properties": {
             "kind": { "const": "runtime_selected" },
             "metadata": { "$ref": "#/$defs/runtime_selected_metadata" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "metadata"],
+          "properties": {
+            "kind": { "const": "runtime_shadow_differential" },
+            "metadata": { "$ref": "#/$defs/runtime_shadow_differential_metadata" }
           }
         },
         {

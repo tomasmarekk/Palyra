@@ -11,13 +11,11 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::DuplicateRunId { run_id } => {
             Status::already_exists(format!("orchestrator run already exists: {run_id}"))
         }
-        JournalError::SessionRunAlreadyActive {
-            session_id,
-            active_run_id,
-            requested_run_id,
-        } => Status::failed_precondition(format!(
-            "orchestrator session {session_id} already has active run {active_run_id}; wait for it, cancel it, or start a different session before starting run {requested_run_id}"
-        )),
+        JournalError::SessionRunAlreadyActive { session_id, active_run_id, requested_run_id } => {
+            Status::failed_precondition(format!(
+                "orchestrator session {session_id} already has active run {active_run_id}; wait for it, cancel it, or start a different session before starting run {requested_run_id}"
+            ))
+        }
         JournalError::DuplicateTapeSequence { run_id, seq } => Status::already_exists(format!(
             "orchestrator tape already contains seq={seq} for run {run_id}"
         )),
@@ -61,12 +59,11 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
                 "networked worker dispatch settlement rejected for request {remote_request_id}"
             ))
         }
-        JournalError::NetworkedWorkerFleetCapacityExceeded {
-            current_entries,
-            max_entries,
-        } => Status::resource_exhausted(format!(
-            "networked worker fleet capacity reached ({current_entries} >= {max_entries})"
-        )),
+        JournalError::NetworkedWorkerFleetCapacityExceeded { current_entries, max_entries } => {
+            Status::resource_exhausted(format!(
+                "networked worker fleet capacity reached ({current_entries} >= {max_entries})"
+            ))
+        }
         JournalError::NetworkedWorkerFleetGenerationConflict {
             expected_generation,
             actual_generation,
@@ -103,9 +100,7 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
                 "background task worker update rejected for {task_id}: {reason}"
             ))
         }
-        JournalError::BackgroundTaskChildConflict { reason } => {
-            Status::failed_precondition(reason)
-        }
+        JournalError::BackgroundTaskChildConflict { reason } => Status::failed_precondition(reason),
         JournalError::ToolSideEffectFenceNotFound { operation_id } => {
             Status::not_found(format!("tool side-effect fence not found: {operation_id}"))
         }
@@ -139,13 +134,11 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::FlowStepNotFound { flow_id, step_id } => {
             Status::not_found(format!("flow step not found: {flow_id}/{step_id}"))
         }
-        JournalError::FlowRevisionConflict {
-            flow_id,
-            expected_revision,
-            actual_revision,
-        } => Status::aborted(format!(
-            "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
-        )),
+        JournalError::FlowRevisionConflict { flow_id, expected_revision, actual_revision } => {
+            Status::aborted(format!(
+                "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
+            ))
+        }
         JournalError::InvalidFlowDependencies { flow_id, step_id, reason_code } => {
             Status::invalid_argument(format!(
                 "invalid flow dependencies for {flow_id}/{step_id}: {reason_code}"
@@ -185,11 +178,9 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
                 "tool result artifact digest mismatch: {artifact_id}"
             ))
         }
-        JournalError::ToolResultArtifactScopeMismatch { artifact_id } => {
-            Status::permission_denied(format!(
-                "tool result artifact is outside the current run/session scope: {artifact_id}"
-            ))
-        }
+        JournalError::ToolResultArtifactScopeMismatch { artifact_id } => Status::permission_denied(
+            format!("tool result artifact is outside the current run/session scope: {artifact_id}"),
+        ),
         JournalError::ToolResultArtifactReadDenied { artifact_id, reason } => {
             Status::permission_denied(format!(
                 "tool result artifact read denied for {artifact_id}: {reason}"

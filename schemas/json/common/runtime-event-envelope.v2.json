@@ -100,7 +100,8 @@
         "run.failed",
         "run.cancelled",
         "runtime.backpressure.applied",
-        "runtime.compatibility.blocked"
+        "runtime.compatibility.blocked",
+        "runtime.finalization.started"
       ]
     },
     "reason_code": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9_.-]+$" },
@@ -172,7 +173,8 @@
               "harness.attempt.cancelled",
               "harness.attempt.cleaned_up",
               "provider.attempt.started",
-              "provider.attempt.completed"
+              "provider.attempt.completed",
+              "runtime.finalization.started"
             ]
           }
         }

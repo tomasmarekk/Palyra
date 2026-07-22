@@ -167,6 +167,9 @@ pub fn load_config() -> Result<LoadedConfig> {
                 daemon.port = port;
             }
         }
+        if let Some(file_runtime_kernel) = parsed.runtime_kernel {
+            super::runtime_kernel::apply_file(&mut daemon.runtime_kernel, file_runtime_kernel)?;
+        }
         if let Some(file_gateway) = parsed.gateway {
             if let Some(grpc_bind_addr) = file_gateway.grpc_bind_addr {
                 gateway.grpc_bind_addr = grpc_bind_addr;
@@ -1491,6 +1494,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         daemon.port = port.parse::<u16>().context("PALYRA_DAEMON_PORT must be a valid u16")?;
         source.push_str(" +env(PALYRA_DAEMON_PORT)");
     }
+    super::runtime_kernel::apply_env(&mut daemon.runtime_kernel, &mut source)?;
 
     if let Ok(mode) = env::var("PALYRA_DEPLOYMENT_MODE") {
         deployment.mode = DeploymentMode::parse(mode.as_str(), "PALYRA_DEPLOYMENT_MODE")?;
@@ -2540,6 +2544,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
         &mut source,
     )?;
+    super::runtime_kernel::validate(&daemon.runtime_kernel, &feature_rollouts)?;
 
     // Cross-field validation runs only after every source (defaults, file,
     // env) has been merged, so it judges the final effective values.
@@ -5476,7 +5481,8 @@ mod tests {
         GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
         MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
         ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
-        RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
+        RetrievalDualPathConfig, RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig,
+        ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -5545,6 +5551,42 @@ mod tests {
     fn identity_config_defaults_to_secure_mode() {
         let config = IdentityConfig::default();
         assert!(!config.allow_insecure_node_rpc_without_mtls);
+    }
+
+    #[test]
+    fn runtime_kernel_env_profile_overrides_file_and_defaults_remain_legacy() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+            version = 1
+            [runtime_kernel]
+            profile = "legacy"
+            "#,
+        )
+        .expect("runtime-kernel config should be written");
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _profile = ScopedEnvVar::set("PALYRA_RUNTIME_KERNEL_PROFILE", "v2");
+        let _canary = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_CANARY_BASIS_POINTS");
+        let _shadow = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS");
+        let _sampling_identity = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_SAMPLING_IDENTITY");
+        let _sampling_key = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX");
+        let _session_policy = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY");
+        let _rollback = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_ROLLBACK_POLICY");
+
+        let loaded = load_config().expect("env profile should override file profile");
+        assert_eq!(loaded.daemon.runtime_kernel.profile, RuntimeKernelProfile::V2);
+        assert!(loaded.source.contains("+env(PALYRA_RUNTIME_KERNEL_PROFILE)"));
+
+        drop(_profile);
+        let _profile_unset = ScopedEnvVar::unset("PALYRA_RUNTIME_KERNEL_PROFILE");
+        let loaded = load_config().expect("file legacy profile should load");
+        assert_eq!(loaded.daemon.runtime_kernel.profile, RuntimeKernelProfile::Legacy);
     }
 
     #[test]

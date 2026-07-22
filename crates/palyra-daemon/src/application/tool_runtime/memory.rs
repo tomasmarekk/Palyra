@@ -84,10 +84,8 @@ const MEMORY_SOURCE_VALUES: &[&str] =
 const MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "memory hits are retrieved evidence; do not claim no stored preference or prior fact exists unless the hits are irrelevant to the user's question";
 const MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no memory hits were returned; do not invent stored preferences or prior facts";
-const MEMORY_CHANNEL_ISOLATION_ABSENT_CLAIM_BOUNDARY: &str =
-    "no hits were found in the requested channel for this bounded query; this is a negative isolation probe, not a general memory inventory";
-const MEMORY_CHANNEL_ISOLATION_PRESENT_CLAIM_BOUNDARY: &str =
-    "one or more hits exist in the requested channel for this bounded query; content is withheld by the isolation probe";
+const MEMORY_CHANNEL_ISOLATION_ABSENT_CLAIM_BOUNDARY: &str = "no hits were found in the requested channel for this bounded query; this is a negative isolation probe, not a general memory inventory";
+const MEMORY_CHANNEL_ISOLATION_PRESENT_CLAIM_BOUNDARY: &str = "one or more hits exist in the requested channel for this bounded query; content is withheld by the isolation probe";
 const COMBINED_MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "durable lifecycle or workspace memory hits are retrieved evidence; do not claim no stored preference or project fact exists unless the hits are irrelevant";
 const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable lifecycle or workspace memory hits were returned";
@@ -96,8 +94,7 @@ const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
 const DEFAULT_WORKSPACE_MEMORY_SEARCH_PREFIX: &str = "MEMORY.md";
 const DEFAULT_PROJECT_MEMORY_SEARCH_PREFIX: &str = "projects/default";
 const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript or session-level hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
-const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
-    "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
+const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str = "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
 const MEMORY_STATUS_CLAIM_BOUNDARY: &str = "memory status is usage and retention diagnostics; do not infer memory capacity from search hit_count, and treat no_hard_capacity_configured as no entries/bytes hard limit";
 const MAX_WORKSPACE_RECALL_TOOL_SNIPPET_CHARS: usize = 512;
 

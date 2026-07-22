@@ -46,6 +46,9 @@ use crate::{
             MergedDeliveryProgress, DELIVERY_ARBITRATION_POLICY_ID,
         },
         learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
+        run_stream::admission_ingress::{
+            register_delegation_ingress, register_internal_ingress, DelegationIngressRegistration,
+        },
     },
     auxiliary_executor::{execute_auxiliary_task, AuxiliaryExecutionRequest, AuxiliaryTaskType},
     delegation::{
@@ -1651,6 +1654,16 @@ async fn run_background_task_stream(
     } else {
         &task.session_id
     };
+    let parameter_delta_bytes = build_parameter_delta_bytes(task)?;
+    let delegated_admission_json = if task.delegation.is_some() {
+        Some(String::from_utf8(parameter_delta_bytes.clone()).map_err(|error| {
+            Status::internal(format!(
+                "failed to encode delegated admission authority as UTF-8: {error}"
+            ))
+        })?)
+    } else {
+        None
+    };
     let mut run_request = Request::new(tokio_stream::iter(vec![common_v1::RunStreamRequest {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: run_session_id.clone() }),
@@ -1685,7 +1698,7 @@ async fn run_background_task_stream(
             .parent_run_id
             .as_ref()
             .map(|ulid| common_v1::CanonicalId { ulid: ulid.clone() }),
-        parameter_delta_json: build_parameter_delta_bytes(task)?,
+        parameter_delta_json: parameter_delta_bytes,
         queued_input_id: task
             .queued_input_id
             .as_ref()
@@ -1698,6 +1711,40 @@ async fn run_background_task_stream(
         task.device_id.as_str(),
         task.channel.as_deref(),
     )?;
+    let proof_channel = task.channel.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if let Some(delegated_admission_json) = delegated_admission_json {
+        let parent_run_id = task.parent_run_id.as_deref().ok_or_else(|| {
+            Status::failed_precondition("delegation task is missing its parent run identity")
+        })?;
+        register_delegation_ingress(
+            run_request.metadata_mut(),
+            DelegationIngressRegistration::new(
+                task.owner_principal.as_str(),
+                task.device_id.as_str(),
+                proof_channel,
+                run_session_id.as_str(),
+                run_id,
+                parent_run_id,
+                delegated_admission_json,
+            ),
+        )
+        .map_err(|error| {
+            Status::internal(format!("failed to seal delegated RunStream ingress: {error}"))
+        })?;
+    } else {
+        register_internal_ingress(
+            run_request.metadata_mut(),
+            task.owner_principal.as_str(),
+            task.device_id.as_str(),
+            proof_channel,
+            run_session_id.as_str(),
+            run_id,
+            task.parent_run_id.as_deref(),
+        )
+        .map_err(|error| {
+            Status::internal(format!("failed to seal internal RunStream ingress: {error}"))
+        })?;
+    }
 
     let mut stream = client
         .run_stream(run_request)

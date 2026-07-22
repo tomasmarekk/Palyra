@@ -728,15 +728,13 @@ async fn prepare_route_tool_side_effect_fence(
         .prepare_tool_side_effect_fence(session_id.to_owned(), run_id.to_owned(), fence)
         .await?
     {
-        SideEffectRetryDecision::Safe => {
-            Ok(Some(ActiveRouteToolSideEffectFence {
-                operation_id,
-                generation,
-                intent_sha256,
-                strategy,
-                external_idempotency_key_sha256,
-            }))
-        }
+        SideEffectRetryDecision::Safe => Ok(Some(ActiveRouteToolSideEffectFence {
+            operation_id,
+            generation,
+            intent_sha256,
+            strategy,
+            external_idempotency_key_sha256,
+        })),
         SideEffectRetryDecision::Completed => {
             Err(Status::already_exists("tool side effect already completed for this proposal"))
         }

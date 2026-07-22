@@ -7,8 +7,10 @@
 //! [`tape`] emits wire events paired with tape appends, and [`cancellation`]
 //! handles the cancel transition shared by all of them.
 
+pub(crate) mod admission_ingress;
 pub(crate) mod agent_loop;
 pub(crate) mod cancellation;
+pub(crate) mod embedded_attempt;
 pub(crate) mod flow_control;
 pub(crate) mod orchestration;
 pub(crate) mod public_events;

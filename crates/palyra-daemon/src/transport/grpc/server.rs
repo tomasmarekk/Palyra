@@ -20,6 +20,7 @@ use super::{
 };
 use crate::{
     app::shutdown::shutdown_signal,
+    channels::ChannelPlatform,
     config::LoadedConfig,
     gateway::{self, GatewayRuntimeState},
     node_rpc,
@@ -38,6 +39,7 @@ pub(crate) async fn serve(
     loaded: &LoadedConfig,
     identity_runtime: &crate::IdentityRuntime,
     runtime: Arc<GatewayRuntimeState>,
+    channels: Arc<ChannelPlatform>,
     auth: GatewayAuthConfig,
     auth_runtime: Arc<gateway::AuthRuntimeState>,
     grpc_url: String,
@@ -48,10 +50,11 @@ pub(crate) async fn serve(
     node_runtime: Arc<NodeRuntimeState>,
     node_rpc_mtls_required: bool,
 ) -> Result<()> {
-    let gateway_service = services::gateway::GatewayServiceImpl::new(
+    let gateway_service = services::gateway::GatewayServiceImpl::new_with_delivery_outbox(
         runtime.clone(),
         auth.clone(),
         Arc::clone(&node_runtime),
+        channels,
     );
     let grpc_gateway_server =
         gateway_v1::gateway_service_server::GatewayServiceServer::new(gateway_service)

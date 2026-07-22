@@ -86,7 +86,8 @@ runtime_contract_enum! {
         RunFailed => "run.failed",
         RunCancelled => "run.cancelled",
         BackpressureApplied => "runtime.backpressure.applied",
-        CompatibilityBlocked => "runtime.compatibility.blocked"
+        CompatibilityBlocked => "runtime.compatibility.blocked",
+        FinalizationStarted => "runtime.finalization.started"
     }
 }
 
@@ -555,6 +556,17 @@ pub const RUNTIME_EVENT_DESCRIPTORS: &[RuntimeEventDescriptor] = &[
         false,
         NO_REQUIRED_IDENTITIES,
     ),
+    runtime_event_descriptor(
+        RuntimeEventName::FinalizationStarted,
+        RuntimeGenerationLane::Run,
+        RuntimeSubsystem::RuntimeKernel,
+        RuntimeErrorPhase::Finalization,
+        RuntimeEventActorKind::Host,
+        RuntimeRetryability::NotRetryable,
+        RuntimeEventRedactionClass::MetadataOnly,
+        false,
+        ATTEMPT_IDENTITIES,
+    ),
 ];
 
 impl RuntimeEventName {
@@ -599,6 +611,7 @@ impl RuntimeEventName {
             Self::RunCancelled => &RUNTIME_EVENT_DESCRIPTORS[34],
             Self::BackpressureApplied => &RUNTIME_EVENT_DESCRIPTORS[35],
             Self::CompatibilityBlocked => &RUNTIME_EVENT_DESCRIPTORS[36],
+            Self::FinalizationStarted => &RUNTIME_EVENT_DESCRIPTORS[37],
         }
     }
 
@@ -1052,7 +1065,16 @@ mod tests {
             })
         );
 
-        let tool_result = event(2, RuntimeEventName::ToolResultObserved);
+        let finalization = event(2, RuntimeEventName::FinalizationStarted);
+        assert_eq!(
+            finalization.validate(),
+            Err(RuntimeEventValidationError::MissingIdentity {
+                event_name: RuntimeEventName::FinalizationStarted.as_str().to_owned(),
+                field: "attempt_id",
+            })
+        );
+
+        let tool_result = event(3, RuntimeEventName::ToolResultObserved);
         assert_eq!(
             tool_result.validate(),
             Err(RuntimeEventValidationError::MissingIdentity {

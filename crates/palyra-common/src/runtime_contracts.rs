@@ -134,7 +134,19 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v13";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v14";
+/// Progress message emitted after the V2 provider effect has started.
+///
+/// Fixture-backed cancellation QA uses this boundary to request cancellation
+/// without depending on scheduler timing or a tape-only event.
+pub const RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE: &str =
+    "progress:runtime_kernel_v2.provider_effect_started";
+/// Exact host adapter selected when RuntimeKernelV2 consumes preassembled context.
+pub const RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_ID: &str =
+    "runtime_kernel_v2.preassembled_context";
+/// Version of the host adapter selected for preassembled RuntimeKernelV2 context.
+pub const RUNTIME_KERNEL_V2_PREASSEMBLED_CONTEXT_ENGINE_VERSION: &str =
+    "context_engine.preassembled_v2.v1";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

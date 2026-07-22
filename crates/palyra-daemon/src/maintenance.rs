@@ -61,8 +61,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "stale_runs",
                     component: "runs",
-                    description:
-                        "Detects run records that have stayed active past their runtime lease window.",
+                    description: "Detects run records that have stayed active past their runtime lease window.",
                     safety_level: "repairable",
                     interval_ms: 300_000,
                     max_work_per_run: 32,
@@ -73,8 +72,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "orphan_artifacts",
                     component: "artifacts",
-                    description:
-                        "Finds content-addressed artifacts that no longer have a journal or run reference.",
+                    description: "Finds content-addressed artifacts that no longer have a journal or run reference.",
                     safety_level: "retention_bound_delete",
                     interval_ms: 900_000,
                     max_work_per_run: 64,
@@ -85,8 +83,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "expired_leases",
                     component: "leases",
-                    description:
-                        "Reaps expired provider and worker leases after fail-closed ownership checks.",
+                    description: "Reaps expired provider and worker leases after fail-closed ownership checks.",
                     safety_level: "repairable",
                     interval_ms: 120_000,
                     max_work_per_run: 64,
@@ -97,8 +94,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "stale_bindings",
                     component: "bindings",
-                    description:
-                        "Flags stale plugin, hook, and channel bindings that need operator review.",
+                    description: "Flags stale plugin, hook, and channel bindings that need operator review.",
                     safety_level: "review_required",
                     interval_ms: 600_000,
                     max_work_per_run: 32,
@@ -109,8 +105,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "old_delivery_attempts",
                     component: "delivery",
-                    description:
-                        "Compacts old delivery attempts after retry, quarantine, and dead-letter retention gates.",
+                    description: "Compacts old delivery attempts after retry, quarantine, and dead-letter retention gates.",
                     safety_level: "retention_bound_delete",
                     interval_ms: 600_000,
                     max_work_per_run: 128,
@@ -121,8 +116,7 @@ impl Default for MaintenanceRegistry {
                 sweeper(SweeperDefinitionSpec {
                     task_id: "memory_retention",
                     component: "memory",
-                    description:
-                        "Applies memory TTL, capacity, and vacuum maintenance using the journal retention policy.",
+                    description: "Applies memory TTL, capacity, and vacuum maintenance using the journal retention policy.",
                     safety_level: "retention_bound_delete",
                     interval_ms: 300_000,
                     max_work_per_run: 512,
@@ -932,7 +926,7 @@ fn load_plugin_health() -> PluginHealthSnapshot {
                 total_bindings: 0,
                 unhealthy_bindings: 0,
                 load_error: Some(crate::sanitize_http_error_message(error.to_string().as_str())),
-            }
+            };
         }
     };
     let index = match crate::plugins::load_plugin_bindings_index(root.as_path()) {
@@ -942,7 +936,7 @@ fn load_plugin_health() -> PluginHealthSnapshot {
                 total_bindings: 0,
                 unhealthy_bindings: 0,
                 load_error: Some(crate::sanitize_http_error_message(error.to_string().as_str())),
-            }
+            };
         }
     };
     // A binding counts as healthy only when it is enabled AND passes the typed-contract,

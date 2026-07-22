@@ -723,9 +723,9 @@ mod tests {
         let blueprints = automation_blueprints();
         assert!(blueprints.iter().any(|blueprint| blueprint.id == "local_repo_hygiene"));
         assert!(blueprints.iter().all(|blueprint| !blueprint.required_capabilities.is_empty()));
-        assert!(blueprints.iter().all(|blueprint| !blueprint.proposed_spec_template["enabled"]
-            .as_bool()
-            .unwrap_or(true)));
+        assert!(blueprints.iter().all(|blueprint| {
+            !blueprint.proposed_spec_template["enabled"].as_bool().unwrap_or(true)
+        }));
     }
 
     #[test]

@@ -437,6 +437,7 @@ pub(crate) async fn execute_auxiliary_task(
                     max_wait_ms: contract.routing_task_class.max_lease_wait_ms(),
                     session_id: Some(request.session_id.clone()),
                     run_id: request.run_id.clone(),
+                    runtime_authority: None,
                     diagnostic_scope_id: Some(request.task_id.clone()),
                 },
             )

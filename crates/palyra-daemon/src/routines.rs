@@ -2050,7 +2050,7 @@ pub fn observe_file_watch_path(
             return Err(RoutineRegistryError::InvalidField {
                 field: "trigger_payload.path",
                 message: format!("failed to inspect watched path: {error}"),
-            })
+            });
         }
     };
     let kind = if metadata.is_dir() {
@@ -3663,7 +3663,7 @@ fn parse_duration_to_ms(
             return Err(RoutineRegistryError::InvalidField {
                 field,
                 message: format!("unsupported duration unit '{unit}'"),
-            })
+            });
         }
     };
     quantity.checked_mul(multiplier).ok_or_else(|| RoutineRegistryError::InvalidField {

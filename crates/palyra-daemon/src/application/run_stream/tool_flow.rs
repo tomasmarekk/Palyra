@@ -139,6 +139,9 @@ const TOOL_REPAIR_ACCEPTED_EVENT: &str = "tool.repair.accepted";
 const TOOL_REPAIR_REJECTED_EVENT: &str = "tool.repair.rejected";
 const TOOL_EFFECT_STARTED_EVENT: &str = "tool_effect_started";
 
+include!("tool_flow/stages.rs");
+include!("tool_flow/owner.rs");
+
 type RunStreamProgressSender = mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>;
 
 struct ProcessProgressSlot {
@@ -181,6 +184,23 @@ impl ProcessProgressReceiver {
 pub(crate) struct RunStreamToolProposalPreparation {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
+    backend_selection: ToolProposalBackendSelection,
+    tool_signature: ToolCallSignature,
+    synthetic_outcome: Option<ToolExecutionOutcome>,
+    approval_timed_out: bool,
+}
+
+/// Host-owned gate state produced before any approval wait begins.
+///
+/// Keeping this state separate makes the approval suspension point explicit
+/// while preserving the established policy, audit, and dispatch paths.
+struct RunStreamToolGatePreparation {
+    resolved_session_id: String,
+    skill_context: Option<crate::gateway::ToolSkillContext>,
+    skill_gate_decision: Option<crate::tool_protocol::ToolDecision>,
+    approval_subject_id: String,
+    proposal_approval_required: bool,
+    effective_posture: crate::tool_posture::EffectiveToolPosture,
     backend_selection: ToolProposalBackendSelection,
     tool_signature: ToolCallSignature,
     synthetic_outcome: Option<ToolExecutionOutcome>,
@@ -311,6 +331,29 @@ struct PreparedToolRuntimeOutcome {
     outcome: ToolExecutionOutcome,
     side_effect_fence: Option<ActiveToolSideEffectFence>,
     post_execution_error: Option<Status>,
+}
+
+#[derive(Debug)]
+enum ToolOutcomeFinalizationError {
+    BeforeSettlement(Status),
+    SettlementFailed(Status),
+    AfterSettlement(Status),
+}
+
+impl ToolOutcomeFinalizationError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::BeforeSettlement(error)
+            | Self::SettlementFailed(error)
+            | Self::AfterSettlement(error) => error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FinalizedToolExecutionOutcome<T> {
+    completed: RunStreamToolExecutionOutcome,
+    retained_projection: T,
 }
 
 impl ToolParallelism {
@@ -604,6 +647,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         backend_selection,
         tool_signature,
         synthetic_outcome,
+        approval_timed_out: _,
     } = prepare_run_stream_tool_proposal_execution(
         sender,
         stream,
@@ -1722,6 +1766,53 @@ async fn prepare_run_stream_tool_proposal_execution(
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparation, Status> {
+    let prepared_gate = prepare_run_stream_tool_gate_without_approval(
+        sender,
+        runtime_state,
+        request_context,
+        active_session_id,
+        run_id,
+        proposal_id,
+        tool_name,
+        input_json,
+        tape_seq,
+    )
+    .await?;
+    resolve_run_stream_tool_gate_approval(
+        sender,
+        stream,
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        proposal_id,
+        tool_name,
+        input_json,
+        remaining_tool_budget,
+        allow_sensitive_tools,
+        approval_cache_generation,
+        flow_control,
+        tape_seq,
+        prepared_gate,
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn prepare_run_stream_tool_gate_without_approval(
+    sender: &mpsc::Sender<
+        Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+    >,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    active_session_id: Option<&str>,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    tape_seq: &mut i64,
+) -> Result<RunStreamToolGatePreparation, Status> {
     let resolved_session_id = active_session_id.ok_or_else(|| {
         Status::internal(
             "run stream internal invariant violated: missing session_id while preparing tool proposal",
@@ -1823,6 +1914,51 @@ async fn prepare_run_stream_tool_proposal_execution(
         | BeforeToolDecisionKind::RequireReread
         | BeforeToolDecisionKind::RequireSmallerPatch => {}
     }
+    Ok(RunStreamToolGatePreparation {
+        resolved_session_id: resolved_session_id.to_owned(),
+        skill_context,
+        skill_gate_decision,
+        approval_subject_id,
+        proposal_approval_required,
+        effective_posture,
+        backend_selection,
+        tool_signature,
+        synthetic_outcome,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn resolve_run_stream_tool_gate_approval(
+    sender: &mpsc::Sender<
+        Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+    >,
+    stream: &mut Streaming<crate::transport::grpc::proto::palyra::common::v1::RunStreamRequest>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    remaining_tool_budget: &mut u32,
+    allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
+    flow_control: &RunStreamFlowControl,
+    tape_seq: &mut i64,
+    prepared_gate: RunStreamToolGatePreparation,
+) -> Result<RunStreamToolProposalPreparation, Status> {
+    let RunStreamToolGatePreparation {
+        resolved_session_id,
+        skill_context,
+        skill_gate_decision,
+        approval_subject_id,
+        proposal_approval_required,
+        effective_posture,
+        backend_selection,
+        tool_signature,
+        synthetic_outcome,
+    } = prepared_gate;
     let approval_outcome = resolve_run_stream_tool_approval_outcome(
         sender,
         stream,
@@ -1862,6 +1998,9 @@ async fn prepare_run_stream_tool_proposal_execution(
                 pending_approval_id: None,
             },
         );
+    let approval_timed_out = approval_outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.decision == crate::journal::ApprovalDecision::Timeout);
     send_tool_decision_with_tape(
         sender,
         runtime_state,
@@ -1878,7 +2017,7 @@ async fn prepare_run_stream_tool_proposal_execution(
     record_tool_proposal_decision_audit_trail(
         runtime_state,
         request_context,
-        resolved_session_id,
+        resolved_session_id.as_str(),
         run_id,
         proposal_id,
         tool_name,
@@ -1889,10 +2028,11 @@ async fn prepare_run_stream_tool_proposal_execution(
     .await?;
     Ok(RunStreamToolProposalPreparation {
         decision,
-        resolved_session_id: resolved_session_id.to_owned(),
+        resolved_session_id,
         backend_selection,
         tool_signature,
         synthetic_outcome,
+        approval_timed_out,
     })
 }
 
@@ -3088,15 +3228,13 @@ async fn prepare_tool_side_effect_fence(
     };
     match runtime_state.prepare_tool_side_effect_fence(session_id, run_id.to_owned(), fence).await?
     {
-        SideEffectRetryDecision::Safe => {
-            Ok(Some(ActiveToolSideEffectFence {
-                operation_id,
-                generation,
-                intent_sha256,
-                strategy,
-                external_idempotency_key_sha256,
-            }))
-        }
+        SideEffectRetryDecision::Safe => Ok(Some(ActiveToolSideEffectFence {
+            operation_id,
+            generation,
+            intent_sha256,
+            strategy,
+            external_idempotency_key_sha256,
+        })),
         SideEffectRetryDecision::Completed => {
             Err(Status::already_exists("tool side effect already completed for this proposal"))
         }
@@ -3343,6 +3481,32 @@ async fn finalize_prepared_tool_execution_outcome(
     side_effect_fence: Option<&ActiveToolSideEffectFence>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
+    project_retain_commit_tool_execution_outcome(
+        sender,
+        runtime_state,
+        request_context,
+        run_id,
+        prepared,
+        execution_outcome,
+        side_effect_fence,
+        tape_seq,
+        |_| Ok(()),
+    )
+    .await
+    .map(|finalized| finalized.completed)
+    .map_err(ToolOutcomeFinalizationError::into_status)
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn project_prepared_tool_execution_outcome(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    execution_outcome: ToolExecutionOutcome,
+    tape_seq: &mut i64,
+) -> Result<ToolExecutionOutcome, Status> {
     dispatch_after_tool_hook_if_enabled(runtime_state, run_id, prepared, &execution_outcome)
         .await?;
     let replay_safety = classify_tool_result_replay_safety(
@@ -3394,7 +3558,23 @@ async fn finalize_prepared_tool_execution_outcome(
         &execution_outcome,
     )
     .await?;
+    Ok(execution_outcome)
+}
 
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn commit_and_publish_projected_tool_execution_outcome(
+    sender: &mpsc::Sender<
+        Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+    >,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    execution_outcome: ToolExecutionOutcome,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
+    tape_seq: &mut i64,
+) -> Result<RunStreamToolExecutionOutcome, ToolOutcomeFinalizationError> {
     let transition_is_atomic =
         side_effect_fence.is_some() && !execution_outcome.attestation.timed_out;
     if transition_is_atomic {
@@ -3407,14 +3587,16 @@ async fn finalize_prepared_tool_execution_outcome(
             side_effect_fence,
             &execution_outcome,
         )
-        .await?;
+        .await
+        .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
         send_committed_run_stream_tool_outcome(
             sender,
             run_id,
             prepared.proposal_id.as_str(),
             &execution_outcome,
         )
-        .await?;
+        .await
+        .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
     } else {
         send_tool_result_with_tape(
             sender,
@@ -3426,7 +3608,8 @@ async fn finalize_prepared_tool_execution_outcome(
             execution_outcome.output_json.as_slice(),
             execution_outcome.error.as_str(),
         )
-        .await?;
+        .await
+        .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
 
         send_tool_attestation_with_tape(
             sender,
@@ -3442,15 +3625,19 @@ async fn finalize_prepared_tool_execution_outcome(
             execution_outcome.attestation.sandbox_enforcement.as_str(),
             execution_outcome.attestation.execution_manifest.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
         runtime_state.record_tool_attestation_emitted();
-        settle_tool_side_effect_fence(runtime_state, side_effect_fence, &execution_outcome).await?;
+        settle_tool_side_effect_fence(runtime_state, side_effect_fence, &execution_outcome)
+            .await
+            .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
     }
     apply_tool_fault_after_tool_commit(
         runtime_state,
         prepared.proposal_id.as_str(),
         transition_is_atomic,
-    )?;
+    )
+    .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
 
     let _ = build_and_ingest_tool_result_memory_summary(
         runtime_state,
@@ -3475,6 +3662,188 @@ async fn finalize_prepared_tool_execution_outcome(
         input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn project_retain_commit_tool_execution_outcome<T>(
+    sender: &RunStreamProgressSender,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    execution_outcome: ToolExecutionOutcome,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
+    tape_seq: &mut i64,
+    retain_projection: impl FnOnce(&ToolExecutionOutcome) -> Result<T, Status>,
+) -> Result<FinalizedToolExecutionOutcome<T>, ToolOutcomeFinalizationError> {
+    let projected = project_prepared_tool_execution_outcome(
+        runtime_state,
+        request_context,
+        run_id,
+        prepared,
+        execution_outcome,
+        tape_seq,
+    )
+    .await;
+    retain_commit_projected_tool_execution_outcome(
+        sender,
+        runtime_state,
+        request_context,
+        run_id,
+        prepared,
+        projected,
+        side_effect_fence,
+        tape_seq,
+        retain_projection,
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn retain_commit_projected_tool_execution_outcome<T>(
+    sender: &RunStreamProgressSender,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    projected: Result<ToolExecutionOutcome, Status>,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
+    tape_seq: &mut i64,
+    retain_projection: impl FnOnce(&ToolExecutionOutcome) -> Result<T, Status>,
+) -> Result<FinalizedToolExecutionOutcome<T>, ToolOutcomeFinalizationError> {
+    let projected = match projected {
+        Ok(projected) => projected,
+        Err(error) => {
+            return Err(settle_failed_tool_finalization(
+                runtime_state,
+                run_id,
+                prepared,
+                side_effect_fence,
+                error,
+            )
+            .await);
+        }
+    };
+    let retained_projection = match retain_projection(&projected) {
+        Ok(retained_projection) => retained_projection,
+        Err(error) => {
+            return Err(settle_failed_tool_finalization(
+                runtime_state,
+                run_id,
+                prepared,
+                side_effect_fence,
+                error,
+            )
+            .await);
+        }
+    };
+    let completed = match commit_and_publish_projected_tool_execution_outcome(
+        sender,
+        runtime_state,
+        request_context,
+        run_id,
+        prepared,
+        projected,
+        side_effect_fence,
+        tape_seq,
+    )
+    .await
+    {
+        Ok(completed) => completed,
+        Err(ToolOutcomeFinalizationError::BeforeSettlement(error)) => {
+            return Err(settle_failed_tool_finalization(
+                runtime_state,
+                run_id,
+                prepared,
+                side_effect_fence,
+                error,
+            )
+            .await);
+        }
+        Err(error @ ToolOutcomeFinalizationError::AfterSettlement(_))
+        | Err(error @ ToolOutcomeFinalizationError::SettlementFailed(_)) => return Err(error),
+    };
+    Ok(FinalizedToolExecutionOutcome { completed, retained_projection })
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_drained_tool_execution_before_error<T>(
+    sender: &RunStreamProgressSender,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    execution_outcome: ToolExecutionOutcome,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
+    tape_seq: &mut i64,
+    retain_projection: impl FnOnce(&ToolExecutionOutcome) -> Result<T, Status>,
+    post_execution_error: Status,
+) -> Result<Status, Status> {
+    match project_retain_commit_tool_execution_outcome(
+        sender,
+        runtime_state,
+        request_context,
+        run_id,
+        prepared,
+        execution_outcome,
+        side_effect_fence,
+        tape_seq,
+        retain_projection,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(ToolOutcomeFinalizationError::BeforeSettlement(_)) if side_effect_fence.is_some() => {}
+        Err(ToolOutcomeFinalizationError::AfterSettlement(error)) => {
+            // The atomic tape/fence commit already owns the durable truth.
+            // A later stream failure must not downgrade an observed effect.
+            warn!(
+                run_id = %run_id,
+                proposal_id = %prepared.proposal_id,
+                tool_name = %prepared.tool_name,
+                error = %error,
+                "drained tool outcome was durably settled before publication failed"
+            );
+        }
+        Err(ToolOutcomeFinalizationError::BeforeSettlement(finalization_error))
+        | Err(ToolOutcomeFinalizationError::SettlementFailed(finalization_error)) => {
+            return Err(finalization_error);
+        }
+    }
+    Ok(post_execution_error)
+}
+
+#[allow(clippy::result_large_err)]
+async fn settle_failed_tool_finalization(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    side_effect_fence: Option<&ActiveToolSideEffectFence>,
+    finalization_error: Status,
+) -> ToolOutcomeFinalizationError {
+    let Some(side_effect_fence) = side_effect_fence else {
+        return ToolOutcomeFinalizationError::BeforeSettlement(finalization_error);
+    };
+    if let Err(settlement_error) =
+        mark_tool_side_effect_unknown(runtime_state, Some(side_effect_fence)).await
+    {
+        return ToolOutcomeFinalizationError::SettlementFailed(Status::internal(format!(
+            "tool outcome finalization failed before settlement: {}; effect-unknown persistence also failed: {}",
+            redact_run_stream_text(finalization_error.message()),
+            redact_run_stream_text(settlement_error.message())
+        )));
+    }
+    warn!(
+        run_id = %run_id,
+        proposal_id = %prepared.proposal_id,
+        tool_name = %prepared.tool_name,
+        error = %finalization_error,
+        "tool outcome could not be committed and was marked effect unknown"
+    );
+    ToolOutcomeFinalizationError::BeforeSettlement(finalization_error)
 }
 
 fn apply_tool_fault_after_tool_commit(
@@ -4395,20 +4764,27 @@ mod tests {
         allow_sensitive_tools_approval_outcome, append_process_progress_backpressure_tape_event,
         classify_tool_parallelism, classify_tool_result_replay_safety,
         commit_run_stream_tool_execution_outcome, drain_parallel_tool_group_after_cancel,
-        drain_parallel_tool_group_after_error, process_progress_channel_for_tool,
-        process_progress_status_message, projection_policy_contract, sessions_spawn_tape_payload,
+        drain_parallel_tool_group_after_error, finalize_drained_tool_execution_before_error,
+        process_progress_channel_for_tool, process_progress_status_message,
+        projection_policy_contract, retain_commit_projected_tool_execution_outcome,
+        sessions_spawn_tape_payload, settle_failed_tool_finalization,
         tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
-        workspace_spill_unavailable_projection, ParallelToolExecutionTaskOutcome, ToolParallelism,
+        workspace_spill_unavailable_projection, OrchestratorTapeAppendRequest,
+        ParallelToolExecutionTaskOutcome, RunStreamPreparedToolExecution, ToolParallelism,
         TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
+    use crate::application::tool_governance::build_tool_call_signature;
     use crate::application::tool_registry::{
         tool_execution_semantics, ToolReplaySafetyClass, ToolResultProjectionPolicy,
     };
+    use crate::application::tool_security::ToolProposalBackendSelection;
+    use crate::execution_backends::{ExecutionBackendPreference, ExecutionBackendResolution};
     use crate::gateway::runtime::tests::{start_test_orchestrator_run, test_runtime_state};
     use crate::gateway::GatewayRuntimeState;
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::sandbox_runner::ProcessProgressEvent;
-    use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
+    use crate::tool_protocol::{ToolAttestation, ToolDecision, ToolExecutionOutcome};
+    use crate::transport::grpc::auth::RequestContext;
     use palyra_common::runtime_contracts::{
         project_legacy_runtime_error, ArtifactRetentionPolicy, CancellationSettlementOutcome,
         ReconciliationStrategy, RuntimeErrorClass, RuntimeErrorObservation, RuntimeEventEnvelopeV2,
@@ -4453,6 +4829,132 @@ mod tests {
                 execution_manifest: None,
             },
         }
+    }
+
+    fn mutating_prepared_tool(
+        session_id: &str,
+        proposal_id: &str,
+    ) -> RunStreamPreparedToolExecution {
+        let tool_name = "palyra.fs.apply_patch";
+        let input_json = br#"{"patch":"*** Begin Patch\n*** End Patch"}"#.to_vec();
+        RunStreamPreparedToolExecution {
+            proposal_id: proposal_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            replay_safety_class: ToolReplaySafetyClass::ExternalSideEffect,
+            tool_signature: build_tool_call_signature(tool_name, input_json.as_slice()),
+            input_json,
+            decision: ToolDecision {
+                allowed: true,
+                reason: "test policy grant".to_owned(),
+                approval_required: false,
+                policy_enforced: true,
+            },
+            resolved_session_id: session_id.to_owned(),
+            backend_selection: ToolProposalBackendSelection {
+                agent_id: None,
+                requested_preference: ExecutionBackendPreference::LocalSandbox,
+                resolution: ExecutionBackendResolution {
+                    requested: ExecutionBackendPreference::LocalSandbox,
+                    resolved: ExecutionBackendPreference::LocalSandbox,
+                    fallback_used: false,
+                    reason_code: "test_local_sandbox".to_owned(),
+                    approval_required: false,
+                    reason: "test local sandbox".to_owned(),
+                },
+            },
+        }
+    }
+
+    async fn start_mutating_tool_fence(
+        state: &Arc<GatewayRuntimeState>,
+        session_id: &str,
+        run_id: &str,
+        proposal_id: &str,
+    ) -> super::ActiveToolSideEffectFence {
+        start_test_orchestrator_run(state, session_id, run_id);
+        let (_, generation) = state
+            .runtime_generation_for_tool_blocking(run_id)
+            .expect("tool generation query should succeed")
+            .expect("tool generation should be active");
+        let (operation_id, tool_execution_id) =
+            GatewayRuntimeState::tool_side_effect_identities(proposal_id)
+                .expect("tool side-effect identities should validate");
+        let intent_sha256 = "a".repeat(64);
+        let fence = SideEffectFenceV1 {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            tool_execution_id,
+            intent_generation: generation,
+            observed_generation: generation,
+            intent_sha256: intent_sha256.clone(),
+            state: SideEffectFenceState::IntentRecorded,
+            semantics: tool_execution_semantics(
+                "palyra.fs.apply_patch",
+                ToolReplaySafetyClass::ExternalSideEffect,
+            ),
+            external_idempotency_key_sha256: None,
+            evidence_sha256: None,
+            reason_code: "tool.effect.intent_recorded".to_owned(),
+            updated_at_unix_ms: crate::gateway::current_unix_ms(),
+        };
+        state
+            .prepare_tool_side_effect_fence(session_id.to_owned(), run_id.to_owned(), fence)
+            .await
+            .expect("tool effect intent should persist");
+        state
+            .transition_tool_side_effect_fence(
+                operation_id.clone(),
+                SideEffectFenceState::EffectStarted,
+                generation,
+                "tool.effect.started".to_owned(),
+                None,
+            )
+            .await
+            .expect("tool effect should start");
+        super::ActiveToolSideEffectFence {
+            operation_id,
+            generation,
+            intent_sha256,
+            strategy: ReconciliationStrategy::WorkspaceDigest,
+            external_idempotency_key_sha256: None,
+        }
+    }
+
+    fn assert_tool_fence_is_observed(
+        state: &GatewayRuntimeState,
+        fence: &super::ActiveToolSideEffectFence,
+    ) {
+        assert_tool_fence_state(state, fence, SideEffectFenceState::EffectObserved);
+    }
+
+    fn assert_tool_fence_state(
+        state: &GatewayRuntimeState,
+        fence: &super::ActiveToolSideEffectFence,
+        expected: SideEffectFenceState,
+    ) {
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("journal database should reopen");
+        let state_name: String = connection
+            .query_row(
+                "SELECT state FROM runtime_side_effect_fences WHERE operation_ulid = ?1",
+                rusqlite::params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("side-effect fence should load");
+        assert_eq!(state_name, expected.as_str());
+        let unresolved: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_side_effect_fences
+                 WHERE operation_ulid = ?1 AND state IN (?2, ?3)",
+                rusqlite::params![
+                    fence.operation_id.as_str(),
+                    SideEffectFenceState::IntentRecorded.as_str(),
+                    SideEffectFenceState::EffectStarted.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .expect("unresolved fence count should load");
+        assert_eq!(unresolved, 0, "mutating tool fence must not remain unresolved");
     }
 
     #[test]
@@ -4586,6 +5088,230 @@ mod tests {
             )
             .expect("observed runtime event count should load");
         assert_eq!(observed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_mutating_tool_completion_settles_fence_before_error() {
+        let state = test_runtime_state();
+        let session_id = "session_cancelled_drained_mutation";
+        let run_id = "run_cancelled_drained_mutation";
+        let proposal_id = "proposal_cancelled_drained_mutation";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: None,
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let mut tape_seq = 0;
+
+        let propagated = finalize_drained_tool_execution_before_error(
+            &sender,
+            &state,
+            &request_context,
+            run_id,
+            &prepared,
+            tool_outcome_for_replay_test(true, json!({"ok": true}), "", false),
+            Some(&fence),
+            &mut tape_seq,
+            |_| Ok(()),
+            Status::cancelled("tool execution completed after cancellation was requested"),
+        )
+        .await
+        .expect("drained mutation should settle before cancellation propagates");
+
+        assert_eq!(propagated.code(), Code::Cancelled);
+        assert_tool_fence_is_observed(&state, &fence);
+    }
+
+    #[tokio::test]
+    async fn progress_channel_failure_after_mutation_does_not_leave_fence_unresolved() {
+        let state = test_runtime_state();
+        let session_id = "session_progress_failure_drained_mutation";
+        let run_id = "run_progress_failure_drained_mutation";
+        let proposal_id = "proposal_progress_failure_drained_mutation";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: None,
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let mut tape_seq = 0;
+
+        let propagated = finalize_drained_tool_execution_before_error(
+            &sender,
+            &state,
+            &request_context,
+            run_id,
+            &prepared,
+            tool_outcome_for_replay_test(true, json!({"ok": true}), "", false),
+            Some(&fence),
+            &mut tape_seq,
+            |_| Ok(()),
+            Status::cancelled("process progress channel closed after mutation"),
+        )
+        .await
+        .expect("durable settlement should survive progress publication failure");
+
+        assert_eq!(propagated.code(), Code::Cancelled);
+        assert_tool_fence_is_observed(&state, &fence);
+    }
+
+    #[tokio::test]
+    async fn failed_drained_mutation_commit_marks_fence_effect_unknown() {
+        let state = test_runtime_state();
+        let session_id = "session_failed_drained_mutation_commit";
+        let run_id = "run_failed_drained_mutation_commit";
+        let proposal_id = "proposal_failed_drained_mutation_commit";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+
+        let failure = settle_failed_tool_finalization(
+            &state,
+            run_id,
+            &prepared,
+            Some(&fence),
+            Status::internal("test durable commit failure"),
+        )
+        .await;
+        assert!(matches!(failure, super::ToolOutcomeFinalizationError::BeforeSettlement(_)));
+
+        let connection = rusqlite::Connection::open(state.journal_config.db_path.as_path())
+            .expect("journal database should reopen");
+        let state_name: String = connection
+            .query_row(
+                "SELECT state FROM runtime_side_effect_fences WHERE operation_ulid = ?1",
+                rusqlite::params![fence.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("side-effect fence should load");
+        assert_eq!(state_name, SideEffectFenceState::EffectUnknown.as_str());
+    }
+
+    #[tokio::test]
+    async fn ordinary_v2_projection_failure_marks_successful_mutation_effect_unknown() {
+        let state = test_runtime_state();
+        let session_id = "session_v2_projection_failure";
+        let run_id = "run_v2_projection_failure";
+        let proposal_id = "proposal_v2_projection_failure";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: None,
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let mut tape_seq = 0;
+        let mut retained = false;
+        let successful_outcome = tool_outcome_for_replay_test(true, json!({"ok": true}), "", false);
+        assert!(successful_outcome.success, "the mutation must complete before projection fails");
+        let projection_result: Result<ToolExecutionOutcome, Status> =
+            Err(Status::internal("test projection failure"));
+
+        let result = retain_commit_projected_tool_execution_outcome(
+            &sender,
+            &state,
+            &request_context,
+            run_id,
+            &prepared,
+            projection_result,
+            Some(&fence),
+            &mut tape_seq,
+            |_| {
+                retained = true;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(super::ToolOutcomeFinalizationError::BeforeSettlement(_))));
+        assert!(!retained, "a failed projection must never reach projection retention");
+        assert_tool_fence_state(&state, &fence, SideEffectFenceState::EffectUnknown);
+    }
+
+    #[tokio::test]
+    async fn ordinary_v2_retention_failure_marks_successful_mutation_effect_unknown() {
+        let state = test_runtime_state();
+        let session_id = "session_v2_retention_failure";
+        let run_id = "run_v2_retention_failure";
+        let proposal_id = "proposal_v2_retention_failure";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: None,
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let mut tape_seq = 0;
+
+        let result = retain_commit_projected_tool_execution_outcome(
+            &sender,
+            &state,
+            &request_context,
+            run_id,
+            &prepared,
+            Ok(tool_outcome_for_replay_test(true, json!({"ok": true}), "", false)),
+            Some(&fence),
+            &mut tape_seq,
+            |_| Err::<(), _>(Status::internal("test projection retention failure")),
+        )
+        .await;
+
+        assert!(matches!(result, Err(super::ToolOutcomeFinalizationError::BeforeSettlement(_))));
+        assert_tool_fence_state(&state, &fence, SideEffectFenceState::EffectUnknown);
+    }
+
+    #[tokio::test]
+    async fn ordinary_v2_commit_failure_marks_successful_mutation_effect_unknown() {
+        let state = test_runtime_state();
+        let session_id = "session_v2_commit_failure";
+        let run_id = "run_v2_commit_failure";
+        let proposal_id = "proposal_v2_commit_failure";
+        let fence = start_mutating_tool_fence(&state, session_id, run_id, proposal_id).await;
+        let prepared = mutating_prepared_tool(session_id, proposal_id);
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: None,
+        };
+        state
+            .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: 0,
+                event_type: "test.tool_finalization_collision".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .await
+            .expect("test collision row should persist");
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let mut tape_seq = 0;
+        let mut retention_count = 0_u8;
+
+        let result = retain_commit_projected_tool_execution_outcome(
+            &sender,
+            &state,
+            &request_context,
+            run_id,
+            &prepared,
+            Ok(tool_outcome_for_replay_test(true, json!({"ok": true}), "", false)),
+            Some(&fence),
+            &mut tape_seq,
+            |_| {
+                retention_count += 1;
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(super::ToolOutcomeFinalizationError::BeforeSettlement(_))));
+        assert_eq!(retention_count, 1, "the projection must be retained exactly once");
+        assert_tool_fence_state(&state, &fence, SideEffectFenceState::EffectUnknown);
     }
 
     #[test]

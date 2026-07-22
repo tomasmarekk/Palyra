@@ -744,7 +744,7 @@ impl ChannelCommandRegistry {
                     return malformed(
                         "channel_command/malformed_native",
                         format!("native command args_json is not valid JSON: {error}"),
-                    )
+                    );
                 }
             }
         };
@@ -975,11 +975,7 @@ pub(crate) fn build_channel_command_response(
         }
         _ => format!(
             "{command}: accepted in scoped command runtime; args={}",
-            if rendered_args.is_empty() {
-                "none".to_owned()
-            } else {
-                rendered_args.join(" ")
-            }
+            if rendered_args.is_empty() { "none".to_owned() } else { rendered_args.join(" ") }
         ),
     };
     ChannelCommandResponse {

@@ -242,7 +242,7 @@ pub fn extract_document_content(
             return Err(format!(
                 "document extraction is not supported for '{}' with content type '{}'",
                 request.filename, request.content_type
-            ))
+            ));
         }
     };
     let normalized = normalize_extracted_text(content_text.as_str());

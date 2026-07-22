@@ -740,7 +740,7 @@ pub(crate) async fn reconnect_minimax_oauth_attempt(
         AuthCredential::ApiKey { .. } => {
             return Err(runtime_status_response(tonic::Status::failed_precondition(
                 "profile is not a MiniMax OAuth auth profile",
-            )))
+            )));
         }
     };
     start_minimax_oauth_attempt(
@@ -1080,7 +1080,7 @@ pub(crate) async fn reconnect_openai_oauth_attempt(
         AuthCredential::ApiKey { .. } => {
             return Err(runtime_status_response(tonic::Status::failed_precondition(
                 "profile is not an OpenAI OAuth auth profile",
-            )))
+            )));
         }
     };
     start_openai_oauth_attempt(
@@ -4255,7 +4255,7 @@ async fn discover_minimax_api_key_model_id(
             Ok(None) => {
                 return Err(AnthropicCredentialValidationError::Unexpected(
                     "MiniMax model discovery returned no selectable models".to_owned(),
-                ))
+                ));
             }
             Err(OpenAiCredentialValidationError::ProviderUnavailable)
                 if attempt < ANTHROPIC_VALIDATION_RETRY_ATTEMPTS =>

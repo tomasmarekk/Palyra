@@ -3081,8 +3081,7 @@ mod tests {
     fn read_workspace_file_preserves_env_secret_identifiers() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");
-        let contents =
-            "const apiKey = import.meta.env.PRIVATE_API_KEY;\nconst token = process.env.ACCESS_TOKEN;\n";
+        let contents = "const apiKey = import.meta.env.PRIVATE_API_KEY;\nconst token = process.env.ACCESS_TOKEN;\n";
         fs::write(file_path, contents).expect("workspace file should be written");
         let input = WorkspaceReadFileInput {
             path: "app.js".to_owned(),
@@ -3234,15 +3233,15 @@ mod tests {
                 "PORT=3000\nPASSWORD=[REDACTED_SECRET]\nCLIENT_SECRET=[REDACTED_SECRET]\nSERVICE_API_KEY=[REDACTED_SECRET]\n"
             )
         );
-        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
-            .iter()
-            .any(|reason| reason == "secret_leak.assignment.password")));
-        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
-            .iter()
-            .any(|reason| reason == "secret_leak.assignment.client_secret")));
-        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
-            .iter()
-            .any(|reason| reason == "secret_leak.assignment.api_key")));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == "secret_leak.assignment.password")
+        }));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == "secret_leak.assignment.client_secret")
+        }));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == "secret_leak.assignment.api_key")
+        }));
     }
 
     #[test]
@@ -3270,9 +3269,9 @@ mod tests {
             .redaction_notice
             .as_deref()
             .is_some_and(|notice| notice.contains("do not write")));
-        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
-            .iter()
-            .any(|reason| reason.starts_with("secret_leak.assignment."))));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason.starts_with("secret_leak.assignment."))
+        }));
         assert!(text.contains("APP_SECRET=[REDACTED_SECRET]"));
         assert!(text.contains("VITE_PUBLIC_LABEL=Palyra Preview"));
         assert!(!text.contains("server-only-demo-secret"));

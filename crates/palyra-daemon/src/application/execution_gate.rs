@@ -364,14 +364,12 @@ pub(crate) fn evaluate_execution_gate_pipeline(
                         approved.approval_required = true;
                         approved.reason = format!(
                             "explicit approval granted for tool={tool_name}; approval_reason={}; original_reason={}",
-                            approval_outcome.reason,
-                            approved.reason
+                            approval_outcome.reason, approved.reason
                         );
                     } else {
                         approved.reason = format!(
                             "approval granted but post-approval policy denied tool={tool_name}; approval_reason={}; original_reason={}",
-                            approval_outcome.reason,
-                            approved.reason
+                            approval_outcome.reason, approved.reason
                         );
                     }
                     annotate_tool_decision_with_backend_context(approved, backend_selection)
@@ -381,8 +379,7 @@ pub(crate) fn evaluate_execution_gate_pipeline(
                             allowed: false,
                             reason: format!(
                                 "{APPROVAL_DENIED_REASON}; tool={tool_name}; approval_reason={}; original_reason={}",
-                                approval_outcome.reason,
-                                pre_policy_decision.reason
+                                approval_outcome.reason, pre_policy_decision.reason
                             ),
                             approval_required: true,
                             policy_enforced: true,

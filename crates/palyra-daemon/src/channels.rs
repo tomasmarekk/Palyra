@@ -28,8 +28,8 @@ use palyra_connectors::{
     ConnectorQueueSnapshot, ConnectorRouter, ConnectorRouterError, ConnectorStatusSnapshot,
     ConnectorSupervisor, ConnectorSupervisorConfig, ConnectorSupervisorError, DeadLetterRecord,
     DeliveryIntentRecord, DeliveryIntentRetryOutcome, DeliveryIntentStatus, DeliveryPipelineMode,
-    DrainOutcome, InboundIngestOutcome, InboundMessageEvent, RouteInboundResult,
-    RoutedOutboundMessage,
+    DrainOutcome, InboundIngestOutcome, InboundMessageEvent, OutboundMessageRequest,
+    OutboxEffectState, OutboxEnqueueOutcome, RouteInboundResult, RoutedOutboundMessage,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -185,6 +185,61 @@ pub struct ChannelPlatform {
 }
 
 impl ChannelPlatform {
+    /// Idempotently hands a finalized V2 output to the existing connector outbox.
+    ///
+    /// This method never drains the queue or calls a provider adapter.
+    ///
+    /// # Errors
+    /// Returns validation, connector lookup, or connector-store errors.
+    pub(crate) fn enqueue_runtime_final_delivery(
+        &self,
+        request: &OutboundMessageRequest,
+    ) -> Result<OutboxEnqueueOutcome, ChannelPlatformError> {
+        self.supervisor.enqueue_outbound(request).map_err(ChannelPlatformError::from)
+    }
+
+    /// Returns the payload-free state of a finalized V2 outbox envelope.
+    ///
+    /// # Errors
+    /// Returns connector-store errors or rejects malformed persisted state.
+    pub(crate) fn runtime_final_delivery_state(
+        &self,
+        connector_id: &str,
+        envelope_id: &str,
+    ) -> Result<
+        crate::application::runtime_kernel_v2::finalization::DeliveryOutboxState,
+        ChannelPlatformError,
+    > {
+        use crate::application::runtime_kernel_v2::finalization::DeliveryOutboxState;
+
+        let Some(snapshot) =
+            self.supervisor.store().outbox_delivery_snapshot(connector_id, envelope_id)?
+        else {
+            return Ok(DeliveryOutboxState::Missing);
+        };
+        if snapshot.effect_state == OutboxEffectState::OutcomeUnknown {
+            return Ok(DeliveryOutboxState::OutcomeUnknown);
+        }
+        match snapshot.status.as_str() {
+            "pending" => Ok(DeliveryOutboxState::Queued),
+            "delivered" => snapshot
+                .native_message_id
+                .map(|native_message_id| DeliveryOutboxState::Delivered { native_message_id })
+                .ok_or_else(|| {
+                    ChannelPlatformError::Precondition(
+                        "delivered outbox row is missing native acknowledgement identity"
+                            .to_owned(),
+                    )
+                }),
+            "dead" => Err(ChannelPlatformError::Precondition(
+                "final delivery outbox row is dead-lettered".to_owned(),
+            )),
+            _ => Err(ChannelPlatformError::Precondition(
+                "final delivery outbox row has an unsupported status".to_owned(),
+            )),
+        }
+    }
+
     /// Opens the connector and media stores next to `db_path`, wires the
     /// gRPC gateway router, and registers the default connector inventory.
     ///

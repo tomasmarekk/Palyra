@@ -31,6 +31,8 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "model_provider.anthropic_api_key_secret_ref",
     "model_provider.anthropic_api_key_vault_ref",
     "gateway.admin_token",
+    "runtime_kernel.sampling_key_hex",
+    "runtime_kernel.sampling_key_secret_ref",
     "tool_call.browser_service.auth_token",
     "tool_call.browser_service.auth_token_secret_ref",
     "tool_call.browser_service.state_key_secret_ref",
@@ -511,6 +513,94 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Enables the v1 orchestrator run loop.",
     },
     ConfigSchemaEntry {
+        path: "runtime_kernel.profile",
+        value_type: "enum(legacy|v2_shadow|v2_canary|v2)",
+        default_value: Some("legacy"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_PROFILE"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Closed runtime profile applied atomically to newly admitted runs.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.canary_basis_points",
+        value_type: "u16(0..10000)",
+        default_value: Some("0"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_CANARY_BASIS_POINTS"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "V2 canary allocation in basis points.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.shadow_sample_basis_points",
+        value_type: "u16(0..10000)",
+        default_value: Some("0"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Observe-only V2 shadow sampling allocation in basis points.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.sampling_identity",
+        value_type: "enum(session|principal)",
+        default_value: Some("session"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_SAMPLING_IDENTITY"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Stable identity class used only inside keyed rollout sampling.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.sampling_key_hex",
+        value_type: "secret_hex_32_bytes",
+        default_value: None,
+        env_vars: &["PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX"],
+        secret: true,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Deployment-stable keyed sampling material; always redacted.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.sampling_key_secret_ref",
+        value_type: "secret_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Structured source for the deployment-stable 32-byte sampling key.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.existing_session_policy",
+        value_type: "enum(keep_pinned|migrate_at_safe_boundary)",
+        default_value: Some("keep_pinned"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Explicit migration posture for sessions created before a profile change.",
+    },
+    ConfigSchemaEntry {
+        path: "runtime_kernel.rollback_policy",
+        value_type: "enum(finish_read_only_suspend_mutating|suspend_all_at_safe_boundary)",
+        default_value: Some("finish_read_only_suspend_mutating"),
+        env_vars: &["PALYRA_RUNTIME_KERNEL_ROLLBACK_POLICY"],
+        secret: false,
+        deprecated: false,
+        restart_required: false,
+        category: "runtime_kernel",
+        description: "Authority-preserving rollback posture for active V2 runs.",
+    },
+    ConfigSchemaEntry {
         path: "identity.allow_insecure_node_rpc_without_mtls",
         value_type: "bool",
         default_value: Some("false"),
@@ -727,6 +817,7 @@ pub struct RootFileConfig {
     pub doctor_check_registry: Option<FileDoctorCheckRegistryConfig>,
     pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
+    pub runtime_kernel: Option<FileRuntimeKernelConfig>,
     pub memory: Option<FileMemoryConfig>,
     pub media: Option<FileMediaConfig>,
     pub model_provider: Option<FileModelProviderConfig>,
@@ -1125,6 +1216,20 @@ pub struct FileCronConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileOrchestratorConfig {
     pub runloop_v1_enabled: Option<bool>,
+}
+
+/// `[runtime_kernel]`: atomic runtime profile and rollback posture.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRuntimeKernelConfig {
+    pub profile: Option<String>,
+    pub canary_basis_points: Option<u16>,
+    pub shadow_sample_basis_points: Option<u16>,
+    pub sampling_identity: Option<String>,
+    pub sampling_key_hex: Option<String>,
+    pub sampling_key_secret_ref: Option<SecretRef>,
+    pub existing_session_policy: Option<String>,
+    pub rollback_policy: Option<String>,
 }
 
 /// `[memory]`: memory item limits, auto-inject, retention, and retrieval.
@@ -1550,6 +1655,8 @@ mod tests {
         assert!(is_secret_config_path("tool_call.browser_service.auth_token_secret_ref"));
         assert!(is_secret_config_path("tool_call.browser_service.state_key_secret_ref"));
         assert!(is_secret_config_path("tool_call.browser_service.state_key_vault_ref"));
+        assert!(is_secret_config_path("runtime_kernel.sampling_key_hex"));
+        assert!(is_secret_config_path("runtime_kernel.sampling_key_secret_ref"));
         assert!(is_secret_config_path(" admin.auth_token "));
         assert!(is_secret_config_path("admin.auth_token_secret_ref"));
         assert!(is_secret_config_path("admin.connector_token"));
@@ -2394,5 +2501,75 @@ mod tests {
         assert_eq!(code_intel.max_output_bytes, Some(32_768));
         assert_eq!(code_intel.max_items, Some(24));
         assert_eq!(code_intel.idle_reap_ms, Some(60_000));
+    }
+
+    #[test]
+    fn runtime_kernel_schema_and_env_catalog_are_closed_and_redacted() {
+        let mut document: toml::Value = toml::from_str(
+            r#"
+            [runtime_kernel]
+            profile = "v2_canary"
+            canary_basis_points = 250
+            shadow_sample_basis_points = 0
+            sampling_identity = "principal"
+            sampling_key_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            existing_session_policy = "keep_pinned"
+            rollback_policy = "finish_read_only_suspend_mutating"
+            "#,
+        )
+        .expect("runtime-kernel config should parse");
+        let parsed: RootFileConfig =
+            document.clone().try_into().expect("typed runtime-kernel config should parse");
+        let runtime_kernel = parsed.runtime_kernel.expect("runtime-kernel section should exist");
+        assert_eq!(runtime_kernel.profile.as_deref(), Some("v2_canary"));
+        assert_eq!(runtime_kernel.canary_basis_points, Some(250));
+        assert_eq!(runtime_kernel.sampling_identity.as_deref(), Some("principal"));
+
+        redact_secret_config_values(&mut document);
+        assert_eq!(
+            document
+                .get("runtime_kernel")
+                .and_then(|section| section.get("sampling_key_hex"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert!(!document.to_string().contains("aaaaaaaa"));
+
+        let mut secret_ref_document: toml::Value = toml::from_str(
+            r#"
+            [runtime_kernel]
+            profile = "v2_shadow"
+            shadow_sample_basis_points = 100
+            [runtime_kernel.sampling_key_secret_ref]
+            kind = "env"
+            variable = "PALYRA_RUNTIME_KERNEL_SECRET_KEY_TEST"
+            "#,
+        )
+        .expect("runtime-kernel secret-ref config should parse");
+        let _: RootFileConfig = secret_ref_document
+            .clone()
+            .try_into()
+            .expect("typed runtime-kernel secret-ref config should parse");
+        redact_secret_config_values(&mut secret_ref_document);
+        assert_eq!(
+            secret_ref_document
+                .get("runtime_kernel")
+                .and_then(|section| section.get("sampling_key_secret_ref"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert!(!secret_ref_document.to_string().contains("PALYRA_RUNTIME_KERNEL_SECRET_KEY_TEST"));
+
+        for expected in [
+            "PALYRA_RUNTIME_KERNEL_PROFILE",
+            "PALYRA_RUNTIME_KERNEL_CANARY_BASIS_POINTS",
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            "PALYRA_RUNTIME_KERNEL_SAMPLING_IDENTITY",
+            "PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX",
+            "PALYRA_RUNTIME_KERNEL_EXISTING_SESSION_POLICY",
+            "PALYRA_RUNTIME_KERNEL_ROLLBACK_POLICY",
+        ] {
+            assert!(known_config_env_vars().contains(&expected));
+        }
     }
 }

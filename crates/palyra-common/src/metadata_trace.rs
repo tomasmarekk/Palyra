@@ -116,6 +116,8 @@ pub enum MetadataTraceEventDataV1 {
     RunStarted(RunStartedMetadataV1),
     /// The runtime and harness path were selected.
     RuntimeSelected(RuntimeSelectedMetadataV1),
+    /// A side-effect-free V2 shadow plan was compared with the authoritative legacy plan.
+    RuntimeShadowDifferential(RuntimeShadowDifferentialMetadataV1),
     /// Bounded context assembly completed.
     ContextAssembled(ContextAssembledMetadataV1),
     /// A provider route attempt changed phase.
@@ -145,6 +147,7 @@ impl MetadataTraceEventDataV1 {
         match self {
             Self::RunStarted(_) => "run_started",
             Self::RuntimeSelected(_) => "runtime_selected",
+            Self::RuntimeShadowDifferential(_) => "runtime_shadow_differential",
             Self::ContextAssembled(_) => "context_assembled",
             Self::ProviderAttempt(_) => "provider_attempt",
             Self::ToolGate(_) => "tool_gate",
@@ -186,6 +189,36 @@ pub struct RuntimeSelectedMetadataV1 {
     pub auth_profile_id_sha256: Option<String>,
     /// Ordered schema identifiers and their exact digests.
     pub schema_hashes: Vec<MetadataTraceSchemaHashV1>,
+}
+
+/// Metadata emitted for one observe-only RuntimeKernelV2 shadow comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeShadowDifferentialMetadataV1 {
+    /// Bounded reason that the run entered shadow evaluation.
+    pub enrollment: MetadataTraceShadowEnrollmentV1,
+    /// Aggregate result derived from the fixed differential dimensions.
+    pub classification: MetadataTraceShadowClassificationV1,
+    /// Stable machine reason code for the classification.
+    pub reason_code: String,
+    /// Runtime-selection projection comparison.
+    pub runtime_selection: MetadataTraceDifferentialOutcomeV1,
+    /// Ordered context-segment projection comparison.
+    pub context_segments: MetadataTraceDifferentialOutcomeV1,
+    /// Context trust and instruction-safety comparison.
+    pub context_safety: MetadataTraceDifferentialOutcomeV1,
+    /// Input token-budget comparison.
+    pub token_budget: MetadataTraceDifferentialOutcomeV1,
+    /// Model-visible tool-catalog comparison.
+    pub tool_catalog: MetadataTraceDifferentialOutcomeV1,
+    /// Policy-input comparison.
+    pub policy_input: MetadataTraceDifferentialOutcomeV1,
+    /// Canonical expected-phase comparison.
+    pub phase_plan: MetadataTraceDifferentialOutcomeV1,
+    /// Whether this comparison prevents unattended promotion.
+    pub promotion_blocked: bool,
+    /// Proof that the compared candidate had no side-effect authority.
+    pub shadow_side_effect_free: bool,
 }
 
 /// One schema identifier and exact SHA-256 digest used by the runtime.
@@ -361,6 +394,44 @@ pub enum MetadataTraceRouteClassV1 {
     RecordReplay,
     /// Explicitly authorized live route.
     Live,
+}
+
+/// Closed enrollment reasons for RuntimeKernelV2 shadow comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataTraceShadowEnrollmentV1 {
+    /// Deployment-key sampling selected the session.
+    DeterministicSample,
+    /// A host-owned explicit QA enrollment selected the session.
+    ExplicitSession,
+}
+
+/// Closed aggregate classifications for RuntimeKernelV2 shadow comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataTraceShadowClassificationV1 {
+    /// Every fixed differential dimension matched.
+    Expected,
+    /// Only bounded operational drift was observed.
+    Benign,
+    /// Behavioral drift requires operator review.
+    Risky,
+    /// A safety or authority invariant diverged.
+    InvariantViolation,
+}
+
+/// Closed outcomes for one RuntimeKernelV2 shadow differential dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataTraceDifferentialOutcomeV1 {
+    /// Both projections matched.
+    Match,
+    /// Drift stayed within the fixed operational tolerance.
+    BenignDifference,
+    /// Behavioral drift requires review.
+    RiskyDifference,
+    /// Safety or authority semantics diverged.
+    InvariantViolation,
 }
 
 /// Closed provider-attempt outcomes.

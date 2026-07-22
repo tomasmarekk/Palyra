@@ -363,6 +363,20 @@ fn all_event_kinds_have_stable_unique_wire_names() {
                 sha256: digest(MetadataTraceIdDomainV1::Custom, "schema"),
             }],
         }),
+        MetadataTraceEventDataV1::RuntimeShadowDifferential(RuntimeShadowDifferentialMetadataV1 {
+            enrollment: MetadataTraceShadowEnrollmentV1::DeterministicSample,
+            classification: MetadataTraceShadowClassificationV1::Expected,
+            reason_code: "runtime.shadow.differential_expected".to_owned(),
+            runtime_selection: MetadataTraceDifferentialOutcomeV1::Match,
+            context_segments: MetadataTraceDifferentialOutcomeV1::Match,
+            context_safety: MetadataTraceDifferentialOutcomeV1::Match,
+            token_budget: MetadataTraceDifferentialOutcomeV1::Match,
+            tool_catalog: MetadataTraceDifferentialOutcomeV1::Match,
+            policy_input: MetadataTraceDifferentialOutcomeV1::Match,
+            phase_plan: MetadataTraceDifferentialOutcomeV1::Match,
+            promotion_blocked: false,
+            shadow_side_effect_free: true,
+        }),
         MetadataTraceEventDataV1::ContextAssembled(ContextAssembledMetadataV1 {
             context_engine_id: "context".to_owned(),
             context_engine_version: "1.0.0".to_owned(),
@@ -458,6 +472,7 @@ fn json_schema_tracks_contract_and_closes_every_object() {
             "recovery_continuation",
             "run_started",
             "runtime_selected",
+            "runtime_shadow_differential",
             "terminalization",
             "tool_gate",
             "tool_outcome",
@@ -466,6 +481,40 @@ fn json_schema_tracks_contract_and_closes_every_object() {
 
     assert_closed_schema_objects(&schema);
     assert_forbidden_property_names_absent(&schema);
+}
+
+#[test]
+fn shadow_differential_requires_consistent_closed_metadata() {
+    let valid = trace_event(
+        1,
+        1,
+        MetadataTraceEventDataV1::RuntimeShadowDifferential(RuntimeShadowDifferentialMetadataV1 {
+            enrollment: MetadataTraceShadowEnrollmentV1::ExplicitSession,
+            classification: MetadataTraceShadowClassificationV1::InvariantViolation,
+            reason_code: "runtime.shadow.differential_invariant_violation".to_owned(),
+            runtime_selection: MetadataTraceDifferentialOutcomeV1::Match,
+            context_segments: MetadataTraceDifferentialOutcomeV1::Match,
+            context_safety: MetadataTraceDifferentialOutcomeV1::InvariantViolation,
+            token_budget: MetadataTraceDifferentialOutcomeV1::Match,
+            tool_catalog: MetadataTraceDifferentialOutcomeV1::Match,
+            policy_input: MetadataTraceDifferentialOutcomeV1::Match,
+            phase_plan: MetadataTraceDifferentialOutcomeV1::Match,
+            promotion_blocked: true,
+            shadow_side_effect_free: true,
+        }),
+        Some(root_event().event_id_sha256),
+    );
+    valid.validate_shape().expect("consistent shadow metadata should validate");
+
+    let mut forged = valid;
+    let MetadataTraceEventDataV1::RuntimeShadowDifferential(metadata) = &mut forged.event else {
+        panic!("test event must remain a shadow differential");
+    };
+    metadata.shadow_side_effect_free = false;
+    assert_eq!(
+        forged.validate_shape().expect_err("forged shadow authority must fail").code(),
+        "metadata_trace_shadow_differential_invalid"
+    );
 }
 
 fn assert_closed_schema_objects(value: &Value) {
