@@ -4009,11 +4009,19 @@ async fn process_run_stream_message_inner(
     );
     let previous_run_id_for_context = previous_session_run_id.take();
     let context_assembly_started_at = TokioInstant::now();
-    let context_engine_enabled = runtime_state.config.feature_rollouts.context_engine.enabled
-        || matches!(
-            runtime_dispatch,
-            RunStreamRuntimeDispatch::Active { decision: RuntimeDispatchDecision::V2 { .. }, .. }
-        );
+    let v2_runtime_active = match runtime_dispatch {
+        RunStreamRuntimeDispatch::Active { decision, .. } => match decision {
+            RuntimeDispatchDecision::V2 { .. } => true,
+            RuntimeDispatchDecision::Legacy { .. } => false,
+            RuntimeDispatchDecision::LegacyWithShadow { .. } => false,
+            RuntimeDispatchDecision::Blocked { .. } => false,
+        },
+        RunStreamRuntimeDispatch::Uninitialized | RunStreamRuntimeDispatch::AdmissionClosed => {
+            false
+        }
+    };
+    let context_engine_enabled =
+        runtime_state.config.feature_rollouts.context_engine.enabled || v2_runtime_active;
     let prepare_request = PrepareModelProviderInputRequest {
         run_id: run_id.as_str(),
         tape_seq,
