@@ -153,6 +153,32 @@ pub(crate) async fn admin_status_handler(
         state.runtime.daemon_lifecycle_snapshot().map_err(runtime_status_response)?;
     let restart_decisions =
         state.runtime.recent_config_restart_decisions().map_err(runtime_status_response)?;
+    let startup_recovery_actions =
+        state.runtime.recent_startup_recovery_actions().map_err(runtime_status_response)?;
+    let startup_recovery = json!({
+        "schema_version": 1,
+        "total": startup_recovery_actions.len(),
+        "continuation_queued": startup_recovery_actions
+            .iter()
+            .filter(|action| action.actuation_kind
+                == crate::journal::StartupRecoveryActuationKind::ContinuationQueued)
+            .count(),
+        "confirmation_required": startup_recovery_actions
+            .iter()
+            .filter(|action| action.actuation_kind
+                == crate::journal::StartupRecoveryActuationKind::ConfirmationRequired)
+            .count(),
+        "recent": startup_recovery_actions
+            .iter()
+            .map(|action| json!({
+                "decision": action.decision,
+                "reason_code": action.reason_code,
+                "actuation_kind": action.actuation_kind,
+                "created_at_unix_ms": action.created_at_unix_ms,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let safe_resume_matrix = crate::application::tool_registry::safe_resume_matrix();
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
         map.insert("mcp".to_owned(), mcp_payload);
@@ -215,6 +241,15 @@ pub(crate) async fn admin_status_handler(
             serde_json::to_value(restart_decisions).map_err(|error| {
                 runtime_status_response(tonic::Status::internal(format!(
                     "failed to serialize restart decisions: {error}"
+                )))
+            })?,
+        );
+        map.insert("startup_recovery".to_owned(), startup_recovery);
+        map.insert(
+            "safe_resume_matrix".to_owned(),
+            serde_json::to_value(safe_resume_matrix).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to serialize safe resume matrix: {error}"
                 )))
             })?,
         );

@@ -13,7 +13,7 @@ use super::{
     build_model_visible_tool_catalog_snapshot, describe_catalog_tool,
     effective_tool_surface_report, projection_policy_for_tool,
     provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target,
-    resolve_tool_execution_semantics, search_tool_catalog_index,
+    resolve_tool_execution_semantics, safe_resume_matrix, search_tool_catalog_index,
     snapshot_to_provider_request_value, stable_hash_value, tool_execution_semantics,
     validate_tool_call_against_catalog_snapshot, ToolCatalogBuildRequest,
     ToolCatalogPolicySnapshot, ToolExposureSurface, ToolResultProjectionPolicy, ToolSchemaDialect,
@@ -256,6 +256,44 @@ fn input_aware_reconciler_registry_covers_major_mutation_classes() {
 }
 
 #[test]
+fn package_mutations_require_confirmation_for_partial_state() {
+    for input in [
+        br#"{"command":"npm install left-pad"}"#.as_slice(),
+        br#"{"executable":"cargo","args":["install","cargo-audit"]}"#.as_slice(),
+        br#"{"argv":["python","-m","pip","install","requests"]}"#.as_slice(),
+        br#"{"command":"winget install Git.Git"}"#.as_slice(),
+    ] {
+        let resolved = resolve_tool_execution_semantics(
+            "palyra.process.run",
+            ToolReplaySafetyClass::ExternalSideEffect,
+            input,
+        );
+        assert_eq!(resolved.semantics.idempotency_class, RuntimeIdempotencyClass::NonIdempotent);
+        assert_eq!(resolved.semantics.restart_policy, SideEffectRestartPolicy::RequireConfirmation);
+        assert_eq!(resolved.semantics.reconciliation_strategy, ReconciliationStrategy::None);
+    }
+}
+
+#[test]
+fn safe_resume_matrix_has_no_blind_unknown_retry() {
+    let matrix = safe_resume_matrix();
+    assert_eq!(matrix.len(), 8);
+    assert!(matrix.iter().all(|entry| entry.stable_rollout_eligible));
+    assert!(matrix.iter().all(|entry| entry.intent_recorded_outcome == "safe_to_retry"));
+    assert!(matrix.iter().all(|entry| {
+        matches!(entry.unknown_without_receipt_outcome, "needs_confirmation" | "irreconcilable")
+    }));
+    assert!(matrix.iter().any(|entry| {
+        entry.operation_class == "package_install"
+            && entry.unknown_without_receipt_outcome == "needs_confirmation"
+    }));
+    assert!(matrix.iter().any(|entry| {
+        entry.operation_class == "connector_delivery"
+            && entry.exact_receipt_outcome == "already_applied"
+    }));
+}
+
+#[test]
 fn mixed_operation_builtins_fence_only_mutating_inputs() {
     let read_cases = [
         ("palyra.http.fetch", br#"{"url":"https://example.test","method":"HEAD"}"#.as_slice()),
@@ -342,6 +380,11 @@ fn effect_unknown_never_blindly_retries_a_registered_mutation() {
             "palyra.process.run",
             br#"{"command":"echo"}"#.as_slice(),
             SideEffectRetryDecision::ReconciliationRequired,
+        ),
+        (
+            "palyra.process.run",
+            br#"{"command":"npm install left-pad"}"#.as_slice(),
+            SideEffectRetryDecision::ConfirmationRequired,
         ),
         (
             "palyra.http.fetch",

@@ -87,6 +87,7 @@ pub(crate) mod run_admission;
 pub(crate) mod runtime_finalization;
 pub(crate) mod runtime_kernel;
 mod shared_runtime;
+pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
 
 use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
@@ -122,6 +123,9 @@ pub(crate) use shared_runtime::{
 #[cfg(test)]
 pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInvalidateOutcome};
 pub(crate) use shared_runtime::{RuntimeHealthProbeBeginOutcome, RuntimeHealthProbeBeginRequest};
+pub use startup_recovery::{
+    ContinuationRunDescriptor, StartupRecoveryAction, StartupRecoveryActuationKind,
+};
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
 
@@ -1910,11 +1914,21 @@ enum OrchestratorTerminalAuthority {
     Exact,
 }
 
-/// Runs force-failed by startup orphan recovery.
+/// Outcomes produced while the startup barrier owns interrupted Runs.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct OrchestratorStartupRunRecoveryReport {
+    /// Number of nonterminal Runs inspected under the barrier.
+    pub scanned_count: u64,
     pub terminalized_count: u64,
     pub terminalized_run_ids: Vec<String>,
+    /// Continuations durably queued before ingress opened.
+    pub continuation_queued_count: u64,
+    pub continuation_descriptors: Vec<ContinuationRunDescriptor>,
+    /// Durable approvals created for ambiguous recovery.
+    pub confirmation_required_count: u64,
+    pub confirmation_ids: Vec<String>,
+    /// Classifier actions, including blocked and do-not-resume outcomes.
+    pub actions: Vec<StartupRecoveryAction>,
     pub deferred_metadata_trace_run_ids: Vec<String>,
 }
 
@@ -7439,6 +7453,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "config_watch_and_restart_decisions",
         sql: restart::MIGRATION_80_SQL,
     },
+    Migration {
+        version: 81,
+        name: "startup_recovery_actions",
+        sql: startup_recovery::MIGRATION_81_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -8786,15 +8805,28 @@ fn append_run_lifecycle_event_tx(
     Ok(())
 }
 
+struct StartupRecoveryTapeEvent<'a> {
+    candidate: &'a StartupResumeCandidate,
+    reason: &'a str,
+    resume_decision: &'a ResumeDecision,
+    replay_projection: &'a ReplayContinuityPolicyProjection,
+    recovery_action: &'a StartupRecoveryAction,
+    now: i64,
+}
+
 fn append_startup_recovery_tape_event_tx(
     connection: &Connection,
     max_payload_bytes: usize,
-    candidate: &StartupResumeCandidate,
-    reason: &str,
-    resume_decision: &ResumeDecision,
-    replay_projection: &ReplayContinuityPolicyProjection,
-    now: i64,
+    event: StartupRecoveryTapeEvent<'_>,
 ) -> Result<(), JournalError> {
+    let StartupRecoveryTapeEvent {
+        candidate,
+        reason,
+        resume_decision,
+        replay_projection,
+        recovery_action,
+        now,
+    } = event;
     let seq = next_orchestrator_tape_seq(connection, candidate.run_id.as_str())?;
     append_orchestrator_tape_event_tx(
         connection,
@@ -8806,7 +8838,7 @@ fn append_startup_recovery_tape_event_tx(
             payload_json: json!({
                 "event": "run.recovery",
                 "recovery_kind": "startup_orphaned_active_run",
-                "recovery_state": "manual_resume_required",
+                "recovery_state": recovery_action.actuation_kind.as_str(),
                 "run_id": candidate.run_id.as_str(),
                 "session_id": candidate.session_id.as_str(),
                 "previous_state": candidate.previous_state.as_str(),
@@ -8814,6 +8846,15 @@ fn append_startup_recovery_tape_event_tx(
                 "resume_decision": resume_decision.decision.as_str(),
                 "resume_reason_code": resume_decision.reason_code.as_str(),
                 "resume_freshness_age_ms": resume_decision.freshness_age_ms,
+                "continuation_run_id": recovery_action
+                    .continuation
+                    .as_ref()
+                    .map(|descriptor| descriptor.continuation_run_id.as_str()),
+                "continuation_task_id": recovery_action
+                    .continuation
+                    .as_ref()
+                    .map(|descriptor| descriptor.continuation_task_id.as_str()),
+                "confirmation_id": recovery_action.confirmation_id.as_deref(),
                 "replay_continuity": {
                     "event_type": REPLAY_CONTINUITY_EVENT_COMPLETED,
                     "provider_transcript_decision": replay_projection.provider_transcript.decision.as_str(),
@@ -8824,7 +8865,16 @@ fn append_startup_recovery_tape_event_tx(
                     "redaction_level": replay_projection.redaction_level.as_str(),
                 },
                 "reason": reason,
-                "operator_guidance": "Inspect the failed run tape, then start a new run in the same session if continuation is required."
+                "operator_guidance": match recovery_action.actuation_kind {
+                    StartupRecoveryActuationKind::ContinuationQueued =>
+                        "A continuation is queued with a fresh Run identity; do not replay unresolved effects.",
+                    StartupRecoveryActuationKind::ConfirmationRequired =>
+                        "Resolve the durable startup-recovery approval before starting replacement work.",
+                    StartupRecoveryActuationKind::DoNotResume =>
+                        "Inspect durable evidence before manually starting replacement work.",
+                    StartupRecoveryActuationKind::PolicyBlocked =>
+                        "Restore valid authority or policy before starting replacement work.",
+                }
             })
             .to_string(),
         },
@@ -8879,6 +8929,7 @@ struct StartupResumeCandidate {
     previous_state: String,
     parent_run_id: Option<String>,
     principal: String,
+    device_id: String,
     channel: Option<String>,
     origin_kind: String,
 }
@@ -8898,9 +8949,12 @@ fn startup_resume_classifier_input(
             session_id: candidate.session_id.clone(),
             run_state: candidate.previous_state.clone(),
             run_principal: candidate.principal.clone(),
-            reconnect_principal: None,
+            // Startup recovery is host-owned and uses the persisted session
+            // authority. Supplying that exact authority makes SafeToResume
+            // reachable without accepting a caller-selected identity.
+            reconnect_principal: Some(candidate.principal.clone()),
             run_channel: candidate.channel.clone(),
-            reconnect_channel: None,
+            reconnect_channel: candidate.channel.clone(),
             channel_exists: candidate
                 .channel
                 .as_deref()
@@ -12857,8 +12911,11 @@ impl JournalStore {
         })
     }
 
-    /// Force-fails runs left active by a previous daemon process, recording
-    /// lifecycle and recovery tape events for each.
+    /// Classifies and actuates Runs left active by a previous daemon process.
+    ///
+    /// A safe continuation or confirmation is committed atomically with closure
+    /// of the interrupted generation. Stale and policy-blocked Runs are closed
+    /// with explicit evidence and never replayed.
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
@@ -12876,6 +12933,7 @@ impl JournalStore {
                         runs.state,
                         runs.parent_run_ulid,
                         sessions.principal,
+                        sessions.device_id,
                         sessions.channel,
                         COALESCE(runs.origin_kind, 'manual')
                     FROM orchestrator_runs AS runs
@@ -12897,8 +12955,9 @@ impl JournalStore {
                         previous_state: row.get(2)?,
                         parent_run_id: row.get(3)?,
                         principal: row.get(4)?,
-                        channel: row.get(5)?,
-                        origin_kind: row.get(6)?,
+                        device_id: row.get(5)?,
+                        channel: row.get(6)?,
+                        origin_kind: row.get(7)?,
                     })
                 },
             )?;
@@ -12908,8 +12967,10 @@ impl JournalStore {
             }
             records
         };
+        let scanned_count = active_runs.len() as u64;
         let mut terminalized_run_ids = Vec::new();
         let mut deferred_metadata_trace_run_ids = Vec::new();
+        let mut actions = Vec::new();
         for candidate in active_runs {
             let now = current_unix_ms()?;
             let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -12953,6 +13014,27 @@ impl JournalStore {
                     candidate.run_id
                 ))
             })?;
+            let recovery_action = startup_recovery::materialize_startup_recovery_action_tx(
+                &transaction,
+                &candidate,
+                active_generation.generation,
+                &resume_decision,
+                now,
+            )?;
+            let terminal_reason = match recovery_action.actuation_kind {
+                StartupRecoveryActuationKind::ContinuationQueued => {
+                    "interrupted run superseded by a durable startup continuation"
+                }
+                StartupRecoveryActuationKind::ConfirmationRequired => {
+                    "interrupted run awaits durable startup recovery confirmation"
+                }
+                StartupRecoveryActuationKind::DoNotResume => {
+                    "interrupted run is outside the safe automatic recovery contract"
+                }
+                StartupRecoveryActuationKind::PolicyBlocked => {
+                    "interrupted run continuation is blocked by current authority or policy"
+                }
+            };
             let updated = transaction.execute(
                 r#"
                     UPDATE orchestrator_runs
@@ -12968,7 +13050,7 @@ impl JournalStore {
                     candidate.run_id.as_str(),
                     RunLifecycleState::Failed.as_str(),
                     now,
-                    reason,
+                    terminal_reason,
                     candidate.previous_state.as_str(),
                 ],
             )?;
@@ -12999,6 +13081,9 @@ impl JournalStore {
                         "recovery": "startup_orphaned_run",
                         "resume_decision": resume_decision.decision.as_str(),
                         "resume_reason_code": resume_decision.reason_code.as_str(),
+                        "actuation_kind": recovery_action.actuation_kind.as_str(),
+                        "continuation_queued": recovery_action.continuation.is_some(),
+                        "confirmation_required": recovery_action.confirmation_id.is_some(),
                         "replay_continuity": {
                             "event_type": REPLAY_CONTINUITY_EVENT_COMPLETED,
                             "provider_transcript_decision": replay_projection.provider_transcript.decision.as_str(),
@@ -13041,6 +13126,7 @@ impl JournalStore {
                         "state": RunLifecycleState::Failed.as_str(),
                         "recovery": "startup_orphaned_run",
                         "resume_decision": resume_decision.decision.as_str(),
+                        "actuation_kind": recovery_action.actuation_kind.as_str(),
                         "replay_rollout_mode": replay_projection.rollout_mode.as_str(),
                     }),
                 },
@@ -13083,11 +13169,14 @@ impl JournalStore {
             append_startup_recovery_tape_event_tx(
                 &transaction,
                 self.config.max_payload_bytes,
-                &candidate,
-                reason,
-                &resume_decision,
-                &replay_projection,
-                now,
+                StartupRecoveryTapeEvent {
+                    candidate: &candidate,
+                    reason,
+                    resume_decision: &resume_decision,
+                    replay_projection: &replay_projection,
+                    recovery_action: &recovery_action,
+                    now,
+                },
             )?;
             let terminal_tape_sequence =
                 next_orchestrator_tape_seq(&transaction, candidate.run_id.as_str())?;
@@ -13100,7 +13189,7 @@ impl JournalStore {
                     event_type: "status".to_owned(),
                     payload_json: run_terminal_status_payload(
                         RunLifecycleState::Failed,
-                        reason,
+                        terminal_reason,
                         ORCHESTRATOR_STARTUP_RECOVERY_REASON_CODE,
                     ),
                 },
@@ -13139,6 +13228,7 @@ impl JournalStore {
             if defer_metadata_trace_terminalization {
                 deferred_metadata_trace_run_ids.push(candidate.run_id.clone());
             }
+            actions.push(recovery_action);
             terminalized_run_ids.push(candidate.run_id);
         }
         drop(guard);
@@ -13167,9 +13257,19 @@ impl JournalStore {
                 );
             }
         }
+        let continuation_descriptors =
+            actions.iter().filter_map(|action| action.continuation.clone()).collect::<Vec<_>>();
+        let confirmation_ids =
+            actions.iter().filter_map(|action| action.confirmation_id.clone()).collect::<Vec<_>>();
         Ok(OrchestratorStartupRunRecoveryReport {
+            scanned_count,
             terminalized_count: terminalized_run_ids.len() as u64,
             terminalized_run_ids,
+            continuation_queued_count: continuation_descriptors.len() as u64,
+            continuation_descriptors,
+            confirmation_required_count: confirmation_ids.len() as u64,
+            confirmation_ids,
+            actions,
             deferred_metadata_trace_run_ids,
         })
     }
@@ -35185,7 +35285,10 @@ mod tests {
             .expect("snapshot lookup should succeed")
             .expect("run should exist");
         assert_eq!(in_progress.state, RunLifecycleState::Failed.as_str());
-        assert_eq!(in_progress.last_error.as_deref(), Some(reason));
+        assert_eq!(
+            in_progress.last_error.as_deref(),
+            Some("interrupted run is outside the safe automatic recovery contract")
+        );
         assert!(in_progress.completed_at_unix_ms.is_some());
         assert_eq!(in_progress.tape_events, 5);
 
@@ -35194,7 +35297,10 @@ mod tests {
             .expect("snapshot lookup should succeed")
             .expect("run should exist");
         assert_eq!(accepted.state, RunLifecycleState::Failed.as_str());
-        assert_eq!(accepted.last_error.as_deref(), Some(reason));
+        assert_eq!(
+            accepted.last_error.as_deref(),
+            Some("interrupted run is outside the safe automatic recovery contract")
+        );
         assert!(accepted.completed_at_unix_ms.is_some());
         assert_eq!(accepted.tape_events, 4);
 
@@ -35266,7 +35372,7 @@ mod tests {
                 .expect("recovery payload should be JSON");
         assert_eq!(recovery_payload["event"], "run.recovery");
         assert_eq!(recovery_payload["recovery_kind"], "startup_orphaned_active_run");
-        assert_eq!(recovery_payload["recovery_state"], "manual_resume_required");
+        assert_eq!(recovery_payload["recovery_state"], "do_not_resume");
         assert_eq!(recovery_payload["previous_state"], RunLifecycleState::InProgress.as_str());
         assert_eq!(recovery_payload["terminal_state"], RunLifecycleState::Failed.as_str());
         assert_eq!(recovery_payload["resume_decision"], "stale_do_not_resume");
@@ -35328,6 +35434,194 @@ mod tests {
             assert_eq!(terminal_event_count, 1);
             assert_eq!(active_generation_count, 0);
         }
+    }
+
+    #[test]
+    fn startup_recovery_queues_one_real_continuation_for_safe_read_only_wait() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SC1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RC1";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should enter in_progress");
+        for (seq, event_type, payload_json) in [
+            (0, "provider_turn_output", json!({"finish_reason": "tool_calls"})),
+            (
+                1,
+                "tool_proposal",
+                json!({
+                    "proposal_id": "read-1",
+                    "tool_name": "palyra.fs.read_file",
+                }),
+            ),
+            (
+                2,
+                "tool_decision",
+                json!({
+                    "proposal_id": "read-1",
+                    "decision": "allow",
+                }),
+            ),
+        ] {
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq,
+                    event_type: event_type.to_owned(),
+                    payload_json: payload_json.to_string(),
+                })
+                .expect("pre-crash evidence should persist");
+        }
+
+        let report = store
+            .terminalize_orphaned_orchestrator_runs_on_startup("startup_test")
+            .expect("safe recovery should actuate");
+        assert_eq!(report.scanned_count, 1);
+        assert_eq!(report.continuation_queued_count, 1);
+        assert_eq!(report.confirmation_required_count, 0);
+        let descriptor =
+            report.continuation_descriptors.first().expect("continuation should be described");
+        assert_eq!(descriptor.recovered_from_run_id, run_id);
+        assert_eq!(descriptor.session_id, session_id);
+        assert_eq!(descriptor.budget_tokens, 4_096);
+        assert_ne!(descriptor.continuation_run_id, run_id);
+
+        let task = store
+            .get_orchestrator_background_task(descriptor.continuation_task_id.as_str())
+            .expect("continuation task should load")
+            .expect("continuation task should exist");
+        assert_eq!(task.state, AuxiliaryTaskState::Queued.as_str());
+        assert_eq!(task.parent_run_id.as_deref(), Some(run_id));
+        assert_eq!(
+            task.planned_child_run_id.as_deref(),
+            Some(descriptor.continuation_run_id.as_str())
+        );
+        assert!(task.target_run_id.is_none());
+        assert_eq!(task.owner_principal, "user:ops");
+        assert_eq!(task.channel.as_deref(), Some("cli"));
+        assert_eq!(task.max_attempts, 1);
+
+        let second = store
+            .terminalize_orphaned_orchestrator_runs_on_startup("second_startup")
+            .expect("second startup should be idempotent");
+        assert_eq!(second.scanned_count, 0);
+        assert_eq!(second.continuation_queued_count, 0);
+        let connection = store.connection.lock().expect("connection lock should be available");
+        let action_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM startup_recovery_actions_v1 WHERE original_run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("recovery action should count");
+        let continuation_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_background_tasks WHERE parent_run_ulid = ?1 AND task_kind = 'background_prompt'",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("continuation tasks should count");
+        assert_eq!(action_count, 1);
+        assert_eq!(continuation_count, 1);
+    }
+
+    #[test]
+    fn startup_recovery_turns_unknown_mutation_into_durable_confirmation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SC2";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RC2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        activate_runtime_generation(
+            &store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should enter in_progress");
+        for (seq, event_type, payload_json) in [
+            (0, "provider_turn_output", json!({"finish_reason": "tool_calls"})),
+            (
+                1,
+                "tool_proposal",
+                json!({
+                    "proposal_id": "patch-1",
+                    "tool_name": "palyra.fs.apply_patch",
+                }),
+            ),
+            (
+                2,
+                "tool_decision",
+                json!({
+                    "proposal_id": "patch-1",
+                    "decision": "allow",
+                }),
+            ),
+        ] {
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq,
+                    event_type: event_type.to_owned(),
+                    payload_json: payload_json.to_string(),
+                })
+                .expect("pre-crash evidence should persist");
+        }
+
+        let report = store
+            .terminalize_orphaned_orchestrator_runs_on_startup("startup_test")
+            .expect("ambiguous recovery should actuate");
+        assert_eq!(report.continuation_queued_count, 0);
+        assert_eq!(report.confirmation_required_count, 1);
+        let confirmation_id = report.confirmation_ids.first().expect("approval should be durable");
+        let connection = store.connection.lock().expect("connection lock should be available");
+        let approval = connection
+            .query_row(
+                r#"
+                    SELECT principal, device_id, channel, subject_type, subject_id, decision
+                    FROM approvals
+                    WHERE approval_ulid = ?1
+                "#,
+                params![confirmation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("approval should load");
+        assert_eq!(approval.0, "user:ops");
+        assert_eq!(approval.2.as_deref(), Some("cli"));
+        assert_eq!(approval.3, "startup_recovery");
+        assert_eq!(approval.4, run_id);
+        assert!(approval.5.is_none());
+        let continuation_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_background_tasks WHERE parent_run_ulid = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("continuation tasks should count");
+        assert_eq!(continuation_count, 0);
     }
 
     #[test]

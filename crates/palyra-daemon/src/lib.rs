@@ -2875,10 +2875,10 @@ pub async fn run() -> Result<()> {
 
     let startup_run_recovery = runtime
         .terminalize_orphaned_orchestrator_runs_on_startup(
-            "daemon startup detected an orphaned active run from a previous runtime; marked failed and manual same-session resume is required",
+            "daemon startup detected an interrupted active run from a previous runtime",
         )
         .await
-        .context("failed to terminalize orphaned orchestrator runs during startup")?;
+        .context("failed to actuate interrupted orchestrator runs during startup")?;
     let startup_background_task_recovery = runtime
         .reconcile_orphaned_background_tasks_on_startup(
             "daemon startup detected an orphaned in-process background task; automatic replay is blocked and explicit operator retry is required",
@@ -3157,7 +3157,7 @@ pub async fn run() -> Result<()> {
     runtime
         .complete_daemon_startup_recovery()
         .context("failed to release daemon startup recovery barrier")?;
-    if startup_run_recovery.terminalized_count > 0
+    if startup_run_recovery.scanned_count > 0
         || startup_background_task_recovery.failed_count > 0
         || startup_process_lease_reconciliation.inspected_count > 0
         || startup_process_lease_reconciliation.pending_cleanup_inspected_count > 0
@@ -3165,8 +3165,16 @@ pub async fn run() -> Result<()> {
         || recovered_fault_activations > 0
     {
         warn!(
+            scanned_run_count = startup_run_recovery.scanned_count,
             terminalized_count = startup_run_recovery.terminalized_count,
             terminalized_run_ids = ?startup_run_recovery.terminalized_run_ids,
+            continuation_queued_count = startup_run_recovery.continuation_queued_count,
+            continuation_run_ids = ?startup_run_recovery
+                .continuation_descriptors
+                .iter()
+                .map(|descriptor| descriptor.continuation_run_id.as_str())
+                .collect::<Vec<_>>(),
+            confirmation_required_count = startup_run_recovery.confirmation_required_count,
             failed_background_task_count = startup_background_task_recovery.failed_count,
             failed_background_task_ids = ?startup_background_task_recovery.failed_task_ids,
             process_leases_inspected = startup_process_lease_reconciliation.inspected_count,

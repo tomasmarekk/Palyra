@@ -7917,6 +7917,12 @@ impl GatewayRuntimeState {
         self.journal_store.recent_restart_decisions(16).map_err(journal_state_error_status)
     }
 
+    pub(crate) fn recent_startup_recovery_actions(
+        &self,
+    ) -> Result<Vec<crate::journal::StartupRecoveryAction>, Status> {
+        self.journal_store.recent_startup_recovery_actions(16).map_err(journal_state_error_status)
+    }
+
     /// Verifies the journal hash chain on the blocking journal worker.
     ///
     /// # Errors

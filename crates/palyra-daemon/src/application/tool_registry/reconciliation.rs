@@ -9,20 +9,97 @@ use palyra_common::runtime_contracts::{
     ReconciliationStrategy, RuntimeIdempotencyClass, SideEffectRestartPolicy,
     ToolExecutionSemantics,
 };
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::types::ToolReplaySafetyClass;
 
 /// Closed mutation classes supported by the daemon's reconciler registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ToolMutationClass {
     WorkspaceFilePatch,
     ProcessMutation,
+    PackageInstall,
     HttpMutationWithExternalIdempotencyKey,
     HttpMutationWithoutExternalIdempotencyKey,
     Delivery,
     WorkerTask,
     OperatorConfirmation,
+}
+
+impl ToolMutationClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceFilePatch => "workspace_file_patch",
+            Self::ProcessMutation => "process_mutation",
+            Self::PackageInstall => "package_install",
+            Self::HttpMutationWithExternalIdempotencyKey => {
+                "http_mutation_with_external_idempotency_key"
+            }
+            Self::HttpMutationWithoutExternalIdempotencyKey => {
+                "http_mutation_without_external_idempotency_key"
+            }
+            Self::Delivery => "connector_delivery",
+            Self::WorkerTask => "remote_worker_task",
+            Self::OperatorConfirmation => "operator_confirmation",
+        }
+    }
+}
+
+/// One diagnostics-safe row from the execution-fence restart contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SafeResumeMatrixEntry {
+    pub(crate) operation_class: &'static str,
+    pub(crate) restart_policy: SideEffectRestartPolicy,
+    pub(crate) reconciliation_strategy: ReconciliationStrategy,
+    pub(crate) intent_recorded_outcome: &'static str,
+    pub(crate) exact_receipt_outcome: &'static str,
+    pub(crate) unknown_without_receipt_outcome: &'static str,
+    pub(crate) stable_rollout_eligible: bool,
+}
+
+/// Generates the closed recovery matrix from execution-fence semantics.
+#[must_use]
+pub(crate) fn safe_resume_matrix() -> Vec<SafeResumeMatrixEntry> {
+    [
+        ToolMutationClass::WorkspaceFilePatch,
+        ToolMutationClass::ProcessMutation,
+        ToolMutationClass::PackageInstall,
+        ToolMutationClass::HttpMutationWithExternalIdempotencyKey,
+        ToolMutationClass::HttpMutationWithoutExternalIdempotencyKey,
+        ToolMutationClass::Delivery,
+        ToolMutationClass::WorkerTask,
+        ToolMutationClass::OperatorConfirmation,
+    ]
+    .into_iter()
+    .map(|operation_class| {
+        let (_, restart_policy, reconciliation_strategy, _) = mutation_semantics(operation_class);
+        let receipt_backed = reconciliation_strategy != ReconciliationStrategy::None;
+        SafeResumeMatrixEntry {
+            operation_class: operation_class.as_str(),
+            restart_policy,
+            reconciliation_strategy,
+            // IntentRecorded proves dispatch never crossed the durable
+            // effect-start boundary.
+            intent_recorded_outcome: "safe_to_retry",
+            exact_receipt_outcome: if receipt_backed {
+                "already_applied"
+            } else {
+                "needs_confirmation"
+            },
+            unknown_without_receipt_outcome: if restart_policy
+                == SideEffectRestartPolicy::RequireConfirmation
+            {
+                "needs_confirmation"
+            } else {
+                "irreconcilable"
+            },
+            stable_rollout_eligible: receipt_backed
+                || restart_policy == SideEffectRestartPolicy::RequireConfirmation,
+        }
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +245,12 @@ const fn mutation_semantics(
             ReconciliationStrategy::ProcessProvenance,
             false,
         ),
+        ToolMutationClass::PackageInstall => (
+            RuntimeIdempotencyClass::NonIdempotent,
+            SideEffectRestartPolicy::RequireConfirmation,
+            ReconciliationStrategy::None,
+            false,
+        ),
         ToolMutationClass::HttpMutationWithExternalIdempotencyKey => (
             RuntimeIdempotencyClass::ExternalIdempotencyKey,
             SideEffectRestartPolicy::ReconcileBeforeRetry,
@@ -244,11 +327,14 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         | "palyra.browser.downloads.list" => BuiltinToolEffectResolution::read_only(),
         "palyra.sleep" => BuiltinToolEffectResolution::deterministic_idempotent(),
         "palyra.fs.apply_patch" => workspace_patch_effect(input_json),
-        "palyra.process.run"
-        | "palyra.exec.run"
-        | "palyra.process.input"
-        | "palyra.process.send_keys"
-        | "palyra.process.stop" => {
+        "palyra.process.run" | "palyra.exec.run" => {
+            if is_package_mutation(input_json) {
+                BuiltinToolEffectResolution::mutation(ToolMutationClass::PackageInstall)
+            } else {
+                BuiltinToolEffectResolution::mutation(ToolMutationClass::ProcessMutation)
+            }
+        }
+        "palyra.process.input" | "palyra.process.send_keys" | "palyra.process.stop" => {
             BuiltinToolEffectResolution::mutation(ToolMutationClass::ProcessMutation)
         }
         "palyra.http.fetch" => http_fetch_effect(input_json),
@@ -293,6 +379,56 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         _ => return None,
     };
     Some(resolution)
+}
+
+fn is_package_mutation(input_json: &[u8]) -> bool {
+    let Ok(Value::Object(input)) = serde_json::from_slice::<Value>(input_json) else {
+        return false;
+    };
+    let mut tokens = Vec::new();
+    for key in ["command", "executable", "program", "argv", "args"] {
+        match input.get(key) {
+            Some(Value::String(value)) => {
+                tokens.extend(value.split_whitespace().map(str::to_ascii_lowercase));
+            }
+            Some(Value::Array(values)) => {
+                tokens.extend(values.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase));
+            }
+            _ => {}
+        }
+    }
+    let normalized = tokens.iter().map(|token| token.trim_matches(['"', '\''])).collect::<Vec<_>>();
+    let package_manager = normalized.iter().position(|token| {
+        matches!(
+            *token,
+            "npm"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "cargo"
+                | "pip"
+                | "pip3"
+                | "pipx"
+                | "apt"
+                | "apt-get"
+                | "dnf"
+                | "yum"
+                | "pacman"
+                | "brew"
+                | "choco"
+                | "winget"
+        )
+    });
+    let mutating_verb = |token: &&str| {
+        matches!(*token, "install" | "add" | "remove" | "uninstall" | "upgrade" | "update" | "sync")
+    };
+    package_manager.is_some_and(|index| normalized.iter().skip(index + 1).any(mutating_verb))
+        || normalized.windows(4).any(|window| {
+            matches!(window[0], "python" | "python3" | "py")
+                && window[1] == "-m"
+                && window[2] == "pip"
+                && mutating_verb(&window[3])
+        })
 }
 
 fn workspace_patch_effect(input_json: &[u8]) -> BuiltinToolEffectResolution {
