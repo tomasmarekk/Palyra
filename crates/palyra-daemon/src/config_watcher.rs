@@ -62,7 +62,12 @@ impl DebounceState {
 /// Resolves the file component of the loader's human-readable source string.
 #[must_use]
 pub(crate) fn path_from_loaded_source(source: &str) -> Option<PathBuf> {
-    let source = source.split(" +env(").next().map(str::trim).unwrap_or(source);
+    let provenance_start = [" +migration(", " +env("]
+        .into_iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .unwrap_or(source.len());
+    let source = source[..provenance_start].trim();
     (!source.is_empty() && source != "defaults").then(|| PathBuf::from(source))
 }
 
@@ -597,6 +602,19 @@ mod tests {
             attrs: notify::event::EventAttributes::default(),
         };
         assert!(!native_event_matches(&event, Path::new("config.toml")));
+    }
+
+    #[test]
+    fn loaded_source_path_excludes_migration_and_environment_provenance() {
+        assert_eq!(
+            path_from_loaded_source("config.toml +migration(v0->v1) +env(PALYRA_DAEMON_BIND_ADDR)"),
+            Some(PathBuf::from("config.toml"))
+        );
+        assert_eq!(
+            path_from_loaded_source("config.toml +env(PALYRA_DAEMON_PORT)"),
+            Some(PathBuf::from("config.toml"))
+        );
+        assert_eq!(path_from_loaded_source("defaults"), None);
     }
 
     #[test]
