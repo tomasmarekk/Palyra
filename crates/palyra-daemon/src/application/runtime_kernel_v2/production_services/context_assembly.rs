@@ -95,6 +95,12 @@ impl PreassembledContextEngineBinding {
             projection_epoch: self.projection_epoch,
         }
     }
+
+    /// Returns the immutable host projection epoch used by downstream plans.
+    #[must_use]
+    pub(crate) const fn projection_epoch(&self) -> u64 {
+        self.projection_epoch
+    }
 }
 
 /// Fail-closed errors for selected and executable context-engine drift.

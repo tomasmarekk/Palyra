@@ -12589,6 +12589,40 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn latest_orchestrator_session_transcript_event_blocking(
+        &self,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Option<OrchestratorSessionTranscriptRecord>, Status> {
+        self.journal_store
+            .latest_orchestrator_session_transcript_event(session_id, event_type)
+            .map_err(|error| {
+                map_orchestrator_store_error("load latest orchestrator transcript event", error)
+            })
+    }
+
+    /// Loads the newest transcript event of one type for a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn latest_orchestrator_session_transcript_event(
+        self: &Arc<Self>,
+        session_id: String,
+        event_type: String,
+    ) -> Result<Option<OrchestratorSessionTranscriptRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.latest_orchestrator_session_transcript_event_blocking(
+                session_id.as_str(),
+                event_type.as_str(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("latest orchestrator transcript worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn search_orchestrator_session_windows_blocking(
         &self,
         request: &SessionSearchRequest,

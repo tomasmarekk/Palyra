@@ -922,6 +922,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "none".to_owned(),
             execution_manifest: None,
         },
+        "palyra.context.inspect" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.context.inspect requires gateway context runtime".to_owned(),
+            timed_out: false,
+            executor: "context_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
+        },
         "palyra.memory.search" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1207,6 +1216,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             "palyra.echo"
                 | "palyra.sleep"
                 | "palyra.memory.status"
+                | "palyra.context.inspect"
                 | "palyra.memory.search"
                 | "palyra.memory.recall"
                 | "palyra.memory.session_search"
@@ -1304,6 +1314,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "image_observe".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_broker".to_owned()
+    } else if tool_name == "palyra.context.inspect" {
+        "context_runtime".to_owned()
     } else if matches!(
         tool_name,
         "palyra.memory.status"
@@ -1349,6 +1361,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
         "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
         "palyra.memory.status" => MAX_MEMORY_STATUS_TOOL_INPUT_BYTES,
+        "palyra.context.inspect" => MAX_MEMORY_STATUS_TOOL_INPUT_BYTES,
         "palyra.memory.search" => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
         "palyra.memory.recall" => MAX_MEMORY_RECALL_TOOL_INPUT_BYTES,
         "palyra.memory.session_search" | "palyra.session_search" => {

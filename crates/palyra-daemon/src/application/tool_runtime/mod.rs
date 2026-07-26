@@ -8,6 +8,7 @@
 pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod code_intel;
+pub(crate) mod context;
 pub(crate) mod delegation;
 pub(crate) mod http_fetch;
 pub(crate) mod image_observe;

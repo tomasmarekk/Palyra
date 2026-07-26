@@ -15680,6 +15680,55 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Loads the newest transcript event of one type without scanning the
+    /// complete session history.
+    ///
+    /// # Errors
+    /// Returns a journal error when the store lock or query fails.
+    pub fn latest_orchestrator_session_transcript_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Option<OrchestratorSessionTranscriptRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT
+                        runs.session_ulid,
+                        tape.run_ulid,
+                        tape.seq,
+                        tape.event_type,
+                        tape.payload_json,
+                        tape.created_at_unix_ms,
+                        COALESCE(runs.origin_kind, 'manual'),
+                        runs.origin_run_ulid
+                    FROM orchestrator_tape AS tape
+                    INNER JOIN orchestrator_runs AS runs
+                        ON runs.run_ulid = tape.run_ulid
+                    WHERE runs.session_ulid = ?1
+                        AND tape.event_type = ?2
+                    ORDER BY runs.started_at_unix_ms DESC, tape.seq DESC
+                    LIMIT 1
+                "#,
+                params![session_id, event_type],
+                |row| {
+                    Ok(OrchestratorSessionTranscriptRecord {
+                        session_id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        seq: row.get(2)?,
+                        event_type: row.get(3)?,
+                        payload_json: row.get(4)?,
+                        created_at_unix_ms: row.get(5)?,
+                        origin_kind: row.get(6)?,
+                        origin_run_id: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(JournalError::from)
+    }
+
     /// Searches transcripts across sessions and returns grouped context windows.
     ///
     /// # Errors

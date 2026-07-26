@@ -159,6 +159,13 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.context.inspect",
+            "Inspect the current session context-engine binding, health, projection epoch, lifecycle counters, and token calibration. Returns metadata only; prompt text and tool payloads are never exposed.",
+            object_schema(&[], Vec::new(), false),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.memory.search",
             "Search Palyra lifecycle memory and, with explicit approval, workspace/project documents; returns redacted hits.",
             object_schema(

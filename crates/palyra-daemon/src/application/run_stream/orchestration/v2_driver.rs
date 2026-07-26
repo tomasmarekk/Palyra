@@ -127,6 +127,15 @@ struct CallbackState {
     final_text: Option<String>,
     final_projection: Option<crate::application::runtime_kernel_v2::phases::FinalProjectionRef>,
     deferred_tape_events: Vec<V2DeferredTapeEvent>,
+    after_turn_observations: Vec<ContextAfterTurnObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextAfterTurnObservation {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_exchange_count: u64,
+    finish_reason: Option<ProviderFinishReason>,
 }
 
 enum V2DeferredTapeEvent {
@@ -153,6 +162,7 @@ impl RunStreamV2Callbacks {
                 final_text: None,
                 final_projection: None,
                 deferred_tape_events: Vec::new(),
+                after_turn_observations: Vec::new(),
             }),
             sender,
             run_id,
@@ -175,6 +185,14 @@ impl RunStreamV2Callbacks {
             .lock()
             .map_err(|_| Status::internal("V2 provider observation state is unavailable"))?;
         Ok(std::mem::take(&mut state.deferred_tape_events))
+    }
+
+    fn take_after_turn_observations(&self) -> Result<Vec<ContextAfterTurnObservation>, Status> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Status::internal("V2 context lifecycle state is unavailable"))?;
+        Ok(std::mem::take(&mut state.after_turn_observations))
     }
 
     fn retain_tool_proposal(
@@ -297,12 +315,23 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     .map_err(|_| self.kernel_failure("runtime.provider.qa_attestation_invalid"))?;
             }
             if terminal.finish_reason == Some(ProviderFinishReason::Cancelled) {
+                self.state
+                    .lock()
+                    .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?
+                    .after_turn_observations
+                    .push(ContextAfterTurnObservation {
+                        prompt_tokens: response.prompt_tokens,
+                        completion_tokens: response.completion_tokens,
+                        tool_exchange_count: 0,
+                        finish_reason: terminal.finish_reason,
+                    });
                 return Ok(EmbeddedProviderTurn::Cancelled {
                     reason_code: "runtime.provider_call.cancelled".to_owned(),
                 });
             }
             let output = bounded_provider_turn_output_for_persistence(&response.output);
             let proposal = self.retain_tool_proposal(&output)?;
+            let tool_exchange_count = u64::from(proposal.is_some());
             let mut state = self
                 .state
                 .lock()
@@ -312,6 +341,12 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     .deferred_tape_events
                     .push(V2DeferredTapeEvent::ProviderLaneAttested(Box::new(attestation)));
             }
+            state.after_turn_observations.push(ContextAfterTurnObservation {
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+                tool_exchange_count,
+                finish_reason: terminal.finish_reason,
+            });
             state.messages.push(ProviderMessage::assistant_from_output(&output));
             if let Some((proposal, operation_id)) = proposal {
                 return Ok(EmbeddedProviderTurn::Tool { proposal, operation_id });
@@ -349,6 +384,16 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     .deferred_tape_events
                     .push(V2DeferredTapeEvent::ProviderLaneAttested(Box::new(attestation)));
             }
+            self.state
+                .lock()
+                .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?
+                .after_turn_observations
+                .push(ContextAfterTurnObservation {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_exchange_count: 0,
+                    finish_reason: None,
+                });
             match reason_code.as_str() {
                 "runtime.provider_call.cancelled" => {
                     Ok(EmbeddedProviderTurn::Cancelled { reason_code })
@@ -707,12 +752,22 @@ pub(super) async fn drive_authoritative_v2(
         context_binding.clone(),
     ));
     let compaction_projections = Arc::new(RunStreamCompactionProjectionStore::default());
+    let retained_context_tokens = v2_context_retained_token_estimate(&base_provider_request);
+    let compaction_plan = crate::application::context_compaction::ContextCompactionPlanV2::host(
+        crate::application::context_compaction::context_compaction_owner_registry()
+            .next_generation(),
+        context_binding.projection_epoch(),
+        tool_catalog.catalog_hash.clone(),
+        retained_context_tokens.max(1),
+    );
     let compaction_work = Arc::new(RunStreamCompactionInput::new(
         Arc::clone(runtime_state),
         session,
         request_context.principal.clone(),
+        request_context.clone(),
         run_id.to_owned(),
         Arc::clone(&compaction_projections),
+        compaction_plan,
     ));
     let final_projections = Arc::new(RunFinalProjectionStore::default());
 
@@ -757,7 +812,7 @@ pub(super) async fn drive_authoritative_v2(
         provider_authority,
         context_binding.clone(),
         context_work,
-        v2_context_retained_token_estimate(&base_provider_request).saturating_add(1),
+        retained_context_tokens.saturating_add(1),
         compaction_work,
         callbacks.clone(),
     )
@@ -892,6 +947,19 @@ pub(super) async fn drive_authoritative_v2(
         callbacks.take_deferred_tape_events()?,
     )
     .await?;
+    for observation in callbacks.take_after_turn_observations()? {
+        crate::application::context_lifecycle::record_after_turn(
+            runtime_state,
+            run_id,
+            session_id,
+            tape_seq,
+            observation.prompt_tokens,
+            observation.completion_tokens,
+            observation.tool_exchange_count,
+            observation.finish_reason,
+        )
+        .await?;
+    }
     settle_v2_receipt(V2ReceiptSettlement {
         sender,
         runtime_state,

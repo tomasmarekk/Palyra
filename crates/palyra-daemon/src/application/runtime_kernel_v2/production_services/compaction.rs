@@ -12,14 +12,26 @@ use palyra_common::runtime_contracts::{RuntimeContextProjectionId, RuntimeErrorP
 use super::ProductionPayloadRetention;
 use crate::{
     application::{
+        context_compaction::{
+            context_compaction_owner_registry, evaluate_compaction_quality,
+            ContextCompactionPlanV2, ContextProtectedSegment,
+        },
+        context_engine::{
+            ContextEngineCompactionDisposition, ContextEngineCompactionRequest,
+            ContextEngineRegistry,
+        },
         runtime_kernel_v2::phases::{
             CompactionPhase, CompactionRequest, CompactionResult, KernelPhaseError,
             KernelPhaseFuture, KernelPhaseOutput, KernelPhaseReason, RuntimePhaseService,
         },
-        session_compaction::{apply_session_compaction, SessionCompactionApplyRequest},
+        session_compaction::{
+            apply_session_compaction, preview_session_compaction, CompactionSafeguardDecision,
+            SessionCompactionApplyRequest,
+        },
     },
     gateway::GatewayRuntimeState,
     journal::OrchestratorSessionRecord,
+    transport::grpc::auth::RequestContext,
 };
 
 pub(crate) enum CompactionHostOutcome {
@@ -77,9 +89,52 @@ pub(crate) struct RunStreamCompactionInput {
     runtime_state: Arc<GatewayRuntimeState>,
     session: OrchestratorSessionRecord,
     actor_principal: String,
+    request_context: RequestContext,
     run_id: String,
     manifest_material: Vec<u8>,
     projections: Arc<RunStreamCompactionProjectionStore>,
+    plan: ContextCompactionPlanV2,
+}
+
+fn observed_protected_segments(
+    safeguard_passed: bool,
+    pending_approval_open: bool,
+    active_objective_present: bool,
+    active_goal_preserved: bool,
+    tool_pair_intact: bool,
+    provenance_present: bool,
+) -> Vec<ContextProtectedSegment> {
+    let mut observed = vec![
+        ContextProtectedSegment::SystemInstructions,
+        ContextProtectedSegment::SafetyInstructions,
+    ];
+    if safeguard_passed && !pending_approval_open {
+        observed.push(ContextProtectedSegment::UnresolvedApproval);
+    }
+    if safeguard_passed && (!active_objective_present || active_goal_preserved) {
+        observed.push(ContextProtectedSegment::ActiveObjective);
+    }
+    if safeguard_passed && tool_pair_intact {
+        observed.push(ContextProtectedSegment::SideEffectFence);
+        observed.push(ContextProtectedSegment::ToolCallResultPair);
+    }
+    if safeguard_passed && provenance_present {
+        observed.push(ContextProtectedSegment::CitationProvenance);
+    }
+    observed
+}
+
+fn observed_protected_segments_for_plan(
+    plan: &crate::application::session_compaction::SessionCompactionPlan,
+) -> Vec<ContextProtectedSegment> {
+    observed_protected_segments(
+        plan.safeguard.decision == CompactionSafeguardDecision::Passed,
+        plan.safeguard.pre_checkpoint.pending_approval_open,
+        plan.safeguard.pre_checkpoint.active_objective.is_some(),
+        !plan.active_task_summary.active_goal.trim().is_empty(),
+        plan.successor_transcript.split_guard.tool_pair_intact,
+        !plan.evidence_refs.is_empty(),
+    )
 }
 
 impl RunStreamCompactionInput {
@@ -87,17 +142,29 @@ impl RunStreamCompactionInput {
         runtime_state: Arc<GatewayRuntimeState>,
         session: OrchestratorSessionRecord,
         actor_principal: String,
+        request_context: RequestContext,
         run_id: String,
         projections: Arc<RunStreamCompactionProjectionStore>,
+        plan: ContextCompactionPlanV2,
     ) -> Self {
         let manifest_material = serde_json::to_vec(&serde_json::json!({
             "session_id": session.session_id.as_str(),
             "run_id": run_id.as_str(),
             "mode": "automatic",
             "policy": "runtime_kernel_v2",
+            "context_compaction_plan": &plan,
         }))
         .unwrap_or_default();
-        Self { runtime_state, session, actor_principal, run_id, manifest_material, projections }
+        Self {
+            runtime_state,
+            session,
+            actor_principal,
+            request_context,
+            run_id,
+            manifest_material,
+            projections,
+            plan,
+        }
     }
 }
 
@@ -110,6 +177,56 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
         self: Arc<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<CompactionHostOutcome, &'static str>> + Send>> {
         Box::pin(async move {
+            let _owner = context_compaction_owner_registry()
+                .acquire(self.session.session_id.as_str(), &self.plan)?;
+            let engine = ContextEngineRegistry::production_default().selected_engine();
+            let engine_outcome = engine
+                .compact_if_needed(
+                    &self.runtime_state,
+                    &self.request_context,
+                    ContextEngineCompactionRequest {
+                        run_id: self.run_id.as_str(),
+                        session_id: self.session.session_id.as_str(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    crate::application::context_engine::ContextEngineCompactionOutcome {
+                        disposition: ContextEngineCompactionDisposition::HostPlanRequested,
+                        reason_code: "context.compaction.engine_failed_safe_fallback".to_owned(),
+                    }
+                });
+            match engine_outcome.disposition {
+                ContextEngineCompactionDisposition::HostPlanRequested => {}
+                ContextEngineCompactionDisposition::NotNeeded => {
+                    return Err("runtime.compaction.engine_declined");
+                }
+                ContextEngineCompactionDisposition::Applied => {
+                    return Err("runtime.compaction.engine_direct_apply_denied");
+                }
+            }
+            let preview = preview_session_compaction(
+                &self.runtime_state,
+                &self.session,
+                Some("runtime_kernel_v2_context_pressure"),
+                Some("runtime_kernel_v2"),
+                None,
+            )
+            .await
+            .map_err(|_| "runtime.compaction.preflight_failed")?;
+            if !preview.eligible {
+                return Err("runtime.compaction.preflight_ineligible");
+            }
+            let preview_observed = observed_protected_segments_for_plan(&preview);
+            let preview_quality = evaluate_compaction_quality(
+                &self.plan,
+                preview.estimated_input_tokens,
+                preview.estimated_output_tokens,
+                preview_observed.as_slice(),
+            );
+            if !preview_quality.accepted {
+                return Err("runtime.compaction.preflight_quality_gate_failed");
+            }
             let execution = apply_session_compaction(SessionCompactionApplyRequest {
                 runtime_state: &self.runtime_state,
                 session: &self.session,
@@ -125,6 +242,16 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
             })
             .await
             .map_err(|_| "runtime.compaction.host_failed")?;
+            let observed = observed_protected_segments_for_plan(&execution.plan);
+            let quality = evaluate_compaction_quality(
+                &self.plan,
+                execution.artifact.estimated_input_tokens,
+                execution.artifact.estimated_output_tokens,
+                observed.as_slice(),
+            );
+            if !quality.accepted {
+                return Err("runtime.compaction.quality_gate_failed");
+            }
             self.projections.retain(AppliedCompactionProjection {
                 artifact_id: execution.artifact.artifact_id.clone(),
                 mode: execution.artifact.mode.clone(),
@@ -138,6 +265,9 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
                 "estimated_input_tokens": execution.artifact.estimated_input_tokens,
                 "estimated_output_tokens": execution.artifact.estimated_output_tokens,
                 "write_count": execution.writes.len(),
+                "context_compaction_plan": &self.plan,
+                "context_engine_reason_code": engine_outcome.reason_code,
+                "quality_gate": quality,
             }))
             .map_err(|_| "runtime.compaction.evidence_invalid")?;
             Ok(CompactionHostOutcome::Applied {
@@ -254,8 +384,10 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        await_started_work, AppliedCompactionProjection, RunStreamCompactionProjectionStore,
+        await_started_work, observed_protected_segments, AppliedCompactionProjection,
+        RunStreamCompactionProjectionStore,
     };
+    use crate::application::context_compaction::ContextProtectedSegment;
 
     fn projection(artifact_id: &str) -> AppliedCompactionProjection {
         AppliedCompactionProjection {
@@ -288,6 +420,24 @@ mod tests {
                 .retain(projection("artifact-2"))
                 .expect_err("an unresolved projection must fail closed"),
             "runtime.compaction.projection_already_retained"
+        );
+    }
+
+    #[test]
+    fn observed_protection_requires_real_safeguard_signals() {
+        let observed = observed_protected_segments(true, false, true, true, true, true);
+        assert!(observed.contains(&ContextProtectedSegment::UnresolvedApproval));
+        assert!(observed.contains(&ContextProtectedSegment::ActiveObjective));
+        assert!(observed.contains(&ContextProtectedSegment::ToolCallResultPair));
+        assert!(observed.contains(&ContextProtectedSegment::CitationProvenance));
+
+        let unsafe_observed = observed_protected_segments(false, true, true, false, false, false);
+        assert_eq!(
+            unsafe_observed,
+            vec![
+                ContextProtectedSegment::SystemInstructions,
+                ContextProtectedSegment::SafetyInstructions,
+            ]
         );
     }
 

@@ -224,6 +224,7 @@ pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
 // These strings are wire/policy contract (allowlists, approvals, journal
 // payloads, fixtures) - never edit an existing value, only append new ones.
 pub(crate) const MEMORY_STATUS_TOOL_NAME: &str = "palyra.memory.status";
+pub(crate) const CONTEXT_INSPECT_TOOL_NAME: &str = "palyra.context.inspect";
 pub(crate) const MEMORY_SEARCH_TOOL_NAME: &str = "palyra.memory.search";
 pub(crate) const MEMORY_RECALL_TOOL_NAME: &str = "palyra.memory.recall";
 pub(crate) const MEMORY_SESSION_SEARCH_TOOL_NAME: &str = "palyra.memory.session_search";
@@ -954,6 +955,14 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
             remaining_tool_budget,
             controls.child_task_parent_context.as_ref(),
+        )
+        .await
+    } else if tool_name == CONTEXT_INSPECT_TOOL_NAME {
+        crate::application::tool_runtime::context::execute_context_inspect_tool(
+            runtime_state,
+            context,
+            proposal_id,
+            input_json,
         )
         .await
     } else if tool_name == MEMORY_STATUS_TOOL_NAME {

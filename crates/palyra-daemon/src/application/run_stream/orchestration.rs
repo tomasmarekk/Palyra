@@ -3652,30 +3652,39 @@ async fn process_run_stream_message_inner(
     );
     let previous_run_id_for_context = previous_session_run_id.take();
     let context_assembly_started_at = TokioInstant::now();
-    let prepared_provider_input = prepare_model_provider_input(
-        runtime_state,
-        request_context,
-        PrepareModelProviderInputRequest {
-            run_id: run_id.as_str(),
-            tape_seq,
-            session_id: session_id_for_message.as_str(),
-            previous_run_id: previous_run_id_for_context.as_deref(),
-            parameter_delta_json: parameter_delta_json.as_deref(),
-            input_text: input_text.as_str(),
-            channel_turn_envelope: None,
-            attachments: input_content.attachments.as_slice(),
-            provider_kind_hint: Some(lease_provider_kind.as_str()),
-            provider_model_id_hint: provider_model_override
-                .as_deref()
-                .or(Some(routing_decision.actual_model_id.as_str())),
-            tool_catalog_snapshot: first_turn_tool_catalog_snapshot.as_ref(),
-            memory_ingest_reason: "run_stream_user_input",
-            memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
-            channel_for_log: request_context.channel.as_deref().unwrap_or("n/a"),
-        },
-    )
-    .await?;
-    let context_engine_enabled = runtime_state.config.feature_rollouts.context_engine.enabled;
+    let context_engine_enabled = runtime_state.config.feature_rollouts.context_engine.enabled
+        || matches!(
+            runtime_dispatch,
+            RunStreamRuntimeDispatch::Active { decision: RuntimeDispatchDecision::V2 { .. }, .. }
+        );
+    let prepare_request = PrepareModelProviderInputRequest {
+        run_id: run_id.as_str(),
+        tape_seq,
+        session_id: session_id_for_message.as_str(),
+        previous_run_id: previous_run_id_for_context.as_deref(),
+        parameter_delta_json: parameter_delta_json.as_deref(),
+        input_text: input_text.as_str(),
+        channel_turn_envelope: None,
+        attachments: input_content.attachments.as_slice(),
+        provider_kind_hint: Some(lease_provider_kind.as_str()),
+        provider_model_id_hint: provider_model_override
+            .as_deref()
+            .or(Some(routing_decision.actual_model_id.as_str())),
+        tool_catalog_snapshot: first_turn_tool_catalog_snapshot.as_ref(),
+        memory_ingest_reason: "run_stream_user_input",
+        memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
+        channel_for_log: request_context.channel.as_deref().unwrap_or("n/a"),
+    };
+    let prepared_provider_input = if context_engine_enabled {
+        crate::application::context_engine::prepare_model_provider_input_with_context_engine(
+            runtime_state,
+            request_context,
+            prepare_request,
+        )
+        .await?
+    } else {
+        prepare_model_provider_input(runtime_state, request_context, prepare_request).await?
+    };
     let (context_engine_id, context_engine_version) = if context_engine_enabled {
         ("default_context_engine", "context_engine.default.v1")
     } else {
@@ -4642,6 +4651,9 @@ async fn process_run_stream_message_inner(
             }
         }
         let provider_output = provider_response.output.clone();
+        let lifecycle_prompt_tokens = provider_response.prompt_tokens;
+        let lifecycle_completion_tokens = provider_response.completion_tokens;
+        let lifecycle_finish_reason = provider_response.output.finish_reason;
         if let Err(error) = append_tool_call_assembly_audit_tape_event_if_relevant(
             runtime_state,
             run_id.as_str(),
@@ -4696,6 +4708,19 @@ async fn process_run_stream_message_inner(
                 final_provider_output,
                 final_reply_tokens_deferred,
             } => {
+                if context_engine_enabled {
+                    crate::application::context_lifecycle::record_after_turn(
+                        runtime_state,
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        tape_seq,
+                        lifecycle_prompt_tokens,
+                        lifecycle_completion_tokens,
+                        u64::try_from(tool_result_messages.len()).unwrap_or(u64::MAX),
+                        Some(lifecycle_finish_reason),
+                    )
+                    .await?;
+                }
                 loop_state.append_assistant_turn(&provider_output);
                 let should_refeed_tool_results = !tool_result_messages.is_empty();
                 if !should_refeed_tool_results {
@@ -5126,6 +5151,19 @@ async fn process_run_stream_message_inner(
                 .await?;
             }
             RunStreamProviderResponseOutcome::Failed { message, provider_trace_ref, reason } => {
+                if context_engine_enabled {
+                    crate::application::context_lifecycle::record_after_turn(
+                        runtime_state,
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        tape_seq,
+                        lifecycle_prompt_tokens,
+                        lifecycle_completion_tokens,
+                        0,
+                        Some(lifecycle_finish_reason),
+                    )
+                    .await?;
+                }
                 let recovery_decision = provider_turn_recovery_state.decide(
                     provider_turn_anomaly_from_response_failure(reason, message.as_str()),
                     ProviderTurnRecoveryInput {
@@ -5235,6 +5273,19 @@ async fn process_run_stream_message_inner(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             RunStreamProviderResponseOutcome::Terminal(_) => {
+                if context_engine_enabled {
+                    crate::application::context_lifecycle::record_after_turn(
+                        runtime_state,
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        tape_seq,
+                        lifecycle_prompt_tokens,
+                        lifecycle_completion_tokens,
+                        0,
+                        Some(lifecycle_finish_reason),
+                    )
+                    .await?;
+                }
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
@@ -6835,6 +6886,7 @@ fn has_action_tool_evidence(messages: &[ProviderMessage]) -> bool {
                 | "palyra.fs.read_file"
                 | "palyra.fs.search"
                 | "palyra.memory.status"
+                | "palyra.context.inspect"
                 | "palyra.memory.search"
                 | "palyra.memory.recall"
         )

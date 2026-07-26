@@ -153,6 +153,7 @@ const SAFE_CHAT_PROFILE_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
     "palyra.memory.status",
+    "palyra.context.inspect",
     "palyra.memory.search",
     "palyra.memory.session_search",
     "palyra.session_search",
@@ -168,6 +169,7 @@ const CODE_PROFILE_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
     "palyra.memory.status",
+    "palyra.context.inspect",
     "palyra.memory.search",
     "palyra.memory.session_search",
     "palyra.session_search",
@@ -190,6 +192,7 @@ const RESEARCH_PROFILE_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
     "palyra.memory.status",
+    "palyra.context.inspect",
     "palyra.memory.search",
     "palyra.memory.recall",
     "palyra.memory.session_search",
@@ -216,6 +219,7 @@ const AUTOMATION_PROFILE_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
     "palyra.memory.status",
+    "palyra.context.inspect",
     "palyra.memory.search",
     "palyra.memory.retain",
     "palyra.retain",
@@ -244,6 +248,7 @@ const OPS_PROFILE_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
     "palyra.memory.status",
+    "palyra.context.inspect",
     "palyra.memory.search",
     "palyra.fs.read_file",
     "palyra.fs.list_dir",
@@ -439,7 +444,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         | "palyra.mcp.prompts.get" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
-        "palyra.memory.status" => {
+        "palyra.memory.status" | "palyra.context.inspect" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.memory.search" => {
@@ -723,6 +728,8 @@ mod tests {
     fn memory_status_is_read_only_without_approval() {
         assert!(!tool_requires_approval("palyra.memory.status"));
         assert!(tool_policy_capability_names("palyra.memory.status").is_empty());
+        assert!(!tool_requires_approval("palyra.context.inspect"));
+        assert!(tool_policy_capability_names("palyra.context.inspect").is_empty());
     }
 
     #[test]
