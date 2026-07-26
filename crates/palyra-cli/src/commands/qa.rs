@@ -2243,6 +2243,7 @@ mod tests {
             [
                 "real_runtime.malformed_stream_recovery",
                 "real_runtime.mutation_approval_denied",
+                "real_runtime.provider_attempt_recovery_executor",
                 "real_runtime.read_only_tool",
                 "real_runtime.record_replay_text",
                 "real_runtime.text_exact",
