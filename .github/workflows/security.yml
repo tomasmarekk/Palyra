@@ -27,9 +27,6 @@ jobs:
           cache: true
           run-install: true
 
-      - name: npm audit (high)
-        run: npm audit --workspace @palyra/web --audit-level=high --omit=dev
-
       - name: Collect npm audit reports (runtime + full)
         run: |
           mkdir -p security-artifacts
@@ -53,13 +50,13 @@ jobs:
           run_audit_json security-artifacts/npm-audit-runtime.json --omit=dev
           run_audit_json security-artifacts/npm-audit-full.json
 
-      - name: Validate dev-only npm advisories allowlist
+      - name: Validate npm advisories allowlist
         run: |
-          node scripts/validate-npm-audit-dev-allowlist.mjs \
+          node scripts/validate-npm-audit-allowlist.mjs \
             --full security-artifacts/npm-audit-full.json \
             --runtime security-artifacts/npm-audit-runtime.json \
-            --allowlist npm-audit-dev-allowlist.json \
-            --summary security-artifacts/npm-audit-dev-summary.json \
+            --allowlist npm-audit-allowlist.json \
+            --summary security-artifacts/npm-audit-summary.json \
             --threshold high
 
       - name: Install Rust toolchain

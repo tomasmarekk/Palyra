@@ -186,6 +186,7 @@ function collectExpiredAllowlistEntries(entries, now) {
     if (!expiry || expiry.getTime() < now.getTime()) {
       expiredEntries.push({
         id: entry.id,
+        scope: entry.scope ?? null,
         expires_on: entry.expires_on ?? null,
         owner: entry.owner ?? null,
         reason: entry.reason ?? null,
@@ -209,19 +210,61 @@ function main() {
   const runtimeReport = readJson(runtimePath);
   const allowlist = readJson(allowlistPath);
 
+  if (allowlist.version !== 2) {
+    throw new Error("npm audit allowlist version must be 2");
+  }
   const allowlistEntries = Array.isArray(allowlist.entries) ? allowlist.entries : [];
-  const allowlistById = new Map();
+  const allowlistByScopeAndId = new Map();
   for (const entry of allowlistEntries) {
-    if (!entry || typeof entry !== "object" || typeof entry.id !== "string") {
-      continue;
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      typeof entry.id !== "string" ||
+      !["runtime", "dev"].includes(entry.scope) ||
+      typeof entry.owner !== "string" ||
+      entry.owner.trim().length === 0 ||
+      typeof entry.reason !== "string" ||
+      entry.reason.trim().length === 0
+    ) {
+      throw new Error(
+        "each npm audit allowlist entry requires id, runtime/dev scope, owner, and reason",
+      );
     }
-    allowlistById.set(entry.id, entry);
+    const key = `${entry.scope}:${entry.id}`;
+    if (allowlistByScopeAndId.has(key)) {
+      throw new Error(`duplicate npm audit allowlist entry ${key}`);
+    }
+    allowlistByScopeAndId.set(key, entry);
   }
   const expiredAllowlist = collectExpiredAllowlistEntries(allowlistEntries, now);
-  const expiredAllowlistIds = new Set(expiredAllowlist.map((entry) => entry.id));
+  const expiredAllowlistKeys = new Set(
+    expiredAllowlist.map((entry) => `${entry.scope}:${entry.id}`),
+  );
 
   const fullAdvisories = collectAdvisories(fullReport);
   const runtimeAdvisories = collectAdvisories(runtimeReport);
+
+  const runtimeTrackedAdvisories = [];
+  for (const [id, advisory] of runtimeAdvisories) {
+    const severityRank = SEVERITY_ORDER.get(advisory.severity) ?? -1;
+    if (severityRank < thresholdRank) {
+      continue;
+    }
+    const key = `runtime:${id}`;
+    const allow = allowlistByScopeAndId.get(key);
+    runtimeTrackedAdvisories.push({
+      id,
+      severity: advisory.severity,
+      title: advisory.title,
+      url: advisory.url,
+      packages: [...advisory.packages].sort((a, b) => a.localeCompare(b)),
+      allowlisted: Boolean(allow),
+      expires_on: allow?.expires_on ?? null,
+      expired: allow ? expiredAllowlistKeys.has(key) : false,
+      owner: allow?.owner ?? null,
+      reason: allow?.reason ?? null,
+    });
+  }
 
   const devOnlyAdvisories = [];
   for (const [id, advisory] of fullAdvisories) {
@@ -232,8 +275,9 @@ function main() {
     if (severityRank < thresholdRank) {
       continue;
     }
-    const allow = allowlistById.get(id);
-    const expired = allow ? expiredAllowlistIds.has(allow.id) : false;
+    const key = `dev:${id}`;
+    const allow = allowlistByScopeAndId.get(key);
+    const expired = allow ? expiredAllowlistKeys.has(key) : false;
     devOnlyAdvisories.push({
       id,
       severity: advisory.severity,
@@ -256,15 +300,32 @@ function main() {
     }
     return a.id.localeCompare(b.id);
   });
+  runtimeTrackedAdvisories.sort((a, b) => {
+    const rankDiff =
+      (SEVERITY_ORDER.get(b.severity) ?? -1) - (SEVERITY_ORDER.get(a.severity) ?? -1);
+    if (rankDiff !== 0) {
+      return rankDiff;
+    }
+    return a.id.localeCompare(b.id);
+  });
 
-  const unallowlisted = devOnlyAdvisories.filter((item) => !item.allowlisted);
+  const unallowlistedRuntime = runtimeTrackedAdvisories.filter((item) => !item.allowlisted);
+  const unallowlistedDevOnly = devOnlyAdvisories.filter((item) => !item.allowlisted);
+  const unallowlisted = [...unallowlistedRuntime, ...unallowlistedDevOnly];
+  const expiredRuntime = runtimeTrackedAdvisories.filter(
+    (item) => item.allowlisted && item.expired,
+  );
   const expiredDevOnly = devOnlyAdvisories.filter((item) => item.allowlisted && item.expired);
 
-  const activeDevOnlyIds = new Set(devOnlyAdvisories.map((item) => item.id));
+  const activeAllowlistKeys = new Set([
+    ...runtimeTrackedAdvisories.map((item) => `runtime:${item.id}`),
+    ...devOnlyAdvisories.map((item) => `dev:${item.id}`),
+  ]);
   const staleAllowlist = allowlistEntries
-    .filter((entry) => entry && typeof entry.id === "string" && !activeDevOnlyIds.has(entry.id))
+    .filter((entry) => !activeAllowlistKeys.has(`${entry.scope}:${entry.id}`))
     .map((entry) => ({
       id: entry.id,
+      scope: entry.scope,
       expires_on: entry.expires_on ?? null,
       owner: entry.owner ?? null,
       reason: entry.reason ?? null,
@@ -276,14 +337,19 @@ function main() {
     counts: {
       full_advisories: fullAdvisories.size,
       runtime_advisories: runtimeAdvisories.size,
+      runtime_tracked: runtimeTrackedAdvisories.length,
       dev_only_tracked: devOnlyAdvisories.length,
       unallowlisted: unallowlisted.length,
+      unallowlisted_runtime: unallowlistedRuntime.length,
+      unallowlisted_dev_only: unallowlistedDevOnly.length,
       expired: expiredAllowlist.length,
+      expired_runtime: expiredRuntime.length,
       expired_dev_only: expiredDevOnly.length,
       stale_allowlist: staleAllowlist.length,
     },
     full_advisories: advisoryMapToObject(fullAdvisories),
     runtime_advisories: advisoryMapToObject(runtimeAdvisories),
+    runtime_tracked_advisories: runtimeTrackedAdvisories,
     dev_only_advisories: devOnlyAdvisories,
     unallowlisted,
     expired_allowlist: expiredAllowlist,
@@ -298,10 +364,16 @@ function main() {
   }
 
   console.log(
-    `dev-only advisories (severity >= ${threshold}): ${devOnlyAdvisories.length}, unallowlisted: ${unallowlisted.length}, expired_allowlist_entries: ${expiredAllowlist.length}`,
+    `npm advisories (severity >= ${threshold}): runtime=${runtimeTrackedAdvisories.length}, dev_only=${devOnlyAdvisories.length}, unallowlisted=${unallowlisted.length}, expired_allowlist_entries=${expiredAllowlist.length}`,
   );
 
-  for (const item of unallowlisted) {
+  for (const item of unallowlistedRuntime) {
+    console.log(
+      `::warning::Unallowlisted runtime advisory ${item.id} (${item.severity}) affects ${item.packages.join(", ")}`,
+    );
+  }
+
+  for (const item of unallowlistedDevOnly) {
     console.log(
       `::warning::Unallowlisted dev advisory ${item.id} (${item.severity}) affects ${item.packages.join(", ")}`,
     );
@@ -309,24 +381,24 @@ function main() {
 
   for (const item of expiredAllowlist) {
     console.log(
-      `::warning::Expired allowlist entry ${item.id} expired on ${item.expires_on} (owner: ${item.owner ?? "n/a"})`,
+      `::warning::Expired ${item.scope ?? "unknown"} allowlist entry ${item.id} expired on ${item.expires_on} (owner: ${item.owner ?? "n/a"})`,
     );
   }
 
   for (const item of staleAllowlist) {
     console.log(
-      `::notice::Stale allowlist entry ${item.id} is not present in current audit results`,
+      `::notice::Stale ${item.scope} allowlist entry ${item.id} is not present in current audit results`,
     );
   }
 
   if (unallowlisted.length > 0 || expiredAllowlist.length > 0) {
     console.error(
-      `dev advisory governance check failed on ${formatUtcDate(now)}: unallowlisted=${unallowlisted.length}, expired_allowlist=${expiredAllowlist.length}`,
+      `npm advisory governance check failed on ${formatUtcDate(now)}: unallowlisted=${unallowlisted.length}, expired_allowlist=${expiredAllowlist.length}`,
     );
     process.exit(1);
   }
 
-  console.log("dev advisory governance check passed");
+  console.log("npm advisory governance check passed");
 }
 
 try {

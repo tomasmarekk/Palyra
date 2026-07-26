@@ -1231,7 +1231,7 @@ fn is_high_risk_workspace_path(path: &str) -> bool {
         || normalized == "cargo.lock"
         || normalized == "deny.toml"
         || normalized == "osv-scanner.toml"
-        || normalized == "npm-audit-dev-allowlist.json"
+        || normalized == "npm-audit-allowlist.json"
         || normalized == "package-lock.json"
         || normalized == "pnpm-lock.yaml"
         || normalized.starts_with(".github/workflows/")
@@ -1647,6 +1647,18 @@ mod tests {
 
         assert_eq!(risk.level, WorkspaceMutationRiskLevel::High);
         assert!(risk.fail_closed_without_preflight);
+    }
+
+    #[test]
+    fn npm_audit_allowlist_is_always_high_risk() {
+        let risk = assess_workspace_mutation_risk(
+            &[attestation("npm-audit-allowlist.json", "update")],
+            &[],
+        );
+
+        assert_eq!(risk.level, WorkspaceMutationRiskLevel::High);
+        assert!(risk.fail_closed_without_preflight);
+        assert_eq!(risk.review_posture, "review_required");
     }
 
     #[test]
