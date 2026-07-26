@@ -721,6 +721,12 @@ impl AgentRunLoopState {
         self.messages.clone()
     }
 
+    /// Replaces only the provider projection after a preflight context
+    /// recovery; durable session evidence remains in the journal.
+    pub(crate) fn replace_messages(&mut self, messages: Vec<ProviderMessage>) {
+        self.messages = messages;
+    }
+
     /// Number of tool results appended so far in this run.
     pub(crate) fn completed_tool_calls(&self) -> u32 {
         self.completed_tool_calls

@@ -90,10 +90,30 @@ turns:
       prompt_tokens: 11
       completion_tokens: 8
       latency_ms: 2
+  - id: provider_context_overflow_after_apply
+    match:
+      prompt_contains:
+        - session_compaction_summary
+        - recover the provider context_overflow fixture through compact_and_retry
+    behavior:
+      kind: text
+      text: "context_window_exceeded recovered through compact_and_retry."
+      finish_reason: stop
+      prompt_tokens: 11
+      completion_tokens: 8
+      latency_ms: 2
   - id: compaction
     match:
       prompt_contains:
         - exercise the authoritative v2 compaction boundary
+    behavior:
+      kind: context_overflow
+      error_message: "fixture context window exceeded"
+      latency_ms: 2
+  - id: provider_context_overflow
+    match:
+      prompt_contains:
+        - recover the provider context_overflow fixture through compact_and_retry
     behavior:
       kind: context_overflow
       error_message: "fixture context window exceeded"

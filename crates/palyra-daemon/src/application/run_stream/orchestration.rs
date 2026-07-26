@@ -48,6 +48,9 @@ use crate::{
         HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_CLEANED_UP_EVENT, HARNESS_RUN_COMPLETED_EVENT,
         HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     },
+    application::context_recovery::{
+        recover_provider_request_preflight, ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
+    },
     application::learning::schedule_post_run_reflection,
     application::provider_events::{
         process_run_stream_provider_events, RunStreamProviderEventsOutcome,
@@ -3920,6 +3923,7 @@ async fn process_run_stream_message_inner(
     let mut pending_browser_followup_deadline = false;
     let mut pending_tool_followup_deadline = false;
     let mut provider_turn_recovery_state = ProviderTurnRecoveryState::new();
+    let mut context_recovery_generation = 0_u64;
 
     loop {
         match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
@@ -4272,6 +4276,64 @@ async fn process_run_stream_message_inner(
             context_pressure_report.tape_payload().to_string(),
         )
         .await?;
+        let selected_model_id = provider_request
+            .model_override
+            .clone()
+            .unwrap_or_else(|| routing_decision.actual_model_id.clone());
+        match recover_provider_request_preflight(
+            &mut provider_request,
+            &provider_snapshot,
+            lease_provider_id.as_str(),
+            selected_model_id.as_str(),
+            &tool_catalog_snapshot,
+            context_recovery_generation,
+        )
+        .map_err(|reason| {
+            Status::failed_precondition(format!("context recovery preflight failed: {reason}"))
+        })? {
+            ContextPreflightRecoveryOutcome::NotRequired => {}
+            ContextPreflightRecoveryOutcome::Recovered { plan } => {
+                context_recovery_generation = plan.generation;
+                provider_model_override = provider_request.model_override.clone();
+                base_provider_request.model_override = provider_model_override.clone();
+                loop_state.replace_messages(provider_request.messages.clone());
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    CONTEXT_RECOVERY_EVENT,
+                    plan.tape_payload().to_string(),
+                )
+                .await?;
+            }
+            ContextPreflightRecoveryOutcome::Exhausted { plan } => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    CONTEXT_RECOVERY_EVENT,
+                    plan.tape_payload().to_string(),
+                )
+                .await?;
+                terminate_run_stream_with_agent_loop_reason(
+                    sender,
+                    runtime_state,
+                    run_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &loop_state,
+                    active_flow_control.as_ref().ok_or_else(|| {
+                        Status::internal("run termination requires an active flow-control scope")
+                    })?,
+                    AgentLoopTerminationReason::ContextBudgetExhausted,
+                    "provider context recovery exhausted before the provider call",
+                    None,
+                    harness_lifecycle.as_ref(),
+                )
+                .await?;
+                return Ok(RunStreamMessageProcessingOutcome::Terminate);
+            }
+        }
         // Follow-up deadlines apply to exactly one turn: the turn right after
         // a tool batch. Browser batches keep their shorter specialized guard;
         // other tools use the generic post-tool guard.

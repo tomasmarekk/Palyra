@@ -499,15 +499,18 @@ impl EmbeddedAttemptHostState for ProductionAttemptHostState {
     {
         Box::pin(async move {
             self.callbacks.accept_compaction(request, &result).await?;
-            let CompactionResult::Applied { context_projection_id, .. } = result;
-            if let Some(context) = self
-                .cursor
-                .lock()
-                .map_err(|_| self.callbacks.kernel_failure("runtime.context.cursor_unavailable"))?
-                .context
-                .as_mut()
-            {
-                context.projection_id = context_projection_id;
+            if let CompactionResult::Applied { context_projection_id, .. } = result {
+                if let Some(context) = self
+                    .cursor
+                    .lock()
+                    .map_err(|_| {
+                        self.callbacks.kernel_failure("runtime.context.cursor_unavailable")
+                    })?
+                    .context
+                    .as_mut()
+                {
+                    context.projection_id = context_projection_id;
+                }
             }
             Ok(())
         })

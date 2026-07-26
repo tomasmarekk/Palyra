@@ -20,6 +20,7 @@ use crate::application::tool_registry::ModelVisibleToolCatalogSnapshot;
 pub(crate) const CONTEXT_COMPACTION_PLAN_SCHEMA_VERSION: u32 = 2;
 pub(crate) const CONTEXT_INSPECT_TOOL_NAME: &str = "palyra.context.inspect";
 const CONTEXT_TOOL_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_COMPACTION_MINIMUM_SAVINGS_BASIS_POINTS: u16 = 500;
 
 /// Authority permitted to request compaction; the host remains the only writer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,7 +54,7 @@ pub(crate) struct ContextCompactionPlanV2 {
     pub(crate) catalog_hash: String,
     pub(crate) estimated_input_tokens: u64,
     pub(crate) expected_savings_tokens: u64,
-    pub(crate) minimum_savings_tokens: u64,
+    pub(crate) minimum_savings_basis_points: u16,
     pub(crate) protected_segments: Vec<ContextProtectedSegment>,
     pub(crate) fallback_engine_id: String,
     pub(crate) fallback_reason_code: String,
@@ -67,7 +68,6 @@ impl ContextCompactionPlanV2 {
         catalog_hash: String,
         estimated_input_tokens: u64,
     ) -> Self {
-        let minimum_savings_tokens = estimated_input_tokens.saturating_div(20).max(1);
         Self {
             schema_version: CONTEXT_COMPACTION_PLAN_SCHEMA_VERSION,
             plan_id: Ulid::new().to_string(),
@@ -77,7 +77,7 @@ impl ContextCompactionPlanV2 {
             catalog_hash,
             estimated_input_tokens,
             expected_savings_tokens: estimated_input_tokens.saturating_div(3).max(1),
-            minimum_savings_tokens,
+            minimum_savings_basis_points: CONTEXT_COMPACTION_MINIMUM_SAVINGS_BASIS_POINTS,
             protected_segments: vec![
                 ContextProtectedSegment::SystemInstructions,
                 ContextProtectedSegment::SafetyInstructions,
@@ -110,8 +110,8 @@ impl ContextCompactionPlanV2 {
         }
         if self.estimated_input_tokens == 0
             || self.expected_savings_tokens == 0
-            || self.minimum_savings_tokens == 0
-            || self.expected_savings_tokens < self.minimum_savings_tokens
+            || self.minimum_savings_basis_points == 0
+            || self.minimum_savings_basis_points > 10_000
         {
             return Err("context.compaction.plan_savings_invalid");
         }
@@ -143,10 +143,16 @@ pub(crate) struct ContextCompactionQualityOutcome {
     pub(crate) accepted: bool,
     pub(crate) reason_code: String,
     pub(crate) realized_savings_tokens: u64,
+    pub(crate) required_savings_tokens: u64,
     pub(crate) protected_segments_preserved: bool,
 }
 
 /// Applies the deterministic post-write quality gate to bounded token counts.
+///
+/// The percentage is evaluated against the exact compactable input observed by
+/// the host. This avoids comparing session-transcript savings with the larger
+/// provider request estimate, which also includes protected instructions and
+/// schema overhead that compaction cannot remove.
 #[must_use]
 pub(crate) fn evaluate_compaction_quality(
     plan: &ContextCompactionPlanV2,
@@ -155,13 +161,18 @@ pub(crate) fn evaluate_compaction_quality(
     preserved_segments: &[ContextProtectedSegment],
 ) -> ContextCompactionQualityOutcome {
     let realized_savings_tokens = actual_input_tokens.saturating_sub(actual_output_tokens);
+    let required_savings_tokens = actual_input_tokens
+        .saturating_mul(u64::from(plan.minimum_savings_basis_points))
+        .saturating_add(9_999)
+        .saturating_div(10_000)
+        .max(1);
     let expected = plan.protected_segments.iter().copied().collect::<BTreeSet<_>>();
     let observed = preserved_segments.iter().copied().collect::<BTreeSet<_>>();
     let protected_segments_preserved = expected.is_subset(&observed);
     let (accepted, reason_code) = if !protected_segments_preserved {
         (false, "context.compaction.protected_segment_lost")
     } else if actual_output_tokens >= actual_input_tokens
-        || realized_savings_tokens < plan.minimum_savings_tokens
+        || realized_savings_tokens < required_savings_tokens
     {
         (false, "context.compaction.insufficient_savings")
     } else {
@@ -171,6 +182,7 @@ pub(crate) fn evaluate_compaction_quality(
         accepted,
         reason_code: reason_code.to_owned(),
         realized_savings_tokens,
+        required_savings_tokens,
         protected_segments_preserved,
     }
 }
@@ -351,6 +363,20 @@ mod tests {
 
         assert!(!outcome.accepted);
         assert_eq!(outcome.reason_code, "context.compaction.insufficient_savings");
+        assert_eq!(outcome.required_savings_tokens, 50);
+    }
+
+    #[test]
+    fn savings_gate_uses_the_observed_compactable_input_domain() {
+        let registry = ContextCompactionOwnerRegistry::new();
+        let plan =
+            ContextCompactionPlanV2::host(registry.next_generation(), 1, "a".repeat(64), 10_000);
+
+        let outcome =
+            evaluate_compaction_quality(&plan, 400, 370, plan.protected_segments.as_slice());
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.required_savings_tokens, 20);
     }
 
     #[test]

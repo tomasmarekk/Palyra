@@ -14,7 +14,7 @@ use crate::{
     application::{
         context_compaction::{
             context_compaction_owner_registry, evaluate_compaction_quality,
-            ContextCompactionPlanV2, ContextProtectedSegment,
+            ContextCompactionPlanV2, ContextCompactionQualityOutcome, ContextProtectedSegment,
         },
         context_engine::{
             ContextEngineCompactionDisposition, ContextEngineCompactionRequest,
@@ -26,7 +26,7 @@ use crate::{
         },
         session_compaction::{
             apply_session_compaction, preview_session_compaction, CompactionSafeguardDecision,
-            SessionCompactionApplyRequest,
+            SessionCompactionApplyRequest, SessionCompactionPlan,
         },
     },
     gateway::GatewayRuntimeState,
@@ -36,6 +36,7 @@ use crate::{
 
 pub(crate) enum CompactionHostOutcome {
     Applied { context_projection_id: RuntimeContextProjectionId, evidence_material: Vec<u8> },
+    Skipped { reason_code: &'static str, evidence_material: Vec<u8> },
 }
 
 /// Host-retained material needed to rematerialize the provider request after
@@ -102,7 +103,6 @@ fn observed_protected_segments(
     active_objective_present: bool,
     active_goal_preserved: bool,
     tool_pair_intact: bool,
-    provenance_present: bool,
 ) -> Vec<ContextProtectedSegment> {
     let mut observed = vec![
         ContextProtectedSegment::SystemInstructions,
@@ -118,7 +118,10 @@ fn observed_protected_segments(
         observed.push(ContextProtectedSegment::SideEffectFence);
         observed.push(ContextProtectedSegment::ToolCallResultPair);
     }
-    if safeguard_passed && provenance_present {
+    // The preview/execution plan itself retains every source evidence ref.
+    // An empty set is vacuously preserved; requiring a non-empty set would
+    // reject valid text-only compaction before the host write.
+    if safeguard_passed {
         observed.push(ContextProtectedSegment::CitationProvenance);
     }
     observed
@@ -133,7 +136,6 @@ fn observed_protected_segments_for_plan(
         plan.safeguard.pre_checkpoint.active_objective.is_some(),
         !plan.active_task_summary.active_goal.trim().is_empty(),
         plan.successor_transcript.split_guard.tool_pair_intact,
-        !plan.evidence_refs.is_empty(),
     )
 }
 
@@ -196,10 +198,35 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
                         reason_code: "context.compaction.engine_failed_safe_fallback".to_owned(),
                     }
                 });
+            let skipped_outcome =
+                |reason_code: &'static str,
+                 preview: Option<&SessionCompactionPlan>,
+                 quality: Option<&ContextCompactionQualityOutcome>| {
+                    let preview_evidence = preview.map(|plan| {
+                        serde_json::json!({
+                            "eligible": plan.eligible,
+                            "blocked_reason": plan.blocked_reason,
+                            "estimated_input_tokens": plan.estimated_input_tokens,
+                            "estimated_output_tokens": plan.estimated_output_tokens,
+                            "safeguard_decision": plan.safeguard.decision,
+                        })
+                    });
+                    CompactionHostOutcome::Skipped {
+                        reason_code,
+                        evidence_material: serde_json::to_vec(&serde_json::json!({
+                            "reason_code": reason_code,
+                            "context_compaction_plan": &self.plan,
+                            "context_engine_reason_code": engine_outcome.reason_code,
+                            "preview": preview_evidence,
+                            "quality_gate": quality,
+                        }))
+                        .unwrap_or_default(),
+                    }
+                };
             match engine_outcome.disposition {
                 ContextEngineCompactionDisposition::HostPlanRequested => {}
                 ContextEngineCompactionDisposition::NotNeeded => {
-                    return Err("runtime.compaction.engine_declined");
+                    return Ok(skipped_outcome("runtime.compaction.engine_declined", None, None));
                 }
                 ContextEngineCompactionDisposition::Applied => {
                     return Err("runtime.compaction.engine_direct_apply_denied");
@@ -215,7 +242,11 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
             .await
             .map_err(|_| "runtime.compaction.preflight_failed")?;
             if !preview.eligible {
-                return Err("runtime.compaction.preflight_ineligible");
+                return Ok(skipped_outcome(
+                    "runtime.compaction.preflight_ineligible",
+                    Some(&preview),
+                    None,
+                ));
             }
             let preview_observed = observed_protected_segments_for_plan(&preview);
             let preview_quality = evaluate_compaction_quality(
@@ -225,7 +256,16 @@ impl RetainedCompactionWork for RunStreamCompactionInput {
                 preview_observed.as_slice(),
             );
             if !preview_quality.accepted {
-                return Err("runtime.compaction.preflight_quality_gate_failed");
+                let reason_code = match preview_quality.reason_code.as_str() {
+                    "context.compaction.protected_segment_lost" => {
+                        "runtime.compaction.preflight_protected_segment_lost"
+                    }
+                    "context.compaction.insufficient_savings" => {
+                        "runtime.compaction.preflight_insufficient_savings"
+                    }
+                    _ => "runtime.compaction.preflight_quality_gate_failed",
+                };
+                return Ok(skipped_outcome(reason_code, Some(&preview), Some(&preview_quality)));
             }
             let execution = apply_session_compaction(SessionCompactionApplyRequest {
                 runtime_state: &self.runtime_state,
@@ -351,6 +391,15 @@ impl RuntimePhaseService<CompactionPhase, CompactionRequest, CompactionResult>
                         ),
                     },
                 ),
+                CompactionHostOutcome::Skipped { reason_code, evidence_material } => (
+                    KernelPhaseReason::CompactionSkipped,
+                    CompactionResult::Skipped {
+                        reason_code: reason_code.to_owned(),
+                        evidence: self
+                            .retention
+                            .retain_evidence_material(reason_code, evidence_material.as_slice()),
+                    },
+                ),
             };
             Ok(KernelPhaseOutput::from_input(&input, reason, result)?)
         })
@@ -425,13 +474,13 @@ mod tests {
 
     #[test]
     fn observed_protection_requires_real_safeguard_signals() {
-        let observed = observed_protected_segments(true, false, true, true, true, true);
+        let observed = observed_protected_segments(true, false, true, true, true);
         assert!(observed.contains(&ContextProtectedSegment::UnresolvedApproval));
         assert!(observed.contains(&ContextProtectedSegment::ActiveObjective));
         assert!(observed.contains(&ContextProtectedSegment::ToolCallResultPair));
         assert!(observed.contains(&ContextProtectedSegment::CitationProvenance));
 
-        let unsafe_observed = observed_protected_segments(false, true, true, false, false, false);
+        let unsafe_observed = observed_protected_segments(false, true, true, false, false);
         assert_eq!(
             unsafe_observed,
             vec![

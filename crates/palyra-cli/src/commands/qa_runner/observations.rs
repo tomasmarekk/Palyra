@@ -41,6 +41,7 @@ const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 const TAPE_PAGE_SIZE: usize = 256;
 const AUTHORITATIVE_COMPACTION_SEED_TURNS: usize = 5;
+const AUTHORITATIVE_COMPACTION_SEED_DETAIL_REPETITIONS: usize = 5;
 const CONTROL_PLANE_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) struct QaScenarioObservations {
@@ -329,9 +330,13 @@ async fn seed_authoritative_v2_compaction_history(
 ) -> Result<()> {
     let launch_cwd = sandbox.workspace().to_string_lossy().into_owned();
     for turn in 1..=AUTHORITATIVE_COMPACTION_SEED_TURNS {
+        let continuity_detail = "Retain the active objective, safety constraints, tool pairing, \
+                                 and citation provenance while condensing older transcript detail. "
+            .repeat(AUTHORITATIVE_COMPACTION_SEED_DETAIL_REPETITIONS);
         let message = json!({
             "text": format!(
-                "Seed authoritative V2 compaction history turn {turn}: preserve deterministic continuity."
+                "Seed authoritative V2 compaction history turn {turn}: \
+                 preserve deterministic continuity. {continuity_detail}"
             ),
             "session_label": "QA: runtime_kernel_v2.authoritative_compaction",
             "allow_sensitive_tools": false,

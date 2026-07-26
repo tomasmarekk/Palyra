@@ -1,50 +1,84 @@
-schema_version: 1
+# Exercises provider context overflow through the authoritative runtime and the
+# real bounded ContextRecoveryController ladder.
+schema_version: 5
 id: provider.compat.context_overflow
-title: Provider compatibility context overflow
+title: Provider context overflow recovery through the real runtime
 area: provider
 mode:
-  provider: mock
+  runner: fixture
   deterministic: true
+runner:
+  provider_fixture: qa/fixtures/runtime_kernel_v2_authoritative.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: runtime_kernel_v2_authoritative_compaction
 requires:
   model: text
   capabilities:
-    - qa_lab
-    - provider_compat
+    - agent_run
     - context_compaction
+    - provider_recovery
+    - qa_lab
+    - runtime_kernel_v2_authoritative
   tools: []
   fixtures:
-    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+    - qa/fixtures/runtime_kernel_v2_authoritative.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
 steps:
   - id: prompt
     action: user_prompt
-    prompt: "Classify the context_overflow provider compatibility fixture."
+    prompt: "Recover the provider context_overflow fixture through compact_and_retry."
 expect:
   terminal_state: completed
   final_answer:
-    contains:
-      - "context_window_exceeded"
-      - "compact_and_retry"
+    equals: "context_window_exceeded recovered through compact_and_retry."
   events:
-    - event_type: provider.compat.fixture.loaded
+    - event_type: runtime.authority.selected
       min_count: 1
-    - event_type: provider.recovery.decision
+    - event_type: provider.lane.attested
+      min_count: 1
+    - event_type: recovery.action.started
+      min_count: 1
+    - event_type: context.recovery.plan
+      min_count: 1
+    - event_type: runtime.compaction.required
+      min_count: 1
+    - event_type: runtime.compaction.applied
+      min_count: 1
+    - event_type: recovery.action.completed
+      min_count: 1
+    - event_type: run.completed
       min_count: 1
   tool_calls: []
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v14
+    provider_lane: fixture
+    attempt_owner: runtime_kernel_v2.embedded
+    harness_id: runtime_kernel_v2.embedded
+    context_engine_id: runtime_kernel_v2.preassembled_context
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
 forbidden:
-  tool_calls: []
+  tool_calls:
+    - "*"
   events:
-    - context.raw_dumped
+    - run.failed
+    - secret.exposed
   artifacts: []
   claims: []
 artifacts:
-  - path: qa/reports/provider/context_overflow.json
-    kind: report
+  - path: qa/reports/provider/context_overflow.evidence.json
+    kind: evidence
     required: true
 maturity:
   labels:
     - p0
+    - release_smoke
+    - real_runtime
     - nightly
-    - provider_compat
+    - deterministic
+    - provider_recovery
+    - context_compaction
+    - runtime_kernel_v2_authoritative
 timeout:
-  run_ms: 30000
+  run_ms: 60000
   step_ms: 10000

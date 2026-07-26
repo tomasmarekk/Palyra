@@ -119,6 +119,13 @@ pub(crate) enum CompactionResult {
         /// Host-retained compaction/checkpoint evidence.
         evidence: RedactedEvidenceRef,
     },
+    /// No mutation was committed and recovery may advance to another action.
+    Skipped {
+        /// Stable host classification for replay and recovery planning.
+        reason_code: String,
+        /// Host-retained preflight evidence.
+        evidence: RedactedEvidenceRef,
+    },
 }
 
 /// Request to commit exactly one terminal run outcome.

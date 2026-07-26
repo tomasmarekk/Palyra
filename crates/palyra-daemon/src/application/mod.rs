@@ -22,6 +22,7 @@ pub mod context_compaction;
 pub mod context_compression;
 pub mod context_engine;
 pub mod context_lifecycle;
+pub mod context_recovery;
 pub mod context_references;
 pub mod conversation_bindings;
 pub mod delivery_arbitration;

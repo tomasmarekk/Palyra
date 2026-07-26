@@ -3,6 +3,7 @@ id: pr_smoke
 mode: pr
 scenario_roots:
   - qa/scenarios/real_runtime
+  - qa/scenarios/provider
 include_tags:
   - release_smoke
   - real_runtime
@@ -22,6 +23,8 @@ available_capabilities:
   - qa_lab
   - approvals
   - provider_recovery
+  - context_compaction
+  - runtime_kernel_v2_authoritative
   - workspace_context
 capability_skips: []
 flaky_policy:

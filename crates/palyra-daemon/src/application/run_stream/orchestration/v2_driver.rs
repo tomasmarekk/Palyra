@@ -23,6 +23,12 @@ use ulid::Ulid;
 
 use crate::{
     application::{
+        context_recovery::{
+            context_recovery_input_for_request, estimated_required_tokens_for_request,
+            reduce_optional_context, truncate_old_tool_tails, ContextRecoveryAction,
+            ContextRecoveryController, ContextRecoveryPlan, ContextRecoveryStep,
+            TokenBreakdownCategory, CONTEXT_RECOVERY_EVENT,
+        },
         run_admission::PersistedV2AdmissionToken,
         run_stream::{
             cancellation::request_persisted_run_interrupt,
@@ -124,10 +130,13 @@ struct CallbackState {
     first_provider_turn: bool,
     messages: Vec<ProviderMessage>,
     compacted_input_text: Option<String>,
+    model_override: Option<String>,
     final_text: Option<String>,
     final_projection: Option<crate::application::runtime_kernel_v2::phases::FinalProjectionRef>,
     deferred_tape_events: Vec<V2DeferredTapeEvent>,
     after_turn_observations: Vec<ContextAfterTurnObservation>,
+    context_recovery: ContextRecoveryController,
+    pending_context_recovery_step: Option<ContextRecoveryStep>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +151,9 @@ enum V2DeferredTapeEvent {
     ProviderLaneAttested(Box<ProviderLaneAttestationEvent>),
     CompactionRequired,
     CompactionApplied { artifact_id_sha256: String },
+    CompactionSkipped { reason_code: String },
+    ContextRecoveryPlan(Box<ContextRecoveryPlan>),
+    ContextRecoveryAction { event_type: &'static str, action: String, reason_code: String },
     ToolDenied { proposal_id: String, reason_code: &'static str },
 }
 
@@ -152,6 +164,7 @@ impl RunStreamV2Callbacks {
         base_request: ProviderRequest,
         lease: ProviderLeaseExecutionContext,
         catalog: ModelVisibleToolCatalogSnapshot,
+        context_recovery: ContextRecoveryController,
         resources: V2CallbackResources,
     ) -> Self {
         Self {
@@ -159,10 +172,13 @@ impl RunStreamV2Callbacks {
                 first_provider_turn: true,
                 messages: base_request.effective_messages(),
                 compacted_input_text: None,
+                model_override: base_request.model_override.clone(),
                 final_text: None,
                 final_projection: None,
                 deferred_tape_events: Vec::new(),
                 after_turn_observations: Vec::new(),
+                context_recovery,
+                pending_context_recovery_step: None,
             }),
             sender,
             run_id,
@@ -247,6 +263,103 @@ impl RunStreamV2Callbacks {
             crate::journal::redact_payload_json(serialized.as_bytes()).unwrap_or(serialized);
         Ok(ProviderMessage::tool_result(proposal_id.to_owned(), redacted))
     }
+
+    fn projected_recovery_request(&self, state: &CallbackState) -> ProviderRequest {
+        let mut request = self.base_request.clone();
+        request.messages = state.messages.clone();
+        if let Some(input_text) = state.compacted_input_text.as_ref() {
+            request.input_text = input_text.clone();
+        }
+        request.model_override = state.model_override.clone();
+        request.tool_catalog_snapshot = Some(snapshot_to_provider_request_value(&self.catalog));
+        request
+    }
+
+    const fn recovery_action_label(action: ContextRecoveryAction) -> &'static str {
+        match action {
+            ContextRecoveryAction::Compact => "compact",
+            ContextRecoveryAction::TruncateOldToolTails => "truncate_old_tool_tails",
+            ContextRecoveryAction::ReduceOptionalContext => "reduce_optional_context",
+            ContextRecoveryAction::RouteLargerWindow => "route_larger_window",
+            ContextRecoveryAction::FailDeterministic => "fail_deterministic",
+        }
+    }
+
+    fn continue_prompt_local_recovery(
+        &self,
+        state: &mut CallbackState,
+    ) -> Result<(), RuntimeErrorEnvelopeV1> {
+        loop {
+            let step = state
+                .context_recovery
+                .next_step()
+                .map_err(|_| self.kernel_failure("runtime.context_recovery.controller_failed"))?
+                .ok_or_else(|| self.kernel_failure("runtime.context_recovery.budget_exhausted"))?;
+            let action = Self::recovery_action_label(step.action);
+            state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
+                event_type: "recovery.action.started",
+                action: action.to_owned(),
+                reason_code: step.reason_code.clone(),
+            });
+
+            let (after_tokens, removed_categories, evidence_retained) = match step.action {
+                ContextRecoveryAction::Compact => {
+                    return Err(
+                        self.kernel_failure("runtime.context_recovery.compaction_reentered")
+                    );
+                }
+                ContextRecoveryAction::TruncateOldToolTails => {
+                    let mutation = truncate_old_tool_tails(state.messages.as_mut_slice());
+                    let evidence_retained = mutation.removed_categories.is_empty()
+                        || !mutation.evidence_refs.is_empty();
+                    let request = self.projected_recovery_request(state);
+                    (
+                        estimated_required_tokens_for_request(&request, &self.catalog),
+                        mutation.removed_categories,
+                        evidence_retained,
+                    )
+                }
+                ContextRecoveryAction::ReduceOptionalContext => {
+                    let mutation = reduce_optional_context(&mut state.messages);
+                    let request = self.projected_recovery_request(state);
+                    (
+                        estimated_required_tokens_for_request(&request, &self.catalog),
+                        mutation.removed_categories,
+                        true,
+                    )
+                }
+                ContextRecoveryAction::RouteLargerWindow
+                | ContextRecoveryAction::FailDeterministic => {
+                    (state.context_recovery.current_tokens(), Vec::new(), true)
+                }
+            };
+            let outcome = state
+                .context_recovery
+                .record_outcome(&step, after_tokens, removed_categories, evidence_retained)
+                .map_err(|_| {
+                    self.kernel_failure("runtime.context_recovery.executor_outcome_invalid")
+                })?;
+            if let Some(route) = outcome.route_fallback.as_ref() {
+                state.model_override = Some(route.model_id.clone());
+            }
+            state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
+                event_type: "recovery.action.completed",
+                action: action.to_owned(),
+                reason_code: outcome.reason_code.clone(),
+            });
+            let plan = state.context_recovery.plan().clone();
+            state
+                .deferred_tape_events
+                .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
+
+            if step.action == ContextRecoveryAction::FailDeterministic {
+                return Err(self.kernel_failure("runtime.context_recovery.exhausted"));
+            }
+            if outcome.terminal {
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
@@ -292,6 +405,7 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
             if let Some(compacted_input_text) = state.compacted_input_text.as_ref() {
                 request.input_text = compacted_input_text.clone();
             }
+            request.model_override = state.model_override.clone();
             request.tool_catalog_snapshot = Some(snapshot_to_provider_request_value(&self.catalog));
             Ok(Some(PreparedProductionProviderTurn {
                 projection_id: context.projection_id.clone(),
@@ -336,6 +450,16 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                 .state
                 .lock()
                 .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
+            let recovery_completed = !state.context_recovery.plan().steps.is_empty()
+                && state.context_recovery.plan().terminal_reason_code.as_deref()
+                    != Some("context.recovery.provider_retry_succeeded");
+            if recovery_completed {
+                state.context_recovery.record_provider_success();
+                let plan = state.context_recovery.plan().clone();
+                state
+                    .deferred_tape_events
+                    .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
+            }
             if let Some(attestation) = provider_lane_attestation {
                 state
                     .deferred_tape_events
@@ -399,13 +523,34 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     Ok(EmbeddedProviderTurn::Cancelled { reason_code })
                 }
                 "runtime.provider_call.context_window_exceeded" => {
-                    self.state
-                        .lock()
+                    let mut state = self.state.lock().map_err(|_| {
+                        self.kernel_failure("runtime.provider.turn_state_unavailable")
+                    })?;
+                    let step = state
+                        .context_recovery
+                        .next_step()
                         .map_err(|_| {
-                            self.kernel_failure("runtime.provider.turn_state_unavailable")
+                            self.kernel_failure("runtime.context_recovery.controller_failed")
                         })?
+                        .ok_or_else(|| {
+                            self.kernel_failure("runtime.context_recovery.budget_exhausted")
+                        })?;
+                    if step.action != ContextRecoveryAction::Compact {
+                        return Err(
+                            self.kernel_failure("runtime.context_recovery.executor_required")
+                        );
+                    }
+                    state.pending_context_recovery_step = Some(step);
+                    let plan = state.context_recovery.plan().clone();
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
+                        event_type: "recovery.action.started",
+                        action: "compact".to_owned(),
+                        reason_code: "context.recovery.compact_requested".to_owned(),
+                    });
+                    state
                         .deferred_tape_events
-                        .push(V2DeferredTapeEvent::CompactionRequired);
+                        .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionRequired);
                     Ok(EmbeddedProviderTurn::CompactionRequired)
                 }
                 _ => Err(self.kernel_failure("runtime.provider.call_failed")),
@@ -419,43 +564,107 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
         result: &'a CompactionResult,
     ) -> HarnessFuture<'a, Result<(), RuntimeErrorEnvelopeV1>> {
         Box::pin(async move {
-            let CompactionResult::Applied { .. } = result;
-            let projection = self.compaction_projections.take().ok_or_else(|| {
-                self.kernel_failure("runtime.compaction.applied_projection_missing")
-            })?;
-            let current_input =
-                self.base_request.user_visible_input_text.as_deref().ok_or_else(|| {
-                    self.kernel_failure("runtime.compaction.current_input_missing")
-                })?;
-            let block = crate::application::session_compaction::render_compaction_prompt_block(
-                projection.artifact_id.as_str(),
-                projection.mode.as_str(),
-                projection.trigger_reason.as_str(),
-                projection.summary_text.as_str(),
-            );
-            let compacted_input_text = format!("{block}\n\n{current_input}");
-            let mut messages = self
-                .base_request
-                .effective_messages()
-                .into_iter()
-                .filter(|message| {
-                    matches!(
-                        message.role,
-                        ProviderMessageRole::System | ProviderMessageRole::Developer
-                    )
-                })
-                .collect::<Vec<_>>();
-            messages.push(ProviderMessage::user_text(compacted_input_text.clone()));
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
-            state.messages = messages;
-            state.compacted_input_text = Some(compacted_input_text);
-            state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionApplied {
-                artifact_id_sha256: crate::sha256_hex(projection.artifact_id.as_bytes()),
+            let recovery_step = state.pending_context_recovery_step.take().ok_or_else(|| {
+                self.kernel_failure("runtime.context_recovery.compaction_step_missing")
+            })?;
+            let recovery_outcome = match result {
+                CompactionResult::Applied { .. } => {
+                    let projection = self.compaction_projections.take().ok_or_else(|| {
+                        self.kernel_failure("runtime.compaction.applied_projection_missing")
+                    })?;
+                    let current_input =
+                        self.base_request.user_visible_input_text.as_deref().ok_or_else(|| {
+                            self.kernel_failure("runtime.compaction.current_input_missing")
+                        })?;
+                    let block =
+                        crate::application::session_compaction::render_compaction_prompt_block(
+                            projection.artifact_id.as_str(),
+                            projection.mode.as_str(),
+                            projection.trigger_reason.as_str(),
+                            projection.summary_text.as_str(),
+                        );
+                    let compacted_input_text = format!("{block}\n\n{current_input}");
+                    let mut messages = self
+                        .base_request
+                        .effective_messages()
+                        .into_iter()
+                        .filter(|message| {
+                            matches!(
+                                message.role,
+                                ProviderMessageRole::System | ProviderMessageRole::Developer
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    messages.push(ProviderMessage::user_text(compacted_input_text.clone()));
+                    state.messages = messages;
+                    state.compacted_input_text = Some(compacted_input_text);
+                    let recovered_request = self.projected_recovery_request(&state);
+                    let after_tokens =
+                        estimated_required_tokens_for_request(&recovered_request, &self.catalog);
+                    let outcome = state
+                        .context_recovery
+                        .record_outcome(
+                            &recovery_step,
+                            after_tokens,
+                            vec![
+                                TokenBreakdownCategory::SessionHistory,
+                                TokenBreakdownCategory::ToolResults,
+                            ],
+                            true,
+                        )
+                        .map_err(|_| {
+                            self.kernel_failure(
+                                "runtime.context_recovery.compaction_outcome_invalid",
+                            )
+                        })?;
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionApplied {
+                        artifact_id_sha256: crate::sha256_hex(projection.artifact_id.as_bytes()),
+                    });
+                    outcome
+                }
+                CompactionResult::Skipped { reason_code, .. } => {
+                    let after_tokens = state.context_recovery.current_tokens();
+                    let outcome = state
+                        .context_recovery
+                        .record_outcome_with_host_reason(
+                            &recovery_step,
+                            after_tokens,
+                            Vec::new(),
+                            true,
+                            Some(reason_code.as_str()),
+                        )
+                        .map_err(|_| {
+                            self.kernel_failure(
+                                "runtime.context_recovery.compaction_outcome_invalid",
+                            )
+                        })?;
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionSkipped {
+                        reason_code: reason_code.clone(),
+                    });
+                    outcome
+                }
+            };
+            let completed_reason = recovery_outcome
+                .host_reason_code
+                .clone()
+                .unwrap_or_else(|| recovery_outcome.reason_code.clone());
+            state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
+                event_type: "recovery.action.completed",
+                action: "compact".to_owned(),
+                reason_code: completed_reason,
             });
-            Ok(())
+            let plan = state.context_recovery.plan().clone();
+            state
+                .deferred_tape_events
+                .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
+            if recovery_outcome.terminal {
+                return Ok(());
+            }
+            self.continue_prompt_local_recovery(&mut state)
         })
     }
 
@@ -731,6 +940,19 @@ pub(super) async fn drive_authoritative_v2(
     base_provider_request.model_override = Some(selection.provider.model_id.clone());
     base_provider_request.tool_catalog_snapshot =
         Some(snapshot_to_provider_request_value(&tool_catalog));
+    let provider_snapshot = runtime_state.model_provider_status_snapshot();
+    let context_recovery = ContextRecoveryController::new(context_recovery_input_for_request(
+        &base_provider_request,
+        &provider_snapshot,
+        selection.provider.provider_id.as_str(),
+        selection.provider.model_id.as_str(),
+        &tool_catalog,
+        true,
+        0,
+    ))
+    .map_err(|reason| {
+        Status::failed_precondition(format!("V2 context recovery input failed: {reason}"))
+    })?;
     let lease = ProviderLeaseExecutionContext {
         provider_id: selection.provider.provider_id,
         credential_id: selection.provider.credential_id,
@@ -798,6 +1020,7 @@ pub(super) async fn drive_authoritative_v2(
         base_provider_request.clone(),
         lease,
         tool_catalog,
+        context_recovery,
         V2CallbackResources {
             proposal_retention: attempt_factory.proposal_retention(),
             compaction_projections,
@@ -1042,6 +1265,28 @@ async fn append_v2_deferred_tape_events(
                     "schema_version": 1,
                     "reason_code": "runtime.compaction.applied",
                     "artifact_id_sha256": artifact_id_sha256,
+                })
+                .to_string(),
+            ),
+            V2DeferredTapeEvent::CompactionSkipped { reason_code } => (
+                "runtime.compaction.skipped".to_owned(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "reason_code": reason_code,
+                    "redaction_level": "metadata_only",
+                })
+                .to_string(),
+            ),
+            V2DeferredTapeEvent::ContextRecoveryPlan(plan) => {
+                (CONTEXT_RECOVERY_EVENT.to_owned(), plan.tape_payload().to_string())
+            }
+            V2DeferredTapeEvent::ContextRecoveryAction { event_type, action, reason_code } => (
+                event_type.to_owned(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "action": action,
+                    "reason_code": reason_code,
+                    "redaction_level": "metadata_only",
                 })
                 .to_string(),
             ),
