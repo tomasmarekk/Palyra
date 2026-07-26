@@ -269,8 +269,10 @@ pub enum AuthProfileFailureKind {
     AuthInvalid,
     RefreshDue,
     RefreshFailed,
+    Permission,
     Quota,
     RateLimit,
+    SuspectedCompromise,
     Transient,
     ConfigMissing,
 }
@@ -283,10 +285,43 @@ impl AuthProfileFailureKind {
             Self::AuthInvalid => "auth_invalid",
             Self::RefreshDue => "refresh_due",
             Self::RefreshFailed => "refresh_failed",
+            Self::Permission => "permission",
             Self::Quota => "quota",
             Self::RateLimit => "rate_limit",
+            Self::SuspectedCompromise => "suspected_compromise",
             Self::Transient => "transient",
             Self::ConfigMissing => "config_missing",
+        }
+    }
+}
+
+/// Provider-auth failure classification used by per-attempt rotation policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFailureClass {
+    Invalid,
+    Expired,
+    Permission,
+    Quota,
+    RateLimited,
+    SuspectedCompromise,
+}
+
+impl AuthFailureClass {
+    /// Returns whether another credential may be selected automatically.
+    ///
+    /// Permission failures are request-policy failures and therefore cannot be
+    /// repaired by changing credentials. Suspected compromise is fail-closed
+    /// unless an explicit security policy authorizes rotation.
+    #[must_use]
+    pub const fn allows_automatic_rotation(
+        self,
+        suspected_compromise_rotation_authorized: bool,
+    ) -> bool {
+        match self {
+            Self::Invalid | Self::Expired | Self::Quota | Self::RateLimited => true,
+            Self::Permission => false,
+            Self::SuspectedCompromise => suspected_compromise_rotation_authorized,
         }
     }
 }
@@ -415,6 +450,26 @@ pub struct AuthProfileSelectionResult {
     /// `selected`, `no_candidates`, or `no_eligible_candidates`.
     pub reason_code: String,
     pub candidates: Vec<AuthProfileSelectionCandidate>,
+    pub generated_at_unix_ms: i64,
+}
+
+/// Redacted identity bound to one concrete provider attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialAttemptBinding {
+    pub profile_id: String,
+    pub profile_id_sha256: String,
+    pub auth_class: AuthCredentialType,
+    pub selection_reason: String,
+}
+
+/// Redacted selection evidence retained for one provider attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialSelectionReport {
+    pub schema_version: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<CredentialAttemptBinding>,
+    pub reason_code: String,
+    pub considered_profile_hashes: Vec<String>,
     pub generated_at_unix_ms: i64,
 }
 

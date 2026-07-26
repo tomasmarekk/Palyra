@@ -7,11 +7,11 @@
 use crate::{
     compute_backoff_ms, load_secret_utf8, normalize_optional_text, normalize_token_endpoint,
     persist_secret_utf8, validate_runtime_token_endpoint_with_resolver, AuthCredential,
-    AuthCredentialType, AuthProfileEligibility, AuthProfileError, AuthProfileFailureKind,
-    AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope, AuthProfileSelectionRequest,
-    AuthProfileSetRequest, AuthProvider, AuthProviderKind, AuthTokenExpiryState,
-    HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshOutcomeKind,
-    OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
+    AuthCredentialType, AuthFailureClass, AuthProfileEligibility, AuthProfileError,
+    AuthProfileFailureKind, AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope,
+    AuthProfileSelectionRequest, AuthProfileSetRequest, AuthProvider, AuthProviderKind,
+    AuthTokenExpiryState, HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError,
+    OAuthRefreshOutcomeKind, OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
 };
 use palyra_vault::Vault;
 use palyra_vault::{
@@ -1265,6 +1265,32 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
     assert_eq!(failover.selected_profile_id.as_deref(), Some("openai-b"));
     assert_eq!(failover.candidates[0].profile_id, "openai-a");
     assert_eq!(failover.candidates[0].reason_code, "cooldown_active");
+
+    let after_cooldown = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            now.saturating_add(60_001),
+        )
+        .expect("selector should restore a profile after cooldown expiry");
+    assert_eq!(after_cooldown.selected_profile_id.as_deref(), Some("openai-a"));
+}
+
+#[test]
+fn auth_failure_rotation_policy_fails_closed_for_permission_and_compromise() {
+    assert!(AuthFailureClass::Invalid.allows_automatic_rotation(false));
+    assert!(AuthFailureClass::Expired.allows_automatic_rotation(false));
+    assert!(AuthFailureClass::Quota.allows_automatic_rotation(false));
+    assert!(AuthFailureClass::RateLimited.allows_automatic_rotation(false));
+    assert!(!AuthFailureClass::Permission.allows_automatic_rotation(false));
+    assert!(!AuthFailureClass::SuspectedCompromise.allows_automatic_rotation(false));
+    assert!(AuthFailureClass::SuspectedCompromise.allows_automatic_rotation(true));
 }
 
 #[test]

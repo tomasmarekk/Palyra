@@ -100,9 +100,10 @@ pub use shared_runtime::{
     ProviderAttemptCompletionRequest, ProviderAttemptRuntimeAuthority, ProviderAttemptStartRequest,
     ProviderConfigurationAttemptCompletionOutcome, ProviderConfigurationAttemptCompletionRequest,
     ProviderConfigurationAttemptRuntimeAuthority, ProviderConfigurationAttemptStartRequest,
-    RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeGenerationInvalidateRequest,
-    RuntimeStaleEventDiagnosticRequest, SharedRuntimeDiagnostics,
-    SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
+    ProviderCredentialAttemptMetadata, RuntimeEventAppendOutcome, RuntimeEventAppendRequest,
+    RuntimeGenerationInvalidateRequest, RuntimeStaleEventDiagnosticRequest,
+    SharedRuntimeDiagnostics, SideEffectFenceCleanupOutcomeRequest,
+    SideEffectFenceOperatorResolutionRequest,
 };
 #[cfg(test)]
 pub use shared_runtime::{
@@ -32927,7 +32928,7 @@ mod tests {
         ProviderAttemptCompletionRequest, ProviderAttemptStartRequest,
         ProviderConfigurationAttemptCompletionOutcome,
         ProviderConfigurationAttemptCompletionRequest, ProviderConfigurationAttemptStartRequest,
-        RecallArtifactCreateRequest, RecallArtifactListFilter,
+        ProviderCredentialAttemptMetadata, RecallArtifactCreateRequest, RecallArtifactListFilter,
         RunScopedRuntimeHealthObservationOutcome, RuntimeEventAppendOutcome,
         RuntimeEventAppendRequest, RuntimeGenerationActivateRequest,
         RuntimeGenerationInvalidateOutcome, RuntimeGenerationInvalidateRequest,
@@ -33143,6 +33144,11 @@ mod tests {
         let configuration_epoch = activate_test_provider_runtime(&store);
         let attempt_id = RuntimeAttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5PA3")
             .expect("attempt identity should validate");
+        let credential = ProviderCredentialAttemptMetadata {
+            profile_id_sha256: "a".repeat(64),
+            auth_class: "oauth".to_owned(),
+            selection_reason: "eligible".to_owned(),
+        };
 
         let authority = store
             .start_provider_attempt(&ProviderAttemptStartRequest {
@@ -33153,6 +33159,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
+                credential: Some(credential.clone()),
             })
             .expect("provider attempt should start");
         let completion = store
@@ -33202,6 +33209,22 @@ mod tests {
                 metadata.get("configuration_epoch").and_then(serde_json::Value::as_u64),
                 Some(configuration_epoch.get())
             );
+            assert_eq!(
+                metadata.pointer("/auth_profile_binding/profile_id_sha256"),
+                Some(&serde_json::Value::String(credential.profile_id_sha256.clone()))
+            );
+            assert_eq!(
+                metadata.pointer("/auth_profile_binding/auth_class"),
+                Some(&serde_json::Value::String("oauth".to_owned()))
+            );
+            assert_eq!(
+                metadata.pointer("/auth_profile_binding/selection_reason"),
+                Some(&serde_json::Value::String("eligible".to_owned()))
+            );
+            let serialized =
+                serde_json::to_string(metadata).expect("provider metadata should serialize");
+            assert!(!serialized.contains("oauth-primary"));
+            assert!(!serialized.contains("access-token"));
         }
     }
 
@@ -33225,6 +33248,7 @@ mod tests {
             "model-primary",
             "failure",
             Some("superseded"),
+            None,
             1_730_000_000_000,
         )
         .expect("superseded provider event should build");
@@ -33272,6 +33296,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
+                credential: None,
             })
             .expect_err("stale configuration authority must fail before effect start");
         assert!(matches!(
@@ -33301,6 +33326,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
+                credential: None,
             })
             .expect("provider attempt should start");
         authority.started_event_id = RuntimeEventId::parse("provider_attempt:forged:started")
@@ -33376,6 +33402,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
+                credential: None,
             })
             .expect("first provider attempt should start");
         let first_completion = ProviderAttemptCompletionRequest {
@@ -33416,6 +33443,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "openai-primary".to_owned(),
                 model_id: "gpt-4o-mini".to_owned(),
+                credential: None,
             })
             .expect("second provider attempt should start");
         let concurrent = store
@@ -33428,6 +33456,7 @@ mod tests {
                 runtime_authority: None,
                 provider_id: "anthropic-primary".to_owned(),
                 model_id: "claude-sonnet".to_owned(),
+                credential: None,
             })
             .expect("concurrent provider attempt should share configuration authority");
         assert_eq!(concurrent.generation, stale.generation);

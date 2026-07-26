@@ -1316,6 +1316,7 @@ impl AuthProfileRegistry {
                 AuthProfileFailureKind::AuthInvalid | AuthProfileFailureKind::ConfigMissing => {
                     AuthProfileEligibility::MissingCredential
                 }
+                AuthProfileFailureKind::SuspectedCompromise => AuthProfileEligibility::Revoked,
                 _ => record.eligibility,
             }
         };
@@ -1482,6 +1483,11 @@ fn doctor_hint_for_state(
             AuthProfileDoctorSeverity::Error,
             "credential vault reference is missing or unreadable",
         ),
+        (AuthProfileEligibility::Revoked, _, Some(AuthProfileFailureKind::SuspectedCompromise)) => (
+            "suspected_compromise".to_owned(),
+            AuthProfileDoctorSeverity::Error,
+            "credential is quarantined after a suspected compromise; security review is required",
+        ),
         (_, AuthTokenExpiryState::Expiring, _) => (
             "refresh_due".to_owned(),
             AuthProfileDoctorSeverity::Warning,
@@ -1503,8 +1509,10 @@ fn failure_cooldown_ms(
         AuthProfileFailureKind::RefreshFailed => Some(compute_backoff_ms(provider, failure_count)),
         AuthProfileFailureKind::AuthInvalid => Some(5 * 60 * 1_000),
         AuthProfileFailureKind::RefreshDue => Some(30_000),
+        AuthProfileFailureKind::Permission => None,
         AuthProfileFailureKind::Quota => Some(30 * 60 * 1_000),
         AuthProfileFailureKind::RateLimit => Some(60_000),
+        AuthProfileFailureKind::SuspectedCompromise => None,
         AuthProfileFailureKind::Transient => Some(15_000),
         AuthProfileFailureKind::ConfigMissing => None,
     }

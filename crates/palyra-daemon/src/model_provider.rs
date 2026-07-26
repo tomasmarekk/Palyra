@@ -29,6 +29,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use palyra_auth::{AuthCredentialType, CredentialAttemptBinding, CredentialSelectionReport};
 use palyra_common::{
     qa_runtime_path::{
         qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
@@ -39,6 +40,7 @@ use palyra_common::{
     },
     runtime_contracts::{RuntimeAttemptId, RuntimeGeneration, RuntimeInstanceId},
 };
+use palyra_vault::SensitiveBytes;
 use reqwest::{header::RETRY_AFTER, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -538,6 +540,49 @@ pub struct ProviderAttemptBinding {
     pub credential_id: String,
     pub model_id: String,
     pub health_authority: ProviderAttemptHealthAuthority,
+    pub credential_attempt: Option<CredentialAttemptBinding>,
+    pub credential_selection: Option<CredentialSelectionReport>,
+}
+
+/// Zeroizing credential material exposed only to the selected provider adapter.
+pub struct ProviderCredentialLease {
+    auth_class: AuthCredentialType,
+    secret: SensitiveBytes,
+}
+
+impl ProviderCredentialLease {
+    /// Takes ownership of one just-in-time credential buffer.
+    #[must_use]
+    pub fn new(auth_class: AuthCredentialType, secret: SensitiveBytes) -> Self {
+        Self { auth_class, secret }
+    }
+
+    /// Returns the credential class needed to select provider auth headers.
+    #[must_use]
+    pub const fn auth_class(&self) -> AuthCredentialType {
+        self.auth_class
+    }
+
+    fn secret_utf8(&self) -> Result<&str, ProviderError> {
+        std::str::from_utf8(self.secret.as_ref()).map_err(|_| ProviderError::RequestFailed {
+            message: "selected provider credential is not valid UTF-8".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: fail_closed_provider_classification(
+                "provider_credential_material_invalid_utf8",
+            ),
+        })
+    }
+}
+
+impl std::fmt::Debug for ProviderCredentialLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderCredentialLease")
+            .field("auth_class", &self.auth_class)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Opaque generation authority held from provider effect start through completion.
@@ -726,8 +771,39 @@ pub type ProviderAttemptPermitFuture<'a> = Pin<
     >,
 >;
 
+/// Future that prepares redacted credential selection for one provider attempt.
+pub type ProviderAttemptPreparationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ProviderAttemptBinding, ProviderAttemptAdmissionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Future that materializes a zeroizing credential immediately before an effect.
+pub type ProviderCredentialLeaseFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<ProviderCredentialLease>, ProviderAttemptAdmissionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// Host-owned admission and feedback boundary around registry candidate calls.
 pub trait ProviderAttemptAdmission: Send + Sync {
+    /// Selects and binds the credential for one concrete provider attempt.
+    ///
+    /// The default preserves static provider configuration. Host admissions may
+    /// override this to perform async refresh and per-attempt profile selection.
+    fn prepare_attempt<'a>(
+        &'a self,
+        provider_id: &'a str,
+        credential_id: &'a str,
+        model_id: &'a str,
+    ) -> ProviderAttemptPreparationFuture<'a> {
+        Box::pin(async move { self.bind_attempt(provider_id, credential_id, model_id) })
+    }
+
     /// Binds one candidate to the exact health authority captured for this provider swap.
     fn bind_attempt(
         &self,
@@ -751,6 +827,14 @@ pub trait ProviderAttemptAdmission: Send + Sync {
         &'a self,
         binding: &'a ProviderAttemptBinding,
     ) -> ProviderAttemptPermitFuture<'a>;
+
+    /// Resolves credential material just-in-time after admission and before effect start.
+    fn materialize_credential<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+    ) -> ProviderCredentialLeaseFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Persists exact generation authority immediately before the external effect.
     fn record_started<'a>(
@@ -833,6 +917,8 @@ impl ProviderAttemptAdmission for UnrestrictedProviderAttemptAdmission {
             credential_id: credential_id.to_owned(),
             model_id: model_id.to_owned(),
             health_authority: ProviderAttemptHealthAuthority { component_id, generation },
+            credential_attempt: None,
+            credential_selection: None,
         })
     }
 
@@ -921,6 +1007,28 @@ pub trait ModelProvider: Send + Sync {
         _admission: Arc<dyn ProviderAttemptAdmission>,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
         self.complete(request)
+    }
+
+    /// Completes one request with an optional host-owned credential override.
+    ///
+    /// Only HTTP provider adapters override this method. The lease is borrowed
+    /// for the effect and zeroized by the caller immediately afterward.
+    fn complete_with_credential<'a>(
+        &'a self,
+        request: ProviderRequest,
+        _credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        self.complete(request)
+    }
+
+    /// Transcribes one request with an optional host-owned credential override.
+    fn transcribe_audio_with_credential<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+        _credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        self.transcribe_audio(request)
     }
 
     /// Executes exactly one chat request for a host-owned probe.
@@ -1254,6 +1362,40 @@ fn provider_attempt_summary(
         reason_code,
         state,
     }
+}
+
+fn bind_provider_attempt_state(
+    mut state: ProviderAttemptState,
+    binding: &ProviderAttemptBinding,
+) -> ProviderAttemptState {
+    state.credential_id = binding.credential_id.clone();
+    state
+}
+
+fn auth_failure_class_for_provider_error(
+    error: &ProviderError,
+) -> Option<palyra_auth::AuthFailureClass> {
+    if matches!(error, ProviderError::MissingApiKey | ProviderError::MissingAnthropicApiKey) {
+        return Some(palyra_auth::AuthFailureClass::Invalid);
+    }
+    match error.failure_snapshot().class.as_str() {
+        "auth_invalid" => Some(palyra_auth::AuthFailureClass::Invalid),
+        "auth_expired" => Some(palyra_auth::AuthFailureClass::Expired),
+        "permission_denied" => Some(palyra_auth::AuthFailureClass::Permission),
+        "quota" | "quota_exceeded" => Some(palyra_auth::AuthFailureClass::Quota),
+        "rate_limit" | "rate_limited" => Some(palyra_auth::AuthFailureClass::RateLimited),
+        "suspected_compromise" => Some(palyra_auth::AuthFailureClass::SuspectedCompromise),
+        _ => None,
+    }
+}
+
+pub(crate) fn provider_error_allows_credential_rotation(
+    error: &ProviderError,
+    partial_output_started: bool,
+) -> bool {
+    !partial_output_started
+        && auth_failure_class_for_provider_error(error)
+            .is_some_and(|class| class.allows_automatic_rotation(false))
 }
 
 fn provider_attempt_success_state(
@@ -2017,7 +2159,7 @@ impl ModelProvider for RegistryBackedModelProvider {
             let mut last_error = None;
             let mut blocked_credentials = HashMap::<String, ProviderAttemptState>::new();
 
-            for (index, model) in candidates.iter().enumerate() {
+            'candidate: for (index, model) in candidates.iter().enumerate() {
                 // Registry normalization guarantees every model references a
                 // known provider; a miss here means internal state corruption.
                 let runtime = self
@@ -2038,17 +2180,47 @@ impl ModelProvider for RegistryBackedModelProvider {
                     ));
                     if index + 1 < candidates.len() {
                         failover_count = failover_count.saturating_add(1);
-                        continue;
+                        continue 'candidate;
                     }
-                    break;
+                    break 'candidate;
                 }
-                let binding = match admission.bind_attempt(
-                    model.provider_id.as_str(),
-                    credential_id.as_str(),
-                    model.model_id.as_str(),
-                ) {
-                    Ok(binding) => binding,
-                    Err(admission_error) => {
+                'credential: loop {
+                    let binding = match admission
+                        .prepare_attempt(
+                            model.provider_id.as_str(),
+                            credential_id.as_str(),
+                            model.model_id.as_str(),
+                        )
+                        .await
+                    {
+                        Ok(binding) => binding,
+                        Err(admission_error) => {
+                            let state = provider_attempt_admission_state(
+                                index,
+                                model,
+                                runtime,
+                                &admission_error,
+                                current_unix_ms().unwrap_or_default(),
+                            );
+                            attempts.push(provider_attempt_summary(
+                                model.provider_id.clone(),
+                                model.model_id.clone(),
+                                "skipped",
+                                true,
+                                false,
+                                Some(admission_error.reason_code().to_owned()),
+                                Some(state),
+                            ));
+                            last_error =
+                                Some(provider_attempt_admission_provider_error(admission_error));
+                            if index + 1 < candidates.len() {
+                                failover_count = failover_count.saturating_add(1);
+                                continue 'candidate;
+                            }
+                            break 'candidate;
+                        }
+                    };
+                    if let Err(admission_error) = admission.check_eligibility(&binding) {
                         let state = provider_attempt_admission_state(
                             index,
                             model,
@@ -2069,221 +2241,253 @@ impl ModelProvider for RegistryBackedModelProvider {
                             Some(provider_attempt_admission_provider_error(admission_error));
                         if index + 1 < candidates.len() {
                             failover_count = failover_count.saturating_add(1);
-                            continue;
+                            continue 'candidate;
                         }
-                        break;
+                        break 'candidate;
                     }
-                };
-                if let Err(admission_error) = admission.check_eligibility(&binding) {
-                    let state = provider_attempt_admission_state(
-                        index,
-                        model,
-                        runtime,
-                        &admission_error,
-                        current_unix_ms().unwrap_or_default(),
-                    );
-                    attempts.push(provider_attempt_summary(
-                        model.provider_id.clone(),
-                        model.model_id.clone(),
-                        "skipped",
-                        true,
-                        false,
-                        Some(admission_error.reason_code().to_owned()),
-                        Some(state),
-                    ));
-                    last_error = Some(provider_attempt_admission_provider_error(admission_error));
-                    if index + 1 < candidates.len() {
-                        failover_count = failover_count.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
 
-                let cache_key = self.response_cache_key(&request, model);
-                if let Some(mut cached) =
-                    self.lookup_cached_response(cache_key.as_str(), model, runtime)
-                {
-                    cached.failover_count = failover_count;
-                    rebind_provider_attempts(&mut cached.attempts, attempts.len(), model, runtime);
-                    cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
-                    cached.qa_lane_attestation = qa_registry_provider_lane_attestation(
-                        request.qa_attestation_context.as_ref(),
-                        cached.qa_lane_attestation.take(),
-                        &self.config,
-                        model,
-                        runtime,
-                    )?;
-                    self.record_runtime_metrics(
-                        false,
-                        cached.prompt_tokens,
-                        cached.completion_tokens,
-                        cached.retry_count,
-                        elapsed_millis_since(started_at),
-                        None,
-                    );
-                    return Ok(cached);
-                }
-
-                let _permit = match admission.acquire(&binding).await {
-                    Ok(permit) => permit,
-                    Err(admission_error) => {
-                        let state = provider_attempt_admission_state(
-                            index,
+                    let cache_key = self.response_cache_key(&request, model);
+                    if let Some(mut cached) =
+                        self.lookup_cached_response(cache_key.as_str(), model, runtime)
+                    {
+                        cached.failover_count = failover_count;
+                        rebind_provider_attempts(
+                            &mut cached.attempts,
+                            attempts.len(),
                             model,
                             runtime,
-                            &admission_error,
-                            current_unix_ms().unwrap_or_default(),
                         );
-                        attempts.push(provider_attempt_summary(
-                            model.provider_id.clone(),
-                            model.model_id.clone(),
-                            "skipped",
-                            true,
-                            false,
-                            Some(admission_error.reason_code().to_owned()),
-                            Some(state),
-                        ));
-                        last_error =
-                            Some(provider_attempt_admission_provider_error(admission_error));
-                        if index + 1 < candidates.len() {
-                            failover_count = failover_count.saturating_add(1);
-                            continue;
-                        }
-                        break;
-                    }
-                };
-
-                let runtime_authority = admission
-                    .record_started(&binding)
-                    .await
-                    .map_err(provider_attempt_admission_provider_error)?;
-                let mut provider_request = request.clone();
-                provider_request.model_override = Some(model.model_id.clone());
-                match runtime.provider.complete(provider_request).await {
-                    Ok(mut response) => {
-                        if admission
-                            .record_success(&binding, runtime_authority)
-                            .await
-                            .map_err(provider_attempt_admission_provider_error)?
-                            == ProviderAttemptCompletionDisposition::StaleSuppressed
-                        {
-                            return Err(provider_attempt_superseded_error());
-                        }
-                        response.provider_id = model.provider_id.clone();
-                        response.model_id = model.model_id.clone();
-                        response.qa_lane_attestation = qa_registry_provider_lane_attestation(
+                        cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
+                        cached.qa_lane_attestation = qa_registry_provider_lane_attestation(
                             request.qa_attestation_context.as_ref(),
-                            response.qa_lane_attestation.take(),
+                            cached.qa_lane_attestation.take(),
                             &self.config,
                             model,
                             runtime,
                         )?;
-                        response.served_from_cache = false;
-                        response.failover_count = failover_count;
-                        let outcome = if index == 0 { "success" } else { "failover_success" };
-                        let mut provider_attempts = std::mem::take(&mut response.attempts);
-                        if provider_attempts.len() > 1 {
-                            let attempt_offset = attempts.len();
-                            rebind_provider_attempts(
-                                &mut provider_attempts,
-                                attempt_offset,
-                                model,
-                                runtime,
-                            );
-                            let final_attempt_index = attempt_offset
-                                .saturating_add(provider_attempts.len())
-                                .saturating_sub(1);
-                            if let Some(final_attempt) = provider_attempts.last_mut() {
-                                final_attempt.outcome = outcome.to_owned();
-                                final_attempt.reason_code =
-                                    (index > 0).then(|| "failover_success".to_owned());
-                                let mut state = provider_attempt_success_state(
-                                    index, model, runtime, &response, outcome, false,
-                                );
-                                state.attempt_index = provider_attempt_index(final_attempt_index);
-                                final_attempt.state = Some(state);
-                            }
-                            attempts.extend(provider_attempts);
-                        } else {
-                            attempts.push(provider_attempt_summary(
-                                model.provider_id.clone(),
-                                model.model_id.clone(),
-                                outcome,
-                                false,
-                                false,
-                                (index > 0).then(|| "failover_success".to_owned()),
-                                Some(provider_attempt_success_state(
-                                    index, model, runtime, &response, outcome, false,
-                                )),
-                            ));
-                        }
-                        response.attempts = attempts;
-                        self.insert_cached_response(cache_key, &response);
                         self.record_runtime_metrics(
                             false,
-                            response.prompt_tokens,
-                            response.completion_tokens,
-                            response.retry_count,
+                            cached.prompt_tokens,
+                            cached.completion_tokens,
+                            cached.retry_count,
                             elapsed_millis_since(started_at),
                             None,
                         );
-                        return Ok(response);
+                        return Ok(cached);
                     }
-                    Err(error) => {
-                        if admission
-                            .record_failure(&binding, runtime_authority, &error)
-                            .await
-                            .map_err(provider_attempt_admission_provider_error)?
-                            == ProviderAttemptCompletionDisposition::StaleSuppressed
-                        {
-                            return Err(provider_attempt_superseded_error());
-                        }
-                        // Missing-credential errors count as retryable in the
-                        // attempt record: the failure is provider-local and a
-                        // failover candidate with its own credential can still
-                        // serve the request.
-                        let retryable = matches!(
-                            error,
-                            ProviderError::CircuitOpen { .. }
-                                | ProviderError::RequestFailed { retryable: true, .. }
-                                | ProviderError::MissingApiKey
-                                | ProviderError::MissingAnthropicApiKey
-                        );
-                        let failover_allowed = retryable
-                            || matches!(
-                                error.classification().recommended_action,
-                                ProviderFailureAction::ProviderFailover
-                                    | ProviderFailureAction::RotateCredential
+
+                    let _permit = match admission.acquire(&binding).await {
+                        Ok(permit) => permit,
+                        Err(admission_error) => {
+                            let state = provider_attempt_admission_state(
+                                index,
+                                model,
+                                runtime,
+                                &admission_error,
+                                current_unix_ms().unwrap_or_default(),
                             );
-                        let failure = error.failure_snapshot();
-                        let state = provider_attempt_error_state(
-                            index,
-                            model,
-                            runtime,
-                            &error,
-                            current_unix_ms().unwrap_or_default(),
-                        );
-                        let blocks_credential = provider_failure_blocks_credential(&failure);
-                        attempts.push(provider_attempt_summary(
-                            model.provider_id.clone(),
-                            model.model_id.clone(),
-                            "error",
-                            retryable,
-                            false,
-                            Some(error.envelope().provider_trace_ref.unwrap_or_else(|| {
-                                error.classification().class.as_str().to_owned()
-                            })),
-                            Some(state.clone()),
-                        ));
-                        if blocks_credential {
-                            blocked_credentials.insert(state.credential_id.clone(), state);
+                            attempts.push(provider_attempt_summary(
+                                model.provider_id.clone(),
+                                model.model_id.clone(),
+                                "skipped",
+                                true,
+                                false,
+                                Some(admission_error.reason_code().to_owned()),
+                                Some(state),
+                            ));
+                            last_error =
+                                Some(provider_attempt_admission_provider_error(admission_error));
+                            if index + 1 < candidates.len() {
+                                failover_count = failover_count.saturating_add(1);
+                                continue 'candidate;
+                            }
+                            break 'candidate;
                         }
-                        last_error = Some(error);
-                        if failover_allowed && index + 1 < candidates.len() {
-                            failover_count = failover_count.saturating_add(1);
-                            continue;
+                    };
+
+                    let credential = match admission.materialize_credential(&binding).await {
+                        Ok(credential) => credential,
+                        Err(admission_error) => {
+                            let state = provider_attempt_admission_state(
+                                index,
+                                model,
+                                runtime,
+                                &admission_error,
+                                current_unix_ms().unwrap_or_default(),
+                            );
+                            attempts.push(provider_attempt_summary(
+                                model.provider_id.clone(),
+                                model.model_id.clone(),
+                                "skipped",
+                                true,
+                                false,
+                                Some(admission_error.reason_code().to_owned()),
+                                Some(bind_provider_attempt_state(state, &binding)),
+                            ));
+                            last_error =
+                                Some(provider_attempt_admission_provider_error(admission_error));
+                            if binding.credential_attempt.is_some() {
+                                continue 'credential;
+                            }
+                            if index + 1 < candidates.len() {
+                                failover_count = failover_count.saturating_add(1);
+                                continue 'candidate;
+                            }
+                            break 'candidate;
                         }
-                        break;
+                    };
+                    let runtime_authority = admission
+                        .record_started(&binding)
+                        .await
+                        .map_err(provider_attempt_admission_provider_error)?;
+                    let mut provider_request = request.clone();
+                    provider_request.model_override = Some(model.model_id.clone());
+                    let provider_result = runtime
+                        .provider
+                        .complete_with_credential(provider_request, credential.as_ref())
+                        .await;
+                    drop(credential);
+                    match provider_result {
+                        Ok(mut response) => {
+                            if admission
+                                .record_success(&binding, runtime_authority)
+                                .await
+                                .map_err(provider_attempt_admission_provider_error)?
+                                == ProviderAttemptCompletionDisposition::StaleSuppressed
+                            {
+                                return Err(provider_attempt_superseded_error());
+                            }
+                            response.provider_id = model.provider_id.clone();
+                            response.model_id = model.model_id.clone();
+                            response.qa_lane_attestation = qa_registry_provider_lane_attestation(
+                                request.qa_attestation_context.as_ref(),
+                                response.qa_lane_attestation.take(),
+                                &self.config,
+                                model,
+                                runtime,
+                            )?;
+                            response.served_from_cache = false;
+                            response.failover_count = failover_count;
+                            let outcome = if index == 0 { "success" } else { "failover_success" };
+                            let mut provider_attempts = std::mem::take(&mut response.attempts);
+                            if provider_attempts.len() > 1 {
+                                let attempt_offset = attempts.len();
+                                rebind_provider_attempts(
+                                    &mut provider_attempts,
+                                    attempt_offset,
+                                    model,
+                                    runtime,
+                                );
+                                let final_attempt_index = attempt_offset
+                                    .saturating_add(provider_attempts.len())
+                                    .saturating_sub(1);
+                                if let Some(final_attempt) = provider_attempts.last_mut() {
+                                    final_attempt.outcome = outcome.to_owned();
+                                    final_attempt.reason_code =
+                                        (index > 0).then(|| "failover_success".to_owned());
+                                    let mut state = bind_provider_attempt_state(
+                                        provider_attempt_success_state(
+                                            index, model, runtime, &response, outcome, false,
+                                        ),
+                                        &binding,
+                                    );
+                                    state.attempt_index =
+                                        provider_attempt_index(final_attempt_index);
+                                    final_attempt.state = Some(state);
+                                }
+                                attempts.extend(provider_attempts);
+                            } else {
+                                attempts.push(provider_attempt_summary(
+                                    model.provider_id.clone(),
+                                    model.model_id.clone(),
+                                    outcome,
+                                    false,
+                                    false,
+                                    (index > 0).then(|| "failover_success".to_owned()),
+                                    Some(bind_provider_attempt_state(
+                                        provider_attempt_success_state(
+                                            index, model, runtime, &response, outcome, false,
+                                        ),
+                                        &binding,
+                                    )),
+                                ));
+                            }
+                            response.attempts = attempts;
+                            self.insert_cached_response(cache_key, &response);
+                            self.record_runtime_metrics(
+                                false,
+                                response.prompt_tokens,
+                                response.completion_tokens,
+                                response.retry_count,
+                                elapsed_millis_since(started_at),
+                                None,
+                            );
+                            return Ok(response);
+                        }
+                        Err(error) => {
+                            if admission
+                                .record_failure(&binding, runtime_authority, &error)
+                                .await
+                                .map_err(provider_attempt_admission_provider_error)?
+                                == ProviderAttemptCompletionDisposition::StaleSuppressed
+                            {
+                                return Err(provider_attempt_superseded_error());
+                            }
+                            // Missing-credential errors count as retryable in the
+                            // attempt record: the failure is provider-local and a
+                            // failover candidate with its own credential can still
+                            // serve the request.
+                            let retryable = matches!(
+                                error,
+                                ProviderError::CircuitOpen { .. }
+                                    | ProviderError::RequestFailed { retryable: true, .. }
+                                    | ProviderError::MissingApiKey
+                                    | ProviderError::MissingAnthropicApiKey
+                            );
+                            let failover_allowed = retryable
+                                || matches!(
+                                    error.classification().recommended_action,
+                                    ProviderFailureAction::ProviderFailover
+                                        | ProviderFailureAction::RotateCredential
+                                );
+                            let failure = error.failure_snapshot();
+                            let state = bind_provider_attempt_state(
+                                provider_attempt_error_state(
+                                    index,
+                                    model,
+                                    runtime,
+                                    &error,
+                                    current_unix_ms().unwrap_or_default(),
+                                ),
+                                &binding,
+                            );
+                            let blocks_credential = provider_failure_blocks_credential(&failure);
+                            attempts.push(provider_attempt_summary(
+                                model.provider_id.clone(),
+                                model.model_id.clone(),
+                                "error",
+                                retryable,
+                                false,
+                                Some(error.envelope().provider_trace_ref.unwrap_or_else(|| {
+                                    error.classification().class.as_str().to_owned()
+                                })),
+                                Some(state.clone()),
+                            ));
+                            if blocks_credential {
+                                blocked_credentials.insert(state.credential_id.clone(), state);
+                            }
+                            if binding.credential_attempt.is_some()
+                                && provider_error_allows_credential_rotation(&error, false)
+                            {
+                                continue 'credential;
+                            }
+                            last_error = Some(error);
+                            if failover_allowed && index + 1 < candidates.len() {
+                                failover_count = failover_count.saturating_add(1);
+                                continue 'candidate;
+                            }
+                            break 'candidate;
+                        }
                     }
                 }
             }
@@ -2439,46 +2643,64 @@ impl ModelProvider for RegistryBackedModelProvider {
                 .get(model.provider_id.as_str())
                 .ok_or(ProviderError::StatePoisoned)?;
             let credential_id = registry_provider_credential_id(&runtime.entry);
-            let binding = admission
-                .bind_attempt(
-                    model.provider_id.as_str(),
-                    credential_id.as_str(),
-                    model.model_id.as_str(),
-                )
-                .map_err(provider_attempt_admission_provider_error)?;
-            admission
-                .check_eligibility(&binding)
-                .map_err(provider_attempt_admission_provider_error)?;
-            let _permit = admission
-                .acquire(&binding)
-                .await
-                .map_err(provider_attempt_admission_provider_error)?;
-            let runtime_authority = admission
-                .record_started(&binding)
-                .await
-                .map_err(provider_attempt_admission_provider_error)?;
-            match runtime.provider.transcribe_audio(request).await {
-                Ok(response) => {
-                    if admission
-                        .record_success(&binding, runtime_authority)
-                        .await
-                        .map_err(provider_attempt_admission_provider_error)?
-                        == ProviderAttemptCompletionDisposition::StaleSuppressed
-                    {
-                        return Err(provider_attempt_superseded_error());
+            loop {
+                let binding = admission
+                    .prepare_attempt(
+                        model.provider_id.as_str(),
+                        credential_id.as_str(),
+                        model.model_id.as_str(),
+                    )
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                admission
+                    .check_eligibility(&binding)
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let _permit = admission
+                    .acquire(&binding)
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let credential = match admission.materialize_credential(&binding).await {
+                    Ok(credential) => credential,
+                    Err(_) if binding.credential_attempt.is_some() => continue,
+                    Err(error) => return Err(provider_attempt_admission_provider_error(error)),
+                };
+                let runtime_authority = admission
+                    .record_started(&binding)
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let result = runtime
+                    .provider
+                    .transcribe_audio_with_credential(request.clone(), credential.as_ref())
+                    .await;
+                drop(credential);
+                match result {
+                    Ok(response) => {
+                        if admission
+                            .record_success(&binding, runtime_authority)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
+                        return Ok(response);
                     }
-                    Ok(response)
-                }
-                Err(error) => {
-                    if admission
-                        .record_failure(&binding, runtime_authority, &error)
-                        .await
-                        .map_err(provider_attempt_admission_provider_error)?
-                        == ProviderAttemptCompletionDisposition::StaleSuppressed
-                    {
-                        return Err(provider_attempt_superseded_error());
+                    Err(error) => {
+                        if admission
+                            .record_failure(&binding, runtime_authority, &error)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
+                        if binding.credential_attempt.is_some()
+                            && provider_error_allows_credential_rotation(&error, false)
+                        {
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    Err(error)
                 }
             }
         })
@@ -5506,6 +5728,148 @@ fn finish_reason_from_openai_responses_status(status: Option<&str>) -> ProviderF
     }
 }
 
+impl OpenAiCompatibleProvider {
+    async fn complete_with_api_key(
+        &self,
+        request: ProviderRequest,
+        api_key: &str,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let started_at = Instant::now();
+        if let Err(error) = self.ensure_circuit_closed() {
+            self.record_runtime_metrics(
+                true,
+                0,
+                0,
+                error.retry_count(),
+                elapsed_millis_since(started_at),
+                Some(error.failure_snapshot()),
+            );
+            return Err(error);
+        }
+
+        let mut retry_count = 0_u32;
+        for attempt in 0..=self.config.max_retries {
+            match self.request_once(api_key, &request).await {
+                Ok(mut response) => {
+                    self.record_success()?;
+                    response.retry_count = retry_count;
+                    self.record_runtime_metrics(
+                        false,
+                        response.prompt_tokens,
+                        response.completion_tokens,
+                        response.retry_count,
+                        elapsed_millis_since(started_at),
+                        None,
+                    );
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let can_retry = error.retryable && attempt < self.config.max_retries;
+                    if can_retry {
+                        tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                        retry_count = retry_count.saturating_add(1);
+                        continue;
+                    }
+
+                    self.record_failure()?;
+                    let provider_error = if error.invalid_response {
+                        ProviderError::InvalidResponse {
+                            message: error.message,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    } else {
+                        ProviderError::RequestFailed {
+                            message: error.message,
+                            retryable: error.retryable,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    };
+                    self.record_runtime_metrics(
+                        true,
+                        0,
+                        0,
+                        provider_error.retry_count(),
+                        elapsed_millis_since(started_at),
+                        Some(provider_error.failure_snapshot()),
+                    );
+                    return Err(provider_error);
+                }
+            }
+        }
+
+        let exhausted_error = ProviderError::RequestFailed {
+            message: "openai-compatible execution exhausted retries".to_owned(),
+            retryable: true,
+            retry_count,
+            classification: retry_provider_classification(
+                "openai_compatible_chat_retries_exhausted",
+            ),
+        };
+        self.record_runtime_metrics(
+            true,
+            0,
+            0,
+            exhausted_error.retry_count(),
+            elapsed_millis_since(started_at),
+            Some(exhausted_error.failure_snapshot()),
+        );
+        Err(exhausted_error)
+    }
+
+    async fn transcribe_audio_with_api_key(
+        &self,
+        request: AudioTranscriptionRequest,
+        api_key: &str,
+    ) -> Result<AudioTranscriptionResponse, ProviderError> {
+        self.ensure_circuit_closed()?;
+
+        let mut retry_count = 0_u32;
+        for attempt in 0..=self.config.max_retries {
+            match self.transcribe_audio_once(api_key, &request).await {
+                Ok(mut response) => {
+                    self.record_success()?;
+                    response.retry_count = retry_count;
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let can_retry = error.retryable && attempt < self.config.max_retries;
+                    if can_retry {
+                        tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                        retry_count = retry_count.saturating_add(1);
+                        continue;
+                    }
+                    self.record_failure()?;
+                    return Err(if error.invalid_response {
+                        ProviderError::InvalidResponse {
+                            message: error.message,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    } else {
+                        ProviderError::RequestFailed {
+                            message: error.message,
+                            retryable: error.retryable,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    });
+                }
+            }
+        }
+
+        Err(ProviderError::RequestFailed {
+            message: "openai-compatible audio transcription exhausted retries".to_owned(),
+            retryable: true,
+            retry_count,
+            classification: retry_provider_classification(
+                "openai_compatible_audio_retries_exhausted",
+            ),
+        })
+    }
+}
+
 impl ModelProvider for OpenAiCompatibleProvider {
     fn probe_chat_once<'a>(
         &'a self,
@@ -5539,87 +5903,20 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 );
                 return Err(error);
             };
-            if let Err(error) = self.ensure_circuit_closed() {
-                self.record_runtime_metrics(
-                    true,
-                    0,
-                    0,
-                    error.retry_count(),
-                    elapsed_millis_since(started_at),
-                    Some(error.failure_snapshot()),
-                );
-                return Err(error);
-            }
+            self.complete_with_api_key(request, api_key.as_str()).await
+        })
+    }
 
-            let mut retry_count = 0_u32;
-            for attempt in 0..=self.config.max_retries {
-                match self.request_once(api_key.as_str(), &request).await {
-                    Ok(mut response) => {
-                        self.record_success()?;
-                        response.retry_count = retry_count;
-                        self.record_runtime_metrics(
-                            false,
-                            response.prompt_tokens,
-                            response.completion_tokens,
-                            response.retry_count,
-                            elapsed_millis_since(started_at),
-                            None,
-                        );
-                        return Ok(response);
-                    }
-                    Err(error) => {
-                        let can_retry = error.retryable && attempt < self.config.max_retries;
-                        if can_retry {
-                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
-                            retry_count = retry_count.saturating_add(1);
-                            continue;
-                        }
-
-                        self.record_failure()?;
-                        let provider_error = if error.invalid_response {
-                            ProviderError::InvalidResponse {
-                                message: error.message,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        } else {
-                            ProviderError::RequestFailed {
-                                message: error.message,
-                                retryable: error.retryable,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        };
-                        self.record_runtime_metrics(
-                            true,
-                            0,
-                            0,
-                            provider_error.retry_count(),
-                            elapsed_millis_since(started_at),
-                            Some(provider_error.failure_snapshot()),
-                        );
-                        return Err(provider_error);
-                    }
-                }
-            }
-
-            let exhausted_error = ProviderError::RequestFailed {
-                message: "openai-compatible execution exhausted retries".to_owned(),
-                retryable: true,
-                retry_count,
-                classification: retry_provider_classification(
-                    "openai_compatible_chat_retries_exhausted",
-                ),
+    fn complete_with_credential<'a>(
+        &'a self,
+        request: ProviderRequest,
+        credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(credential) = credential else {
+                return self.complete(request).await;
             };
-            self.record_runtime_metrics(
-                true,
-                0,
-                0,
-                exhausted_error.retry_count(),
-                elapsed_millis_since(started_at),
-                Some(exhausted_error.failure_snapshot()),
-            );
-            Err(exhausted_error)
+            self.complete_with_api_key(request, credential.secret_utf8()?).await
         })
     }
 
@@ -5632,50 +5929,21 @@ impl ModelProvider for OpenAiCompatibleProvider {
             let Some(api_key) = self.config.openai_api_key.as_ref() else {
                 return Err(ProviderError::MissingApiKey);
             };
-            self.ensure_circuit_closed()?;
+            self.transcribe_audio_with_api_key(request, api_key.as_str()).await
+        })
+    }
 
-            let mut retry_count = 0_u32;
-            for attempt in 0..=self.config.max_retries {
-                match self.transcribe_audio_once(api_key.as_str(), &request).await {
-                    Ok(mut response) => {
-                        self.record_success()?;
-                        response.retry_count = retry_count;
-                        return Ok(response);
-                    }
-                    Err(error) => {
-                        let can_retry = error.retryable && attempt < self.config.max_retries;
-                        if can_retry {
-                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
-                            retry_count = retry_count.saturating_add(1);
-                            continue;
-                        }
-                        self.record_failure()?;
-                        return Err(if error.invalid_response {
-                            ProviderError::InvalidResponse {
-                                message: error.message,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        } else {
-                            ProviderError::RequestFailed {
-                                message: error.message,
-                                retryable: error.retryable,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        });
-                    }
-                }
-            }
-
-            Err(ProviderError::RequestFailed {
-                message: "openai-compatible audio transcription exhausted retries".to_owned(),
-                retryable: true,
-                retry_count,
-                classification: retry_provider_classification(
-                    "openai_compatible_audio_retries_exhausted",
-                ),
-            })
+    fn transcribe_audio_with_credential<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+        credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(credential) = credential else {
+                return self.transcribe_audio(request).await;
+            };
+            self.transcribe_audio_with_api_key(request, credential.secret_utf8()?).await
         })
     }
 
@@ -5863,7 +6131,7 @@ impl AnthropicProvider {
     async fn complete_probe_once(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
         let api_key =
             self.config.anthropic_api_key.as_ref().ok_or(ProviderError::MissingAnthropicApiKey)?;
-        self.request_once(api_key.as_str(), request)
+        self.request_once(api_key.as_str(), request, None)
             .await
             .map(|_| ())
             .map_err(|error| error.into_provider_error(0))
@@ -5923,6 +6191,7 @@ impl AnthropicProvider {
         &self,
         api_key: &str,
         request: &ProviderRequest,
+        auth_class: Option<AuthCredentialType>,
     ) -> Result<ProviderResponse, AttemptError> {
         let model_name = selected_chat_model_id(
             request.model_override.as_deref(),
@@ -5949,18 +6218,34 @@ impl AnthropicProvider {
             .client
             .post(self.messages_endpoint())
             .header("anthropic-version", ANTHROPIC_API_VERSION);
-        let request_builder = if anthropic_compatible_uses_bearer_auth(
-            self.config.auth_profile_provider_kind,
-            self.config.credential_source,
-        ) {
+        let bearer_auth = match auth_class {
+            Some(AuthCredentialType::Oauth) => true,
+            Some(AuthCredentialType::ApiKey) => matches!(
+                self.config.auth_profile_provider_kind,
+                Some(ModelProviderAuthProviderKind::Minimax)
+            ),
+            None => anthropic_compatible_uses_bearer_auth(
+                self.config.auth_profile_provider_kind,
+                self.config.credential_source,
+            ),
+        };
+        let request_builder = if bearer_auth {
             request_builder.bearer_auth(api_key)
         } else {
             request_builder.header("x-api-key", api_key)
         };
-        let request_builder = if anthropic_compatible_uses_anthropic_oauth_headers(
-            self.config.auth_profile_provider_kind,
-            self.config.credential_source,
-        ) {
+        let oauth_headers = match auth_class {
+            Some(AuthCredentialType::Oauth) => matches!(
+                self.config.auth_profile_provider_kind,
+                Some(ModelProviderAuthProviderKind::Anthropic)
+            ),
+            Some(AuthCredentialType::ApiKey) => false,
+            None => anthropic_compatible_uses_anthropic_oauth_headers(
+                self.config.auth_profile_provider_kind,
+                self.config.credential_source,
+            ),
+        };
+        let request_builder = if oauth_headers {
             request_builder
                 .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
                 .header("user-agent", ANTHROPIC_OAUTH_USER_AGENT)
@@ -6127,6 +6412,85 @@ impl AnthropicProvider {
             ),
         })
     }
+
+    async fn complete_with_api_key(
+        &self,
+        request: ProviderRequest,
+        api_key: &str,
+        auth_class: Option<AuthCredentialType>,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let started_at = Instant::now();
+        if let Err(error) = self.ensure_circuit_closed() {
+            self.record_runtime_metrics(
+                true,
+                0,
+                0,
+                error.retry_count(),
+                elapsed_millis_since(started_at),
+                Some(error.failure_snapshot()),
+            );
+            return Err(error);
+        }
+
+        let mut retry_count = 0_u32;
+        for attempt in 0..=self.config.max_retries {
+            match self.request_once(api_key, &request, auth_class).await {
+                Ok(mut response) => {
+                    self.record_success()?;
+                    response.retry_count = retry_count;
+                    self.record_runtime_metrics(
+                        false,
+                        response.prompt_tokens,
+                        response.completion_tokens,
+                        response.retry_count,
+                        elapsed_millis_since(started_at),
+                        None,
+                    );
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let can_retry = error.retryable && attempt < self.config.max_retries;
+                    if can_retry {
+                        tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                        retry_count = retry_count.saturating_add(1);
+                        continue;
+                    }
+
+                    self.record_failure()?;
+                    let provider_error = if error.invalid_response {
+                        ProviderError::InvalidResponse {
+                            message: error.message,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    } else {
+                        ProviderError::RequestFailed {
+                            message: error.message,
+                            retryable: error.retryable,
+                            retry_count,
+                            classification: error.classification,
+                        }
+                    };
+                    self.record_runtime_metrics(
+                        true,
+                        0,
+                        0,
+                        provider_error.retry_count(),
+                        elapsed_millis_since(started_at),
+                        Some(provider_error.failure_snapshot()),
+                    );
+                    return Err(provider_error);
+                }
+            }
+        }
+
+        Err(ProviderError::RequestFailed {
+            message: "anthropic execution exhausted retries".to_owned(),
+            retryable: true,
+            retry_count,
+            classification: retry_provider_classification("anthropic_chat_retries_exhausted"),
+        })
+    }
 }
 
 impl ModelProvider for AnthropicProvider {
@@ -6155,76 +6519,25 @@ impl ModelProvider for AnthropicProvider {
                 );
                 return Err(error);
             };
-            if let Err(error) = self.ensure_circuit_closed() {
-                self.record_runtime_metrics(
-                    true,
-                    0,
-                    0,
-                    error.retry_count(),
-                    elapsed_millis_since(started_at),
-                    Some(error.failure_snapshot()),
-                );
-                return Err(error);
-            }
+            self.complete_with_api_key(request, api_key.as_str(), None).await
+        })
+    }
 
-            let mut retry_count = 0_u32;
-            for attempt in 0..=self.config.max_retries {
-                match self.request_once(api_key.as_str(), &request).await {
-                    Ok(mut response) => {
-                        self.record_success()?;
-                        response.retry_count = retry_count;
-                        self.record_runtime_metrics(
-                            false,
-                            response.prompt_tokens,
-                            response.completion_tokens,
-                            response.retry_count,
-                            elapsed_millis_since(started_at),
-                            None,
-                        );
-                        return Ok(response);
-                    }
-                    Err(error) => {
-                        let can_retry = error.retryable && attempt < self.config.max_retries;
-                        if can_retry {
-                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
-                            retry_count = retry_count.saturating_add(1);
-                            continue;
-                        }
-
-                        self.record_failure()?;
-                        let provider_error = if error.invalid_response {
-                            ProviderError::InvalidResponse {
-                                message: error.message,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        } else {
-                            ProviderError::RequestFailed {
-                                message: error.message,
-                                retryable: error.retryable,
-                                retry_count,
-                                classification: error.classification,
-                            }
-                        };
-                        self.record_runtime_metrics(
-                            true,
-                            0,
-                            0,
-                            provider_error.retry_count(),
-                            elapsed_millis_since(started_at),
-                            Some(provider_error.failure_snapshot()),
-                        );
-                        return Err(provider_error);
-                    }
-                }
-            }
-
-            Err(ProviderError::RequestFailed {
-                message: "anthropic execution exhausted retries".to_owned(),
-                retryable: true,
-                retry_count,
-                classification: retry_provider_classification("anthropic_chat_retries_exhausted"),
-            })
+    fn complete_with_credential<'a>(
+        &'a self,
+        request: ProviderRequest,
+        credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(credential) = credential else {
+                return self.complete(request).await;
+            };
+            self.complete_with_api_key(
+                request,
+                credential.secret_utf8()?,
+                Some(credential.auth_class()),
+            )
+            .await
         })
     }
 
@@ -6635,9 +6948,10 @@ mod tests {
         OpenAiCompatibleProvider, ProviderAttemptAdmission, ProviderAttemptAdmissionError,
         ProviderAttemptBinding, ProviderAttemptCompletionDisposition,
         ProviderAttemptCompletionFuture, ProviderAttemptHealthAuthority, ProviderAttemptPermit,
-        ProviderAttemptPermitFuture, ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture,
-        ProviderCapabilitiesSnapshot, ProviderChatAdapter, ProviderError, ProviderEvent,
-        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
+        ProviderAttemptPermitFuture, ProviderAttemptPreparationFuture,
+        ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture, ProviderCapabilitiesSnapshot,
+        ProviderChatAdapter, ProviderCredentialLease, ProviderCredentialLeaseFuture, ProviderError,
+        ProviderEvent, ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
         ProviderHealthProbeTarget, ProviderImageInput, ProviderLiveBindingMetadata,
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
         ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
@@ -6651,12 +6965,14 @@ mod tests {
         QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use palyra_auth::{AuthCredentialType, CredentialAttemptBinding, CredentialSelectionReport};
     use palyra_common::runtime_contracts::{
         RuntimeAttemptId, RuntimeGeneration, RuntimeInstanceId,
     };
     use palyra_model_providers::{
         classify_transport_provider_failure, parse_qa_mock_provider_fixture_yaml,
     };
+    use palyra_vault::SensitiveBytes;
     use ulid::Ulid;
 
     fn repo_root() -> PathBuf {
@@ -8659,6 +8975,8 @@ turns:
                     generation: RuntimeGeneration::new(1)
                         .expect("test provider health generation should be valid"),
                 },
+                credential_attempt: None,
+                credential_selection: None,
             })
         }
 
@@ -8737,6 +9055,247 @@ turns:
         ) -> Result<(), ProviderAttemptAdmissionError> {
             ProviderAttemptAdmission::check_eligibility(self, binding)
         }
+    }
+
+    #[derive(Default)]
+    struct RotatingCredentialAdmission {
+        prepared: AtomicUsize,
+        failed: AtomicUsize,
+        succeeded: AtomicUsize,
+    }
+
+    impl RotatingCredentialAdmission {
+        fn binding(
+            provider_id: &str,
+            credential_id: &str,
+            model_id: &str,
+        ) -> ProviderAttemptBinding {
+            ProviderAttemptBinding {
+                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                    .expect("test provider attempt identity should be valid"),
+                provider_id: provider_id.to_owned(),
+                credential_id: credential_id.to_owned(),
+                model_id: model_id.to_owned(),
+                health_authority: ProviderAttemptHealthAuthority {
+                    component_id: RuntimeInstanceId::parse(
+                        format!("provider:{provider_id}").as_str(),
+                    )
+                    .expect("test provider health identity should be valid"),
+                    generation: RuntimeGeneration::new(1)
+                        .expect("test provider health generation should be valid"),
+                },
+                credential_attempt: None,
+                credential_selection: None,
+            }
+        }
+    }
+
+    impl ProviderAttemptAdmission for RotatingCredentialAdmission {
+        fn prepare_attempt<'a>(
+            &'a self,
+            provider_id: &'a str,
+            _credential_id: &'a str,
+            model_id: &'a str,
+        ) -> ProviderAttemptPreparationFuture<'a> {
+            Box::pin(async move {
+                let attempt_index = self.prepared.fetch_add(1, Ordering::SeqCst);
+                let profile_id = match attempt_index {
+                    0 => "profile-invalid",
+                    1 => "profile-valid",
+                    _ => {
+                        return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                            safe_message: "test credential profiles exhausted".to_owned(),
+                            reason_code: "credential_selection_exhausted".to_owned(),
+                            retry_after_ms: None,
+                            operator_action_required: false,
+                        });
+                    }
+                };
+                let mut binding = Self::binding(
+                    provider_id,
+                    format!("auth-profile:{provider_id}:{profile_id}").as_str(),
+                    model_id,
+                );
+                let credential_attempt = CredentialAttemptBinding {
+                    profile_id: profile_id.to_owned(),
+                    profile_id_sha256: crate::sha256_hex(profile_id.as_bytes()),
+                    auth_class: AuthCredentialType::ApiKey,
+                    selection_reason: "eligible".to_owned(),
+                };
+                binding.credential_attempt = Some(credential_attempt.clone());
+                binding.credential_selection = Some(CredentialSelectionReport {
+                    schema_version: 1,
+                    selected: Some(credential_attempt),
+                    reason_code: "selected".to_owned(),
+                    considered_profile_hashes: Vec::new(),
+                    generated_at_unix_ms: 1,
+                });
+                Ok(binding)
+            })
+        }
+
+        fn bind_attempt(
+            &self,
+            provider_id: &str,
+            credential_id: &str,
+            model_id: &str,
+        ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
+            Ok(Self::binding(provider_id, credential_id, model_id))
+        }
+
+        fn check_eligibility(
+            &self,
+            _binding: &ProviderAttemptBinding,
+        ) -> Result<(), ProviderAttemptAdmissionError> {
+            Ok(())
+        }
+
+        fn acquire<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptPermitFuture<'a> {
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptPermit>) })
+        }
+
+        fn materialize_credential<'a>(
+            &'a self,
+            binding: &'a ProviderAttemptBinding,
+        ) -> ProviderCredentialLeaseFuture<'a> {
+            Box::pin(async move {
+                let profile_id = binding
+                    .credential_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.profile_id.as_str())
+                    .unwrap_or_default();
+                let secret = match profile_id {
+                    "profile-invalid" => b"invalid-key".to_vec(),
+                    "profile-valid" => b"valid-key".to_vec(),
+                    _ => {
+                        return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                            safe_message: "test credential profile is unknown".to_owned(),
+                            reason_code: "credential_materialization_profile_missing".to_owned(),
+                            retry_after_ms: None,
+                            operator_action_required: false,
+                        });
+                    }
+                };
+                Ok(Some(ProviderCredentialLease::new(
+                    AuthCredentialType::ApiKey,
+                    SensitiveBytes::new(secret),
+                )))
+            })
+        }
+
+        fn record_started<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+        ) -> ProviderAttemptStartFuture<'a> {
+            Box::pin(async { Ok(Box::new(()) as Box<dyn ProviderAttemptRuntimeAuthority>) })
+        }
+
+        fn record_success<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            self.succeeded.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+
+        fn record_failure<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+            _authority: Box<dyn ProviderAttemptRuntimeAuthority>,
+            _error: &'a ProviderError,
+        ) -> ProviderAttemptCompletionFuture<'a> {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ProviderAttemptCompletionDisposition::Appended) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_rotates_api_key_before_route_fallback() {
+        let responses = vec![
+            (401_u16, r#"{"error":{"message":"invalid API key"}}"#.to_owned()),
+            (200_u16, r#"{"choices":[{"message":{"content":"credential recovered"}}]}"#.to_owned()),
+        ];
+        let (base_url, request_count, handle) = spawn_scripted_server(responses);
+        let mut config = openai_chat_and_audio_test_config(base_url);
+        config.max_retries = 0;
+        config.registry.providers[0].max_retries = 0;
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should initialize");
+        let admission = Arc::new(RotatingCredentialAdmission::default());
+
+        let response = provider
+            .complete_with_attempt_admission(
+                ProviderRequest::from_input_text(
+                    "rotate the invalid credential".to_owned(),
+                    false,
+                    Vec::new(),
+                    None,
+                ),
+                admission.clone(),
+            )
+            .await
+            .expect("second credential should recover the provider request");
+
+        assert_eq!(response.output.full_text, "credential recovered");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.prepared.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.failed.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.succeeded.load(Ordering::SeqCst), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permission_failure_does_not_rotate_credential() {
+        let responses = vec![(403_u16, r#"{"error":{"message":"permission denied"}}"#.to_owned())];
+        let (base_url, request_count, handle) = spawn_scripted_server(responses);
+        let mut config = openai_chat_and_audio_test_config(base_url);
+        config.max_retries = 0;
+        config.registry.providers[0].max_retries = 0;
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should initialize");
+        let admission = Arc::new(RotatingCredentialAdmission::default());
+
+        let error = provider
+            .complete_with_attempt_admission(
+                ProviderRequest::from_input_text(
+                    "do not rotate a permission failure".to_owned(),
+                    false,
+                    Vec::new(),
+                    None,
+                ),
+                admission.clone(),
+            )
+            .await
+            .expect_err("permission failure must remain terminal for this route");
+
+        assert_eq!(error.failure_snapshot().class, "permission_denied");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.prepared.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.failed.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.succeeded.load(Ordering::SeqCst), 0);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[test]
+    fn partial_output_blocks_credential_rotation() {
+        let error = ProviderError::RequestFailed {
+            message: "invalid API key".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                401,
+                false,
+                "openai_chat_http",
+                "invalid API key",
+            ),
+        };
+
+        assert!(super::provider_error_allows_credential_rotation(&error, false));
+        assert!(!super::provider_error_allows_credential_rotation(&error, true));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9314,6 +9873,8 @@ turns:
                     generation: RuntimeGeneration::new(1)
                         .expect("test provider health generation should be valid"),
                 },
+                credential_attempt: None,
+                credential_selection: None,
             })
         }
 

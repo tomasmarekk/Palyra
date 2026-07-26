@@ -2756,6 +2756,7 @@ pub async fn run() -> Result<()> {
             model_provider,
             vault: Arc::clone(&vault),
             auth_profile_registry: Some(Arc::clone(&auth_registry)),
+            auth_runtime: Some(Arc::clone(&auth_runtime)),
             agent_registry,
             tool_posture_registry,
             retrieval_backend: Arc::new(ExternalDerivedRetrievalBackend::new(

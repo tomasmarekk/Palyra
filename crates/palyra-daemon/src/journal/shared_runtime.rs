@@ -1482,6 +1482,16 @@ pub struct ProviderAttemptRuntimeAuthority {
     pub configuration_epoch: RuntimeGeneration,
     /// Canonical start event referenced by completion evidence.
     pub started_event_id: RuntimeEventId,
+    /// Redacted credential binding copied into terminal attempt evidence.
+    pub credential: Option<ProviderCredentialAttemptMetadata>,
+}
+
+/// Redacted per-attempt credential metadata safe for runtime evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCredentialAttemptMetadata {
+    pub profile_id_sha256: String,
+    pub auth_class: String,
+    pub selection_reason: String,
 }
 
 /// Exact Provider lane pre-acquired for one authoritative kernel Run lease.
@@ -1531,6 +1541,8 @@ pub struct ProviderAttemptStartRequest {
     pub provider_id: String,
     /// Bounded model identifier.
     pub model_id: String,
+    /// Redacted credential selection; raw profile ids and secrets are forbidden.
+    pub credential: Option<ProviderCredentialAttemptMetadata>,
 }
 
 /// Metadata-only result used to close one exact provider attempt.
@@ -1843,6 +1855,7 @@ impl JournalStore {
             request.model_id.as_str(),
             "started",
             None,
+            request.credential.as_ref(),
             now,
         )?;
         if matches!(
@@ -1865,6 +1878,7 @@ impl JournalStore {
             generation: lease.generation,
             configuration_epoch,
             started_event_id,
+            credential: request.credential.clone(),
         })
     }
 
@@ -1943,6 +1957,7 @@ impl JournalStore {
             request.model_id.as_str(),
             request.outcome.as_str(),
             request.error_class.as_deref(),
+            request.authority.credential.as_ref(),
             now,
         )?;
         let outcome = match append_runtime_event_tx(
@@ -7406,6 +7421,7 @@ pub(super) fn provider_attempt_runtime_event(
     model_id: &str,
     outcome: &str,
     error_class: Option<&str>,
+    credential: Option<&ProviderCredentialAttemptMetadata>,
     now: i64,
 ) -> Result<RuntimeEventAppendRequest, JournalError> {
     let session_identity = RuntimeSessionId::parse(session_id)
@@ -7454,6 +7470,16 @@ pub(super) fn provider_attempt_runtime_event(
     if let Some(error_class) = error_class {
         metadata
             .insert("error_class".to_owned(), serde_json::Value::String(error_class.to_owned()));
+    }
+    if let Some(credential) = credential {
+        metadata.insert(
+            "auth_profile_binding".to_owned(),
+            serde_json::json!({
+                "profile_id_sha256": credential.profile_id_sha256,
+                "auth_class": credential.auth_class,
+                "selection_reason": credential.selection_reason,
+            }),
+        );
     }
     let mut envelope = RuntimeEventEnvelopeV2 {
         schema_version: 2,

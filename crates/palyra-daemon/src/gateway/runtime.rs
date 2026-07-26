@@ -26,9 +26,15 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+use palyra_auth::{
+    AuthCredential, AuthCredentialType, AuthProfileEligibility, AuthProfileRecord,
+    AuthProfileScope, AuthProfileSelectionRequest, AuthTokenExpiryState, CredentialAttemptBinding,
+    CredentialSelectionReport, OAuthRefreshOutcomeKind,
+};
 use palyra_common::runtime_contracts::{
     RuntimeCausalLink, RuntimeCausalLinkKind, RuntimeIdentityKind, RuntimeIdentityRef,
 };
+use palyra_vault::{SensitiveBytes, VaultRef};
 
 use crate::agents::{
     AgentBindingOutcome, AgentBindingQuery, AgentBindingRequest, AgentDeleteOutcome, AgentListPage,
@@ -116,26 +122,26 @@ use crate::journal::{
     ProviderAttemptStartRequest, ProviderConfigurationAttemptCompletionOutcome,
     ProviderConfigurationAttemptCompletionRequest,
     ProviderConfigurationAttemptRuntimeAuthority as JournalProviderConfigurationAttemptRuntimeAuthority,
-    ProviderConfigurationAttemptStartRequest, RecallArtifactCreateRequest,
-    RecallArtifactListFilter, RecallArtifactRecord, RetrievalBranchDiagnostics,
-    RunScopedRuntimeHealthObservationOutcome, RuntimeEventAppendOutcome, RuntimeEventAppendRequest,
-    RuntimeHealthComponentActivation, RuntimeHealthObservationRequest,
-    RuntimeHealthProbeBeginRequest, RuntimeHealthProbeReconciliationMode,
-    RuntimeHealthProbeReconciliationOutcome, RuntimeHealthProbeSettlementOutcome,
-    RuntimeHealthProbeSettlementRequest, RuntimeHealthQuarantineClearOutcome,
-    RuntimeHealthQuarantineClearRequest, RuntimeStaleEventDiagnosticRequest,
-    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
-    SessionProjectContextStateUpsertRequest, SessionSearchOutcome, SessionSearchRequest,
-    SessionWriteLeaseRecord, SharedRuntimeDiagnostics, SideEffectFenceCleanupOutcomeRequest,
-    SideEffectFenceOperatorResolutionRequest, ToolEffectObservationCommitRequest,
-    ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord, ToolJobRetryRequest,
-    ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest, ToolJobTransitionRequest,
-    ToolJobsListFilter, ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
-    TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter,
-    TurnControlAuditEventRecord, WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter,
-    WorkItemRecord, WorkItemUpdateRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
-    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
-    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    ProviderConfigurationAttemptStartRequest, ProviderCredentialAttemptMetadata,
+    RecallArtifactCreateRequest, RecallArtifactListFilter, RecallArtifactRecord,
+    RetrievalBranchDiagnostics, RunScopedRuntimeHealthObservationOutcome,
+    RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeHealthComponentActivation,
+    RuntimeHealthObservationRequest, RuntimeHealthProbeBeginRequest,
+    RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
+    RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
+    RuntimeHealthQuarantineClearOutcome, RuntimeHealthQuarantineClearRequest,
+    RuntimeStaleEventDiagnosticRequest, SessionProjectContextStateCopyRequest,
+    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
+    SessionSearchOutcome, SessionSearchRequest, SessionWriteLeaseRecord, SharedRuntimeDiagnostics,
+    SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
+    ToolEffectObservationCommitRequest, ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord,
+    ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest,
+    ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
+    ToolResultArtifactReadRequest, TurnControlAuditEventAppendRequest,
+    TurnControlAuditEventListFilter, TurnControlAuditEventRecord, WorkItemCreateRequest,
+    WorkItemEventRecord, WorkItemListFilter, WorkItemRecord, WorkItemUpdateRequest,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
+    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -150,7 +156,8 @@ use crate::model_provider::{
     ProviderAttemptAdmission, ProviderAttemptAdmissionError, ProviderAttemptBinding,
     ProviderAttemptCompletionDisposition, ProviderAttemptCompletionFuture,
     ProviderAttemptHealthAuthority, ProviderAttemptPermit, ProviderAttemptPermitFuture,
-    ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture, ProviderFailureClass,
+    ProviderAttemptPreparationFuture, ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture,
+    ProviderCredentialLease, ProviderCredentialLeaseFuture, ProviderFailureClass,
     ProviderHealthProbeTarget, ProviderModelRole, ProviderProbeAdmission,
 };
 use crate::node_runtime::CapabilityDispatchAuthorizer;
@@ -1273,7 +1280,7 @@ pub struct GatewayJournalConfigSnapshot {
 /// Externally constructed collaborators injected into
 /// [`GatewayRuntimeState::new_with_provider`].
 #[rustfmt::skip]
-pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime, pub(crate) runtime_kernel_dispatcher: Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher> }
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub auth_runtime: Option<Arc<AuthRuntimeState>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime, pub(crate) runtime_kernel_dispatcher: Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher> }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProviderHealthAuthorityKey {
@@ -1466,6 +1473,225 @@ fn provider_failure_affects_candidate_health(error: &ProviderError) -> bool {
     )
 }
 
+fn credential_attempt_admission_error(
+    safe_message: &str,
+    reason_code: &str,
+    operator_action_required: bool,
+) -> ProviderAttemptAdmissionError {
+    ProviderAttemptAdmissionError::HealthBlocked {
+        safe_message: safe_message.to_owned(),
+        reason_code: reason_code.to_owned(),
+        retry_after_ms: None,
+        operator_action_required,
+    }
+}
+
+/// Host service that composes auth selection, OAuth refresh, and vault access.
+#[derive(Clone)]
+struct CredentialAvailabilityService {
+    auth_runtime: Arc<AuthRuntimeState>,
+    vault: Arc<Vault>,
+}
+
+impl CredentialAvailabilityService {
+    fn new(auth_runtime: Arc<AuthRuntimeState>, vault: Arc<Vault>) -> Self {
+        Self { auth_runtime, vault }
+    }
+
+    async fn select_attempt(
+        &self,
+        provider_id: &str,
+        configured_credential_id: &str,
+        excluded_profile_ids: Vec<String>,
+    ) -> Result<
+        Option<(String, CredentialAttemptBinding, CredentialSelectionReport)>,
+        ProviderAttemptAdmissionError,
+    > {
+        let Some(configured_profile_id) =
+            auth_profile_id_from_credential_id(configured_credential_id).map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let registry = Arc::clone(&self.auth_runtime.registry);
+        let configured_profile_id_for_lookup = configured_profile_id.clone();
+        let configured_profile = tokio::task::spawn_blocking(move || {
+            registry.get_profile(configured_profile_id_for_lookup.as_str())
+        })
+        .await
+        .map_err(|_| {
+            credential_attempt_admission_error(
+                "credential profile lookup worker failed",
+                "credential_selection_worker_failed",
+                false,
+            )
+        })?
+        .map_err(|_| {
+            credential_attempt_admission_error(
+                "credential profile registry is unavailable",
+                "credential_selection_registry_unavailable",
+                false,
+            )
+        })?
+        .ok_or_else(|| {
+            credential_attempt_admission_error(
+                "configured credential profile does not exist",
+                "credential_selection_profile_missing",
+                true,
+            )
+        })?;
+
+        let agent_id = match &configured_profile.scope {
+            AuthProfileScope::Global => None,
+            AuthProfileScope::Agent { agent_id } => Some(agent_id.clone()),
+        };
+        let request = AuthProfileSelectionRequest {
+            provider: Some(configured_profile.provider.clone()),
+            agent_id,
+            explicit_profile_order: Vec::new(),
+            allowed_credential_types: Vec::new(),
+            policy_denied_profile_ids: excluded_profile_ids,
+        };
+        let mut selection = self.select_profiles(request.clone()).await?;
+        if selection.selected_profile_id.is_none() {
+            let refresh_candidates = selection
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.credential_type == AuthCredentialType::Oauth
+                        && candidate.token_expiry_state == AuthTokenExpiryState::Expired
+                        && candidate.eligibility == AuthProfileEligibility::Expired
+                })
+                .map(|candidate| candidate.profile_id.clone())
+                .collect::<Vec<_>>();
+            for profile_id in refresh_candidates {
+                let outcome = self
+                    .auth_runtime
+                    .refresh_oauth_profile(profile_id, Arc::clone(&self.vault))
+                    .await
+                    .map_err(|_| {
+                        credential_attempt_admission_error(
+                            "OAuth credential refresh failed",
+                            "credential_selection_refresh_failed",
+                            false,
+                        )
+                    })?;
+                if matches!(outcome.kind, OAuthRefreshOutcomeKind::Failed) {
+                    continue;
+                }
+            }
+            selection = self.select_profiles(request).await?;
+        }
+
+        let selected_profile_id = selection.selected_profile_id.clone().ok_or_else(|| {
+            credential_attempt_admission_error(
+                "no eligible credential profile is available",
+                "credential_selection_exhausted",
+                false,
+            )
+        })?;
+        let selected = selection
+            .candidates
+            .iter()
+            .find(|candidate| candidate.profile_id == selected_profile_id)
+            .ok_or_else(|| {
+                credential_attempt_admission_error(
+                    "credential selection result is inconsistent",
+                    "credential_selection_inconsistent",
+                    true,
+                )
+            })?;
+        let profile_id_sha256 = crate::sha256_hex(selected_profile_id.as_bytes());
+        let attempt = CredentialAttemptBinding {
+            profile_id: selected_profile_id.clone(),
+            profile_id_sha256: profile_id_sha256.clone(),
+            auth_class: selected.credential_type,
+            selection_reason: selected.reason_code.clone(),
+        };
+        let report = CredentialSelectionReport {
+            schema_version: 1,
+            selected: Some(attempt.clone()),
+            reason_code: selection.reason_code,
+            considered_profile_hashes: selection
+                .candidates
+                .iter()
+                .map(|candidate| crate::sha256_hex(candidate.profile_id.as_bytes()))
+                .collect(),
+            generated_at_unix_ms: selection.generated_at_unix_ms,
+        };
+        Ok(Some((format!("auth-profile:{provider_id}:{selected_profile_id}"), attempt, report)))
+    }
+
+    async fn select_profiles(
+        &self,
+        request: AuthProfileSelectionRequest,
+    ) -> Result<palyra_auth::AuthProfileSelectionResult, ProviderAttemptAdmissionError> {
+        let registry = Arc::clone(&self.auth_runtime.registry);
+        let vault = Arc::clone(&self.vault);
+        tokio::task::spawn_blocking(move || registry.select_auth_profile(vault.as_ref(), request))
+            .await
+            .map_err(|_| {
+                credential_attempt_admission_error(
+                    "credential selection worker failed",
+                    "credential_selection_worker_failed",
+                    false,
+                )
+            })?
+            .map_err(|_| {
+                credential_attempt_admission_error(
+                    "credential selection failed",
+                    "credential_selection_failed",
+                    false,
+                )
+            })
+    }
+
+    async fn materialize(
+        &self,
+        attempt: CredentialAttemptBinding,
+    ) -> Result<ProviderCredentialLease, ProviderAttemptAdmissionError> {
+        let registry = Arc::clone(&self.auth_runtime.registry);
+        let vault = Arc::clone(&self.vault);
+        tokio::task::spawn_blocking(move || {
+            let profile = registry
+                .get_profile(attempt.profile_id.as_str())
+                .map_err(|_| "registry_unavailable")?
+                .ok_or("profile_missing")?;
+            if profile.credential.credential_type() != attempt.auth_class {
+                return Err("credential_class_changed");
+            }
+            let vault_ref = match profile.credential {
+                AuthCredential::ApiKey { api_key_vault_ref } => api_key_vault_ref,
+                AuthCredential::Oauth { access_token_vault_ref, .. } => access_token_vault_ref,
+            };
+            let parsed = VaultRef::parse(vault_ref.as_str()).map_err(|_| "vault_ref_invalid")?;
+            let secret = vault
+                .get_secret(&parsed.scope, parsed.key.as_str())
+                .map_err(|_| "secret_unavailable")?;
+            let secret_text =
+                std::str::from_utf8(secret.as_slice()).map_err(|_| "secret_invalid_utf8")?;
+            if secret_text.trim().is_empty() {
+                return Err("secret_empty");
+            }
+            Ok(ProviderCredentialLease::new(attempt.auth_class, SensitiveBytes::new(secret)))
+        })
+        .await
+        .map_err(|_| {
+            credential_attempt_admission_error(
+                "credential materialization worker failed",
+                "credential_materialization_worker_failed",
+                false,
+            )
+        })?
+        .map_err(|reason_code| {
+            credential_attempt_admission_error(
+                "selected credential could not be materialized",
+                reason_code,
+                false,
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 struct GatewayProviderAttemptAdmission {
     runtime_state: Arc<GatewayRuntimeState>,
@@ -1473,6 +1699,7 @@ struct GatewayProviderAttemptAdmission {
     expected_configuration_epoch: RuntimeGeneration,
     health_authority_by_provider: Arc<BTreeMap<String, ProviderAttemptHealthAuthority>>,
     feedback: Arc<Mutex<Vec<ProviderAttemptFeedback>>>,
+    attempted_profile_ids: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
     #[cfg(test)]
     fail_health_observation_once: Option<Arc<AtomicBool>>,
 }
@@ -1512,6 +1739,8 @@ fn bind_provider_attempt(
         credential_id: credential_id.to_owned(),
         model_id: model_id.to_owned(),
         health_authority: authority,
+        credential_attempt: None,
+        credential_selection: None,
     })
 }
 
@@ -1732,6 +1961,46 @@ impl GatewayProviderAttemptAdmission {
 }
 
 impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
+    fn prepare_attempt<'a>(
+        &'a self,
+        provider_id: &'a str,
+        credential_id: &'a str,
+        model_id: &'a str,
+    ) -> ProviderAttemptPreparationFuture<'a> {
+        Box::pin(async move {
+            let Some(service) = self.runtime_state.credential_availability.as_ref() else {
+                return self.bind_attempt(provider_id, credential_id, model_id);
+            };
+            let excluded_profile_ids = self
+                .attempted_profile_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(provider_id)
+                .map(|profiles| profiles.iter().cloned().collect())
+                .unwrap_or_default();
+            let Some((selected_credential_id, attempt, report)) =
+                service.select_attempt(provider_id, credential_id, excluded_profile_ids).await?
+            else {
+                return self.bind_attempt(provider_id, credential_id, model_id);
+            };
+            self.attempted_profile_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entry(provider_id.to_owned())
+                .or_default()
+                .insert(attempt.profile_id.clone());
+            let mut binding = bind_provider_attempt(
+                self.health_authority_by_provider.as_ref(),
+                provider_id,
+                selected_credential_id.as_str(),
+                model_id,
+            )?;
+            binding.credential_attempt = Some(attempt);
+            binding.credential_selection = Some(report);
+            Ok(binding)
+        })
+    }
+
     fn bind_attempt(
         &self,
         provider_id: &str,
@@ -1804,6 +2073,25 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
         })
     }
 
+    fn materialize_credential<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+    ) -> ProviderCredentialLeaseFuture<'a> {
+        Box::pin(async move {
+            let Some(attempt) = binding.credential_attempt.clone() else {
+                return Ok(None);
+            };
+            let service = self.runtime_state.credential_availability.as_ref().ok_or_else(|| {
+                credential_attempt_admission_error(
+                    "credential availability service is unavailable",
+                    "credential_materialization_service_unavailable",
+                    true,
+                )
+            })?;
+            service.materialize(attempt).await.map(Some)
+        })
+    }
+
     fn record_started<'a>(
         &'a self,
         binding: &'a ProviderAttemptBinding,
@@ -1824,6 +2112,17 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
             let attempt_id = binding.attempt_id.clone();
             let provider_id = binding.provider_id.clone();
             let model_id = binding.model_id.clone();
+            let credential = binding.credential_attempt.as_ref().map(|attempt| {
+                ProviderCredentialAttemptMetadata {
+                    profile_id_sha256: attempt.profile_id_sha256.clone(),
+                    auth_class: match attempt.auth_class {
+                        AuthCredentialType::ApiKey => "api_key",
+                        AuthCredentialType::Oauth => "oauth",
+                    }
+                    .to_owned(),
+                    selection_reason: attempt.selection_reason.clone(),
+                }
+            });
             let authority = tokio::task::spawn_blocking(move || {
                 let _reload_guard = runtime_state
                     .model_provider_reload_lock
@@ -1854,6 +2153,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                             runtime_authority,
                             provider_id,
                             model_id,
+                            credential,
                         })
                         .map(GatewayProviderAttemptRuntimeAuthority::Run),
                     (_, None) => runtime_state
@@ -2543,6 +2843,7 @@ pub struct GatewayRuntimeState {
     managed_runtime_health_authorities: RwLock<BTreeMap<String, ManagedRuntimeHealthAuthority>>,
     managed_runtime_health_stale_suppressions: AtomicU64,
     auth_profile_registry: Option<Arc<AuthProfileRegistry>>,
+    credential_availability: Option<CredentialAvailabilityService>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) memory_config: RwLock<MemoryRuntimeConfig>,
     pub(crate) retrieval_config: RwLock<RetrievalRuntimeConfig>,
@@ -3080,6 +3381,28 @@ pub struct AuthRuntimeState {
     refresh_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OAuthRefreshMarker {
+    profile_id: String,
+    provider: String,
+    updated_at_unix_ms: i64,
+    last_success_unix_ms: Option<i64>,
+    expires_at_unix_ms: Option<i64>,
+}
+
+fn oauth_refresh_marker(profile: AuthProfileRecord) -> Option<OAuthRefreshMarker> {
+    let AuthCredential::Oauth { expires_at_unix_ms, refresh_state, .. } = profile.credential else {
+        return None;
+    };
+    Some(OAuthRefreshMarker {
+        profile_id: profile.profile_id,
+        provider: profile.provider.label(),
+        updated_at_unix_ms: profile.updated_at_unix_ms,
+        last_success_unix_ms: refresh_state.last_success_unix_ms,
+        expires_at_unix_ms,
+    })
+}
+
 impl AuthRuntimeState {
     /// Creates the auth runtime over a profile registry and refresh adapter.
     #[must_use]
@@ -3131,8 +3454,34 @@ impl AuthRuntimeState {
         profile_id: String,
         vault: Arc<Vault>,
     ) -> Result<OAuthRefreshOutcome, Status> {
+        let observed_marker = self
+            .registry
+            .get_profile(profile_id.as_str())
+            .map_err(map_auth_profile_error)?
+            .and_then(oauth_refresh_marker);
         let refresh_lock = self.refresh_lock(profile_id.as_str());
         let _refresh_guard = refresh_lock.lock().await;
+        let current_marker = self
+            .registry
+            .get_profile(profile_id.as_str())
+            .map_err(map_auth_profile_error)?
+            .and_then(oauth_refresh_marker);
+        if let (Some(observed), Some(current)) = (observed_marker.as_ref(), current_marker.as_ref())
+        {
+            if current.updated_at_unix_ms != observed.updated_at_unix_ms
+                && current.last_success_unix_ms.is_some()
+                && current.last_success_unix_ms != observed.last_success_unix_ms
+            {
+                return Ok(OAuthRefreshOutcome {
+                    profile_id: current.profile_id.clone(),
+                    provider: current.provider.clone(),
+                    kind: OAuthRefreshOutcomeKind::SkippedNotDue,
+                    reason: "refresh satisfied by an in-flight request".to_owned(),
+                    next_allowed_refresh_unix_ms: None,
+                    expires_at_unix_ms: current.expires_at_unix_ms,
+                });
+            }
+        }
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let outcome = state
@@ -3466,9 +3815,11 @@ fn auth_profile_failure_kind_for_provider_error(
     let failure = error.failure_snapshot();
     match failure.class.as_str() {
         "auth_expired" => Some(AuthProfileFailureKind::RefreshDue),
-        "auth_invalid" | "permission_denied" => Some(AuthProfileFailureKind::AuthInvalid),
+        "auth_invalid" => Some(AuthProfileFailureKind::AuthInvalid),
+        "permission_denied" => Some(AuthProfileFailureKind::Permission),
         "quota" | "quota_exceeded" => Some(AuthProfileFailureKind::Quota),
         "rate_limit" | "rate_limited" => Some(AuthProfileFailureKind::RateLimit),
+        "suspected_compromise" => Some(AuthProfileFailureKind::SuspectedCompromise),
         "network_unavailable"
         | "provider_timeout"
         | "transient_upstream"
@@ -4000,7 +4351,7 @@ impl GatewayRuntimeState {
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
-        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection, runtime_kernel_dispatcher: Arc::new(crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::legacy_default().expect("legacy runtime dispatcher should initialize")) };
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, auth_runtime: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection, runtime_kernel_dispatcher: Arc::new(crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::legacy_default().expect("legacy runtime dispatcher should initialize")) };
         Self::new_with_provider(
             config,
             journal_config,
@@ -4029,7 +4380,10 @@ impl GatewayRuntimeState {
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
         #[rustfmt::skip]
-        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection, runtime_kernel_dispatcher } = dependencies;
+        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, auth_runtime, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection, runtime_kernel_dispatcher } = dependencies;
+        let credential_availability = auth_runtime.map(|auth_runtime| {
+            CredentialAvailabilityService::new(auth_runtime, Arc::clone(&vault))
+        });
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
@@ -4259,6 +4613,7 @@ impl GatewayRuntimeState {
             managed_runtime_health_authorities: RwLock::new(managed_runtime_health_authorities),
             managed_runtime_health_stale_suppressions: AtomicU64::new(0),
             auth_profile_registry,
+            credential_availability,
             vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
             retrieval_config: RwLock::new(RetrievalRuntimeConfig::default()),
@@ -8396,6 +8751,7 @@ impl GatewayRuntimeState {
                 provider_runtime.health_authority_by_provider.clone(),
             ),
             feedback: Arc::new(Mutex::new(Vec::new())),
+            attempted_profile_ids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             #[cfg(test)]
             fail_health_observation_once: None,
         };
@@ -8413,42 +8769,84 @@ impl GatewayRuntimeState {
                     "model provider does not identify its direct completion model",
                 )
             })?;
-            let binding = candidate_admission
-                .bind_attempt(
-                    provider_status.provider_id.as_str(),
-                    provider_status.credential_id.as_str(),
-                    model_id,
-                )
-                .map_err(|error| {
-                    map_provider_error(provider_attempt_admission_provider_error(error))
-                })?;
-            candidate_admission.check_eligibility(&binding).map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            let _permit = candidate_admission.acquire(&binding).await.map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            let runtime_authority =
-                candidate_admission.record_started(&binding).await.map_err(|error| {
-                    map_provider_error(provider_attempt_admission_provider_error(error))
-                })?;
-            self.apply_fixture_provider_fault("provider.fixture.after_intent", fault_actor)?;
-            self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
-            self.apply_fixture_provider_fault("provider.fixture.before_effect", fault_actor)?;
-            let result = model_provider.complete(request).await;
-            let completion = match &result {
-                Ok(_) => candidate_admission.record_success(&binding, runtime_authority).await,
-                Err(error) => {
-                    candidate_admission.record_failure(&binding, runtime_authority, error).await
+            let mut effect_gate_applied = false;
+            loop {
+                let binding = match candidate_admission
+                    .prepare_attempt(
+                        provider_status.provider_id.as_str(),
+                        provider_status.credential_id.as_str(),
+                        model_id,
+                    )
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if let Err(error) = candidate_admission.check_eligibility(&binding) {
+                    break Err(provider_attempt_admission_provider_error(error));
                 }
-            }
-            .map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            if completion == ProviderAttemptCompletionDisposition::StaleSuppressed {
-                Err(crate::model_provider::provider_attempt_superseded_error())
-            } else {
-                result
+                let _permit = match candidate_admission.acquire(&binding).await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let credential = match candidate_admission.materialize_credential(&binding).await {
+                    Ok(credential) => credential,
+                    Err(_) if binding.credential_attempt.is_some() => continue,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let runtime_authority = match candidate_admission.record_started(&binding).await {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if !effect_gate_applied {
+                    self.apply_fixture_provider_fault(
+                        "provider.fixture.after_intent",
+                        fault_actor,
+                    )?;
+                    self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
+                    self.apply_fixture_provider_fault(
+                        "provider.fixture.before_effect",
+                        fault_actor,
+                    )?;
+                    effect_gate_applied = true;
+                }
+                let attempt_result = model_provider
+                    .complete_with_credential(request.clone(), credential.as_ref())
+                    .await;
+                drop(credential);
+                let completion = match &attempt_result {
+                    Ok(_) => candidate_admission.record_success(&binding, runtime_authority).await,
+                    Err(error) => {
+                        candidate_admission.record_failure(&binding, runtime_authority, error).await
+                    }
+                };
+                let completion = match completion {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if completion == ProviderAttemptCompletionDisposition::StaleSuppressed {
+                    break Err(crate::model_provider::provider_attempt_superseded_error());
+                }
+                if let Err(error) = &attempt_result {
+                    if binding.credential_attempt.is_some()
+                        && crate::model_provider::provider_error_allows_credential_rotation(
+                            error, false,
+                        )
+                    {
+                        continue;
+                    }
+                }
+                break attempt_result;
             }
         };
         self.apply_fixture_provider_fault("provider.fixture.after_effect_before_ack", fault_actor)?;
@@ -8648,6 +9046,7 @@ impl GatewayRuntimeState {
                 provider_runtime.health_authority_by_provider.clone(),
             ),
             feedback: Arc::new(Mutex::new(Vec::new())),
+            attempted_profile_ids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             #[cfg(test)]
             fail_health_observation_once: None,
         };
@@ -8666,39 +9065,72 @@ impl GatewayRuntimeState {
                     "model provider does not identify its audio transcription model",
                 )
             })?;
-            let binding = candidate_admission
-                .bind_attempt(
-                    provider_status.provider_id.as_str(),
-                    provider_status.credential_id.as_str(),
-                    model_id,
-                )
-                .map_err(|error| {
-                    map_provider_error(provider_attempt_admission_provider_error(error))
-                })?;
-            candidate_admission.check_eligibility(&binding).map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            let _permit = candidate_admission.acquire(&binding).await.map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            let runtime_authority =
-                candidate_admission.record_started(&binding).await.map_err(|error| {
-                    map_provider_error(provider_attempt_admission_provider_error(error))
-                })?;
-            let result = model_provider.transcribe_audio(request).await;
-            let completion = match &result {
-                Ok(_) => candidate_admission.record_success(&binding, runtime_authority).await,
-                Err(error) => {
-                    candidate_admission.record_failure(&binding, runtime_authority, error).await
+            loop {
+                let binding = match candidate_admission
+                    .prepare_attempt(
+                        provider_status.provider_id.as_str(),
+                        provider_status.credential_id.as_str(),
+                        model_id,
+                    )
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if let Err(error) = candidate_admission.check_eligibility(&binding) {
+                    break Err(provider_attempt_admission_provider_error(error));
                 }
+                let _permit = match candidate_admission.acquire(&binding).await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let credential = match candidate_admission.materialize_credential(&binding).await {
+                    Ok(credential) => credential,
+                    Err(_) if binding.credential_attempt.is_some() => continue,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let runtime_authority = match candidate_admission.record_started(&binding).await {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let attempt_result = model_provider
+                    .transcribe_audio_with_credential(request.clone(), credential.as_ref())
+                    .await;
+                drop(credential);
+                let completion = match &attempt_result {
+                    Ok(_) => candidate_admission.record_success(&binding, runtime_authority).await,
+                    Err(error) => {
+                        candidate_admission.record_failure(&binding, runtime_authority, error).await
+                    }
+                };
+                let completion = match completion {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if completion == ProviderAttemptCompletionDisposition::StaleSuppressed {
+                    break Err(crate::model_provider::provider_attempt_superseded_error());
+                }
+                if let Err(error) = &attempt_result {
+                    if binding.credential_attempt.is_some()
+                        && crate::model_provider::provider_error_allows_credential_rotation(
+                            error, false,
+                        )
+                    {
+                        continue;
+                    }
+                }
+                break attempt_result;
             }
-            .map_err(|error| {
-                map_provider_error(provider_attempt_admission_provider_error(error))
-            })?;
-            if completion == ProviderAttemptCompletionDisposition::StaleSuppressed {
-                return Err(provider_reconfigured_status());
-            }
-            result
         };
         if !candidate_admission.apply_buffered_feedback() {
             return Err(provider_reconfigured_status());
@@ -18909,11 +19341,12 @@ pub(crate) mod tests {
         fallback_workspace_document_search_hits, provider_credential_attribution_for_provider,
         provider_lease_timeout_status, select_default_agent_model_profile,
         shared_runtime_event_for_tape, sign_canvas_hmac_sha256,
-        validate_memory_item_content_limits, BrowserServiceRuntimeConfig, CanvasHostRuntimeConfig,
-        GatewayJournalConfigSnapshot, GatewayProviderAttemptAdmission,
-        GatewayProviderAttemptRuntimeAuthorityGuard, GatewayRuntimeConfigSnapshot,
-        GatewayRuntimeState, HttpFetchRuntimeConfig, ManagedRuntimeHealthFamily,
-        MemoryRuntimeConfig, ProviderAttemptFeedback, RunInterruptLatencyCounters,
+        validate_memory_item_content_limits, AuthRuntimeState, BrowserServiceRuntimeConfig,
+        CanvasHostRuntimeConfig, CredentialAvailabilityService, GatewayJournalConfigSnapshot,
+        GatewayProviderAttemptAdmission, GatewayProviderAttemptRuntimeAuthorityGuard,
+        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, HttpFetchRuntimeConfig,
+        ManagedRuntimeHealthFamily, MemoryRuntimeConfig, ProviderAttemptFeedback,
+        RunInterruptLatencyCounters,
     };
     use crate::agents::AgentRegistry;
     use crate::application::code_intel_runtime::{
@@ -18950,8 +19383,10 @@ pub(crate) mod tests {
     };
     use crate::retrieval::RetrievalRuntimeConfig;
     use palyra_auth::{
-        AuthCredential, AuthProfileFailureKind, AuthProfileRegistry, AuthProfileScope,
-        AuthProfileSetRequest, AuthProvider, AuthProviderKind,
+        AuthCredential, AuthCredentialType, AuthProfileFailureKind, AuthProfileRegistry,
+        AuthProfileScope, AuthProfileSetRequest, AuthProvider, AuthProviderKind,
+        OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshRequest, OAuthRefreshResponse,
+        OAuthRefreshState,
     };
     use palyra_common::runtime_contracts::{
         CircuitBreakerPolicy, HealthProbeDisposition, LegacyRuntimeIdentityAdapter,
@@ -18962,18 +19397,187 @@ pub(crate) mod tests {
         RUNTIME_EVENT_LEGACY_IDENTITY_ADAPTER_EXTENSION,
     };
     use palyra_model_providers::{classify_http_provider_failure, retry_provider_classification};
-    use palyra_vault::VaultScope;
+    use palyra_vault::{Vault, VaultScope};
     use std::{
         future::Future,
         pin::Pin,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
     };
     use tokio::sync::{mpsc, Notify};
     use tonic::Code;
+
+    #[derive(Default)]
+    struct SingleFlightRefreshAdapter {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl OAuthRefreshAdapter for SingleFlightRefreshAdapter {
+        fn refresh_access_token(
+            &self,
+            _request: &OAuthRefreshRequest,
+        ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(OAuthRefreshResponse {
+                access_token: "refreshed-access-token".to_owned(),
+                refresh_token: None,
+                expires_in_seconds: Some(3_600),
+            })
+        }
+    }
+
+    fn expired_oauth_credential_service(
+        adapter: Arc<SingleFlightRefreshAdapter>,
+    ) -> (CredentialAvailabilityService, Arc<Vault>) {
+        let state_root = unique_runtime_test_root("palyra-credential-availability");
+        let identity_root = state_root.join("identity");
+        std::fs::create_dir_all(identity_root.as_path())
+            .expect("test identity root should initialize");
+        let registry = Arc::new(
+            AuthProfileRegistry::open(identity_root.as_path())
+                .expect("test auth profile registry should initialize"),
+        );
+        let state = test_runtime_state();
+        let vault = Arc::clone(&state.vault);
+        let scope = "global".parse::<VaultScope>().expect("test vault scope should parse");
+        vault
+            .put_secret(&scope, "oauth_access", b"expired-access-token")
+            .expect("expired access token should persist");
+        vault
+            .put_secret(&scope, "oauth_refresh", b"refresh-token")
+            .expect("refresh token should persist");
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "oauth-primary".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "OAuth primary".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/oauth_access".to_owned(),
+                    refresh_token_vault_ref: "global/oauth_refresh".to_owned(),
+                    token_endpoint: "https://example.test/oauth/token".to_owned(),
+                    client_id: Some("test-client".to_owned()),
+                    client_secret_vault_ref: None,
+                    scopes: vec!["chat".to_owned()],
+                    expires_at_unix_ms: Some(current_unix_ms().saturating_sub(60_000)),
+                    refresh_state: OAuthRefreshState::default(),
+                },
+            })
+            .expect("expired OAuth profile should persist");
+        let refresh_adapter: Arc<dyn OAuthRefreshAdapter> = adapter;
+        let auth_runtime = Arc::new(AuthRuntimeState::new(registry, refresh_adapter));
+        (CredentialAvailabilityService::new(auth_runtime, Arc::clone(&vault)), vault)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_availability_refreshes_expired_oauth_before_materialization() {
+        let adapter = Arc::new(SingleFlightRefreshAdapter::default());
+        let (service, vault) = expired_oauth_credential_service(Arc::clone(&adapter));
+
+        let (_, binding, report) = service
+            .select_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:oauth-primary",
+                Vec::new(),
+            )
+            .await
+            .expect("credential selection should succeed")
+            .expect("configured auth profile should use dynamic selection");
+        let lease = service
+            .materialize(binding.clone())
+            .await
+            .expect("refreshed credential should materialize");
+
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(binding.auth_class, AuthCredentialType::Oauth);
+        assert_eq!(binding.profile_id_sha256.len(), 64);
+        assert_eq!(binding.selection_reason, "eligible");
+        assert_eq!(report.reason_code, "selected");
+        assert_eq!(lease.auth_class(), AuthCredentialType::Oauth);
+        assert!(!format!("{lease:?}").contains("refreshed-access-token"));
+        drop(lease);
+        let scope = "global".parse::<VaultScope>().expect("test vault scope should parse");
+        assert_eq!(
+            vault.get_secret(&scope, "oauth_access").expect("access token should load"),
+            b"refreshed-access-token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_credential_selection_refreshes_one_oauth_profile_single_flight() {
+        let adapter = Arc::new(SingleFlightRefreshAdapter::default());
+        let (service, _vault) = expired_oauth_credential_service(Arc::clone(&adapter));
+        let left = service.clone();
+        let right = service;
+
+        let (left_result, right_result) = tokio::join!(
+            left.select_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:oauth-primary",
+                Vec::new(),
+            ),
+            right.select_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:oauth-primary",
+                Vec::new(),
+            )
+        );
+
+        assert!(left_result.expect("left selection should complete").is_some());
+        assert!(right_result.expect("right selection should complete").is_some());
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_availability_reports_exhaustion_when_all_profiles_are_unavailable() {
+        let state_root = unique_runtime_test_root("palyra-credential-exhaustion");
+        let identity_root = state_root.join("identity");
+        std::fs::create_dir_all(identity_root.as_path())
+            .expect("test identity root should initialize");
+        let registry = Arc::new(
+            AuthProfileRegistry::open(identity_root.as_path())
+                .expect("test auth profile registry should initialize"),
+        );
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "missing-primary".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "Missing primary".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/missing_primary".to_owned(),
+                },
+            })
+            .expect("unavailable profile descriptor should persist");
+        let state = test_runtime_state();
+        let adapter: Arc<dyn OAuthRefreshAdapter> = Arc::new(SingleFlightRefreshAdapter::default());
+        let auth_runtime = Arc::new(AuthRuntimeState::new(registry, adapter));
+        let service = CredentialAvailabilityService::new(auth_runtime, Arc::clone(&state.vault));
+
+        let error = service
+            .select_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:missing-primary",
+                Vec::new(),
+            )
+            .await
+            .expect_err("selection must fail when every credential is unavailable");
+
+        let ProviderAttemptAdmissionError::HealthBlocked { reason_code, .. } = error else {
+            panic!("credential exhaustion should use a health-blocked admission error");
+        };
+        assert_eq!(reason_code, "credential_selection_exhausted");
+    }
 
     #[test]
     fn stale_lsp_generation_cannot_overwrite_reactivated_read_model() {
@@ -20115,6 +20719,7 @@ pub(crate) mod tests {
                 provider_runtime.health_authority_by_provider.clone(),
             ),
             feedback: Arc::new(Mutex::new(Vec::new())),
+            attempted_profile_ids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             fail_health_observation_once: Some(Arc::new(AtomicBool::new(true))),
         };
         let binding = admission
@@ -21215,6 +21820,7 @@ pub(crate) mod tests {
                 provider_runtime.health_authority_by_provider.clone(),
             ),
             feedback: Arc::new(Mutex::new(Vec::new())),
+            attempted_profile_ids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             fail_health_observation_once: None,
         }
     }
