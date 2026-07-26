@@ -131,7 +131,7 @@ use crate::journal::{
     ProviderConfigurationAttemptRuntimeAuthority as JournalProviderConfigurationAttemptRuntimeAuthority,
     ProviderConfigurationAttemptStartRequest, ProviderCredentialAttemptMetadata,
     RecallArtifactCreateRequest, RecallArtifactListFilter, RecallArtifactRecord,
-    RetrievalBranchDiagnostics, RunScopedRuntimeHealthObservationOutcome,
+    RemediationDecision, RetrievalBranchDiagnostics, RunScopedRuntimeHealthObservationOutcome,
     RuntimeEventAppendOutcome, RuntimeEventAppendRequest, RuntimeHealthComponentActivation,
     RuntimeHealthObservationRequest, RuntimeHealthProbeBeginRequest,
     RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
@@ -141,6 +141,7 @@ use crate::journal::{
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
     SessionSearchOutcome, SessionSearchRequest, SessionWriteLeaseRecord, SharedRuntimeDiagnostics,
     SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
+    StuckRunIncidentV2, StuckRunRemediationClaimOutcome, StuckRunRemediationCompletionOutcome,
     ToolEffectObservationCommitRequest, ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord,
     ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest,
     ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
@@ -182,10 +183,11 @@ use crate::retrieval::{
     RetrievalSourceProfileKind,
 };
 use crate::self_healing::{
-    IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
-    RuntimeIncidentObservation, RuntimeIncidentRecord, RuntimeIncidentSummary,
-    RuntimeRemediationAttemptRecord, SelfHealingFeature, SelfHealingSettingsSnapshot,
-    SelfHealingState, WorkHeartbeatKind, WorkHeartbeatRecord, WorkHeartbeatUpdate,
+    IncidentDomain, OrphanReconciliationReport, RemediationAttemptStatus,
+    RuntimeIncidentHistoryEntry, RuntimeIncidentObservation, RuntimeIncidentRecord,
+    RuntimeIncidentSummary, RuntimeRemediationAttemptRecord, SelfHealingFeature,
+    SelfHealingSettingsSnapshot, SelfHealingState, WorkHeartbeatKind, WorkHeartbeatRecord,
+    WorkHeartbeatUpdate,
 };
 use crate::tool_posture::{
     ToolPostureAuditEventRecord, ToolPostureOverrideClearRequest, ToolPostureOverrideRecord,
@@ -5925,6 +5927,20 @@ impl GatewayRuntimeState {
         self.self_healing.list_heartbeats()
     }
 
+    #[must_use]
+    pub(crate) fn self_healing_heartbeat(
+        &self,
+        kind: WorkHeartbeatKind,
+        object_id: &str,
+    ) -> Option<WorkHeartbeatRecord> {
+        self.self_healing.heartbeat(kind, object_id)
+    }
+
+    #[must_use]
+    pub(crate) fn latest_orphan_reconciliation(&self) -> Option<OrphanReconciliationReport> {
+        self.self_healing.latest_orphan_reconciliation()
+    }
+
     pub(crate) fn record_self_healing_heartbeat(&self, update: WorkHeartbeatUpdate) {
         self.self_healing.record_heartbeat(update);
     }
@@ -5979,6 +5995,42 @@ impl GatewayRuntimeState {
             status,
             detail,
         )
+    }
+
+    pub(crate) fn inspect_stuck_run_incident(
+        &self,
+        heartbeat: &WorkHeartbeatRecord,
+    ) -> Result<Option<StuckRunIncidentV2>, JournalError> {
+        self.journal_store.inspect_stuck_run_incident(
+            heartbeat.object_id.as_str(),
+            heartbeat.execution_generation,
+            heartbeat.updated_at_unix_ms,
+        )
+    }
+
+    pub(crate) fn record_stuck_run_remediation_decision(
+        &self,
+        decision: &RemediationDecision,
+    ) -> Result<(), JournalError> {
+        self.journal_store.record_stuck_run_remediation_decision(decision)
+    }
+
+    pub(crate) fn claim_stuck_run_remediation(
+        &self,
+        incident: &StuckRunIncidentV2,
+        worker_id: &str,
+        claim_ttl_ms: i64,
+    ) -> Result<StuckRunRemediationClaimOutcome, JournalError> {
+        self.journal_store.claim_stuck_run_remediation(incident, worker_id, claim_ttl_ms)
+    }
+
+    pub(crate) fn complete_stuck_run_remediation(
+        &self,
+        incident: &StuckRunIncidentV2,
+        worker_id: &str,
+        claim_epoch: u64,
+    ) -> Result<StuckRunRemediationCompletionOutcome, JournalError> {
+        self.journal_store.complete_stuck_run_remediation(incident, worker_id, claim_epoch)
     }
 
     pub(crate) fn record_channel_message_routed(&self) {

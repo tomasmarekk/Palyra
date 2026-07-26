@@ -2413,6 +2413,7 @@ pub(crate) async fn build_observability_payload(
     let healing_history = state.runtime.self_healing_recent_history(64);
     let healing_remediation_attempts = state.runtime.self_healing_recent_remediation_attempts(64);
     let healing_heartbeats = state.runtime.self_healing_heartbeats();
+    let orphan_reconciliation = state.runtime.latest_orphan_reconciliation();
 
     Ok(json!({
         "failure_classes": failure_classes,
@@ -2434,6 +2435,7 @@ pub(crate) async fn build_observability_payload(
             "recent_history": healing_history,
             "recent_remediation_attempts": healing_remediation_attempts,
             "heartbeats": healing_heartbeats,
+            "orphan_reconciliation": orphan_reconciliation,
         },
         "chat": {
             "active_console_streams": lock_console_chat_streams(&state.console_chat_streams).len(),

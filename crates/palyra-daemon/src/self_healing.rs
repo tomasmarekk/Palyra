@@ -7,7 +7,7 @@
 //! everything else only records a remediation proposal for the operator.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     env, fs,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,9 +20,20 @@ use tonic::Request as TonicRequest;
 use tracing::warn;
 
 use crate::{
-    app::state::AppState, apply_browser_service_auth, browser_v1, build_console_browser_client,
-    common_v1, gateway::GatewayRuntimeState, journal::SkillExecutionStatus,
-    load_installed_skills_index, managed_skill_artifact_path, resolve_skills_root,
+    app::state::AppState,
+    apply_browser_service_auth, browser_v1, build_console_browser_client, common_v1,
+    gateway::{
+        cleanup_run_resources, GatewayRuntimeState, OrchestratorRunWaitRequest,
+        ProcessLeaseReconciliationReport,
+    },
+    journal::{
+        OrchestratorCancelRequest, RemediationDecision, SkillExecutionStatus, StuckRunIncidentV2,
+        StuckRunRemediationClaimOutcome, StuckRunRemediationCompletionOutcome,
+        StuckRunRemediationDecisionKind, StuckRunRemediationPolicy,
+    },
+    load_installed_skills_index, managed_skill_artifact_path,
+    orchestrator::RunLifecycleState,
+    resolve_skills_root,
 };
 
 const INCIDENT_HISTORY_LIMIT: usize = 128;
@@ -33,6 +44,12 @@ const HEALING_LOOP_INTERVAL: Duration = Duration::from_secs(15);
 const RUN_HEARTBEAT_STUCK_AFTER_MS: i64 = 120_000;
 const BACKGROUND_TASK_STUCK_AFTER_MS: i64 = 120_000;
 const APPROVAL_STUCK_AFTER_MS: i64 = 600_000;
+const STUCK_RUN_CLAIM_TTL_MS: i64 = 30_000;
+const STUCK_RUN_SETTLE_TIMEOUT: Duration = Duration::from_millis(750);
+const STUCK_RUN_REMEDIATION_LIMIT: usize = 4;
+const STUCK_RUN_REMEDIATION_WINDOW_MS: i64 = 60_000;
+const STUCK_RUN_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const STUCK_RUN_CIRCUIT_OPEN_MS: i64 = 300_000;
 
 const HEALING_MODE_ENV: &str = "PALYRA_HEALING_MODE";
 const HEALING_WATCHDOG_MODE_ENV: &str = "PALYRA_HEALING_WATCHDOG_MODE";
@@ -93,7 +110,7 @@ pub(crate) enum RemediationBlastRadius {
 pub(crate) enum SelfHealingMode {
     Disabled,
     ObserveOnly,
-    Auto,
+    GenerationSafeAutoRecovery,
 }
 
 impl SelfHealingMode {
@@ -102,7 +119,9 @@ impl SelfHealingMode {
         match value.as_deref().map(str::trim).filter(|candidate| !candidate.is_empty()) {
             Some("disabled") => Self::Disabled,
             Some("observe_only") => Self::ObserveOnly,
-            Some("auto") => Self::Auto,
+            // `auto` remains accepted as a compatibility alias for existing
+            // deployments, but diagnostics always expose the explicit policy.
+            Some("generation_safe_auto_recovery" | "auto") => Self::GenerationSafeAutoRecovery,
             _ => default,
         }
     }
@@ -202,6 +221,40 @@ pub(crate) struct WorkHeartbeatRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Resource family registered with the unified orphan reaper.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OrphanResourceType {
+    Run,
+    Process,
+    Mcp,
+    Lsp,
+    Acp,
+    Pty,
+    Worker,
+}
+
+/// Result produced by one registered cleanup adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OrphanReconciliationEntry {
+    pub resource_type: OrphanResourceType,
+    pub inspected_count: usize,
+    pub reconciled_count: usize,
+    pub quarantined_count: usize,
+    pub reason_code: String,
+}
+
+/// Bounded unified report covering every runtime resource family.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OrphanReconciliationReport {
+    pub report_id: String,
+    pub policy: StuckRunRemediationPolicy,
+    pub entries: Vec<OrphanReconciliationEntry>,
+    pub bounded: bool,
+    pub completed_at_unix_ms: i64,
+    pub schema_version: u32,
+}
+
 /// Effective mode of one feature area, as exposed to status surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SelfHealingFeatureSettingSnapshot {
@@ -263,6 +316,10 @@ struct SelfHealingStateInner {
     incident_history: Vec<RuntimeIncidentHistoryEntry>,
     remediation_attempts: Vec<RuntimeRemediationAttemptRecord>,
     heartbeats: HashMap<String, WorkHeartbeatRecord>,
+    stuck_run_remediation_window: VecDeque<i64>,
+    stuck_run_consecutive_failures: u32,
+    stuck_run_circuit_open_until_unix_ms: Option<i64>,
+    latest_orphan_reconciliation: Option<OrphanReconciliationReport>,
 }
 
 /// In-memory self-healing store: settings are read at construction, mutable state (incidents,
@@ -430,6 +487,71 @@ impl SelfHealingState {
             .collect::<Vec<_>>();
         heartbeats.sort_by_key(|heartbeat| std::cmp::Reverse(heartbeat.updated_at_unix_ms));
         heartbeats
+    }
+
+    /// Returns the exact current heartbeat for a generation-sensitive recheck.
+    #[must_use]
+    pub(crate) fn heartbeat(
+        &self,
+        kind: WorkHeartbeatKind,
+        object_id: &str,
+    ) -> Option<WorkHeartbeatRecord> {
+        self.inner
+            .lock()
+            .expect("self-healing mutex poisoned")
+            .heartbeats
+            .get(heartbeat_key(kind, object_id).as_str())
+            .cloned()
+    }
+
+    #[must_use]
+    pub(crate) fn latest_orphan_reconciliation(&self) -> Option<OrphanReconciliationReport> {
+        self.inner.lock().expect("self-healing mutex poisoned").latest_orphan_reconciliation.clone()
+    }
+
+    fn record_orphan_reconciliation(&self, report: OrphanReconciliationReport) {
+        self.inner.lock().expect("self-healing mutex poisoned").latest_orphan_reconciliation =
+            Some(report);
+    }
+
+    fn acquire_stuck_run_remediation_permit(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<(), StuckRunRemediationDecisionKind> {
+        let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
+        if inner
+            .stuck_run_circuit_open_until_unix_ms
+            .is_some_and(|open_until| open_until > now_unix_ms)
+        {
+            return Err(StuckRunRemediationDecisionKind::CircuitOpen);
+        }
+        inner.stuck_run_circuit_open_until_unix_ms = None;
+        while inner.stuck_run_remediation_window.front().is_some_and(|recorded_at| {
+            now_unix_ms.saturating_sub(*recorded_at) >= STUCK_RUN_REMEDIATION_WINDOW_MS
+        }) {
+            inner.stuck_run_remediation_window.pop_front();
+        }
+        if inner.stuck_run_remediation_window.len() >= STUCK_RUN_REMEDIATION_LIMIT {
+            return Err(StuckRunRemediationDecisionKind::RateLimited);
+        }
+        inner.stuck_run_remediation_window.push_back(now_unix_ms);
+        Ok(())
+    }
+
+    fn record_stuck_run_remediation_success(&self) {
+        let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
+        inner.stuck_run_consecutive_failures = 0;
+        inner.stuck_run_circuit_open_until_unix_ms = None;
+    }
+
+    fn record_stuck_run_remediation_failure(&self, now_unix_ms: i64) {
+        let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
+        inner.stuck_run_consecutive_failures =
+            inner.stuck_run_consecutive_failures.saturating_add(1);
+        if inner.stuck_run_consecutive_failures >= STUCK_RUN_CIRCUIT_FAILURE_THRESHOLD {
+            inner.stuck_run_circuit_open_until_unix_ms =
+                Some(now_unix_ms.saturating_add(STUCK_RUN_CIRCUIT_OPEN_MS));
+        }
     }
 
     /// Records (or refreshes) the liveness heartbeat for one unit of work.
@@ -654,6 +776,9 @@ async fn run_self_healing_cycle(state: &AppState) -> Result<(), String> {
     if let Err(error) = evaluate_watchdog_runtime(state).await {
         errors.push(("watchdog", error));
     }
+    if let Err(error) = run_unified_orphan_reaper(state).await {
+        errors.push(("orphan_reaper", error));
+    }
     if let Err(error) = evaluate_pending_approvals(state).await {
         errors.push(("approvals", error));
     }
@@ -695,13 +820,7 @@ async fn evaluate_watchdog_runtime(state: &AppState) -> Result<(), String> {
                     );
                     continue;
                 }
-                evaluate_stale_heartbeat(
-                    &state.runtime,
-                    &heartbeat,
-                    now,
-                    RUN_HEARTBEAT_STUCK_AFTER_MS,
-                    build_run_watchdog_remediation(),
-                );
+                evaluate_stale_run_heartbeat(state, &heartbeat, now).await?;
             }
             WorkHeartbeatKind::BackgroundTask => {
                 let snapshot = state
@@ -767,6 +886,379 @@ fn evaluate_stale_heartbeat(
         dedupe_key: heartbeat_dedupe_key(heartbeat),
         remediation: Some(remediation),
     });
+}
+
+async fn evaluate_stale_run_heartbeat(
+    state: &AppState,
+    heartbeat: &WorkHeartbeatRecord,
+    now: i64,
+) -> Result<(), String> {
+    let age_ms = now.saturating_sub(heartbeat.updated_at_unix_ms);
+    let dedupe_key = heartbeat_dedupe_key(heartbeat);
+    if age_ms <= RUN_HEARTBEAT_STUCK_AFTER_MS {
+        state.runtime.resolve_self_healing_incident(
+            IncidentDomain::Watchdog,
+            dedupe_key.as_str(),
+            "heartbeat moved again before stuck threshold",
+        );
+        return Ok(());
+    }
+    let Some(incident) = state
+        .runtime
+        .inspect_stuck_run_incident(heartbeat)
+        .map_err(|error| format!("failed to inspect stuck-run authority: {error}"))?
+    else {
+        return Ok(());
+    };
+    let runtime_incident =
+        state.runtime.observe_self_healing_incident(RuntimeIncidentObservation {
+            domain: IncidentDomain::Watchdog,
+            severity: IncidentSeverity::High,
+            summary: "run appears stuck".to_owned(),
+            detail: format!(
+                "Run reference {} has a stale heartbeat for {} ms under generation {}.",
+                short_hash(incident.run_id.as_str()),
+                age_ms,
+                incident.generation,
+            ),
+            dedupe_key: dedupe_key.clone(),
+            remediation: Some(build_run_watchdog_remediation()),
+        });
+    let policy = if state.runtime.self_healing.mode_for_feature(SelfHealingFeature::Watchdog)
+        == SelfHealingMode::GenerationSafeAutoRecovery
+    {
+        StuckRunRemediationPolicy::GenerationSafeAutoRecovery
+    } else {
+        StuckRunRemediationPolicy::ObserveOnly
+    };
+    let current_heartbeat =
+        state.runtime.self_healing_heartbeat(WorkHeartbeatKind::Run, incident.run_id.as_str());
+    let decision_kind =
+        decide_stuck_run_remediation(&incident, current_heartbeat.as_ref(), policy, now);
+    let mut decision =
+        RemediationDecision::new(incident.incident_id.clone(), policy, decision_kind, now);
+    state
+        .runtime
+        .record_stuck_run_remediation_decision(&decision)
+        .map_err(|error| format!("failed to persist stuck-run decision: {error}"))?;
+    if decision_kind != StuckRunRemediationDecisionKind::AutoRecover {
+        let _ = state.runtime.record_self_healing_remediation_attempt(
+            runtime_incident.incident_id.as_str(),
+            "generation_safe_stuck_run_recovery",
+            SelfHealingFeature::Watchdog,
+            RemediationAttemptStatus::Skipped,
+            decision.reason_code,
+        );
+        return Ok(());
+    }
+    if let Err(blocked) = state.runtime.self_healing.acquire_stuck_run_remediation_permit(now) {
+        decision = RemediationDecision::new(incident.incident_id.clone(), policy, blocked, now);
+        state
+            .runtime
+            .record_stuck_run_remediation_decision(&decision)
+            .map_err(|error| format!("failed to persist remediation throttle decision: {error}"))?;
+        let _ = state.runtime.record_self_healing_remediation_attempt(
+            runtime_incident.incident_id.as_str(),
+            "generation_safe_stuck_run_recovery",
+            SelfHealingFeature::Watchdog,
+            RemediationAttemptStatus::Skipped,
+            decision.reason_code,
+        );
+        return Ok(());
+    }
+    let worker_id = format!("self-healing-watchdog:{}", std::process::id());
+    let claim = state
+        .runtime
+        .claim_stuck_run_remediation(&incident, worker_id.as_str(), STUCK_RUN_CLAIM_TTL_MS)
+        .map_err(|error| format!("failed to claim stuck-run remediation: {error}"))?;
+    let claim_epoch = match claim {
+        StuckRunRemediationClaimOutcome::Claimed { claim_epoch } => claim_epoch,
+        StuckRunRemediationClaimOutcome::Busy
+        | StuckRunRemediationClaimOutcome::AlreadyCompleted => return Ok(()),
+        StuckRunRemediationClaimOutcome::StaleAuthority => {
+            let stale = RemediationDecision::new(
+                incident.incident_id.clone(),
+                policy,
+                StuckRunRemediationDecisionKind::LaneOwnerMismatch,
+                current_unix_ms(),
+            );
+            state
+                .runtime
+                .record_stuck_run_remediation_decision(&stale)
+                .map_err(|error| format!("failed to persist stale-authority decision: {error}"))?;
+            return Ok(());
+        }
+    };
+    let current_heartbeat =
+        state.runtime.self_healing_heartbeat(WorkHeartbeatKind::Run, incident.run_id.as_str());
+    if decide_stuck_run_remediation(
+        &incident,
+        current_heartbeat.as_ref(),
+        policy,
+        current_unix_ms(),
+    ) != StuckRunRemediationDecisionKind::AutoRecover
+    {
+        let fresh = RemediationDecision::new(
+            incident.incident_id.clone(),
+            policy,
+            StuckRunRemediationDecisionKind::FreshHeartbeat,
+            current_unix_ms(),
+        );
+        state
+            .runtime
+            .record_stuck_run_remediation_decision(&fresh)
+            .map_err(|error| format!("failed to persist post-claim heartbeat decision: {error}"))?;
+        return Ok(());
+    }
+    let attempt =
+        remediate_claimed_stuck_run(state, &incident, worker_id.as_str(), claim_epoch).await;
+    match attempt {
+        Ok(()) => {
+            state.runtime.self_healing.record_stuck_run_remediation_success();
+            let _ = state.runtime.record_self_healing_remediation_attempt(
+                runtime_incident.incident_id.as_str(),
+                "generation_safe_stuck_run_recovery",
+                SelfHealingFeature::Watchdog,
+                RemediationAttemptStatus::Succeeded,
+                "runtime.healing.stuck_run.continuation_queued",
+            );
+            state.runtime.resolve_self_healing_incident(
+                IncidentDomain::Watchdog,
+                dedupe_key.as_str(),
+                "stuck run was generation-fenced and queued for safe continuation",
+            );
+            Ok(())
+        }
+        Err(error) => {
+            state.runtime.self_healing.record_stuck_run_remediation_failure(current_unix_ms());
+            let _ = state.runtime.record_self_healing_remediation_attempt(
+                runtime_incident.incident_id.as_str(),
+                "generation_safe_stuck_run_recovery",
+                SelfHealingFeature::Watchdog,
+                RemediationAttemptStatus::Failed,
+                error.clone(),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn decide_stuck_run_remediation(
+    incident: &StuckRunIncidentV2,
+    current_heartbeat: Option<&WorkHeartbeatRecord>,
+    policy: StuckRunRemediationPolicy,
+    now_unix_ms: i64,
+) -> StuckRunRemediationDecisionKind {
+    let Some(current_heartbeat) = current_heartbeat else {
+        return StuckRunRemediationDecisionKind::FreshHeartbeat;
+    };
+    if current_heartbeat.updated_at_unix_ms != incident.heartbeat_updated_at_unix_ms {
+        return StuckRunRemediationDecisionKind::FreshHeartbeat;
+    }
+    if current_heartbeat
+        .execution_generation
+        .is_some_and(|generation| generation != incident.generation)
+        || incident.heartbeat_generation.is_some_and(|generation| generation != incident.generation)
+    {
+        return StuckRunRemediationDecisionKind::StaleGeneration;
+    }
+    if incident.generation_lease_expires_at_unix_ms <= now_unix_ms {
+        return StuckRunRemediationDecisionKind::ExpiredGenerationLease;
+    }
+    if incident.mutating_tool_in_flight {
+        return StuckRunRemediationDecisionKind::ActiveMutationBlocked;
+    }
+    if incident.pending_approval {
+        return StuckRunRemediationDecisionKind::ApprovalBlocked;
+    }
+    if !(incident.read_only_tool_wait || incident.provider_wait_in_flight) {
+        return StuckRunRemediationDecisionKind::UnsafeWaitState;
+    }
+    match policy {
+        StuckRunRemediationPolicy::ObserveOnly => StuckRunRemediationDecisionKind::ObserveOnly,
+        StuckRunRemediationPolicy::GenerationSafeAutoRecovery => {
+            StuckRunRemediationDecisionKind::AutoRecover
+        }
+    }
+}
+
+async fn remediate_claimed_stuck_run(
+    state: &AppState,
+    incident: &StuckRunIncidentV2,
+    worker_id: &str,
+    claim_epoch: u64,
+) -> Result<(), String> {
+    state
+        .runtime
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: incident.run_id.clone(),
+            reason: "generation-safe stale read-only wait remediation".to_owned(),
+        })
+        .await
+        .map_err(|error| format!("cooperative stuck-run cancellation failed: {error}"))?;
+    let wait = state
+        .runtime
+        .wait_for_orchestrator_run(OrchestratorRunWaitRequest {
+            run_id: incident.run_id.clone(),
+            timeout: STUCK_RUN_SETTLE_TIMEOUT,
+            poll_interval: Duration::from_millis(50),
+            return_on_waiting: false,
+        })
+        .await;
+    match wait {
+        Ok(outcome) if outcome.snapshot.state != RunLifecycleState::Cancelled.as_str() => {
+            state
+                .runtime
+                .clear_self_healing_heartbeat(WorkHeartbeatKind::Run, incident.run_id.as_str());
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
+            state
+                .runtime
+                .update_orchestrator_run_state(
+                    incident.run_id.clone(),
+                    RunLifecycleState::Cancelled,
+                    Some("generation-safe stuck-run hard abort".to_owned()),
+                )
+                .await
+                .map_err(|error| format!("stuck-run generation invalidation failed: {error}"))?;
+            let _ = cleanup_run_resources(
+                &state.runtime,
+                incident.run_id.as_str(),
+                "generation-safe stuck-run hard abort",
+            )
+            .await;
+        }
+        Err(error) => return Err(format!("stuck-run bounded settle failed: {error}")),
+    }
+    match state
+        .runtime
+        .complete_stuck_run_remediation(incident, worker_id, claim_epoch)
+        .map_err(|error| format!("failed to queue stuck-run continuation: {error}"))?
+    {
+        StuckRunRemediationCompletionOutcome::ContinuationQueued { .. }
+        | StuckRunRemediationCompletionOutcome::AlreadyQueued { .. } => {
+            state
+                .runtime
+                .clear_self_healing_heartbeat(WorkHeartbeatKind::Run, incident.run_id.as_str());
+            Ok(())
+        }
+        StuckRunRemediationCompletionOutcome::StaleClaim => {
+            Err("stuck-run remediation claim became stale before completion".to_owned())
+        }
+    }
+}
+
+async fn run_unified_orphan_reaper(state: &AppState) -> Result<(), String> {
+    let policy = if state.runtime.self_healing.mode_for_feature(SelfHealingFeature::Watchdog)
+        == SelfHealingMode::GenerationSafeAutoRecovery
+    {
+        StuckRunRemediationPolicy::GenerationSafeAutoRecovery
+    } else {
+        StuckRunRemediationPolicy::ObserveOnly
+    };
+    let now = current_unix_ms();
+    let stale_runs = state
+        .runtime
+        .self_healing_heartbeats()
+        .iter()
+        .filter(|heartbeat| {
+            heartbeat.kind == WorkHeartbeatKind::Run
+                && now.saturating_sub(heartbeat.updated_at_unix_ms) > RUN_HEARTBEAT_STUCK_AFTER_MS
+        })
+        .count();
+    let mut entries = vec![OrphanReconciliationEntry {
+        resource_type: OrphanResourceType::Run,
+        inspected_count: stale_runs,
+        reconciled_count: 0,
+        quarantined_count: 0,
+        reason_code: "runtime.orphan.run_watchdog_adapter".to_owned(),
+    }];
+    if policy == StuckRunRemediationPolicy::ObserveOnly {
+        for resource_type in [
+            OrphanResourceType::Process,
+            OrphanResourceType::Mcp,
+            OrphanResourceType::Lsp,
+            OrphanResourceType::Acp,
+            OrphanResourceType::Pty,
+            OrphanResourceType::Worker,
+        ] {
+            entries.push(OrphanReconciliationEntry {
+                resource_type,
+                inspected_count: 0,
+                reconciled_count: 0,
+                quarantined_count: 0,
+                reason_code: "runtime.orphan.observe_only".to_owned(),
+            });
+        }
+    } else {
+        let process = state
+            .runtime
+            .reconcile_persisted_process_leases_async()
+            .await
+            .map_err(|error| format!("process orphan reconciliation failed: {error}"))?;
+        entries.extend(process_orphan_entries(&process));
+        let workers = state
+            .runtime
+            .reap_expired_networked_workers()
+            .await
+            .map_err(|error| format!("worker orphan reconciliation failed: {error}"))?;
+        entries.push(OrphanReconciliationEntry {
+            resource_type: OrphanResourceType::Worker,
+            inspected_count: workers.len(),
+            reconciled_count: workers.len(),
+            quarantined_count: 0,
+            reason_code: "runtime.orphan.worker_expiry_reconciled".to_owned(),
+        });
+    }
+    let report = OrphanReconciliationReport {
+        report_id: stable_sha256_id("orphan-reconciliation", now.to_string().as_str()),
+        policy,
+        entries,
+        bounded: true,
+        completed_at_unix_ms: now,
+        schema_version: 1,
+    };
+    state.runtime.self_healing.record_orphan_reconciliation(report);
+    Ok(())
+}
+
+fn process_orphan_entries(
+    process: &ProcessLeaseReconciliationReport,
+) -> Vec<OrphanReconciliationEntry> {
+    let reconciled = process
+        .closed_count
+        .saturating_add(process.expired_count)
+        .saturating_add(process.pending_cleanup_completed_count);
+    let delegated = [
+        OrphanResourceType::Mcp,
+        OrphanResourceType::Lsp,
+        OrphanResourceType::Acp,
+        OrphanResourceType::Pty,
+    ]
+    .into_iter()
+    .map(|resource_type| OrphanReconciliationEntry {
+        resource_type,
+        inspected_count: process.inspected_count,
+        reconciled_count: reconciled,
+        quarantined_count: process.quarantined_count,
+        reason_code: "runtime.orphan.delegated_to_process_lease".to_owned(),
+    });
+    std::iter::once(OrphanReconciliationEntry {
+        resource_type: OrphanResourceType::Process,
+        inspected_count: process
+            .inspected_count
+            .saturating_add(process.pending_cleanup_inspected_count),
+        reconciled_count: reconciled,
+        quarantined_count: process
+            .quarantined_count
+            .saturating_add(process.orphaned_count)
+            .saturating_add(process.pending_cleanup_count),
+        reason_code: "runtime.orphan.process_lease_reconciled".to_owned(),
+    })
+    .chain(delegated)
+    .collect()
 }
 
 async fn evaluate_pending_approvals(state: &AppState) -> Result<(), String> {
@@ -1002,7 +1494,7 @@ async fn heal_missing_active_profiles(state: &AppState) -> Result<(), String> {
         });
 
         if state.runtime.self_healing.mode_for_feature(SelfHealingFeature::Browser)
-            != SelfHealingMode::Auto
+            != SelfHealingMode::GenerationSafeAutoRecovery
         {
             let _ = state.runtime.record_self_healing_remediation_attempt(
                 incident.incident_id.as_str(),
@@ -1208,6 +1700,10 @@ fn stable_sha256_id(prefix: &str, payload: &str) -> String {
     format!("{prefix}_{}", &digest[..16])
 }
 
+fn short_hash(payload: &str) -> String {
+    hex::encode(Sha256::digest(payload.as_bytes()))[..12].to_owned()
+}
+
 fn heartbeat_key(kind: WorkHeartbeatKind, object_id: &str) -> String {
     format!("{kind:?}:{object_id}")
 }
@@ -1218,14 +1714,15 @@ fn heartbeat_dedupe_key(heartbeat: &WorkHeartbeatRecord) -> String {
 
 fn build_run_watchdog_remediation() -> RuntimeRemediationDescriptor {
     RuntimeRemediationDescriptor {
-        remediation_id: "inspect_or_cancel_run".to_owned(),
-        label: "Inspect stuck run".to_owned(),
-        description: "Review the stalled run and cancel it only after operator confirmation."
-            .to_owned(),
-        risk_level: RemediationRiskLevel::Medium,
+        remediation_id: "generation_safe_stuck_run_recovery".to_owned(),
+        label: "Recover safe stuck run".to_owned(),
+        description:
+            "Generation-fence a stale read-only wait, cancel it, and queue one continuation."
+                .to_owned(),
+        risk_level: RemediationRiskLevel::Low,
         blast_radius: RemediationBlastRadius::Session,
-        requires_approval: true,
-        auto_executable: false,
+        requires_approval: false,
+        auto_executable: true,
     }
 }
 
@@ -1303,6 +1800,166 @@ fn truncate_vec<T>(entries: &mut Vec<T>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stuck_run_incident() -> StuckRunIncidentV2 {
+        StuckRunIncidentV2 {
+            incident_id: "incident".to_owned(),
+            run_id: "run".to_owned(),
+            session_id: "session".to_owned(),
+            generation: 7,
+            generation_lease_id: "lease".to_owned(),
+            generation_lease_expires_at_unix_ms: i64::MAX,
+            lane_owner: "orchestrator_run".to_owned(),
+            heartbeat_generation: Some(7),
+            heartbeat_updated_at_unix_ms: 1_000,
+            provider_wait_in_flight: false,
+            read_only_tool_wait: true,
+            mutating_tool_in_flight: false,
+            pending_approval: false,
+            requeue_idempotency_key: "requeue".to_owned(),
+            continuation_task_id: "task".to_owned(),
+            continuation_run_id: "continuation".to_owned(),
+            created_at_unix_ms: 2_000,
+            schema_version: 2,
+        }
+    }
+
+    fn stuck_run_heartbeat(updated_at_unix_ms: i64) -> WorkHeartbeatRecord {
+        WorkHeartbeatRecord {
+            heartbeat_key: "Run:run".to_owned(),
+            kind: WorkHeartbeatKind::Run,
+            object_id: "run".to_owned(),
+            execution_generation: Some(7),
+            summary: "run".to_owned(),
+            updated_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn stale_read_only_wait_is_auto_recoverable_only_under_explicit_policy() {
+        let mut incident = stuck_run_incident();
+        incident.read_only_tool_wait = false;
+        incident.provider_wait_in_flight = true;
+        let heartbeat = stuck_run_heartbeat(incident.heartbeat_updated_at_unix_ms);
+
+        assert_eq!(
+            decide_stuck_run_remediation(
+                &incident,
+                Some(&heartbeat),
+                StuckRunRemediationPolicy::GenerationSafeAutoRecovery,
+                2_000,
+            ),
+            StuckRunRemediationDecisionKind::AutoRecover
+        );
+        assert_eq!(
+            decide_stuck_run_remediation(
+                &incident,
+                Some(&heartbeat),
+                StuckRunRemediationPolicy::ObserveOnly,
+                2_000,
+            ),
+            StuckRunRemediationDecisionKind::ObserveOnly
+        );
+    }
+
+    #[test]
+    fn fresh_heartbeat_after_detection_blocks_remediation() {
+        let incident = stuck_run_incident();
+        let heartbeat =
+            stuck_run_heartbeat(incident.heartbeat_updated_at_unix_ms.saturating_add(1));
+
+        assert_eq!(
+            decide_stuck_run_remediation(
+                &incident,
+                Some(&heartbeat),
+                StuckRunRemediationPolicy::GenerationSafeAutoRecovery,
+                2_000,
+            ),
+            StuckRunRemediationDecisionKind::FreshHeartbeat
+        );
+    }
+
+    #[test]
+    fn active_mutation_blocks_automatic_replay() {
+        let mut incident = stuck_run_incident();
+        incident.mutating_tool_in_flight = true;
+        incident.read_only_tool_wait = false;
+        let heartbeat = stuck_run_heartbeat(incident.heartbeat_updated_at_unix_ms);
+
+        assert_eq!(
+            decide_stuck_run_remediation(
+                &incident,
+                Some(&heartbeat),
+                StuckRunRemediationPolicy::GenerationSafeAutoRecovery,
+                2_000,
+            ),
+            StuckRunRemediationDecisionKind::ActiveMutationBlocked
+        );
+    }
+
+    #[test]
+    fn expired_generation_lease_blocks_automatic_recovery() {
+        let mut incident = stuck_run_incident();
+        incident.generation_lease_expires_at_unix_ms = 1_999;
+        let heartbeat = stuck_run_heartbeat(incident.heartbeat_updated_at_unix_ms);
+
+        assert_eq!(
+            decide_stuck_run_remediation(
+                &incident,
+                Some(&heartbeat),
+                StuckRunRemediationPolicy::GenerationSafeAutoRecovery,
+                2_000,
+            ),
+            StuckRunRemediationDecisionKind::ExpiredGenerationLease
+        );
+    }
+
+    #[test]
+    fn remediation_rate_limit_and_circuit_breaker_are_bounded() {
+        let state = SelfHealingState::new();
+        for index in 0..STUCK_RUN_REMEDIATION_LIMIT {
+            state
+                .acquire_stuck_run_remediation_permit(index as i64)
+                .expect("bounded attempts should be permitted");
+        }
+        assert_eq!(
+            state.acquire_stuck_run_remediation_permit(10),
+            Err(StuckRunRemediationDecisionKind::RateLimited)
+        );
+
+        for _ in 0..STUCK_RUN_CIRCUIT_FAILURE_THRESHOLD {
+            state.record_stuck_run_remediation_failure(100);
+        }
+        assert_eq!(
+            state.acquire_stuck_run_remediation_permit(101),
+            Err(StuckRunRemediationDecisionKind::CircuitOpen)
+        );
+    }
+
+    #[test]
+    fn unified_process_adapter_registers_every_process_backed_resource_type() {
+        let entries = process_orphan_entries(&ProcessLeaseReconciliationReport {
+            inspected_count: 1,
+            closed_count: 1,
+            orphaned_count: 0,
+            quarantined_count: 0,
+            expired_count: 0,
+            pending_cleanup_inspected_count: 0,
+            pending_cleanup_completed_count: 0,
+            pending_cleanup_count: 0,
+        });
+
+        assert_eq!(
+            entries.iter().map(|entry| entry.resource_type).collect::<Vec<_>>(),
+            vec![
+                OrphanResourceType::Process,
+                OrphanResourceType::Mcp,
+                OrphanResourceType::Lsp,
+                OrphanResourceType::Acp,
+                OrphanResourceType::Pty,
+            ]
+        );
+    }
 
     #[test]
     fn incident_lifecycle_updates_summary() {

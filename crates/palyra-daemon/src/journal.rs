@@ -89,6 +89,7 @@ pub(crate) mod runtime_kernel;
 mod shared_runtime;
 pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
+pub(crate) mod stuck_run_remediation;
 
 use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
 pub use shared_runtime::{
@@ -125,6 +126,11 @@ pub use shared_runtime::{RuntimeGenerationActivateRequest, RuntimeGenerationInva
 pub(crate) use shared_runtime::{RuntimeHealthProbeBeginOutcome, RuntimeHealthProbeBeginRequest};
 pub use startup_recovery::{
     ContinuationRunDescriptor, StartupRecoveryAction, StartupRecoveryActuationKind,
+};
+pub use stuck_run_remediation::{
+    RemediationDecision, StuckRunIncidentV2, StuckRunRemediationClaimOutcome,
+    StuckRunRemediationCompletionOutcome, StuckRunRemediationDecisionKind,
+    StuckRunRemediationPolicy,
 };
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
@@ -7462,6 +7468,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 82,
         name: "pending_final_delivery_recovery",
         sql: runtime_finalization::MIGRATION_82_SQL,
+    },
+    Migration {
+        version: 83,
+        name: "stuck_run_remediation",
+        sql: stuck_run_remediation::MIGRATION_83_SQL,
     },
 ];
 
