@@ -180,6 +180,27 @@ fn qa_run_pack_accepts_full_p0_pack() -> Result<()> {
 }
 
 #[test]
+fn qa_run_pack_accepts_provider_p0_schema_preview() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "run-pack", "--path", "qa/scenarios/provider", "--tag", "p0", "--json"])
+        .output()
+        .context("failed to execute provider P0 schema preview")?;
+
+    assert!(
+        output.status.success(),
+        "provider P0 schema preview should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("provider P0 schema preview JSON should parse")?;
+    assert_eq!(payload.pointer("/selected_count").and_then(Value::as_u64), Some(12));
+    assert_eq!(payload.pointer("/passed").and_then(Value::as_u64), Some(12));
+    assert_eq!(payload.pointer("/failed").and_then(Value::as_u64), Some(0));
+    Ok(())
+}
+
+#[test]
 fn qa_run_pack_filters_release_smoke_and_writes_aggregate_report() -> Result<()> {
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = temp_dir.path().join("reports").join("qa-pack-report.json");

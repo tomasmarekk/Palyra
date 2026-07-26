@@ -1618,7 +1618,12 @@ fn build_pack_scenario_report(path: &Path, requested_tags: &[String]) -> QaPackS
         );
     }
 
-    let evidence = build_qa_evidence_bundle(&manifest, schema_preview_evidence(&manifest));
+    let mut preview_manifest = manifest.clone();
+    // The parser already validates runtime-path selectors. A schema preview must
+    // not fabricate runtime provenance that only a real `qa gate` can prove.
+    preview_manifest.expect.runtime_path = None;
+    let evidence =
+        build_qa_evidence_bundle(&preview_manifest, schema_preview_evidence(&preview_manifest));
     let issue_codes = evidence
         .checks
         .iter()
