@@ -41,6 +41,10 @@ use crate::agents::{
     AgentRecord, AgentResolveOutcome, AgentResolveRequest, AgentSetDefaultOutcome,
     AgentUnbindOutcome, AgentUnbindRequest, SessionAgentBinding,
 };
+use crate::application::daemon_lifecycle::{
+    DaemonDrainRequest, DaemonLifecycleController, DaemonLifecycleError, DaemonLifecyclePhase,
+    DaemonLifecycleSnapshot, LifecycleSubsystem,
+};
 use crate::application::file_view_registry::{
     FileViewRegistry, WorkspaceFileViewRecord, WorkspacePatchFileViewReport,
 };
@@ -2839,6 +2843,8 @@ pub struct GatewayRuntimeState {
     runtime_shadow_diagnostics:
         crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics,
     pub(crate) journal_store: JournalStore,
+    pub(crate) daemon_lifecycle: DaemonLifecycleController,
+    daemon_lifecycle_transition_lock: Mutex<()>,
     pub(crate) fault_injection: QaFaultRuntime,
     revoked_certificate_count: usize,
     model_provider: RwLock<ModelProviderRuntime>,
@@ -3882,6 +3888,14 @@ fn journal_state_error_status(error: JournalError) -> Status {
     }
 }
 
+fn daemon_lifecycle_status(error: DaemonLifecycleError) -> Status {
+    match error {
+        DaemonLifecycleError::InvalidTransition { .. }
+        | DaemonLifecycleError::StaleEpoch { .. } => Status::failed_precondition(error.to_string()),
+        DaemonLifecycleError::LockPoisoned => Status::internal(error.to_string()),
+    }
+}
+
 /// Parses the stored run state into the canonical lifecycle phase, failing
 /// closed on states this build does not know.
 fn canonical_phase_from_snapshot(
@@ -4499,6 +4513,7 @@ impl GatewayRuntimeState {
             NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
             current_unix_ms(),
         )?;
+        let daemon_lifecycle_startup = journal_store.begin_daemon_lifecycle_startup()?;
         Ok(Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
@@ -4605,6 +4620,8 @@ impl GatewayRuntimeState {
             runtime_shadow_diagnostics:
                 crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics::default(),
             journal_store,
+            daemon_lifecycle: DaemonLifecycleController::new(daemon_lifecycle_startup),
+            daemon_lifecycle_transition_lock: Mutex::new(()),
             fault_injection,
             revoked_certificate_count,
             model_provider: RwLock::new(ModelProviderRuntime {
@@ -7645,6 +7662,194 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.checkpoint_journal_wal_blocking(mode))
             .await
             .map_err(|_| Status::internal("journal WAL checkpoint worker panicked"))?
+    }
+
+    /// Returns the process-wide startup, drain, and shutdown state.
+    pub(crate) fn daemon_lifecycle_snapshot(&self) -> Result<DaemonLifecycleSnapshot, Status> {
+        self.daemon_lifecycle.snapshot().map_err(daemon_lifecycle_status)
+    }
+
+    /// Opens ingress after every startup recovery actuator has completed.
+    ///
+    /// # Errors
+    /// Returns `internal` when durable transition evidence cannot be committed.
+    pub(crate) fn complete_daemon_startup_recovery(
+        &self,
+    ) -> Result<DaemonLifecycleSnapshot, Status> {
+        let _transition_guard = self
+            .daemon_lifecycle_transition_lock
+            .lock()
+            .map_err(|_| Status::internal("daemon lifecycle transition lock poisoned"))?;
+        let next =
+            self.daemon_lifecycle.propose_startup_ready().map_err(daemon_lifecycle_status)?;
+        self.journal_store
+            .append_daemon_lifecycle_snapshot(&next)
+            .map_err(journal_state_error_status)?;
+        self.daemon_lifecycle.apply(next.clone()).map_err(daemon_lifecycle_status)?;
+        Ok(next)
+    }
+
+    /// Starts the sole coordinated drain sequence.
+    ///
+    /// Concurrent signal and admin requests converge on the first committed
+    /// drain epoch. The elected caller waits for active runs, drains subsystem
+    /// producers, checkpoints SQLite, and finally releases all transports.
+    ///
+    /// # Errors
+    /// Returns a transport status when lifecycle evidence or the final
+    /// checkpoint cannot be committed.
+    pub(crate) async fn begin_daemon_drain(
+        self: &Arc<Self>,
+        request: DaemonDrainRequest,
+    ) -> Result<DaemonLifecycleSnapshot, Status> {
+        let (snapshot, elected) = self.request_daemon_drain(request)?;
+        if elected {
+            self.run_daemon_drain(snapshot.epoch).await?;
+        }
+        self.daemon_lifecycle_snapshot()
+    }
+
+    /// Persists a drain request and runs its coordinator in the background.
+    ///
+    /// This variant lets the admin transport acknowledge the committed
+    /// boundary before that same transport is asked to stop.
+    ///
+    /// # Errors
+    /// Returns a transport status when the initial drain transition cannot be
+    /// committed.
+    pub(crate) fn spawn_daemon_drain(
+        self: &Arc<Self>,
+        request: DaemonDrainRequest,
+    ) -> Result<DaemonLifecycleSnapshot, Status> {
+        let (snapshot, elected) = self.request_daemon_drain(request)?;
+        if elected {
+            let runtime = Arc::clone(self);
+            let epoch = snapshot.epoch;
+            tokio::spawn(async move {
+                if let Err(error) = runtime.run_daemon_drain(epoch).await {
+                    tracing::error!(
+                        code = %error.code(),
+                        message = %error.message(),
+                        lifecycle_epoch = epoch,
+                        "background daemon drain coordinator failed"
+                    );
+                }
+            });
+        }
+        Ok(snapshot)
+    }
+
+    /// Cancels a drain before checkpointing begins.
+    ///
+    /// # Errors
+    /// Returns `failed_precondition` after the point of no return, or
+    /// `internal` when durable transition evidence cannot be committed.
+    pub(crate) fn cancel_daemon_drain(
+        &self,
+        epoch: u64,
+        requested_by: String,
+    ) -> Result<DaemonLifecycleSnapshot, Status> {
+        let _transition_guard = self
+            .daemon_lifecycle_transition_lock
+            .lock()
+            .map_err(|_| Status::internal("daemon lifecycle transition lock poisoned"))?;
+        let next = self
+            .daemon_lifecycle
+            .propose_cancel(epoch, requested_by)
+            .map_err(daemon_lifecycle_status)?;
+        self.journal_store
+            .append_daemon_lifecycle_snapshot(&next)
+            .map_err(journal_state_error_status)?;
+        self.daemon_lifecycle.apply(next.clone()).map_err(daemon_lifecycle_status)?;
+        Ok(next)
+    }
+
+    /// Resolves when the lifecycle controller releases process transports.
+    pub(crate) async fn wait_for_daemon_shutdown(&self) {
+        self.daemon_lifecycle.wait_for_shutdown().await;
+    }
+
+    fn request_daemon_drain(
+        &self,
+        request: DaemonDrainRequest,
+    ) -> Result<(DaemonLifecycleSnapshot, bool), Status> {
+        let _transition_guard = self
+            .daemon_lifecycle_transition_lock
+            .lock()
+            .map_err(|_| Status::internal("daemon lifecycle transition lock poisoned"))?;
+        let current = self.daemon_lifecycle.snapshot().map_err(daemon_lifecycle_status)?;
+        let next = self
+            .daemon_lifecycle
+            .propose_drain(request, current_unix_ms())
+            .map_err(daemon_lifecycle_status)?;
+        if next.revision == current.revision {
+            return Ok((current, false));
+        }
+        self.journal_store
+            .append_daemon_lifecycle_snapshot(&next)
+            .map_err(journal_state_error_status)?;
+        self.daemon_lifecycle.apply(next.clone()).map_err(daemon_lifecycle_status)?;
+        Ok((next, true))
+    }
+
+    async fn run_daemon_drain(self: &Arc<Self>, epoch: u64) -> Result<(), Status> {
+        loop {
+            let snapshot = self.daemon_lifecycle_snapshot()?;
+            if snapshot.epoch != epoch || snapshot.phase == DaemonLifecyclePhase::Running {
+                return Ok(());
+            }
+            let active_runs = self.counters.snapshot().active_orchestrator_runs();
+            if active_runs == 0
+                || snapshot.deadline_unix_ms.is_some_and(|deadline| current_unix_ms() >= deadline)
+            {
+                break;
+            }
+            let notified = self.orchestrator_run_notify.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
+        }
+
+        let draining =
+            self.advance_daemon_lifecycle(epoch, DaemonLifecyclePhase::DrainingSubsystems)?;
+        self.daemon_lifecycle
+            .abort_subsystem(LifecycleSubsystem::Channels)
+            .map_err(daemon_lifecycle_status)?;
+        let mut lifecycle = self.daemon_lifecycle.subscribe();
+        loop {
+            if self.daemon_lifecycle.subsystems_settled().map_err(daemon_lifecycle_status)? {
+                break;
+            }
+            let deadline_reached =
+                draining.deadline_unix_ms.is_some_and(|deadline| current_unix_ms() >= deadline);
+            if deadline_reached {
+                self.daemon_lifecycle
+                    .abort_undrained_subsystems()
+                    .map_err(daemon_lifecycle_status)?;
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(100), lifecycle.changed()).await;
+        }
+        self.advance_daemon_lifecycle(epoch, DaemonLifecyclePhase::Checkpointing)?;
+        self.checkpoint_journal_wal(JournalWalCheckpointMode::Full).await?;
+        self.advance_daemon_lifecycle(epoch, DaemonLifecyclePhase::ShutdownRequested)?;
+        Ok(())
+    }
+
+    fn advance_daemon_lifecycle(
+        &self,
+        epoch: u64,
+        phase: DaemonLifecyclePhase,
+    ) -> Result<DaemonLifecycleSnapshot, Status> {
+        let _transition_guard = self
+            .daemon_lifecycle_transition_lock
+            .lock()
+            .map_err(|_| Status::internal("daemon lifecycle transition lock poisoned"))?;
+        let next =
+            self.daemon_lifecycle.propose_advance(epoch, phase).map_err(daemon_lifecycle_status)?;
+        self.journal_store
+            .append_daemon_lifecycle_snapshot(&next)
+            .map_err(journal_state_error_status)?;
+        self.daemon_lifecycle.apply(next.clone()).map_err(daemon_lifecycle_status)?;
+        Ok(next)
     }
 
     /// Verifies the journal hash chain on the blocking journal worker.

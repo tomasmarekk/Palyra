@@ -19,7 +19,6 @@ use super::{
     services,
 };
 use crate::{
-    app::shutdown::shutdown_signal,
     channels::ChannelPlatform,
     config::LoadedConfig,
     gateway::{self, GatewayRuntimeState},
@@ -169,6 +168,7 @@ pub(crate) async fn serve(
         None
     };
 
+    let grpc_shutdown_runtime = Arc::clone(&runtime);
     let grpc_server = async move {
         grpc_server_builder
             .add_service(grpc_gateway_server)
@@ -178,26 +178,32 @@ pub(crate) async fn serve(
             .add_service(grpc_vault_server)
             .add_service(grpc_auth_server)
             .add_service(grpc_canvas_server)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
+            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), async move {
+                grpc_shutdown_runtime.wait_for_daemon_shutdown().await;
+            })
             .await
             .context("palyrad gRPC server failed")
     };
+    let node_shutdown_runtime = Arc::clone(&runtime);
     let node_rpc_server = async move {
         node_rpc_server_builder
             .add_service(node_rpc_server)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(node_rpc_listener),
-                shutdown_signal(),
-            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(node_rpc_listener), async move {
+                node_shutdown_runtime.wait_for_daemon_shutdown().await;
+            })
             .await
             .context("palyrad node RPC server failed")
     };
 
     if let Some(quic_endpoint) = quic_endpoint {
+        let quic_shutdown_runtime = Arc::clone(&runtime);
         tokio::try_join!(grpc_server, node_rpc_server, async move {
-            quic_runtime::serve(quic_endpoint, node_rpc_mtls_required)
-                .await
-                .context("palyrad QUIC server failed")
+            tokio::select! {
+                result = quic_runtime::serve(quic_endpoint, node_rpc_mtls_required) => {
+                    result.context("palyrad QUIC server failed")
+                }
+                () = quic_shutdown_runtime.wait_for_daemon_shutdown() => Ok(()),
+            }
         },)?;
     } else {
         tokio::try_join!(grpc_server, node_rpc_server)?;

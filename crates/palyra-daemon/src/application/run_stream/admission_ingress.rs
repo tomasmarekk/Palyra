@@ -18,6 +18,7 @@ use tonic::metadata::MetadataMap;
 use crate::{
     agents::AgentResolveRequest,
     application::{
+        daemon_lifecycle::DrainAdmissionPolicy,
         run_admission::{AdmissionCaller, AdmissionEnvironmentSnapshot, AdmissionQueueIntent},
         runtime_kernel_v2::{
             dispatcher::RuntimeKernelDispatcher, runtime_selection::HostVerifiedRunAdmission,
@@ -151,12 +152,18 @@ pub(crate) async fn admission_environment(
         "max_depth": queue_policy.max_depth,
         "merge_window_ms": queue_policy.merge_window_ms,
     }))?;
+    let lifecycle = runtime_state
+        .daemon_lifecycle_snapshot()
+        .map_err(|status| tonic::Status::internal(status.message().to_owned()))?;
+    let draining = lifecycle.phase.blocks_admission()
+        && lifecycle.admission_policy == DrainAdmissionPolicy::RejectNew;
+    let drain_reason = draining.then(|| lifecycle.reason_code.clone());
     Ok(AdmissionEnvironmentSnapshot::host_snapshot(
         workspace_sha256,
         access_policy_json,
         queue_policy_json,
-        false,
-        None,
+        draining,
+        drain_reason,
         u64::try_from(queue_policy.max_depth).unwrap_or(u64::MAX),
     ))
 }

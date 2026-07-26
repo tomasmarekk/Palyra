@@ -624,12 +624,24 @@ fn resolve_incident_locked(
 /// than propagates) cycle failures so one bad cycle never kills the watchdog.
 pub(crate) fn spawn_self_healing_loop(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = state.runtime.daemon_lifecycle.subscribe();
         let mut ticker = interval(HEALING_LOOP_INTERVAL);
         // Delay instead of bursting after a stall (for example host suspend); back-to-back
         // healing cycles would only re-observe the same incidents.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             if let Err(error) = run_self_healing_cycle(&state).await {
                 warn!(message = %error, "self-healing cycle failed");
             }

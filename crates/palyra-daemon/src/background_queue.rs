@@ -107,11 +107,22 @@ pub(crate) fn spawn_background_queue_loop(
     grpc_url: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
         loop {
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             if let Err(error) = poll_background_queue(&runtime, &auth, grpc_url.as_str()).await {
                 warn!(status_code = ?error.code(), status_message = %error.message(), "background queue poll failed");
             }
-            tokio::time::sleep(BACKGROUND_QUEUE_IDLE_SLEEP).await;
+            tokio::select! {
+                () = tokio::time::sleep(BACKGROUND_QUEUE_IDLE_SLEEP) => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                }
+            }
         }
     })
 }

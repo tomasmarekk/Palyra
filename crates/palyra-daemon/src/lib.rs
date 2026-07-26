@@ -139,7 +139,6 @@ use app::{
     bootstrap::load_runtime_bootstrap,
     logging::init_tracing,
     runtime::{build_app_state, loopback_grpc_url, AppStateBuildContext},
-    shutdown::shutdown_signal,
     state::{
         AppState, ConsoleActionContext, ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession,
         OpenAiOAuthAttempt,
@@ -2240,6 +2239,38 @@ const PROCESS_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 const RUNTIME_HEALTH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const NETWORKED_WORKER_EXPIRY_INTERVAL: Duration = Duration::from_secs(15);
 
+fn supervise_lifecycle_subsystem_task(
+    runtime: &Arc<GatewayRuntimeState>,
+    subsystem: application::daemon_lifecycle::LifecycleSubsystem,
+    task: tokio::task::JoinHandle<()>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    runtime
+        .daemon_lifecycle
+        .register_subsystem_task(subsystem, task.abort_handle())
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to register daemon lifecycle subsystem")?;
+    let runtime = Arc::clone(runtime);
+    Ok(tokio::spawn(async move {
+        let outcome = task.await;
+        if let Err(error) = &outcome {
+            if !error.is_cancelled() {
+                tracing::warn!(
+                    subsystem = subsystem.as_str(),
+                    message = %error,
+                    "daemon lifecycle subsystem task failed"
+                );
+            }
+        }
+        if let Err(error) = runtime.daemon_lifecycle.acknowledge_subsystem_drained(subsystem) {
+            tracing::warn!(
+                subsystem = subsystem.as_str(),
+                message = %error,
+                "failed to acknowledge daemon lifecycle subsystem drain"
+            );
+        }
+    }))
+}
+
 fn spawn_networked_worker_expiry_loop(
     runtime: Arc<GatewayRuntimeState>,
 ) -> tokio::task::JoinHandle<()> {
@@ -2251,11 +2282,23 @@ fn spawn_networked_worker_expiry_loop_with_interval(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
         let first_tick = tokio::time::Instant::now() + interval;
         let mut ticker = tokio::time::interval_at(first_tick, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             match runtime.reap_expired_networked_workers().await {
                 Ok(events) if !events.is_empty() => {
                     tracing::warn!(
@@ -2290,13 +2333,25 @@ fn spawn_runtime_health_reconciliation_loop_with_interval(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
         // Startup reconciles inherited probes before runtime activation; delay the first
         // periodic pass so it cannot race the startup inventory transaction.
         let first_tick = tokio::time::Instant::now() + interval;
         let mut ticker = tokio::time::interval_at(first_tick, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             match runtime.reconcile_runtime_health_probes_async().await {
                 Ok(outcome)
                     if outcome.examined > 0
@@ -2340,13 +2395,25 @@ fn spawn_process_lease_reconciliation_loop_with_interval(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
         // Startup performs the first pass synchronously before listeners bind. `interval_at`
         // prevents an immediate periodic duplicate while retaining delayed missed-tick behavior.
         let first_tick = tokio::time::Instant::now() + interval;
         let mut ticker = tokio::time::interval_at(first_tick, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             match runtime.reconcile_persisted_process_leases_async().await {
                 Ok(report)
                     if report.inspected_count > 0 || report.pending_cleanup_inspected_count > 0 =>
@@ -2383,7 +2450,8 @@ fn spawn_process_lease_reconciliation_loop_with_interval(
 /// references (auditing each access to the journal), enforce the fail-closed
 /// remote-bind guard, bind the admin HTTP, gateway gRPC, and node-RPC
 /// listeners, spawn the scheduler/channel/hook/background/self-healing/process-reconciliation
-/// and networked-worker expiry loops, then serve until Ctrl+C triggers graceful shutdown.
+/// and networked-worker expiry loops, then serve until the lifecycle controller
+/// completes a SIGINT, SIGTERM, admin, or restart drain.
 ///
 /// With `--journal-migrate-only` it applies journal migrations and returns
 /// before binding any listener.
@@ -3085,6 +3153,9 @@ pub async fn run() -> Result<()> {
     let recovered_fault_activations = recovered_journal_fault_activations
         .saturating_add(recovered_connector_fault_activations)
         .saturating_add(recovered_generic_fault_activations);
+    runtime
+        .complete_daemon_startup_recovery()
+        .context("failed to release daemon startup recovery barrier")?;
     if startup_run_recovery.terminalized_count > 0
         || startup_background_task_recovery.failed_count > 0
         || startup_process_lease_reconciliation.inspected_count > 0
@@ -3126,14 +3197,18 @@ pub async fn run() -> Result<()> {
         scheduler_wake: Arc::clone(&scheduler_wake),
         timezone_mode: loaded.cron.timezone,
     });
-    let _cron_scheduler_task = spawn_scheduler_loop(
-        runtime.clone(),
-        auth.clone(),
-        grpc_url.clone(),
-        Arc::clone(&scheduler_wake),
-        loaded.memory.retention.clone(),
-        Arc::clone(&access_registry),
-    );
+    let _cron_scheduler_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::Scheduler,
+        spawn_scheduler_loop(
+            runtime.clone(),
+            auth.clone(),
+            grpc_url.clone(),
+            Arc::clone(&scheduler_wake),
+            loaded.memory.retention.clone(),
+            Arc::clone(&access_registry),
+        ),
+    )?;
 
     let state = build_app_state(
         &loaded,
@@ -3171,24 +3246,53 @@ pub async fn run() -> Result<()> {
     };
     let hook_execution_timeout = Duration::from_millis(loaded.tool_call.execution_timeout_ms);
     let app = transport::http::router::build_router(state.clone());
-    let _channel_worker_task = Arc::clone(&channels).spawn_worker();
-    let _hook_runtime_task =
-        hooks::spawn_hook_runtime(runtime.clone(), hook_runtime_policy, hook_execution_timeout);
-    let _background_queue_task = background_queue::spawn_background_queue_loop(
-        runtime.clone(),
-        auth.clone(),
-        grpc_url.clone(),
-    );
-    let _self_healing_task = self_healing::spawn_self_healing_loop(state.clone());
-    let _runtime_health_reconciliation_task =
-        spawn_runtime_health_reconciliation_loop(runtime.clone());
-    let _process_lease_reconciliation_task =
-        spawn_process_lease_reconciliation_loop(runtime.clone());
-    let _networked_worker_expiry_task = spawn_networked_worker_expiry_loop(runtime.clone());
+    let _channel_worker_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::Channels,
+        Arc::clone(&channels).spawn_worker(),
+    )?;
+    let _hook_runtime_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::Hooks,
+        hooks::spawn_hook_runtime(runtime.clone(), hook_runtime_policy, hook_execution_timeout),
+    )?;
+    let _background_queue_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::BackgroundQueue,
+        background_queue::spawn_background_queue_loop(
+            runtime.clone(),
+            auth.clone(),
+            grpc_url.clone(),
+        ),
+    )?;
+    let _self_healing_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::SelfHealing,
+        self_healing::spawn_self_healing_loop(state.clone()),
+    )?;
+    let _runtime_health_reconciliation_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::RuntimeHealth,
+        spawn_runtime_health_reconciliation_loop(runtime.clone()),
+    )?;
+    let _process_lease_reconciliation_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::ProcessLeases,
+        spawn_process_lease_reconciliation_loop(runtime.clone()),
+    )?;
+    let _networked_worker_expiry_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::NetworkedWorkers,
+        spawn_networked_worker_expiry_loop(runtime.clone()),
+    )?;
+    let _shutdown_signal_task = app::shutdown::spawn_shutdown_signal_listener(Arc::clone(&runtime));
 
+    let admin_shutdown_runtime = Arc::clone(&runtime);
     let admin_server = async move {
         axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                admin_shutdown_runtime.wait_for_daemon_shutdown().await;
+            })
             .await
             .context("palyrad admin server failed")
     };

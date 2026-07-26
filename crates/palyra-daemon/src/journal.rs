@@ -79,6 +79,7 @@ use crate::{
     retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
 };
 
+pub(crate) mod lifecycle;
 mod metadata_trace;
 mod retrieval_index_status;
 pub(crate) mod run_admission;
@@ -7425,7 +7426,12 @@ const MIGRATIONS: &[Migration] = &[
                     expected_active_generation,
                     created_at_unix_ms
                 );
-        "#,
+            "#,
+    },
+    Migration {
+        version: 79,
+        name: "daemon_lifecycle_transitions",
+        sql: lifecycle::MIGRATION_79_SQL,
     },
 ];
 

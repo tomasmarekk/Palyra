@@ -1612,6 +1612,7 @@ pub fn spawn_scheduler_loop(
     access_registry: Arc<Mutex<AccessRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = state.daemon_lifecycle.subscribe();
         let periodic_skill_reaudit = match resolve_periodic_skill_reaudit_config() {
             Ok(value) => value,
             Err(error) => {
@@ -1626,6 +1627,9 @@ pub fn spawn_scheduler_loop(
             warn!(error = %error, "cron scheduler startup recovery failed");
         }
         loop {
+            if lifecycle.borrow().phase.blocks_admission() {
+                break;
+            }
             if let Err(error) = process_due_jobs(
                 Arc::clone(&state),
                 auth.clone(),
@@ -1700,6 +1704,11 @@ pub fn spawn_scheduler_loop(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = wake_signal.notified() => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.blocks_admission() {
+                        break;
+                    }
+                }
             }
         }
     })

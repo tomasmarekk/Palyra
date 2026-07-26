@@ -519,6 +519,7 @@ pub(crate) fn spawn_hook_runtime(
     execution_timeout: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
         // Start the cursor at the newest journal seq so daemon restarts do not replay historical
         // skill events into hooks; only events recorded after startup are dispatched.
         let mut last_journal_seq = match runtime.recent_journal_snapshot(1).await {
@@ -542,7 +543,18 @@ pub(crate) fn spawn_hook_runtime(
         }
 
         loop {
-            tokio::time::sleep(Duration::from_millis(HOOK_JOURNAL_POLL_INTERVAL_MS)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(HOOK_JOURNAL_POLL_INTERVAL_MS)) => {}
+                changed = lifecycle.changed() => {
+                    if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if lifecycle.borrow().phase.stops_subsystems() {
+                break;
+            }
             match runtime.recent_journal_snapshot(HOOK_JOURNAL_SNAPSHOT_LIMIT).await {
                 Ok(snapshot) => {
                     let mut events = snapshot

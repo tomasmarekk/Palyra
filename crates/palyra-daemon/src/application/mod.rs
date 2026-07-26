@@ -25,6 +25,7 @@ pub mod context_lifecycle;
 pub mod context_recovery;
 pub mod context_references;
 pub mod conversation_bindings;
+pub(crate) mod daemon_lifecycle;
 pub mod delivery_arbitration;
 pub mod execution_gate;
 pub mod file_view_registry;
