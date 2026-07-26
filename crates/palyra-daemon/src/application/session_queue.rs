@@ -14,7 +14,12 @@
 //! `OrchestratorQueuedInputRecord`s; runtime code owns persistence, audit, and
 //! forwarding side effects.
 
-use palyra_common::runtime_contracts::{QueueDecision, QueueMode};
+use std::collections::BTreeSet;
+
+use palyra_common::runtime_contracts::{
+    QueueDecision, QueueMode, QueueOutcome, QueuedInputDeliveryBoundary, QueuedInputState,
+    QUEUE_OUTCOME_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -55,12 +60,13 @@ pub(crate) struct SessionQueuePolicy {
 /// Snapshot of where the active run currently stands; gates interrupt/steer.
 ///
 /// The flags feed [`Self::can_steer`] and [`Self::can_interrupt`]: both are
-/// denied while an approval is pending or a sensitive tool is executing.
+/// denied while an approval, sensitive tool, or final delivery is active.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueSafeBoundary {
     pub(crate) active_run_stream: bool,
     pub(crate) pending_approval: bool,
     pub(crate) sensitive_tool_execution: bool,
+    pub(crate) delivery_in_progress: bool,
     pub(crate) before_model_round: bool,
     pub(crate) after_model_round: bool,
     pub(crate) after_tool_result: bool,
@@ -72,12 +78,14 @@ pub(crate) struct SessionQueueSafeBoundary {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueDecision {
     pub(crate) decision: QueueDecision,
+    pub(crate) requested_mode: QueueMode,
     /// Mode actually applied, which may differ from the requested one (for
     /// example a deferred interrupt lands in collect mode).
     pub(crate) mode: QueueMode,
     /// False only for overflow: the input must not enter the pending queue.
     pub(crate) accepted: bool,
     pub(crate) reason: String,
+    pub(crate) delivery_boundary: QueuedInputDeliveryBoundary,
     pub(crate) safe_boundary: SessionQueueSafeBoundary,
     pub(crate) policy: SessionQueuePolicy,
 }
@@ -89,6 +97,8 @@ pub(crate) struct QueueCollectSummary {
     /// Human-readable digest; bounded to the first few queued inputs.
     pub(crate) text: String,
     pub(crate) source_count: usize,
+    /// Deduplicated attachment references retained for the summary input.
+    pub(crate) attachment_refs_json: Value,
     /// Full audit trail: every source id is retained even when the rendered
     /// text omits items beyond the display bound.
     pub(crate) provenance_json: Value,
@@ -345,6 +355,7 @@ impl SessionQueueSafeBoundary {
             active_run_stream,
             pending_approval,
             sensitive_tool_execution: false,
+            delivery_in_progress: false,
             before_model_round: active_run_stream && !pending_approval,
             after_model_round: false,
             after_tool_result: false,
@@ -359,6 +370,7 @@ impl SessionQueueSafeBoundary {
         self.active_run_stream
             && !self.pending_approval
             && !self.sensitive_tool_execution
+            && !self.delivery_in_progress
             && (self.before_model_round
                 || self.after_model_round
                 || self.after_tool_result
@@ -369,7 +381,10 @@ impl SessionQueueSafeBoundary {
     /// or a sensitive tool mid-flight.
     #[must_use]
     pub(crate) const fn can_interrupt(&self) -> bool {
-        self.active_run_stream && !self.pending_approval && !self.sensitive_tool_execution
+        self.active_run_stream
+            && !self.pending_approval
+            && !self.sensitive_tool_execution
+            && !self.delivery_in_progress
     }
 }
 
@@ -379,9 +394,11 @@ impl SessionQueueDecision {
     pub(crate) fn explain_json(&self) -> Value {
         json!({
             "decision": self.decision.as_str(),
+            "requested_mode": self.requested_mode.as_str(),
             "mode": self.mode.as_str(),
             "accepted": self.accepted,
             "reason": self.reason,
+            "delivery_boundary": self.delivery_boundary.as_str(),
             "safe_boundary": self.safe_boundary,
             "policy": self.policy.snapshot_json(),
         })
@@ -407,9 +424,11 @@ pub(crate) fn decide_session_queue_mode(
     if current_depth >= policy.cap {
         return SessionQueueDecision {
             decision: QueueDecision::Overflow,
+            requested_mode,
             mode: QueueMode::Collect,
             accepted: false,
             reason: "queue_cap_reached_overflow_summary_required".to_owned(),
+            delivery_boundary: QueuedInputDeliveryBoundary::BacklogSummary,
             safe_boundary,
             policy,
         };
@@ -435,11 +454,54 @@ pub(crate) fn decide_session_queue_mode(
     };
     SessionQueueDecision {
         decision,
+        requested_mode,
         mode,
         accepted: true,
         reason: reason.to_owned(),
+        delivery_boundary: delivery_boundary_for_mode(requested_mode, decision, mode),
         safe_boundary,
         policy,
+    }
+}
+
+#[must_use]
+pub(crate) fn queue_outcome(
+    queued_input_id: impl Into<String>,
+    lifecycle_state: QueuedInputState,
+    delivery_boundary: QueuedInputDeliveryBoundary,
+    expected_active_generation: Option<u64>,
+    observed_active_generation: Option<u64>,
+    accepted: bool,
+    reason_code: impl Into<String>,
+) -> QueueOutcome {
+    QueueOutcome {
+        schema_version: QUEUE_OUTCOME_SCHEMA_VERSION,
+        queued_input_id: queued_input_id.into(),
+        lifecycle_state,
+        delivery_boundary,
+        expected_active_generation,
+        observed_active_generation,
+        accepted,
+        reason_code: reason_code.into(),
+    }
+}
+
+#[must_use]
+const fn delivery_boundary_for_mode(
+    requested_mode: QueueMode,
+    decision: QueueDecision,
+    effective_mode: QueueMode,
+) -> QueuedInputDeliveryBoundary {
+    if matches!(decision, QueueDecision::Overflow | QueueDecision::Defer)
+        || matches!(effective_mode, QueueMode::Collect | QueueMode::SteerBacklog)
+    {
+        return QueuedInputDeliveryBoundary::BacklogSummary;
+    }
+    match requested_mode {
+        QueueMode::Followup => QueuedInputDeliveryBoundary::NextTurn,
+        QueueMode::Steer => QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+        QueueMode::Interrupt => QueuedInputDeliveryBoundary::CancelThenNextTurn,
+        QueueMode::Collect | QueueMode::SteerBacklog => QueuedInputDeliveryBoundary::BacklogSummary,
     }
 }
 
@@ -468,6 +530,13 @@ pub(crate) fn build_queue_collect_summary(
     });
     let source_ids =
         queued_inputs.iter().map(|queued| queued.queued_input_id.clone()).collect::<Vec<_>>();
+    let attachment_refs = queued_inputs
+        .iter()
+        .flat_map(queued_attachment_refs)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|artifact_id| json!({ "artifact_id": artifact_id }))
+        .collect::<Vec<_>>();
     let omitted_count = source_count.saturating_sub(COLLECT_SUMMARY_MAX_ITEMS);
     let mut lines = Vec::with_capacity(source_count.min(COLLECT_SUMMARY_MAX_ITEMS) + 2);
     lines.push(format!("Collected {source_count} queued input(s) for later handling."));
@@ -485,15 +554,34 @@ pub(crate) fn build_queue_collect_summary(
         summary_ref: summary_ref.clone(),
         text: lines.join("\n"),
         source_count,
+        attachment_refs_json: Value::Array(attachment_refs.clone()),
         provenance_json: json!({
             "summary_ref": summary_ref,
             "reason": reason,
             "source_count": source_count,
             "omitted_count": omitted_count,
             "source_queued_input_ids": source_ids,
+            "attachment_refs": attachment_refs,
             "sources": rendered_items.collect::<Vec<_>>(),
         }),
     }
+}
+
+fn queued_attachment_refs(queued: &OrchestratorQueuedInputRecord) -> Vec<String> {
+    serde_json::from_str::<Value>(queued.attachments_json.as_str())
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| {
+            value
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|artifact_id| !artifact_id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Classifies the session's busy state and recommends the next operator step.
@@ -612,7 +700,7 @@ pub(crate) fn session_queue_metrics(
         total_count += 1;
         let profile = queue_profile_for_input(queued);
         profile_counts.observe(profile);
-        if queued.state == "pending" {
+        if QueuedInputState::parse(queued.state.as_str()).is_some_and(QueuedInputState::is_active) {
             pending_created_at.push(queued.created_at_unix_ms);
             if profile == SessionQueueProfile::OperatorPriority {
                 operator_priority_pending += 1;
@@ -682,7 +770,7 @@ pub(crate) fn pending_queue_depth(
     queued_inputs
         .iter()
         .filter(|queued| {
-            queued.state == "pending"
+            QueuedInputState::parse(queued.state.as_str()).is_some_and(QueuedInputState::is_active)
                 && coalescing_group
                     .is_none_or(|group| queued.coalescing_group.as_deref() == Some(group))
         })
@@ -797,7 +885,7 @@ fn normalize_priority_lane(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use palyra_common::runtime_contracts::{QueueDecision, QueueMode};
+    use palyra_common::runtime_contracts::{QueueDecision, QueueMode, QueuedInputDeliveryBoundary};
 
     use crate::config::SessionQueuePolicyConfig;
 
@@ -853,6 +941,81 @@ mod tests {
     }
 
     #[test]
+    fn queue_modes_map_to_exact_boundaries_across_active_run_states() {
+        let safe = SessionQueueSafeBoundary::active(true, false);
+        let approval = SessionQueueSafeBoundary::active(true, true);
+        let mut tool = safe.clone();
+        tool.sensitive_tool_execution = true;
+        let mut delivery = safe.clone();
+        delivery.delivery_in_progress = true;
+        let active_states =
+            [("safe", safe), ("approval", approval), ("tool", tool), ("delivery", delivery)];
+        let modes = [
+            QueueMode::Followup,
+            QueueMode::Collect,
+            QueueMode::SteerBacklog,
+            QueueMode::Steer,
+            QueueMode::Interrupt,
+        ];
+
+        for (active_state, boundary) in active_states {
+            let permits_control = active_state == "safe";
+            for mode in modes {
+                let decision = decide_session_queue_mode(
+                    SessionQueuePolicy::from_config(
+                        &SessionQueuePolicyConfig::default(),
+                        "session-1",
+                        None,
+                        None,
+                    ),
+                    Some(mode),
+                    boundary.clone(),
+                    0,
+                );
+                let (expected_decision, expected_mode, expected_boundary) = match mode {
+                    QueueMode::Followup => (
+                        QueueDecision::Enqueue,
+                        QueueMode::Followup,
+                        QueuedInputDeliveryBoundary::NextTurn,
+                    ),
+                    QueueMode::Collect => (
+                        QueueDecision::Enqueue,
+                        QueueMode::Collect,
+                        QueuedInputDeliveryBoundary::BacklogSummary,
+                    ),
+                    QueueMode::SteerBacklog => (
+                        QueueDecision::SteerBacklog,
+                        QueueMode::SteerBacklog,
+                        QueuedInputDeliveryBoundary::BacklogSummary,
+                    ),
+                    QueueMode::Steer if permits_control => (
+                        QueueDecision::Steer,
+                        QueueMode::Steer,
+                        QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+                    ),
+                    QueueMode::Interrupt if permits_control => (
+                        QueueDecision::Interrupt,
+                        QueueMode::Interrupt,
+                        QueuedInputDeliveryBoundary::CancelThenNextTurn,
+                    ),
+                    QueueMode::Steer | QueueMode::Interrupt => (
+                        QueueDecision::Defer,
+                        QueueMode::Collect,
+                        QueuedInputDeliveryBoundary::BacklogSummary,
+                    ),
+                };
+
+                assert_eq!(
+                    (decision.decision, decision.mode, decision.delivery_boundary),
+                    (expected_decision, expected_mode, expected_boundary),
+                    "unexpected delivery contract for {mode:?} at {active_state}"
+                );
+                assert_eq!(decision.requested_mode, mode);
+            }
+        }
+    }
+
+    #[test]
     fn queue_cap_switches_to_overflow_summary() {
         let config =
             SessionQueuePolicyConfig { max_depth: 2, ..SessionQueuePolicyConfig::default() };
@@ -879,12 +1042,18 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 state: "pending".to_owned(),
                 queue_mode: "collect".to_owned(),
+                delivery_boundary: "backlog_summary".to_owned(),
+                expected_active_generation: Some(1),
+                claimed_active_generation: None,
+                lifecycle_revision: 0,
                 priority_lane: "normal".to_owned(),
                 coalescing_group: Some("group-1".to_owned()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: "{}".to_owned(),
                 decision_reason: "collect_requested".to_owned(),
                 text: format!("queued input text {index}"),
+                attachments_json: format!(r#"[{{"artifact_id":"artifact-{index}"}}]"#),
+                queue_outcome_json: "{}".to_owned(),
                 accepted_at_unix_ms: Some(index),
                 coalesced_at_unix_ms: None,
                 forwarded_at_unix_ms: None,
@@ -908,6 +1077,7 @@ mod tests {
             14
         );
         assert_eq!(summary.provenance_json["sources"].as_array().unwrap().len(), 12);
+        assert_eq!(summary.attachment_refs_json.as_array().unwrap().len(), 14);
         assert_eq!(pending_queue_depth(records.as_slice(), Some("group-1")), 14);
     }
 
@@ -926,12 +1096,18 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 state: "pending".to_owned(),
                 queue_mode: "collect".to_owned(),
+                delivery_boundary: "backlog_summary".to_owned(),
+                expected_active_generation: Some(1),
+                claimed_active_generation: None,
+                lifecycle_revision: 0,
                 priority_lane: "normal".to_owned(),
                 coalescing_group: Some(policy.coalescing_group.clone()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: "{}".to_owned(),
                 decision_reason: "collect_requested".to_owned(),
                 text: "old".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: "{}".to_owned(),
                 accepted_at_unix_ms: Some(100),
                 coalesced_at_unix_ms: None,
                 forwarded_at_unix_ms: None,
@@ -948,12 +1124,18 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 state: "pending".to_owned(),
                 queue_mode: "followup".to_owned(),
+                delivery_boundary: "next_turn".to_owned(),
+                expected_active_generation: Some(1),
+                claimed_active_generation: None,
+                lifecycle_revision: 0,
                 priority_lane: "operator_priority".to_owned(),
                 coalescing_group: Some(policy.coalescing_group.clone()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: "{}".to_owned(),
                 decision_reason: "operator_prioritized".to_owned(),
                 text: "new".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: "{}".to_owned(),
                 accepted_at_unix_ms: Some(250),
                 coalesced_at_unix_ms: None,
                 forwarded_at_unix_ms: None,
@@ -1087,12 +1269,18 @@ mod tests {
             session_id: "session-1".to_owned(),
             state: state.to_owned(),
             queue_mode: "followup".to_owned(),
+            delivery_boundary: "next_turn".to_owned(),
+            expected_active_generation: Some(1),
+            claimed_active_generation: None,
+            lifecycle_revision: 0,
             priority_lane: priority_lane.to_owned(),
             coalescing_group: Some("session:session-1".to_owned()),
             overflow_summary_ref: None,
             safe_boundary_flags_json: "{}".to_owned(),
             decision_reason: "followup_requested".to_owned(),
             text: "queued input".to_owned(),
+            attachments_json: "[]".to_owned(),
+            queue_outcome_json: "{}".to_owned(),
             accepted_at_unix_ms: Some(100),
             coalesced_at_unix_ms: None,
             forwarded_at_unix_ms: None,

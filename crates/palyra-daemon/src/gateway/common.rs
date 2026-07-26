@@ -73,6 +73,15 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::SessionIdentityMismatch { session_id } => Status::failed_precondition(
             format!("orchestrator session identity mismatch for session: {session_id}"),
         ),
+        JournalError::QueuedInputTransitionConflict {
+            queued_input_id,
+            expected_state,
+            expected_revision,
+            actual_state,
+            actual_revision,
+        } => Status::aborted(format!(
+            "queued input transition conflict for {queued_input_id}: expected {expected_state}@{expected_revision}, found {actual_state}@{actual_revision}"
+        )),
         JournalError::BackgroundTaskNotFound { task_id } => {
             Status::not_found(format!("background task not found: {task_id}"))
         }

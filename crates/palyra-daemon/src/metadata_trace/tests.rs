@@ -572,6 +572,40 @@ fn unsupported_malformed_oversized_and_out_of_range_rows_fail_closed() {
 }
 
 #[test]
+fn injected_queue_outcome_projects_stable_redacted_metadata() {
+    let event = project(
+        "turn_control.active_run_steering.injected",
+        json!({
+            "schema_version": 1,
+            "event": "turn_control.active_run_steering.injected",
+            "queued_input_count": 1,
+            "queued_inputs": [{
+                "queued_input_id": "01ARZ3NDEKTSV4RRFFQ69G5FB9",
+                "text": SECRET_SENTINEL,
+                "queue_outcome": {
+                    "schema_version": 1,
+                    "queued_input_id": "01ARZ3NDEKTSV4RRFFQ69G5FB9",
+                    "lifecycle_state": "injected",
+                    "delivery_boundary": "current_run_before_provider",
+                    "expected_active_generation": 1,
+                    "observed_active_generation": 2,
+                    "accepted": true,
+                    "reason_code": "queue.active_run.injected"
+                }
+            }]
+        }),
+    )
+    .expect("injected queue outcome should project");
+
+    let MetadataTraceEventDataV1::Recovery(recovery) = &event.event else {
+        panic!("queue outcome should project as guarded recovery evidence");
+    };
+    assert_eq!(recovery.strategy, MetadataTraceRecoveryStrategyV1::IdempotencyGuard);
+    assert_eq!(recovery.reason_code, "queue.active_run.injected");
+    assert_projection_excludes_hostile_content(&event);
+}
+
+#[test]
 fn capacity_event_uses_closed_payload_and_valid_domain_hash() {
     let context = projection_context();
     let capacity = metadata_trace_capacity_reached_event(

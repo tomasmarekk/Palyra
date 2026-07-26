@@ -62,10 +62,10 @@ use crate::application::{
     },
     progress_draft::project_progress_draft_tape_event,
     session_queue::{
-        decide_queue_steering, decide_session_queue_mode, pending_queue_depth, QueueSteeringAction,
-        QueueSteeringDecision, QueueSteeringRequest, SessionQueueDecision, SessionQueuePolicy,
-        SessionQueueSafeBoundary, QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED,
-        QUEUE_STEERING_EVENT_STARTED,
+        decide_queue_steering, decide_session_queue_mode, pending_queue_depth, queue_outcome,
+        QueueSteeringAction, QueueSteeringDecision, QueueSteeringRequest, SessionQueueDecision,
+        SessionQueuePolicy, SessionQueueSafeBoundary, QUEUE_STEERING_EVENT_COMPLETED,
+        QUEUE_STEERING_EVENT_FAILED, QUEUE_STEERING_EVENT_STARTED,
     },
     turn_control::{
         decide_turn_control_request, ControlActivePhase, TurnControlAction,
@@ -790,6 +790,7 @@ fn session_queue_boundary_for_control(
             active_run_stream: true,
             pending_approval: false,
             sensitive_tool_execution: false,
+            delivery_in_progress: false,
             before_model_round: true,
             after_model_round: false,
             after_tool_result: false,
@@ -800,6 +801,7 @@ fn session_queue_boundary_for_control(
             active_run_stream: true,
             pending_approval: false,
             sensitive_tool_execution: true,
+            delivery_in_progress: false,
             before_model_round: false,
             after_model_round: false,
             after_tool_result: false,
@@ -810,6 +812,7 @@ fn session_queue_boundary_for_control(
             active_run_stream: true,
             pending_approval: true,
             sensitive_tool_execution: false,
+            delivery_in_progress: false,
             before_model_round: false,
             after_model_round: false,
             after_tool_result: false,
@@ -822,6 +825,7 @@ fn session_queue_boundary_for_control(
             active_run_stream: false,
             pending_approval: false,
             sensitive_tool_execution: false,
+            delivery_in_progress: false,
             before_model_round: false,
             after_model_round: false,
             after_tool_result: false,
@@ -11237,8 +11241,11 @@ impl GatewayRuntimeState {
                 "runtime.generation.active_run_steered",
             )
             .map(|lease| lease.generation)
-            .map_err(|error| {
-                map_orchestrator_store_error("supersede steered run generation", error)
+            .map_err(|error| match error {
+                crate::journal::JournalError::InvalidArgument(message) => {
+                    Status::failed_precondition(message)
+                }
+                other => map_orchestrator_store_error("supersede steered run generation", other),
             })
     }
 
@@ -11837,6 +11844,7 @@ impl GatewayRuntimeState {
                 }
                 self.prioritize_orchestrator_queued_input(
                     queued_input_id.to_owned(),
+                    None,
                     priority_lane.to_owned(),
                     decision.reason_code.clone(),
                     decision.journal_projection.payload_json.clone(),
@@ -11906,12 +11914,32 @@ impl GatewayRuntimeState {
             safe_boundary,
             current_depth,
         );
+        let (_, active_generation) =
+            self.runtime_generation_for_run(run_id.to_owned()).await?.ok_or_else(|| {
+                Status::failed_precondition(
+                    "turn control redirect requires an active runtime generation",
+                )
+            })?;
+        let expected_active_generation = i64::try_from(active_generation.get()).map_err(|_| {
+            Status::failed_precondition("runtime generation exceeds the journal integer range")
+        })?;
         let queued_input_id = Ulid::new().to_string();
-        let queued_state = if queue_decision.accepted {
-            QueuedInputState::Pending
-        } else {
+        let queued_state = if !queue_decision.accepted {
             QueuedInputState::Overflowed
+        } else if queue_decision.decision == QueueDecision::Defer {
+            QueuedInputState::Deferred
+        } else {
+            QueuedInputState::Pending
         };
+        let queue_outcome = queue_outcome(
+            queued_input_id.clone(),
+            queued_state,
+            queue_decision.delivery_boundary,
+            Some(active_generation.get()),
+            Some(active_generation.get()),
+            queue_decision.accepted,
+            queue_decision.reason.clone(),
+        );
         let queued = self
             .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
                 queued_input_id: queued_input_id.clone(),
@@ -11921,12 +11949,17 @@ impl GatewayRuntimeState {
                 text: instruction.to_owned(),
                 origin_run_id: Some(run_id.to_owned()),
                 queue_mode: queue_decision.mode.as_str().to_owned(),
+                delivery_boundary: queue_decision.delivery_boundary.as_str().to_owned(),
+                expected_active_generation: Some(expected_active_generation),
                 priority_lane: queue_decision.policy.priority_lane.clone(),
                 coalescing_group: Some(queue_decision.policy.coalescing_group.clone()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: serde_json::to_string(&queue_decision.safe_boundary)
                     .unwrap_or_else(|_| "{}".to_owned()),
-                decision_reason: decision.reason_code.clone(),
+                decision_reason: queue_decision.reason.clone(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: serde_json::to_string(&queue_outcome)
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 accepted_at_unix_ms: queue_decision
                     .accepted
                     .then_some(crate::gateway::current_unix_ms()),
@@ -12046,13 +12079,33 @@ impl GatewayRuntimeState {
             request.safe_boundary.clone(),
             current_depth,
         );
+        let (_, active_generation) =
+            self.runtime_generation_for_run(request.run_id.clone()).await?.ok_or_else(|| {
+                Status::failed_precondition(
+                    "queued input admission requires an active runtime generation",
+                )
+            })?;
+        let expected_active_generation = i64::try_from(active_generation.get()).map_err(|_| {
+            Status::failed_precondition("runtime generation exceeds the journal integer range")
+        })?;
         let timestamp_unix_ms = current_unix_ms();
         let queued_input_id = Ulid::new().to_string();
-        let queued_state = if decision.accepted {
-            QueuedInputState::Pending
-        } else {
+        let queued_state = if !decision.accepted {
             QueuedInputState::Overflowed
+        } else if decision.decision == QueueDecision::Defer {
+            QueuedInputState::Deferred
+        } else {
+            QueuedInputState::Pending
         };
+        let queue_outcome = queue_outcome(
+            queued_input_id.clone(),
+            queued_state,
+            decision.delivery_boundary,
+            Some(active_generation.get()),
+            Some(active_generation.get()),
+            decision.accepted,
+            decision.reason.clone(),
+        );
         let queued_input = self
             .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
                 queued_input_id: queued_input_id.clone(),
@@ -12062,12 +12115,17 @@ impl GatewayRuntimeState {
                 text: request.text,
                 origin_run_id: request.origin_run_id.or_else(|| Some(request.run_id.clone())),
                 queue_mode: decision.mode.as_str().to_owned(),
+                delivery_boundary: decision.delivery_boundary.as_str().to_owned(),
+                expected_active_generation: Some(expected_active_generation),
                 priority_lane: decision.policy.priority_lane.clone(),
                 coalescing_group: Some(decision.policy.coalescing_group.clone()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: serde_json::to_string(&decision.safe_boundary)
                     .unwrap_or_else(|_| "{}".to_owned()),
                 decision_reason: decision.reason.clone(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: serde_json::to_string(&queue_outcome)
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 accepted_at_unix_ms: decision.accepted.then_some(timestamp_unix_ms),
                 policy_snapshot_json: decision.policy.snapshot_json().to_string(),
                 explain_json: decision.explain_json().to_string(),
@@ -12253,6 +12311,7 @@ impl GatewayRuntimeState {
                 })?;
                 self.prioritize_orchestrator_queued_input(
                     decision.queued_input_id.clone(),
+                    Some(queued.lifecycle_revision),
                     priority_lane.clone(),
                     decision.reason_code.clone(),
                     decision.payload_json.clone(),
@@ -13162,7 +13221,7 @@ impl GatewayRuntimeState {
     fn update_orchestrator_queued_input_state_blocking(
         &self,
         request: &OrchestratorQueuedInputUpdateRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<OrchestratorQueuedInputRecord, Status> {
         self.journal_store.update_orchestrator_queued_input_state(request).map_err(|error| {
             map_orchestrator_store_error("update queued orchestrator input", error)
         })
@@ -13176,7 +13235,7 @@ impl GatewayRuntimeState {
     pub async fn update_orchestrator_queued_input_state(
         self: &Arc<Self>,
         request: OrchestratorQueuedInputUpdateRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<OrchestratorQueuedInputRecord, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             state.update_orchestrator_queued_input_state_blocking(&request)
@@ -13189,13 +13248,29 @@ impl GatewayRuntimeState {
     fn prioritize_orchestrator_queued_input_blocking(
         &self,
         queued_input_id: &str,
+        expected_revision: Option<i64>,
         priority_lane: &str,
         decision_reason: &str,
         explain_json: &str,
     ) -> Result<(), Status> {
+        let expected_revision = match expected_revision {
+            Some(revision) => revision,
+            None => {
+                self.journal_store
+                    .orchestrator_queued_input_by_id(queued_input_id)
+                    .map_err(|error| {
+                        map_orchestrator_store_error("load queued orchestrator input", error)
+                    })?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("queued input not found: {queued_input_id}"))
+                    })?
+                    .lifecycle_revision
+            }
+        };
         self.journal_store
             .prioritize_orchestrator_queued_input(
                 queued_input_id,
+                expected_revision,
                 priority_lane,
                 decision_reason,
                 explain_json,
@@ -13214,6 +13289,7 @@ impl GatewayRuntimeState {
     pub async fn prioritize_orchestrator_queued_input(
         self: &Arc<Self>,
         queued_input_id: String,
+        expected_revision: Option<i64>,
         priority_lane: String,
         decision_reason: String,
         explain_json: String,
@@ -13222,6 +13298,7 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || {
             state.prioritize_orchestrator_queued_input_blocking(
                 queued_input_id.as_str(),
+                expected_revision,
                 priority_lane.as_str(),
                 decision_reason.as_str(),
                 explain_json.as_str(),

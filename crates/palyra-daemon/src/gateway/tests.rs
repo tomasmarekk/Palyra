@@ -29,9 +29,10 @@ use palyra_common::{
         AuxiliaryTaskKind, AuxiliaryTaskState, CleanupOutcome, CleanupReportV1,
         CleanupStepDisposition, CleanupStepKind, CleanupStepRecord, FlowState, FlowStepState,
         ProcessLeaseV1, ProcessOwnershipKind, ProcessProvenance, PublicRuntimeEventName, QueueMode,
-        QueuedInputState, RuntimeActorKind, RuntimeActorRef, RuntimeGeneration,
-        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1,
-        RuntimeHandleKind, RuntimeHandleState, RuntimeInstanceId, RuntimeLeaseId,
+        QueueOutcome, QueuedInputDeliveryBoundary, QueuedInputState, RuntimeActorKind,
+        RuntimeActorRef, RuntimeGeneration, RuntimeGenerationLane, RuntimeGenerationTransitionKind,
+        RuntimeHandleDescriptorV1, RuntimeHandleKind, RuntimeHandleState, RuntimeInstanceId,
+        RuntimeLeaseId,
     },
     workspace_patch::WorkspacePatchRedactionPolicy,
 };
@@ -2126,10 +2127,29 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
 
     assert!(outcome.decision.accepted);
     assert_eq!(outcome.decision.mode, QueueMode::Followup);
+    assert_eq!(outcome.decision.delivery_boundary, QueuedInputDeliveryBoundary::NextTurn);
     assert_eq!(outcome.observed_queue_depth, 1);
     assert_eq!(outcome.queued_input.state, QueuedInputState::Pending.as_str());
+    assert_eq!(
+        outcome.queued_input.delivery_boundary,
+        QueuedInputDeliveryBoundary::NextTurn.as_str()
+    );
+    assert!(outcome.queued_input.expected_active_generation.is_some());
     assert_eq!(outcome.queued_input.origin_run_id.as_deref(), Some(run_id.as_str()));
     assert!(outcome.queued_input.accepted_at_unix_ms.is_some());
+    let queue_outcome: QueueOutcome =
+        serde_json::from_str(&outcome.queued_input.queue_outcome_json)
+            .expect("queue outcome should preserve the public contract");
+    assert_eq!(queue_outcome.lifecycle_state, QueuedInputState::Pending);
+    assert_eq!(queue_outcome.delivery_boundary, QueuedInputDeliveryBoundary::NextTurn);
+    assert_eq!(
+        queue_outcome.expected_active_generation,
+        outcome
+            .queued_input
+            .expected_active_generation
+            .and_then(|generation| u64::try_from(generation).ok())
+    );
+    assert!(queue_outcome.accepted);
 
     let queued_inputs = state
         .list_orchestrator_queued_inputs(session_id)
@@ -2138,6 +2158,8 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
     assert_eq!(queued_inputs.len(), 1);
     assert_eq!(queued_inputs[0].queued_input_id, outcome.queued_input.queued_input_id);
     assert_eq!(queued_inputs[0].queue_mode, QueueMode::Followup.as_str());
+    assert_eq!(queued_inputs[0].delivery_boundary, QueuedInputDeliveryBoundary::NextTurn.as_str());
+    assert_eq!(queued_inputs[0].queue_outcome_json, outcome.queued_input.queue_outcome_json);
 }
 
 #[test]

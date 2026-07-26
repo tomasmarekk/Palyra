@@ -134,7 +134,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v14";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v15";
 /// Progress message emitted after the V2 provider effect has started.
 ///
 /// Fixture-backed cancellation QA uses this boundary to request cancellation
@@ -164,10 +164,28 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds generation-scoped harness attempt lifecycle events and canonical V2-to-public ordering correlation.",
+        "changelog_note": "Adds exact session-queue delivery boundaries, terminal lifecycle evidence, and interrupt-specific cancellation classification.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "runtime_error_contract": runtime_error_contract_snapshot(),
         "shared_runtime_primitives": shared_runtime_contract_snapshot(),
+        "session_queue": {
+            "snapshot_version": "runtime-contracts.session_queue.v1",
+            "changelog_note": "Pins queue modes, delivery boundaries, lifecycle states, and the user-visible QueueOutcome shape used for exact active-run delivery.",
+            "schema_version": QUEUE_OUTCOME_SCHEMA_VERSION,
+            "modes": QueueMode::wire_contract_values(),
+            "decisions": QueueDecision::wire_contract_values(),
+            "delivery_boundaries": QueuedInputDeliveryBoundary::wire_contract_values(),
+            "lifecycle_states": QueuedInputState::wire_contract_values(),
+            "queue_outcome_required_fields": [
+                "schema_version",
+                "queued_input_id",
+                "lifecycle_state",
+                "delivery_boundary",
+                "accepted",
+                "reason_code",
+            ],
+            "exactly_one_terminal_state": true,
+        },
         "metadata_trace": {
             "snapshot_version": "runtime-contracts.metadata_trace.v1",
             "changelog_note": "Introduces a bounded metadata-only run trace with append-only crash-safe segments and a separate approval-gated rich export.",
@@ -468,8 +486,8 @@ pub fn validate_public_contract_snapshot(snapshot: &Value) -> Result<(), String>
 
 fn shared_runtime_contract_snapshot() -> Value {
     json!({
-        "snapshot_version": "runtime-contracts.shared_runtime.v3",
-        "changelog_note": "Publishes the closed cancellation settlement vocabulary alongside ordinary/probe health authority separation, typed identities, host-owned sequencing, side-effect uncertainty, process provenance, cleanup evidence, and fail-closed startup compatibility.",
+        "snapshot_version": "runtime-contracts.shared_runtime.v4",
+        "changelog_note": "Adds interrupt-specific supersession to the closed cancellation vocabulary while preserving typed identities, host-owned sequencing, side-effect uncertainty, cleanup evidence, and fail-closed startup compatibility.",
         "identity_set": {
             "schema_version": RUNTIME_IDENTITY_SET_SCHEMA_VERSION,
             "causal_relations": RuntimeCausalLinkKind::wire_contract_values(),
@@ -3969,6 +3987,16 @@ runtime_contract_enum! {
 }
 
 runtime_contract_enum! {
+    /// Boundary at which one queued input may become visible to the model.
+    pub enum QueuedInputDeliveryBoundary {
+        CurrentRunBeforeProvider => "current_run_before_provider",
+        NextTurn => "next_turn",
+        BacklogSummary => "backlog_summary",
+        CancelThenNextTurn => "cancel_then_next_turn"
+    }
+}
+
+runtime_contract_enum! {
     /// High-level pruning policy classes that keep future rollout knobs stable.
     pub enum PruningPolicyClass {
         Disabled => "disabled" | "off",
@@ -4022,14 +4050,18 @@ impl AuxiliaryTaskState {
 }
 
 runtime_contract_enum! {
-    /// Queue lifecycle states currently persisted for queued inputs.
+    /// Durable queue lifecycle states used by compare-and-set transitions.
     pub enum QueuedInputState {
         Pending => "pending" | "queued",
+        Claimed => "claimed",
+        Injected => "injected",
+        Deferred => "deferred",
         Forwarded => "forwarded" | "delivered",
         DeliveryFailed => "delivery_failed" | "failed_delivery",
         Merged => "merged",
         Steered => "steered",
         Interrupted => "interrupted",
+        Superseded => "superseded",
         Overflowed => "overflowed" | "overflow",
         Rejected => "rejected" | "reject",
         Cancelled => "cancelled" | "canceled"
@@ -4038,9 +4070,33 @@ runtime_contract_enum! {
 
 impl QueuedInputState {
     #[must_use]
-    pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Pending)
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Claimed | Self::Deferred)
     }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+}
+
+/// Schema version for user-visible queued-input outcome evidence.
+pub const QUEUE_OUTCOME_SCHEMA_VERSION: u32 = 1;
+
+/// User-visible evidence for the latest durable queued-input outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueOutcome {
+    pub schema_version: u32,
+    pub queued_input_id: String,
+    pub lifecycle_state: QueuedInputState,
+    pub delivery_boundary: QueuedInputDeliveryBoundary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_active_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_active_generation: Option<u64>,
+    pub accepted: bool,
+    pub reason_code: String,
 }
 
 runtime_contract_enum! {
@@ -4149,18 +4205,19 @@ mod tests {
         AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
         PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, PruningPolicyClass,
         PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope, PublicRuntimeEventName,
-        PublicRuntimeEventProjectionContext, QueueDecision, QueueMode, QueuedInputState,
-        RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope, RealtimeEventSensitivity,
-        RealtimeEventTopic, RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole,
-        RealtimeScope, RealtimeSubscription, RunLifecycleHookDecision,
-        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecyclePhase,
-        RuntimeEventEnvelopeV2, RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef,
-        RuntimeGeneration, RuntimeIdentitySetV1, RuntimeRunId, RuntimeSessionId, RuntimeTraceId,
-        StableErrorEnvelope, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        PublicRuntimeEventProjectionContext, QueueDecision, QueueMode, QueueOutcome,
+        QueuedInputDeliveryBoundary, QueuedInputState, RealtimeCapability, RealtimeCommand,
+        RealtimeCommandEnvelope, RealtimeEventSensitivity, RealtimeEventTopic,
+        RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope,
+        RealtimeSubscription, RunLifecycleHookDecision, RunLifecycleHookDecisionKind,
+        RunLifecycleHookPhase, RunLifecyclePhase, RuntimeEventEnvelopeV2, RuntimeEventId,
+        RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration, RuntimeIdentitySetV1,
+        RuntimeRunId, RuntimeSessionId, RuntimeTraceId, StableErrorEnvelope,
+        ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
         AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA, PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
-        REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
+        QUEUE_OUTCOME_SCHEMA_VERSION, REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -4531,6 +4588,27 @@ mod tests {
             serde_json::from_str("\"steer_backlog\"").expect("queue mode should deserialize");
         assert_eq!(parsed, QueueMode::SteerBacklog);
         assert_eq!(parsed.as_str(), "steer_backlog");
+    }
+
+    #[test]
+    fn queue_outcome_round_trips_exact_delivery_contract() {
+        let outcome = QueueOutcome {
+            schema_version: QUEUE_OUTCOME_SCHEMA_VERSION,
+            queued_input_id: "queued-1".to_owned(),
+            lifecycle_state: QueuedInputState::Injected,
+            delivery_boundary: QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+            expected_active_generation: Some(4),
+            observed_active_generation: Some(5),
+            accepted: true,
+            reason_code: "queue.active_run.injected".to_owned(),
+        };
+
+        let serialized = serde_json::to_string(&outcome).expect("queue outcome should serialize");
+        assert!(serialized.contains(r#""lifecycle_state":"injected""#));
+        assert!(serialized.contains(r#""delivery_boundary":"current_run_before_provider""#));
+        let parsed: QueueOutcome =
+            serde_json::from_str(serialized.as_str()).expect("queue outcome should deserialize");
+        assert_eq!(parsed, outcome);
     }
 
     #[test]

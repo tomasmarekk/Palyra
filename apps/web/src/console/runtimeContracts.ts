@@ -174,12 +174,17 @@ export function normalizeAuxiliaryTaskState(value?: string | null): AuxiliaryTas
 
 export const QUEUED_INPUT_STATES = [
   "pending",
+  "claimed",
+  "injected",
+  "deferred",
   "forwarded",
   "delivery_failed",
   "merged",
   "steered",
   "interrupted",
+  "superseded",
   "overflowed",
+  "rejected",
   "cancelled",
 ] as const;
 export type QueuedInputState = (typeof QUEUED_INPUT_STATES)[number];
@@ -189,6 +194,12 @@ export function normalizeQueuedInputState(value?: string | null): QueuedInputSta
     case "queued":
     case "pending":
       return "pending";
+    case "claimed":
+      return "claimed";
+    case "injected":
+      return "injected";
+    case "deferred":
+      return "deferred";
     case "delivered":
     case "forwarded":
       return "forwarded";
@@ -201,14 +212,55 @@ export function normalizeQueuedInputState(value?: string | null): QueuedInputSta
       return "steered";
     case "interrupted":
       return "interrupted";
+    case "superseded":
+      return "superseded";
     case "overflow":
     case "overflowed":
       return "overflowed";
+    case "reject":
+    case "rejected":
+      return "rejected";
     case "canceled":
     case "cancelled":
       return "cancelled";
     default:
       return "pending";
+  }
+}
+
+export const QUEUED_INPUT_DELIVERY_BOUNDARIES = [
+  "current_run_before_provider",
+  "next_turn",
+  "backlog_summary",
+  "cancel_then_next_turn",
+] as const;
+export type QueuedInputDeliveryBoundary = (typeof QUEUED_INPUT_DELIVERY_BOUNDARIES)[number];
+
+export function normalizeQueuedInputDeliveryBoundary(
+  value: string | null | undefined,
+  fallbackMode: QueueMode = "followup",
+): QueuedInputDeliveryBoundary {
+  switch (normalizeRuntimeToken(value)) {
+    case "current_run_before_provider":
+      return "current_run_before_provider";
+    case "next_turn":
+      return "next_turn";
+    case "backlog_summary":
+      return "backlog_summary";
+    case "cancel_then_next_turn":
+      return "cancel_then_next_turn";
+    default:
+      switch (fallbackMode) {
+        case "steer":
+          return "current_run_before_provider";
+        case "interrupt":
+          return "cancel_then_next_turn";
+        case "collect":
+        case "steer_backlog":
+          return "backlog_summary";
+        case "followup":
+          return "next_turn";
+      }
   }
 }
 

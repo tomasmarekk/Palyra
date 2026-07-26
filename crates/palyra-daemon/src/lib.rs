@@ -1705,6 +1705,8 @@ struct ConsoleChatQueueRequest {
     text: String,
     #[serde(default)]
     queue_mode: Option<String>,
+    #[serde(default)]
+    attachments: Vec<ConsoleChatAttachmentReference>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1880,7 +1882,7 @@ struct ConsoleChatAttachmentUploadRequest {
     bytes_base64: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConsoleChatAttachmentReference {
     artifact_id: String,
 }

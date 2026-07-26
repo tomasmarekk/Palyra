@@ -31,10 +31,12 @@ import {
   normalizeAuxiliaryTaskKind,
   normalizeAuxiliaryTaskState,
   normalizeQueueMode,
+  normalizeQueuedInputDeliveryBoundary,
   normalizeQueuedInputState,
   type AuxiliaryTaskKind,
   type AuxiliaryTaskState,
   type QueueMode,
+  type QueuedInputDeliveryBoundary,
   type QueuedInputState,
 } from "./console/runtimeContracts";
 
@@ -1168,12 +1170,18 @@ export interface ChatQueuedInputRecord {
   session_id: string;
   state: QueuedInputState;
   queue_mode: QueueMode;
+  delivery_boundary: QueuedInputDeliveryBoundary;
+  expected_active_generation?: number;
+  claimed_active_generation?: number;
+  lifecycle_revision: number;
   priority_lane: string;
   coalescing_group?: string;
   overflow_summary_ref?: string;
   safe_boundary_flags_json: string;
   decision_reason: string;
   text: string;
+  attachments_json: string;
+  queue_outcome_json: string;
   accepted_at_unix_ms?: number;
   coalesced_at_unix_ms?: number;
   forwarded_at_unix_ms?: number;
@@ -1183,6 +1191,17 @@ export interface ChatQueuedInputRecord {
   created_at_unix_ms: number;
   updated_at_unix_ms: number;
   origin_run_id?: string;
+}
+
+export interface ChatQueueOutcome {
+  schema_version: number;
+  queued_input_id: string;
+  lifecycle_state: QueuedInputState;
+  delivery_boundary: QueuedInputDeliveryBoundary;
+  expected_active_generation?: number;
+  observed_active_generation?: number;
+  accepted: boolean;
+  reason_code: string;
 }
 
 export interface ChatQueueControlRecord {
@@ -1213,6 +1232,7 @@ export interface ChatQueueActionEnvelope {
   control?: ChatQueueControlRecord;
   queue: ChatQueuePolicySnapshot;
   queued_input?: ChatQueuedInputRecord;
+  queue_outcome?: ChatQueueOutcome;
   queued_input_id?: string;
   drained_count?: number;
   merged_count?: number;
@@ -1608,17 +1628,39 @@ export interface ChatBackgroundTaskRecord {
   completed_at_unix_ms?: number;
 }
 
-type RawChatQueuedInputRecord = Omit<ChatQueuedInputRecord, "state"> & {
+type RawChatQueuedInputRecord = Omit<
+  ChatQueuedInputRecord,
+  | "state"
+  | "queue_mode"
+  | "delivery_boundary"
+  | "lifecycle_revision"
+  | "attachments_json"
+  | "queue_outcome_json"
+> & {
   state: string;
+  queue_mode?: string;
+  delivery_boundary?: string;
+  lifecycle_revision?: number;
+  attachments_json?: string;
+  queue_outcome_json?: string;
+};
+
+type RawChatQueueOutcome = Omit<ChatQueueOutcome, "lifecycle_state" | "delivery_boundary"> & {
+  lifecycle_state: string;
+  delivery_boundary: string;
 };
 
 type RawChatQueuePolicySnapshot = Omit<ChatQueuePolicySnapshot, "queued_inputs"> & {
   queued_inputs: RawChatQueuedInputRecord[];
 };
 
-type RawChatQueueActionEnvelope = Omit<ChatQueueActionEnvelope, "queue" | "queued_input"> & {
+type RawChatQueueActionEnvelope = Omit<
+  ChatQueueActionEnvelope,
+  "queue" | "queued_input" | "queue_outcome"
+> & {
   queue: RawChatQueuePolicySnapshot;
   queued_input?: RawChatQueuedInputRecord;
+  queue_outcome?: RawChatQueueOutcome;
 };
 
 type RawChatBackgroundTaskRecord = Omit<ChatBackgroundTaskRecord, "task_kind" | "state"> & {
@@ -3621,15 +3663,28 @@ function providerAuthPath(provider: string, action?: string): string {
 }
 
 function normalizeChatQueuedInputRecord(record: RawChatQueuedInputRecord): ChatQueuedInputRecord {
+  const queueMode = normalizeQueueMode(record.queue_mode);
   return {
     ...record,
     state: normalizeQueuedInputState(record.state),
-    queue_mode: normalizeQueueMode(record.queue_mode),
+    queue_mode: queueMode,
+    delivery_boundary: normalizeQueuedInputDeliveryBoundary(record.delivery_boundary, queueMode),
+    lifecycle_revision: record.lifecycle_revision ?? 0,
     priority_lane: record.priority_lane ?? "normal",
     safe_boundary_flags_json: record.safe_boundary_flags_json ?? "{}",
     decision_reason: record.decision_reason ?? "legacy_followup",
+    attachments_json: record.attachments_json ?? "[]",
+    queue_outcome_json: record.queue_outcome_json ?? "{}",
     policy_snapshot_json: record.policy_snapshot_json ?? "{}",
     explain_json: record.explain_json ?? "{}",
+  };
+}
+
+function normalizeChatQueueOutcome(outcome: RawChatQueueOutcome): ChatQueueOutcome {
+  return {
+    ...outcome,
+    lifecycle_state: normalizeQueuedInputState(outcome.lifecycle_state),
+    delivery_boundary: normalizeQueuedInputDeliveryBoundary(outcome.delivery_boundary),
   };
 }
 
@@ -3651,6 +3706,10 @@ function normalizeChatQueueActionEnvelope(
     queued_input:
       envelope.queued_input !== undefined
         ? normalizeChatQueuedInputRecord(envelope.queued_input)
+        : undefined,
+    queue_outcome:
+      envelope.queue_outcome !== undefined
+        ? normalizeChatQueueOutcome(envelope.queue_outcome)
         : undefined,
   };
 }
@@ -4914,15 +4973,21 @@ export class ConsoleApiClient {
 
   async queueFollowUp(
     runId: string,
-    payload: { text: string; queue_mode?: QueueMode },
+    payload: {
+      text: string;
+      queue_mode?: QueueMode;
+      attachments?: Array<{ artifact_id: string }>;
+    },
   ): Promise<{
     queued_input: ChatQueuedInputRecord;
+    queue_outcome: ChatQueueOutcome;
     decision?: JsonValue;
     policy?: JsonValue;
     contract: ContractDescriptor;
   }> {
     const response = await this.request<{
       queued_input: RawChatQueuedInputRecord;
+      queue_outcome: RawChatQueueOutcome;
       decision?: JsonValue;
       policy?: JsonValue;
       contract: ContractDescriptor;
@@ -4937,6 +5002,7 @@ export class ConsoleApiClient {
     return {
       ...response,
       queued_input: normalizeChatQueuedInputRecord(response.queued_input),
+      queue_outcome: normalizeChatQueueOutcome(response.queue_outcome),
     };
   }
 

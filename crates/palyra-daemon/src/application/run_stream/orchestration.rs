@@ -25,8 +25,9 @@ use palyra_common::{
     runtime_contracts::{
         classify_agent_harness_terminal, AgentHarnessAttemptClassification,
         AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
-        AgentHarnessSelectionMode, CancellationContextV1, CancellationReason, QueuedInputState,
-        RuntimeErrorPhase, RuntimeSessionId, RuntimeTerminalOutcome,
+        AgentHarnessSelectionMode, CancellationContextV1, CancellationReason, QueueMode,
+        QueuedInputDeliveryBoundary, QueuedInputState, RuntimeErrorPhase, RuntimeSessionId,
+        RuntimeTerminalOutcome,
     },
     runtime_preview::RuntimePreviewMode,
 };
@@ -86,6 +87,7 @@ use crate::{
             ShadowSelectionSemanticV1, ShadowToolCatalogSemanticV1, ShadowV2PreContextInputV1,
         },
     },
+    application::session_queue::queue_outcome,
     application::tool_governance::{
         project_harness_tool_surface, BeforeFinalizeBudget, BeforeFinalizeDecision,
         BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
@@ -2229,12 +2231,33 @@ async fn drain_active_run_steering_before_provider_call(
     loop_state: &mut AgentRunLoopState,
     active_flow_control: &mut Option<RunStreamFlowControl>,
 ) -> Result<(), Status> {
+    let current_flow_control = active_flow_control.as_ref().ok_or_else(|| {
+        Status::internal("active run steering requires an initialized flow-control scope")
+    })?;
+    let current_generation = current_flow_control.root_context().generation;
+    let current_generation_i64 = i64::try_from(current_generation.get())
+        .map_err(|_| Status::failed_precondition("runtime generation exceeds journal range"))?;
     let mut targeted_inputs = runtime_state
         .list_orchestrator_queued_inputs(session_id.to_owned())
         .await?
         .into_iter()
         .filter(|queued| queued.state == QueuedInputState::Pending.as_str())
         .filter(|queued| queued_targets_active_run(queued, run_id))
+        .filter(|queued| {
+            matches!(
+                (
+                    QueueMode::parse(queued.queue_mode.as_str()),
+                    QueuedInputDeliveryBoundary::parse(queued.delivery_boundary.as_str()),
+                ),
+                (
+                    Some(QueueMode::Steer),
+                    Some(QueuedInputDeliveryBoundary::CurrentRunBeforeProvider)
+                ) | (
+                    Some(QueueMode::Interrupt),
+                    Some(QueuedInputDeliveryBoundary::CancelThenNextTurn)
+                )
+            )
+        })
         .collect::<Vec<_>>();
     if targeted_inputs.is_empty() {
         return Ok(());
@@ -2244,15 +2267,148 @@ async fn drain_active_run_steering_before_provider_call(
             .cmp(&queued_input_sort_key(right))
             .then_with(|| left.queued_input_id.cmp(&right.queued_input_id))
     });
-    let replacement_generation = runtime_state
+    let mut claimed_inputs = Vec::with_capacity(targeted_inputs.len());
+    for queued in targeted_inputs {
+        let boundary = QueuedInputDeliveryBoundary::parse(queued.delivery_boundary.as_str())
+            .ok_or_else(|| {
+                Status::failed_precondition("queued input has an invalid delivery boundary")
+            })?;
+        let expected_generation =
+            queued.expected_active_generation.and_then(|value| u64::try_from(value).ok());
+        if expected_generation != Some(current_generation.get()) {
+            let outcome = queue_outcome(
+                queued.queued_input_id.clone(),
+                QueuedInputState::Superseded,
+                boundary,
+                expected_generation,
+                Some(current_generation.get()),
+                false,
+                "queue.generation.superseded",
+            );
+            let transition = runtime_state
+                .update_orchestrator_queued_input_state(OrchestratorQueuedInputUpdateRequest {
+                    queued_input_id: queued.queued_input_id.clone(),
+                    expected_state: queued.state.clone(),
+                    expected_revision: queued.lifecycle_revision,
+                    state: QueuedInputState::Superseded.as_str().to_owned(),
+                    claimed_active_generation: None,
+                    overflow_summary_ref: None,
+                    decision_reason: Some("queue.generation.superseded".to_owned()),
+                    explain_json: Some(
+                        json!({
+                            "schema_version": 1,
+                            "run_id": run_id,
+                            "expected_active_generation": expected_generation,
+                            "observed_active_generation": current_generation.get(),
+                            "delivery_boundary": boundary.as_str(),
+                        })
+                        .to_string(),
+                    ),
+                    queue_outcome_json: Some(
+                        serde_json::to_string(&outcome)
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                    ),
+                })
+                .await;
+            match transition {
+                Ok(_) => {}
+                Err(error) if error.code() == Code::Aborted => {}
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
+        let outcome = queue_outcome(
+            queued.queued_input_id.clone(),
+            QueuedInputState::Claimed,
+            boundary,
+            expected_generation,
+            Some(current_generation.get()),
+            true,
+            "queue.active_run.claimed",
+        );
+        let transition = runtime_state
+            .update_orchestrator_queued_input_state(OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued.queued_input_id.clone(),
+                expected_state: queued.state.clone(),
+                expected_revision: queued.lifecycle_revision,
+                state: QueuedInputState::Claimed.as_str().to_owned(),
+                claimed_active_generation: Some(current_generation_i64),
+                overflow_summary_ref: None,
+                decision_reason: Some("queue.active_run.claimed".to_owned()),
+                explain_json: None,
+                queue_outcome_json: Some(
+                    serde_json::to_string(&outcome)
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                ),
+            })
+            .await;
+        match transition {
+            Ok(claimed) => claimed_inputs.push(claimed),
+            Err(error) if error.code() == Code::Aborted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if claimed_inputs.is_empty() {
+        return Ok(());
+    }
+    let replacement_generation = match runtime_state
         .supersede_run_generation_for_steer(session_id.to_owned(), run_id.to_owned())
-        .await?;
+        .await
+    {
+        Ok(generation) => generation,
+        Err(error) => {
+            for claimed in &claimed_inputs {
+                let boundary =
+                    QueuedInputDeliveryBoundary::parse(claimed.delivery_boundary.as_str())
+                        .unwrap_or(QueuedInputDeliveryBoundary::CurrentRunBeforeProvider);
+                let outcome = queue_outcome(
+                    claimed.queued_input_id.clone(),
+                    QueuedInputState::Superseded,
+                    boundary,
+                    claimed.expected_active_generation.and_then(|value| u64::try_from(value).ok()),
+                    Some(current_generation.get()),
+                    false,
+                    "queue.active_run.terminal_race",
+                );
+                let transition = runtime_state
+                    .update_orchestrator_queued_input_state(OrchestratorQueuedInputUpdateRequest {
+                        queued_input_id: claimed.queued_input_id.clone(),
+                        expected_state: claimed.state.clone(),
+                        expected_revision: claimed.lifecycle_revision,
+                        state: QueuedInputState::Superseded.as_str().to_owned(),
+                        claimed_active_generation: None,
+                        overflow_summary_ref: None,
+                        decision_reason: Some("queue.active_run.terminal_race".to_owned()),
+                        explain_json: None,
+                        queue_outcome_json: Some(serde_json::to_string(&outcome).map_err(
+                            |serialization| Status::internal(serialization.to_string()),
+                        )?),
+                    })
+                    .await;
+                if let Err(transition_error) = transition {
+                    if transition_error.code() != Code::Aborted {
+                        return Err(transition_error);
+                    }
+                }
+            }
+            if matches!(error.code(), Code::FailedPrecondition | Code::Aborted | Code::NotFound) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     let superseded_flow_control = active_flow_control.as_ref().ok_or_else(|| {
         Status::internal("active run steering requires an initialized flow-control scope")
     })?;
     let replacement_flow_control =
         superseded_flow_control.supersede_generation(replacement_generation)?;
-    superseded_flow_control.request_cancel(CancellationReason::SteerSupersede);
+    let cancellation_reason =
+        if claimed_inputs.iter().any(|queued| queued.queue_mode == QueueMode::Interrupt.as_str()) {
+            CancellationReason::InterruptSupersede
+        } else {
+            CancellationReason::SteerSupersede
+        };
+    superseded_flow_control.request_cancel(cancellation_reason);
     *active_flow_control = Some(replacement_flow_control);
     append_agent_loop_tape_event(
         runtime_state,
@@ -2262,32 +2418,57 @@ async fn drain_active_run_steering_before_provider_call(
         active_run_steering_payload(
             "turn_control.active_run_steering.received",
             run_id,
-            targeted_inputs.as_slice(),
+            claimed_inputs.as_slice(),
         )
         .to_string(),
     )
     .await?;
-    let guidance = active_run_steering_guidance(targeted_inputs.as_slice());
+    let guidance = active_run_steering_guidance(claimed_inputs.as_slice());
     loop_state.append_user_guidance(guidance);
-    for queued in &targeted_inputs {
-        runtime_state
+    let mut injected_inputs = Vec::with_capacity(claimed_inputs.len());
+    for queued in &claimed_inputs {
+        let boundary = QueuedInputDeliveryBoundary::parse(queued.delivery_boundary.as_str())
+            .ok_or_else(|| {
+                Status::failed_precondition("claimed queued input has an invalid delivery boundary")
+            })?;
+        let outcome = queue_outcome(
+            queued.queued_input_id.clone(),
+            QueuedInputState::Injected,
+            boundary,
+            queued.expected_active_generation.and_then(|value| u64::try_from(value).ok()),
+            Some(replacement_generation.get()),
+            true,
+            "queue.active_run.injected",
+        );
+        let injected = runtime_state
             .update_orchestrator_queued_input_state(OrchestratorQueuedInputUpdateRequest {
                 queued_input_id: queued.queued_input_id.clone(),
-                state: QueuedInputState::Forwarded.as_str().to_owned(),
+                expected_state: queued.state.clone(),
+                expected_revision: queued.lifecycle_revision,
+                state: QueuedInputState::Injected.as_str().to_owned(),
+                claimed_active_generation: None,
                 overflow_summary_ref: None,
-                decision_reason: Some("turn_control.active_run_steering.injected".to_owned()),
+                decision_reason: Some("queue.active_run.injected".to_owned()),
                 explain_json: Some(
                     json!({
                         "schema_version": 1,
                         "run_id": run_id,
                         "queued_input_id": queued.queued_input_id.as_str(),
-                        "state": QueuedInputState::Forwarded.as_str(),
+                        "state": QueuedInputState::Injected.as_str(),
                         "injected_before": "provider_request",
+                        "delivery_boundary": boundary.as_str(),
+                        "expected_active_generation": queued.expected_active_generation,
+                        "observed_active_generation": replacement_generation.get(),
                     })
                     .to_string(),
                 ),
+                queue_outcome_json: Some(
+                    serde_json::to_string(&outcome)
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                ),
             })
             .await?;
+        injected_inputs.push(injected);
     }
     append_agent_loop_tape_event(
         runtime_state,
@@ -2297,7 +2478,7 @@ async fn drain_active_run_steering_before_provider_call(
         active_run_steering_payload(
             "turn_control.active_run_steering.injected",
             run_id,
-            targeted_inputs.as_slice(),
+            injected_inputs.as_slice(),
         )
         .to_string(),
     )
@@ -2340,6 +2521,12 @@ fn active_run_steering_payload(
                 "text_sha256": crate::sha256_hex(input.text.as_bytes()),
                 "text_bytes": input.text.len(),
                 "queue_mode": input.queue_mode.as_str(),
+                "delivery_boundary": input.delivery_boundary.as_str(),
+                "expected_active_generation": input.expected_active_generation,
+                "claimed_active_generation": input.claimed_active_generation,
+                "lifecycle_revision": input.lifecycle_revision,
+                "queue_outcome": serde_json::from_str::<Value>(input.queue_outcome_json.as_str())
+                    .unwrap_or_else(|_| json!({})),
                 "priority_lane": input.priority_lane.as_str(),
                 "created_at_unix_ms": input.created_at_unix_ms,
                 "accepted_at_unix_ms": input.accepted_at_unix_ms,
@@ -7779,9 +7966,10 @@ mod tests {
     use palyra_common::runtime_contracts::{
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
         AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
-        CancellationContextV1, CancellationReason, CancellationScopeKind, QueuedInputState,
-        RuntimeErrorPhase, RuntimeGeneration, RuntimeGenerationLane,
-        RuntimeGenerationTransitionKind, RuntimeOperationId, RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
+        CancellationContextV1, CancellationReason, CancellationScopeKind, QueueMode,
+        QueuedInputDeliveryBoundary, QueuedInputState, RuntimeErrorPhase, RuntimeGeneration,
+        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
+        RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
     };
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use serde_json::{json, Value};
@@ -7889,12 +8077,18 @@ mod tests {
             session_id: "session".to_owned(),
             state: "pending".to_owned(),
             queue_mode: "interrupt".to_owned(),
+            delivery_boundary: "cancel_then_next_turn".to_owned(),
+            expected_active_generation: Some(1),
+            claimed_active_generation: None,
+            lifecycle_revision: 0,
             priority_lane: "default".to_owned(),
             coalescing_group: None,
             overflow_summary_ref: None,
             safe_boundary_flags_json: "{}".to_owned(),
             decision_reason: "test".to_owned(),
             text: text.to_owned(),
+            attachments_json: "[]".to_owned(),
+            queue_outcome_json: "{}".to_owned(),
             accepted_at_unix_ms: Some(accepted_at_unix_ms),
             coalesced_at_unix_ms: None,
             forwarded_at_unix_ms: None,
@@ -7905,6 +8099,44 @@ mod tests {
             updated_at_unix_ms: accepted_at_unix_ms,
             origin_run_id: Some("run_active".to_owned()),
         }
+    }
+
+    async fn persist_active_queued_input(
+        state: &Arc<crate::gateway::GatewayRuntimeState>,
+        session_id: &str,
+        run_id: &str,
+        queued_input_id: &str,
+        mode: QueueMode,
+        boundary: QueuedInputDeliveryBoundary,
+        expected_generation: RuntimeGeneration,
+    ) {
+        state
+            .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
+                queued_input_id: queued_input_id.to_owned(),
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                state: QueuedInputState::Pending.as_str().to_owned(),
+                text: format!("operator input for {mode:?}"),
+                origin_run_id: Some(run_id.to_owned()),
+                queue_mode: mode.as_str().to_owned(),
+                delivery_boundary: boundary.as_str().to_owned(),
+                expected_active_generation: Some(
+                    i64::try_from(expected_generation.get())
+                        .expect("test generation should fit journal range"),
+                ),
+                priority_lane: "normal".to_owned(),
+                coalescing_group: Some("active-run-test".to_owned()),
+                overflow_summary_ref: None,
+                safe_boundary_flags_json: "{}".to_owned(),
+                decision_reason: "test.active_run_queue".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: "{}".to_owned(),
+                accepted_at_unix_ms: Some(crate::gateway::current_unix_ms()),
+                policy_snapshot_json: "{}".to_owned(),
+                explain_json: "{}".to_owned(),
+            })
+            .await
+            .expect("queued input should persist");
     }
 
     #[tokio::test]
@@ -8053,11 +8285,17 @@ mod tests {
                 text: "use the corrected target".to_owned(),
                 origin_run_id: Some(run_id.to_owned()),
                 queue_mode: "interrupt".to_owned(),
+                delivery_boundary: QueuedInputDeliveryBoundary::CancelThenNextTurn
+                    .as_str()
+                    .to_owned(),
+                expected_active_generation: Some(1),
                 priority_lane: "normal".to_owned(),
                 coalescing_group: Some("active-steer-generation".to_owned()),
                 overflow_summary_ref: None,
                 safe_boundary_flags_json: "{}".to_owned(),
                 decision_reason: "test.active_steer".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: "{}".to_owned(),
                 accepted_at_unix_ms: Some(crate::gateway::current_unix_ms()),
                 policy_snapshot_json: "{}".to_owned(),
                 explain_json: "{}".to_owned(),
@@ -8105,7 +8343,7 @@ mod tests {
         assert_eq!(replacement.root_context().deadline_unix_ms, original_root.deadline_unix_ms);
         assert_eq!(
             superseded_observer.current_cancellation_reason(),
-            Some(CancellationReason::SteerSupersede)
+            Some(CancellationReason::InterruptSupersede)
         );
         assert_eq!(replacement.current_cancellation_reason(), None);
         assert_eq!(tape_seq, 2);
@@ -8114,7 +8352,7 @@ mod tests {
             .await
             .expect("queued inputs should load");
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].state, QueuedInputState::Forwarded.as_str());
+        assert_eq!(queued[0].state, QueuedInputState::Injected.as_str());
         let transition_count = state
             .journal_store
             .runtime_generation_transition_count_for_test(
@@ -8125,6 +8363,165 @@ mod tests {
             )
             .expect("steer transition count should query");
         assert_eq!(transition_count, 1);
+    }
+
+    #[tokio::test]
+    async fn active_run_drain_leaves_followup_for_next_turn() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-followup-boundary";
+        let run_id = "run-followup-boundary";
+        start_test_run(&state, session_id, run_id);
+        let (_, initial_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("generation lookup should succeed")
+            .expect("run should have an active generation");
+        persist_active_queued_input(
+            &state,
+            session_id,
+            run_id,
+            "queued-followup-boundary",
+            QueueMode::Followup,
+            QueuedInputDeliveryBoundary::NextTurn,
+            initial_generation,
+        )
+        .await;
+        let mut active_flow_control = Some(
+            RunStreamFlowControl::new(initial_generation, Duration::from_secs(60))
+                .expect("flow control should initialize"),
+        );
+        let mut loop_state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
+        let original_messages = loop_state.messages();
+        let mut tape_seq = 0;
+
+        drain_active_run_steering_before_provider_call(
+            &state,
+            session_id,
+            run_id,
+            &mut tape_seq,
+            &mut loop_state,
+            &mut active_flow_control,
+        )
+        .await
+        .expect("next-turn followup should be ignored by active drain");
+
+        let (_, observed_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("generation lookup should succeed")
+            .expect("run should keep an active generation");
+        let queued = state
+            .list_orchestrator_queued_inputs(session_id.to_owned())
+            .await
+            .expect("queued inputs should load");
+        assert_eq!(observed_generation, initial_generation);
+        assert_eq!(queued[0].state, QueuedInputState::Pending.as_str());
+        assert_eq!(loop_state.messages(), original_messages);
+        assert_eq!(tape_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn active_run_drain_supersedes_stale_generation_input() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-stale-steer";
+        let run_id = "run-stale-steer";
+        start_test_run(&state, session_id, run_id);
+        let (_, initial_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("generation lookup should succeed")
+            .expect("run should have an active generation");
+        let stale_generation = initial_generation.next().expect("test generation should advance");
+        persist_active_queued_input(
+            &state,
+            session_id,
+            run_id,
+            "queued-stale-steer",
+            QueueMode::Steer,
+            QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+            stale_generation,
+        )
+        .await;
+        let mut active_flow_control = Some(
+            RunStreamFlowControl::new(initial_generation, Duration::from_secs(60))
+                .expect("flow control should initialize"),
+        );
+        let mut loop_state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
+        let mut tape_seq = 0;
+
+        drain_active_run_steering_before_provider_call(
+            &state,
+            session_id,
+            run_id,
+            &mut tape_seq,
+            &mut loop_state,
+            &mut active_flow_control,
+        )
+        .await
+        .expect("stale steering should settle without injection");
+
+        let queued = state
+            .list_orchestrator_queued_inputs(session_id.to_owned())
+            .await
+            .expect("queued inputs should load");
+        assert_eq!(queued[0].state, QueuedInputState::Superseded.as_str());
+        assert_eq!(loop_state.messages().len(), 1);
+        assert_eq!(tape_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_run_wins_after_queue_claim_without_injection() {
+        let state = build_test_runtime_state(false);
+        let session_id = "session-terminal-queue-race";
+        let run_id = "run-terminal-queue-race";
+        start_test_run(&state, session_id, run_id);
+        let (_, initial_generation) = state
+            .runtime_generation_for_run(run_id.to_owned())
+            .await
+            .expect("generation lookup should succeed")
+            .expect("run should have an active generation");
+        persist_active_queued_input(
+            &state,
+            session_id,
+            run_id,
+            "queued-terminal-race",
+            QueueMode::Steer,
+            QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+            initial_generation,
+        )
+        .await;
+        state
+            .journal_store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+            .expect("terminal run should settle before the drain");
+        let mut active_flow_control = Some(
+            RunStreamFlowControl::new(initial_generation, Duration::from_secs(60))
+                .expect("flow control should initialize"),
+        );
+        let mut loop_state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
+        let mut tape_seq = 0;
+
+        drain_active_run_steering_before_provider_call(
+            &state,
+            session_id,
+            run_id,
+            &mut tape_seq,
+            &mut loop_state,
+            &mut active_flow_control,
+        )
+        .await
+        .expect("terminal race should settle the queued input");
+
+        let queued = state
+            .list_orchestrator_queued_inputs(session_id.to_owned())
+            .await
+            .expect("queued inputs should load");
+        assert_eq!(queued[0].state, QueuedInputState::Superseded.as_str());
+        assert_eq!(loop_state.messages().len(), 1);
+        assert_eq!(tape_seq, 0);
     }
 
     #[test]

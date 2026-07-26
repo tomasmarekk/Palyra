@@ -2613,6 +2613,7 @@ describe("ConsoleApiClient", () => {
   });
 
   it("normalizes queued follow-up lifecycle aliases onto canonical queue states", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
       jsonResponse({
         principal: "admin:web-console",
@@ -2631,10 +2632,21 @@ describe("ConsoleApiClient", () => {
           created_at_unix_ms: 100,
           updated_at_unix_ms: 120,
         },
+        queue_outcome: {
+          schema_version: 1,
+          queued_input_id: "queued-1",
+          lifecycle_state: "forwarded",
+          delivery_boundary: "next_turn",
+          expected_active_generation: 1,
+          observed_active_generation: 1,
+          accepted: true,
+          reason_code: "queue.next_turn.forwarded",
+        },
         contract: { contract_version: "control-plane.v1" },
       }),
     ];
-    const client = new ConsoleApiClient("", (_input, _init) => {
+    const client = new ConsoleApiClient("", (input, init) => {
+      calls.push({ input, init });
       const response = responses.shift();
       if (response === undefined) {
         throw new Error("No response queued for fetch mock.");
@@ -2648,9 +2660,19 @@ describe("ConsoleApiClient", () => {
       device_id: "device-1",
       channel: "web",
     });
-    const queued = await client.queueFollowUp("run-1", { text: "continue" });
+    const queued = await client.queueFollowUp("run-1", {
+      text: "continue",
+      attachments: [{ artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FB7" }],
+    });
 
     expect(queued.queued_input.state).toBe("forwarded");
+    expect(queued.queue_outcome.reason_code).toBe("queue.next_turn.forwarded");
+    const queueRequestBody = calls[1]?.init?.body;
+    expect(typeof queueRequestBody).toBe("string");
+    expect(JSON.parse(typeof queueRequestBody === "string" ? queueRequestBody : "")).toMatchObject({
+      text: "continue",
+      attachments: [{ artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FB7" }],
+    });
   });
 
   it("submits approval decisions with CSRF protection", async () => {

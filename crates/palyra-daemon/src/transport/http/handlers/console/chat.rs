@@ -23,14 +23,16 @@ use crate::{
     },
     application::session_queue::{
         analyze_session_queue, build_queue_collect_summary, decide_session_queue_mode,
-        pending_queue_depth, QueueSteeringRequest, SessionQueuePolicy, SessionQueueSafeBoundary,
+        pending_queue_depth, queue_outcome, QueueSteeringRequest, SessionQueuePolicy,
+        SessionQueueSafeBoundary,
     },
     *,
 };
 use base64::Engine as _;
 use palyra_common::{
     runtime_contracts::{
-        AuxiliaryTaskKind, AuxiliaryTaskState, QueueDecision, QueueMode, QueuedInputState,
+        AuxiliaryTaskKind, AuxiliaryTaskState, QueueDecision, QueueMode,
+        QueuedInputDeliveryBoundary, QueuedInputState,
     },
     runtime_preview::{
         RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
@@ -3003,10 +3005,10 @@ fn build_background_task_cancelled_result_json(task_id: &str) -> String {
 // --- Session input queue (admission and operator controls) ---
 
 /// `POST /console/v1/chat/runs/{run_id}/queue` - submits a follow-up message
-/// while a run is still streaming. The session queue policy decides whether
-/// the input is forwarded into the live run stream immediately
-/// (followup/steer/interrupt), deferred/collected as backlog, merged into a
-/// collect summary, or rejected as overflow; every decision is journaled as a
+/// while a run is still streaming. Followups enter the request stream for the
+/// next turn; steer and interrupt inputs remain journal-owned until the run
+/// loop claims their exact generation boundary; collect inputs stay in bounded
+/// attachment-aware backlog summaries. Every decision is journaled as a
 /// queued-input record plus runtime-decision and tape events.
 ///
 /// # Errors
@@ -3056,6 +3058,38 @@ pub(crate) async fn console_chat_queue_handler(
             "chat run does not belong to the authenticated console session context",
         )));
     }
+    let (generation_session_id, active_generation) = state
+        .runtime
+        .persisted_runtime_generation_for_run(run_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::failed_precondition(
+                "queued input requires an active runtime generation",
+            ))
+        })?;
+    if generation_session_id != stream.session_id {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "queued input runtime generation belongs to another session",
+        )));
+    }
+    let expected_active_generation = i64::try_from(active_generation.get()).map_err(|_| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "runtime generation exceeds the journal integer range",
+        ))
+    })?;
+    let attachment_refs_json = serde_json::to_string(&payload.attachments).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "attachments could not be serialized: {error}"
+        )))
+    })?;
+    let resolved_attachments = load_console_chat_message_attachments(
+        &state,
+        &session.context,
+        stream.session_id.as_str(),
+        payload.attachments.as_slice(),
+    )
+    .map_err(|response| *response)?;
     // A pending tool approval is an unsafe boundary: forwarding a follow-up
     // mid-approval could race the approval response, so the decision below
     // degrades to enqueue/collect while any approval is outstanding.
@@ -3100,12 +3134,13 @@ pub(crate) async fn console_chat_queue_handler(
         queue_decision.decision = QueueDecision::Defer;
         queue_decision.mode = QueueMode::Collect;
         queue_decision.reason = "session_queue_paused".to_owned();
+        queue_decision.delivery_boundary = QueuedInputDeliveryBoundary::BacklogSummary;
     }
     let queued_input_id = Ulid::new().to_string();
     let pending_group_inputs = existing_queued_inputs
         .iter()
         .filter(|queued| {
-            queued.state == QueuedInputState::Pending.as_str()
+            QueuedInputState::parse(queued.state.as_str()).is_some_and(QueuedInputState::is_active)
                 && queued.coalescing_group.as_deref() == Some(coalescing_group.as_str())
         })
         .cloned()
@@ -3116,6 +3151,7 @@ pub(crate) async fn console_chat_queue_handler(
     let should_collect_summary = queue_decision.decision == QueueDecision::Overflow
         || (queue_decision.mode == QueueMode::Collect && !pending_group_inputs.is_empty());
     let mut effective_text = text.clone();
+    let mut effective_attachments_json = attachment_refs_json.clone();
     let mut overflow_summary_ref = None;
     if should_collect_summary {
         if queue_decision.decision != QueueDecision::Overflow {
@@ -3134,6 +3170,10 @@ pub(crate) async fn console_chat_queue_handler(
                 QueuedInputState::Overflowed.as_str().to_owned()
             },
             queue_mode: queue_decision.mode.as_str().to_owned(),
+            delivery_boundary: queue_decision.delivery_boundary.as_str().to_owned(),
+            expected_active_generation: Some(expected_active_generation),
+            claimed_active_generation: None,
+            lifecycle_revision: 0,
             priority_lane: queue_decision.policy.priority_lane.clone(),
             coalescing_group: Some(coalescing_group.clone()),
             overflow_summary_ref: Some(summary_ref.clone()),
@@ -3141,6 +3181,8 @@ pub(crate) async fn console_chat_queue_handler(
                 .unwrap_or_else(|_| "{}".to_owned()),
             decision_reason: queue_decision.reason.clone(),
             text: text.clone(),
+            attachments_json: attachment_refs_json.clone(),
+            queue_outcome_json: "{}".to_owned(),
             accepted_at_unix_ms: queue_decision.accepted.then_some(timestamp_unix_ms),
             coalesced_at_unix_ms: None,
             forwarded_at_unix_ms: None,
@@ -3157,13 +3199,25 @@ pub(crate) async fn console_chat_queue_handler(
             queue_decision.reason.as_str(),
         );
         effective_text = collect_summary.text;
+        effective_attachments_json = collect_summary.attachment_refs_json.to_string();
         overflow_summary_ref = Some(collect_summary.summary_ref);
     }
-    let initial_queued_state = if queue_decision.accepted {
-        QueuedInputState::Pending
-    } else {
+    let initial_queued_state = if !queue_decision.accepted {
         QueuedInputState::Overflowed
+    } else if queue_decision.decision == QueueDecision::Defer {
+        QueuedInputState::Deferred
+    } else {
+        QueuedInputState::Pending
     };
+    let initial_queue_outcome = queue_outcome(
+        queued_input_id.clone(),
+        initial_queued_state,
+        queue_decision.delivery_boundary,
+        Some(active_generation.get()),
+        Some(active_generation.get()),
+        queue_decision.accepted,
+        queue_decision.reason.clone(),
+    );
     let mut queued = state
         .runtime
         .create_orchestrator_queued_input(journal::OrchestratorQueuedInputCreateRequest {
@@ -3174,12 +3228,18 @@ pub(crate) async fn console_chat_queue_handler(
             text: effective_text.clone(),
             origin_run_id: Some(run_id.clone()),
             queue_mode: queue_decision.mode.as_str().to_owned(),
+            delivery_boundary: queue_decision.delivery_boundary.as_str().to_owned(),
+            expected_active_generation: Some(expected_active_generation),
             priority_lane: queue_decision.policy.priority_lane.clone(),
             coalescing_group: Some(queue_decision.policy.coalescing_group.clone()),
             overflow_summary_ref: overflow_summary_ref.clone(),
             safe_boundary_flags_json: serde_json::to_string(&queue_decision.safe_boundary)
                 .unwrap_or_else(|_| "{}".to_owned()),
             decision_reason: queue_decision.reason.clone(),
+            attachments_json: effective_attachments_json,
+            queue_outcome_json: serde_json::to_string(&initial_queue_outcome).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(error.to_string()))
+            })?,
             accepted_at_unix_ms: queue_decision.accepted.then_some(timestamp_unix_ms),
             policy_snapshot_json: queue_decision.policy.snapshot_json().to_string(),
             explain_json: queue_decision.explain_json().to_string(),
@@ -3187,18 +3247,37 @@ pub(crate) async fn console_chat_queue_handler(
         .await
         .map_err(runtime_status_response)?;
     for pending in &pending_group_inputs {
+        let merged_state = if queue_decision.decision == QueueDecision::Overflow {
+            QueuedInputState::Overflowed
+        } else {
+            QueuedInputState::Merged
+        };
+        let pending_boundary =
+            QueuedInputDeliveryBoundary::parse(pending.delivery_boundary.as_str())
+                .unwrap_or(QueuedInputDeliveryBoundary::BacklogSummary);
+        let pending_outcome = queue_outcome(
+            pending.queued_input_id.clone(),
+            merged_state,
+            pending_boundary,
+            pending.expected_active_generation.and_then(|value| u64::try_from(value).ok()),
+            Some(active_generation.get()),
+            false,
+            queue_decision.reason.clone(),
+        );
         state
             .runtime
             .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
                 queued_input_id: pending.queued_input_id.clone(),
-                state: if queue_decision.decision == QueueDecision::Overflow {
-                    QueuedInputState::Overflowed.as_str().to_owned()
-                } else {
-                    QueuedInputState::Merged.as_str().to_owned()
-                },
+                expected_state: pending.state.clone(),
+                expected_revision: pending.lifecycle_revision,
+                state: merged_state.as_str().to_owned(),
+                claimed_active_generation: None,
                 overflow_summary_ref: overflow_summary_ref.clone(),
                 decision_reason: Some(queue_decision.reason.clone()),
                 explain_json: Some(queue_decision.explain_json().to_string()),
+                queue_outcome_json: Some(serde_json::to_string(&pending_outcome).map_err(
+                    |error| runtime_status_response(tonic::Status::internal(error.to_string())),
+                )?),
             })
             .await
             .map_err(runtime_status_response)?;
@@ -3240,6 +3319,8 @@ pub(crate) async fn console_chat_queue_handler(
         "origin_run_id": run_id,
         "decision": queue_decision.decision.as_str(),
         "queue_mode": queue_decision.mode.as_str(),
+        "delivery_boundary": queue_decision.delivery_boundary.as_str(),
+        "queue_outcome": initial_queue_outcome,
         "safe_boundary": queue_decision.safe_boundary,
         "policy": queue_decision.policy.snapshot_json(),
     }));
@@ -3265,20 +3346,44 @@ pub(crate) async fn console_chat_queue_handler(
     )
     .await
     .map_err(runtime_status_response)?;
-    // Only live-delivery modes reach the gRPC stream, and never while an
-    // approval is pending; everything else stays queued for a later run.
-    if !matches!(
-        queue_decision.mode,
-        QueueMode::Followup | QueueMode::Steer | QueueMode::SteerBacklog | QueueMode::Interrupt
-    ) || pending_approval
-    {
+    // Follow-ups enter the request stream behind the active turn. Steering
+    // and interrupts stay journal-owned until the run loop claims them at
+    // their generation-bound provider boundary.
+    if queue_decision.mode != QueueMode::Followup || pending_approval {
         return Ok(Json(json!({
             "queued_input": queued,
             "decision": queue_decision.explain_json(),
+            "queue_outcome": initial_queue_outcome,
             "policy": queue_decision.policy.snapshot_json(),
             "contract": contract_descriptor(),
         })));
     }
+    let claimed_outcome = queue_outcome(
+        queued.queued_input_id.clone(),
+        QueuedInputState::Claimed,
+        queue_decision.delivery_boundary,
+        Some(active_generation.get()),
+        Some(active_generation.get()),
+        true,
+        "queue.next_turn.claimed",
+    );
+    let claimed = state
+        .runtime
+        .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+            queued_input_id: queued.queued_input_id.clone(),
+            expected_state: queued.state.clone(),
+            expected_revision: queued.lifecycle_revision,
+            state: QueuedInputState::Claimed.as_str().to_owned(),
+            claimed_active_generation: Some(expected_active_generation),
+            overflow_summary_ref: None,
+            decision_reason: Some("queue.next_turn.claimed".to_owned()),
+            explain_json: None,
+            queue_outcome_json: Some(serde_json::to_string(&claimed_outcome).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(error.to_string()))
+            })?),
+        })
+        .await
+        .map_err(runtime_status_response)?;
     let request = common_v1::RunStreamRequest {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: stream.session_id.clone() }),
@@ -3288,7 +3393,7 @@ pub(crate) async fn console_chat_queue_handler(
             stream.session_id.as_str(),
             text,
             timestamp_unix_ms,
-            Vec::new(),
+            resolved_attachments,
         )),
         allow_sensitive_tools: false,
         session_key: String::new(),
@@ -3302,14 +3407,29 @@ pub(crate) async fn console_chat_queue_handler(
         queued_input_id: Some(common_v1::CanonicalId { ulid: queued_input_id.clone() }),
     };
     if stream.request_sender.send(request).await.is_err() {
+        let failed_outcome = queue_outcome(
+            claimed.queued_input_id.clone(),
+            QueuedInputState::DeliveryFailed,
+            queue_decision.delivery_boundary,
+            Some(active_generation.get()),
+            Some(active_generation.get()),
+            false,
+            "queue.next_turn.delivery_failed",
+        );
         state
             .runtime
             .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
-                queued_input_id,
+                queued_input_id: claimed.queued_input_id.clone(),
+                expected_state: claimed.state.clone(),
+                expected_revision: claimed.lifecycle_revision,
                 state: QueuedInputState::DeliveryFailed.as_str().to_owned(),
+                claimed_active_generation: None,
                 overflow_summary_ref: None,
-                decision_reason: None,
+                decision_reason: Some("queue.next_turn.delivery_failed".to_owned()),
                 explain_json: None,
+                queue_outcome_json: Some(serde_json::to_string(&failed_outcome).map_err(
+                    |error| runtime_status_response(tonic::Status::internal(error.to_string())),
+                )?),
             })
             .await
             .map_err(runtime_status_response)?;
@@ -3363,14 +3483,29 @@ pub(crate) async fn console_chat_queue_handler(
             "failed to forward queued follow-up to the active run stream",
         )));
     }
-    state
+    let forwarded_outcome = queue_outcome(
+        claimed.queued_input_id.clone(),
+        QueuedInputState::Forwarded,
+        queue_decision.delivery_boundary,
+        Some(active_generation.get()),
+        Some(active_generation.get()),
+        true,
+        "queue.next_turn.forwarded",
+    );
+    queued = state
         .runtime
         .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
-            queued_input_id: queued.queued_input_id.clone(),
+            queued_input_id: claimed.queued_input_id.clone(),
+            expected_state: claimed.state.clone(),
+            expected_revision: claimed.lifecycle_revision,
             state: QueuedInputState::Forwarded.as_str().to_owned(),
+            claimed_active_generation: None,
             overflow_summary_ref: None,
-            decision_reason: None,
+            decision_reason: Some("queue.next_turn.forwarded".to_owned()),
             explain_json: None,
+            queue_outcome_json: Some(serde_json::to_string(&forwarded_outcome).map_err(
+                |error| runtime_status_response(tonic::Status::internal(error.to_string())),
+            )?),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -3420,10 +3555,10 @@ pub(crate) async fn console_chat_queue_handler(
     )
     .await
     .map_err(runtime_status_response)?;
-    queued.state = QueuedInputState::Forwarded.as_str().to_owned();
     Ok(Json(json!({
         "queued_input": queued,
         "decision": queue_decision.explain_json(),
+        "queue_outcome": forwarded_outcome,
         "policy": queue_decision.policy.snapshot_json(),
         "contract": contract_descriptor(),
     })))
@@ -3623,11 +3758,16 @@ pub(crate) async fn console_chat_queue_drain_handler(
         .unwrap_or_else(|| "queue_drained_by_operator".to_owned());
     let pending_inputs = snapshot.pending_inputs();
     for queued in &pending_inputs {
+        let outcome =
+            queued_record_outcome(queued, QueuedInputState::Cancelled, false, reason.as_str());
         state
             .runtime
             .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
                 queued_input_id: queued.queued_input_id.clone(),
+                expected_state: queued.state.clone(),
+                expected_revision: queued.lifecycle_revision,
                 state: QueuedInputState::Cancelled.as_str().to_owned(),
+                claimed_active_generation: None,
                 overflow_summary_ref: None,
                 decision_reason: Some(reason.clone()),
                 explain_json: Some(
@@ -3638,6 +3778,9 @@ pub(crate) async fn console_chat_queue_drain_handler(
                     })
                     .to_string(),
                 ),
+                queue_outcome_json: Some(serde_json::to_string(&outcome).map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(error.to_string()))
+                })?),
             })
             .await
             .map_err(runtime_status_response)?;
@@ -3702,7 +3845,10 @@ pub(crate) async fn console_chat_queue_cancel_handler(
                 "queued input not found: {queued_input_id}"
             )))
         })?;
-    if queued.state != QueuedInputState::Pending.as_str() {
+    if !matches!(
+        QueuedInputState::parse(queued.state.as_str()),
+        Some(QueuedInputState::Pending | QueuedInputState::Deferred)
+    ) {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "only pending queued inputs can be cancelled",
         )));
@@ -3711,11 +3857,16 @@ pub(crate) async fn console_chat_queue_cancel_handler(
         .reason
         .and_then(trim_to_option)
         .unwrap_or_else(|| "queued_input_cancelled_by_operator".to_owned());
+    let outcome =
+        queued_record_outcome(queued, QueuedInputState::Cancelled, false, reason.as_str());
     state
         .runtime
         .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
             queued_input_id: queued_input_id.clone(),
+            expected_state: queued.state.clone(),
+            expected_revision: queued.lifecycle_revision,
             state: QueuedInputState::Cancelled.as_str().to_owned(),
+            claimed_active_generation: None,
             overflow_summary_ref: None,
             decision_reason: Some(reason.clone()),
             explain_json: Some(
@@ -3726,6 +3877,9 @@ pub(crate) async fn console_chat_queue_cancel_handler(
                 })
                 .to_string(),
             ),
+            queue_outcome_json: Some(serde_json::to_string(&outcome).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(error.to_string()))
+            })?),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -3790,7 +3944,10 @@ pub(crate) async fn console_chat_queue_reject_handler(
                 "queued input not found: {queued_input_id}"
             )))
         })?;
-    if queued.state != QueuedInputState::Pending.as_str() {
+    if !matches!(
+        QueuedInputState::parse(queued.state.as_str()),
+        Some(QueuedInputState::Pending | QueuedInputState::Deferred)
+    ) {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "only pending queued inputs can be rejected",
         )));
@@ -3799,11 +3956,15 @@ pub(crate) async fn console_chat_queue_reject_handler(
         .reason
         .and_then(trim_to_option)
         .unwrap_or_else(|| "queued_input_rejected_by_operator".to_owned());
+    let outcome = queued_record_outcome(queued, QueuedInputState::Rejected, false, reason.as_str());
     state
         .runtime
         .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
             queued_input_id: queued_input_id.clone(),
+            expected_state: queued.state.clone(),
+            expected_revision: queued.lifecycle_revision,
             state: QueuedInputState::Rejected.as_str().to_owned(),
+            claimed_active_generation: None,
             overflow_summary_ref: None,
             decision_reason: Some(reason.clone()),
             explain_json: Some(
@@ -3814,6 +3975,9 @@ pub(crate) async fn console_chat_queue_reject_handler(
                 })
                 .to_string(),
             ),
+            queue_outcome_json: Some(serde_json::to_string(&outcome).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(error.to_string()))
+            })?),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -3983,6 +4147,8 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
     let run_id = pending_inputs.first().map(|queued| queued.run_id.clone()).ok_or_else(|| {
         runtime_status_response(tonic::Status::internal("pending queue vanished"))
     })?;
+    let expected_active_generation =
+        pending_inputs.first().and_then(|queued| queued.expected_active_generation);
     let explain_json = json!({
         "decision": "merge",
         "mode": QueueMode::Collect.as_str(),
@@ -3992,6 +4158,16 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
         "policy": snapshot.policy.snapshot_json(),
         "summary": collect_summary.provenance_json,
     });
+    let summary_outcome = queue_outcome(
+        queued_input_id.clone(),
+        QueuedInputState::Pending,
+        QueuedInputDeliveryBoundary::BacklogSummary,
+        expected_active_generation.and_then(|value| u64::try_from(value).ok()),
+        expected_active_generation.and_then(|value| u64::try_from(value).ok()),
+        true,
+        reason.clone(),
+    );
+    let summary_attachments_json = collect_summary.attachment_refs_json.to_string();
     let summary_input = state
         .runtime
         .create_orchestrator_queued_input(journal::OrchestratorQueuedInputCreateRequest {
@@ -4002,12 +4178,18 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
             text: collect_summary.text,
             origin_run_id: Some(run_id),
             queue_mode: QueueMode::Collect.as_str().to_owned(),
+            delivery_boundary: QueuedInputDeliveryBoundary::BacklogSummary.as_str().to_owned(),
+            expected_active_generation,
             priority_lane: snapshot.policy.priority_lane.clone(),
             coalescing_group: Some(snapshot.policy.coalescing_group.clone()),
             overflow_summary_ref: Some(summary_ref.clone()),
             safe_boundary_flags_json: serde_json::to_string(&snapshot.safe_boundary)
                 .unwrap_or_else(|_| "{}".to_owned()),
             decision_reason: reason.clone(),
+            attachments_json: summary_attachments_json,
+            queue_outcome_json: serde_json::to_string(&summary_outcome).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(error.to_string()))
+            })?,
             accepted_at_unix_ms: Some(timestamp_unix_ms),
             policy_snapshot_json: snapshot.policy.snapshot_json().to_string(),
             explain_json: explain_json.to_string(),
@@ -4015,14 +4197,22 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
         .await
         .map_err(runtime_status_response)?;
     for queued in &pending_inputs {
+        let outcome =
+            queued_record_outcome(queued, QueuedInputState::Merged, false, reason.as_str());
         state
             .runtime
             .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
                 queued_input_id: queued.queued_input_id.clone(),
+                expected_state: queued.state.clone(),
+                expected_revision: queued.lifecycle_revision,
                 state: QueuedInputState::Merged.as_str().to_owned(),
+                claimed_active_generation: None,
                 overflow_summary_ref: Some(summary_ref.clone()),
                 decision_reason: Some(reason.clone()),
                 explain_json: Some(explain_json.to_string()),
+                queue_outcome_json: Some(serde_json::to_string(&outcome).map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(error.to_string()))
+                })?),
             })
             .await
             .map_err(runtime_status_response)?;
@@ -4968,10 +5158,49 @@ impl ConsoleSessionQueueSnapshot {
     fn pending_inputs(&self) -> Vec<journal::OrchestratorQueuedInputRecord> {
         self.queued_inputs
             .iter()
-            .filter(|queued| queued.state == QueuedInputState::Pending.as_str())
+            .filter(|queued| {
+                matches!(
+                    QueuedInputState::parse(queued.state.as_str()),
+                    Some(QueuedInputState::Pending | QueuedInputState::Deferred)
+                )
+            })
             .cloned()
             .collect()
     }
+}
+
+fn queued_record_outcome(
+    queued: &journal::OrchestratorQueuedInputRecord,
+    lifecycle_state: QueuedInputState,
+    accepted: bool,
+    reason_code: &str,
+) -> palyra_common::runtime_contracts::QueueOutcome {
+    let delivery_boundary = QueuedInputDeliveryBoundary::parse(queued.delivery_boundary.as_str())
+        .unwrap_or_else(|| {
+            match QueueMode::parse(queued.queue_mode.as_str()).unwrap_or(QueueMode::Followup) {
+                QueueMode::Followup => QueuedInputDeliveryBoundary::NextTurn,
+                QueueMode::Steer => QueuedInputDeliveryBoundary::CurrentRunBeforeProvider,
+                QueueMode::Interrupt => QueuedInputDeliveryBoundary::CancelThenNextTurn,
+                QueueMode::Collect | QueueMode::SteerBacklog => {
+                    QueuedInputDeliveryBoundary::BacklogSummary
+                }
+            }
+        });
+    let expected_generation =
+        queued.expected_active_generation.and_then(|value| u64::try_from(value).ok());
+    let observed_generation = queued
+        .claimed_active_generation
+        .and_then(|value| u64::try_from(value).ok())
+        .or(expected_generation);
+    queue_outcome(
+        queued.queued_input_id.clone(),
+        lifecycle_state,
+        delivery_boundary,
+        expected_generation,
+        observed_generation,
+        accepted,
+        reason_code,
+    )
 }
 
 async fn load_console_session_queue_snapshot(
@@ -6583,13 +6812,17 @@ mod tests {
     use super::{
         build_background_task_cancel_requested_result_json,
         build_background_task_cancel_requested_update, build_background_task_cancelled_result_json,
-        build_background_task_cancelled_update, console_attachment_workspace_path,
-        console_background_task_budget_tokens, derive_canvas_transcript_reference,
-        derived_artifact_index_content, derived_artifact_matches_console_context,
-        extract_canvas_id_from_frame_reference, resolve_console_background_task_kind,
-        retry_parameter_delta_from_payload_or_run, run_matches_console_context,
+        build_background_task_cancelled_update, build_console_chat_message_envelope,
+        console_attachment_workspace_path, console_background_task_budget_tokens,
+        derive_canvas_transcript_reference, derived_artifact_index_content,
+        derived_artifact_matches_console_context, extract_canvas_id_from_frame_reference,
+        resolve_console_background_task_kind, retry_parameter_delta_from_payload_or_run,
+        run_matches_console_context,
     };
-    use crate::{domain::workspace::normalize_workspace_path, gateway, journal, media};
+    use crate::{
+        app::state::ConsoleSession, domain::workspace::normalize_workspace_path, gateway, journal,
+        media, transport::grpc::proto::palyra::common::v1 as common_v1,
+    };
     use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
 
     #[test]
@@ -6690,6 +6923,52 @@ mod tests {
                 .normalized_path,
             path
         );
+    }
+
+    #[test]
+    fn queued_followup_envelope_preserves_attachment_payload() {
+        let session = ConsoleSession {
+            session_token_hash_sha256: "hash".to_owned(),
+            csrf_token: "csrf".to_owned(),
+            context: gateway::RequestContext {
+                principal: "admin:web-console".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("web".to_owned()),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+        };
+        let attachment_id = "01ARZ3NDEKTSV4RRFFQ69G5FB7";
+        let attachment = common_v1::MessageAttachment {
+            kind: common_v1::message_attachment::AttachmentKind::File as i32,
+            artifact_id: Some(common_v1::CanonicalId { ulid: attachment_id.to_owned() }),
+            size_bytes: 7,
+            attachment_id: attachment_id.to_owned(),
+            filename: "notes.txt".to_owned(),
+            declared_content_type: "text/plain".to_owned(),
+            source_url: String::new(),
+            content_hash: "sha256:test".to_owned(),
+            origin: "console_chat_upload".to_owned(),
+            policy_context: "attachment.upload.allowed".to_owned(),
+            inline_bytes: b"followup".to_vec(),
+            upload_requested: true,
+            width_px: 0,
+            height_px: 0,
+        };
+
+        let envelope = build_console_chat_message_envelope(
+            &session,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB8",
+            "continue with the attachment".to_owned(),
+            3,
+            vec![attachment],
+        );
+        let content = envelope.content.expect("followup envelope should contain content");
+
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].attachment_id, attachment_id);
+        assert_eq!(content.attachments[0].inline_bytes, b"followup");
+        assert_eq!(content.attachments[0].origin, "console_chat_upload");
     }
 
     #[test]

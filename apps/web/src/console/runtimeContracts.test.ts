@@ -9,6 +9,7 @@ import {
   normalizePruningPolicyClass,
   normalizeQueueDecision,
   normalizeQueueMode,
+  normalizeQueuedInputDeliveryBoundary,
   normalizeQueuedInputState,
   normalizeWorkerLifecycleState,
 } from "./runtimeContracts";
@@ -26,6 +27,14 @@ describe("runtimeContracts", () => {
     expect(normalizeAuxiliaryTaskKind("post_run_reflection")).toBe("post_run_reflection");
     expect(normalizeAuxiliaryTaskState("cancel_requested")).toBe("cancel_requested");
     expect(normalizeQueuedInputState("delivery_failed")).toBe("delivery_failed");
+    expect(normalizeQueuedInputState("claimed")).toBe("claimed");
+    expect(normalizeQueuedInputState("injected")).toBe("injected");
+    expect(normalizeQueuedInputState("deferred")).toBe("deferred");
+    expect(normalizeQueuedInputState("superseded")).toBe("superseded");
+    expect(normalizeQueuedInputState("rejected")).toBe("rejected");
+    expect(normalizeQueuedInputDeliveryBoundary("cancel_then_next_turn")).toBe(
+      "cancel_then_next_turn",
+    );
     expect(normalizeFlowState("waiting_for_approval")).toBe("waiting_for_approval");
     expect(normalizeFlowStepState("compensated")).toBe("compensated");
     expect(normalizeDeliveryPolicy("merge_progress_updates")).toBe("merge_progress_updates");
@@ -44,6 +53,9 @@ describe("runtimeContracts", () => {
     expect(normalizeAuxiliaryTaskKind("reflection")).toBe("post_run_reflection");
     expect(normalizeAuxiliaryTaskState("pending")).toBe("queued");
     expect(normalizeQueuedInputState("delivered")).toBe("forwarded");
+    expect(normalizeQueuedInputDeliveryBoundary(undefined, "steer")).toBe(
+      "current_run_before_provider",
+    );
     expect(normalizeFlowState("approval_wait")).toBe("waiting_for_approval");
     expect(normalizeFlowStepState("timeout")).toBe("timed_out");
     expect(normalizeDeliveryPolicy("prefer_child_terminal")).toBe("prefer_terminal_descendant");

@@ -68,6 +68,7 @@ pub(crate) fn project_orchestrator_tape_record(
         "tool_result" => project_tool_result(payload),
         "provider.recovery.decision" => project_provider_recovery(payload),
         "provider.turn_recovery.decision" => project_provider_turn_recovery(payload),
+        "turn_control.active_run_steering.injected" => project_queue_outcome(payload),
         "run.recovery" => project_run_recovery(payload),
         "message.replied" => project_delivery_intent(record, context),
         "status" => project_terminal_status(payload),
@@ -699,6 +700,40 @@ fn project_provider_turn_recovery(payload: &Map<String, Value>) -> Option<Projec
         _ => return None,
     };
     recovery_event(payload, strategy)
+}
+
+fn project_queue_outcome(payload: &Map<String, Value>) -> Option<ProjectedEvent> {
+    if payload.get("event")?.as_str()? != "turn_control.active_run_steering.injected" {
+        return None;
+    }
+    let queued_inputs = payload.get("queued_inputs")?.as_array()?;
+    let declared_count = payload.get("queued_input_count")?.as_u64()?;
+    if queued_inputs.is_empty()
+        || queued_inputs.len() > 64
+        || declared_count != u64::try_from(queued_inputs.len()).ok()?
+    {
+        return None;
+    }
+    for queued_input in queued_inputs {
+        let outcome = queued_input.as_object()?.get("queue_outcome")?.as_object()?;
+        if outcome.get("lifecycle_state")?.as_str()? != "injected"
+            || outcome.get("reason_code")?.as_str()? != "queue.active_run.injected"
+        {
+            return None;
+        }
+        match outcome.get("delivery_boundary")?.as_str()? {
+            "current_run_before_provider" | "cancel_then_next_turn" => {}
+            _ => return None,
+        }
+    }
+    Some(ProjectedEvent {
+        event: MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+            strategy: MetadataTraceRecoveryStrategyV1::IdempotencyGuard,
+            attempt: 1,
+            reason_code: "queue.active_run.injected".to_owned(),
+        }),
+        stage_duration_ms: None,
+    })
 }
 
 fn recovery_event(

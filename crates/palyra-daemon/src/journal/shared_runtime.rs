@@ -2268,6 +2268,26 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored_state = transaction
+            .query_row(
+                "SELECT state FROM orchestrator_runs WHERE run_ulid = ?1 AND session_ulid = ?2",
+                params![run_id, session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if !stored_state.as_deref().is_some_and(|state| {
+            matches!(
+                crate::orchestrator::RunLifecycleState::from_str(state),
+                Some(
+                    crate::orchestrator::RunLifecycleState::Accepted
+                        | crate::orchestrator::RunLifecycleState::InProgress
+                )
+            )
+        }) {
+            return Err(JournalError::InvalidArgument(format!(
+                "run generation supersession requires active run {run_id}"
+            )));
+        }
         let active = load_generation_tx(&transaction, session_id, RuntimeGenerationLane::Run)?
             .filter(|lease| now < lease.expires_at_unix_ms)
             .ok_or_else(|| {

@@ -36,7 +36,7 @@ use palyra_common::qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFault
 use palyra_common::runtime_contracts::{
     ArtifactReadResponse, ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState,
     CancellationContextV1, CancellationScopeKind, FlowState, IdempotencyOperationState,
-    IdempotencyRecordSnapshot, IdempotencyReplayDecision, RunLifecyclePhase,
+    IdempotencyRecordSnapshot, IdempotencyReplayDecision, QueuedInputState, RunLifecyclePhase,
     RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, RuntimeEventEnvelopeV2,
     RuntimeEventId, RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration,
     RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
@@ -46,7 +46,7 @@ use palyra_common::runtime_contracts::{
 };
 use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use rusqlite::{
-    params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql,
+    params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, Row, ToSql,
     Transaction, TransactionBehavior,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -2520,6 +2520,12 @@ pub struct OrchestratorQueuedInputRecord {
     pub session_id: String,
     pub state: String,
     pub queue_mode: String,
+    pub delivery_boundary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_active_generation: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_active_generation: Option<i64>,
+    pub lifecycle_revision: i64,
     pub priority_lane: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coalescing_group: Option<String>,
@@ -2528,6 +2534,8 @@ pub struct OrchestratorQueuedInputRecord {
     pub safe_boundary_flags_json: String,
     pub decision_reason: String,
     pub text: String,
+    pub attachments_json: String,
+    pub queue_outcome_json: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_at_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4050,11 +4058,15 @@ pub struct OrchestratorQueuedInputCreateRequest {
     pub text: String,
     pub origin_run_id: Option<String>,
     pub queue_mode: String,
+    pub delivery_boundary: String,
+    pub expected_active_generation: Option<i64>,
     pub priority_lane: String,
     pub coalescing_group: Option<String>,
     pub overflow_summary_ref: Option<String>,
     pub safe_boundary_flags_json: String,
     pub decision_reason: String,
+    pub attachments_json: String,
+    pub queue_outcome_json: String,
     pub accepted_at_unix_ms: Option<i64>,
     pub policy_snapshot_json: String,
     pub explain_json: String,
@@ -4064,10 +4076,14 @@ pub struct OrchestratorQueuedInputCreateRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputUpdateRequest {
     pub queued_input_id: String,
+    pub expected_state: String,
+    pub expected_revision: i64,
     pub state: String,
+    pub claimed_active_generation: Option<i64>,
     pub overflow_summary_ref: Option<String>,
     pub decision_reason: Option<String>,
     pub explain_json: Option<String>,
+    pub queue_outcome_json: Option<String>,
 }
 
 /// Pause/resume update for a session's input queue.
@@ -4882,6 +4898,16 @@ pub enum JournalError {
     MetadataTraceInvariant { run_id: String, reason_code: &'static str },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
     SessionIdentityMismatch { session_id: String },
+    #[error(
+        "queued input transition conflict for {queued_input_id}: expected {expected_state}@{expected_revision}, found {actual_state}@{actual_revision}"
+    )]
+    QueuedInputTransitionConflict {
+        queued_input_id: String,
+        expected_state: String,
+        expected_revision: i64,
+        actual_state: String,
+        actual_revision: i64,
+    },
     #[error(
         "run admission idempotency key {idempotency_key} in scope {idempotency_scope} conflicts with durable request evidence"
     )]
@@ -7364,6 +7390,42 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "provider_attempt_outcome_unknown",
         sql: shared_runtime::MIGRATION_77_SQL,
+    },
+    Migration {
+        version: 78,
+        name: "session_queue_exact_delivery",
+        sql: r#"
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN delivery_boundary TEXT NOT NULL DEFAULT 'next_turn';
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN expected_active_generation INTEGER;
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN claimed_active_generation INTEGER;
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN lifecycle_revision INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE orchestrator_queued_inputs
+                ADD COLUMN queue_outcome_json TEXT NOT NULL DEFAULT '{}';
+
+            UPDATE orchestrator_queued_inputs
+            SET delivery_boundary = CASE queue_mode
+                WHEN 'steer' THEN 'current_run_before_provider'
+                WHEN 'interrupt' THEN 'cancel_then_next_turn'
+                WHEN 'collect' THEN 'backlog_summary'
+                WHEN 'steer_backlog' THEN 'backlog_summary'
+                ELSE 'next_turn'
+            END;
+
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_queued_inputs_delivery
+                ON orchestrator_queued_inputs(
+                    session_ulid,
+                    state,
+                    delivery_boundary,
+                    expected_active_generation,
+                    created_at_unix_ms
+                );
+        "#,
     },
 ];
 
@@ -15918,12 +15980,15 @@ impl JournalStore {
         request: &OrchestratorQueuedInputCreateRequest,
     ) -> Result<OrchestratorQueuedInputRecord, JournalError> {
         let now = current_unix_ms()?;
+        let queued_state = QueuedInputState::parse(request.state.as_str()).ok_or_else(|| {
+            JournalError::InvalidArgument(format!("unknown queued input state: {}", request.state))
+        })?;
         let coalesced_at_unix_ms = if matches!(request.state.as_str(), "merged" | "overflowed") {
             Some(now)
         } else {
             None
         };
-        let terminal_at_unix_ms = if request.state == "pending" { None } else { Some(now) };
+        let terminal_at_unix_ms = queued_state.is_terminal().then_some(now);
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         guard.execute(
             r#"
@@ -15933,23 +15998,31 @@ impl JournalStore {
                     session_ulid,
                     state,
                     queue_mode,
+                    delivery_boundary,
+                    expected_active_generation,
+                    claimed_active_generation,
+                    lifecycle_revision,
                     priority_lane,
                     coalescing_group,
                     overflow_summary_ref,
                     safe_boundary_flags_json,
                     decision_reason,
                     text,
+                    attachments_json,
+                    queue_outcome_json,
                     origin_run_ulid,
                     accepted_at_unix_ms,
                     coalesced_at_unix_ms,
+                    forwarded_at_unix_ms,
                     terminal_at_unix_ms,
                     policy_snapshot_json,
                     explain_json,
                     created_at_unix_ms,
                     updated_at_unix_ms
                 ) VALUES (
-                    ?1, ?2, ?3, ?4,
-                    ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0,
+                    ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, NULL, ?19, ?20, ?21, ?22, ?22
                 )
             "#,
             params![
@@ -15958,12 +16031,16 @@ impl JournalStore {
                 request.session_id,
                 request.state,
                 request.queue_mode,
+                request.delivery_boundary,
+                request.expected_active_generation,
                 request.priority_lane,
                 request.coalescing_group,
                 request.overflow_summary_ref,
                 request.safe_boundary_flags_json,
                 request.decision_reason,
                 request.text,
+                request.attachments_json,
+                request.queue_outcome_json,
                 request.origin_run_id,
                 request.accepted_at_unix_ms,
                 coalesced_at_unix_ms,
@@ -15979,12 +16056,18 @@ impl JournalStore {
             session_id: request.session_id.clone(),
             state: request.state.clone(),
             queue_mode: request.queue_mode.clone(),
+            delivery_boundary: request.delivery_boundary.clone(),
+            expected_active_generation: request.expected_active_generation,
+            claimed_active_generation: None,
+            lifecycle_revision: 0,
             priority_lane: request.priority_lane.clone(),
             coalescing_group: request.coalescing_group.clone(),
             overflow_summary_ref: request.overflow_summary_ref.clone(),
             safe_boundary_flags_json: request.safe_boundary_flags_json.clone(),
             decision_reason: request.decision_reason.clone(),
             text: request.text.clone(),
+            attachments_json: request.attachments_json.clone(),
+            queue_outcome_json: request.queue_outcome_json.clone(),
             accepted_at_unix_ms: request.accepted_at_unix_ms,
             coalesced_at_unix_ms,
             forwarded_at_unix_ms: None,
@@ -15997,27 +16080,48 @@ impl JournalStore {
         })
     }
 
-    /// Updates a queued input's state and decision metadata; unknown ids are a
-    /// silent no-op.
+    /// Compares and sets a queued input's lifecycle state and decision metadata.
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
     pub fn update_orchestrator_queued_input_state(
         &self,
         request: &OrchestratorQueuedInputUpdateRequest,
-    ) -> Result<(), JournalError> {
+    ) -> Result<OrchestratorQueuedInputRecord, JournalError> {
+        let target_state = QueuedInputState::parse(request.state.as_str()).ok_or_else(|| {
+            JournalError::InvalidArgument(format!("unknown queued input state: {}", request.state))
+        })?;
+        let expected_state =
+            QueuedInputState::parse(request.expected_state.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "unknown expected queued input state: {}",
+                    request.expected_state
+                ))
+            })?;
+        if !queued_input_transition_allowed(expected_state, target_state) {
+            return Err(JournalError::InvalidArgument(format!(
+                "invalid queued input transition: {} -> {}",
+                expected_state.as_str(),
+                target_state.as_str()
+            )));
+        }
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = transaction.execute(
             r#"
                 UPDATE orchestrator_queued_inputs
                 SET
                     state = ?2,
-                    overflow_summary_ref = COALESCE(?4, overflow_summary_ref),
-                    decision_reason = COALESCE(?5, decision_reason),
-                    explain_json = COALESCE(?6, explain_json),
+                    claimed_active_generation = COALESCE(?4, claimed_active_generation),
+                    overflow_summary_ref = COALESCE(?5, overflow_summary_ref),
+                    decision_reason = COALESCE(?6, decision_reason),
+                    explain_json = COALESCE(?7, explain_json),
+                    queue_outcome_json = COALESCE(?8, queue_outcome_json),
+                    lifecycle_revision = lifecycle_revision + 1,
                     forwarded_at_unix_ms = CASE
-                        WHEN ?2 = 'forwarded' THEN COALESCE(forwarded_at_unix_ms, ?3)
+                        WHEN ?2 IN ('forwarded', 'injected')
+                        THEN COALESCE(forwarded_at_unix_ms, ?3)
                         ELSE forwarded_at_unix_ms
                     END,
                     coalesced_at_unix_ms = CASE
@@ -16025,22 +16129,91 @@ impl JournalStore {
                         ELSE coalesced_at_unix_ms
                     END,
                     terminal_at_unix_ms = CASE
-                        WHEN ?2 <> 'pending' THEN COALESCE(terminal_at_unix_ms, ?3)
+                        WHEN ?9 = 1 THEN COALESCE(terminal_at_unix_ms, ?3)
                         ELSE terminal_at_unix_ms
                     END,
                     updated_at_unix_ms = ?3
                 WHERE queued_input_ulid = ?1
+                  AND state = ?10
+                  AND lifecycle_revision = ?11
             "#,
             params![
                 request.queued_input_id,
                 request.state,
                 now,
+                request.claimed_active_generation,
                 request.overflow_summary_ref.as_deref(),
                 request.decision_reason.as_deref(),
                 request.explain_json.as_deref(),
+                request.queue_outcome_json.as_deref(),
+                i64::from(target_state.is_terminal()),
+                request.expected_state,
+                request.expected_revision,
             ],
         )?;
-        Ok(())
+        if rows == 0 {
+            let actual = transaction
+                .query_row(
+                    r#"
+                        SELECT state, lifecycle_revision
+                        FROM orchestrator_queued_inputs
+                        WHERE queued_input_ulid = ?1
+                    "#,
+                    params![request.queued_input_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((actual_state, actual_revision)) = actual else {
+                return Err(JournalError::InvalidArgument(format!(
+                    "queued input not found: {}",
+                    request.queued_input_id
+                )));
+            };
+            return Err(JournalError::QueuedInputTransitionConflict {
+                queued_input_id: request.queued_input_id.clone(),
+                expected_state: request.expected_state.clone(),
+                expected_revision: request.expected_revision,
+                actual_state,
+                actual_revision,
+            });
+        }
+        let updated = transaction.query_row(
+            r#"
+                SELECT
+                    queued_input_ulid,
+                    run_ulid,
+                    session_ulid,
+                    state,
+                    queue_mode,
+                    delivery_boundary,
+                    expected_active_generation,
+                    claimed_active_generation,
+                    lifecycle_revision,
+                    priority_lane,
+                    coalescing_group,
+                    overflow_summary_ref,
+                    safe_boundary_flags_json,
+                    decision_reason,
+                    text,
+                    attachments_json,
+                    queue_outcome_json,
+                    accepted_at_unix_ms,
+                    coalesced_at_unix_ms,
+                    forwarded_at_unix_ms,
+                    terminal_at_unix_ms,
+                    policy_snapshot_json,
+                    explain_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    origin_run_ulid
+                FROM orchestrator_queued_inputs
+                WHERE queued_input_ulid = ?1
+            "#,
+            params![request.queued_input_id],
+            map_orchestrator_queued_input_row,
+        )?;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     /// Moves a queued input to the given priority lane with an updated decision
@@ -16051,6 +16224,7 @@ impl JournalStore {
     pub fn prioritize_orchestrator_queued_input(
         &self,
         queued_input_id: &str,
+        expected_revision: i64,
         priority_lane: &str,
         decision_reason: &str,
         explain_json: &str,
@@ -16064,11 +16238,20 @@ impl JournalStore {
                     priority_lane = ?2,
                     decision_reason = ?3,
                     explain_json = ?4,
+                    lifecycle_revision = lifecycle_revision + 1,
                     updated_at_unix_ms = ?5
                 WHERE queued_input_ulid = ?1
                   AND state = 'pending'
+                  AND lifecycle_revision = ?6
             "#,
-            params![queued_input_id, priority_lane, decision_reason, explain_json, now],
+            params![
+                queued_input_id,
+                priority_lane,
+                decision_reason,
+                explain_json,
+                now,
+                expected_revision,
+            ],
         )?;
         if rows == 0 {
             return Err(JournalError::InvalidArgument(format!(
@@ -16076,6 +16259,55 @@ impl JournalStore {
             )));
         }
         Ok(())
+    }
+
+    /// Loads one queued input by its durable identity.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn orchestrator_queued_input_by_id(
+        &self,
+        queued_input_id: &str,
+    ) -> Result<Option<OrchestratorQueuedInputRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT
+                        queued_input_ulid,
+                        run_ulid,
+                        session_ulid,
+                        state,
+                        queue_mode,
+                        delivery_boundary,
+                        expected_active_generation,
+                        claimed_active_generation,
+                        lifecycle_revision,
+                        priority_lane,
+                        coalescing_group,
+                        overflow_summary_ref,
+                        safe_boundary_flags_json,
+                        decision_reason,
+                        text,
+                        attachments_json,
+                        queue_outcome_json,
+                        accepted_at_unix_ms,
+                        coalesced_at_unix_ms,
+                        forwarded_at_unix_ms,
+                        terminal_at_unix_ms,
+                        policy_snapshot_json,
+                        explain_json,
+                        created_at_unix_ms,
+                        updated_at_unix_ms,
+                        origin_run_ulid
+                    FROM orchestrator_queued_inputs
+                    WHERE queued_input_ulid = ?1
+                "#,
+                params![queued_input_id],
+                map_orchestrator_queued_input_row,
+            )
+            .optional()
+            .map_err(JournalError::from)
     }
 
     /// Returns a session's queue pause state, if recorded.
@@ -16163,12 +16395,18 @@ impl JournalStore {
                     session_ulid,
                     state,
                     queue_mode,
+                    delivery_boundary,
+                    expected_active_generation,
+                    claimed_active_generation,
+                    lifecycle_revision,
                     priority_lane,
                     coalescing_group,
                     overflow_summary_ref,
                     safe_boundary_flags_json,
                     decision_reason,
                     text,
+                    attachments_json,
+                    queue_outcome_json,
                     accepted_at_unix_ms,
                     coalesced_at_unix_ms,
                     forwarded_at_unix_ms,
@@ -16186,28 +16424,7 @@ impl JournalStore {
         let mut rows = statement.query(params![session_id])?;
         let mut records = Vec::new();
         while let Some(row) = rows.next()? {
-            records.push(OrchestratorQueuedInputRecord {
-                queued_input_id: row.get(0)?,
-                run_id: row.get(1)?,
-                session_id: row.get(2)?,
-                state: row.get(3)?,
-                queue_mode: row.get(4)?,
-                priority_lane: row.get(5)?,
-                coalescing_group: row.get(6)?,
-                overflow_summary_ref: row.get(7)?,
-                safe_boundary_flags_json: row.get(8)?,
-                decision_reason: row.get(9)?,
-                text: row.get(10)?,
-                accepted_at_unix_ms: row.get(11)?,
-                coalesced_at_unix_ms: row.get(12)?,
-                forwarded_at_unix_ms: row.get(13)?,
-                terminal_at_unix_ms: row.get(14)?,
-                policy_snapshot_json: row.get(15)?,
-                explain_json: row.get(16)?,
-                created_at_unix_ms: row.get(17)?,
-                updated_at_unix_ms: row.get(18)?,
-                origin_run_id: row.get(19)?,
-            });
+            records.push(map_orchestrator_queued_input_row(row)?);
         }
         Ok(records)
     }
@@ -27518,6 +27735,73 @@ fn map_orchestrator_session_row(
     })
 }
 
+fn map_orchestrator_queued_input_row(
+    row: &Row<'_>,
+) -> Result<OrchestratorQueuedInputRecord, rusqlite::Error> {
+    Ok(OrchestratorQueuedInputRecord {
+        queued_input_id: row.get(0)?,
+        run_id: row.get(1)?,
+        session_id: row.get(2)?,
+        state: row.get(3)?,
+        queue_mode: row.get(4)?,
+        delivery_boundary: row.get(5)?,
+        expected_active_generation: row.get(6)?,
+        claimed_active_generation: row.get(7)?,
+        lifecycle_revision: row.get(8)?,
+        priority_lane: row.get(9)?,
+        coalescing_group: row.get(10)?,
+        overflow_summary_ref: row.get(11)?,
+        safe_boundary_flags_json: row.get(12)?,
+        decision_reason: row.get(13)?,
+        text: row.get(14)?,
+        attachments_json: row.get(15)?,
+        queue_outcome_json: row.get(16)?,
+        accepted_at_unix_ms: row.get(17)?,
+        coalesced_at_unix_ms: row.get(18)?,
+        forwarded_at_unix_ms: row.get(19)?,
+        terminal_at_unix_ms: row.get(20)?,
+        policy_snapshot_json: row.get(21)?,
+        explain_json: row.get(22)?,
+        created_at_unix_ms: row.get(23)?,
+        updated_at_unix_ms: row.get(24)?,
+        origin_run_id: row.get(25)?,
+    })
+}
+
+const fn queued_input_transition_allowed(from: QueuedInputState, to: QueuedInputState) -> bool {
+    match from {
+        QueuedInputState::Pending | QueuedInputState::Deferred => matches!(
+            to,
+            QueuedInputState::Claimed
+                | QueuedInputState::Deferred
+                | QueuedInputState::Merged
+                | QueuedInputState::Overflowed
+                | QueuedInputState::Rejected
+                | QueuedInputState::Cancelled
+                | QueuedInputState::Superseded
+        ),
+        QueuedInputState::Claimed => matches!(
+            to,
+            QueuedInputState::Injected
+                | QueuedInputState::Forwarded
+                | QueuedInputState::DeliveryFailed
+                | QueuedInputState::Deferred
+                | QueuedInputState::Superseded
+                | QueuedInputState::Cancelled
+        ),
+        QueuedInputState::Injected
+        | QueuedInputState::Forwarded
+        | QueuedInputState::DeliveryFailed
+        | QueuedInputState::Merged
+        | QueuedInputState::Steered
+        | QueuedInputState::Interrupted
+        | QueuedInputState::Superseded
+        | QueuedInputState::Overflowed
+        | QueuedInputState::Rejected
+        | QueuedInputState::Cancelled => false,
+    }
+}
+
 fn load_session_project_context_state(
     connection: &Connection,
     session_id: &str,
@@ -32862,7 +33146,7 @@ mod tests {
             CleanupStepKind, CleanupStepRecord, GenerationCheckDisposition, HealthProbeDisposition,
             HealthProbeLeaseV1, HealthProbeResult, HealthProbeSettlementV1,
             IdempotencyOperationState, IdempotencyReplayDecision, ProcessLeaseV1,
-            ProcessOwnershipKind, ProcessProvenance, QuarantineClearRequest,
+            ProcessOwnershipKind, ProcessProvenance, QuarantineClearRequest, QueuedInputState,
             ReconciliationStrategy, RunLifecyclePhase, RuntimeActorKind, RuntimeActorRef,
             RuntimeAttemptId, RuntimeAuthorityClass, RuntimeCausalLinkKind,
             RuntimeComponentHealthV1, RuntimeErrorPhase, RuntimeEventActorKind,
@@ -32919,12 +33203,13 @@ mod tests {
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
         OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
         OrchestratorCancelRequest, OrchestratorParentGenerationGuard,
-        OrchestratorQueuedInputCreateRequest, OrchestratorRunMetadataUpdateRequest,
-        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlementRequest,
-        OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorStartupBackgroundTaskRecoveryReport,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, PersistedProcessLeaseRecord,
-        ProgressDraftListFilter, ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
+        OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputUpdateRequest,
+        OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionPinCreateRequest,
+        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorStartupBackgroundTaskRecoveryReport, OrchestratorTapeAppendRequest,
+        OrchestratorUsageDelta, PersistedProcessLeaseRecord, ProgressDraftListFilter,
+        ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
         ProviderAttemptCompletionRequest, ProviderAttemptStartRequest,
         ProviderConfigurationAttemptCompletionOutcome,
         ProviderConfigurationAttemptCompletionRequest, ProviderConfigurationAttemptStartRequest,
@@ -34695,11 +34980,15 @@ mod tests {
                 text: "queue cap reached; input was not accepted".to_owned(),
                 origin_run_id: Some(run_id.to_owned()),
                 queue_mode: "collect".to_owned(),
+                delivery_boundary: "backlog_summary".to_owned(),
+                expected_active_generation: Some(1),
                 priority_lane: "normal".to_owned(),
                 coalescing_group: Some("session:queue-test".to_owned()),
                 overflow_summary_ref: Some("queue-summary:test".to_owned()),
                 safe_boundary_flags_json: "{}".to_owned(),
                 decision_reason: "queue_cap_reached_overflow_summary_required".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: r#"{"schema_version":1}"#.to_owned(),
                 accepted_at_unix_ms: None,
                 policy_snapshot_json: "{}".to_owned(),
                 explain_json: r#"{"accepted":false}"#.to_owned(),
@@ -34719,6 +35008,103 @@ mod tests {
             0,
             "overflow audit rows must not increase pending depth"
         );
+    }
+
+    #[test]
+    fn queued_input_transitions_are_compare_and_set_and_terminal_once() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5QB1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5QB2";
+        let queued_input_id = "01ARZ3NDEKTSV4RRFFQ69G5QB3";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let pending = store
+            .create_orchestrator_queued_input(&OrchestratorQueuedInputCreateRequest {
+                queued_input_id: queued_input_id.to_owned(),
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                state: QueuedInputState::Pending.as_str().to_owned(),
+                text: "apply the corrected constraint".to_owned(),
+                origin_run_id: Some(run_id.to_owned()),
+                queue_mode: "steer".to_owned(),
+                delivery_boundary: "current_run_before_provider".to_owned(),
+                expected_active_generation: Some(1),
+                priority_lane: "normal".to_owned(),
+                coalescing_group: Some("session:queue-cas".to_owned()),
+                overflow_summary_ref: None,
+                safe_boundary_flags_json: "{}".to_owned(),
+                decision_reason: "queue.steer.accepted".to_owned(),
+                attachments_json: "[]".to_owned(),
+                queue_outcome_json: r#"{"lifecycle_state":"pending"}"#.to_owned(),
+                accepted_at_unix_ms: Some(1),
+                policy_snapshot_json: "{}".to_owned(),
+                explain_json: "{}".to_owned(),
+            })
+            .expect("queued input should persist");
+
+        let claim_request = OrchestratorQueuedInputUpdateRequest {
+            queued_input_id: queued_input_id.to_owned(),
+            expected_state: pending.state.clone(),
+            expected_revision: pending.lifecycle_revision,
+            state: QueuedInputState::Claimed.as_str().to_owned(),
+            claimed_active_generation: Some(1),
+            overflow_summary_ref: None,
+            decision_reason: Some("queue.active_run.claimed".to_owned()),
+            explain_json: None,
+            queue_outcome_json: Some(r#"{"lifecycle_state":"claimed"}"#.to_owned()),
+        };
+        let claimed = store
+            .update_orchestrator_queued_input_state(&claim_request)
+            .expect("pending input should be claimed");
+        assert_eq!(claimed.lifecycle_revision, 1);
+        assert_eq!(claimed.state, QueuedInputState::Claimed.as_str());
+        assert_eq!(claimed.claimed_active_generation, Some(1));
+        assert_eq!(claimed.terminal_at_unix_ms, None);
+
+        let stale_error = store
+            .update_orchestrator_queued_input_state(&claim_request)
+            .expect_err("the stale claim must lose the compare-and-set race");
+        assert!(matches!(
+            stale_error,
+            JournalError::QueuedInputTransitionConflict {
+                expected_revision: 0,
+                actual_revision: 1,
+                ..
+            }
+        ));
+
+        let injected = store
+            .update_orchestrator_queued_input_state(&OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued_input_id.to_owned(),
+                expected_state: claimed.state.clone(),
+                expected_revision: claimed.lifecycle_revision,
+                state: QueuedInputState::Injected.as_str().to_owned(),
+                claimed_active_generation: None,
+                overflow_summary_ref: None,
+                decision_reason: Some("queue.active_run.injected".to_owned()),
+                explain_json: None,
+                queue_outcome_json: Some(r#"{"lifecycle_state":"injected"}"#.to_owned()),
+            })
+            .expect("claimed input should inject exactly once");
+        assert_eq!(injected.lifecycle_revision, 2);
+        assert!(injected.terminal_at_unix_ms.is_some());
+
+        let terminal_error = store
+            .update_orchestrator_queued_input_state(&OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued_input_id.to_owned(),
+                expected_state: injected.state,
+                expected_revision: injected.lifecycle_revision,
+                state: QueuedInputState::Forwarded.as_str().to_owned(),
+                claimed_active_generation: None,
+                overflow_summary_ref: None,
+                decision_reason: None,
+                explain_json: None,
+                queue_outcome_json: None,
+            })
+            .expect_err("a terminal queue record must never reopen or change outcome");
+        assert!(matches!(terminal_error, JournalError::InvalidArgument(_)));
     }
 
     #[test]
@@ -37982,6 +38368,62 @@ mod tests {
             .expect("migration 77 marker should load");
         assert_eq!(completion_count, 2);
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn session_queue_exact_delivery_migration_backfills_legacy_boundaries() {
+        let db_path = temp_db_path();
+        create_journal_fixture_through(&db_path, 77);
+        let connection = Connection::open(&db_path).expect("v77 journal should open");
+        connection
+            .execute_batch(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid, principal, device_id,
+                        created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (
+                        'legacy_queue_session', 'user:legacy', 'device:legacy', 1, 1
+                    );
+                    INSERT INTO orchestrator_runs (
+                        run_ulid, session_ulid, state,
+                        created_at_unix_ms, started_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (
+                        'legacy_queue_run', 'legacy_queue_session', 'in_progress', 1, 1, 1
+                    );
+                    INSERT INTO orchestrator_queued_inputs (
+                        queued_input_ulid, run_ulid, session_ulid, state, text,
+                        origin_run_ulid, queue_mode, created_at_unix_ms, updated_at_unix_ms
+                    ) VALUES (
+                        'legacy_queue_input', 'legacy_queue_run', 'legacy_queue_session',
+                        'pending', 'redirect safely', 'legacy_queue_run', 'interrupt', 1, 1
+                    );
+                "#,
+            )
+            .expect("legacy queued input should insert");
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("v77 journal should upgrade through exact queue delivery");
+        let queued = store
+            .orchestrator_queued_input_by_id("legacy_queue_input")
+            .expect("migrated queue row should load")
+            .expect("legacy queue row should remain");
+        assert_eq!(queued.delivery_boundary, "cancel_then_next_turn");
+        assert_eq!(queued.expected_active_generation, None);
+        assert_eq!(queued.claimed_active_generation, None);
+        assert_eq!(queued.lifecycle_revision, 0);
+        assert_eq!(queued.attachments_json, "[]");
+        assert_eq!(queued.queue_outcome_json, "{}");
+
+        let connection = Connection::open(db_path).expect("migrated journal should reopen");
+        let applied: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 78 AND name = 'session_queue_exact_delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration 78 marker should load");
+        assert_eq!(applied, 1);
     }
 
     #[test]

@@ -1711,7 +1711,7 @@
     },
     "snapshot_version": "runtime-contracts.agent_hooks.v1"
   },
-  "changelog_note": "Adds generation-scoped harness attempt lifecycle events and canonical V2-to-public ordering correlation.",
+  "changelog_note": "Adds exact session-queue delivery boundaries, terminal lifecycle evidence, and interrupt-specific cancellation classification.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -3240,8 +3240,168 @@
     ]
   },
   "schema_version": 1,
+  "session_queue": {
+    "changelog_note": "Pins queue modes, delivery boundaries, lifecycle states, and the user-visible QueueOutcome shape used for exact active-run delivery.",
+    "decisions": [
+      {
+        "canonical": "enqueue",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "merge",
+        "deprecated_aliases": [
+          "coalesce"
+        ]
+      },
+      {
+        "canonical": "steer",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "steer_backlog",
+        "deprecated_aliases": [
+          "steer-backlog"
+        ]
+      },
+      {
+        "canonical": "interrupt",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "overflow",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "defer",
+        "deprecated_aliases": [
+          "deferred"
+        ]
+      }
+    ],
+    "delivery_boundaries": [
+      {
+        "canonical": "current_run_before_provider",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "next_turn",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "backlog_summary",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "cancel_then_next_turn",
+        "deprecated_aliases": []
+      }
+    ],
+    "exactly_one_terminal_state": true,
+    "lifecycle_states": [
+      {
+        "canonical": "pending",
+        "deprecated_aliases": [
+          "queued"
+        ]
+      },
+      {
+        "canonical": "claimed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "injected",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "deferred",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "forwarded",
+        "deprecated_aliases": [
+          "delivered"
+        ]
+      },
+      {
+        "canonical": "delivery_failed",
+        "deprecated_aliases": [
+          "failed_delivery"
+        ]
+      },
+      {
+        "canonical": "merged",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "steered",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "interrupted",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "superseded",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "overflowed",
+        "deprecated_aliases": [
+          "overflow"
+        ]
+      },
+      {
+        "canonical": "rejected",
+        "deprecated_aliases": [
+          "reject"
+        ]
+      },
+      {
+        "canonical": "cancelled",
+        "deprecated_aliases": [
+          "canceled"
+        ]
+      }
+    ],
+    "modes": [
+      {
+        "canonical": "followup",
+        "deprecated_aliases": [
+          "follow_up"
+        ]
+      },
+      {
+        "canonical": "collect",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "steer",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "steer_backlog",
+        "deprecated_aliases": [
+          "steer-backlog"
+        ]
+      },
+      {
+        "canonical": "interrupt",
+        "deprecated_aliases": []
+      }
+    ],
+    "queue_outcome_required_fields": [
+      "schema_version",
+      "queued_input_id",
+      "lifecycle_state",
+      "delivery_boundary",
+      "accepted",
+      "reason_code"
+    ],
+    "schema_version": 1,
+    "snapshot_version": "runtime-contracts.session_queue.v1"
+  },
   "shared_runtime_primitives": {
-    "changelog_note": "Publishes the closed cancellation settlement vocabulary alongside ordinary/probe health authority separation, typed identities, host-owned sequencing, side-effect uncertainty, process provenance, cleanup evidence, and fail-closed startup compatibility.",
+    "changelog_note": "Adds interrupt-specific supersession to the closed cancellation vocabulary while preserving typed identities, host-owned sequencing, side-effect uncertainty, cleanup evidence, and fail-closed startup compatibility.",
     "compatibility": {
       "admission_postures": [
         {
@@ -3989,6 +4149,10 @@
           "deprecated_aliases": []
         },
         {
+          "canonical": "interrupt_supersede",
+          "deprecated_aliases": []
+        },
+        {
           "canonical": "daemon_drain",
           "deprecated_aliases": []
         },
@@ -4514,9 +4678,9 @@
       ],
       "unknown_effect_auto_retry": false
     },
-    "snapshot_version": "runtime-contracts.shared_runtime.v3"
+    "snapshot_version": "runtime-contracts.shared_runtime.v4"
   },
-  "snapshot_version": "runtime-contracts.v14",
+  "snapshot_version": "runtime-contracts.v15",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

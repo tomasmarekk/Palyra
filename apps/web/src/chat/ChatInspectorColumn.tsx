@@ -197,7 +197,9 @@ export function ChatInspectorColumn({
 }: ChatInspectorColumnProps) {
   const sessionMaintenanceBusy = sessionMaintenanceBusyKey !== null;
   const queueBacklogActionDisabled =
-    selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0;
+    selectedSession === null ||
+    sessionMaintenanceBusy ||
+    !queuedInputs.some((queued) => queued.state === "pending" || queued.state === "deferred");
   const browserSessionIds = extractBrowserSessionIds(runTape);
   const sessionProjectContext = selectedSession?.recap.project_context ?? null;
 
@@ -850,7 +852,7 @@ export function ChatInspectorColumn({
                   <strong>{queued.state}</strong>
                   <span>
                     {shortId(queued.queued_input_id)} · run {shortId(queued.run_id)} ·{" "}
-                    {queued.queue_mode} · {queued.priority_lane}
+                    {queued.queue_mode} · {queued.delivery_boundary} · {queued.priority_lane}
                   </span>
                   <span>
                     {queued.decision_reason}
@@ -860,7 +862,7 @@ export function ChatInspectorColumn({
                   </span>
                   <p>{queued.text}</p>
                 </div>
-                {queued.state === "pending" ? (
+                {queued.state === "pending" || queued.state === "deferred" ? (
                   <div className="chat-ops-card__actions">
                     <ActionButton
                       isDisabled={sessionMaintenanceBusy}

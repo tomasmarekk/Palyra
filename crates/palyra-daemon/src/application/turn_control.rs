@@ -387,6 +387,7 @@ pub(crate) enum ActiveRunInputReasonCode {
     CancelRequested,
     ApprovalResponseInterrupts,
     ExplicitInterrupt,
+    InterruptQueuedAtBoundary,
     SteeringAccepted,
     SteeringQueuedAtBoundary,
     MergeWindowOpen,
@@ -406,6 +407,7 @@ impl ActiveRunInputReasonCode {
             Self::CancelRequested => "active_input.cancel_requested",
             Self::ApprovalResponseInterrupts => "active_input.approval_response_interrupts",
             Self::ExplicitInterrupt => "active_input.explicit_interrupt",
+            Self::InterruptQueuedAtBoundary => "active_input.interrupt_queued_at_boundary",
             Self::SteeringAccepted => "active_input.steering_accepted",
             Self::SteeringQueuedAtBoundary => "active_input.steering_queued_at_boundary",
             Self::MergeWindowOpen => "active_input.merge_window_open",
@@ -428,6 +430,7 @@ pub(crate) struct ActiveRunInputPolicyRequest {
     pub merge_window_open: bool,
     pub tool_drain_active: bool,
     pub approval_pending: bool,
+    pub delivery_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -501,14 +504,34 @@ pub(crate) fn decide_active_run_input_policy(
                 true,
             )
         }
-        ActiveRunInputIntent::Interrupt => active_input_decision(
-            request,
-            ActiveRunInputAction::Interrupt,
-            ActiveRunInputReasonCode::ExplicitInterrupt,
-            true,
-        ),
+        ActiveRunInputIntent::Interrupt => {
+            if request.tool_drain_active
+                || request.approval_pending
+                || request.delivery_active
+                || matches!(
+                    request.active_phase,
+                    ControlActivePhase::ToolExecution | ControlActivePhase::ApprovalPending
+                )
+            {
+                active_input_decision(
+                    request,
+                    ActiveRunInputAction::Queue,
+                    ActiveRunInputReasonCode::InterruptQueuedAtBoundary,
+                    true,
+                )
+            } else {
+                active_input_decision(
+                    request,
+                    ActiveRunInputAction::Interrupt,
+                    ActiveRunInputReasonCode::ExplicitInterrupt,
+                    true,
+                )
+            }
+        }
         ActiveRunInputIntent::Steer => {
             if request.tool_drain_active
+                || request.approval_pending
+                || request.delivery_active
                 || matches!(
                     request.active_phase,
                     ControlActivePhase::ToolExecution | ControlActivePhase::ApprovalPending
@@ -529,12 +552,6 @@ pub(crate) fn decide_active_run_input_policy(
                 )
             }
         }
-        ActiveRunInputIntent::Followup if request.merge_window_open => active_input_decision(
-            request,
-            ActiveRunInputAction::Merge,
-            ActiveRunInputReasonCode::MergeWindowOpen,
-            true,
-        ),
         ActiveRunInputIntent::Followup => active_input_decision(
             request,
             ActiveRunInputAction::Queue,
@@ -582,6 +599,7 @@ fn active_input_decision(
         "merge_window_open": request.merge_window_open,
         "tool_drain_active": request.tool_drain_active,
         "approval_pending": request.approval_pending,
+        "delivery_active": request.delivery_active,
     });
     ActiveRunInputPolicyDecision {
         schema_version: TURN_CONTROL_SCHEMA_VERSION,
@@ -967,21 +985,22 @@ mod tests {
             merge_window_open: false,
             tool_drain_active: false,
             approval_pending: false,
+            delivery_active: false,
             run_id: Some("run-1".to_owned()),
             session_id: Some("session-1".to_owned()),
         }
     }
 
     #[test]
-    fn active_followup_merges_inside_open_merge_window() {
+    fn active_followup_stays_on_the_next_turn_inside_open_merge_window() {
         let mut request = active_input_request(ActiveRunInputIntent::Followup);
         request.merge_window_open = true;
 
         let decision = decide_active_run_input_policy(&request);
 
-        assert_eq!(decision.action, ActiveRunInputAction::Merge);
+        assert_eq!(decision.action, ActiveRunInputAction::Queue);
         assert!(decision.accepted);
-        assert_eq!(decision.reason_code, ActiveRunInputReasonCode::MergeWindowOpen.as_str());
+        assert_eq!(decision.reason_code, ActiveRunInputReasonCode::FollowupQueued.as_str());
         assert_eq!(decision.target_kind, "run");
         assert!(decision.journal_payload_json.contains("active_run_input.policy_decision"));
     }
@@ -1000,6 +1019,45 @@ mod tests {
             ActiveRunInputReasonCode::SteeringQueuedAtBoundary.as_str()
         );
         assert!(decision.accepted);
+    }
+
+    #[test]
+    fn active_steer_queues_while_delivery_is_active() {
+        let mut request = active_input_request(ActiveRunInputIntent::Steer);
+        request.delivery_active = true;
+
+        let decision = decide_active_run_input_policy(&request);
+
+        assert_eq!(decision.action, ActiveRunInputAction::Queue);
+        assert_eq!(
+            decision.reason_code,
+            ActiveRunInputReasonCode::SteeringQueuedAtBoundary.as_str()
+        );
+        assert!(decision.accepted);
+    }
+
+    #[test]
+    fn active_interrupt_is_demoted_during_tool_approval_or_delivery_boundaries() {
+        for active_phase in [
+            ControlActivePhase::ToolExecution,
+            ControlActivePhase::ApprovalPending,
+            ControlActivePhase::ProviderStream,
+        ] {
+            let mut request = active_input_request(ActiveRunInputIntent::Interrupt);
+            request.active_phase = active_phase;
+            request.tool_drain_active = active_phase == ControlActivePhase::ToolExecution;
+            request.approval_pending = active_phase == ControlActivePhase::ApprovalPending;
+            request.delivery_active = active_phase == ControlActivePhase::ProviderStream;
+
+            let decision = decide_active_run_input_policy(&request);
+
+            assert_eq!(decision.action, ActiveRunInputAction::Queue);
+            assert_eq!(
+                decision.reason_code,
+                ActiveRunInputReasonCode::InterruptQueuedAtBoundary.as_str()
+            );
+            assert!(decision.accepted);
+        }
     }
 
     #[test]

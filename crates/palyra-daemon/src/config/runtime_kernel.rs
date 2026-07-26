@@ -319,6 +319,11 @@ mod tests {
         let mut v2 = FeatureRolloutsConfig::default();
         set_bundle(&mut v2, FeatureRolloutSetting::from_config(true));
         assert_eq!(
+            v2.session_queue_policy,
+            FeatureRolloutSetting::from_config(true),
+            "the authoritative V2 bundle must include session_queue_policy"
+        );
+        assert_eq!(
             compatibility_bundle_generation(&v2).expect("complete V2 bundle is valid"),
             Some(CompatibilityBundleGeneration::V2)
         );

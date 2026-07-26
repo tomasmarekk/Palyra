@@ -370,6 +370,7 @@ export async function queueFollowUpTextAction(args: {
   args.setNotice(null);
   try {
     const response = await args.api.queueFollowUp(args.targetRunId, { text: trimmed });
+    const outcome = response.queue_outcome;
     args.appendLocalEntry({
       id: `queued-${response.queued_input.queued_input_id}-${Date.now()}`,
       kind: "status",
@@ -377,13 +378,18 @@ export async function queueFollowUpTextAction(args: {
       session_id: args.sessionId,
       created_at_unix_ms: Date.now(),
       title: "Queued follow-up",
-      text: `Queued input ${shortId(response.queued_input.queued_input_id)} for ${shortId(args.targetRunId)}.`,
-      payload: response.queued_input as unknown as JsonValue,
-      status: "queued",
+      text: `Queued input ${shortId(response.queued_input.queued_input_id)} is ${outcome.lifecycle_state} at ${outcome.delivery_boundary} (${outcome.reason_code}).`,
+      payload: {
+        queued_input: response.queued_input,
+        queue_outcome: outcome,
+      } as unknown as JsonValue,
+      status: outcome.lifecycle_state,
     });
     args.setComposerText("");
     await args.refreshSessionTranscript();
-    args.setNotice("Queued follow-up stored.");
+    args.setNotice(
+      `Queue outcome: ${outcome.lifecycle_state} at ${outcome.delivery_boundary} (${outcome.reason_code}).`,
+    );
   } catch (error) {
     args.setError(toErrorMessage(error));
   } finally {

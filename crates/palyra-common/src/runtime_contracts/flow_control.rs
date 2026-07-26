@@ -31,6 +31,7 @@ runtime_contract_enum! {
     pub enum CancellationReason {
         UserCancel => "user_cancel",
         SteerSupersede => "steer_supersede",
+        InterruptSupersede => "interrupt_supersede",
         DaemonDrain => "daemon_drain",
         DeadlineExceeded => "deadline_exceeded",
         ResourceEviction => "resource_eviction",

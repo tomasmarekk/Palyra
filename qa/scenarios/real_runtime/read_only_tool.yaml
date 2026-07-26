@@ -41,7 +41,7 @@ expect:
     - name: palyra.fs.read_file
       min_count: 1
   runtime_path:
-    runtime_contract_version: runtime-contracts.v14
+    runtime_contract_version: runtime-contracts.v15
     provider_lane: fixture
     attempt_owner: embedded_run_stream
     harness_id: embedded_run_stream
