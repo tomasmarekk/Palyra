@@ -6762,10 +6762,15 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
             .to_owned();
     let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::delayed(
+            200,
+            delayed_final_response.clone(),
+            Duration::from_millis(1_000),
+        ),
         ScriptedOpenAiResponse::delayed(200, delayed_final_response, Duration::from_millis(1_000)),
     ])?;
-    // This scenario qualifies timeout diagnostics, not breaker behavior. A single timed-out
-    // follow-up must not replace the root cause with a circuit-open rejection under load.
+    // This scenario qualifies timeout diagnostics, not breaker behavior. Exhausting the bounded
+    // follow-up recovery must not replace the root cause with a circuit-open rejection.
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
             openai_base_url.as_str(),
@@ -6884,8 +6889,8 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
     );
     assert_eq!(
         request_count.load(Ordering::Relaxed),
-        2,
-        "run should make exactly one follow-up provider attempt after the tool result"
+        3,
+        "run should make one bounded provider recovery attempt after the first timeout"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -7176,6 +7181,8 @@ async fn grpc_run_stream_stops_after_repeated_length_recovery_with_tool_evidence
     let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, first_response),
         ScriptedOpenAiResponse::immediate(200, first_length_response),
+        ScriptedOpenAiResponse::immediate(200, repeated_length_response.clone()),
+        ScriptedOpenAiResponse::immediate(200, repeated_length_response.clone()),
         ScriptedOpenAiResponse::immediate(200, repeated_length_response),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
@@ -7256,13 +7263,13 @@ async fn grpc_run_stream_stops_after_repeated_length_recovery_with_tool_evidence
             .iter()
             .filter(|status| status.as_str() == "progress:agent_loop.length_recovery_requested")
             .count(),
-        1,
-        "run should request one length recovery before falling back: {progress_statuses:?}"
+        3,
+        "run should exhaust the bounded length-recovery budget before falling back: {progress_statuses:?}"
     );
     assert!(!saw_done, "bounded repeated length recovery should remain a failed run");
     assert_eq!(
         request_count.load(Ordering::Relaxed),
-        3,
+        5,
         "run must not start another long provider turn after repeated length recovery"
     );
 
@@ -11446,6 +11453,10 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         "metadata.runtime_selected",
         "context.assembled",
         "provider.attempt.completed",
+        "provider.transcript.projected",
+        "provider.attempt.plan",
+        "provider.attempt.outcome",
+        "provider.stream.terminal_validation",
     ];
     for expected_event_type in runtime_evidence_event_types {
         let matching_events = tape_events

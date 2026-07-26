@@ -1458,9 +1458,11 @@ fn previous_run_provider_source_messages(
                 }
             }
             "message.replied" => {
-                pending_assistant = None;
                 if let Some((_, text)) = extract_previous_run_turn_from_tape_event(event) {
+                    pending_assistant = None;
                     sources.push(provider_assistant_source(Some(text), Vec::new(), source_ref));
+                } else {
+                    flush_pending_provider_assistant(&mut sources, &mut pending_assistant);
                 }
             }
             "tool_proposal" => {
@@ -2539,6 +2541,25 @@ mod tests {
         assert_eq!(projection.repair_report.reason_code, "provider.transcript.valid");
         assert_eq!(projection.messages[1].tool_calls[0].proposal_id, "call_1");
         assert_eq!(projection.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn previous_run_provider_sources_keep_output_when_final_reply_is_redacted() {
+        let events = vec![
+            tape_record(0, "message.received", json!({"text": "remember the codeword"})),
+            tape_record(
+                1,
+                "provider_turn_output",
+                json!({"full_text": "The codeword is AURORA-713"}),
+            ),
+            tape_record(2, "message.replied", json!({"reply_text": "<redacted>"})),
+        ];
+
+        let sources = previous_run_provider_source_messages(events.as_slice());
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1].message.role, ProviderMessageRole::Assistant);
+        assert_eq!(sources[1].message.text_content(), "The codeword is AURORA-713");
     }
 
     fn tape_record(
