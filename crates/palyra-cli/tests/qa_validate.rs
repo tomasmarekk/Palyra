@@ -320,10 +320,10 @@ fn qa_gate_pr_smoke_writes_v3_reports_and_resumes_selectively() -> Result<()> {
         .get("scenarios")
         .and_then(Value::as_array)
         .context("real QA gate should include scenario executions")?;
-    assert_eq!(scenarios.len(), 5);
+    assert_eq!(scenarios.len(), 18);
     let executed_scenarios =
         scenarios.iter().filter(|scenario| scenario.get("execution").is_some()).collect::<Vec<_>>();
-    assert_eq!(executed_scenarios.len(), 4);
+    assert_eq!(executed_scenarios.len(), 6);
     let replay_scenario = scenarios
         .iter()
         .find(|scenario| scenario["id"].as_str() == Some("real_runtime.record_replay_text"))
@@ -1027,8 +1027,8 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
     .context("written release gate JSON should parse")?;
     assert_eq!(payload, file_payload, "release stdout and report file should match");
     assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(3));
-    assert_eq!(payload.pointer("/summary/selected_count").and_then(Value::as_u64), Some(5));
-    assert_eq!(payload.pointer("/summary/passed").and_then(Value::as_u64), Some(5));
+    assert_eq!(payload.pointer("/summary/selected_count").and_then(Value::as_u64), Some(6));
+    assert_eq!(payload.pointer("/summary/passed").and_then(Value::as_u64), Some(6));
     let scorecard = payload
         .get("maturity_scorecard")
         .context("QA gate report should include maturity_scorecard")?;

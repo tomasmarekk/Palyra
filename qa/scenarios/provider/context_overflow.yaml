@@ -42,9 +42,9 @@ expect:
       min_count: 1
     - event_type: runtime.compaction.required
       min_count: 1
-    - event_type: runtime.compaction.applied
-      min_count: 1
     - event_type: recovery.action.completed
+      min_count: 1
+    - event_type: runtime.compaction.applied
       min_count: 1
     - event_type: run.completed
       min_count: 1
@@ -76,6 +76,7 @@ maturity:
     - real_runtime
     - nightly
     - deterministic
+    - provider_compat
     - provider_recovery
     - context_compaction
     - runtime_kernel_v2_authoritative
