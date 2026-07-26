@@ -8809,6 +8809,8 @@ turns:
     #[tokio::test(flavor = "multi_thread")]
     async fn chatgpt_oauth_responses_maps_sanitized_tool_names_to_palyra_tools() {
         let response_body = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":""}}"#,
+            "",
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":"{\"text\":\"hello\"}"}}"#,
             "",
             r#"data: {"type":"response.completed","response":{"id":"resp_tool","model":"provider-selected-model","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#,

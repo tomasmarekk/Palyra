@@ -4749,7 +4749,7 @@ mod tests {
 
         assert_eq!(
             payload.pointer("/engine_registry/schema_version").and_then(Value::as_u64),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             payload.pointer("/engine_registry/selected_engine_id").and_then(Value::as_str),
