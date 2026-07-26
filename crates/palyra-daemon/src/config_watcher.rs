@@ -77,12 +77,11 @@ pub(crate) fn spawn_config_watcher(
     path: PathBuf,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let source_identity_sha256 = source_identity_sha256(path.as_path());
-    let initial = read_fingerprint(path.as_path()).ok();
+    let mut initial = read_fingerprint(path.as_path()).ok();
     let accepted = if crate::config::load_config_from_path(path.as_path()).is_ok() {
-        ensure_seeded_backup(path.as_path())?;
-        initial.clone().ok_or_else(|| {
-            anyhow::anyhow!("validated config disappeared before watcher initialization")
-        })?
+        let refreshed = seed_backup_and_refresh_fingerprint(path.as_path())?;
+        initial = Some(refreshed.clone());
+        refreshed
     } else {
         valid_backup_fingerprint(path.as_path()).with_context(|| {
             format!(
@@ -485,6 +484,13 @@ fn ensure_seeded_backup(path: &Path) -> Result<()> {
         .context("failed to seed config last-known-good backup")
 }
 
+fn seed_backup_and_refresh_fingerprint(path: &Path) -> Result<FileFingerprint> {
+    ensure_seeded_backup(path)?;
+    read_fingerprint(path).with_context(|| {
+        format!("validated config disappeared before watcher initialization: {}", path.display())
+    })
+}
+
 fn valid_backup_fingerprint(path: &Path) -> Result<FileFingerprint> {
     for index in 1..=3 {
         let candidate = backup_path(path, index);
@@ -591,5 +597,19 @@ mod tests {
             attrs: notify::event::EventAttributes::default(),
         };
         assert!(!native_event_matches(&event, Path::new("config.toml")));
+    }
+
+    #[test]
+    fn backup_seeding_refreshes_the_polling_baseline() {
+        let directory = tempfile::tempdir().expect("temp directory should exist");
+        let path = directory.path().join("config.toml");
+        fs::write(&path, b"config_version = 1").expect("fixture should write");
+
+        let baseline = seed_backup_and_refresh_fingerprint(&path)
+            .expect("valid config should establish a watcher baseline");
+        let live = read_fingerprint(&path).expect("seeded config should remain readable");
+
+        assert_eq!(baseline, live);
+        assert!(backup_path(&path, 1).exists());
     }
 }
