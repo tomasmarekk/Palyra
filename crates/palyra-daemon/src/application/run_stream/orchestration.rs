@@ -109,17 +109,19 @@ use crate::{
     },
     model_provider::{
         assemble_canonical_tool_calls, bounded_provider_turn_output_for_persistence,
-        classify_terminal_outcome, decide_tool_repair_candidate,
-        normalize_assistant_output_for_tool_repair, provider_events_from_output,
+        canonical_events_from_normalized_provider_events_v2, classify_terminal_outcome,
+        decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
+        normalized_provider_stream_from_output_v2, provider_events_from_output,
         tool_repair_audit_events_for_decision, validate_canonical_provider_stream,
-        ProviderAttemptSummary, ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason,
+        NormalizedProviderStreamV2, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegmentKind,
         ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderRouteCandidateTrace,
-        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
-        QaProviderAttestationContext, TerminalOutcomeClass, TerminalOutcomeClassification,
-        ToolCallAssemblyPolicy, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
-        PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
+        ProviderRouteSelectionTrace, ProviderTerminalDisposition, ProviderTurnOutput,
+        ProviderUsage, QaProviderAttestationContext, TerminalOutcomeClass,
+        TerminalOutcomeClassification, ToolCallAssemblyPolicy,
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
+        PROVIDER_RECOVERY_DECISION_EVENT, PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT,
         TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
     },
     orchestrator::{
@@ -4682,6 +4684,13 @@ async fn process_run_stream_message_inner(
                 return Err(error);
             }
         };
+        let normalized_provider_stream = validate_and_record_normalized_provider_stream_boundary(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            &provider_response.output,
+        )
+        .await?;
         loop_state.record_provider_response(&provider_response);
         if let Some(budget_tokens) = background_budget_tokens {
             let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
@@ -4721,6 +4730,7 @@ async fn process_run_stream_message_inner(
             run_id.as_str(),
             tape_seq,
             &provider_output,
+            &normalized_provider_stream,
             &tool_catalog_snapshot,
         )
         .await
@@ -5645,17 +5655,54 @@ async fn append_tool_repair_audit_tape_events_if_relevant(
 }
 
 #[allow(clippy::result_large_err)]
+async fn validate_and_record_normalized_provider_stream_boundary(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    provider_output: &ProviderTurnOutput,
+) -> Result<NormalizedProviderStreamV2, Status> {
+    let normalized_stream = normalized_provider_stream_from_output_v2(provider_output);
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT.to_owned(),
+            payload_json: serde_json::to_string(&normalized_stream.terminal_validation).map_err(
+                |error| {
+                    Status::internal(format!(
+                        "failed to serialize provider terminal validation: {error}"
+                    ))
+                },
+            )?,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+
+    if normalized_stream.terminal_validation.disposition
+        == ProviderTerminalDisposition::TerminallyInvalid
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider stream terminal validation failed: {}",
+            normalized_stream.terminal_validation.reason_code
+        )));
+    }
+    Ok(normalized_stream)
+}
+
+#[allow(clippy::result_large_err)]
 async fn append_tool_call_assembly_audit_tape_event_if_relevant(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
     provider_output: &ProviderTurnOutput,
+    normalized_stream: &NormalizedProviderStreamV2,
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
 ) -> Result<(), Status> {
     if !provider_output_needs_tool_call_assembly_audit(provider_output) {
         return Ok(());
     }
-    let canonical_events = canonical_events_from_provider_output(provider_output);
+    let canonical_events =
+        canonical_events_from_normalized_provider_events_v2(&normalized_stream.events);
     let canonical_report = validate_canonical_provider_stream(canonical_events.as_slice());
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
@@ -5707,53 +5754,6 @@ fn provider_output_needs_tool_call_assembly_audit(output: &ProviderTurnOutput) -
         .any(|part| matches!(part, ProviderOutputContentPart::ToolCall { .. }))
         || matches!(output.finish_reason, ProviderFinishReason::ToolCalls)
         || contains_raw_provider_tool_call_markup(output.full_text.as_str())
-}
-
-fn canonical_events_from_provider_output(
-    output: &ProviderTurnOutput,
-) -> Vec<ProviderCanonicalEvent> {
-    let model_id = output.raw_provider_refs.provider_model_id.as_deref().unwrap_or("unknown_model");
-    let provider_call_id = output
-        .raw_provider_refs
-        .provider_response_id
-        .as_deref()
-        .or(output.raw_provider_refs.provider_trace_ref.as_deref())
-        .unwrap_or("provider_turn_output");
-    let mut events = vec![ProviderCanonicalEvent::MessageStart {
-        provider_id: "palyra-runtime".to_owned(),
-        model_id: model_id.to_owned(),
-        provider_call_id: provider_call_id.to_owned(),
-    }];
-    let mut next_tool_index = 0_u32;
-    for part in &output.content_parts {
-        match part {
-            ProviderOutputContentPart::Text { text } => {
-                if !text.is_empty() {
-                    events.push(ProviderCanonicalEvent::ContentDelta { text: text.clone() });
-                }
-            }
-            ProviderOutputContentPart::ToolCall { proposal_id, tool_name, input_json } => {
-                let index = next_tool_index;
-                next_tool_index = next_tool_index.saturating_add(1);
-                events.push(ProviderCanonicalEvent::ToolCallStart {
-                    index,
-                    provider_call_id: Some(proposal_id.clone()),
-                });
-                events.push(ProviderCanonicalEvent::ToolCallNameDelta {
-                    index,
-                    name_delta: tool_name.clone(),
-                });
-                events.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
-                    index,
-                    arguments_delta: serde_json::to_string(input_json)
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                });
-                events.push(ProviderCanonicalEvent::ToolCallEnd { index });
-            }
-        }
-    }
-    events.push(ProviderCanonicalEvent::FinishReason { finish_reason: output.finish_reason });
-    events
 }
 
 fn provider_output_needs_tool_repair_audit(output: &ProviderTurnOutput) -> bool {
@@ -7274,15 +7274,15 @@ mod tests {
         agent_loop_terminal_status_message, apply_background_budget_guard,
         background_budget_overrun_message, background_run_budget_tokens,
         bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
-        browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
-        configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
-        delegated_run_admission, drain_active_run_steering_before_provider_call,
-        effective_provider_request_deadline, embedded_run_stream_runtime_selection_payload,
-        execute_run_stream_provider_request, final_answer_recovery_fallback_summary,
-        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
-        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-        incomplete_terminal_outcome_message, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
+        browser_followup_timeout_partial_summary, configured_run_stream_agent_harness_plugin_id,
+        contains_raw_provider_tool_call_markup, delegated_run_admission,
+        drain_active_run_steering_before_provider_call, effective_provider_request_deadline,
+        embedded_run_stream_runtime_selection_payload, execute_run_stream_provider_request,
+        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
+        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
+        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
+        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        normalized_provider_stream_from_output_v2, phase_heartbeat_interval,
         provider_error_partial_summary, provider_model_override_for_routing,
         provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
         provider_request_timeout_message, provider_request_timeout_status,
@@ -7697,7 +7697,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_output_projects_structured_tools_to_canonical_events() {
+    fn provider_output_projects_structured_tools_to_normalized_events() {
         let output = ProviderTurnOutput {
             full_text: String::new(),
             content_parts: vec![ProviderOutputContentPart::ToolCall {
@@ -7711,21 +7711,24 @@ mod tests {
             redaction_state: Default::default(),
         };
 
-        let events = canonical_events_from_provider_output(&output);
+        let stream = normalized_provider_stream_from_output_v2(&output);
 
-        assert!(events.iter().any(|event| {
+        assert!(stream.events.iter().any(|event| {
             matches!(
                 event,
-                crate::model_provider::ProviderCanonicalEvent::ToolCallNameDelta {
-                    name_delta,
+                crate::model_provider::NormalizedProviderEventV2::ToolCallDelta {
+                    delta_kind:
+                        palyra_model_providers::NormalizedProviderToolDeltaKind::Name,
+                    delta: Some(name_delta),
                     ..
                 } if name_delta == "palyra.fs.read"
             )
         }));
         assert!(matches!(
-            events.last(),
-            Some(crate::model_provider::ProviderCanonicalEvent::FinishReason {
-                finish_reason: ProviderFinishReason::ToolCalls
+            stream.events.last(),
+            Some(crate::model_provider::NormalizedProviderEventV2::Terminal {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
             })
         ));
     }

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "format": "palyra-provider-stream-fault-matrix",
+  "normalized_event_contract": "NormalizedProviderEventV2",
+  "terminal_validation_contract": "ProviderTerminalValidationOutcome",
+  "cases": [
+    {
+      "id": "malformed_sse_chunk",
+      "expected_disposition": "recoverable",
+      "reason_code": "provider.stream.malformed_chunk"
+    },
+    {
+      "id": "duplicate_text_delta",
+      "expected_disposition": "complete",
+      "reason_code": "provider.stream.duplicate_sequence"
+    },
+    {
+      "id": "partial_tool_json",
+      "expected_disposition": "complete",
+      "reason_code": "tool_call.repair.trailing_comma"
+    },
+    {
+      "id": "reasoning_only_terminal",
+      "expected_disposition": "recoverable",
+      "reason_code": "provider.stream.reasoning_only_terminal"
+    },
+    {
+      "id": "missing_usage",
+      "expected_disposition": "complete",
+      "reason_code": "provider.stream.complete_usage_missing"
+    },
+    {
+      "id": "late_usage",
+      "expected_disposition": "complete",
+      "reason_code": "provider.stream.complete_late_usage_ignored"
+    },
+    {
+      "id": "midstream_idle_timeout",
+      "expected_disposition": "recoverable",
+      "reason_code": "provider.stream.idle_timeout"
+    }
+  ]
+}

@@ -26,11 +26,15 @@ use crate::{
 const DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES: usize = 256 * 1024;
 const PROVIDER_SSE_NORMALIZER_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_CANONICAL_STREAM_SCHEMA_VERSION: u16 = 1;
+const NORMALIZED_PROVIDER_EVENT_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_TERMINAL_VALIDATION_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// Audit event emitted for provider SSE stream normalization decisions.
 pub const PROVIDER_SSE_NORMALIZER_AUDIT_EVENT: &str = "provider.stream.sse.normalized";
 /// Audit event emitted for canonical stream sequence validation.
 pub const PROVIDER_CANONICAL_STREAM_AUDIT_EVENT: &str = "provider.stream.canonical";
+/// Audit event emitted after the normalized terminal boundary is validated.
+pub const PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT: &str = "provider.stream.terminal_validation";
 
 /// Incremental event emitted while a provider turn is in flight.
 ///
@@ -131,6 +135,158 @@ pub enum ProviderCanonicalEvent {
     },
 }
 
+/// Provider-neutral event vocabulary accepted by RuntimeKernelV2.
+///
+/// Provider sequence identifiers are consumed inside adapters for
+/// deduplication. The sequence here is host-issued and monotonic, so runtime
+/// consumers never need to interpret provider-specific frame identifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NormalizedProviderEventV2 {
+    TextDelta {
+        sequence: u64,
+        text: String,
+    },
+    ReasoningDelta {
+        sequence: u64,
+        byte_len: usize,
+        payload_sha256: String,
+    },
+    ToolCallDelta {
+        sequence: u64,
+        index: u32,
+        delta_kind: NormalizedProviderToolDeltaKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta: Option<String>,
+    },
+    ToolCallComplete {
+        sequence: u64,
+        index: u32,
+    },
+    Usage {
+        sequence: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
+        late: bool,
+    },
+    ProviderWarning {
+        sequence: u64,
+        reason_code: String,
+        message: String,
+    },
+    Terminal {
+        sequence: u64,
+        status: NormalizedProviderTerminalStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<ProviderFinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
+}
+
+impl NormalizedProviderEventV2 {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        match self {
+            Self::TextDelta { sequence, .. }
+            | Self::ReasoningDelta { sequence, .. }
+            | Self::ToolCallDelta { sequence, .. }
+            | Self::ToolCallComplete { sequence, .. }
+            | Self::Usage { sequence, .. }
+            | Self::ProviderWarning { sequence, .. }
+            | Self::Terminal { sequence, .. } => *sequence,
+        }
+    }
+}
+
+/// Fragment type carried by a normalized tool-call delta.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedProviderToolDeltaKind {
+    Start,
+    Name,
+    Arguments,
+}
+
+/// Terminal meaning after provider-specific framing has been removed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedProviderTerminalStatus {
+    Complete,
+    RecoverableError,
+    TerminalError,
+    Cancelled,
+}
+
+/// High-level terminal decision made before events enter the runtime kernel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTerminalDisposition {
+    Complete,
+    Recoverable,
+    TerminallyInvalid,
+}
+
+/// Placement of provider usage relative to the terminal boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageTiming {
+    BeforeTerminal,
+    Missing,
+    LateOnly,
+    BeforeAndLate,
+}
+
+/// Redacted terminal validation result consumed by orchestration and traces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTerminalValidationOutcome {
+    pub schema_version: u16,
+    pub event_type: String,
+    pub disposition: ProviderTerminalDisposition,
+    pub reason_code: String,
+    pub terminal_count: usize,
+    pub text_delta_count: usize,
+    pub reasoning_delta_count: usize,
+    pub tool_call_count: usize,
+    pub repaired_tool_call_count: usize,
+    pub invalid_tool_call_count: usize,
+    pub usage_timing: ProviderUsageTiming,
+    pub diagnostic_reason_codes: Vec<String>,
+}
+
+/// Complete normalized provider boundary output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedProviderStreamV2 {
+    pub schema_version: u16,
+    pub events: Vec<NormalizedProviderEventV2>,
+    pub terminal_validation: ProviderTerminalValidationOutcome,
+}
+
+/// Explicit opt-in for a hash-only provider debug artifact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderRawDebugArtifactPolicy {
+    pub explicitly_enabled: bool,
+    pub max_input_bytes: usize,
+}
+
+/// Redacted provider debug artifact metadata; raw bytes are never retained.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRawDebugArtifact {
+    pub schema_version: u16,
+    pub redaction_level: String,
+    pub observed_bytes: usize,
+    pub hashed_bytes: usize,
+    pub payload_sha256: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderUsageDelta {
     prompt_tokens: u64,
@@ -189,6 +345,7 @@ pub struct ProviderSseNormalizationReport {
     pub schema_version: u16,
     pub events: Vec<ProviderStreamEvent>,
     pub canonical_events: Vec<ProviderCanonicalEvent>,
+    pub normalized_stream_v2: NormalizedProviderStreamV2,
     pub audit_events: Vec<ProviderSseAuditEvent>,
     pub recovery_decision: Option<ProviderRecoveryDecision>,
     pub terminal: bool,
@@ -197,6 +354,7 @@ pub struct ProviderSseNormalizationReport {
 #[derive(Debug, Clone)]
 struct ParsedSseFrame {
     event_name: Option<String>,
+    event_id: Option<String>,
     data: String,
     byte_len: usize,
     payload_sha256: Option<String>,
@@ -239,11 +397,12 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
             model_id: model_id.to_owned(),
             provider_call_id: provider_call_id(provider_id, model_id),
         }],
+        normalized_stream_v2: normalized_provider_stream_from_canonical_events_v2(&[]),
         audit_events: Vec::new(),
         recovery_decision: None,
         terminal: false,
     };
-    let mut last_delta_hash: Option<String> = None;
+    let mut provider_event_ids = BTreeMap::<String, String>::new();
     let mut usage_seen = false;
 
     for (frame_index, raw_frame) in input.split("\n\n").enumerate() {
@@ -274,12 +433,47 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                     raw_frame.len(),
                     Some(stable_hash_text(raw_frame)),
                 );
+                refresh_sse_normalized_stream(&mut report);
                 return report;
             }
         };
 
+        if let (Some(event_id), Some(payload_sha256)) =
+            (frame.event_id.as_ref(), frame.payload_sha256.as_ref())
+        {
+            if let Some(previous_sha256) = provider_event_ids.get(event_id) {
+                if previous_sha256 == payload_sha256 {
+                    report.audit_events.push(sse_audit_event(
+                        "provider.stream.duplicate_sequence",
+                        ProviderSseAuditSeverity::Recovered,
+                        Some(frame_index),
+                        frame.byte_len,
+                        Some(payload_sha256.clone()),
+                    ));
+                    continue;
+                }
+                fail_sse_report(
+                    &mut report,
+                    provider_id,
+                    model_id,
+                    "provider.stream.sequence_payload_conflict",
+                    ProviderFailureClass::MalformedStream,
+                    ProviderFailureAction::FailClosedNoRetry,
+                    Some(frame_index),
+                    frame.byte_len,
+                    Some(payload_sha256.clone()),
+                );
+                refresh_sse_normalized_stream(&mut report);
+                return report;
+            }
+            provider_event_ids.insert(event_id.clone(), payload_sha256.clone());
+        }
+
         if report.terminal {
-            if frame_has_usage_json(frame.data.as_str()) {
+            if let Some(usage) = serde_json::from_str::<Value>(frame.data.as_str())
+                .ok()
+                .and_then(|value| usage_delta(&value))
+            {
                 report.audit_events.push(sse_audit_event(
                     "provider.stream.late_usage",
                     ProviderSseAuditSeverity::Recovered,
@@ -287,6 +481,13 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                     frame.byte_len,
                     frame.payload_sha256,
                 ));
+                report.canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                });
             }
             continue;
         }
@@ -310,6 +511,7 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                     frame.byte_len,
                     frame.payload_sha256,
                 );
+                refresh_sse_normalized_stream(&mut report);
                 return report;
             }
         };
@@ -333,20 +535,8 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
         }
 
         if let Some(delta) = text_delta(&value) {
-            let delta_hash = stable_hash_text(delta.as_str());
-            if last_delta_hash.as_deref() == Some(delta_hash.as_str()) {
-                report.audit_events.push(sse_audit_event(
-                    "provider.stream.duplicate_delta",
-                    ProviderSseAuditSeverity::Recovered,
-                    Some(frame_index),
-                    frame.byte_len,
-                    Some(delta_hash),
-                ));
-            } else {
-                last_delta_hash = Some(delta_hash);
-                report.events.push(ProviderStreamEvent::Delta { text: delta.clone() });
-                report.canonical_events.push(ProviderCanonicalEvent::ContentDelta { text: delta });
-            }
+            report.events.push(ProviderStreamEvent::Delta { text: delta.clone() });
+            report.canonical_events.push(ProviderCanonicalEvent::ContentDelta { text: delta });
         }
 
         if let Some(reasoning) = reasoning_delta(&value) {
@@ -370,6 +560,7 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                     frame.payload_sha256.clone(),
                 ));
             }
+            close_open_tool_calls_before_terminal(&mut report.canonical_events);
             push_sse_completed(provider_id, model_id, finish_reason, &mut report);
         }
     }
@@ -394,11 +585,13 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
         );
     }
 
+    refresh_sse_normalized_stream(&mut report);
     report
 }
 
 fn parse_sse_frame(raw_frame: &str, frame_index: usize) -> Result<Option<ParsedSseFrame>, String> {
     let mut event_name = None;
+    let mut event_id = None;
     let mut data_lines = Vec::new();
     for line in raw_frame.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -415,7 +608,8 @@ fn parse_sse_frame(raw_frame: &str, frame_index: usize) -> Result<Option<ParsedS
         match field {
             "event" => event_name = Some(value.to_owned()),
             "data" => data_lines.push(value.to_owned()),
-            "id" | "retry" => {}
+            "id" => event_id = (!value.is_empty()).then(|| value.to_owned()),
+            "retry" => {}
             _ => {
                 return Err(format!("provider.stream.unsupported_sse_field.{frame_index}"));
             }
@@ -427,6 +621,7 @@ fn parse_sse_frame(raw_frame: &str, frame_index: usize) -> Result<Option<ParsedS
     let data = data_lines.join("\n");
     Ok(Some(ParsedSseFrame {
         event_name,
+        event_id,
         byte_len: raw_frame.len(),
         payload_sha256: Some(stable_hash_text(data.as_str())),
         data,
@@ -576,6 +771,31 @@ fn response_tool_index(value: &Value) -> Option<u32> {
         .or_else(|| value.get("index"))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+}
+
+fn close_open_tool_calls_before_terminal(events: &mut Vec<ProviderCanonicalEvent>) {
+    let mut open_tools = BTreeSet::<u32>::new();
+    for event in events.iter() {
+        match event {
+            ProviderCanonicalEvent::ToolCallStart { index, .. } => {
+                open_tools.insert(*index);
+            }
+            ProviderCanonicalEvent::ToolCallEnd { index } => {
+                open_tools.remove(index);
+            }
+            ProviderCanonicalEvent::MessageStart { .. }
+            | ProviderCanonicalEvent::ContentDelta { .. }
+            | ProviderCanonicalEvent::ReasoningDelta { .. }
+            | ProviderCanonicalEvent::ToolCallNameDelta { .. }
+            | ProviderCanonicalEvent::ToolCallArgumentsDelta { .. }
+            | ProviderCanonicalEvent::UsageUpdate { .. }
+            | ProviderCanonicalEvent::FinishReason { .. }
+            | ProviderCanonicalEvent::ProviderWarning { .. }
+            | ProviderCanonicalEvent::StreamError { .. } => {}
+        }
+    }
+    events
+        .extend(open_tools.into_iter().map(|index| ProviderCanonicalEvent::ToolCallEnd { index }));
 }
 
 fn usage_delta(value: &Value) -> Option<ProviderUsageDelta> {
@@ -807,6 +1027,577 @@ pub fn validate_canonical_provider_stream(
     }
 }
 
+/// Converts adapter canonical events into the only event model accepted by
+/// RuntimeKernelV2.
+#[must_use]
+pub fn normalized_provider_events_from_canonical_v2(
+    events: &[ProviderCanonicalEvent],
+) -> Vec<NormalizedProviderEventV2> {
+    let mut normalized = Vec::with_capacity(events.len());
+    let mut terminal_seen = false;
+    for event in events {
+        let sequence = u64::try_from(normalized.len()).unwrap_or(u64::MAX);
+        let event = match event {
+            ProviderCanonicalEvent::MessageStart { .. } => continue,
+            ProviderCanonicalEvent::ContentDelta { text } => {
+                NormalizedProviderEventV2::TextDelta { sequence, text: text.clone() }
+            }
+            ProviderCanonicalEvent::ReasoningDelta { byte_len, payload_sha256 } => {
+                NormalizedProviderEventV2::ReasoningDelta {
+                    sequence,
+                    byte_len: *byte_len,
+                    payload_sha256: payload_sha256.clone(),
+                }
+            }
+            ProviderCanonicalEvent::ToolCallStart { index, provider_call_id } => {
+                NormalizedProviderEventV2::ToolCallDelta {
+                    sequence,
+                    index: *index,
+                    delta_kind: NormalizedProviderToolDeltaKind::Start,
+                    provider_call_id: provider_call_id.clone(),
+                    delta: None,
+                }
+            }
+            ProviderCanonicalEvent::ToolCallNameDelta { index, name_delta } => {
+                NormalizedProviderEventV2::ToolCallDelta {
+                    sequence,
+                    index: *index,
+                    delta_kind: NormalizedProviderToolDeltaKind::Name,
+                    provider_call_id: None,
+                    delta: Some(name_delta.clone()),
+                }
+            }
+            ProviderCanonicalEvent::ToolCallArgumentsDelta { index, arguments_delta } => {
+                NormalizedProviderEventV2::ToolCallDelta {
+                    sequence,
+                    index: *index,
+                    delta_kind: NormalizedProviderToolDeltaKind::Arguments,
+                    provider_call_id: None,
+                    delta: Some(arguments_delta.clone()),
+                }
+            }
+            ProviderCanonicalEvent::ToolCallEnd { index } => {
+                NormalizedProviderEventV2::ToolCallComplete { sequence, index: *index }
+            }
+            ProviderCanonicalEvent::UsageUpdate {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => NormalizedProviderEventV2::Usage {
+                sequence,
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+                total_tokens: *total_tokens,
+                cache_read_tokens: *cache_read_tokens,
+                cache_write_tokens: *cache_write_tokens,
+                late: terminal_seen,
+            },
+            ProviderCanonicalEvent::FinishReason { finish_reason } => {
+                terminal_seen = true;
+                let status = match finish_reason {
+                    ProviderFinishReason::Cancelled => NormalizedProviderTerminalStatus::Cancelled,
+                    ProviderFinishReason::Error => NormalizedProviderTerminalStatus::TerminalError,
+                    ProviderFinishReason::Stop
+                    | ProviderFinishReason::Length
+                    | ProviderFinishReason::ToolCalls
+                    | ProviderFinishReason::ContentFilter
+                    | ProviderFinishReason::Unknown => NormalizedProviderTerminalStatus::Complete,
+                };
+                NormalizedProviderEventV2::Terminal {
+                    sequence,
+                    status,
+                    finish_reason: Some(*finish_reason),
+                    reason_code: None,
+                }
+            }
+            ProviderCanonicalEvent::ProviderWarning { reason_code, message } => {
+                NormalizedProviderEventV2::ProviderWarning {
+                    sequence,
+                    reason_code: reason_code.clone(),
+                    message: message.clone(),
+                }
+            }
+            ProviderCanonicalEvent::StreamError { reason_code, recoverable } => {
+                terminal_seen = true;
+                NormalizedProviderEventV2::Terminal {
+                    sequence,
+                    status: if *recoverable {
+                        NormalizedProviderTerminalStatus::RecoverableError
+                    } else {
+                        NormalizedProviderTerminalStatus::TerminalError
+                    },
+                    finish_reason: None,
+                    reason_code: Some(reason_code.clone()),
+                }
+            }
+        };
+        normalized.push(event);
+    }
+    normalized
+}
+
+/// Reconstructs the internal canonical fragments needed by the tool-call
+/// assembler. Provider adapters remain the only code that interprets raw
+/// provider frames.
+#[must_use]
+pub fn canonical_events_from_normalized_provider_events_v2(
+    events: &[NormalizedProviderEventV2],
+) -> Vec<ProviderCanonicalEvent> {
+    let mut canonical = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            NormalizedProviderEventV2::TextDelta { text, .. } => {
+                canonical.push(ProviderCanonicalEvent::ContentDelta { text: text.clone() });
+            }
+            NormalizedProviderEventV2::ReasoningDelta { byte_len, payload_sha256, .. } => canonical
+                .push(ProviderCanonicalEvent::ReasoningDelta {
+                    byte_len: *byte_len,
+                    payload_sha256: payload_sha256.clone(),
+                }),
+            NormalizedProviderEventV2::ToolCallDelta {
+                index,
+                delta_kind,
+                provider_call_id,
+                delta,
+                ..
+            } => match delta_kind {
+                NormalizedProviderToolDeltaKind::Start => {
+                    canonical.push(ProviderCanonicalEvent::ToolCallStart {
+                        index: *index,
+                        provider_call_id: provider_call_id.clone(),
+                    });
+                }
+                NormalizedProviderToolDeltaKind::Name => {
+                    canonical.push(ProviderCanonicalEvent::ToolCallNameDelta {
+                        index: *index,
+                        name_delta: delta.clone().unwrap_or_default(),
+                    });
+                }
+                NormalizedProviderToolDeltaKind::Arguments => {
+                    canonical.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                        index: *index,
+                        arguments_delta: delta.clone().unwrap_or_default(),
+                    });
+                }
+            },
+            NormalizedProviderEventV2::ToolCallComplete { index, .. } => {
+                canonical.push(ProviderCanonicalEvent::ToolCallEnd { index: *index });
+            }
+            NormalizedProviderEventV2::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                ..
+            } => canonical.push(ProviderCanonicalEvent::UsageUpdate {
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+                total_tokens: *total_tokens,
+                cache_read_tokens: *cache_read_tokens,
+                cache_write_tokens: *cache_write_tokens,
+            }),
+            NormalizedProviderEventV2::ProviderWarning { reason_code, message, .. } => {
+                canonical.push(ProviderCanonicalEvent::ProviderWarning {
+                    reason_code: reason_code.clone(),
+                    message: message.clone(),
+                });
+            }
+            NormalizedProviderEventV2::Terminal { status, finish_reason, reason_code, .. } => {
+                match status {
+                    NormalizedProviderTerminalStatus::Complete => {
+                        canonical.push(ProviderCanonicalEvent::FinishReason {
+                            finish_reason: finish_reason.unwrap_or(ProviderFinishReason::Unknown),
+                        });
+                    }
+                    NormalizedProviderTerminalStatus::RecoverableError
+                    | NormalizedProviderTerminalStatus::TerminalError
+                    | NormalizedProviderTerminalStatus::Cancelled => {
+                        canonical.push(ProviderCanonicalEvent::StreamError {
+                            reason_code: reason_code
+                                .clone()
+                                .unwrap_or_else(|| "provider.stream.terminal_error".to_owned()),
+                            recoverable: *status
+                                == NormalizedProviderTerminalStatus::RecoverableError,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    canonical
+}
+
+/// Creates a normalized stream from a completed adapter output.
+#[must_use]
+pub fn normalized_provider_stream_from_output_v2(
+    output: &ProviderTurnOutput,
+) -> NormalizedProviderStreamV2 {
+    let mut canonical = Vec::new();
+    let mut next_tool_index = 0_u32;
+    for part in &output.content_parts {
+        match part {
+            ProviderOutputContentPart::Text { text } if !text.is_empty() => {
+                canonical.push(ProviderCanonicalEvent::ContentDelta { text: text.clone() });
+            }
+            ProviderOutputContentPart::Text { .. } => {}
+            ProviderOutputContentPart::ToolCall { proposal_id, tool_name, input_json } => {
+                let index = next_tool_index;
+                next_tool_index = next_tool_index.saturating_add(1);
+                canonical.push(ProviderCanonicalEvent::ToolCallStart {
+                    index,
+                    provider_call_id: Some(proposal_id.clone()),
+                });
+                canonical.push(ProviderCanonicalEvent::ToolCallNameDelta {
+                    index,
+                    name_delta: tool_name.clone(),
+                });
+                canonical.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                    index,
+                    arguments_delta: serde_json::to_string(input_json)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+                canonical.push(ProviderCanonicalEvent::ToolCallEnd { index });
+            }
+        }
+    }
+    canonical.push(ProviderCanonicalEvent::UsageUpdate {
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens: output.usage.completion_tokens,
+        total_tokens: Some(output.usage.total_tokens),
+        cache_read_tokens: output.usage.cache_read_tokens,
+        cache_write_tokens: output.usage.cache_write_tokens,
+    });
+    canonical.push(ProviderCanonicalEvent::FinishReason { finish_reason: output.finish_reason });
+    normalized_provider_stream_from_canonical_events_v2(canonical.as_slice())
+}
+
+/// Normalizes and validates one canonical adapter stream.
+#[must_use]
+pub fn normalized_provider_stream_from_canonical_events_v2(
+    events: &[ProviderCanonicalEvent],
+) -> NormalizedProviderStreamV2 {
+    let events = normalized_provider_events_from_canonical_v2(events);
+    let terminal_validation = validate_normalized_provider_terminal_v2(events.as_slice());
+    NormalizedProviderStreamV2 {
+        schema_version: NORMALIZED_PROVIDER_EVENT_SCHEMA_VERSION,
+        events,
+        terminal_validation,
+    }
+}
+
+/// Validates terminal closure and classifies recoverable versus ambiguous
+/// normalized streams before orchestration can act on them.
+#[must_use]
+pub fn validate_normalized_provider_terminal_v2(
+    events: &[NormalizedProviderEventV2],
+) -> ProviderTerminalValidationOutcome {
+    let mut terminal_count = 0_usize;
+    let mut terminal_status = None;
+    let mut terminal_reason_code = None;
+    let mut terminal_seen = false;
+    let mut before_terminal_usage = false;
+    let mut late_usage = false;
+    let mut text_delta_count = 0_usize;
+    let mut reasoning_delta_count = 0_usize;
+    let mut open_tools = BTreeSet::<u32>::new();
+    let mut diagnostics = Vec::<String>::new();
+    let mut previous_sequence = None;
+
+    for event in events {
+        let sequence = event.sequence();
+        if previous_sequence.is_some_and(|previous| sequence <= previous) {
+            push_unique_reason(&mut diagnostics, "provider.stream.non_monotonic_host_sequence");
+        }
+        previous_sequence = Some(sequence);
+
+        match event {
+            NormalizedProviderEventV2::TextDelta { .. } => {
+                text_delta_count = text_delta_count.saturating_add(1);
+                if terminal_seen {
+                    push_unique_reason(&mut diagnostics, "provider.stream.event_after_terminal");
+                }
+            }
+            NormalizedProviderEventV2::ReasoningDelta { .. } => {
+                reasoning_delta_count = reasoning_delta_count.saturating_add(1);
+                if terminal_seen {
+                    push_unique_reason(&mut diagnostics, "provider.stream.event_after_terminal");
+                }
+            }
+            NormalizedProviderEventV2::ToolCallDelta { index, delta_kind, .. } => {
+                if terminal_seen {
+                    push_unique_reason(&mut diagnostics, "provider.stream.event_after_terminal");
+                }
+                match delta_kind {
+                    NormalizedProviderToolDeltaKind::Start => {
+                        if !open_tools.insert(*index) {
+                            push_unique_reason(
+                                &mut diagnostics,
+                                "provider.stream.tool_call.duplicated_start",
+                            );
+                        }
+                    }
+                    NormalizedProviderToolDeltaKind::Name
+                    | NormalizedProviderToolDeltaKind::Arguments => {
+                        if !open_tools.contains(index) {
+                            push_unique_reason(
+                                &mut diagnostics,
+                                "provider.stream.tool_call.delta_without_start",
+                            );
+                        }
+                    }
+                }
+            }
+            NormalizedProviderEventV2::ToolCallComplete { index, .. } => {
+                if terminal_seen {
+                    push_unique_reason(&mut diagnostics, "provider.stream.event_after_terminal");
+                }
+                if !open_tools.remove(index) {
+                    push_unique_reason(
+                        &mut diagnostics,
+                        "provider.stream.tool_call.complete_without_start",
+                    );
+                }
+            }
+            NormalizedProviderEventV2::Usage { late, .. } => {
+                if terminal_seen {
+                    late_usage = true;
+                    if !late {
+                        push_unique_reason(
+                            &mut diagnostics,
+                            "provider.stream.late_usage_marker_missing",
+                        );
+                    }
+                } else {
+                    before_terminal_usage = true;
+                    if *late {
+                        push_unique_reason(
+                            &mut diagnostics,
+                            "provider.stream.early_usage_marked_late",
+                        );
+                    }
+                }
+            }
+            NormalizedProviderEventV2::ProviderWarning { .. } => {
+                if terminal_seen {
+                    push_unique_reason(&mut diagnostics, "provider.stream.event_after_terminal");
+                }
+            }
+            NormalizedProviderEventV2::Terminal { status, reason_code, .. } => {
+                terminal_count = terminal_count.saturating_add(1);
+                terminal_status.get_or_insert(*status);
+                if terminal_reason_code.is_none() {
+                    terminal_reason_code = reason_code.clone();
+                }
+                if terminal_seen {
+                    push_unique_reason(
+                        &mut diagnostics,
+                        "provider.stream.multiple_terminal_events",
+                    );
+                }
+                terminal_seen = true;
+                if !open_tools.is_empty() {
+                    push_unique_reason(
+                        &mut diagnostics,
+                        "provider.stream.tool_call.incomplete_at_terminal",
+                    );
+                }
+            }
+        }
+    }
+
+    if terminal_count == 0 {
+        push_unique_reason(&mut diagnostics, "provider.stream.missing_terminal_event");
+    }
+
+    let canonical = canonical_events_from_normalized_provider_events_v2(events);
+    let mut observed_tool_names = BTreeMap::<u32, String>::new();
+    for event in events {
+        if let NormalizedProviderEventV2::ToolCallDelta {
+            index,
+            delta_kind: NormalizedProviderToolDeltaKind::Name,
+            delta: Some(delta),
+            ..
+        } = event
+        {
+            observed_tool_names.entry(*index).or_default().push_str(delta);
+        }
+    }
+    let assembly_policy =
+        crate::tool_call_assembler::ToolCallAssemblyPolicy::new(observed_tool_names.values());
+    let assembly_report =
+        crate::tool_call_assembler::assemble_canonical_tool_calls(&canonical, &assembly_policy);
+    let repaired_tool_call_count = assembly_report
+        .tool_calls
+        .iter()
+        .filter(|tool_call| {
+            tool_call.status == crate::tool_call_assembler::AssembledToolCallStatus::ExecutionReady
+                && !tool_call.repair_steps.is_empty()
+        })
+        .count();
+    let invalid_tool_call_count = assembly_report
+        .tool_calls
+        .iter()
+        .filter(|tool_call| {
+            tool_call.status != crate::tool_call_assembler::AssembledToolCallStatus::ExecutionReady
+        })
+        .count();
+    let needs_self_correction = assembly_report.tool_calls.iter().any(|tool_call| {
+        tool_call.status
+            == crate::tool_call_assembler::AssembledToolCallStatus::NeedsModelSelfCorrection
+    });
+    let ambiguous_tool_call = assembly_report.tool_calls.iter().any(|tool_call| {
+        tool_call.status == crate::tool_call_assembler::AssembledToolCallStatus::FailClosed
+    });
+    if needs_self_correction {
+        push_unique_reason(&mut diagnostics, "provider.stream.tool_call.repairable");
+    }
+    if ambiguous_tool_call && open_tools.is_empty() {
+        push_unique_reason(&mut diagnostics, "provider.stream.tool_call.ambiguous");
+    }
+
+    let usage_timing = match (before_terminal_usage, late_usage) {
+        (true, false) => ProviderUsageTiming::BeforeTerminal,
+        (false, false) => ProviderUsageTiming::Missing,
+        (false, true) => ProviderUsageTiming::LateOnly,
+        (true, true) => ProviderUsageTiming::BeforeAndLate,
+    };
+    let structural_invalid = terminal_count > 1
+        || diagnostics.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "provider.stream.non_monotonic_host_sequence"
+                    | "provider.stream.event_after_terminal"
+                    | "provider.stream.tool_call.duplicated_start"
+                    | "provider.stream.tool_call.delta_without_start"
+                    | "provider.stream.tool_call.complete_without_start"
+                    | "provider.stream.multiple_terminal_events"
+                    | "provider.stream.late_usage_marker_missing"
+                    | "provider.stream.early_usage_marked_late"
+                    | "provider.stream.tool_call.ambiguous"
+            )
+        });
+    let terminal_status =
+        terminal_status.unwrap_or(NormalizedProviderTerminalStatus::RecoverableError);
+    let (disposition, reason_code) = if structural_invalid {
+        (
+            ProviderTerminalDisposition::TerminallyInvalid,
+            diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "provider.stream.terminally_invalid".to_owned()),
+        )
+    } else if terminal_count == 0 {
+        (
+            ProviderTerminalDisposition::Recoverable,
+            "provider.stream.missing_terminal_event".to_owned(),
+        )
+    } else if !open_tools.is_empty() {
+        (
+            ProviderTerminalDisposition::Recoverable,
+            "provider.stream.tool_call.incomplete_at_terminal".to_owned(),
+        )
+    } else if needs_self_correction {
+        (
+            ProviderTerminalDisposition::Recoverable,
+            "provider.stream.tool_call.repairable".to_owned(),
+        )
+    } else {
+        match terminal_status {
+            NormalizedProviderTerminalStatus::RecoverableError => (
+                ProviderTerminalDisposition::Recoverable,
+                terminal_reason_code
+                    .unwrap_or_else(|| "provider.stream.recoverable_terminal".to_owned()),
+            ),
+            NormalizedProviderTerminalStatus::TerminalError => (
+                ProviderTerminalDisposition::TerminallyInvalid,
+                terminal_reason_code.unwrap_or_else(|| "provider.stream.terminal_error".to_owned()),
+            ),
+            NormalizedProviderTerminalStatus::Cancelled => {
+                (ProviderTerminalDisposition::Complete, "provider.stream.cancelled".to_owned())
+            }
+            NormalizedProviderTerminalStatus::Complete
+                if text_delta_count == 0
+                    && assembly_report.tool_calls.is_empty()
+                    && reasoning_delta_count > 0 =>
+            {
+                (
+                    ProviderTerminalDisposition::Recoverable,
+                    "provider.stream.reasoning_only_terminal".to_owned(),
+                )
+            }
+            NormalizedProviderTerminalStatus::Complete
+                if text_delta_count == 0 && assembly_report.tool_calls.is_empty() =>
+            {
+                (
+                    ProviderTerminalDisposition::Recoverable,
+                    "provider.stream.empty_terminal".to_owned(),
+                )
+            }
+            NormalizedProviderTerminalStatus::Complete => {
+                let reason_code = match usage_timing {
+                    ProviderUsageTiming::Missing => "provider.stream.complete_usage_missing",
+                    ProviderUsageTiming::LateOnly | ProviderUsageTiming::BeforeAndLate => {
+                        "provider.stream.complete_late_usage_ignored"
+                    }
+                    ProviderUsageTiming::BeforeTerminal => "provider.stream.complete",
+                };
+                (ProviderTerminalDisposition::Complete, reason_code.to_owned())
+            }
+        }
+    };
+
+    ProviderTerminalValidationOutcome {
+        schema_version: PROVIDER_TERMINAL_VALIDATION_SCHEMA_VERSION,
+        event_type: PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT.to_owned(),
+        disposition,
+        reason_code,
+        terminal_count,
+        text_delta_count,
+        reasoning_delta_count,
+        tool_call_count: assembly_report.tool_calls.len(),
+        repaired_tool_call_count,
+        invalid_tool_call_count,
+        usage_timing,
+        diagnostic_reason_codes: diagnostics,
+    }
+}
+
+/// Produces a hash-only artifact descriptor when debug capture was explicitly
+/// enabled. Raw provider bytes are neither returned nor retained.
+#[must_use]
+pub fn redacted_provider_raw_debug_artifact(
+    raw_payload: &[u8],
+    policy: ProviderRawDebugArtifactPolicy,
+) -> Option<ProviderRawDebugArtifact> {
+    if !policy.explicitly_enabled {
+        return None;
+    }
+    let hashed_bytes = raw_payload.len().min(policy.max_input_bytes.max(1));
+    let payload_sha256 = stable_hash_bytes(&raw_payload[..hashed_bytes]);
+    Some(ProviderRawDebugArtifact {
+        schema_version: 1,
+        redaction_level: "hash_only".to_owned(),
+        observed_bytes: raw_payload.len(),
+        hashed_bytes,
+        payload_sha256,
+        truncated: hashed_bytes < raw_payload.len(),
+    })
+}
+
+fn refresh_sse_normalized_stream(report: &mut ProviderSseNormalizationReport) {
+    report.normalized_stream_v2 =
+        normalized_provider_stream_from_canonical_events_v2(&report.canonical_events);
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason_code: &str) {
+    if !reasons.iter().any(|reason| reason == reason_code) {
+        reasons.push(reason_code.to_owned());
+    }
+}
+
 fn canonical_stream_diagnostic(
     reason_code: &str,
     severity: ProviderSseAuditSeverity,
@@ -866,6 +1657,10 @@ fn fail_sse_report(
     let envelope = ProviderErrorEnvelope::from_error(&error);
     report.recovery_decision = Some(envelope.recovery_decision.clone());
     report.events.push(ProviderStreamEvent::Failed { error: envelope });
+    report.canonical_events.push(ProviderCanonicalEvent::StreamError {
+        reason_code: reason_code.to_owned(),
+        recoverable: action != ProviderFailureAction::FailClosedNoRetry,
+    });
     report.audit_events.push(sse_audit_event(
         reason_code,
         ProviderSseAuditSeverity::Failed,
@@ -895,8 +1690,12 @@ fn sse_audit_event(
 }
 
 fn stable_hash_text(input: &str) -> String {
+    stable_hash_bytes(input.as_bytes())
+}
+
+fn stable_hash_bytes(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(input);
     hex::encode(hasher.finalize())
 }
 
@@ -1137,15 +1936,28 @@ mod tests {
             .audit_events
             .iter()
             .any(|event| event.reason_code == "provider.stream.malformed_chunk"));
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.disposition,
+            ProviderTerminalDisposition::Recoverable
+        );
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.reason_code,
+            "provider.stream.malformed_chunk"
+        );
     }
 
     #[test]
-    fn sse_normalizer_recovers_duplicate_delta_and_late_usage() {
+    fn sse_normalizer_deduplicates_provider_sequence_and_ignores_late_usage() {
         let input = concat!(
+            "id: text-1\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "id: text-1\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "id: usage-1\n",
             "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            "id: terminal-1\n",
             "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "id: usage-2\n",
             "data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n",
         );
 
@@ -1161,11 +1973,40 @@ mod tests {
         assert!(report
             .audit_events
             .iter()
-            .any(|event| event.reason_code == "provider.stream.duplicate_delta"));
+            .any(|event| event.reason_code == "provider.stream.duplicate_sequence"));
         assert!(report
             .audit_events
             .iter()
             .any(|event| event.reason_code == "provider.stream.late_usage"));
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.usage_timing,
+            ProviderUsageTiming::BeforeAndLate
+        );
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.disposition,
+            ProviderTerminalDisposition::Complete
+        );
+    }
+
+    #[test]
+    fn sse_normalizer_preserves_legitimate_repeated_text_without_sequence() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ha\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ha\"}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-compatible", "gpt-test");
+        let text = report
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Delta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert_eq!(text, "haha");
     }
 
     #[test]
@@ -1240,6 +2081,10 @@ mod tests {
             .audit_events
             .iter()
             .any(|event| event.reason_code == "provider.stream.idle_timeout"));
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.reason_code,
+            "provider.stream.idle_timeout"
+        );
     }
 
     #[test]
@@ -1303,5 +2148,162 @@ mod tests {
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic.reason_code == "provider.stream.tool_call.incomplete_at_terminal"
         }));
+    }
+
+    #[test]
+    fn normalized_terminal_repairs_unambiguous_partial_tool_json() {
+        let events = vec![
+            ProviderCanonicalEvent::ToolCallStart {
+                index: 0,
+                provider_call_id: Some("call_1".to_owned()),
+            },
+            ProviderCanonicalEvent::ToolCallNameDelta {
+                index: 0,
+                name_delta: "palyra.fs.read".to_owned(),
+            },
+            ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                index: 0,
+                arguments_delta: r#"{"path":"Cargo.toml",}"#.to_owned(),
+            },
+            ProviderCanonicalEvent::ToolCallEnd { index: 0 },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::ToolCalls },
+        ];
+
+        let stream = normalized_provider_stream_from_canonical_events_v2(&events);
+
+        assert_eq!(stream.terminal_validation.disposition, ProviderTerminalDisposition::Complete);
+        assert_eq!(stream.terminal_validation.repaired_tool_call_count, 1);
+        assert_eq!(stream.terminal_validation.invalid_tool_call_count, 0);
+    }
+
+    #[test]
+    fn normalized_terminal_rejects_ambiguous_tool_json() {
+        let events = vec![
+            ProviderCanonicalEvent::ToolCallStart {
+                index: 0,
+                provider_call_id: Some("call_1".to_owned()),
+            },
+            ProviderCanonicalEvent::ToolCallNameDelta {
+                index: 0,
+                name_delta: "palyra.fs.read".to_owned(),
+            },
+            ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                index: 0,
+                arguments_delta: r#"{"path":"Cargo.toml""#.to_owned(),
+            },
+            ProviderCanonicalEvent::ToolCallEnd { index: 0 },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::ToolCalls },
+        ];
+
+        let stream = normalized_provider_stream_from_canonical_events_v2(&events);
+
+        assert_eq!(
+            stream.terminal_validation.disposition,
+            ProviderTerminalDisposition::TerminallyInvalid
+        );
+        assert_eq!(stream.terminal_validation.reason_code, "provider.stream.tool_call.ambiguous");
+    }
+
+    #[test]
+    fn normalized_terminal_classifies_reasoning_only_as_recoverable() {
+        let events = vec![
+            ProviderCanonicalEvent::ReasoningDelta {
+                byte_len: 7,
+                payload_sha256: stable_hash_text("private"),
+            },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::Stop },
+        ];
+
+        let stream = normalized_provider_stream_from_canonical_events_v2(&events);
+
+        assert_eq!(
+            stream.terminal_validation.disposition,
+            ProviderTerminalDisposition::Recoverable
+        );
+        assert_eq!(
+            stream.terminal_validation.reason_code,
+            "provider.stream.reasoning_only_terminal"
+        );
+    }
+
+    #[test]
+    fn normalized_terminal_accepts_missing_usage_and_rejects_multiple_terminals() {
+        let missing_usage = vec![
+            ProviderCanonicalEvent::ContentDelta { text: "done".to_owned() },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::Stop },
+        ];
+        let missing_usage_stream =
+            normalized_provider_stream_from_canonical_events_v2(&missing_usage);
+        assert_eq!(
+            missing_usage_stream.terminal_validation.disposition,
+            ProviderTerminalDisposition::Complete
+        );
+        assert_eq!(
+            missing_usage_stream.terminal_validation.usage_timing,
+            ProviderUsageTiming::Missing
+        );
+
+        let multiple_terminals = vec![
+            ProviderCanonicalEvent::ContentDelta { text: "done".to_owned() },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::Stop },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::Stop },
+        ];
+        let invalid_stream =
+            normalized_provider_stream_from_canonical_events_v2(&multiple_terminals);
+        assert_eq!(
+            invalid_stream.terminal_validation.disposition,
+            ProviderTerminalDisposition::TerminallyInvalid
+        );
+        assert_eq!(invalid_stream.terminal_validation.terminal_count, 2);
+    }
+
+    #[test]
+    fn raw_provider_debug_artifact_requires_explicit_opt_in_and_keeps_only_a_hash() {
+        let raw = br#"{"secret":"provider-payload"}"#;
+
+        assert!(redacted_provider_raw_debug_artifact(
+            raw,
+            ProviderRawDebugArtifactPolicy::default()
+        )
+        .is_none());
+
+        let artifact = redacted_provider_raw_debug_artifact(
+            raw,
+            ProviderRawDebugArtifactPolicy { explicitly_enabled: true, max_input_bytes: 8 },
+        )
+        .expect("explicit debug policy should produce hash-only metadata");
+        assert_eq!(artifact.redaction_level, "hash_only");
+        assert_eq!(artifact.hashed_bytes, 8);
+        assert!(artifact.truncated);
+        assert!(!serde_json::to_string(&artifact)
+            .expect("artifact should serialize")
+            .contains("provider-payload"));
+    }
+
+    #[test]
+    fn provider_stream_fault_matrix_covers_required_anomalies() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/golden/provider_stream_fault_matrix_v2.json"
+        ))
+        .expect("provider stream fault matrix should parse");
+        let case_ids = fixture
+            .get("cases")
+            .and_then(Value::as_array)
+            .expect("fault matrix cases should be an array")
+            .iter()
+            .filter_map(|case| case.get("id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+
+        for required in [
+            "malformed_sse_chunk",
+            "duplicate_text_delta",
+            "partial_tool_json",
+            "reasoning_only_terminal",
+            "missing_usage",
+            "late_usage",
+            "midstream_idle_timeout",
+        ] {
+            assert!(case_ids.contains(required), "missing fault case: {required}");
+        }
     }
 }

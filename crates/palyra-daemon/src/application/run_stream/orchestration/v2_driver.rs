@@ -83,10 +83,12 @@ use crate::{
         OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
     },
     model_provider::{
-        bounded_provider_turn_output_for_persistence, provider_events_from_output, ProviderEvent,
-        ProviderFinishReason, ProviderMessage, ProviderMessageRole, ProviderOutputContentPart,
-        ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderTurnOutput,
-        ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+        bounded_provider_turn_output_for_persistence, normalized_provider_stream_from_output_v2,
+        provider_events_from_output, ProviderEvent, ProviderFinishReason, ProviderMessage,
+        ProviderMessageRole, ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
+        ProviderResponse, ProviderTerminalDisposition, ProviderTerminalValidationOutcome,
+        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+        PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT,
     },
     orchestrator::{RunLifecycleState, RunStateMachine},
     provider_leases::ProviderLeaseExecutionContext,
@@ -149,6 +151,7 @@ struct ContextAfterTurnObservation {
 
 enum V2DeferredTapeEvent {
     ProviderLaneAttested(Box<ProviderLaneAttestationEvent>),
+    ProviderTerminalValidation(Box<ProviderTerminalValidationOutcome>),
     CompactionRequired,
     CompactionApplied { artifact_id_sha256: String },
     CompactionSkipped { reason_code: String },
@@ -427,6 +430,26 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                 attestation
                     .validate_shape()
                     .map_err(|_| self.kernel_failure("runtime.provider.qa_attestation_invalid"))?;
+            }
+            let terminal_validation =
+                normalized_provider_stream_from_output_v2(&response.output).terminal_validation;
+            self.state
+                .lock()
+                .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?
+                .deferred_tape_events
+                .push(V2DeferredTapeEvent::ProviderTerminalValidation(Box::new(
+                    terminal_validation.clone(),
+                )));
+            match terminal_validation.disposition {
+                ProviderTerminalDisposition::Complete => {}
+                ProviderTerminalDisposition::Recoverable => {
+                    return Err(
+                        self.kernel_failure("runtime.provider.terminal_validation_recoverable")
+                    );
+                }
+                ProviderTerminalDisposition::TerminallyInvalid => {
+                    return Err(self.kernel_failure("runtime.provider.terminal_validation_invalid"));
+                }
             }
             if terminal.finish_reason == Some(ProviderFinishReason::Cancelled) {
                 self.state
@@ -1251,6 +1274,14 @@ async fn append_v2_deferred_tape_events(
                 })?;
                 (PROVIDER_LANE_ATTESTATION_EVENT.to_owned(), payload_json)
             }
+            V2DeferredTapeEvent::ProviderTerminalValidation(outcome) => (
+                PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT.to_owned(),
+                serde_json::to_string(&outcome).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to serialize V2 provider terminal validation: {error}"
+                    ))
+                })?,
+            ),
             V2DeferredTapeEvent::CompactionRequired => (
                 "runtime.compaction.required".to_owned(),
                 serde_json::json!({

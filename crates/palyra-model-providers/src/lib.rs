@@ -119,12 +119,19 @@ pub use snapshots::{
     ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
 };
 pub use streaming::{
+    canonical_events_from_normalized_provider_events_v2,
     canonical_events_from_provider_stream_events, normalize_provider_sse_stream,
-    normalize_provider_sse_stream_with_idle_timeout, provider_output_from_text_and_tools,
-    validate_canonical_provider_stream, ProviderCanonicalEvent, ProviderCanonicalStreamDiagnostic,
-    ProviderCanonicalStreamReport, ProviderSseAuditEvent, ProviderSseAuditSeverity,
-    ProviderSseNormalizationReport, ProviderStreamAccumulator, ProviderStreamEvent,
-    PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_SSE_NORMALIZER_AUDIT_EVENT,
+    normalize_provider_sse_stream_with_idle_timeout, normalized_provider_events_from_canonical_v2,
+    normalized_provider_stream_from_canonical_events_v2, normalized_provider_stream_from_output_v2,
+    provider_output_from_text_and_tools, redacted_provider_raw_debug_artifact,
+    validate_canonical_provider_stream, validate_normalized_provider_terminal_v2,
+    NormalizedProviderEventV2, NormalizedProviderStreamV2, NormalizedProviderTerminalStatus,
+    NormalizedProviderToolDeltaKind, ProviderCanonicalEvent, ProviderCanonicalStreamDiagnostic,
+    ProviderCanonicalStreamReport, ProviderRawDebugArtifact, ProviderRawDebugArtifactPolicy,
+    ProviderSseAuditEvent, ProviderSseAuditSeverity, ProviderSseNormalizationReport,
+    ProviderStreamAccumulator, ProviderStreamEvent, ProviderTerminalDisposition,
+    ProviderTerminalValidationOutcome, ProviderUsageTiming, PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
+    PROVIDER_SSE_NORMALIZER_AUDIT_EVENT, PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT,
 };
 pub use tool_call_assembler::{
     assemble_canonical_tool_calls, AssembledToolCall, AssembledToolCallStatus,

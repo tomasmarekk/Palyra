@@ -63,14 +63,17 @@ pub(crate) use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
-    assemble_canonical_tool_calls, validate_canonical_provider_stream, ProviderCanonicalEvent,
-    ProviderError, ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity,
-    ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
+    assemble_canonical_tool_calls, canonical_events_from_normalized_provider_events_v2,
+    normalize_provider_sse_stream, normalized_provider_stream_from_output_v2,
+    validate_canonical_provider_stream, NormalizedProviderEventV2, NormalizedProviderStreamV2,
+    ProviderCanonicalEvent, ProviderError, ProviderErrorEnvelope, ProviderErrorKind,
+    ProviderErrorSeverity, ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
     ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
     ProviderRecoveryDecision, ProviderRecoveryDecisionKind, ProviderRecoveryPlanSnapshot,
-    ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ToolCallAssemblyPolicy,
+    ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
+    ProviderTerminalDisposition, ProviderTerminalValidationOutcome, ToolCallAssemblyPolicy,
     PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
-    TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
+    PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT, TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -4839,12 +4842,13 @@ impl OpenAiCompatibleProvider {
             }
             Err(error) => return Err(error),
         };
-        let parsed = parse_openai_codex_sse_response(body_text.as_str()).map_err(|error| {
-            AttemptError::invalid_response(
-                format!("openai-codex responses SSE parsing failed: {error}"),
-                "openai_codex_responses_sse",
-            )
-        })?;
+        let parsed = parse_openai_codex_sse_response(body_text.as_str(), actual_model_id.as_str())
+            .map_err(|error| {
+                AttemptError::invalid_response(
+                    format!("openai-codex responses SSE parsing failed: {error}"),
+                    "openai_codex_responses_sse",
+                )
+            })?;
         openai_codex_provider_response(parsed, request, actual_model_id)
     }
 
@@ -5077,7 +5081,16 @@ fn openai_codex_runtime_model_id(configured_model_id: &str) -> String {
     configured_model_id.rsplit('/').next().unwrap_or(configured_model_id).trim().to_owned()
 }
 
-fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse> {
+fn parse_openai_codex_sse_response(body: &str, model_id: &str) -> Result<OpenAiResponsesResponse> {
+    let normalized = normalize_provider_sse_stream(body, "openai-primary", model_id);
+    if normalized.normalized_stream_v2.terminal_validation.disposition
+        == ProviderTerminalDisposition::TerminallyInvalid
+    {
+        anyhow::bail!(
+            "OpenAI Codex SSE terminal validation failed: {}",
+            normalized.normalized_stream_v2.terminal_validation.reason_code
+        );
+    }
     let mut parsed = OpenAiResponsesResponse {
         id: None,
         model: None,
@@ -5086,7 +5099,6 @@ fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse
         usage: None,
         output: Vec::new(),
     };
-    let mut streamed_text = String::new();
 
     for line in body.lines() {
         let line = line.trim();
@@ -5101,11 +5113,7 @@ fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse
             .with_context(|| format!("invalid OpenAI Codex SSE data frame: {data}"))?;
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
         match event_type {
-            "response.output_text.delta" => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    streamed_text.push_str(delta);
-                }
-            }
+            "response.output_text.delta" => {}
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
                     parsed.output.push(
@@ -5135,6 +5143,20 @@ fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse
         }
     }
 
+    let streamed_text = normalized
+        .normalized_stream_v2
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedProviderEventV2::TextDelta { text, .. } => Some(text.as_str()),
+            NormalizedProviderEventV2::ReasoningDelta { .. }
+            | NormalizedProviderEventV2::ToolCallDelta { .. }
+            | NormalizedProviderEventV2::ToolCallComplete { .. }
+            | NormalizedProviderEventV2::Usage { .. }
+            | NormalizedProviderEventV2::ProviderWarning { .. }
+            | NormalizedProviderEventV2::Terminal { .. } => None,
+        })
+        .collect::<String>();
     if !streamed_text.is_empty() {
         parsed.output_text = Some(streamed_text);
     }
@@ -6602,9 +6624,9 @@ mod tests {
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
-        provider_attempt_index, provider_seconds_to_millis, qa_live_provider_base_url_sha256,
-        qa_live_provider_binding_sha256, qa_provider_binding_sha256,
-        run_provider_failover_self_check, sanitize_remote_error,
+        parse_openai_codex_sse_response, provider_attempt_index, provider_seconds_to_millis,
+        qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
+        qa_provider_binding_sha256, run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
         AnthropicProvider, AudioTranscriptionRequest, EmbeddingsRequest, ModelProvider,
@@ -6669,6 +6691,28 @@ mod tests {
         assert_eq!(provider_seconds_to_millis(-1.0), 0);
         assert_eq!(provider_seconds_to_millis(f64::INFINITY), 0);
         assert_eq!(provider_seconds_to_millis(u64::MAX as f64), u64::MAX);
+    }
+
+    #[test]
+    fn openai_codex_sse_parser_deduplicates_replayed_provider_sequence() {
+        let body = [
+            "id: delta-1",
+            r#"data: {"type":"response.output_text.delta","delta":"same"}"#,
+            "",
+            "id: delta-1",
+            r#"data: {"type":"response.output_text.delta","delta":"same"}"#,
+            "",
+            "id: terminal-1",
+            r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let parsed = parse_openai_codex_sse_response(body.as_str(), "gpt-test")
+            .expect("stream should parse");
+
+        assert_eq!(parsed.output_text.as_deref(), Some("same"));
+        assert_eq!(parsed.status.as_deref(), Some("completed"));
     }
 
     #[test]
