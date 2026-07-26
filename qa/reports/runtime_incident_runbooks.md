@@ -130,6 +130,44 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 - Disable the capture path and restore the last known-good golden fixtures.
 - Re-run replay and current-state inventory checks before promotion.
 
+## Continuity Recovery Blocked or Unknown
+
+### Symptoms
+
+- `ContinuityCampaignReport` records `confirmation_required` or `terminalized`
+  where a scenario was expected to resume.
+- A recovery record has a stable `continuity.*` failure class but lacks one of
+  the journal, metadata trace, cleanup, or final-outcome evidence references.
+- Delivery or a mutating effect may have completed before acknowledgement.
+
+### Diagnostics
+
+- Run `just continuity-crash-campaign` and preserve
+  `target/release-artifacts/continuity-campaign/report.json`.
+- Match the failed case by scenario, crash boundary, reason code, and evidence
+  references; do not infer success from process exit status alone.
+- Inspect the authorized metadata trace and cleanup report for the exact run
+  generation. Treat missing, corrupt, or generation-mismatched evidence as
+  blocked.
+
+### Safe Mitigation
+
+- For `confirmation_required`, suspend automatic replay and obtain an operator
+  decision using the durable confirmation surface.
+- For `terminalized`, preserve the terminal outcome and start new work with a
+  new idempotency identity only after cleanup is observable.
+- For unknown delivery acknowledgement, do not resend until the delivery
+  arbitration record proves that the original send was not confirmed.
+
+### Rollback
+
+- Return affected recovery paths to observe-only behavior while retaining all
+  journal, metadata trace, and cleanup evidence.
+- Do not delete recovery records, reuse a stale generation lease, or repeat a
+  confirmed side effect during rollback.
+- Re-run the full continuity gate on both Windows and Unix before restoring
+  automatic recovery.
+
 ## Verification Runtime
 
 ### Symptoms

@@ -46,6 +46,18 @@ jobs:
       - name: Validate journal migration fixture
         run: bash scripts/test/check-journal-migration-fixture.sh
 
+      - name: Run continuity crash campaign
+        run: bash scripts/test/run-deterministic-fault-smoke.sh
+
+      - name: Upload continuity campaign evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: continuity-campaign-${{ github.sha }}
+          path: |
+            target/release-artifacts/continuity-campaign/**
+            artifacts/qa-lab/deterministic-fault-smoke/**
+          if-no-files-found: error
+
       - name: Derive release metadata
         id: meta
         shell: pwsh

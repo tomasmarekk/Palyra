@@ -69,6 +69,7 @@ Assert-OrdinaryArtifactDirectory -Path $artifactDir -AllowMissing $false
 Set-Content -LiteralPath $statusPath -Value "status=started" -Encoding utf8
 
 cargo test -p palyra-common --lib qa_fault --locked
+& (Join-Path $PSScriptRoot "run-continuity-campaign-gate.ps1")
 cargo test -p palyra-cli --lib failure_diagnostics_are_persistable_before_state_root_removal_without_secrets --locked
 cargo test -p palyra-daemon --lib "qa_fault_injection::tests" --locked
 cargo test -p palyra-daemon --lib tools_list_changed_notification_refreshes_future_calls_without_rewriting_in_flight_call --locked

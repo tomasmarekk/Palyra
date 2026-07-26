@@ -177,6 +177,7 @@ fn shared_runtime_schemas_are_versioned_closed_and_bounded() -> Result<()> {
         ("process-lease.v1.json", 1_u64),
         ("cleanup-report.v1.json", 1_u64),
         ("runtime-state-compatibility-report.v1.json", 1_u64),
+        ("continuity-campaign-report.v1.json", 1_u64),
     ];
 
     for (name, expected_version) in contracts {

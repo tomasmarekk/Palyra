@@ -33,6 +33,7 @@ resolve_cargo() {
 
 CARGO_BIN="$(resolve_cargo)"
 
+bash "$ROOT_DIR/scripts/test/run-continuity-campaign-gate.sh"
 "$CARGO_BIN" test -p palyra-common --test release_eval_contract --locked
 "$CARGO_BIN" run -p palyra-cli --example run_release_eval_gate --locked -- \
   --manifest fixtures/golden/release_eval_inventory.json \

@@ -72,6 +72,7 @@ $palyradEnvironmentConfigured = $false
 try {
     cargo test -p palyra-common replay_bundle --locked
     cargo test -p palyra-common --test release_eval_contract --locked
+    & (Join-Path $PSScriptRoot "run-continuity-campaign-gate.ps1")
     cargo run -p palyra-cli --example run_release_eval_gate --locked -- `
         --manifest fixtures/golden/release_eval_inventory.json `
         --report-dir target/release-artifacts/release-evals

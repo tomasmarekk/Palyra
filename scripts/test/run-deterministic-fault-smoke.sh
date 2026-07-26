@@ -71,6 +71,7 @@ assert_physical_directory "$ARTIFACT_ABSOLUTE" "$ROOT_DIR/artifacts/qa-lab/deter
 printf '%s\n' 'status=started' >"$ARTIFACT_ABSOLUTE/status.txt"
 
 "$CARGO_BIN" test -p palyra-common --lib qa_fault --locked
+bash "$ROOT_DIR/scripts/test/run-continuity-campaign-gate.sh"
 "$CARGO_BIN" test -p palyra-cli --lib failure_diagnostics_are_persistable_before_state_root_removal_without_secrets --locked
 "$CARGO_BIN" test -p palyra-daemon --lib qa_fault_injection::tests --locked
 "$CARGO_BIN" test -p palyra-daemon --lib tools_list_changed_notification_refreshes_future_calls_without_rewriting_in_flight_call --locked

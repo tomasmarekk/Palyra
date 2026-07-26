@@ -56,6 +56,15 @@ deterministic-fault-smoke:
     #!pwsh
     & ./scripts/test/run-deterministic-fault-smoke.ps1
 
+[unix]
+continuity-crash-campaign:
+    bash scripts/test/run-continuity-campaign-gate.sh
+
+[windows]
+continuity-crash-campaign:
+    #!pwsh
+    & ./scripts/test/run-continuity-campaign-gate.ps1
+
 retrieval-benchmark:
     bash scripts/test/run-retrieval-benchmark.sh
 

@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palyra.dev/schemas/common/continuity-campaign-report.v1.json",
+  "title": "Palyra continuity campaign report",
+  "description": "Redacted release evidence for the mandatory runtime crash matrix.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "campaign_id",
+    "status",
+    "reason_code",
+    "redacted",
+    "summary",
+    "qualification_evidence_refs",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "campaign_id": {
+      "$ref": "#/$defs/evidenceRef"
+    },
+    "status": {
+      "enum": [
+        "passed",
+        "failed"
+      ]
+    },
+    "reason_code": {
+      "$ref": "#/$defs/reasonCode"
+    },
+    "redacted": {
+      "const": true
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "qualification_evidence_refs": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/qualificationEvidence"
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 56,
+      "maxItems": 56,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "boundedString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": ".*\\S.*"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "evidenceRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.:/-]*$"
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_count",
+        "boundary_count",
+        "matrix_case_count",
+        "resume_eligible_count",
+        "actual_resume_success_count",
+        "confirmation_required_count",
+        "terminalized_count",
+        "duplicate_side_effect_count",
+        "duplicate_confirmed_delivery_count",
+        "failed_case_count"
+      ],
+      "properties": {
+        "scenario_count": {
+          "const": 8
+        },
+        "boundary_count": {
+          "const": 7
+        },
+        "matrix_case_count": {
+          "const": 56
+        },
+        "resume_eligible_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "actual_resume_success_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "confirmation_required_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "terminalized_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "duplicate_side_effect_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "duplicate_confirmed_delivery_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        },
+        "failed_case_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 56
+        }
+      }
+    },
+    "qualificationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement",
+        "evidence_ref"
+      ],
+      "properties": {
+        "requirement": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "evidence_ref": {
+          "$ref": "#/$defs/evidenceRef"
+        }
+      }
+    },
+    "injectedFault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point_id",
+        "action",
+        "injected"
+      ],
+      "properties": {
+        "point_id": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "action": {
+          "const": "terminate_process"
+        },
+        "injected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "invariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invariant",
+        "passed",
+        "reason_code",
+        "evidence_ref"
+      ],
+      "properties": {
+        "invariant": {
+          "enum": [
+            "journal_replay",
+            "metadata_trace",
+            "cleanup_report",
+            "final_user_outcome",
+            "duplicate_side_effect_prevention",
+            "duplicate_delivery_prevention",
+            "evidence_redaction"
+          ]
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "evidence_ref": {
+          "$ref": "#/$defs/evidenceRef"
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "scenario",
+        "boundary",
+        "injected_fault",
+        "resume_eligible",
+        "actual_disposition",
+        "actual_resume_succeeded",
+        "duplicate_side_effect_count",
+        "duplicate_confirmed_delivery_count",
+        "stable_failure_class",
+        "reason_code",
+        "invariants",
+        "passed"
+      ],
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/evidenceRef"
+        },
+        "scenario": {
+          "enum": [
+            "provider",
+            "read_only_tool",
+            "mutating_tool",
+            "approval",
+            "compaction",
+            "delivery",
+            "child_run",
+            "process_wait"
+          ]
+        },
+        "boundary": {
+          "enum": [
+            "before_intent",
+            "after_intent",
+            "before_effect",
+            "after_effect_before_ack",
+            "after_ack_before_transition",
+            "during_delivery",
+            "during_cleanup"
+          ]
+        },
+        "injected_fault": {
+          "$ref": "#/$defs/injectedFault"
+        },
+        "resume_eligible": {
+          "type": "boolean"
+        },
+        "actual_disposition": {
+          "enum": [
+            "safe_resume",
+            "confirmation_required",
+            "terminalized"
+          ]
+        },
+        "actual_resume_succeeded": {
+          "type": "boolean"
+        },
+        "duplicate_side_effect_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "duplicate_confirmed_delivery_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "stable_failure_class": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/reasonCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "invariants": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": {
+            "$ref": "#/$defs/invariant"
+          }
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

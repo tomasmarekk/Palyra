@@ -133,6 +133,7 @@ trap record_replay_gate_failure EXIT
 
 "$CARGO_BIN" test -p palyra-common replay_bundle --locked
 "$CARGO_BIN" test -p palyra-common --test release_eval_contract --locked
+bash "$ROOT_DIR/scripts/test/run-continuity-campaign-gate.sh"
 "$CARGO_BIN" run -p palyra-cli --example run_release_eval_gate --locked -- \
   --manifest fixtures/golden/release_eval_inventory.json \
   --report-dir target/release-artifacts/release-evals

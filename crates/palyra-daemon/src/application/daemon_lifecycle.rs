@@ -575,6 +575,20 @@ mod tests {
     }
 
     #[test]
+    fn recovery_barrier_rejects_input_until_ready() {
+        let controller = controller();
+        let barrier = controller.snapshot().expect("recovery barrier should load");
+        assert!(barrier.phase.blocks_admission());
+        assert_eq!(barrier.admission_policy, DrainAdmissionPolicy::RejectNew);
+        assert_eq!(barrier.reason_code, "daemon.lifecycle.startup_recovery");
+
+        let running = controller.propose_startup_ready().expect("startup should finish");
+        controller.apply(running).expect("running transition should apply");
+        let ready = controller.snapshot().expect("running snapshot should load");
+        assert!(!ready.phase.blocks_admission());
+    }
+
+    #[test]
     fn drain_advances_through_checkpoint_before_shutdown() {
         let controller = controller();
         let running = controller.propose_startup_ready().expect("startup should finish");

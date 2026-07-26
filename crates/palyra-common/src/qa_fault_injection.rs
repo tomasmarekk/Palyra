@@ -59,12 +59,14 @@ const MAX_IDENTIFIER_BYTES: usize = 96;
 const MAX_LOGICAL_TIME_ADVANCE_MS: u64 = 3_600_000;
 const MAX_PRIVATE_PATH_BYTES: usize = 4_096;
 
+mod continuity;
 mod controller;
 mod evidence;
 mod evidence_validation;
 mod launch;
 mod plan;
 
+pub use continuity::*;
 pub use controller::*;
 pub use evidence::*;
 pub use launch::*;

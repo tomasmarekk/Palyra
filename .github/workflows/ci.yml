@@ -180,7 +180,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: deterministic-fault-smoke-${{ runner.os }}
-          path: artifacts/qa-lab/deterministic-fault-smoke/**
+          path: |
+            artifacts/qa-lab/deterministic-fault-smoke/**
+            target/release-artifacts/continuity-campaign/**
           if-no-files-found: error
 
   runtime-contract-snapshots:
