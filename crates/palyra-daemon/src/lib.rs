@@ -64,6 +64,7 @@ mod channels;
 mod command_router;
 mod commitments;
 mod config;
+mod config_watcher;
 mod cron;
 mod delegation;
 pub mod domain;
@@ -3285,6 +3286,10 @@ pub async fn run() -> Result<()> {
         application::daemon_lifecycle::LifecycleSubsystem::NetworkedWorkers,
         spawn_networked_worker_expiry_loop(runtime.clone()),
     )?;
+    let _config_watcher_task = config_watcher::path_from_loaded_source(&loaded.source)
+        .map(|path| config_watcher::spawn_config_watcher(state.clone(), path))
+        .transpose()
+        .context("failed to initialize config watcher")?;
     let _shutdown_signal_task = app::shutdown::spawn_shutdown_signal_listener(Arc::clone(&runtime));
 
     let admin_shutdown_runtime = Arc::clone(&runtime);

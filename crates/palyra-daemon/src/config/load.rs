@@ -97,6 +97,37 @@ use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProces
 /// (incomplete gateway TLS, preview mode enabled without its rollout flag,
 /// conflicting secret sources, invalid retrieval weights).
 pub fn load_config() -> Result<LoadedConfig> {
+    load_config_from_resolved_path(find_config_path()?)
+}
+
+/// Loads and validates one explicit config path while retaining environment overrides.
+///
+/// This is used only for last-known-good backup validation. It does not mutate
+/// `PALYRA_CONFIG` or change the process-global loader authority.
+///
+/// # Errors
+/// Returns the same parsing, migration, and validation failures as
+/// [`load_config`].
+pub(crate) fn load_config_from_path(path: &Path) -> Result<LoadedConfig> {
+    load_config_from_resolved_path(Some(path.to_path_buf()))
+}
+
+/// Returns original config paths whose standard backups may recover startup.
+///
+/// Unlike normal resolution, the explicit path may be temporarily missing so
+/// its sibling backups can still be inspected.
+///
+/// # Errors
+/// Returns an error when `PALYRA_CONFIG` contains an invalid path.
+pub(crate) fn config_recovery_paths() -> Result<Vec<PathBuf>> {
+    if let Ok(path) = env::var("PALYRA_CONFIG") {
+        return Ok(vec![parse_config_path(&path)
+            .context("PALYRA_CONFIG contains an invalid config recovery path")?]);
+    }
+    Ok(default_config_search_paths())
+}
+
+fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<LoadedConfig> {
     let mut deployment = DeploymentConfig::default();
     let mut deployment_profile_explicit = false;
     let mut daemon = DaemonConfig::default();
@@ -134,7 +165,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut migrated_from_version = None;
     let mut process_runner_path_access_mode_explicit = false;
 
-    if let Some(path) = find_config_path()? {
+    if let Some(path) = config_path {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let (parsed, migration) = parse_root_file_config(&content)

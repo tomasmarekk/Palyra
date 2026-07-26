@@ -49,6 +49,7 @@ palyra-workerd = { version = "0.1.0", path = "../palyra-workerd" }
 prost.workspace = true
 libc.workspace = true
 lopdf.workspace = true
+notify.workspace = true
 quick-xml.workspace = true
 quinn.workspace = true
 serde.workspace = true

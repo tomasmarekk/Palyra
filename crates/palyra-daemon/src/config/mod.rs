@@ -12,4 +12,5 @@ pub(crate) mod runtime_kernel;
 pub(crate) mod schema;
 
 pub use load::load_config;
+pub(crate) use load::{config_recovery_paths, load_config_from_path};
 pub use schema::*;

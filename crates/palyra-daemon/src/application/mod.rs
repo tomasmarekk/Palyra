@@ -51,6 +51,7 @@ pub mod provider_turn_recovery;
 pub mod recall;
 pub mod release_hardening;
 pub mod replay_continuity;
+pub(crate) mod restart_coordinator;
 pub mod resume_classifier;
 pub(crate) mod run_admission;
 pub mod runtime_boundary_metrics;

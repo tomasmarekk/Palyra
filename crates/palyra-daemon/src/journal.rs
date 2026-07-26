@@ -81,6 +81,7 @@ use crate::{
 
 pub(crate) mod lifecycle;
 mod metadata_trace;
+pub(crate) mod restart;
 mod retrieval_index_status;
 pub(crate) mod run_admission;
 pub(crate) mod runtime_finalization;
@@ -7432,6 +7433,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 79,
         name: "daemon_lifecycle_transitions",
         sql: lifecycle::MIGRATION_79_SQL,
+    },
+    Migration {
+        version: 80,
+        name: "config_watch_and_restart_decisions",
+        sql: restart::MIGRATION_80_SQL,
     },
 ];
 

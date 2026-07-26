@@ -149,6 +149,10 @@ pub(crate) async fn admin_status_handler(
         }),
     );
     let feature_usage = state.runtime.feature_usage_snapshot();
+    let daemon_lifecycle =
+        state.runtime.daemon_lifecycle_snapshot().map_err(runtime_status_response)?;
+    let restart_decisions =
+        state.runtime.recent_config_restart_decisions().map_err(runtime_status_response)?;
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
         map.insert("mcp".to_owned(), mcp_payload);
@@ -195,6 +199,22 @@ pub(crate) async fn admin_status_handler(
             serde_json::to_value(lifecycle).map_err(|error| {
                 runtime_status_response(tonic::Status::internal(format!(
                     "failed to serialize lifecycle snapshot: {error}"
+                )))
+            })?,
+        );
+        map.insert(
+            "daemon_lifecycle".to_owned(),
+            serde_json::to_value(daemon_lifecycle).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to serialize daemon lifecycle snapshot: {error}"
+                )))
+            })?,
+        );
+        map.insert(
+            "restart_decisions".to_owned(),
+            serde_json::to_value(restart_decisions).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to serialize restart decisions: {error}"
                 )))
             })?,
         );

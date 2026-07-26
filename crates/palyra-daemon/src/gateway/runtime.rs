@@ -48,6 +48,9 @@ use crate::application::daemon_lifecycle::{
 use crate::application::file_view_registry::{
     FileViewRegistry, WorkspaceFileViewRecord, WorkspacePatchFileViewReport,
 };
+use crate::application::restart_coordinator::{
+    decide_restart, RestartBlockerSnapshot, RestartDecision, RestartRequest,
+};
 use crate::application::run_stream::flow_control::{
     RunInterruptLatencyObservation, RunInterruptPhase, RUN_INTERRUPT_LATENCY_CLAMPED_REASON_CODE,
     RUN_INTERRUPT_LATENCY_MAX_MS, RUN_INTERRUPT_LATENCY_REASON_CODE,
@@ -7850,6 +7853,68 @@ impl GatewayRuntimeState {
             .map_err(journal_state_error_status)?;
         self.daemon_lifecycle.apply(next.clone()).map_err(daemon_lifecycle_status)?;
         Ok(next)
+    }
+
+    /// Classifies and persists one validated configuration restart request.
+    ///
+    /// Automatic restart is denied while any durable mutation fence is
+    /// started or outcome-unknown. Equivalent candidate hashes coalesce before
+    /// they can create a second lifecycle drain.
+    ///
+    /// # Errors
+    /// Returns a transport status when diagnostics or durable decision
+    /// evidence cannot be loaded.
+    pub(crate) async fn coordinate_config_restart(
+        self: &Arc<Self>,
+        request: RestartRequest,
+        blocked_active_steps: u32,
+        manual_review_steps: u32,
+    ) -> Result<RestartDecision, Status> {
+        let existing_request_id = self
+            .journal_store
+            .restart_request_for_coalescing_key(request.coalescing_key.as_str())
+            .map_err(journal_state_error_status)?;
+        let diagnostics = self.shared_runtime_diagnostics().await?;
+        let outcome_unknown_mutations = diagnostics
+            .side_effect_fences_by_state
+            .get("effect_started")
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(
+                diagnostics.side_effect_fences_by_state.get("effect_unknown").copied().unwrap_or(0),
+            );
+        let lifecycle = self.daemon_lifecycle_snapshot()?;
+        let decision = decide_restart(
+            request,
+            RestartBlockerSnapshot {
+                active_runs: self.counters.snapshot().active_orchestrator_runs(),
+                outcome_unknown_mutations,
+                blocked_active_steps,
+                manual_review_steps,
+                lifecycle_phase: lifecycle.phase.as_str().to_owned(),
+            },
+            existing_request_id,
+            current_unix_ms(),
+        );
+        self.journal_store
+            .record_restart_decision(&decision)
+            .map_err(journal_state_error_status)?;
+        if decision.kind.starts_drain() {
+            self.spawn_daemon_drain(DaemonDrainRequest {
+                trigger: crate::application::daemon_lifecycle::DaemonDrainTrigger::ConfigRestart,
+                reason_code: decision.reason_code.clone(),
+                requested_by: "system:config_watcher".to_owned(),
+                deadline_unix_ms: current_unix_ms().saturating_add(30_000),
+                admission_policy:
+                    crate::application::daemon_lifecycle::DrainAdmissionPolicy::RejectNew,
+            })?;
+        }
+        Ok(decision)
+    }
+
+    /// Returns bounded redacted restart decisions for diagnostics.
+    pub(crate) fn recent_config_restart_decisions(&self) -> Result<Vec<RestartDecision>, Status> {
+        self.journal_store.recent_restart_decisions(16).map_err(journal_state_error_status)
     }
 
     /// Verifies the journal hash chain on the blocking journal worker.
