@@ -1137,6 +1137,7 @@ const fn delivery_state_str(state: RuntimeDeliveryState) -> &'static str {
         RuntimeDeliveryState::IntentRecorded => "intent_recorded",
         RuntimeDeliveryState::Queued => "queued",
         RuntimeDeliveryState::OutcomeUnknown => "outcome_unknown",
+        RuntimeDeliveryState::DeadLetter => "dead_letter",
         RuntimeDeliveryState::Delivered => "delivered",
     }
 }

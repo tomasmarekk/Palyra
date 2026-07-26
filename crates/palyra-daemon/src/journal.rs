@@ -7458,6 +7458,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "startup_recovery_actions",
         sql: startup_recovery::MIGRATION_81_SQL,
     },
+    Migration {
+        version: 82,
+        name: "pending_final_delivery_recovery",
+        sql: runtime_finalization::MIGRATION_82_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -8943,11 +8948,23 @@ fn startup_resume_classifier_input(
     let signals = summarize_resume_tape_observations(observations.as_slice());
     let replay_transcript_signals =
         summarize_replay_transcript_observations(observations.as_slice());
+    let final_output_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runtime_final_output_artifacts WHERE run_ulid = ?1)",
+        params![candidate.run_id.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
     Ok((
         ResumeClassifierInput {
             run_id: candidate.run_id.clone(),
             session_id: candidate.session_id.clone(),
-            run_state: candidate.previous_state.clone(),
+            // A committed final artifact is terminal even when the legacy run
+            // row still says active. Recovery may finish delivery, but must not
+            // regenerate already-persisted output.
+            run_state: if final_output_exists {
+                "done".to_owned()
+            } else {
+                candidate.previous_state.clone()
+            },
             run_principal: candidate.principal.clone(),
             // Startup recovery is host-owned and uses the persisted session
             // authority. Supplying that exact authority makes SafeToResume
@@ -35434,6 +35451,93 @@ mod tests {
             assert_eq!(terminal_event_count, 1);
             assert_eq!(active_generation_count, 0);
         }
+    }
+
+    #[test]
+    fn startup_recovery_never_regenerates_a_committed_final_output() {
+        use palyra_common::runtime_contracts::RuntimeTerminalOutcome;
+
+        use crate::journal::runtime_finalization::{
+            DeliveryArbitrationActionV2, DeliveryArbitrationDecisionV2,
+            FinalOutputArtifactDescriptor,
+        };
+        use crate::journal::StartupRecoveryActuationKind;
+
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SF1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RF1";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        let lease = store
+            .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
+            .expect("run generation should load")
+            .expect("run generation should be active");
+        let content_sha256 = "a".repeat(64);
+        let descriptor = FinalOutputArtifactDescriptor {
+            artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5AF1".to_owned(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            run_generation: lease.generation,
+            run_lease_id: lease.lease_id.as_str().to_owned(),
+            terminal_outcome: RuntimeTerminalOutcome::Completed,
+            content_sha256: content_sha256.clone(),
+            projection_sha256: content_sha256.clone(),
+            user_visible: false,
+            verification_evidence: Vec::new(),
+            missing_artifacts: Vec::new(),
+            active_process_state: Vec::new(),
+            reason_code: RuntimeTerminalOutcome::Completed.reason_code().to_owned(),
+            committed_at_unix_ms: 0,
+        };
+        let decision = DeliveryArbitrationDecisionV2 {
+            artifact_id: descriptor.artifact_id.clone(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            run_generation: lease.generation,
+            parent_run_id: None,
+            descendant_run_ids: Vec::new(),
+            action: DeliveryArbitrationActionV2::Suppress,
+            destination_binding_sha256: None,
+            delivery_intent_id: None,
+            connector_id: None,
+            outbox_envelope_id: None,
+            content_sha256,
+            outbound_request_sha256: None,
+            dedupe_key: None,
+            outbound_request: None,
+            reason_code: "runtime.delivery.arbitration_suppress".to_owned(),
+            decided_at_unix_ms: 0,
+        };
+        store
+            .commit_runtime_final_output_with_arbitration(&descriptor, &decision)
+            .expect("final artifact and arbitration should commit");
+
+        let report = store
+            .terminalize_orphaned_orchestrator_runs_on_startup(
+                "daemon startup detected a finalized orphan",
+            )
+            .expect("startup recovery should reconcile the finalized run");
+
+        assert_eq!(report.continuation_queued_count, 0);
+        assert_eq!(report.confirmation_required_count, 0);
+        assert_eq!(
+            report.actions.first().map(|action| action.actuation_kind),
+            Some(StartupRecoveryActuationKind::DoNotResume)
+        );
+        let tape = store.orchestrator_tape(run_id).expect("recovery tape should load");
+        let resume = tape
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == crate::application::resume_classifier::RUN_RESUME_DECISION_RECORDED_EVENT
+            })
+            .expect("resume classifier evidence should exist");
+        let payload: serde_json::Value = serde_json::from_str(resume.payload_json.as_str())
+            .expect("resume evidence should parse");
+        assert_eq!(payload["decision"], "terminal_do_not_resume");
+        assert_eq!(payload["reason_code"], "resume.terminal_run_state");
     }
 
     #[test]

@@ -1146,7 +1146,7 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                         self.kernel_failure("runtime.delivery.final_projection_missing")
                     })?;
                 let delivery_intent_id =
-                    RuntimeDeliveryIntentId::parse(Ulid::new().to_string().as_str())
+                    RuntimeDeliveryIntentId::parse(final_projection.id().as_str())
                         .map_err(|_| self.kernel_failure("runtime.delivery.intent_id_invalid"))?;
                 return Ok(EmbeddedDeliveryPlan::Commit(DeliveryRequest {
                     delivery_intent_id,

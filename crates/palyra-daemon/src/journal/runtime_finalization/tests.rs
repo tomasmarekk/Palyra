@@ -5,6 +5,7 @@ use std::path::Path;
 use palyra_common::runtime_contracts::{
     RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeTerminalOutcome,
 };
+use palyra_connectors::OutboundMessageRequest;
 use rusqlite::params;
 
 use crate::journal::{
@@ -13,9 +14,9 @@ use crate::journal::{
 };
 
 use super::{
-    runtime_finalization_now, FinalOutputArtifactDescriptor, FinalizationEvidenceRef,
-    RuntimeDeliveryIntentDescriptor, RuntimeDeliveryLinkObservation, RuntimeDeliveryState,
-    RuntimeFinalizationCommitOutcome,
+    runtime_finalization_now, DeliveryArbitrationActionV2, DeliveryArbitrationDecisionV2,
+    FinalOutputArtifactDescriptor, FinalizationEvidenceRef, RuntimeDeliveryIntentDescriptor,
+    RuntimeDeliveryLinkObservation, RuntimeDeliveryState, RuntimeFinalizationCommitOutcome,
 };
 
 struct Fixture {
@@ -130,6 +131,71 @@ fn intent(fixture: &Fixture, intent_id: &str) -> RuntimeDeliveryIntentDescriptor
     }
 }
 
+fn arbitration(
+    fixture: &Fixture,
+    action: DeliveryArbitrationActionV2,
+) -> DeliveryArbitrationDecisionV2 {
+    let descriptor = intent(fixture, "delivery-final");
+    let request = OutboundMessageRequest {
+        envelope_id: descriptor.outbox_envelope_id.clone(),
+        connector_id: descriptor.connector_id.clone(),
+        conversation_id: "conversation-final".to_owned(),
+        reply_thread_id: None,
+        in_reply_to_message_id: None,
+        text: "durable final".to_owned(),
+        broadcast: false,
+        auto_ack_text: None,
+        auto_reaction: None,
+        attachments: Vec::new(),
+        structured_json: None,
+        a2ui_update: None,
+        timeout_ms: 1_000,
+        max_payload_bytes: 16 * 1024,
+    };
+    let deliver = action == DeliveryArbitrationActionV2::Deliver;
+    DeliveryArbitrationDecisionV2 {
+        artifact_id: "final-projection".to_owned(),
+        session_id: "session-final".to_owned(),
+        run_id: "run-final".to_owned(),
+        run_generation: fixture.run_generation,
+        parent_run_id: None,
+        descendant_run_ids: Vec::new(),
+        action,
+        destination_binding_sha256: deliver.then(|| descriptor.destination_binding_sha256.clone()),
+        delivery_intent_id: deliver.then(|| descriptor.delivery_intent_id.clone()),
+        connector_id: deliver.then(|| descriptor.connector_id.clone()),
+        outbox_envelope_id: deliver.then(|| descriptor.outbox_envelope_id.clone()),
+        content_sha256: descriptor.content_sha256.clone(),
+        outbound_request_sha256: deliver.then(|| descriptor.outbound_request_sha256.clone()),
+        dedupe_key: deliver.then(|| descriptor.dedupe_key.clone()),
+        outbound_request: deliver.then_some(request),
+        reason_code: if deliver {
+            "runtime.delivery.arbitration_deliver"
+        } else {
+            "runtime.delivery.arbitration_suppress"
+        }
+        .to_owned(),
+        decided_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
+    }
+}
+
+fn commit_artifact_with_arbitration(
+    fixture: &Fixture,
+    outcome: RuntimeTerminalOutcome,
+    visible: bool,
+) -> RuntimeFinalizationCommitOutcome {
+    let descriptor = artifact(fixture, outcome, visible);
+    let action = if visible {
+        DeliveryArbitrationActionV2::Deliver
+    } else {
+        DeliveryArbitrationActionV2::Suppress
+    };
+    fixture
+        .store
+        .commit_runtime_final_output_with_arbitration(&descriptor, &arbitration(fixture, action))
+        .expect("artifact and arbitration should commit")
+}
+
 fn observation(state: RuntimeDeliveryState, reason_code: &str) -> RuntimeDeliveryLinkObservation {
     RuntimeDeliveryLinkObservation {
         delivery_intent_id: "delivery-final".to_owned(),
@@ -140,6 +206,7 @@ fn observation(state: RuntimeDeliveryState, reason_code: &str) -> RuntimeDeliver
             RuntimeDeliveryState::Queued => "1".repeat(64),
             RuntimeDeliveryState::OutcomeUnknown => "2".repeat(64),
             RuntimeDeliveryState::Delivered => "3".repeat(64),
+            RuntimeDeliveryState::DeadLetter => "5".repeat(64),
             RuntimeDeliveryState::IntentRecorded => "4".repeat(64),
         },
         reason_code: reason_code.to_owned(),
@@ -157,7 +224,10 @@ fn first_commit_uses_journal_time_for_artifact_and_intent_evidence() {
     descriptor.committed_at_unix_ms = 0;
     fixture
         .store
-        .commit_runtime_final_output(&descriptor)
+        .commit_runtime_final_output_with_arbitration(
+            &descriptor,
+            &arbitration(&fixture, DeliveryArbitrationActionV2::Deliver),
+        )
         .expect("artifact should commit with journal-owned time");
     let stored_artifact = fixture
         .store
@@ -215,7 +285,10 @@ fn backdated_artifact_commit_cannot_revive_an_expired_run_lease() {
     let mut descriptor = artifact(&fixture, RuntimeTerminalOutcome::Completed, true);
     descriptor.committed_at_unix_ms = 0;
     assert!(matches!(
-        fixture.store.commit_runtime_final_output(&descriptor),
+        fixture.store.commit_runtime_final_output_with_arbitration(
+            &descriptor,
+            &arbitration(&fixture, DeliveryArbitrationActionV2::Deliver),
+        ),
         Err(JournalError::RuntimeFinalizationAuthorityStale { .. })
     ));
 }
@@ -224,10 +297,7 @@ fn backdated_artifact_commit_cannot_revive_an_expired_run_lease() {
 fn superseded_delivery_authority_rejects_a_backdated_intent() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Completed, true))
-        .expect("artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
     fixture
         .store
         .activate_runtime_generation(&RuntimeGenerationActivateRequest {
@@ -265,14 +335,7 @@ fn final_output_load_rejects_schema_digest_and_denormalized_tampering() {
     for (statement, label) in tamper_cases {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let fixture = setup(&directory.path().join("journal.sqlite3"));
-        fixture
-            .store
-            .commit_runtime_final_output(&artifact(
-                &fixture,
-                RuntimeTerminalOutcome::Completed,
-                true,
-            ))
-            .expect("artifact should commit");
+        commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
         {
             let connection =
                 fixture.store.connection.lock().expect("journal lock should be available");
@@ -312,14 +375,7 @@ fn delivery_intent_load_rejects_schema_digest_and_denormalized_tampering() {
     for (statement, label) in tamper_cases {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let fixture = setup(&directory.path().join("journal.sqlite3"));
-        fixture
-            .store
-            .commit_runtime_final_output(&artifact(
-                &fixture,
-                RuntimeTerminalOutcome::Completed,
-                true,
-            ))
-            .expect("artifact should commit");
+        commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
         fixture
             .store
             .commit_runtime_delivery_intent(&intent(&fixture, "delivery-final"))
@@ -386,14 +442,7 @@ fn delivery_link_load_rejects_digest_json_and_denormalized_tampering() {
     for (statement, label) in tamper_cases {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let fixture = setup(&directory.path().join("journal.sqlite3"));
-        fixture
-            .store
-            .commit_runtime_final_output(&artifact(
-                &fixture,
-                RuntimeTerminalOutcome::Completed,
-                true,
-            ))
-            .expect("artifact should commit");
+        commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
         fixture
             .store
             .commit_runtime_delivery_intent(&intent(&fixture, "delivery-final"))
@@ -434,7 +483,13 @@ fn duplicate_final_and_transport_replay_reuse_one_artifact() {
     let descriptor = artifact(&fixture, RuntimeTerminalOutcome::Completed, true);
 
     assert_eq!(
-        fixture.store.commit_runtime_final_output(&descriptor).expect("first final should commit"),
+        fixture
+            .store
+            .commit_runtime_final_output_with_arbitration(
+                &descriptor,
+                &arbitration(&fixture, DeliveryArbitrationActionV2::Deliver),
+            )
+            .expect("first final should commit"),
         RuntimeFinalizationCommitOutcome::Inserted
     );
     let mut replayed = descriptor.clone();
@@ -442,15 +497,22 @@ fn duplicate_final_and_transport_replay_reuse_one_artifact() {
     assert_eq!(
         fixture
             .store
-            .commit_runtime_final_output(&replayed)
+            .commit_runtime_final_output_with_arbitration(
+                &replayed,
+                &arbitration(&fixture, DeliveryArbitrationActionV2::Deliver),
+            )
             .expect("transport replay should be idempotent after lease expiry"),
         RuntimeFinalizationCommitOutcome::Existing
     );
 
     let mut conflicting = descriptor;
     conflicting.artifact_id = "second-final-projection".to_owned();
+    let mut conflicting_decision = arbitration(&fixture, DeliveryArbitrationActionV2::Deliver);
+    conflicting_decision.artifact_id = conflicting.artifact_id.clone();
     assert!(matches!(
-        fixture.store.commit_runtime_final_output(&conflicting),
+        fixture
+            .store
+            .commit_runtime_final_output_with_arbitration(&conflicting, &conflicting_decision,),
         Err(JournalError::RuntimeFinalOutputConflict { .. })
     ));
 }
@@ -459,10 +521,7 @@ fn duplicate_final_and_transport_replay_reuse_one_artifact() {
 fn recovery_fills_artifact_to_intent_and_intent_to_queue_crash_windows() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Completed, true))
-        .expect("artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
     assert_eq!(
         fixture.store.runtime_delivery_state("delivery-final").expect("state lookup should work"),
         None,
@@ -471,7 +530,7 @@ fn recovery_fills_artifact_to_intent_and_intent_to_queue_crash_windows() {
 
     fixture
         .store
-        .commit_runtime_delivery_intent(&intent(&fixture, "delivery-final"))
+        .ensure_pending_final_delivery_intent("final-projection")
         .expect("recovery should commit intent");
     assert_eq!(
         fixture.store.runtime_delivery_state("delivery-final").expect("intent state should load"),
@@ -494,10 +553,7 @@ fn recovery_fills_artifact_to_intent_and_intent_to_queue_crash_windows() {
 fn connector_unknown_outcome_never_downgrades_to_queued() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Completed, true))
-        .expect("artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
     fixture
         .store
         .commit_runtime_delivery_intent(&intent(&fixture, "delivery-final"))
@@ -560,10 +616,7 @@ fn connector_unknown_outcome_never_downgrades_to_queued() {
 fn cancelled_hidden_run_has_no_delivery_intent() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Cancelled, false))
-        .expect("cancelled artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Cancelled, false);
     assert!(matches!(
         fixture.store.commit_runtime_delivery_intent(&intent(&fixture, "delivery-final")),
         Err(JournalError::RuntimeDeliveryNotVisible { .. })
@@ -574,10 +627,7 @@ fn cancelled_hidden_run_has_no_delivery_intent() {
 fn cancellation_after_ack_cannot_rewrite_delivery_history() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Completed, true))
-        .expect("artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
     fixture
         .store
         .commit_runtime_delivery_intent(&intent(&fixture, "delivery-final"))
@@ -596,11 +646,10 @@ fn cancellation_after_ack_cannot_rewrite_delivery_history() {
         .expect("ack snapshot should exist");
 
     assert!(matches!(
-        fixture.store.commit_runtime_final_output(&artifact(
-            &fixture,
-            RuntimeTerminalOutcome::Cancelled,
-            false,
-        )),
+        fixture.store.commit_runtime_final_output_with_arbitration(
+            &artifact(&fixture, RuntimeTerminalOutcome::Cancelled, false),
+            &arbitration(&fixture, DeliveryArbitrationActionV2::Suppress),
+        ),
         Err(JournalError::RuntimeFinalOutputConflict { .. })
     ));
     assert_eq!(
@@ -637,10 +686,7 @@ fn cancellation_after_ack_cannot_rewrite_delivery_history() {
 fn duplicate_delivery_identity_and_link_create_one_durable_send_lane() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let fixture = setup(&directory.path().join("journal.sqlite3"));
-    fixture
-        .store
-        .commit_runtime_final_output(&artifact(&fixture, RuntimeTerminalOutcome::Completed, true))
-        .expect("artifact should commit");
+    commit_artifact_with_arbitration(&fixture, RuntimeTerminalOutcome::Completed, true);
     let descriptor = intent(&fixture, "delivery-final");
     fixture.store.commit_runtime_delivery_intent(&descriptor).expect("intent should commit");
     let mut replayed = descriptor.clone();
@@ -682,4 +728,93 @@ fn duplicate_delivery_identity_and_link_create_one_durable_send_lane() {
         .expect("link count should load");
     assert_eq!(intent_count, 1);
     assert_eq!(link_count, 1);
+}
+
+#[test]
+fn artifact_and_arbitration_commit_rolls_back_as_one_unit() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let fixture = setup(&directory.path().join("journal.sqlite3"));
+    {
+        let connection = fixture.store.connection.lock().expect("journal lock should be available");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_arbitration_insert
+                    BEFORE INSERT ON runtime_delivery_arbitration_v2
+                    BEGIN
+                        SELECT RAISE(ABORT, 'simulated crash before arbitration');
+                    END;
+                "#,
+            )
+            .expect("fault trigger should install");
+    }
+    let descriptor = artifact(&fixture, RuntimeTerminalOutcome::Completed, true);
+    let decision = arbitration(&fixture, DeliveryArbitrationActionV2::Deliver);
+    assert!(matches!(
+        fixture.store.commit_runtime_final_output_with_arbitration(&descriptor, &decision),
+        Err(JournalError::Sqlite(_))
+    ));
+    assert!(
+        fixture
+            .store
+            .runtime_final_output("run-final", fixture.run_generation)
+            .expect("artifact lookup should work")
+            .is_none(),
+        "artifact must not survive a failed arbitration insert"
+    );
+    {
+        let connection = fixture.store.connection.lock().expect("journal lock should be available");
+        connection
+            .execute_batch("DROP TRIGGER fail_arbitration_insert;")
+            .expect("fault trigger should drop");
+    }
+    fixture
+        .store
+        .commit_runtime_final_output_with_arbitration(&descriptor, &decision)
+        .expect("exact retry should commit the complete bundle");
+    assert!(fixture
+        .store
+        .runtime_delivery_arbitration("final-projection")
+        .expect("arbitration lookup should work")
+        .is_some());
+}
+
+#[test]
+fn parent_descendant_actions_have_stable_semantic_hashes() {
+    for action in [
+        DeliveryArbitrationActionV2::Suppress,
+        DeliveryArbitrationActionV2::Merge,
+        DeliveryArbitrationActionV2::Summarize,
+        DeliveryArbitrationActionV2::Defer,
+        DeliveryArbitrationActionV2::Deliver,
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let fixture = setup(&directory.path().join("journal.sqlite3"));
+        let visible = action == DeliveryArbitrationActionV2::Deliver;
+        let descriptor = artifact(&fixture, RuntimeTerminalOutcome::Completed, visible);
+        let mut decision = arbitration(&fixture, action);
+        decision.parent_run_id = Some("parent-run".to_owned());
+        decision.descendant_run_ids = vec!["child-run-a".to_owned(), "child-run-b".to_owned()];
+        let expected_hash = decision.decision_sha256().expect("decision should hash");
+        decision.decided_at_unix_ms = decision.decided_at_unix_ms.saturating_add(10_000);
+        assert_eq!(
+            decision.decision_sha256().expect("timestamp-adjusted decision should hash"),
+            expected_hash,
+            "semantic hash must not depend on journal time"
+        );
+
+        fixture
+            .store
+            .commit_runtime_final_output_with_arbitration(&descriptor, &decision)
+            .expect("parent/descendant decision should commit");
+        let stored = fixture
+            .store
+            .runtime_delivery_arbitration("final-projection")
+            .expect("stored decision should load")
+            .expect("stored decision should exist");
+        assert_eq!(stored.action, action);
+        assert_eq!(stored.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(stored.descendant_run_ids, decision.descendant_run_ids);
+        assert_eq!(stored.decision_sha256().expect("stored decision should hash"), expected_hash);
+    }
 }

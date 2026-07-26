@@ -166,6 +166,8 @@ pub(crate) enum DeliveryDisposition {
     Delivered,
     /// The adapter outcome is unresolved and cannot be replayed blindly.
     Unknown,
+    /// The connector parked delivery for an explicit operator retry.
+    DeadLetter,
 }
 
 /// Durable delivery result.

@@ -22,17 +22,21 @@ use crate::{
         PhaseLaneAuthority, RuntimePhaseService,
     },
     journal::{
-        runtime_finalization::{runtime_finalization_now, FinalOutputArtifactDescriptor},
+        runtime_finalization::{
+            runtime_finalization_now, DeliveryArbitrationActionV2, DeliveryArbitrationDecisionV2,
+            FinalOutputArtifactDescriptor,
+        },
         JournalConfig, JournalStore, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
         RuntimeGenerationActivateRequest,
     },
 };
 
 use super::{
-    digest_array, final_delivery_content_matches, final_delivery_destination_binding,
-    final_delivery_request_sha256, reconcile_delivery_outbox, DeliveryOutboxPort,
-    DeliveryOutboxState, DeliveryReconciliation, FinalizationHostError, JournalDeliveryService,
-    RetainedFinalDelivery, RunFinalProjectionStore, RuntimeDeliverySnapshot, RuntimeDeliveryState,
+    deterministic_final_envelope_id, digest_array, final_delivery_content_matches,
+    final_delivery_destination_binding, final_delivery_request_sha256, reconcile_delivery_outbox,
+    recover_pending_final_deliveries, DeliveryOutboxPort, DeliveryOutboxState,
+    DeliveryReconciliation, FinalizationHostError, JournalDeliveryService, RetainedFinalDelivery,
+    RunFinalProjectionStore, RuntimeDeliverySnapshot, RuntimeDeliveryState,
 };
 
 #[derive(Debug)]
@@ -296,6 +300,68 @@ fn delivery_input(
     .expect("delivery input should validate")
 }
 
+fn commit_pending_final_bundle(
+    fixture: &DeliveryFixture,
+    parent_run_id: Option<&str>,
+) -> DeliveryArbitrationDecisionV2 {
+    let content_sha256 = super::hex_sha256(request().text.as_bytes());
+    let artifact_id = "pending-final-projection";
+    let intent_id = "pending-final-projection";
+    let mut durable_request = request();
+    let destination_binding_sha256 = final_delivery_destination_binding(&durable_request);
+    durable_request.envelope_id = deterministic_final_envelope_id(
+        "run-final",
+        fixture.run_generation,
+        fixture.run_lease_id.as_str(),
+        intent_id,
+        artifact_id,
+        content_sha256.as_str(),
+        destination_binding_sha256.as_str(),
+    );
+    let artifact = FinalOutputArtifactDescriptor {
+        artifact_id: artifact_id.to_owned(),
+        session_id: "session-final".to_owned(),
+        run_id: "run-final".to_owned(),
+        run_generation: fixture.run_generation,
+        run_lease_id: fixture.run_lease_id.clone(),
+        terminal_outcome: RuntimeTerminalOutcome::Completed,
+        content_sha256: content_sha256.clone(),
+        projection_sha256: content_sha256.clone(),
+        user_visible: true,
+        verification_evidence: Vec::new(),
+        missing_artifacts: Vec::new(),
+        active_process_state: Vec::new(),
+        reason_code: RuntimeTerminalOutcome::Completed.reason_code().to_owned(),
+        committed_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
+    };
+    let decision = DeliveryArbitrationDecisionV2 {
+        artifact_id: artifact_id.to_owned(),
+        session_id: "session-final".to_owned(),
+        run_id: "run-final".to_owned(),
+        run_generation: fixture.run_generation,
+        parent_run_id: parent_run_id.map(str::to_owned),
+        descendant_run_ids: Vec::new(),
+        action: DeliveryArbitrationActionV2::Deliver,
+        destination_binding_sha256: Some(destination_binding_sha256),
+        delivery_intent_id: Some(intent_id.to_owned()),
+        connector_id: Some(durable_request.connector_id.clone()),
+        outbox_envelope_id: Some(durable_request.envelope_id.clone()),
+        content_sha256,
+        outbound_request_sha256: Some(
+            final_delivery_request_sha256(&durable_request).expect("durable request should hash"),
+        ),
+        dedupe_key: Some(durable_request.delivery_idempotency_key()),
+        outbound_request: Some(durable_request),
+        reason_code: "runtime.delivery.arbitration_deliver".to_owned(),
+        decided_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
+    };
+    fixture
+        .journal
+        .commit_runtime_final_output_with_arbitration(&artifact, &decision)
+        .expect("pending final bundle should commit");
+    decision
+}
+
 #[tokio::test]
 async fn canonical_delivery_phase_commits_once_and_replay_does_not_resend() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
@@ -305,12 +371,13 @@ async fn canonical_delivery_phase_commits_once_and_replay_does_not_resend() {
     let content_sha256 = hex::encode(content_digest);
     let projections = Arc::new(RunFinalProjectionStore::default());
     let outbound_request = request();
+    let destination_binding_sha256 = final_delivery_destination_binding(&outbound_request);
     let projection = projections
         .retain_visible(
             content,
             RetainedFinalDelivery {
-                destination_binding_sha256: final_delivery_destination_binding(&outbound_request),
-                request: outbound_request,
+                destination_binding_sha256: destination_binding_sha256.clone(),
+                request: outbound_request.clone(),
             },
             Vec::new(),
             Vec::new(),
@@ -318,25 +385,57 @@ async fn canonical_delivery_phase_commits_once_and_replay_does_not_resend() {
         )
         .expect("visible projection should be retained");
     let projection_id = projection.id().clone();
+    let mut durable_request = outbound_request;
+    durable_request.envelope_id = deterministic_final_envelope_id(
+        "run-final",
+        fixture.run_generation,
+        fixture.run_lease_id.as_str(),
+        "delivery-final",
+        projection_id.as_str(),
+        content_sha256.as_str(),
+        destination_binding_sha256.as_str(),
+    );
+    let artifact = FinalOutputArtifactDescriptor {
+        artifact_id: projection_id.as_str().to_owned(),
+        session_id: "session-final".to_owned(),
+        run_id: "run-final".to_owned(),
+        run_generation: fixture.run_generation,
+        run_lease_id: fixture.run_lease_id.clone(),
+        terminal_outcome: RuntimeTerminalOutcome::Completed,
+        content_sha256: content_sha256.clone(),
+        projection_sha256: content_sha256.clone(),
+        user_visible: true,
+        verification_evidence: Vec::new(),
+        missing_artifacts: Vec::new(),
+        active_process_state: Vec::new(),
+        reason_code: RuntimeTerminalOutcome::Completed.reason_code().to_owned(),
+        committed_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
+    };
+    let decision = DeliveryArbitrationDecisionV2 {
+        artifact_id: projection_id.as_str().to_owned(),
+        session_id: "session-final".to_owned(),
+        run_id: "run-final".to_owned(),
+        run_generation: fixture.run_generation,
+        parent_run_id: None,
+        descendant_run_ids: Vec::new(),
+        action: DeliveryArbitrationActionV2::Deliver,
+        destination_binding_sha256: Some(destination_binding_sha256),
+        delivery_intent_id: Some("delivery-final".to_owned()),
+        connector_id: Some(durable_request.connector_id.clone()),
+        outbox_envelope_id: Some(durable_request.envelope_id.clone()),
+        content_sha256: content_sha256.clone(),
+        outbound_request_sha256: Some(
+            final_delivery_request_sha256(&durable_request).expect("durable request should hash"),
+        ),
+        dedupe_key: Some(durable_request.delivery_idempotency_key()),
+        outbound_request: Some(durable_request),
+        reason_code: "runtime.delivery.arbitration_deliver".to_owned(),
+        decided_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
+    };
     fixture
         .journal
-        .commit_runtime_final_output(&FinalOutputArtifactDescriptor {
-            artifact_id: projection_id.as_str().to_owned(),
-            session_id: "session-final".to_owned(),
-            run_id: "run-final".to_owned(),
-            run_generation: fixture.run_generation,
-            run_lease_id: fixture.run_lease_id.clone(),
-            terminal_outcome: RuntimeTerminalOutcome::Completed,
-            content_sha256: content_sha256.clone(),
-            projection_sha256: content_sha256,
-            user_visible: true,
-            verification_evidence: Vec::new(),
-            missing_artifacts: Vec::new(),
-            active_process_state: Vec::new(),
-            reason_code: RuntimeTerminalOutcome::Completed.reason_code().to_owned(),
-            committed_at_unix_ms: runtime_finalization_now().expect("clock should be available"),
-        })
-        .expect("final artifact should commit");
+        .commit_runtime_final_output_with_arbitration(&artifact, &decision)
+        .expect("final artifact and arbitration should commit");
     let outbox = Arc::new(CountingOutbox::default());
     let service =
         JournalDeliveryService::new(Arc::clone(&fixture.journal), projections, outbox.clone());
@@ -395,5 +494,112 @@ fn terminal_delivery_replay_preserves_evidence_without_touching_outbox() {
     }
 
     assert_eq!(outbox.inspect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(outbox.enqueue_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn startup_recovery_enqueues_the_exact_pending_final_once() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let fixture = delivery_fixture(&directory.path().join("journal.sqlite3"));
+    let decision = commit_pending_final_bundle(&fixture, Some("parent-run"));
+    let outbox = CountingOutbox::default();
+
+    let first = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("first startup recovery should enqueue");
+    let second = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("duplicate startup recovery should reconcile");
+
+    assert_eq!(first.artifact_without_intent_count, 1);
+    assert_eq!(first.intent_pending_count, 1);
+    assert_eq!(second.artifact_without_intent_count, 0);
+    assert_eq!(second.intent_pending_count, 1);
+    assert_eq!(outbox.enqueue_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.parent_wake_run_ids, vec!["parent-run".to_owned()]);
+    let durable_intent = fixture
+        .journal
+        .runtime_delivery_intent(
+            decision.delivery_intent_id.as_deref().expect("decision should have an intent"),
+        )
+        .expect("intent should load")
+        .expect("intent should exist");
+    assert_eq!(
+        durable_intent.dedupe_key,
+        decision.dedupe_key.expect("decision should have a dedupe key")
+    );
+    assert_eq!(
+        durable_intent.content_sha256, decision.content_sha256,
+        "recovery must reuse the original content digest"
+    );
+}
+
+#[test]
+fn startup_recovery_never_retries_an_unknown_delivery() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let fixture = delivery_fixture(&directory.path().join("journal.sqlite3"));
+    commit_pending_final_bundle(&fixture, None);
+    let outbox = CountingOutbox::default();
+    *outbox.state.lock().expect("outbox state should lock") = DeliveryOutboxState::OutcomeUnknown;
+
+    let first = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("unknown outcome should reconcile");
+    let second = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("unknown outcome replay should reconcile");
+
+    assert_eq!(first.outcome_unknown_count, 1);
+    assert_eq!(second.outcome_unknown_count, 1);
+    assert_eq!(outbox.enqueue_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .journal
+            .runtime_delivery_snapshot("pending-final-projection")
+            .expect("snapshot should load")
+            .expect("snapshot should exist")
+            .state,
+        RuntimeDeliveryState::OutcomeUnknown
+    );
+}
+
+#[test]
+fn dead_letter_operator_retry_advances_only_after_ack() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let fixture = delivery_fixture(&directory.path().join("journal.sqlite3"));
+    commit_pending_final_bundle(&fixture, None);
+    let outbox = CountingOutbox::default();
+    *outbox.state.lock().expect("outbox state should lock") = DeliveryOutboxState::DeadLetter;
+
+    let dead = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("dead letter should remain operator-visible");
+    assert_eq!(dead.dead_letter_count, 1);
+    assert_eq!(outbox.enqueue_calls.load(Ordering::SeqCst), 0);
+
+    *outbox.state.lock().expect("outbox state should lock") = DeliveryOutboxState::Queued;
+    let pending = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("operator retry should remain pending");
+    assert_eq!(pending.intent_pending_count, 1);
+    assert_eq!(
+        fixture
+            .journal
+            .runtime_delivery_snapshot("pending-final-projection")
+            .expect("snapshot should load")
+            .expect("snapshot should exist")
+            .state,
+        RuntimeDeliveryState::DeadLetter,
+        "queued retry must not erase dead-letter evidence"
+    );
+
+    *outbox.state.lock().expect("outbox state should lock") =
+        DeliveryOutboxState::Delivered { native_message_id: "provider-ack".to_owned() };
+    let acknowledged = recover_pending_final_deliveries(&fixture.journal, &outbox)
+        .expect("provider ack should advance the lineage");
+    assert_eq!(acknowledged.acknowledged_count, 1);
+    assert_eq!(
+        fixture
+            .journal
+            .runtime_delivery_snapshot("pending-final-projection")
+            .expect("snapshot should load")
+            .expect("snapshot should exist")
+            .state,
+        RuntimeDeliveryState::Delivered
+    );
     assert_eq!(outbox.enqueue_calls.load(Ordering::SeqCst), 0);
 }

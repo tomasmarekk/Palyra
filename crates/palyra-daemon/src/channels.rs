@@ -231,9 +231,7 @@ impl ChannelPlatform {
                             .to_owned(),
                     )
                 }),
-            "dead" => Err(ChannelPlatformError::Precondition(
-                "final delivery outbox row is dead-lettered".to_owned(),
-            )),
+            "dead" => Ok(DeliveryOutboxState::DeadLetter),
             _ => Err(ChannelPlatformError::Precondition(
                 "final delivery outbox row has an unsupported status".to_owned(),
             )),

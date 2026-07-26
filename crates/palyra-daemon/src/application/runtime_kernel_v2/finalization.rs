@@ -18,9 +18,10 @@ use crate::{
     application::tool_registry::canonical_json_bytes,
     journal::{
         runtime_finalization::{
-            runtime_finalization_now, FinalOutputArtifactDescriptor, FinalizationEvidenceRef,
-            RuntimeDeliveryIntentDescriptor, RuntimeDeliveryLinkObservation,
-            RuntimeDeliverySnapshot, RuntimeDeliveryState,
+            runtime_finalization_now, DeliveryArbitrationActionV2, DeliveryArbitrationDecisionV2,
+            FinalOutputArtifactDescriptor, FinalizationEvidenceRef, PendingFinalRecoveryOutcome,
+            PendingFinalRecoveryState, RuntimeDeliveryIntentDescriptor,
+            RuntimeDeliveryLinkObservation, RuntimeDeliverySnapshot, RuntimeDeliveryState,
         },
         JournalError, JournalStore,
     },
@@ -195,6 +196,8 @@ pub(crate) enum DeliveryOutboxState {
     Queued,
     /// The existing outbox parked the effect as outcome-unknown.
     OutcomeUnknown,
+    /// The existing outbox parked the request for explicit operator retry.
+    DeadLetter,
     /// The provider acknowledged delivery.
     Delivered {
         /// Provider-native message identity, hashed before journaling.
@@ -297,7 +300,7 @@ impl JournalFinalizationService {
         &self,
         input: KernelPhaseInput<FinalizationPhase, FinalizationRequest>,
     ) -> Result<KernelPhaseOutput<FinalizationPhase, FinalizationReceipt>, KernelPhaseError> {
-        let retained = self
+        let mut retained = self
             .projections
             .resolve(&input.payload().final_projection)
             .map_err(finalization_phase_error)?;
@@ -311,6 +314,76 @@ impl JournalFinalizationService {
 
         let boundary = input.boundary();
         let authority = boundary.execution().lane_authority();
+        let decision = match retained.delivery.as_mut() {
+            Some(delivery) => {
+                let delivery_intent_id = input.payload().final_projection.id().as_str().to_owned();
+                delivery.request.envelope_id = deterministic_final_envelope_id(
+                    boundary.identities().run_id.as_str(),
+                    boundary.generation(),
+                    authority.run_lease_id().as_str(),
+                    delivery_intent_id.as_str(),
+                    input.payload().final_projection.id().as_str(),
+                    retained.content_sha256.as_str(),
+                    delivery.destination_binding_sha256.as_str(),
+                );
+                if !valid_sha256(&delivery.destination_binding_sha256)
+                    || delivery.destination_binding_sha256
+                        != final_delivery_destination_binding(&delivery.request)
+                    || !final_delivery_content_matches(
+                        retained.content_sha256.as_str(),
+                        delivery.request.text.as_str(),
+                    )
+                {
+                    return Err(finalization_phase_error(
+                        FinalizationHostError::InvalidDeliveryMetadata,
+                    ));
+                }
+                let request_sha256 = final_delivery_request_sha256(&delivery.request)
+                    .map_err(finalization_phase_error)?;
+                DeliveryArbitrationDecisionV2 {
+                    artifact_id: input.payload().final_projection.id().as_str().to_owned(),
+                    session_id: boundary.identities().session_id.as_str().to_owned(),
+                    run_id: boundary.identities().run_id.as_str().to_owned(),
+                    run_generation: boundary.generation(),
+                    parent_run_id: None,
+                    descendant_run_ids: Vec::new(),
+                    action: DeliveryArbitrationActionV2::Deliver,
+                    destination_binding_sha256: Some(delivery.destination_binding_sha256.clone()),
+                    delivery_intent_id: Some(delivery_intent_id),
+                    connector_id: Some(delivery.request.connector_id.clone()),
+                    outbox_envelope_id: Some(delivery.request.envelope_id.clone()),
+                    content_sha256: retained.content_sha256.clone(),
+                    outbound_request_sha256: Some(request_sha256),
+                    dedupe_key: Some(delivery.request.delivery_idempotency_key()),
+                    outbound_request: Some(delivery.request.clone()),
+                    reason_code: "runtime.delivery.arbitration_deliver".to_owned(),
+                    decided_at_unix_ms: runtime_finalization_now().map_err(|error| {
+                        finalization_phase_error(FinalizationHostError::Journal(error))
+                    })?,
+                }
+            }
+            None => DeliveryArbitrationDecisionV2 {
+                artifact_id: input.payload().final_projection.id().as_str().to_owned(),
+                session_id: boundary.identities().session_id.as_str().to_owned(),
+                run_id: boundary.identities().run_id.as_str().to_owned(),
+                run_generation: boundary.generation(),
+                parent_run_id: None,
+                descendant_run_ids: Vec::new(),
+                action: DeliveryArbitrationActionV2::Suppress,
+                destination_binding_sha256: None,
+                delivery_intent_id: None,
+                connector_id: None,
+                outbox_envelope_id: None,
+                content_sha256: retained.content_sha256.clone(),
+                outbound_request_sha256: None,
+                dedupe_key: None,
+                outbound_request: None,
+                reason_code: "runtime.delivery.arbitration_suppress".to_owned(),
+                decided_at_unix_ms: runtime_finalization_now().map_err(|error| {
+                    finalization_phase_error(FinalizationHostError::Journal(error))
+                })?,
+            },
+        };
         let descriptor = FinalOutputArtifactDescriptor {
             artifact_id: input.payload().final_projection.id().as_str().to_owned(),
             session_id: boundary.identities().session_id.as_str().to_owned(),
@@ -330,7 +403,7 @@ impl JournalFinalizationService {
         };
         self.journal
             .store()
-            .commit_runtime_final_output(&descriptor)
+            .commit_runtime_final_output_with_arbitration(&descriptor, &decision)
             .map_err(|error| finalization_phase_error(FinalizationHostError::Journal(error)))?;
         let evidence = RedactedEvidenceRef::from_host(
             input.payload().final_projection.id().clone(),
@@ -503,6 +576,9 @@ impl JournalDeliveryService {
             DeliveryOutboxState::OutcomeUnknown => {
                 (RuntimeDeliveryState::OutcomeUnknown, "runtime.delivery.outcome_unknown", None)
             }
+            DeliveryOutboxState::DeadLetter => {
+                (RuntimeDeliveryState::DeadLetter, "runtime.delivery.dead_letter", None)
+            }
             DeliveryOutboxState::Delivered { native_message_id } => (
                 RuntimeDeliveryState::Delivered,
                 "runtime.delivery.acknowledged",
@@ -556,6 +632,181 @@ impl DeliveryOutboxPort for crate::channels::ChannelPlatform {
     }
 }
 
+/// Aggregate startup reconciliation result for durable final deliveries.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFinalRecoveryReport {
+    pub(crate) scanned_count: usize,
+    pub(crate) artifact_without_intent_count: usize,
+    pub(crate) intent_pending_count: usize,
+    pub(crate) outcome_unknown_count: usize,
+    pub(crate) acknowledged_count: usize,
+    pub(crate) dead_letter_count: usize,
+    pub(crate) parent_wake_run_ids: Vec<String>,
+}
+
+/// Completes only the missing delivery portion of already-finalized outputs.
+///
+/// The exact request, envelope id, content hash, and dedupe key all come from
+/// the durable arbitration record. Confirmed or uncertain effects are never
+/// enqueued again.
+///
+/// # Errors
+/// Returns a journal, integrity, or connector-outbox error.
+pub(crate) fn recover_pending_final_deliveries(
+    journal: &JournalStore,
+    outbox: &dyn DeliveryOutboxPort,
+) -> Result<PendingFinalRecoveryReport, FinalizationHostError> {
+    let decisions = journal.pending_final_delivery_arbitrations()?;
+    let mut report = PendingFinalRecoveryReport::default();
+    for decision in decisions {
+        report.scanned_count = report.scanned_count.saturating_add(1);
+        let intent_id = decision
+            .delivery_intent_id
+            .clone()
+            .ok_or(FinalizationHostError::InvalidDeliveryMetadata)?;
+        let intent_missing = journal.runtime_delivery_intent(intent_id.as_str())?.is_none();
+        if intent_missing {
+            report.artifact_without_intent_count =
+                report.artifact_without_intent_count.saturating_add(1);
+            record_pending_outcome(
+                journal,
+                &decision,
+                PendingFinalRecoveryState::ArtifactWithoutIntent,
+                "runtime.delivery.recovery_intent_missing",
+                decision.decision_sha256()?,
+            )?;
+        }
+        let intent = journal.ensure_pending_final_delivery_intent(decision.artifact_id.as_str())?;
+        let request = decision
+            .outbound_request
+            .as_ref()
+            .ok_or(FinalizationHostError::InvalidDeliveryMetadata)?;
+        if request.connector_id != intent.connector_id
+            || request.envelope_id != intent.outbox_envelope_id
+            || request.delivery_idempotency_key() != intent.dedupe_key
+            || final_delivery_request_sha256(request)? != intent.outbound_request_sha256
+            || !final_delivery_content_matches(
+                intent.content_sha256.as_str(),
+                request.text.as_str(),
+            )
+        {
+            return Err(FinalizationHostError::InvalidDeliveryMetadata);
+        }
+
+        let durable = journal
+            .runtime_delivery_snapshot(intent.delivery_intent_id.as_str())?
+            .ok_or(FinalizationHostError::InvalidDeliveryMetadata)?;
+        let outbox_state = match durable.state {
+            RuntimeDeliveryState::Delivered => DeliveryOutboxState::Delivered {
+                native_message_id: "durable-acknowledgement".to_owned(),
+            },
+            RuntimeDeliveryState::OutcomeUnknown => DeliveryOutboxState::OutcomeUnknown,
+            RuntimeDeliveryState::DeadLetter
+            | RuntimeDeliveryState::IntentRecorded
+            | RuntimeDeliveryState::Queued => {
+                match outbox
+                    .inspect(intent.connector_id.as_str(), intent.outbox_envelope_id.as_str())?
+                {
+                    DeliveryOutboxState::Missing
+                        if durable.state == RuntimeDeliveryState::DeadLetter =>
+                    {
+                        DeliveryOutboxState::DeadLetter
+                    }
+                    DeliveryOutboxState::Missing => {
+                        outbox.enqueue(request)?;
+                        DeliveryOutboxState::Queued
+                    }
+                    state => state,
+                }
+            }
+        };
+        let now = runtime_finalization_now()?;
+        let (recovery_state, delivery_state, reason_code, native_message_id_sha256) =
+            match outbox_state {
+                DeliveryOutboxState::Missing => {
+                    return Err(FinalizationHostError::InvalidDeliveryMetadata);
+                }
+                DeliveryOutboxState::Queued => {
+                    report.intent_pending_count = report.intent_pending_count.saturating_add(1);
+                    (
+                        PendingFinalRecoveryState::IntentPending,
+                        RuntimeDeliveryState::Queued,
+                        "runtime.delivery.recovery_intent_pending",
+                        None,
+                    )
+                }
+                DeliveryOutboxState::OutcomeUnknown => {
+                    report.outcome_unknown_count = report.outcome_unknown_count.saturating_add(1);
+                    (
+                        PendingFinalRecoveryState::OutcomeUnknown,
+                        RuntimeDeliveryState::OutcomeUnknown,
+                        "runtime.delivery.recovery_outcome_unknown",
+                        None,
+                    )
+                }
+                DeliveryOutboxState::DeadLetter => {
+                    report.dead_letter_count = report.dead_letter_count.saturating_add(1);
+                    (
+                        PendingFinalRecoveryState::DeadLetter,
+                        RuntimeDeliveryState::DeadLetter,
+                        "runtime.delivery.recovery_dead_letter",
+                        None,
+                    )
+                }
+                DeliveryOutboxState::Delivered { native_message_id } => {
+                    report.acknowledged_count = report.acknowledged_count.saturating_add(1);
+                    (
+                        PendingFinalRecoveryState::Acked,
+                        RuntimeDeliveryState::Delivered,
+                        "runtime.delivery.recovery_acknowledged",
+                        Some(hex_sha256(native_message_id.as_bytes())),
+                    )
+                }
+            };
+        let evidence_sha256 = durable
+            .evidence_sha256
+            .unwrap_or_else(|| delivery_evidence_sha256(&intent, delivery_state, reason_code));
+        journal.record_runtime_delivery_link(&RuntimeDeliveryLinkObservation {
+            delivery_intent_id: intent.delivery_intent_id.clone(),
+            state: delivery_state,
+            connector_id: intent.connector_id.clone(),
+            outbox_envelope_id: intent.outbox_envelope_id.clone(),
+            evidence_sha256: evidence_sha256.clone(),
+            reason_code: reason_code.to_owned(),
+            native_message_id_sha256,
+            observed_at_unix_ms: now,
+        })?;
+        record_pending_outcome(journal, &decision, recovery_state, reason_code, evidence_sha256)?;
+        if let Some(parent_run_id) = decision.parent_run_id {
+            report.parent_wake_run_ids.push(parent_run_id);
+        }
+    }
+    report.parent_wake_run_ids.sort();
+    report.parent_wake_run_ids.dedup();
+    Ok(report)
+}
+
+fn record_pending_outcome(
+    journal: &JournalStore,
+    decision: &DeliveryArbitrationDecisionV2,
+    state: PendingFinalRecoveryState,
+    reason_code: &str,
+    evidence_sha256: String,
+) -> Result<(), FinalizationHostError> {
+    journal.record_pending_final_recovery_outcome(&PendingFinalRecoveryOutcome {
+        artifact_id: decision.artifact_id.clone(),
+        delivery_intent_id: decision.delivery_intent_id.clone(),
+        run_id: decision.run_id.clone(),
+        state,
+        evidence_sha256,
+        reason_code: reason_code.to_owned(),
+        parent_run_id: decision.parent_run_id.clone(),
+        parent_wake_required: decision.parent_run_id.is_some(),
+        observed_at_unix_ms: runtime_finalization_now()?,
+    })?;
+    Ok(())
+}
+
 enum DeliveryReconciliation {
     Replay { state: RuntimeDeliveryState, evidence_sha256: String },
     Observe(DeliveryOutboxState),
@@ -579,6 +830,9 @@ fn reconcile_delivery_outbox(
 
     let state = outbox.inspect(request.connector_id.as_str(), request.envelope_id.as_str())?;
     if state == DeliveryOutboxState::Missing {
+        if durable.state == RuntimeDeliveryState::DeadLetter {
+            return Ok(DeliveryReconciliation::Observe(DeliveryOutboxState::DeadLetter));
+        }
         outbox.enqueue(request)?;
         return Ok(DeliveryReconciliation::Observe(DeliveryOutboxState::Queued));
     }
@@ -602,6 +856,7 @@ fn delivery_phase_output(
         RuntimeDeliveryState::IntentRecorded => DeliveryDisposition::IntentRecorded,
         RuntimeDeliveryState::Queued => DeliveryDisposition::Queued,
         RuntimeDeliveryState::OutcomeUnknown => DeliveryDisposition::Unknown,
+        RuntimeDeliveryState::DeadLetter => DeliveryDisposition::DeadLetter,
         RuntimeDeliveryState::Delivered => DeliveryDisposition::Delivered,
     };
     let reason = if disposition == DeliveryDisposition::Unknown {
@@ -650,6 +905,7 @@ fn delivery_evidence_sha256(
             RuntimeDeliveryState::IntentRecorded => "intent_recorded",
             RuntimeDeliveryState::Queued => "queued",
             RuntimeDeliveryState::OutcomeUnknown => "outcome_unknown",
+            RuntimeDeliveryState::DeadLetter => "dead_letter",
             RuntimeDeliveryState::Delivered => "delivered",
         }
         .as_bytes(),

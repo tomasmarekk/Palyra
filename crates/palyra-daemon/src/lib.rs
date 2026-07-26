@@ -3147,6 +3147,15 @@ pub async fn run() -> Result<()> {
         .context("failed to reconcile connector outbox effects after QA fault restart")?;
     #[cfg(not(feature = "qa-fault-injection"))]
     let recovered_connector_fault_activations = 0usize;
+    let pending_final_recovery =
+        application::runtime_kernel_v2::finalization::recover_pending_final_deliveries(
+            &runtime.journal_store,
+            channels.as_ref(),
+        )
+        .context("failed to reconcile pending final deliveries during startup")?;
+    if !pending_final_recovery.parent_wake_run_ids.is_empty() {
+        scheduler_wake.notify_waiters();
+    }
     let recovered_generic_fault_activations = runtime
         .fault_injection
         .record_startup_orphan_recoveries()
@@ -3162,6 +3171,7 @@ pub async fn run() -> Result<()> {
         || startup_process_lease_reconciliation.inspected_count > 0
         || startup_process_lease_reconciliation.pending_cleanup_inspected_count > 0
         || !startup_networked_worker_expiry.is_empty()
+        || pending_final_recovery.scanned_count > 0
         || recovered_fault_activations > 0
     {
         warn!(
@@ -3184,6 +3194,18 @@ pub async fn run() -> Result<()> {
             process_leases_expired = startup_process_lease_reconciliation.expired_count,
             pending_process_cleanups_inspected =
                 startup_process_lease_reconciliation.pending_cleanup_inspected_count,
+            pending_final_deliveries_scanned = pending_final_recovery.scanned_count,
+            final_artifacts_without_intent =
+                pending_final_recovery.artifact_without_intent_count,
+            final_delivery_intents_pending = pending_final_recovery.intent_pending_count,
+            final_delivery_outcomes_unknown = pending_final_recovery.outcome_unknown_count,
+            final_deliveries_acknowledged = pending_final_recovery.acknowledged_count,
+            final_delivery_dead_letters = pending_final_recovery.dead_letter_count,
+            final_delivery_parent_wake_digests = ?pending_final_recovery
+                .parent_wake_run_ids
+                .iter()
+                .filter_map(|run_id| crate::metadata_trace::hash_metadata_trace_run_id(run_id))
+                .collect::<Vec<_>>(),
             pending_process_cleanups_completed =
                 startup_process_lease_reconciliation.pending_cleanup_completed_count,
             pending_process_cleanups_remaining =
