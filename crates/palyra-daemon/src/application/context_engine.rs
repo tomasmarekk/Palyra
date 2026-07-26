@@ -48,7 +48,7 @@ use crate::{
         provider_input::{
             build_attachment_recall_prompt, build_explicit_recall_prompt,
             build_memory_augmented_prompt, build_previous_run_context_prompt,
-            build_previous_run_provider_messages, build_project_context_prompt,
+            build_previous_run_provider_projection, build_project_context_prompt,
             build_provider_image_inputs, parse_provider_reasoning_effort_override,
             parse_provider_service_tier_override, record_provider_pruning_decision,
             resolve_latest_session_compaction_artifact, MemoryPromptFailureMode,
@@ -1367,8 +1367,17 @@ async fn prepare_model_provider_input_with_default_context_engine(
     }
 
     let mut provider_messages = compiled_instructions.provider_messages();
-    provider_messages
-        .extend(build_previous_run_provider_messages(runtime_state, previous_run_id).await?);
+    let previous_projection = build_previous_run_provider_projection(
+        runtime_state,
+        run_id,
+        tape_seq,
+        previous_run_id,
+        provider_budget.profile.provider_kind.as_str(),
+        provider_budget.profile.model_id.as_str(),
+        prompt_cache_session_metadata.prompt_cache_epoch(),
+    )
+    .await?;
+    provider_messages.extend(previous_projection.messages);
     let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
         crate::application::provider_input::build_prompt_cache_metadata(
             assembled.prompt_text.as_str(),

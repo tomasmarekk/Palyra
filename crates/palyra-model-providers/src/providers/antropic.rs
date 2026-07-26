@@ -115,7 +115,10 @@ fn anthropic_system_payload(request: &ProviderRequest, system: String) -> Value 
 
 fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>, Option<String>) {
     let mut system_blocks = Vec::new();
-    let mut messages = request.effective_messages();
+    let mut messages = crate::project_provider_request_messages(
+        request.effective_messages(),
+        crate::ProviderTranscriptDialect::AnthropicMessages,
+    );
     let cache_control_message_indexes = anthropic_cache_control_message_indexes(request, &messages);
     if !request.vision_inputs.is_empty() {
         if let Some(last_user) =
@@ -377,7 +380,7 @@ mod tests {
     use crate::config::{ModelProviderAuthProviderKind, ModelProviderCredentialSource};
     use crate::{
         PromptCacheReport, PromptCacheStrategy, ProviderMessage, ProviderMessageContentPart,
-        ProviderMessageRole, ProviderRequest,
+        ProviderMessageRole, ProviderMessageToolCall, ProviderRequest,
     };
 
     fn prompt_cache_request(enabled: bool) -> ProviderRequest {
@@ -488,5 +491,39 @@ mod tests {
                 .is_none(),
             "current turn should not receive an Anthropic cache marker"
         );
+    }
+
+    #[test]
+    fn active_anthropic_payload_synthesizes_a_strict_missing_tool_result() {
+        let mut request =
+            ProviderRequest::from_input_text("current turn".to_owned(), false, Vec::new(), None);
+        request.messages = vec![
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "bad id/with spaces".to_owned(),
+                    tool_name: "palyra.status".to_owned(),
+                    input_json: serde_json::json!({}),
+                }],
+            },
+            ProviderMessage::user_text("continue safely"),
+        ];
+
+        let payload = messages_payload(&request, "claude-test", Vec::new());
+        let messages = payload["messages"].as_array().expect("messages should be an array");
+        let tool_use = &messages[0]["content"][0];
+        let tool_result = &messages[1]["content"][0];
+        let normalized_id = tool_use["id"].as_str().expect("Anthropic tool use should have an ID");
+
+        assert!(normalized_id.starts_with("toolu_"));
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], normalized_id);
+        assert!(tool_result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(r#""success":false"#)));
     }
 }

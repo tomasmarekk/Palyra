@@ -16,6 +16,7 @@ pub mod snapshots;
 pub mod streaming;
 pub mod tool_call_assembler;
 pub mod tool_repair;
+pub mod transcript_projection;
 
 mod redaction;
 
@@ -147,4 +148,12 @@ pub use tool_repair::{
     ToolRepairDecisionStatus, ToolRepairStreamNormalizer, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
     PROVIDER_STREAM_NORMALIZED_EVENT, PROVIDER_STREAM_REPAIR_BOUNDARY_CLOSED_EVENT,
     TOOL_REPAIR_ACCEPTED_EVENT, TOOL_REPAIR_CANDIDATE_DETECTED_EVENT, TOOL_REPAIR_REJECTED_EVENT,
+};
+pub use transcript_projection::{
+    authorize_provider_reasoning_replay, project_provider_request_messages,
+    project_provider_transcript, ProviderReasoningReplayError, ProviderReasoningReplayRequest,
+    ProviderTranscriptDialect, ProviderTranscriptProjectionError,
+    ProviderTranscriptProjectionRequest, ProviderTranscriptProjectionV1,
+    ProviderTranscriptSourceMessage, TranscriptRepairRecord, TranscriptRepairReport,
+    MAX_PROVIDER_TRANSCRIPT_MESSAGES, MAX_PROVIDER_TRANSCRIPT_TOOL_RESULT_CHARS,
 };

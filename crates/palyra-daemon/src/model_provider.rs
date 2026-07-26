@@ -100,16 +100,18 @@ use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
-    classify_terminal_outcome, AudioTranscriptionRequest, AudioTranscriptionResponse,
-    AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy,
-    PromptCacheReport, PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary,
-    ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
-    ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+    classify_terminal_outcome, project_provider_transcript, AudioTranscriptionRequest,
+    AudioTranscriptionResponse, AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse,
+    PromptCachePolicy, PromptCacheReport, PromptCacheStrategy, ProviderAttemptState,
+    ProviderAttemptSummary, ProviderEvent, ProviderFinishReason, ProviderImageInput,
+    ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
     ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
     ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
     ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
-    ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext, TerminalOutcomeClass,
-    TerminalOutcomeClassification,
+    ProviderTranscriptDialect, ProviderTranscriptProjectionRequest, ProviderTranscriptProjectionV1,
+    ProviderTranscriptSourceMessage, ProviderTurnOutput, ProviderUsage,
+    QaProviderAttestationContext, TerminalOutcomeClass, TerminalOutcomeClassification,
+    TranscriptRepairReport,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -7274,7 +7276,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_adapter_converts_orphan_tool_results_to_text() {
+    fn anthropic_adapter_isolates_orphan_tool_results_without_replaying_payload() {
         let request = ProviderRequest {
             input_text: "Continue from previous evidence.".to_owned(),
             user_visible_input_text: None,
@@ -7307,7 +7309,11 @@ mod tests {
         assert!(anthropic_payload["messages"][1]["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("Tool result for call_orphan_01"));
+            .contains("unpaired tool result omitted"));
+        let serialized =
+            serde_json::to_string(&anthropic_payload).expect("payload should serialize");
+        assert!(!serialized.contains("call_orphan_01"));
+        assert!(!serialized.contains(r#""status":"ok""#));
         assert_eq!(anthropic_payload["messages"][2]["role"], "user");
         assert_eq!(anthropic_payload["messages"].as_array().unwrap().len(), 3);
     }

@@ -350,7 +350,10 @@ fn openai_image_part(image: &ProviderImageInput) -> Value {
 }
 
 fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
-    let mut messages = request.effective_messages();
+    let mut messages = crate::project_provider_request_messages(
+        request.effective_messages(),
+        crate::ProviderTranscriptDialect::OpenAiChatCompletions,
+    );
     if !request.vision_inputs.is_empty() {
         if let Some(last_user) =
             messages.iter_mut().rev().find(|message| message.role == ProviderMessageRole::User)
@@ -404,7 +407,10 @@ fn build_openai_responses_input_and_instructions(
     request: &ProviderRequest,
     tool_wire_names: &HashMap<String, String>,
 ) -> (Vec<Value>, Option<String>) {
-    let mut messages = request.effective_messages();
+    let mut messages = crate::project_provider_request_messages(
+        request.effective_messages(),
+        crate::ProviderTranscriptDialect::OpenAiResponses,
+    );
     if !request.vision_inputs.is_empty() {
         if let Some(last_user) =
             messages.iter_mut().rev().find(|message| message.role == ProviderMessageRole::User)
@@ -580,6 +586,30 @@ fn responses_safe_tool_name(original_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProviderMessageToolCall;
+
+    fn malformed_tool_history_request() -> ProviderRequest {
+        let mut request =
+            ProviderRequest::from_input_text("current turn".to_owned(), false, Vec::new(), None);
+        request.messages = vec![
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "bad id/with spaces".to_owned(),
+                    tool_name: "palyra.status".to_owned(),
+                    input_json: json!({}),
+                }],
+            },
+            ProviderMessage::user_text("late divider"),
+            ProviderMessage::tool_result("bad id/with spaces", r#"{"status":"ok"}"#),
+            ProviderMessage::tool_result("bad id/with spaces", r#"{"status":"duplicate"}"#),
+            ProviderMessage::tool_result("orphan", r#"{"status":"orphan"}"#),
+        ];
+        request
+    }
 
     fn reasoning_request(effort: ProviderReasoningEffort) -> ProviderRequest {
         let mut request =
@@ -710,5 +740,42 @@ mod tests {
         let payload = chat_completions_payload(&request, "gpt-5.5", Vec::new());
 
         assert!(payload.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn active_openai_payloads_share_repaired_tool_pair_projection() {
+        let request = malformed_tool_history_request();
+
+        let chat = chat_completions_payload(&request, "gpt-test", Vec::new());
+        let chat_messages = chat["messages"].as_array().expect("chat messages should be an array");
+        let normalized_id = chat_messages[0]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("chat tool call should have an ID");
+        assert!(normalized_id.starts_with("call_"));
+        assert_eq!(chat_messages[1]["role"], "tool");
+        assert_eq!(chat_messages[1]["tool_call_id"], normalized_id);
+        assert_eq!(
+            chat_messages.iter().filter(|message| message["role"] == "tool").count(),
+            1,
+            "duplicate and orphan tool results must not reach the chat schema"
+        );
+
+        let responses = responses_payload(&request, "gpt-test", Vec::new());
+        let input = responses.body["input"].as_array().expect("responses input should be an array");
+        let call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .expect("responses input should contain the repaired call");
+        let output_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .expect("responses input should contain the paired result");
+        assert_eq!(output_index, call_index + 1);
+        assert_eq!(input[call_index]["call_id"], input[output_index]["call_id"]);
+        assert_eq!(
+            input.iter().filter(|item| item["type"] == "function_call_output").count(),
+            1,
+            "duplicate and orphan outputs must not reach the Responses schema"
+        );
     }
 }

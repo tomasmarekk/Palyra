@@ -60,6 +60,7 @@ pub(crate) fn project_orchestrator_tape_record(
         "provider.lane.attested" => project_provider_lane_attested(payload),
         "provider.retry.started" => project_provider_retry_started(payload),
         "provider.route.changed" => project_provider_route_changed(payload),
+        "provider.transcript.projected" => project_provider_transcript(payload),
         "tool.before_decision" => project_before_tool_decision(payload),
         "tool_proposal" => project_tool_proposal(payload),
         "tool_approval_request" => project_approval_request(payload),
@@ -442,6 +443,76 @@ fn project_provider_route_changed(payload: &Map<String, Value>) -> Option<Projec
         required_reason_code(payload, "reason_code")?,
         None,
     )
+}
+
+fn project_provider_transcript(payload: &Map<String, Value>) -> Option<ProjectedEvent> {
+    if payload.get("schema_version")?.as_u64()? != 1
+        || payload.get("redaction_level")?.as_str()? != "metadata_only"
+        || payload.get("projection_epoch")?.as_u64().is_none()
+        || payload.get("message_count")?.as_u64()? > 512
+        || required_sha256(payload, "projection_sha256").is_none()
+        || required_sha256(payload, "model_id_sha256").is_none()
+        || !matches!(
+            payload.get("dialect")?.as_str()?,
+            "provider_neutral"
+                | "open_ai_chat_completions"
+                | "open_ai_responses"
+                | "anthropic_messages"
+        )
+    {
+        return None;
+    }
+    let projection_id = payload.get("projection_id")?.as_str()?;
+    let projection_digest = projection_id.strip_prefix("provider_projection_v1:")?;
+    if projection_digest.len() != 26
+        || !projection_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let repair_report = payload.get("repair_report")?.as_object()?;
+    if repair_report.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let reason_code = required_reason_code(repair_report, "reason_code")?;
+    if !matches!(reason_code.as_str(), "provider.transcript.valid" | "provider.transcript.repaired")
+    {
+        return None;
+    }
+    let repairs = repair_report.get("repairs")?.as_array()?;
+    if repairs.len() > 1_024
+        || repairs.iter().any(|repair| {
+            let Some(repair) = repair.as_object() else {
+                return true;
+            };
+            if required_reason_code(repair, "reason_code").is_none() {
+                return true;
+            }
+            repair.get("source_tape_refs").is_some_and(|refs| {
+                refs.as_array().is_none_or(|refs| {
+                    refs.len() > 512
+                        || refs.iter().any(|reference| {
+                            reference
+                                .as_str()
+                                .and_then(|reference| reference.strip_prefix("tape_seq:"))
+                                .is_none_or(|sequence| {
+                                    sequence.is_empty()
+                                        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                        })
+                })
+            })
+        })
+    {
+        return None;
+    }
+    Some(ProjectedEvent {
+        event: MetadataTraceEventDataV1::Recovery(RecoveryMetadataV1 {
+            strategy: MetadataTraceRecoveryStrategyV1::IdempotencyGuard,
+            attempt: 1,
+            reason_code,
+        }),
+        stage_duration_ms: None,
+    })
 }
 
 #[expect(

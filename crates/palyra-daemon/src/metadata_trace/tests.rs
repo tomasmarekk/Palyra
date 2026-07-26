@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 
 use palyra_common::metadata_trace::{
     MetadataTraceCapacityLimitV1, MetadataTraceEventDataV1, MetadataTraceProviderAttemptOutcomeV1,
-    MetadataTraceTerminalOutcomeV1, MetadataTraceToolGateDecisionV1, MetadataTraceToolOutcomeV1,
-    METADATA_TRACE_MAX_EVENTS, METADATA_TRACE_MAX_STAGE_DURATION_MS,
+    MetadataTraceRecoveryStrategyV1, MetadataTraceTerminalOutcomeV1,
+    MetadataTraceToolGateDecisionV1, MetadataTraceToolOutcomeV1, METADATA_TRACE_MAX_EVENTS,
+    METADATA_TRACE_MAX_STAGE_DURATION_MS,
 };
 use serde_json::{json, Value};
 
@@ -492,6 +493,40 @@ fn recovery_delivery_and_terminal_events_ignore_free_form_diagnostics() {
     assert!(!metadata.output_emitted);
     assert!(metadata.side_effect_may_have_occurred);
     assert_projection_excludes_hostile_content(&terminal);
+}
+
+#[test]
+fn provider_transcript_repair_report_projects_closed_replay_evidence() {
+    let projection = project(
+        "provider.transcript.projected",
+        json!({
+            "schema_version": 1,
+            "projection_id": format!("provider_projection_v1:{}", "a".repeat(26)),
+            "projection_sha256": "b".repeat(64),
+            "projection_epoch": 7,
+            "dialect": "anthropic_messages",
+            "model_id_sha256": "c".repeat(64),
+            "message_count": 4,
+            "repair_report": {
+                "schema_version": 1,
+                "reason_code": "provider.transcript.repaired",
+                "repairs": [{
+                    "reason_code": "provider.transcript.missing_result_synthesized",
+                    "source_tape_refs": ["tape_seq:9"],
+                    "hostile": SECRET_SENTINEL,
+                }],
+            },
+            "redaction_level": "metadata_only",
+            "provider_payload": SECRET_SENTINEL,
+        }),
+    )
+    .expect("closed transcript repair evidence should project");
+    let MetadataTraceEventDataV1::Recovery(recovery) = &projection.event else {
+        panic!("transcript repair should project as deterministic recovery metadata");
+    };
+    assert_eq!(recovery.strategy, MetadataTraceRecoveryStrategyV1::IdempotencyGuard);
+    assert_eq!(recovery.reason_code, "provider.transcript.repaired");
+    assert_projection_excludes_hostile_content(&projection);
 }
 
 #[test]

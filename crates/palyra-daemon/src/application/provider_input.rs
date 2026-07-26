@@ -70,10 +70,12 @@ use crate::{
     media::MediaDerivedArtifactSelection,
     media::MediaRuntimeConfig,
     model_provider::{
-        PromptCachePolicy, PromptCacheReport, PromptCacheStrategy, ProviderImageInput,
-        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderPromptCacheHint,
-        ProviderPromptSegment, ProviderPromptSegmentKind, ProviderReasoningEffort,
-        ProviderServiceTier,
+        project_provider_transcript, PromptCachePolicy, PromptCacheReport, PromptCacheStrategy,
+        ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderMessageToolCall, ProviderPromptCacheHint, ProviderPromptSegment,
+        ProviderPromptSegmentKind, ProviderReasoningEffort, ProviderServiceTier,
+        ProviderTranscriptDialect, ProviderTranscriptProjectionRequest,
+        ProviderTranscriptProjectionV1, ProviderTranscriptSourceMessage,
     },
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -1367,25 +1369,10 @@ async fn load_previous_run_context_turns(
     runtime_state: &Arc<GatewayRuntimeState>,
     previous_run_id: Option<&str>,
 ) -> Result<Vec<(&'static str, String)>, Status> {
-    let Some(previous_run_id) = previous_run_id else {
-        return Ok(Vec::new());
-    };
-    let tape_snapshot = match runtime_state
-        .orchestrator_tape_snapshot(
-            previous_run_id.to_owned(),
-            None,
-            Some(MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS),
-        )
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) if error.code() == tonic::Code::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-
+    let events = load_previous_run_tape_events(runtime_state, previous_run_id).await?;
     let mut turns = Vec::new();
     let mut provider_turn_output_assistant_fallback = None;
-    for event in &tape_snapshot.events {
+    for event in &events {
         if let Some(text) = provider_turn_output_text_from_tape_event(event) {
             provider_turn_output_assistant_fallback = Some(text);
             continue;
@@ -1423,33 +1410,203 @@ async fn load_previous_run_context_turns(
     Ok(turns)
 }
 
-/// Reconstructs the previous run's turns as structured provider messages.
-///
-/// Returns an empty list when there is no previous run or its tape no longer
-/// exists.
-///
-/// # Errors
-/// Returns `Status` when reading the previous run's tape fails for any
-/// reason other than `NotFound`.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn build_previous_run_provider_messages(
+async fn load_previous_run_tape_events(
     runtime_state: &Arc<GatewayRuntimeState>,
     previous_run_id: Option<&str>,
-) -> Result<Vec<ProviderMessage>, Status> {
-    let turns = load_previous_run_context_turns(runtime_state, previous_run_id).await?;
-    Ok(turns
-        .into_iter()
-        .map(|(speaker, text)| match speaker {
-            "assistant" => ProviderMessage {
-                role: ProviderMessageRole::Assistant,
-                content: vec![ProviderMessageContentPart::text(text)],
-                name: None,
-                tool_call_id: None,
-                tool_calls: Vec::new(),
-            },
-            _ => ProviderMessage::user_text(text),
+) -> Result<Vec<OrchestratorTapeRecord>, Status> {
+    let Some(previous_run_id) = previous_run_id else {
+        return Ok(Vec::new());
+    };
+    match runtime_state
+        .orchestrator_tape_snapshot(
+            previous_run_id.to_owned(),
+            None,
+            Some(MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS),
+        )
+        .await
+    {
+        Ok(snapshot) => Ok(snapshot.events),
+        Err(error) if error.code() == tonic::Code::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn previous_run_provider_source_messages(
+    events: &[OrchestratorTapeRecord],
+) -> Vec<ProviderTranscriptSourceMessage> {
+    let mut sources = Vec::new();
+    let mut pending_assistant = None::<ProviderTranscriptSourceMessage>;
+    let mut previous_was_tool_proposal = false;
+    for event in events {
+        let source_ref = format!("tape_seq:{}", event.seq);
+        match event.event_type.as_str() {
+            "provider_turn_output" => {
+                if let Some(text) = provider_turn_output_text_from_tape_event(event) {
+                    flush_pending_provider_assistant(&mut sources, &mut pending_assistant);
+                    pending_assistant =
+                        Some(provider_assistant_source(Some(text), Vec::new(), source_ref));
+                }
+            }
+            "message.received" => {
+                flush_pending_provider_assistant(&mut sources, &mut pending_assistant);
+                if let Some((_, text)) = extract_previous_run_turn_from_tape_event(event) {
+                    sources.push(ProviderTranscriptSourceMessage {
+                        message: ProviderMessage::user_text(text),
+                        source_tape_refs: vec![source_ref],
+                    });
+                }
+            }
+            "message.replied" => {
+                pending_assistant = None;
+                if let Some((_, text)) = extract_previous_run_turn_from_tape_event(event) {
+                    sources.push(provider_assistant_source(Some(text), Vec::new(), source_ref));
+                }
+            }
+            "tool_proposal" => {
+                let Some(tool_call) = provider_tool_call_from_tape_event(event) else {
+                    previous_was_tool_proposal = false;
+                    continue;
+                };
+                if previous_was_tool_proposal {
+                    if let Some(previous) = sources.last_mut().filter(|source| {
+                        source.message.role == ProviderMessageRole::Assistant
+                            && !source.message.tool_calls.is_empty()
+                    }) {
+                        previous.message.tool_calls.push(tool_call);
+                        previous.source_tape_refs.push(source_ref);
+                        continue;
+                    }
+                }
+                let mut assistant = pending_assistant.take().unwrap_or_else(|| {
+                    provider_assistant_source(None, Vec::new(), source_ref.clone())
+                });
+                assistant.message.tool_calls.push(tool_call);
+                assistant.source_tape_refs.push(source_ref);
+                assistant.source_tape_refs.sort();
+                assistant.source_tape_refs.dedup();
+                sources.push(assistant);
+            }
+            "tool_result" => {
+                flush_pending_provider_assistant(&mut sources, &mut pending_assistant);
+                if let Some(message) = provider_tool_result_from_tape_event(event) {
+                    sources.push(ProviderTranscriptSourceMessage {
+                        message,
+                        source_tape_refs: vec![source_ref],
+                    });
+                }
+            }
+            _ => {}
+        }
+        previous_was_tool_proposal = event.event_type == "tool_proposal";
+    }
+    flush_pending_provider_assistant(&mut sources, &mut pending_assistant);
+    sources
+}
+
+fn flush_pending_provider_assistant(
+    sources: &mut Vec<ProviderTranscriptSourceMessage>,
+    pending: &mut Option<ProviderTranscriptSourceMessage>,
+) {
+    if let Some(source) = pending.take() {
+        sources.push(source);
+    }
+}
+
+fn provider_assistant_source(
+    text: Option<String>,
+    tool_calls: Vec<ProviderMessageToolCall>,
+    source_ref: String,
+) -> ProviderTranscriptSourceMessage {
+    ProviderTranscriptSourceMessage {
+        message: ProviderMessage {
+            role: ProviderMessageRole::Assistant,
+            content: text.map(ProviderMessageContentPart::text).into_iter().collect(),
+            name: None,
+            tool_call_id: None,
+            tool_calls,
+        },
+        source_tape_refs: vec![source_ref],
+    }
+}
+
+fn provider_tool_call_from_tape_event(
+    event: &OrchestratorTapeRecord,
+) -> Option<ProviderMessageToolCall> {
+    let payload = redacted_tape_payload_value(event.payload_json.as_str())?;
+    Some(ProviderMessageToolCall {
+        proposal_id: payload.get("proposal_id")?.as_str()?.to_owned(),
+        tool_name: payload
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("palyra.unknown")
+            .to_owned(),
+        input_json: payload.get("input_json").cloned().unwrap_or_else(|| json!({})),
+    })
+}
+
+fn provider_tool_result_from_tape_event(event: &OrchestratorTapeRecord) -> Option<ProviderMessage> {
+    let payload = redacted_tape_payload_value(event.payload_json.as_str())?;
+    let proposal_id = payload.get("proposal_id")?.as_str()?.to_owned();
+    let result = json!({
+        "success": payload.get("success").and_then(Value::as_bool).unwrap_or(false),
+        "output_json": payload.get("output_json").cloned().unwrap_or(Value::Null),
+        "error": payload.get("error").and_then(Value::as_str).unwrap_or_default(),
+    });
+    Some(ProviderMessage::tool_result(proposal_id, result.to_string()))
+}
+
+fn redacted_tape_payload_value(payload_json: &str) -> Option<Value> {
+    let redacted = crate::journal::redact_payload_json(payload_json.as_bytes()).ok()?;
+    serde_json::from_str(redacted.as_str()).ok()
+}
+
+/// Projects immutable prior-run tape evidence into provider-ready messages
+/// and records hash-only repair evidence on the current run.
+///
+/// # Errors
+/// Returns `Status` when tape loading, deterministic projection, or repair
+/// evidence persistence fails.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+pub(crate) async fn build_previous_run_provider_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    previous_run_id: Option<&str>,
+    provider_kind: &str,
+    model_id: &str,
+    projection_epoch: u64,
+) -> Result<ProviderTranscriptProjectionV1, Status> {
+    let events = load_previous_run_tape_events(runtime_state, previous_run_id).await?;
+    let projection = project_provider_transcript(ProviderTranscriptProjectionRequest {
+        dialect: ProviderTranscriptDialect::from_provider_kind(provider_kind),
+        model_id: model_id.to_owned(),
+        projection_epoch,
+        messages: previous_run_provider_source_messages(events.as_slice()),
+    })
+    .map_err(|error| Status::internal(format!("provider_transcript_projection_failed: {error}")))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "provider.transcript.projected".to_owned(),
+            payload_json: json!({
+                "schema_version": projection.schema_version,
+                "projection_id": projection.projection_id,
+                "projection_sha256": projection.projection_sha256,
+                "projection_epoch": projection.projection_epoch,
+                "dialect": projection.dialect,
+                "model_id_sha256": projection.model_id_sha256,
+                "message_count": projection.messages.len(),
+                "repair_report": projection.repair_report,
+                "redaction_level": "metadata_only",
+            })
+            .to_string(),
         })
-        .collect())
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(projection)
 }
 
 /// Prepends a `<recent_conversation>` block with the previous run's turns.
@@ -1731,8 +1888,8 @@ async fn prepare_model_provider_input_legacy(
         input_text,
         channel_turn_envelope: _,
         attachments,
-        provider_kind_hint: _,
-        provider_model_id_hint: _,
+        provider_kind_hint,
+        provider_model_id_hint,
         tool_catalog_snapshot,
         memory_ingest_reason,
         memory_prompt_failure_mode,
@@ -1762,13 +1919,18 @@ async fn prepare_model_provider_input_legacy(
         memory_ingest_reason,
     )
     .await;
-    let previous_provider_messages = match build_previous_run_provider_messages(
+    let previous_provider_messages = match build_previous_run_provider_projection(
         runtime_state,
+        run_id,
+        tape_seq,
         previous_run_id,
+        provider_kind_hint.unwrap_or("provider_neutral"),
+        provider_model_id_hint.unwrap_or("unknown"),
+        0,
     )
     .await
     {
-        Ok(value) => value,
+        Ok(projection) => projection.messages,
         Err(error) => {
             warn!(
                 run_id,
@@ -1778,7 +1940,7 @@ async fn prepare_model_provider_input_legacy(
                 channel = channel_for_log,
                 status_code = ?error.code(),
                 status_message = %error.message(),
-                "failed to load previous-run provider messages; continuing with raw provider message history"
+                "failed to project previous-run provider messages; continuing with raw provider message history"
             );
             Vec::new()
         }
@@ -1897,14 +2059,14 @@ async fn prepare_model_provider_input_legacy(
         let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
             build_prompt_cache_metadata(
                 provider_input_text.as_str(),
-                &[],
+                previous_provider_messages.as_slice(),
                 Some(input_text),
                 tool_catalog_snapshot,
                 None,
             );
         return Ok(PreparedModelProviderInput {
             provider_input_text,
-            provider_messages: Vec::new(),
+            provider_messages: previous_provider_messages,
             vision_inputs: build_provider_image_inputs(attachments, &runtime_state.config.media),
             instruction_hash: None,
             instruction_trust_summary: None,
@@ -2316,15 +2478,80 @@ mod tests {
     use super::{
         build_prompt_cache_metadata, curated_memory_sources_for_prompt_context,
         parse_provider_reasoning_effort_override, parse_provider_service_tier_override,
-        render_legacy_runtime_context_prompt, sanitize_prompt_inline_value,
-        PromptCacheSessionMetadata,
+        previous_run_provider_source_messages, render_legacy_runtime_context_prompt,
+        sanitize_prompt_inline_value, PromptCacheSessionMetadata,
     };
-    use crate::journal::MemorySource;
+    use crate::journal::{MemorySource, OrchestratorTapeRecord};
     use crate::model_provider::{
-        PromptCacheStrategy, ProviderMessage, ProviderPromptCacheHint, ProviderPromptSegmentKind,
-        ProviderReasoningEffort, ProviderServiceTier,
+        project_provider_transcript, PromptCacheStrategy, ProviderMessage, ProviderMessageRole,
+        ProviderPromptCacheHint, ProviderPromptSegmentKind, ProviderReasoningEffort,
+        ProviderServiceTier, ProviderTranscriptDialect, ProviderTranscriptProjectionRequest,
     };
     use chrono::TimeZone;
+    use serde_json::json;
+
+    #[test]
+    fn previous_run_provider_sources_preserve_tool_evidence_and_redact_secrets() {
+        const SECRET: &str = "PALYRA_TEST_SECRET_transcript_projection";
+        let events = vec![
+            tape_record(0, "message.received", json!({"text": "inspect status"})),
+            tape_record(1, "provider_turn_output", json!({"full_text": "I will inspect it"})),
+            tape_record(
+                2,
+                "tool_proposal",
+                json!({
+                    "proposal_id": "call_1",
+                    "tool_name": "palyra.status",
+                    "input_json": {"api_key": SECRET},
+                    "approval_required": false,
+                }),
+            ),
+            tape_record(
+                3,
+                "tool_result",
+                json!({
+                    "proposal_id": "call_1",
+                    "success": true,
+                    "output_json": {"token": SECRET, "status": "ok"},
+                    "error": "",
+                }),
+            ),
+            tape_record(4, "message.replied", json!({"reply_text": "Status is healthy"})),
+        ];
+
+        let sources = previous_run_provider_source_messages(events.as_slice());
+        let serialized = serde_json::to_string(&sources).expect("sources should serialize");
+        assert!(!serialized.contains(SECRET));
+        assert_eq!(sources.len(), 4);
+        assert_eq!(sources[1].message.role, ProviderMessageRole::Assistant);
+        assert_eq!(sources[1].message.tool_calls[0].proposal_id, "call_1");
+        assert_eq!(sources[2].message.role, ProviderMessageRole::Tool);
+        assert_eq!(sources[2].message.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(sources[1].source_tape_refs, ["tape_seq:1", "tape_seq:2"]);
+
+        let projection = project_provider_transcript(ProviderTranscriptProjectionRequest {
+            dialect: ProviderTranscriptDialect::OpenAiResponses,
+            model_id: "gpt-test".to_owned(),
+            projection_epoch: 9,
+            messages: sources,
+        })
+        .expect("tape evidence should project");
+        assert_eq!(projection.repair_report.reason_code, "provider.transcript.valid");
+        assert_eq!(projection.messages[1].tool_calls[0].proposal_id, "call_1");
+        assert_eq!(projection.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    fn tape_record(
+        seq: i64,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> OrchestratorTapeRecord {
+        OrchestratorTapeRecord {
+            seq,
+            event_type: event_type.to_owned(),
+            payload_json: payload.to_string(),
+        }
+    }
 
     #[test]
     fn sanitize_prompt_inline_value_flattens_control_characters() {
