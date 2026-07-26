@@ -54,6 +54,8 @@ pub(crate) fn project_orchestrator_tape_record(
         "harness.selection" | "metadata.runtime_selected" => project_runtime_selected(payload),
         "runtime.shadow.differential" => project_runtime_shadow_differential(payload),
         "context.assembled" => project_context_assembled(payload),
+        "provider.attempt.plan" => project_provider_attempt_plan(payload),
+        "provider.attempt.outcome" => project_provider_attempt_outcome(payload),
         "provider.attempt.completed" => project_provider_attempt_completed(payload),
         "provider.lane.attested" => project_provider_lane_attested(payload),
         "provider.retry.started" => project_provider_retry_started(payload),
@@ -320,6 +322,64 @@ fn project_provider_attempt_completed(payload: &Map<String, Value>) -> Option<Pr
             reason_code: required_reason_code(payload, "reason_code")?,
         }),
         stage_duration_ms: Some(required_stage_duration(payload)?),
+    })
+}
+
+fn project_provider_attempt_plan(payload: &Map<String, Value>) -> Option<ProjectedEvent> {
+    let attempt = bounded_u16(payload.get("attempt_index")?)?;
+    provider_attempt_hash_event(
+        required_sha256(payload, "provider_ref_sha256")?,
+        required_sha256(payload, "model_ref_sha256")?,
+        parse_route_class(payload.get("route_class")?)?,
+        attempt,
+        MetadataTraceProviderAttemptOutcomeV1::Started,
+        "provider.attempt.planned".to_owned(),
+    )
+}
+
+fn project_provider_attempt_outcome(payload: &Map<String, Value>) -> Option<ProjectedEvent> {
+    let attempt = bounded_u16(payload.get("attempt_index")?)?;
+    let disposition = payload.get("disposition")?.as_str()?;
+    let outcome = match disposition {
+        "completed" => MetadataTraceProviderAttemptOutcomeV1::Succeeded,
+        "timed_out" | "failed" | "superseded" => {
+            MetadataTraceProviderAttemptOutcomeV1::RetryableFailure
+        }
+        "cancelled" => MetadataTraceProviderAttemptOutcomeV1::Cancelled,
+        _ => return None,
+    };
+    provider_attempt_hash_event(
+        required_sha256(payload, "provider_ref_sha256")?,
+        required_sha256(payload, "model_ref_sha256")?,
+        parse_route_class(payload.get("route_class")?)?,
+        attempt,
+        outcome,
+        required_reason_code(payload, "reason_code")?,
+    )
+}
+
+fn provider_attempt_hash_event(
+    provider_id_sha256: String,
+    model_id_sha256: String,
+    route_class: MetadataTraceRouteClassV1,
+    attempt: u16,
+    outcome: MetadataTraceProviderAttemptOutcomeV1,
+    reason_code: String,
+) -> Option<ProjectedEvent> {
+    if attempt == 0 || attempt > METADATA_TRACE_MAX_ATTEMPTS {
+        return None;
+    }
+    Some(ProjectedEvent {
+        event: MetadataTraceEventDataV1::ProviderAttempt(ProviderAttemptMetadataV1 {
+            provider_id_sha256,
+            model_id_sha256,
+            route_class,
+            auth_profile_id_sha256: None,
+            attempt,
+            outcome,
+            reason_code,
+        }),
+        stage_duration_ms: None,
     })
 }
 

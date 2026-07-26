@@ -1,0 +1,26 @@
+schema_version: 1
+id: qa.mock.provider.attempt-recovery-executor
+turns:
+  - id: recovery_guidance_produces_final_text
+    match:
+      prompt_contains:
+        - exercise the provider attempt recovery executor
+        - provider did not produce a user-visible final answer
+    behavior:
+      kind: text
+      text: "Recovered through the bounded provider attempt executor."
+      finish_reason: stop
+      prompt_tokens: 8
+      completion_tokens: 9
+      latency_ms: 1
+  - id: reasoning_only_requires_outer_recovery
+    match:
+      prompt_contains:
+        - exercise the provider attempt recovery executor
+    behavior:
+      kind: text
+      text: "Reasoning: the final answer has not been emitted."
+      finish_reason: stop
+      prompt_tokens: 6
+      completion_tokens: 7
+      latency_ms: 1

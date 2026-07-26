@@ -541,7 +541,12 @@ fn phase_authorizes(transition: KernelTransition, phase: RuntimeErrorPhase) -> b
         KernelTransition::Cancel => phase == RuntimeErrorPhase::Cancellation,
         KernelTransition::Suspend => phase == RuntimeErrorPhase::Queueing,
         KernelTransition::BeginRecovery => {
-            matches!(phase, RuntimeErrorPhase::Recovery | RuntimeErrorPhase::ToolExecution)
+            matches!(
+                phase,
+                RuntimeErrorPhase::Recovery
+                    | RuntimeErrorPhase::ToolExecution
+                    | RuntimeErrorPhase::ProviderFinalization
+            )
         }
         KernelTransition::ResumeRuntimeSelection => phase == RuntimeErrorPhase::Finalization,
     }
@@ -604,6 +609,16 @@ fn edge_is_allowed(
             KernelState::RecoveryPending,
             KernelTransition::BeginResultProjection,
             RuntimeEventName::ToolEffectReconciled,
+        )
+        | (
+            KernelState::CallingProvider,
+            KernelTransition::BeginRecovery,
+            RuntimeEventName::ProviderAttemptCompleted,
+        )
+        | (
+            KernelState::RecoveryPending,
+            KernelTransition::BeginProviderCall,
+            RuntimeEventName::ProviderAttemptStarted,
         )
         | (
             KernelState::CallingProvider,

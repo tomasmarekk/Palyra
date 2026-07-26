@@ -284,6 +284,58 @@ fn preferred_provider_event_hashes_route_ids_and_requires_prehashed_auth_profile
 }
 
 #[test]
+fn recovery_attempt_plan_and_outcome_project_hash_only_metadata() {
+    let provider_ref_sha256 = "a".repeat(64);
+    let model_ref_sha256 = "b".repeat(64);
+    let plan = project(
+        "provider.attempt.plan",
+        json!({
+            "attempt_index": 2,
+            "provider_ref_sha256": provider_ref_sha256,
+            "model_ref_sha256": model_ref_sha256,
+            "route_class": "primary",
+            "original_request_digest_sha256": "c".repeat(64),
+            "request_diff": {
+                "changed_fields": ["messages"],
+                "hostile": SECRET_SENTINEL,
+            },
+        }),
+    )
+    .expect("hash-only attempt plan should project");
+    let MetadataTraceEventDataV1::ProviderAttempt(plan) = plan.event else {
+        panic!("attempt plan should use the provider-attempt trace variant");
+    };
+    assert_eq!(plan.attempt, 2);
+    assert_eq!(plan.provider_id_sha256, "a".repeat(64));
+    assert_eq!(plan.model_id_sha256, "b".repeat(64));
+    assert_eq!(plan.outcome, MetadataTraceProviderAttemptOutcomeV1::Started);
+
+    let outcome = project(
+        "provider.attempt.outcome",
+        json!({
+            "attempt_index": 2,
+            "provider_ref_sha256": "a".repeat(64),
+            "model_ref_sha256": "b".repeat(64),
+            "route_class": "primary",
+            "disposition": "timed_out",
+            "reason_code": "provider.call.timeout",
+            "usage": {
+                "prompt_tokens": 20,
+                "output_tokens": 3,
+                "hostile": SECRET_SENTINEL,
+            },
+        }),
+    )
+    .expect("hash-only attempt outcome should project");
+    let MetadataTraceEventDataV1::ProviderAttempt(outcome) = outcome.event else {
+        panic!("attempt outcome should use the provider-attempt trace variant");
+    };
+    assert_eq!(outcome.attempt, 2);
+    assert_eq!(outcome.outcome, MetadataTraceProviderAttemptOutcomeV1::RetryableFailure);
+    assert_eq!(outcome.reason_code, "provider.call.timeout");
+}
+
+#[test]
 fn legacy_provider_evidence_hashes_identities_without_copying_binding_details() {
     let lane = project(
         "provider.lane.attested",

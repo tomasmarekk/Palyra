@@ -43,6 +43,7 @@ pub(crate) struct HostHarnessEventSink {
     observations_accepted: usize,
     prompt_tokens: u64,
     completion_tokens: u64,
+    provider_recovery_pending: bool,
     verification: VerificationState,
     delivery: DeliveryObservationState,
     delivery_skip_evidence: Option<DeliverySkipEvidence>,
@@ -97,6 +98,7 @@ impl HostHarnessEventSink {
             observations_accepted: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
+            provider_recovery_pending: false,
             verification: VerificationState::NotStarted,
             delivery: DeliveryObservationState::Pending,
             delivery_skip_evidence: None,
@@ -305,6 +307,39 @@ impl HostHarnessEventSink {
                     json!({}),
                     sequence,
                 )?;
+            }
+            HarnessEventKind::ProviderRecoveryStarted { reason_code } => {
+                let identities =
+                    self.identities_for_lane(RuntimeGenerationLane::Provider, |identities| {
+                        identities.attempt_id = Some(self.request.attempt_id().clone());
+                    })?;
+                self.apply_transition(
+                    RuntimeEventName::ProviderAttemptCompleted,
+                    KernelTransition::BeginRecovery,
+                    identities,
+                    "runtime.harness.provider_recovery_started",
+                    json!({"reason_code": reason_code}),
+                    sequence,
+                )?;
+                self.provider_recovery_pending = true;
+            }
+            HarnessEventKind::ProviderRecoveryCompleted { reason_code } => {
+                if !self.provider_recovery_pending {
+                    return Err(HarnessContractError::InvalidEvent);
+                }
+                let identities =
+                    self.identities_for_lane(RuntimeGenerationLane::Provider, |identities| {
+                        identities.attempt_id = Some(self.request.attempt_id().clone());
+                    })?;
+                self.apply_transition(
+                    RuntimeEventName::ProviderAttemptStarted,
+                    KernelTransition::BeginProviderCall,
+                    identities,
+                    "runtime.harness.provider_recovery_completed",
+                    json!({"reason_code": reason_code}),
+                    sequence,
+                )?;
+                self.provider_recovery_pending = false;
             }
             HarnessEventKind::CompactionRequired => {
                 let identities =
@@ -908,6 +943,74 @@ mod tests {
             .filter(|event| event.event_name == RuntimeEventName::ProviderAttemptStarted)
             .count();
         assert_eq!(provider_starts, 2);
+    }
+
+    #[tokio::test]
+    async fn provider_recovery_reenters_the_same_authoritative_provider_lane() {
+        let (mut sink, journal) = sink();
+        let adapter = EmbeddedHarnessAdapter::new(driver(
+            vec![
+                event(2, HarnessEventKind::ProviderCallStarted),
+                event(
+                    3,
+                    HarnessEventKind::ProviderRecoveryStarted {
+                        reason_code: "provider.turn_recovery.provider_timeout".to_owned(),
+                    },
+                ),
+                event(
+                    4,
+                    HarnessEventKind::ProviderRecoveryCompleted {
+                        reason_code: "provider.recovery.backoff_completed".to_owned(),
+                    },
+                ),
+                event(5, HarnessEventKind::ProviderCallCompleted),
+                event(6, HarnessEventKind::VerificationStarted),
+                event(7, HarnessEventKind::VerificationPassed),
+            ],
+            completed(8),
+        ));
+        let request = sink.request.clone();
+
+        adapter
+            .run_attempt(&request, &mut sink)
+            .await
+            .expect("bounded provider recovery should return to the provider lane");
+
+        let names = journal.events().into_iter().map(|event| event.event_name).collect::<Vec<_>>();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event_name| **event_name == RuntimeEventName::ProviderAttemptStarted)
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event_name| **event_name == RuntimeEventName::ProviderAttemptCompleted)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_recovery_completion_without_started_evidence_is_rejected() {
+        let (mut sink, _journal) = sink();
+        sink.accepted(HarnessAccepted { generation: generation(7), sequence: 1 })
+            .await
+            .expect("acceptance succeeds");
+        sink.event(event(2, HarnessEventKind::ProviderCallStarted)).await.expect("provider starts");
+
+        assert!(matches!(
+            sink.event(event(
+                3,
+                HarnessEventKind::ProviderRecoveryCompleted {
+                    reason_code: "provider.recovery.forged_completion".to_owned(),
+                },
+            ))
+            .await,
+            Err(HarnessContractError::InvalidEvent)
+        ));
     }
 
     #[tokio::test]

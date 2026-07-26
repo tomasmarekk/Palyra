@@ -49,7 +49,8 @@ use crate::{
         HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     },
     application::context_recovery::{
-        recover_provider_request_preflight, ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
+        recover_provider_request_after_overflow, recover_provider_request_preflight,
+        ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
     },
     application::learning::schedule_post_run_reflection,
     application::provider_events::{
@@ -61,10 +62,13 @@ use crate::{
         PrepareModelProviderInputRequest,
     },
     application::provider_turn_recovery::{
-        anomaly_from_terminal_outcome, cancellation_closure, ContextPressureInput,
-        ContextPressureReport, ProviderCancellationPhase, ProviderTurnAnomaly,
-        ProviderTurnRecoveryInput, ProviderTurnRecoveryState, PROVIDER_CANCELLATION_CLOSURE_EVENT,
-        PROVIDER_CONTEXT_PRESSURE_EVENT, PROVIDER_TURN_RECOVERY_EVENT,
+        anomaly_from_terminal_outcome, anomaly_from_terminal_validation, cancellation_closure,
+        ContextPressureInput, ContextPressureReport, ProviderAttemptPlan,
+        ProviderAttemptStateMachine, ProviderCancellationPhase, ProviderRecoveryCommand,
+        ProviderRecoverySideEffectState, ProviderTurnAnomaly, ProviderTurnRecoveryInput,
+        RecoveryExecutorInput, PROVIDER_ATTEMPT_OUTCOME_EVENT, PROVIDER_ATTEMPT_PLAN_EVENT,
+        PROVIDER_CANCELLATION_CLOSURE_EVENT, PROVIDER_CONTEXT_PRESSURE_EVENT,
+        PROVIDER_TURN_RECOVERY_EVENT, RECOVERY_ACTION_STARTED_EVENT,
     },
     application::run_admission::{
         AdmissionCaller, RunAdmissionCommand, RunAdmissionController, RunAdmissionControllerOutcome,
@@ -189,7 +193,9 @@ const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 // deadline, with no actionable stall diagnostic for the operator.
 const TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 120_000;
 const TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
 const MAX_FOLLOWUP_TIMEOUT_RECOVERY_ATTEMPTS: u8 = 1;
+#[cfg(test)]
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2025,6 +2031,165 @@ async fn append_agent_loop_tape_event(
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
     Ok(())
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+async fn execute_provider_recovery_action(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    state_machine: &ProviderAttemptStateMachine,
+    decision: crate::application::provider_turn_recovery::ProviderTurnRecoveryDecision,
+    attempt_plan: &ProviderAttemptPlan,
+    executor_input: RecoveryExecutorInput,
+    base_request: &mut ProviderRequest,
+    current_request: &mut ProviderRequest,
+    loop_state: &mut AgentRunLoopState,
+    tool_catalog: &ModelVisibleToolCatalogSnapshot,
+    selected_provider_id: &str,
+    provider_model_override: &mut Option<String>,
+    context_recovery_generation: &mut u64,
+) -> Result<bool, Status> {
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        PROVIDER_TURN_RECOVERY_EVENT,
+        decision.tape_payload().to_string(),
+    )
+    .await?;
+    let prepared = state_machine.prepare_recovery(decision, attempt_plan, executor_input);
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        RECOVERY_ACTION_STARTED_EVENT,
+        prepared.started_payload().to_string(),
+    )
+    .await?;
+    if let Some(outcome) = prepared.immediate_outcome.clone() {
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            outcome.event_type.as_str(),
+            outcome.tape_payload().to_string(),
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    let command = prepared.command.clone().ok_or_else(|| {
+        Status::internal("provider recovery executor omitted both command and terminal outcome")
+    })?;
+    let (outcome, retry) = match command {
+        ProviderRecoveryCommand::RetryCurrentRequest => {
+            (prepared.completed("provider.recovery.retry_current_request.completed"), true)
+        }
+        ProviderRecoveryCommand::AppendGuidance { guidance } => {
+            loop_state.append_user_guidance(guidance);
+            (prepared.completed("provider.recovery.append_guidance.completed"), true)
+        }
+        ProviderRecoveryCommand::RecoverContext => {
+            let snapshot = runtime_state.model_provider_status_snapshot();
+            let selected_model_id = current_request
+                .model_override
+                .as_deref()
+                .or(snapshot.route_selection.selected_model_id.as_deref())
+                .or(snapshot.model_id.as_deref())
+                .unwrap_or("default")
+                .to_owned();
+            match recover_provider_request_after_overflow(
+                current_request,
+                &snapshot,
+                selected_provider_id,
+                selected_model_id.as_str(),
+                tool_catalog,
+                *context_recovery_generation,
+            )
+            .map_err(|reason| {
+                Status::failed_precondition(format!(
+                    "provider context overflow recovery failed: {reason}"
+                ))
+            })? {
+                ContextPreflightRecoveryOutcome::Recovered { plan } => {
+                    *context_recovery_generation = plan.generation;
+                    *provider_model_override = current_request.model_override.clone();
+                    base_request.model_override = current_request.model_override.clone();
+                    loop_state.replace_messages(current_request.messages.clone());
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id,
+                        tape_seq,
+                        CONTEXT_RECOVERY_EVENT,
+                        plan.tape_payload().to_string(),
+                    )
+                    .await?;
+                    (prepared.completed("provider.recovery.context.completed"), true)
+                }
+                ContextPreflightRecoveryOutcome::NotRequired => (
+                    prepared.failed("provider.recovery.context.provider_overflow_unreproduced"),
+                    false,
+                ),
+                ContextPreflightRecoveryOutcome::Exhausted { plan } => {
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id,
+                        tape_seq,
+                        CONTEXT_RECOVERY_EVENT,
+                        plan.tape_payload().to_string(),
+                    )
+                    .await?;
+                    (prepared.failed("provider.recovery.context.exhausted"), false)
+                }
+            }
+        }
+        ProviderRecoveryCommand::LowerOutputBudget => {
+            let current = current_request
+                .max_output_tokens
+                .or(base_request.max_output_tokens)
+                .unwrap_or(4_096);
+            let reduced = current.saturating_div(2).max(256);
+            current_request.max_output_tokens = Some(reduced);
+            base_request.max_output_tokens = Some(reduced);
+            (prepared.completed("provider.recovery.output_budget_lowered"), true)
+        }
+        ProviderRecoveryCommand::DropVisionInputs
+        | ProviderRecoveryCommand::StripUnsupportedContent => {
+            current_request.vision_inputs.clear();
+            base_request.vision_inputs.clear();
+            loop_state.append_user_guidance(
+                "Continue without provider-native image payloads. Use only retained textual metadata and explicitly report when visual evidence is unavailable."
+                    .to_owned(),
+            );
+            (prepared.completed("provider.recovery.unsupported_content_stripped"), true)
+        }
+        ProviderRecoveryCommand::RefreshCredential => {
+            (prepared.unsupported("provider.recovery.auth_refresh_port_unavailable"), false)
+        }
+        ProviderRecoveryCommand::SelectFallbackRoute => (
+            // Registry-backed completion already exhausts every authorized
+            // candidate before returning an error to this outer executor.
+            prepared.blocked("provider.recovery.route_fallback_exhausted"),
+            false,
+        ),
+        ProviderRecoveryCommand::Backoff { delay_ms } => {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            (prepared.completed("provider.recovery.backoff.completed"), true)
+        }
+        ProviderRecoveryCommand::FailDeterministic => {
+            (prepared.completed("provider.recovery.fail_deterministic.completed"), false)
+        }
+    };
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        outcome.event_type.as_str(),
+        outcome.tape_payload().to_string(),
+    )
+    .await?;
+    Ok(retry)
 }
 
 #[allow(clippy::result_large_err)]
@@ -3915,16 +4080,21 @@ async fn process_run_stream_message_inner(
         },
     )
     .await?;
-    let mut length_recovery_attempts = 0u8;
-    let mut final_answer_recovery_attempted = false;
     let mut verification_finalizer_nudge_attempted = false;
     let mut before_finalize_budget = BeforeFinalizeBudget::new(1);
-    let mut followup_timeout_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
     let mut run_progress_controller = RunProgressController::new(3);
     let mut pending_browser_followup_deadline = false;
     let mut pending_tool_followup_deadline = false;
-    let mut provider_turn_recovery_state = ProviderTurnRecoveryState::new();
+    let network_authority = format!("{}:{}", lease_provider_id, lease_provider_kind);
+    let tool_authority = serde_json::to_vec(&base_provider_request.tool_catalog_snapshot)
+        .map(|value| crate::sha256_hex(value.as_slice()))
+        .unwrap_or_else(|_| crate::sha256_hex(b"provider_tool_authority_unavailable"));
+    let mut provider_turn_recovery_state = ProviderAttemptStateMachine::for_request(
+        &base_provider_request,
+        network_authority.as_str(),
+        tool_authority.as_str(),
+    );
     let mut context_recovery_generation = 0_u64;
 
     loop {
@@ -4375,6 +4545,24 @@ async fn process_run_stream_message_inner(
             )?;
         let provider_diagnostic_scope_id =
             provider_cancellation.context().scope_id.as_str().to_owned();
+        let attempted_model_id = provider_request
+            .model_override
+            .as_deref()
+            .unwrap_or(routing_decision.actual_model_id.as_str());
+        let attempt_plan = provider_turn_recovery_state.plan_attempt(
+            &provider_request,
+            lease_provider_id.as_str(),
+            lease_credential_id.as_str(),
+            attempted_model_id,
+        );
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            PROVIDER_ATTEMPT_PLAN_EVENT,
+            attempt_plan.tape_payload().to_string(),
+        )
+        .await?;
         let provider_response = match execute_run_stream_provider_request(
             sender,
             runtime_state,
@@ -4405,6 +4593,16 @@ async fn process_run_stream_message_inner(
         .await
         {
             Ok(RunStreamProviderRequestOutcome::Completed { response, duration_ms }) => {
+                let attempt_outcome = provider_turn_recovery_state
+                    .record_completed_attempt(&attempt_plan, response.as_ref());
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
+                )
+                .await?;
                 record_provider_attempt_completed_metadata_event(
                     runtime_state,
                     run_id.as_str(),
@@ -4428,54 +4626,78 @@ async fn process_run_stream_message_inner(
                     ),
                 )
                 .await?;
-                let recovery_decision = provider_turn_recovery_state.decide(
-                    provider_turn_anomaly_from_timeout(reason),
-                    ProviderTurnRecoveryInput {
-                        context_pressure: Some(context_pressure_report.clone()),
-                        ..ProviderTurnRecoveryInput::default()
-                    },
+                let attempt_outcome = provider_turn_recovery_state.record_failed_attempt(
+                    &attempt_plan,
+                    "timed_out",
+                    "provider.attempt.deadline_exceeded",
                 );
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
                     tape_seq,
-                    PROVIDER_TURN_RECOVERY_EVENT,
-                    recovery_decision.tape_payload().to_string(),
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
                 )
                 .await?;
-                // With tool evidence on the tape the run is worth resuming:
-                // try one follow-up recovery turn, else emit a partial
-                // summary and terminate as needs_continuation.
-                // Without tool evidence the timeout is a plain failure.
-                if loop_state.completed_tool_calls() > 0 {
-                    if let Some(recovery_prompt) = followup_timeout_recovery_prompt(
-                        reason,
-                        message.as_str(),
-                        &loop_state,
-                        followup_timeout_recovery_attempts,
-                    ) {
-                        followup_timeout_recovery_attempts =
-                            followup_timeout_recovery_attempts.saturating_add(1);
-                        let recovery_event = followup_timeout_recovery_event(reason);
-                        loop_state.append_user_guidance(recovery_prompt);
-                        append_agent_loop_tape_event(
-                            runtime_state,
-                            run_id.as_str(),
-                            tape_seq,
-                            recovery_event,
-                            loop_state.turn_payload(run_id.as_str(), recovery_event),
-                        )
-                        .await?;
-                        send_agent_loop_progress_status(
-                            sender,
-                            runtime_state,
-                            run_id.as_str(),
-                            tape_seq,
-                            recovery_event,
-                        )
-                        .await?;
-                        continue;
-                    }
+                let anomaly = provider_turn_anomaly_from_timeout(reason);
+                let recovery_decision = provider_turn_recovery_state.decide(
+                    anomaly,
+                    ProviderTurnRecoveryInput {
+                        context_pressure: Some(context_pressure_report.clone()),
+                        ..ProviderTurnRecoveryInput::default()
+                    },
+                );
+                let completed_tool_calls = loop_state.completed_tool_calls();
+                let retry = execute_provider_recovery_action(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &provider_turn_recovery_state,
+                    recovery_decision,
+                    &attempt_plan,
+                    RecoveryExecutorInput {
+                        issue_summary: message.clone(),
+                        completed_tool_calls,
+                        side_effect_state: if completed_tool_calls > 0 {
+                            ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                        } else {
+                            ProviderRecoverySideEffectState::None
+                        },
+                        partial_user_visible_output: false,
+                        summary_only_closeout: user_requested_summary_only_closeout(
+                            loop_state.messages().as_slice(),
+                        ),
+                    },
+                    &mut base_provider_request,
+                    &mut provider_request,
+                    &mut loop_state,
+                    &tool_catalog_snapshot,
+                    lease_provider_id.as_str(),
+                    &mut provider_model_override,
+                    &mut context_recovery_generation,
+                )
+                .await?;
+                if retry {
+                    let recovery_event = followup_timeout_recovery_event(reason);
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        recovery_event,
+                        loop_state.turn_payload(run_id.as_str(), recovery_event),
+                    )
+                    .await?;
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        recovery_event,
+                    )
+                    .await?;
+                    continue;
+                }
+                if completed_tool_calls > 0 {
                     let fallback_summary = match reason {
                         ProviderRequestTimeoutReason::BrowserFollowup => {
                             browser_followup_timeout_partial_summary(
@@ -4548,6 +4770,19 @@ async fn process_run_stream_message_inner(
                 return Err(Status::deadline_exceeded(message));
             }
             Ok(RunStreamProviderRequestOutcome::Superseded) => {
+                let attempt_outcome = provider_turn_recovery_state.record_failed_attempt(
+                    &attempt_plan,
+                    "superseded",
+                    "runtime.generation.provider_reconfigured",
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
+                )
+                .await?;
                 let provider_snapshot = runtime_state.model_provider_status_snapshot();
                 let replacement_model_id = provider_request
                     .model_override
@@ -4597,6 +4832,19 @@ async fn process_run_stream_message_inner(
                 continue;
             }
             Ok(RunStreamProviderRequestOutcome::Terminal(state)) => {
+                let attempt_outcome = provider_turn_recovery_state.record_failed_attempt(
+                    &attempt_plan,
+                    "cancelled",
+                    "provider.attempt.cancelled",
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
+                )
+                .await?;
                 debug_assert_eq!(run_state.state(), state);
                 append_agent_loop_tape_event(
                     runtime_state,
@@ -4619,20 +4867,67 @@ async fn process_run_stream_message_inner(
                     provider_status_recovery_decision_payload(error.code(), error.message(), None),
                 )
                 .await?;
+                let anomaly = provider_turn_anomaly_from_status(error.code(), error.message());
+                let attempt_outcome = provider_turn_recovery_state.record_failed_attempt(
+                    &attempt_plan,
+                    "failed",
+                    format!("provider.attempt.{}", anomaly.as_str()).as_str(),
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
+                )
+                .await?;
+                let recovery_decision = provider_turn_recovery_state.decide(
+                    anomaly,
+                    ProviderTurnRecoveryInput {
+                        credential_id: Some(lease_credential_id.clone()),
+                        retry_after_ms: None,
+                        context_pressure: Some(context_pressure_report.clone()),
+                    },
+                );
+                let completed_tool_calls = loop_state.completed_tool_calls();
+                if execute_provider_recovery_action(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &provider_turn_recovery_state,
+                    recovery_decision,
+                    &attempt_plan,
+                    RecoveryExecutorInput {
+                        issue_summary: error.message().to_owned(),
+                        completed_tool_calls,
+                        side_effect_state: if completed_tool_calls > 0 {
+                            ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                        } else {
+                            ProviderRecoverySideEffectState::None
+                        },
+                        partial_user_visible_output: false,
+                        summary_only_closeout: user_requested_summary_only_closeout(
+                            loop_state.messages().as_slice(),
+                        ),
+                    },
+                    &mut base_provider_request,
+                    &mut provider_request,
+                    &mut loop_state,
+                    &tool_catalog_snapshot,
+                    lease_provider_id.as_str(),
+                    &mut provider_model_override,
+                    &mut context_recovery_generation,
+                )
+                .await?
+                {
+                    continue;
+                }
                 if loop_state.completed_tool_calls() > 0 {
-                    let fallback_summary = if final_answer_recovery_attempted {
-                        final_answer_recovery_fallback_summary(
-                            error.message(),
-                            &loop_state,
-                            run_id.as_str(),
-                        )
-                    } else {
-                        provider_error_partial_summary(
-                            error.message(),
-                            &loop_state,
-                            run_id.as_str(),
-                        )
-                    };
+                    let fallback_summary = provider_error_partial_summary(
+                        error.message(),
+                        &loop_state,
+                        run_id.as_str(),
+                    );
                     send_deferred_final_reply_tokens(
                         sender,
                         runtime_state,
@@ -4720,6 +5015,93 @@ async fn process_run_stream_message_inner(
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
+        }
+        if normalized_provider_stream.terminal_validation.disposition
+            != ProviderTerminalDisposition::Complete
+        {
+            let anomaly =
+                anomaly_from_terminal_validation(&normalized_provider_stream.terminal_validation);
+            let recovery_decision = provider_turn_recovery_state.decide(
+                anomaly,
+                ProviderTurnRecoveryInput {
+                    context_pressure: Some(context_pressure_report.clone()),
+                    ..ProviderTurnRecoveryInput::default()
+                },
+            );
+            let completed_tool_calls = loop_state.completed_tool_calls();
+            let retry = execute_provider_recovery_action(
+                runtime_state,
+                run_id.as_str(),
+                tape_seq,
+                &provider_turn_recovery_state,
+                recovery_decision,
+                &attempt_plan,
+                RecoveryExecutorInput {
+                    issue_summary: normalized_provider_stream
+                        .terminal_validation
+                        .reason_code
+                        .clone(),
+                    completed_tool_calls,
+                    side_effect_state: if completed_tool_calls > 0 {
+                        ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                    } else {
+                        ProviderRecoverySideEffectState::None
+                    },
+                    partial_user_visible_output: !provider_response
+                        .output
+                        .full_text
+                        .trim()
+                        .is_empty(),
+                    summary_only_closeout: user_requested_summary_only_closeout(
+                        loop_state.messages().as_slice(),
+                    ),
+                },
+                &mut base_provider_request,
+                &mut provider_request,
+                &mut loop_state,
+                &tool_catalog_snapshot,
+                lease_provider_id.as_str(),
+                &mut provider_model_override,
+                &mut context_recovery_generation,
+            )
+            .await?;
+            if context_engine_enabled {
+                crate::application::context_lifecycle::record_after_turn(
+                    runtime_state,
+                    run_id.as_str(),
+                    session_id.as_str(),
+                    tape_seq,
+                    provider_response.prompt_tokens,
+                    provider_response.completion_tokens,
+                    0,
+                    Some(provider_response.output.finish_reason),
+                )
+                .await?;
+            }
+            if retry {
+                continue;
+            }
+            let reason = format!(
+                "provider stream recovery stopped: {}",
+                normalized_provider_stream.terminal_validation.reason_code
+            );
+            terminate_run_stream_with_agent_loop_reason(
+                sender,
+                runtime_state,
+                run_state,
+                run_id.as_str(),
+                tape_seq,
+                &loop_state,
+                active_flow_control.as_ref().ok_or_else(|| {
+                    Status::internal("run termination requires an active flow-control scope")
+                })?,
+                AgentLoopTerminationReason::ProviderError,
+                reason.as_str(),
+                provider_response.output.raw_provider_refs.provider_trace_ref.clone(),
+                harness_lifecycle.as_ref(),
+            )
+            .await?;
+            return Ok(RunStreamMessageProcessingOutcome::Terminate);
         }
         let provider_output = provider_response.output.clone();
         let lifecycle_prompt_tokens = provider_response.prompt_tokens;
@@ -4809,42 +5191,60 @@ async fn process_run_stream_message_inner(
                                     ..ProviderTurnRecoveryInput::default()
                                 },
                             );
-                            append_agent_loop_tape_event(
+                            let completed_tool_calls = loop_state.completed_tool_calls();
+                            if execute_provider_recovery_action(
                                 runtime_state,
                                 run_id.as_str(),
                                 tape_seq,
-                                PROVIDER_TURN_RECOVERY_EVENT,
-                                recovery_decision.tape_payload().to_string(),
+                                &provider_turn_recovery_state,
+                                recovery_decision,
+                                &attempt_plan,
+                                RecoveryExecutorInput {
+                                    issue_summary: message.clone(),
+                                    completed_tool_calls,
+                                    side_effect_state: if completed_tool_calls > 0 {
+                                        ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                                    } else {
+                                        ProviderRecoverySideEffectState::None
+                                    },
+                                    partial_user_visible_output: final_reply_text
+                                        .as_deref()
+                                        .is_some_and(|text| !text.trim().is_empty()),
+                                    summary_only_closeout: user_requested_summary_only_closeout(
+                                        loop_state.messages().as_slice(),
+                                    ),
+                                },
+                                &mut base_provider_request,
+                                &mut provider_request,
+                                &mut loop_state,
+                                &tool_catalog_snapshot,
+                                lease_provider_id.as_str(),
+                                &mut provider_model_override,
+                                &mut context_recovery_generation,
                             )
-                            .await?;
-                        }
-                        if let Some(recovery_prompt) = final_answer_recovery_prompt(
-                            message.as_str(),
-                            &loop_state,
-                            final_answer_recovery_attempted,
-                        ) {
-                            final_answer_recovery_attempted = true;
-                            loop_state.append_user_guidance(recovery_prompt);
-                            append_agent_loop_tape_event(
-                                runtime_state,
-                                run_id.as_str(),
-                                tape_seq,
-                                "agent_loop.final_answer_recovery_requested",
-                                loop_state.turn_payload(
+                            .await?
+                            {
+                                append_agent_loop_tape_event(
+                                    runtime_state,
                                     run_id.as_str(),
+                                    tape_seq,
                                     "agent_loop.final_answer_recovery_requested",
-                                ),
-                            )
-                            .await?;
-                            send_agent_loop_progress_status(
-                                sender,
-                                runtime_state,
-                                run_id.as_str(),
-                                tape_seq,
-                                "agent_loop.final_answer_recovery_requested",
-                            )
-                            .await?;
-                            continue;
+                                    loop_state.turn_payload(
+                                        run_id.as_str(),
+                                        "agent_loop.final_answer_recovery_requested",
+                                    ),
+                                )
+                                .await?;
+                                send_agent_loop_progress_status(
+                                    sender,
+                                    runtime_state,
+                                    run_id.as_str(),
+                                    tape_seq,
+                                    "agent_loop.final_answer_recovery_requested",
+                                )
+                                .await?;
+                                continue;
+                            }
                         }
                         if loop_state.completed_tool_calls() > 0 {
                             let fallback_summary = final_answer_recovery_fallback_summary(
@@ -5236,27 +5636,69 @@ async fn process_run_stream_message_inner(
                     )
                     .await?;
                 }
+                let anomaly = provider_turn_anomaly_from_response_failure(reason, message.as_str());
                 let recovery_decision = provider_turn_recovery_state.decide(
-                    provider_turn_anomaly_from_response_failure(reason, message.as_str()),
+                    anomaly,
                     ProviderTurnRecoveryInput {
                         context_pressure: Some(context_pressure_report.clone()),
                         ..ProviderTurnRecoveryInput::default()
                     },
                 );
-                append_agent_loop_tape_event(
+                let completed_tool_calls = loop_state.completed_tool_calls();
+                if execute_provider_recovery_action(
                     runtime_state,
                     run_id.as_str(),
                     tape_seq,
-                    PROVIDER_TURN_RECOVERY_EVENT,
-                    recovery_decision.tape_payload().to_string(),
+                    &provider_turn_recovery_state,
+                    recovery_decision,
+                    &attempt_plan,
+                    RecoveryExecutorInput {
+                        issue_summary: message.clone(),
+                        completed_tool_calls,
+                        side_effect_state: if completed_tool_calls > 0 {
+                            ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                        } else {
+                            ProviderRecoverySideEffectState::None
+                        },
+                        partial_user_visible_output: !provider_output.full_text.trim().is_empty(),
+                        summary_only_closeout: user_requested_summary_only_closeout(
+                            loop_state.messages().as_slice(),
+                        ),
+                    },
+                    &mut base_provider_request,
+                    &mut provider_request,
+                    &mut loop_state,
+                    &tool_catalog_snapshot,
+                    lease_provider_id.as_str(),
+                    &mut provider_model_override,
+                    &mut context_recovery_generation,
                 )
-                .await?;
-                if should_stop_after_repeated_length_recovery(
-                    reason,
-                    message.as_str(),
-                    &loop_state,
-                    length_recovery_attempts,
-                ) {
+                .await?
+                {
+                    let recovery_event = if anomaly == ProviderTurnAnomaly::LengthFinalText {
+                        "agent_loop.length_recovery_requested"
+                    } else {
+                        "agent_loop.provider_recovery_requested"
+                    };
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        recovery_event,
+                        loop_state.turn_payload(run_id.as_str(), recovery_event),
+                    )
+                    .await?;
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        recovery_event,
+                    )
+                    .await?;
+                    continue;
+                }
+                if anomaly == ProviderTurnAnomaly::LengthFinalText && completed_tool_calls > 0 {
                     let fallback_summary = length_recovery_fallback_summary(
                         message.as_str(),
                         &loop_state,
@@ -5293,37 +5735,6 @@ async fn process_run_stream_message_inner(
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
-                }
-                // On a recovery turn the truncated assistant output is
-                // deliberately NOT appended to the history: re-feeding it
-                // would waste context and bias the model toward repeating the
-                // overlong answer. Only the corrective guidance is added.
-                if let Some(recovery_prompt) = length_recovery_prompt(
-                    reason,
-                    message.as_str(),
-                    &loop_state,
-                    length_recovery_attempts,
-                ) {
-                    length_recovery_attempts = length_recovery_attempts.saturating_add(1);
-                    loop_state.append_user_guidance(recovery_prompt);
-                    append_agent_loop_tape_event(
-                        runtime_state,
-                        run_id.as_str(),
-                        tape_seq,
-                        "agent_loop.length_recovery_requested",
-                        loop_state
-                            .turn_payload(run_id.as_str(), "agent_loop.length_recovery_requested"),
-                    )
-                    .await?;
-                    send_agent_loop_progress_status(
-                        sender,
-                        runtime_state,
-                        run_id.as_str(),
-                        tape_seq,
-                        "agent_loop.length_recovery_requested",
-                    )
-                    .await?;
-                    continue;
                 }
                 loop_state.append_assistant_turn(&provider_output);
                 terminate_run_stream_with_agent_loop_reason(
@@ -5678,14 +6089,6 @@ async fn validate_and_record_normalized_provider_stream_boundary(
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
 
-    if normalized_stream.terminal_validation.disposition
-        == ProviderTerminalDisposition::TerminallyInvalid
-    {
-        return Err(Status::failed_precondition(format!(
-            "provider stream terminal validation failed: {}",
-            normalized_stream.terminal_validation.reason_code
-        )));
-    }
     Ok(normalized_stream)
 }
 
@@ -6373,6 +6776,7 @@ fn should_emit_budget_exhausted_partial_summary(
     matches!(reason, AgentLoopTerminationReason::WallClock) && loop_state.completed_tool_calls() > 0
 }
 
+#[cfg(test)]
 fn length_recovery_prompt(
     reason: AgentLoopTerminationReason,
     message: &str,
@@ -6398,18 +6802,6 @@ fn length_recovery_prompt(
     })
 }
 
-fn should_stop_after_repeated_length_recovery(
-    reason: AgentLoopTerminationReason,
-    message: &str,
-    loop_state: &AgentRunLoopState,
-    attempt_count: u8,
-) -> bool {
-    attempt_count > 0
-        && loop_state.completed_tool_calls() > 0
-        && reason == AgentLoopTerminationReason::IncompleteFinalAnswer
-        && message.contains("finish_reason=length")
-}
-
 fn length_recovery_fallback_summary(
     message: &str,
     loop_state: &AgentRunLoopState,
@@ -6423,6 +6815,7 @@ fn length_recovery_fallback_summary(
     )
 }
 
+#[cfg(test)]
 fn final_answer_recovery_prompt(
     message: &str,
     loop_state: &AgentRunLoopState,
@@ -6528,6 +6921,7 @@ fn user_message_blocks_more_tool_work(normalized: &str) -> bool {
         || STOP_MARKERS.iter().any(|marker| normalized.contains(marker))
 }
 
+#[cfg(test)]
 fn followup_timeout_recovery_prompt(
     reason: ProviderRequestTimeoutReason,
     message: &str,
@@ -6678,6 +7072,43 @@ fn provider_status_recovery_decision(
             ("failover_provider", "provider.recovery.failover_provider")
         }
         _ => ("fail_closed", "provider.recovery.fail_closed"),
+    }
+}
+
+fn provider_turn_anomaly_from_status(status_code: Code, message: &str) -> ProviderTurnAnomaly {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("context_overflow")
+        || normalized.contains("context_window_exceeded")
+        || normalized.contains("context length")
+    {
+        return ProviderTurnAnomaly::ContextOverflow;
+    }
+    if normalized.contains("multimodal")
+        || normalized.contains("image") && normalized.contains("unsupported")
+    {
+        return ProviderTurnAnomaly::MultimodalUnsupported;
+    }
+    if normalized.contains("max_output_tokens") || normalized.contains("maximum output") {
+        return ProviderTurnAnomaly::MaxOutputTokensTooLarge;
+    }
+    if normalized.contains("auth_expired") || normalized.contains("token expired") {
+        return ProviderTurnAnomaly::AuthExpired;
+    }
+    if normalized.contains("malformed_stream")
+        || normalized.contains("malformed_response")
+        || normalized.contains("invalid sse")
+    {
+        return ProviderTurnAnomaly::MalformedStream;
+    }
+    match status_code {
+        Code::Unauthenticated => ProviderTurnAnomaly::AuthInvalid,
+        Code::PermissionDenied => ProviderTurnAnomaly::PermissionDenied,
+        Code::ResourceExhausted => ProviderTurnAnomaly::RateLimit,
+        Code::Unavailable | Code::DeadlineExceeded => ProviderTurnAnomaly::ProviderTimeout,
+        Code::InvalidArgument if normalized.contains("json") => {
+            ProviderTurnAnomaly::MalformedJsonArguments
+        }
+        _ => ProviderTurnAnomaly::MalformedStream,
     }
 }
 

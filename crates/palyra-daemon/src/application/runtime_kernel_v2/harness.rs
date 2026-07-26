@@ -199,6 +199,12 @@ pub(crate) enum HarnessEventKind {
     },
     CompactionRequired,
     CompactionCompleted,
+    ProviderRecoveryStarted {
+        reason_code: String,
+    },
+    ProviderRecoveryCompleted {
+        reason_code: String,
+    },
     FinalizationReady,
     DeliveryIntentCommitted {
         delivery_intent_id: RuntimeDeliveryIntentId,
@@ -251,6 +257,10 @@ impl HarnessEvent {
             HarnessEventKind::Heartbeat { ordinal } => *ordinal > 0,
             HarnessEventKind::FinalizationRecoveryPending { reason_code, stage } => {
                 is_reason_code(reason_code) && is_reason_code(stage)
+            }
+            HarnessEventKind::ProviderRecoveryStarted { reason_code }
+            | HarnessEventKind::ProviderRecoveryCompleted { reason_code } => {
+                is_reason_code(reason_code)
             }
             HarnessEventKind::ApprovalResolved {
                 resolution, evidence_id, evidence_sha256, ..

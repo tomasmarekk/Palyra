@@ -616,13 +616,57 @@ pub(crate) fn recover_provider_request_preflight(
     catalog: &ModelVisibleToolCatalogSnapshot,
     prior_generation: u64,
 ) -> Result<ContextPreflightRecoveryOutcome, &'static str> {
-    let input = context_recovery_input_for_request(
+    recover_provider_request(
         request,
         provider_snapshot,
         selected_provider_id,
         selected_model_id,
         catalog,
         false,
+        prior_generation,
+    )
+}
+
+/// Applies the same bounded ladder after the provider explicitly rejects the
+/// estimated context size.
+///
+/// # Errors
+/// Returns a stable controller error when an invariant is violated.
+pub(crate) fn recover_provider_request_after_overflow(
+    request: &mut ProviderRequest,
+    provider_snapshot: &ProviderStatusSnapshot,
+    selected_provider_id: &str,
+    selected_model_id: &str,
+    catalog: &ModelVisibleToolCatalogSnapshot,
+    prior_generation: u64,
+) -> Result<ContextPreflightRecoveryOutcome, &'static str> {
+    recover_provider_request(
+        request,
+        provider_snapshot,
+        selected_provider_id,
+        selected_model_id,
+        catalog,
+        true,
+        prior_generation,
+    )
+}
+
+fn recover_provider_request(
+    request: &mut ProviderRequest,
+    provider_snapshot: &ProviderStatusSnapshot,
+    selected_provider_id: &str,
+    selected_model_id: &str,
+    catalog: &ModelVisibleToolCatalogSnapshot,
+    provider_overflow_observed: bool,
+    prior_generation: u64,
+) -> Result<ContextPreflightRecoveryOutcome, &'static str> {
+    let input = context_recovery_input_for_request(
+        request,
+        provider_snapshot,
+        selected_provider_id,
+        selected_model_id,
+        catalog,
+        provider_overflow_observed,
         prior_generation,
     );
     let mut controller = ContextRecoveryController::new(input)?;

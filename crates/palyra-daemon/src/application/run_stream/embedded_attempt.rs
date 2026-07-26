@@ -4,7 +4,7 @@
 //! payloads and final projections, while the existing run-stream tool owner
 //! retains raw proposals and pumps the sole live tool-authority gateway.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use super::tool_flow::{
     run_stream_live_tool_authority, RunStreamLiveToolFlowOwner, RunStreamLiveToolHost,
@@ -45,6 +45,13 @@ pub(crate) enum EmbeddedProviderTurn {
     Tool { proposal: ToolProposalRequest, operation_id: RuntimeOperationId },
     /// The current context must be compacted before another provider call.
     CompactionRequired,
+    /// A bounded provider recovery action prepared another attempt.
+    RetryRequired {
+        reason_code: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        delay_ms: Option<u64>,
+    },
     /// Cancellation won the provider race.
     Cancelled { reason_code: String },
 }
@@ -783,6 +790,43 @@ impl EmbeddedAttemptDriver for RunStreamEmbeddedAttemptDriver {
                         .await?;
                         // CompactionCompleted is itself the durable transition
                         // back into CallingProvider for the retry iteration.
+                        provider_start_already_committed = true;
+                    }
+                    EmbeddedProviderTurn::RetryRequired {
+                        reason_code,
+                        prompt_tokens,
+                        completion_tokens,
+                        delay_ms,
+                    } => {
+                        if prompt_tokens > 0 || completion_tokens > 0 {
+                            Self::emit(
+                                request,
+                                events,
+                                &mut sequence,
+                                HarnessEventKind::Usage { prompt_tokens, completion_tokens },
+                            )
+                            .await?;
+                        }
+                        Self::emit(
+                            request,
+                            events,
+                            &mut sequence,
+                            HarnessEventKind::ProviderRecoveryStarted {
+                                reason_code: reason_code.clone(),
+                            },
+                        )
+                        .await?;
+                        if let Some(delay_ms) = delay_ms {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        Self::emit(
+                            request,
+                            events,
+                            &mut sequence,
+                            HarnessEventKind::ProviderRecoveryCompleted { reason_code },
+                        )
+                        .await?;
+                        // RecoveryCompleted durably re-enters CallingProvider.
                         provider_start_already_committed = true;
                     }
                     EmbeddedProviderTurn::Cancelled { reason_code } => {

@@ -29,6 +29,14 @@ use crate::{
             ContextRecoveryController, ContextRecoveryPlan, ContextRecoveryStep,
             TokenBreakdownCategory, CONTEXT_RECOVERY_EVENT,
         },
+        provider_turn_recovery::{
+            anomaly_from_terminal_validation, ProviderAttemptOutcome, ProviderAttemptPlan,
+            ProviderAttemptStateMachine, ProviderRecoveryCommand, ProviderRecoverySideEffectState,
+            ProviderTurnAnomaly, ProviderTurnRecoveryDecision, ProviderTurnRecoveryInput,
+            RecoveryActionOutcome, RecoveryExecutorInput, PROVIDER_ATTEMPT_OUTCOME_EVENT,
+            PROVIDER_ATTEMPT_PLAN_EVENT, PROVIDER_TURN_RECOVERY_EVENT,
+            RECOVERY_ACTION_STARTED_EVENT,
+        },
         run_admission::PersistedV2AdmissionToken,
         run_stream::{
             cancellation::request_persisted_run_interrupt,
@@ -101,8 +109,8 @@ use crate::{
 use super::{
     append_agent_loop_tape_event, persist_accepted_final_reply_side_effects,
     run_runtime_path_summary_payload, send_settled_final_status, status_tape_payload,
-    RunStreamMessageProcessingOutcome, RUNTIME_SELECTED_METADATA_EVENT,
-    RUNTIME_SELECTED_METADATA_SCHEMA_V1,
+    user_requested_summary_only_closeout, RunStreamMessageProcessingOutcome,
+    RUNTIME_SELECTED_METADATA_EVENT, RUNTIME_SELECTED_METADATA_SCHEMA_V1,
 };
 
 struct RunStreamV2Callbacks {
@@ -133,12 +141,16 @@ struct CallbackState {
     messages: Vec<ProviderMessage>,
     compacted_input_text: Option<String>,
     model_override: Option<String>,
+    max_output_tokens: Option<u64>,
+    drop_vision_inputs: bool,
     final_text: Option<String>,
     final_projection: Option<crate::application::runtime_kernel_v2::phases::FinalProjectionRef>,
     deferred_tape_events: Vec<V2DeferredTapeEvent>,
     after_turn_observations: Vec<ContextAfterTurnObservation>,
     context_recovery: ContextRecoveryController,
     pending_context_recovery_step: Option<ContextRecoveryStep>,
+    provider_recovery: ProviderAttemptStateMachine,
+    current_attempt_plan: ProviderAttemptPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +161,18 @@ struct ContextAfterTurnObservation {
     finish_reason: Option<ProviderFinishReason>,
 }
 
+enum V2ProviderRecoveryDisposition {
+    Retry { reason_code: String, delay_ms: Option<u64> },
+    CompactionRequired,
+    Stop { reason_code: String },
+}
+
 enum V2DeferredTapeEvent {
+    ProviderAttemptPlan(Box<ProviderAttemptPlan>),
+    ProviderAttemptOutcome(Box<ProviderAttemptOutcome>),
+    ProviderRecoveryDecision(Box<ProviderTurnRecoveryDecision>),
+    ProviderRecoveryStarted(serde_json::Value),
+    ProviderRecoveryOutcome(Box<RecoveryActionOutcome>),
     ProviderLaneAttested(Box<ProviderLaneAttestationEvent>),
     ProviderTerminalValidation(Box<ProviderTerminalValidationOutcome>),
     CompactionRequired,
@@ -170,18 +193,41 @@ impl RunStreamV2Callbacks {
         context_recovery: ContextRecoveryController,
         resources: V2CallbackResources,
     ) -> Self {
+        let network_authority = format!("{}:{}", lease.provider_id, lease.task_label);
+        let tool_authority = serde_json::to_vec(&snapshot_to_provider_request_value(&catalog))
+            .map(|value| crate::sha256_hex(value.as_slice()))
+            .unwrap_or_else(|_| crate::sha256_hex(b"v2_tool_authority_unavailable"));
+        let mut provider_recovery = ProviderAttemptStateMachine::for_request(
+            &base_request,
+            network_authority.as_str(),
+            tool_authority.as_str(),
+        );
+        let initial_model_id =
+            base_request.model_override.as_deref().unwrap_or("default").to_owned();
+        let initial_attempt_plan = provider_recovery.plan_attempt(
+            &base_request,
+            lease.provider_id.as_str(),
+            lease.credential_id.as_str(),
+            initial_model_id.as_str(),
+        );
         Self {
             state: Mutex::new(CallbackState {
                 first_provider_turn: true,
                 messages: base_request.effective_messages(),
                 compacted_input_text: None,
                 model_override: base_request.model_override.clone(),
+                max_output_tokens: base_request.max_output_tokens,
+                drop_vision_inputs: false,
                 final_text: None,
                 final_projection: None,
-                deferred_tape_events: Vec::new(),
+                deferred_tape_events: vec![V2DeferredTapeEvent::ProviderAttemptPlan(Box::new(
+                    initial_attempt_plan.clone(),
+                ))],
                 after_turn_observations: Vec::new(),
                 context_recovery,
                 pending_context_recovery_step: None,
+                provider_recovery,
+                current_attempt_plan: initial_attempt_plan,
             }),
             sender,
             run_id,
@@ -274,6 +320,10 @@ impl RunStreamV2Callbacks {
             request.input_text = input_text.clone();
         }
         request.model_override = state.model_override.clone();
+        request.max_output_tokens = state.max_output_tokens;
+        if state.drop_vision_inputs {
+            request.vision_inputs.clear();
+        }
         request.tool_catalog_snapshot = Some(snapshot_to_provider_request_value(&self.catalog));
         request
     }
@@ -363,6 +413,166 @@ impl RunStreamV2Callbacks {
             }
         }
     }
+
+    fn prepare_provider_recovery(
+        &self,
+        state: &mut CallbackState,
+        anomaly: ProviderTurnAnomaly,
+        issue_summary: String,
+        partial_user_visible_output: bool,
+    ) -> Result<V2ProviderRecoveryDisposition, RuntimeErrorEnvelopeV1> {
+        let decision =
+            state.provider_recovery.decide(anomaly, ProviderTurnRecoveryInput::default());
+        let completed_tool_calls = u32::try_from(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.role == ProviderMessageRole::Tool)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let prepared = state.provider_recovery.prepare_recovery(
+            decision.clone(),
+            &state.current_attempt_plan,
+            RecoveryExecutorInput {
+                issue_summary,
+                completed_tool_calls,
+                side_effect_state: if completed_tool_calls > 0 {
+                    ProviderRecoverySideEffectState::ConfirmedWithReconciliation
+                } else {
+                    ProviderRecoverySideEffectState::None
+                },
+                partial_user_visible_output,
+                summary_only_closeout: user_requested_summary_only_closeout(
+                    state.messages.as_slice(),
+                ),
+            },
+        );
+        state
+            .deferred_tape_events
+            .push(V2DeferredTapeEvent::ProviderRecoveryDecision(Box::new(decision)));
+        state
+            .deferred_tape_events
+            .push(V2DeferredTapeEvent::ProviderRecoveryStarted(prepared.started_payload()));
+        if let Some(outcome) = prepared.immediate_outcome.clone() {
+            let reason_code = outcome.reason_code.clone();
+            state
+                .deferred_tape_events
+                .push(V2DeferredTapeEvent::ProviderRecoveryOutcome(Box::new(outcome)));
+            return Ok(V2ProviderRecoveryDisposition::Stop { reason_code });
+        }
+        let command = prepared.command.clone().ok_or_else(|| {
+            self.kernel_failure("runtime.provider.recovery_executor_missing_outcome")
+        })?;
+        let (outcome, disposition) = match command {
+            ProviderRecoveryCommand::RetryCurrentRequest => {
+                let outcome =
+                    prepared.completed("provider.recovery.retry_current_request.completed");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms: None })
+            }
+            ProviderRecoveryCommand::AppendGuidance { guidance } => {
+                state.messages.push(ProviderMessage::user_text(guidance));
+                let outcome = prepared.completed("provider.recovery.append_guidance.completed");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms: None })
+            }
+            ProviderRecoveryCommand::RecoverContext => {
+                let step = state
+                    .context_recovery
+                    .next_step()
+                    .map_err(|_| self.kernel_failure("runtime.context_recovery.controller_failed"))?
+                    .ok_or_else(|| {
+                        self.kernel_failure("runtime.context_recovery.budget_exhausted")
+                    })?;
+                if step.action != ContextRecoveryAction::Compact {
+                    let outcome = prepared.failed("provider.recovery.context.executor_required");
+                    let reason_code = outcome.reason_code.clone();
+                    (outcome, V2ProviderRecoveryDisposition::Stop { reason_code })
+                } else {
+                    let context_plan = state.context_recovery.plan().clone();
+                    state.pending_context_recovery_step = Some(step);
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
+                        event_type: "recovery.action.started",
+                        action: "compact".to_owned(),
+                        reason_code: "context.recovery.compact_requested".to_owned(),
+                    });
+                    state
+                        .deferred_tape_events
+                        .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(context_plan)));
+                    state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionRequired);
+                    let outcome =
+                        prepared.completed("provider.recovery.context.compaction_requested");
+                    (outcome, V2ProviderRecoveryDisposition::CompactionRequired)
+                }
+            }
+            ProviderRecoveryCommand::LowerOutputBudget => {
+                let current = state.max_output_tokens.unwrap_or(4_096);
+                state.max_output_tokens = Some(current.saturating_div(2).max(256));
+                let outcome = prepared.completed("provider.recovery.output_budget_lowered");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms: None })
+            }
+            ProviderRecoveryCommand::DropVisionInputs
+            | ProviderRecoveryCommand::StripUnsupportedContent => {
+                state.drop_vision_inputs = true;
+                state.messages.push(ProviderMessage::user_text(
+                    "Continue without provider-native image payloads. Use only retained textual metadata and explicitly report when visual evidence is unavailable.",
+                ));
+                let outcome = prepared.completed("provider.recovery.unsupported_content_stripped");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms: None })
+            }
+            ProviderRecoveryCommand::RefreshCredential => {
+                let outcome =
+                    prepared.unsupported("provider.recovery.auth_refresh_port_unavailable");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Stop { reason_code })
+            }
+            ProviderRecoveryCommand::SelectFallbackRoute => {
+                let outcome = prepared.blocked("provider.recovery.route_fallback_exhausted");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Stop { reason_code })
+            }
+            ProviderRecoveryCommand::Backoff { delay_ms } => {
+                let outcome = prepared.completed("provider.recovery.backoff.completed");
+                let reason_code = outcome.reason_code.clone();
+                (
+                    outcome,
+                    V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms: Some(delay_ms) },
+                )
+            }
+            ProviderRecoveryCommand::FailDeterministic => {
+                let outcome = prepared.completed("provider.recovery.fail_deterministic.completed");
+                let reason_code = outcome.reason_code.clone();
+                (outcome, V2ProviderRecoveryDisposition::Stop { reason_code })
+            }
+        };
+        state
+            .deferred_tape_events
+            .push(V2DeferredTapeEvent::ProviderRecoveryOutcome(Box::new(outcome)));
+        Ok(disposition)
+    }
+}
+
+fn v2_provider_failure_anomaly(reason_code: &str) -> ProviderTurnAnomaly {
+    if reason_code.contains("context_window") || reason_code.contains("context_overflow") {
+        ProviderTurnAnomaly::ContextOverflow
+    } else if reason_code.contains("auth_expired") {
+        ProviderTurnAnomaly::AuthExpired
+    } else if reason_code.contains("auth") {
+        ProviderTurnAnomaly::AuthInvalid
+    } else if reason_code.contains("rate_limit") || reason_code.contains("resource_exhausted") {
+        ProviderTurnAnomaly::RateLimit
+    } else if reason_code.contains("multimodal") || reason_code.contains("unsupported_image") {
+        ProviderTurnAnomaly::MultimodalUnsupported
+    } else if reason_code.contains("empty") {
+        ProviderTurnAnomaly::EmptyFinalAnswer
+    } else if reason_code.contains("timeout") || reason_code.contains("deadline") {
+        ProviderTurnAnomaly::ProviderTimeout
+    } else {
+        ProviderTurnAnomaly::MalformedStream
+    }
 }
 
 impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
@@ -403,13 +613,18 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                 state.first_provider_turn = false;
                 return Ok(None);
             }
-            let mut request = self.base_request.clone();
-            request.messages = state.messages.clone();
-            if let Some(compacted_input_text) = state.compacted_input_text.as_ref() {
-                request.input_text = compacted_input_text.clone();
-            }
-            request.model_override = state.model_override.clone();
-            request.tool_catalog_snapshot = Some(snapshot_to_provider_request_value(&self.catalog));
+            let request = self.projected_recovery_request(&state);
+            let model_id = request.model_override.as_deref().unwrap_or("default").to_owned();
+            let plan = state.provider_recovery.plan_attempt(
+                &request,
+                self.lease.provider_id.as_str(),
+                self.lease.credential_id.as_str(),
+                model_id.as_str(),
+            );
+            state.current_attempt_plan = plan.clone();
+            state
+                .deferred_tape_events
+                .push(V2DeferredTapeEvent::ProviderAttemptPlan(Box::new(plan)));
             Ok(Some(PreparedProductionProviderTurn {
                 projection_id: context.projection_id.clone(),
                 request,
@@ -433,22 +648,54 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
             }
             let terminal_validation =
                 normalized_provider_stream_from_output_v2(&response.output).terminal_validation;
-            self.state
-                .lock()
-                .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?
-                .deferred_tape_events
-                .push(V2DeferredTapeEvent::ProviderTerminalValidation(Box::new(
-                    terminal_validation.clone(),
-                )));
-            match terminal_validation.disposition {
-                ProviderTerminalDisposition::Complete => {}
-                ProviderTerminalDisposition::Recoverable => {
-                    return Err(
-                        self.kernel_failure("runtime.provider.terminal_validation_recoverable")
-                    );
-                }
-                ProviderTerminalDisposition::TerminallyInvalid => {
-                    return Err(self.kernel_failure("runtime.provider.terminal_validation_invalid"));
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
+                let plan = state.current_attempt_plan.clone();
+                let attempt_outcome =
+                    state.provider_recovery.record_completed_attempt(&plan, &response);
+                state
+                    .deferred_tape_events
+                    .push(V2DeferredTapeEvent::ProviderAttemptOutcome(Box::new(attempt_outcome)));
+                state.deferred_tape_events.push(V2DeferredTapeEvent::ProviderTerminalValidation(
+                    Box::new(terminal_validation.clone()),
+                ));
+            }
+            if terminal_validation.disposition != ProviderTerminalDisposition::Complete {
+                let anomaly = anomaly_from_terminal_validation(&terminal_validation);
+                let recovery = {
+                    let mut state = self.state.lock().map_err(|_| {
+                        self.kernel_failure("runtime.provider.turn_state_unavailable")
+                    })?;
+                    self.prepare_provider_recovery(
+                        &mut state,
+                        anomaly,
+                        terminal_validation.reason_code.clone(),
+                        terminal_validation.text_delta_count > 0,
+                    )?
+                };
+                match recovery {
+                    V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms } => {
+                        return Ok(EmbeddedProviderTurn::RetryRequired {
+                            reason_code,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            delay_ms,
+                        });
+                    }
+                    V2ProviderRecoveryDisposition::CompactionRequired => {
+                        return Ok(EmbeddedProviderTurn::CompactionRequired);
+                    }
+                    V2ProviderRecoveryDisposition::Stop { reason_code } => {
+                        tracing::warn!(
+                            run_id = self.run_id,
+                            reason_code,
+                            "authoritative provider recovery stopped"
+                        );
+                        return Err(self.kernel_failure("runtime.provider.recovery_blocked"));
+                    }
                 }
             }
             if terminal.finish_reason == Some(ProviderFinishReason::Cancelled) {
@@ -473,16 +720,6 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                 .state
                 .lock()
                 .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
-            let recovery_completed = !state.context_recovery.plan().steps.is_empty()
-                && state.context_recovery.plan().terminal_reason_code.as_deref()
-                    != Some("context.recovery.provider_retry_succeeded");
-            if recovery_completed {
-                state.context_recovery.record_provider_success();
-                let plan = state.context_recovery.plan().clone();
-                state
-                    .deferred_tape_events
-                    .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
-            }
             if let Some(attestation) = provider_lane_attestation {
                 state
                     .deferred_tape_events
@@ -494,14 +731,65 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                 tool_exchange_count,
                 finish_reason: terminal.finish_reason,
             });
+            let final_output_unusable = proposal.is_none()
+                && (terminal.class != TerminalOutcomeClass::VisibleText
+                    || output.full_text.trim().is_empty());
+            if final_output_unusable {
+                let anomaly = match terminal.class {
+                    TerminalOutcomeClass::ReasoningOnly | TerminalOutcomeClass::PlanningOnly => {
+                        ProviderTurnAnomaly::ReasoningOnly
+                    }
+                    TerminalOutcomeClass::ProtocolError => {
+                        ProviderTurnAnomaly::MalformedToolSequence
+                    }
+                    TerminalOutcomeClass::Empty
+                    | TerminalOutcomeClass::VisibleText
+                    | TerminalOutcomeClass::ToolOnly
+                    | TerminalOutcomeClass::IntentionalSilent
+                    | TerminalOutcomeClass::ProviderError => ProviderTurnAnomaly::EmptyFinalAnswer,
+                };
+                let recovery = self.prepare_provider_recovery(
+                    &mut state,
+                    anomaly,
+                    "runtime.provider.final_output_unusable".to_owned(),
+                    !output.full_text.trim().is_empty(),
+                )?;
+                drop(state);
+                return match recovery {
+                    V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms } => {
+                        Ok(EmbeddedProviderTurn::RetryRequired {
+                            reason_code,
+                            prompt_tokens: response.prompt_tokens,
+                            completion_tokens: response.completion_tokens,
+                            delay_ms,
+                        })
+                    }
+                    V2ProviderRecoveryDisposition::CompactionRequired => {
+                        Ok(EmbeddedProviderTurn::CompactionRequired)
+                    }
+                    V2ProviderRecoveryDisposition::Stop { reason_code } => {
+                        tracing::warn!(
+                            run_id = self.run_id,
+                            reason_code,
+                            "authoritative final-output recovery stopped"
+                        );
+                        Err(self.kernel_failure("runtime.provider.recovery_blocked"))
+                    }
+                };
+            }
+            let recovery_completed = !state.context_recovery.plan().steps.is_empty()
+                && state.context_recovery.plan().terminal_reason_code.as_deref()
+                    != Some("context.recovery.provider_retry_succeeded");
+            if recovery_completed {
+                state.context_recovery.record_provider_success();
+                let plan = state.context_recovery.plan().clone();
+                state
+                    .deferred_tape_events
+                    .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
+            }
             state.messages.push(ProviderMessage::assistant_from_output(&output));
             if let Some((proposal, operation_id)) = proposal {
                 return Ok(EmbeddedProviderTurn::Tool { proposal, operation_id });
-            }
-            if terminal.class != TerminalOutcomeClass::VisibleText
-                || output.full_text.trim().is_empty()
-            {
-                return Err(self.kernel_failure("runtime.provider.final_output_unusable"));
             }
             let text_utf8_bytes = u64::try_from(output.full_text.len()).unwrap_or(u64::MAX);
             state.final_text = Some(output.full_text);
@@ -517,7 +805,7 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
         &'a self,
         _request: &'a HarnessAttemptRequest,
         reason_code: String,
-        _output_emitted: bool,
+        output_emitted: bool,
         qa_lane_attestation: Option<ProviderLaneAttestationEvent>,
     ) -> HarnessFuture<'a, Result<EmbeddedProviderTurn, RuntimeErrorEnvelopeV1>> {
         Box::pin(async move {
@@ -531,52 +819,58 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     .deferred_tape_events
                     .push(V2DeferredTapeEvent::ProviderLaneAttested(Box::new(attestation)));
             }
-            self.state
-                .lock()
-                .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?
-                .after_turn_observations
-                .push(ContextAfterTurnObservation {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
+                state.after_turn_observations.push(ContextAfterTurnObservation {
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     tool_exchange_count: 0,
                     finish_reason: None,
                 });
-            match reason_code.as_str() {
-                "runtime.provider_call.cancelled" => {
-                    Ok(EmbeddedProviderTurn::Cancelled { reason_code })
+                let plan = state.current_attempt_plan.clone();
+                let attempt_outcome = state.provider_recovery.record_failed_attempt(
+                    &plan,
+                    "failed",
+                    reason_code.as_str(),
+                );
+                state
+                    .deferred_tape_events
+                    .push(V2DeferredTapeEvent::ProviderAttemptOutcome(Box::new(attempt_outcome)));
+            }
+            if reason_code == "runtime.provider_call.cancelled" {
+                return Ok(EmbeddedProviderTurn::Cancelled { reason_code });
+            }
+            let anomaly = v2_provider_failure_anomaly(reason_code.as_str());
+            let recovery = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| self.kernel_failure("runtime.provider.turn_state_unavailable"))?;
+                self.prepare_provider_recovery(&mut state, anomaly, reason_code, output_emitted)?
+            };
+            match recovery {
+                V2ProviderRecoveryDisposition::Retry { reason_code, delay_ms } => {
+                    Ok(EmbeddedProviderTurn::RetryRequired {
+                        reason_code,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        delay_ms,
+                    })
                 }
-                "runtime.provider_call.context_window_exceeded" => {
-                    let mut state = self.state.lock().map_err(|_| {
-                        self.kernel_failure("runtime.provider.turn_state_unavailable")
-                    })?;
-                    let step = state
-                        .context_recovery
-                        .next_step()
-                        .map_err(|_| {
-                            self.kernel_failure("runtime.context_recovery.controller_failed")
-                        })?
-                        .ok_or_else(|| {
-                            self.kernel_failure("runtime.context_recovery.budget_exhausted")
-                        })?;
-                    if step.action != ContextRecoveryAction::Compact {
-                        return Err(
-                            self.kernel_failure("runtime.context_recovery.executor_required")
-                        );
-                    }
-                    state.pending_context_recovery_step = Some(step);
-                    let plan = state.context_recovery.plan().clone();
-                    state.deferred_tape_events.push(V2DeferredTapeEvent::ContextRecoveryAction {
-                        event_type: "recovery.action.started",
-                        action: "compact".to_owned(),
-                        reason_code: "context.recovery.compact_requested".to_owned(),
-                    });
-                    state
-                        .deferred_tape_events
-                        .push(V2DeferredTapeEvent::ContextRecoveryPlan(Box::new(plan)));
-                    state.deferred_tape_events.push(V2DeferredTapeEvent::CompactionRequired);
+                V2ProviderRecoveryDisposition::CompactionRequired => {
                     Ok(EmbeddedProviderTurn::CompactionRequired)
                 }
-                _ => Err(self.kernel_failure("runtime.provider.call_failed")),
+                V2ProviderRecoveryDisposition::Stop { reason_code } => {
+                    tracing::warn!(
+                        run_id = self.run_id,
+                        reason_code,
+                        "authoritative provider failure recovery stopped"
+                    );
+                    Err(self.kernel_failure("runtime.provider.recovery_blocked"))
+                }
             }
         })
     }
@@ -1263,6 +1557,21 @@ async fn append_v2_deferred_tape_events(
 ) -> Result<(), Status> {
     for event in events {
         let (event_type, payload_json) = match event {
+            V2DeferredTapeEvent::ProviderAttemptPlan(plan) => {
+                (PROVIDER_ATTEMPT_PLAN_EVENT.to_owned(), plan.tape_payload().to_string())
+            }
+            V2DeferredTapeEvent::ProviderAttemptOutcome(outcome) => {
+                (PROVIDER_ATTEMPT_OUTCOME_EVENT.to_owned(), outcome.tape_payload().to_string())
+            }
+            V2DeferredTapeEvent::ProviderRecoveryDecision(decision) => {
+                (PROVIDER_TURN_RECOVERY_EVENT.to_owned(), decision.tape_payload().to_string())
+            }
+            V2DeferredTapeEvent::ProviderRecoveryStarted(payload) => {
+                (RECOVERY_ACTION_STARTED_EVENT.to_owned(), payload.to_string())
+            }
+            V2DeferredTapeEvent::ProviderRecoveryOutcome(outcome) => {
+                (outcome.event_type.clone(), outcome.tape_payload().to_string())
+            }
             V2DeferredTapeEvent::ProviderLaneAttested(attestation) => {
                 attestation.validate_shape().map_err(|error| {
                     Status::internal(format!("invalid V2 provider lane attestation: {error}"))

@@ -1,0 +1,80 @@
+# Exercises the outer attempt state machine instead of adapter-internal retry.
+schema_version: 5
+id: real_runtime.provider_attempt_recovery_executor
+title: Provider attempt recovery executor through the real runtime
+area: provider
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/provider_attempt_recovery_executor.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_provider_recovery
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - provider_recovery
+  tools: []
+  fixtures:
+    - qa/fixtures/provider_attempt_recovery_executor.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exercise the provider attempt recovery executor."
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "Recovered through the bounded provider attempt executor."
+  events:
+    - event_type: run.started
+      min_count: 1
+    - event_type: provider.attempt.plan
+      min_count: 2
+    - event_type: provider.attempt.outcome
+      min_count: 2
+    - event_type: provider.turn_recovery.decision
+      min_count: 1
+    - event_type: recovery.action.started
+      min_count: 1
+    - event_type: recovery.action.completed
+      min_count: 1
+    - event_type: model_token
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v14
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/real_runtime/provider_attempt_recovery_executor.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - real_runtime
+    - nightly
+    - deterministic
+    - provider_recovery
+    - baseline_replay
+timeout:
+  run_ms: 30000
+  step_ms: 10000
