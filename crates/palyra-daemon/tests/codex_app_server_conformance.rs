@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 // Startup verifies the large debug bridge binary before the attempt begins, so the
 // process-backed suite needs a budget above the transport's 45-second handshake bound.
 const PROCESS_CONFORMANCE_ATTEMPT_BUDGET_MS: i64 = 90_000;
+const PROCESS_CONFORMANCE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 enum ApprovalMode {
@@ -328,13 +329,23 @@ async fn codex_approval_denial_timeout_and_steer_are_host_controlled() {
         )
         .await
     });
-    for _ in 0..500 {
-        if transport.health().state == ManagedRuntimeHealthState::Ready {
-            break;
+    let health = tokio::time::timeout(PROCESS_CONFORMANCE_READY_TIMEOUT, async {
+        loop {
+            let health = transport.health();
+            if health.state == ManagedRuntimeHealthState::Ready
+                || matches!(
+                    health.state,
+                    ManagedRuntimeHealthState::Crashed | ManagedRuntimeHealthState::Quarantined
+                )
+                || run.is_finished()
+            {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let health = transport.health();
+    })
+    .await
+    .unwrap_or_else(|_| transport.health());
     assert_eq!(
         health.state,
         ManagedRuntimeHealthState::Ready,
