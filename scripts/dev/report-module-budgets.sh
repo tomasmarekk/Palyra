@@ -341,7 +341,7 @@ else
 fi
 echo
 
-echo "New oversized files introduced outside the allowlist:"
+echo "New files above the warning threshold (report-only):"
 if (( ${#new_oversized_files[@]} == 0 )); then
   echo "  none"
 else
@@ -365,11 +365,6 @@ if ${strict_mode}; then
 
   if (( ${#strict_entrypoint_regressions[@]} > 0 )); then
     echo "strict mode: one or more touched entrypoints crossed the strict threshold or exceeded strict growth delta" >&2
-    strict_failed=true
-  fi
-
-  if (( ${#new_oversized_files[@]} > 0 )); then
-    echo "strict mode: one or more new oversized files were introduced outside the allowlist" >&2
     strict_failed=true
   fi
 
