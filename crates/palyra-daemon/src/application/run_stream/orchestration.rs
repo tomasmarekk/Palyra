@@ -45,15 +45,26 @@ use crate::{
     application::agent_harness::{
         AgentHarnessRegistry, AgentHarnessSelectionDiagnostics, AgentHarnessSupportRequest,
     },
+    application::agent_harness_host::HarnessCancellationContext,
     application::agent_harness_lifecycle::{
         HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_CLEANED_UP_EVENT, HARNESS_RUN_COMPLETED_EVENT,
         HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
+    },
+    application::agent_harness_provider_bridge::{
+        execute_external_harness_provider_turn, ExternalHarnessProviderTurn,
+    },
+    application::agent_harness_v2::{LegacyAgentHarnessV2Adapter, SharedAgentHarnessV2},
+    application::codex_app_server_bridge::{
+        codex_agent_harness_descriptor, codex_managed_runtime_descriptor,
+        ManagedCodexAppServerConfig, CODEX_MANAGED_RUNTIME_ID,
     },
     application::context_recovery::{
         recover_provider_request_after_overflow, recover_provider_request_preflight,
         ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
     },
+    application::external_agent_harness::ManagedExternalAgentHarness,
     application::learning::schedule_post_run_reflection,
+    application::managed_runtime::StdioRuntimeTransport,
     application::provider_events::{
         process_run_stream_provider_events, RunStreamProviderEventsOutcome,
         RunStreamToolResultForModel,
@@ -134,7 +145,7 @@ use crate::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
     },
     plugins::{
-        activate_agent_harness_plugins_before_selection, load_plugin_bindings_index,
+        activate_agent_harness_plugins_before_selection_with_policy, load_plugin_bindings_index,
         resolve_plugins_root, AgentHarnessPluginActivationRequest,
     },
     provider_leases::ProviderLeaseExecutionContext,
@@ -382,10 +393,42 @@ const RUN_STREAM_MODEL_CAPABILITIES: [&str; 1] = ["text"];
 // without deriving a digest from any run-specific or user-authored payload.
 const RUNTIME_SELECTED_METADATA_SCHEMA_V1: &[u8] = b"palyra.metadata_trace.runtime_selected.v1\0harness_id\0harness_version\0runtime_id\0runtime_version\0route_class\0auth_profile_id_sha256\0schema_hashes";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RunStreamHarnessLifecycle {
     diagnostics: AgentHarnessSelectionDiagnostics,
     trace_context: String,
+    external: Option<RunStreamExternalHarness>,
+}
+
+#[derive(Clone)]
+struct RunStreamExternalHarness {
+    harness: SharedAgentHarnessV2,
+    session_id: String,
+    provider_id: String,
+    model_id: String,
+}
+
+impl std::fmt::Debug for RunStreamExternalHarness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunStreamExternalHarness")
+            .field("harness_id", &self.harness.descriptor().id)
+            .field("session_id_sha256", &crate::sha256_hex(self.session_id.as_bytes()))
+            .field("provider_id", &self.provider_id)
+            .field("model_id", &self.model_id)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RunStreamHarnessLifecycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunStreamHarnessLifecycle")
+            .field("diagnostics", &self.diagnostics)
+            .field("trace_context", &self.trace_context)
+            .field("external", &self.external)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1558,11 +1601,43 @@ async fn execute_run_stream_provider_request(
         json_mode = provider_request.json_mode,
         status = tracing::field::Empty,
     );
-    let mut provider_future = Box::pin(
-        runtime_state
-            .execute_model_provider_with_lease(provider_request, lease_context)
-            .instrument(provider_span),
-    );
+    let external = harness_lifecycle.as_ref().and_then(|lifecycle| lifecycle.external.clone());
+    let (harness_cancel_sender, harness_cancellation) = HarnessCancellationContext::channel();
+    let harness_deadline_unix_ms = cancellation.context().deadline_unix_ms.unwrap_or_else(|| {
+        now_unix_ms.saturating_add(
+            i64::try_from(provider_deadline_timeout.as_millis()).unwrap_or(i64::MAX),
+        )
+    });
+    let harness_generation = cancellation.context().generation.get();
+    let harness_trace_context = harness_lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.trace_context.clone())
+        .unwrap_or_else(|| "none".to_owned());
+    let provider_future = async move {
+        if let Some(external) = external {
+            let model_id = provider_request
+                .model_override
+                .clone()
+                .unwrap_or_else(|| external.model_id.clone());
+            execute_external_harness_provider_turn(ExternalHarnessProviderTurn {
+                harness: external.harness,
+                run_id: run_id.to_owned(),
+                session_id: external.session_id,
+                generation: harness_generation,
+                provider_id: external.provider_id,
+                model_id,
+                trace_context: harness_trace_context,
+                provider_request,
+                cancellation: harness_cancellation,
+                deadline_unix_ms: harness_deadline_unix_ms,
+            })
+            .await
+        } else {
+            runtime_state.execute_model_provider_with_lease(provider_request, lease_context).await
+        }
+    }
+    .instrument(provider_span);
+    let mut provider_future = Box::pin(provider_future);
     let provider_started_at = TokioInstant::now();
     let provider_deadline = tokio::time::sleep(provider_deadline_timeout);
     tokio::pin!(provider_deadline);
@@ -1578,6 +1653,8 @@ async fn execute_run_stream_provider_request(
         tokio::select! {
             biased;
             reason = cancellation.cancelled() => {
+                let _ = harness_cancel_sender.send(true);
+                dispose_run_stream_external_harness(harness_lifecycle.as_ref()).await;
                 flow_control.request_cancel(reason);
                 let effective_state = transition_run_stream_to_cancelled(
                     sender,
@@ -1604,6 +1681,8 @@ async fn execute_run_stream_provider_request(
                 };
             }
             _ = &mut provider_deadline => {
+                let _ = harness_cancel_sender.send(true);
+                dispose_run_stream_external_harness(harness_lifecycle.as_ref()).await;
                 return Ok(RunStreamProviderRequestOutcome::TimedOut {
                     reason: timeout_reason,
                     message: provider_request_timeout_message(run_id, provider_deadline_timeout, timeout_reason),
@@ -1642,6 +1721,12 @@ async fn execute_run_stream_provider_request(
                 }
             }
         }
+    }
+}
+
+async fn dispose_run_stream_external_harness(lifecycle: Option<&RunStreamHarnessLifecycle>) {
+    if let Some(external) = lifecycle.and_then(|lifecycle| lifecycle.external.as_ref()) {
+        let _ = external.harness.dispose().await;
     }
 }
 
@@ -2599,6 +2684,26 @@ async fn maybe_start_run_stream_harness_lifecycle(
     })?;
     let configured_plugin_id =
         configured_run_stream_agent_harness_plugin_id(&runtime_state.config.agent_harness_registry);
+    let configured_codex_id =
+        configured_run_stream_codex_harness_id(&runtime_state.config.agent_harness_registry);
+    if configured_plugin_id.is_some() && configured_codex_id.is_some() {
+        return Err(Status::failed_precondition(
+            "agent harness registry must enable at most one plugin or Codex runtime",
+        ));
+    }
+    if configured_codex_id.is_some() {
+        registry
+            .register_async_descriptor(
+                codex_agent_harness_descriptor(),
+                "codex_app_server.managed_runtime_ready",
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "failed to register Codex agent harness descriptor: {error}"
+                ))
+            })?;
+    }
+    let configured_harness_id = configured_plugin_id.or(configured_codex_id);
     let selection_mode =
         run_stream_agent_harness_selection_mode(runtime_state.config.agent_harness_registry.mode);
     if let Some(plugin_id) = configured_plugin_id {
@@ -2636,13 +2741,14 @@ async fn maybe_start_run_stream_harness_lifecycle(
                                 "failed to load plugin bindings for agent harness activation: {error:#}"
                             ))
                         })?;
-                    activate_agent_harness_plugins_before_selection(
+                    activate_agent_harness_plugins_before_selection_with_policy(
                         &bindings,
                         &mut registry,
                         AgentHarnessPluginActivationRequest {
                             requested_plugin_id: Some(plugin_id),
                             explicit,
                         },
+                        &runtime_state.config.tool_call.wasm_runtime,
                     )
                     .map_err(|error| {
                         Status::failed_precondition(format!(
@@ -2706,7 +2812,7 @@ async fn maybe_start_run_stream_harness_lifecycle(
     }
     let support_request = AgentHarnessSupportRequest {
         selection_mode,
-        explicit_harness_id: configured_plugin_id,
+        explicit_harness_id: configured_harness_id,
         provider_id: request.provider_id,
         model_id: request.model_id,
         runtime_policy: RUN_STREAM_HARNESS_RUNTIME_POLICY,
@@ -2722,15 +2828,38 @@ async fn maybe_start_run_stream_harness_lifecycle(
     };
     let selected = registry.select(&support_request).map_err(|error| {
         Status::failed_precondition(format!(
-            "embedded agent harness selection failed: code={} message={}",
+            "agent harness selection failed: code={} message={}",
             error.code, error.message
         ))
     })?;
+    let selected_harness_id = selected.harness.descriptor().id.clone();
+    let external = if selected.harness.descriptor().embedded_default {
+        None
+    } else if configured_codex_id == Some(selected_harness_id.as_str()) {
+        Some(RunStreamExternalHarness {
+            harness: build_run_stream_codex_harness()?,
+            session_id: request.session_id.to_owned(),
+            provider_id: request.provider_id.to_owned(),
+            model_id: request.model_id.to_owned(),
+        })
+    } else {
+        let legacy = registry.lookup_shared(selected_harness_id.as_str()).ok_or_else(|| {
+            Status::failed_precondition(
+                "selected external agent harness disappeared before execution",
+            )
+        })?;
+        Some(RunStreamExternalHarness {
+            harness: Arc::new(LegacyAgentHarnessV2Adapter::new(legacy)),
+            session_id: request.session_id.to_owned(),
+            provider_id: request.provider_id.to_owned(),
+            model_id: request.model_id.to_owned(),
+        })
+    };
     let lifecycle_state = RunStreamHarnessLifecycle {
         diagnostics: selected.diagnostics(),
         trace_context: palyra_common::redaction::redact_diagnostic_text(request.trace_context),
+        external,
     };
-    let selected_harness_id = lifecycle_state.diagnostics.harness_id.clone();
     let embedded_default = lifecycle_state.diagnostics.embedded_default;
 
     append_agent_loop_tape_event(
@@ -2750,9 +2879,11 @@ async fn maybe_start_run_stream_harness_lifecycle(
     )
     .await?;
     *lifecycle = Some(lifecycle_state);
-    if !embedded_default {
+    if !embedded_default
+        && lifecycle.as_ref().and_then(|lifecycle| lifecycle.external.as_ref()).is_none()
+    {
         return Err(Status::failed_precondition(format!(
-            "agent harness '{selected_harness_id}' requires an external run-stream execution bridge"
+            "agent harness '{selected_harness_id}' did not resolve an external execution bridge"
         )));
     }
     Ok(())
@@ -2807,6 +2938,51 @@ fn configured_run_stream_agent_harness_plugin_id(
                 )
         })
         .map(|harness| harness.id.as_str())
+}
+
+fn configured_run_stream_codex_harness_id(
+    config: &crate::config::AgentHarnessRegistryConfig,
+) -> Option<&str> {
+    if config.mode == RuntimePreviewMode::Disabled {
+        return None;
+    }
+    config
+        .harnesses
+        .iter()
+        .find(|harness| {
+            harness.enabled
+                && matches!(
+                    harness.kind.trim().to_ascii_lowercase().as_str(),
+                    "codex" | "codex_app_server"
+                )
+                && harness.id == CODEX_MANAGED_RUNTIME_ID
+        })
+        .map(|harness| harness.id.as_str())
+}
+
+#[allow(clippy::result_large_err)]
+fn build_run_stream_codex_harness() -> Result<SharedAgentHarnessV2, Status> {
+    let cwd = std::env::current_dir()
+        .map_err(|_| Status::failed_precondition("failed to resolve Codex workspace root"))?;
+    let config = ManagedCodexAppServerConfig::resolve_default(cwd.as_path()).map_err(|error| {
+        Status::failed_precondition(format!(
+            "failed to resolve managed Codex app-server runtime: {error}"
+        ))
+    })?;
+    let descriptor = codex_managed_runtime_descriptor(&config).map_err(|error| {
+        Status::failed_precondition(format!(
+            "failed to build managed Codex app-server descriptor: {error}"
+        ))
+    })?;
+    let transport = StdioRuntimeTransport::new(descriptor).map_err(|error| {
+        Status::failed_precondition(format!(
+            "failed to initialize managed Codex app-server transport: {error}"
+        ))
+    })?;
+    Ok(Arc::new(ManagedExternalAgentHarness::new(
+        codex_agent_harness_descriptor(),
+        Arc::new(transport),
+    )))
 }
 
 const fn run_stream_agent_harness_selection_mode(
@@ -7926,13 +8102,14 @@ mod tests {
         background_budget_overrun_message, background_run_budget_tokens,
         bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
         browser_followup_timeout_partial_summary, configured_run_stream_agent_harness_plugin_id,
-        contains_raw_provider_tool_call_markup, delegated_run_admission,
-        drain_active_run_steering_before_provider_call, effective_provider_request_deadline,
-        embedded_run_stream_runtime_selection_payload, execute_run_stream_provider_request,
-        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
-        followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
-        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        configured_run_stream_codex_harness_id, contains_raw_provider_tool_call_markup,
+        delegated_run_admission, drain_active_run_steering_before_provider_call,
+        effective_provider_request_deadline, embedded_run_stream_runtime_selection_payload,
+        execute_run_stream_provider_request, final_answer_recovery_fallback_summary,
+        final_answer_recovery_prompt, followup_timeout_recovery_prompt,
+        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
+        incomplete_terminal_outcome_message, is_browser_tool_name,
+        is_run_stream_response_channel_closed, length_recovery_prompt,
         normalized_provider_stream_from_output_v2, phase_heartbeat_interval,
         provider_error_partial_summary, provider_model_override_for_routing,
         provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
@@ -7956,10 +8133,10 @@ mod tests {
         RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
         RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome,
         RunStreamProviderRequestExecution, RunStreamProviderRequestOutcome,
-        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
-        MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
-        RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
-        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        RUNTIME_SELECTED_METADATA_EVENT, RUN_STREAM_HARNESS_RUNTIME_POLICY,
+        TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS, TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::agent_harness::{
@@ -8738,6 +8915,7 @@ mod tests {
             trace_context: palyra_common::redaction::redact_diagnostic_text(
                 "trace?access_token=secret-token",
             ),
+            external: None,
         }
     }
 
@@ -8791,6 +8969,29 @@ mod tests {
             run_stream_agent_harness_selection_mode(config.mode),
             AgentHarnessSelectionMode::Embedded
         );
+    }
+
+    #[test]
+    fn run_stream_harness_config_resolves_only_the_canonical_codex_runtime() {
+        let mut config = AgentHarnessRegistryConfig {
+            mode: RuntimePreviewMode::Enabled,
+            harnesses: vec![
+                AgentHarnessConfig {
+                    id: "custom-codex".to_owned(),
+                    enabled: true,
+                    kind: "codex_app_server".to_owned(),
+                },
+                AgentHarnessConfig {
+                    id: CODEX_MANAGED_RUNTIME_ID.to_owned(),
+                    enabled: true,
+                    kind: "codex".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(configured_run_stream_codex_harness_id(&config), Some(CODEX_MANAGED_RUNTIME_ID));
+        config.mode = RuntimePreviewMode::Disabled;
+        assert_eq!(configured_run_stream_codex_harness_id(&config), None);
     }
 
     #[test]

@@ -25,6 +25,51 @@ use serde_json::Value;
 
 /// Stable id for the embedded Palyra harness.
 pub const EMBEDDED_PALYRA_HARNESS_ID: &str = "embedded_palyra";
+/// Current asynchronous harness contract version.
+pub const AGENT_HARNESS_CONTRACT_VERSION_V2: &str = "palyra.agent-harness.v2";
+
+/// Optional behavior advertised by a harness descriptor.
+///
+/// Capabilities are compatibility evidence only. The host still authorizes every
+/// provider, tool, approval, delivery, and persistence operation independently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AgentHarnessCapabilities {
+    pub steering: bool,
+    pub resume: bool,
+    pub compaction: bool,
+    pub dynamic_tools: bool,
+    pub approvals: bool,
+    pub computer_use: bool,
+    pub transcript_mirror: bool,
+}
+
+impl AgentHarnessCapabilities {
+    /// Returns the complete embedded harness capability surface.
+    #[must_use]
+    pub const fn embedded() -> Self {
+        Self {
+            steering: true,
+            resume: true,
+            compaction: true,
+            dynamic_tools: true,
+            approvals: true,
+            computer_use: true,
+            transcript_mirror: true,
+        }
+    }
+
+    /// Returns whether every requested capability is present.
+    #[must_use]
+    pub const fn contains(self, required: Self) -> bool {
+        (!required.steering || self.steering)
+            && (!required.resume || self.resume)
+            && (!required.compaction || self.compaction)
+            && (!required.dynamic_tools || self.dynamic_tools)
+            && (!required.approvals || self.approvals)
+            && (!required.computer_use || self.computer_use)
+            && (!required.transcript_mirror || self.transcript_mirror)
+    }
+}
 
 /// Compatibility name for the built-in Palyra harness implementation.
 pub type BuiltinPalyraHarness = EmbeddedPalyraHarness;
@@ -38,6 +83,10 @@ pub struct AgentHarnessDescriptor {
     pub label: String,
     /// Whether this harness is the embedded runtime path.
     pub embedded_default: bool,
+    /// Versioned execution contract implemented by the harness.
+    pub contract_version: String,
+    /// Optional behaviors available through the host-authorized contract.
+    pub capabilities: AgentHarnessCapabilities,
     /// Stable hash over descriptor fields used by diagnostics and replay fixtures.
     pub descriptor_hash: String,
 }
@@ -46,10 +95,33 @@ impl AgentHarnessDescriptor {
     /// Builds a descriptor and computes its deterministic hash.
     #[must_use]
     pub fn new(id: impl Into<String>, label: impl Into<String>, embedded_default: bool) -> Self {
+        let capabilities = if embedded_default {
+            AgentHarnessCapabilities::embedded()
+        } else {
+            Default::default()
+        };
+        Self::with_capabilities(id, label, embedded_default, capabilities)
+    }
+
+    /// Builds a version-two descriptor with explicit compatibility capabilities.
+    #[must_use]
+    pub fn with_capabilities(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        embedded_default: bool,
+        capabilities: AgentHarnessCapabilities,
+    ) -> Self {
         let id = id.into();
         let label = label.into();
-        let descriptor_hash = descriptor_hash(id.as_str(), label.as_str(), embedded_default);
-        Self { id, label, embedded_default, descriptor_hash }
+        let contract_version = AGENT_HARNESS_CONTRACT_VERSION_V2.to_owned();
+        let descriptor_hash = descriptor_hash(
+            id.as_str(),
+            label.as_str(),
+            embedded_default,
+            contract_version.as_str(),
+            capabilities,
+        );
+        Self { id, label, embedded_default, contract_version, capabilities, descriptor_hash }
     }
 
     /// Builds the canonical embedded Palyra descriptor.
@@ -59,13 +131,36 @@ impl AgentHarnessDescriptor {
     }
 }
 
-fn descriptor_hash(id: &str, label: &str, embedded_default: bool) -> String {
+fn descriptor_hash(
+    id: &str,
+    label: &str,
+    embedded_default: bool,
+    contract_version: &str,
+    capabilities: AgentHarnessCapabilities,
+) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
     let mut hash = FNV_OFFSET;
-    for byte in
-        id.bytes().chain([0]).chain(label.bytes()).chain([0]).chain([u8::from(embedded_default)])
+    let capability_bytes = [
+        u8::from(capabilities.steering),
+        u8::from(capabilities.resume),
+        u8::from(capabilities.compaction),
+        u8::from(capabilities.dynamic_tools),
+        u8::from(capabilities.approvals),
+        u8::from(capabilities.computer_use),
+        u8::from(capabilities.transcript_mirror),
+    ];
+    for byte in id
+        .bytes()
+        .chain([0])
+        .chain(label.bytes())
+        .chain([0])
+        .chain([u8::from(embedded_default)])
+        .chain([0])
+        .chain(contract_version.bytes())
+        .chain([0])
+        .chain(capability_bytes)
     {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -157,6 +252,33 @@ pub struct AgentHarnessRegistry {
     disposed: bool,
 }
 
+struct AsyncDescriptorHarness {
+    descriptor: AgentHarnessDescriptor,
+    support_reason_code: String,
+}
+
+#[allow(deprecated)]
+impl AgentHarness for AsyncDescriptorHarness {
+    fn descriptor(&self) -> &AgentHarnessDescriptor {
+        &self.descriptor
+    }
+
+    fn supports(&self, request: &AgentHarnessSupportRequest<'_>) -> AgentHarnessSupportDecision {
+        if request.explicit_harness_id.is_some_and(|id| id != self.descriptor.id.as_str()) {
+            return AgentHarnessSupportDecision::declined("agent_harness_v2.id_mismatch");
+        }
+        AgentHarnessSupportDecision::preferred(self.support_reason_code.clone())
+    }
+
+    fn run_attempt(&self, _attempt: PreparedAgentAttempt<'_>) -> AgentHarnessRunOutcome {
+        AgentHarnessRunOutcome {
+            status: "async_execution_required".to_owned(),
+            emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+            final_message: None,
+        }
+    }
+}
+
 impl AgentHarnessRegistry {
     /// Builds a registry with the embedded Palyra harness installed as default.
     ///
@@ -200,6 +322,24 @@ impl AgentHarnessRegistry {
         Ok(())
     }
 
+    /// Registers an async-v2 descriptor for compatibility-aware selection.
+    ///
+    /// Execution remains exclusively on [`crate::application::agent_harness_v2::AgentHarnessV2`];
+    /// the legacy adapter fails closed if a caller attempts to run it directly.
+    ///
+    /// # Errors
+    /// Returns the same lifecycle and duplicate-id failures as [`Self::register_arc`].
+    pub fn register_async_descriptor(
+        &mut self,
+        descriptor: AgentHarnessDescriptor,
+        support_reason_code: impl Into<String>,
+    ) -> Result<(), AgentHarnessRegistryError> {
+        self.register(AsyncDescriptorHarness {
+            descriptor,
+            support_reason_code: support_reason_code.into(),
+        })
+    }
+
     /// Removes a harness by id and returns its descriptor when present.
     pub fn unregister(&mut self, harness_id: &str) -> Option<AgentHarnessDescriptor> {
         self.harnesses.remove(harness_id).map(|harness| harness.descriptor().clone())
@@ -215,6 +355,12 @@ impl AgentHarnessRegistry {
     #[must_use]
     pub fn lookup(&self, harness_id: &str) -> Option<&dyn AgentHarness> {
         self.harnesses.get(harness_id).map(Arc::as_ref)
+    }
+
+    /// Looks up and clones a shared harness handle for async bridge ownership.
+    #[must_use]
+    pub fn lookup_shared(&self, harness_id: &str) -> Option<Arc<dyn AgentHarness>> {
+        self.harnesses.get(harness_id).cloned()
     }
 
     /// Resets the registry to the embedded default harness.
@@ -431,8 +577,11 @@ fn terminal_status_and_classification(
     }
 }
 
-/// Native harness abstraction. Implementations are selected only after host policy prepares the
-/// attempt and never receive direct authority over tools, approvals, or the journal.
+/// Legacy synchronous native harness abstraction.
+///
+/// New production adapters must implement the asynchronous `AgentHarnessV2`
+/// contract. This trait remains temporarily available for descriptor selection
+/// and compatibility fixtures while callers migrate.
 pub trait AgentHarness: Send + Sync {
     /// Returns the stable harness descriptor.
     fn descriptor(&self) -> &AgentHarnessDescriptor;

@@ -136,6 +136,14 @@ pub fn dispatch_internal_process_supervisor() {
     #[cfg(unix)]
     unix_process_supervisor::dispatch_if_requested();
 }
+
+/// Dispatches the exact hidden Codex bridge before normal daemon initialization.
+///
+/// Normal daemon invocations return immediately. A matching hidden invocation never returns.
+#[doc(hidden)]
+pub fn dispatch_internal_codex_app_server_bridge() {
+    application::codex_app_server_bridge::dispatch_internal_codex_app_server_bridge();
+}
 use app::{
     bootstrap::load_runtime_bootstrap,
     logging::init_tracing,
@@ -2617,8 +2625,12 @@ pub async fn run() -> Result<()> {
     ensure_local_default_agent(&agent_registry, &loaded)
         .context("failed to ensure local default agent state")?;
     let acp_runtime = Arc::new(
-        acp::AcpRuntime::open(acp::acp_root_from_state_root(runtime_state_root.as_path()))
-            .context("failed to initialize ACP runtime state")?,
+        acp::AcpRuntime::open_with_live_runtime(
+            acp::acp_root_from_state_root(runtime_state_root.as_path()),
+            loaded.feature_rollouts.acp_runtime.enabled,
+            loaded.acp_runtime.clone(),
+        )
+        .context("failed to initialize ACP runtime state")?,
     );
     let webhook_registry = Arc::new(
         webhooks::WebhookRegistry::open(runtime_state_root.as_path())

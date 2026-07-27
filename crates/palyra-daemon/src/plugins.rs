@@ -13,6 +13,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,21 +25,33 @@ use palyra_common::versioned_json::{
     VersionedJsonFormat,
 };
 use palyra_plugins_runtime::{
-    negotiate_typed_plugin_contracts, TypedPluginContractAdapterSupport,
-    TypedPluginContractNegotiationInput, TypedPluginContractNegotiationReport,
-    TypedPluginContractStatus,
+    negotiate_typed_plugin_contracts, PluginCoreWasmCancellationTokenV2,
+    TypedPluginContractAdapterSupport, TypedPluginContractNegotiationInput,
+    TypedPluginContractNegotiationReport, TypedPluginContractStatus,
 };
-use palyra_plugins_sdk::{TypedPluginCapabilityClass, TypedPluginContractKind};
+use palyra_plugins_sdk::{
+    executable_plugin_contract_schema_v2, AgentHarnessInvocationV2, AgentHarnessOutcomeV2,
+    AgentHarnessResultV2, ExecutablePluginContractKindV2, ExecutablePluginOperationV2,
+    PluginBindingIdV2, PluginBindingRecordV2, PluginCallIdV2, PluginCapabilityHandleIdV2,
+    PluginCapabilityHandleV2, PluginCapabilityScopeV2, PluginInvocationBudgetV2,
+    PluginInvocationRequestV2, PluginInvocationTerminalOutcomeV2, PluginRuntimeDiagnosticsV2,
+    PluginRuntimeGenerationV2, PluginSchemaHashV2, TypedPluginCapabilityClass,
+    TypedPluginContractKind, DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS,
+};
 use palyra_skills::{SkillConfigProperty, SkillConfigValueType, SkillManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     application::agent_harness::{
         AgentHarness, AgentHarnessDescriptor, AgentHarnessRegistry, AgentHarnessRegistryError,
         AgentHarnessRunOutcome, AgentHarnessSupportDecision, AgentHarnessSupportRequest,
     },
-    wasm_plugin_runner::WasmPluginRunnerPolicy,
+    wasm_plugin_runner::{
+        installed_skill_runtime_limits, resolve_installed_skill_module, ExecutablePluginHostError,
+        ExecutablePluginRuntimeHost, ResolvedInstalledSkillModule, WasmPluginRunnerPolicy,
+    },
 };
 
 use crate::*;
@@ -49,7 +64,13 @@ const PLUGIN_CONFIG_INSTANCE_LAYOUT_VERSION: u32 = 1;
 const PLUGIN_CONFIG_INSTANCE_FILE_NAME: &str = "config.json";
 const PLUGIN_CONFIG_INSTANCE_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("plugin config instance", PLUGIN_CONFIG_INSTANCE_LAYOUT_VERSION);
+#[cfg(test)]
 const AGENT_HARNESS_TEST_CONTRACT_TAG: &str = "agent_harness:test";
+const EXECUTABLE_PLUGIN_BINDING_TTL_MS: u64 = 15 * 60 * 1_000;
+const EXECUTABLE_PLUGIN_MAX_INPUT_BYTES: u32 = 64 * 1024;
+const EXECUTABLE_PLUGIN_MAX_OUTPUT_BYTES: u32 = 64 * 1024;
+const EXECUTABLE_PLUGIN_MAX_EVENT_BYTES: u32 = 16 * 1024;
+const EXECUTABLE_PLUGIN_MAX_EVENTS: u32 = 128;
 
 /// Versioned on-disk index of all plugin bindings, sorted by plugin id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +224,8 @@ pub(crate) struct AgentHarnessPluginActivationRecord {
     pub(crate) descriptor_hash: String,
     pub(crate) activated: bool,
     pub(crate) reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_diagnostics: Option<PluginRuntimeDiagnosticsV2>,
 }
 
 /// Host-owned activation report retained before harness selection.
@@ -1360,10 +1383,35 @@ pub(crate) fn negotiate_plugin_typed_contracts(
 /// # Errors
 /// Returns [`AgentHarnessPluginActivationError`] for explicit missing or
 /// unactivatable plugins, or when the host registry rejects a descriptor.
+#[cfg(test)]
 pub(crate) fn activate_agent_harness_plugins_before_selection(
     bindings: &PluginBindingsIndex,
     registry: &mut AgentHarnessRegistry,
     request: AgentHarnessPluginActivationRequest<'_>,
+) -> std::result::Result<AgentHarnessPluginActivationReport, AgentHarnessPluginActivationError> {
+    activate_agent_harness_plugins(bindings, registry, request, None)
+}
+
+/// Activates plugin-owned harnesses with the runtime policy required for
+/// production ABI v2 module execution.
+///
+/// # Errors
+/// Returns [`AgentHarnessPluginActivationError`] for explicit missing or
+/// unactivatable plugins, or when the host registry rejects a descriptor.
+pub(crate) fn activate_agent_harness_plugins_before_selection_with_policy(
+    bindings: &PluginBindingsIndex,
+    registry: &mut AgentHarnessRegistry,
+    request: AgentHarnessPluginActivationRequest<'_>,
+    runtime_policy: &WasmPluginRunnerPolicy,
+) -> std::result::Result<AgentHarnessPluginActivationReport, AgentHarnessPluginActivationError> {
+    activate_agent_harness_plugins(bindings, registry, request, Some(runtime_policy))
+}
+
+fn activate_agent_harness_plugins(
+    bindings: &PluginBindingsIndex,
+    registry: &mut AgentHarnessRegistry,
+    request: AgentHarnessPluginActivationRequest<'_>,
+    runtime_policy: Option<&WasmPluginRunnerPolicy>,
 ) -> std::result::Result<AgentHarnessPluginActivationReport, AgentHarnessPluginActivationError> {
     let requested = request.requested_plugin_id.map(str::trim).filter(|value| !value.is_empty());
     let mut report = AgentHarnessPluginActivationReport { ready: true, records: Vec::new() };
@@ -1381,21 +1429,45 @@ pub(crate) fn activate_agent_harness_plugins_before_selection(
         );
         match agent_harness_plugin_activation_reason(binding) {
             AgentHarnessPluginActivationReason::Activatable => {
-                registry
-                    .register(PluginAgentHarnessAdapter {
-                        descriptor: descriptor.clone(),
-                        execution_mode: plugin_agent_harness_execution_mode(binding),
-                    })
-                    .map_err(|source| AgentHarnessPluginActivationError::Registry {
-                        plugin_id: binding.plugin_id.clone(),
-                        source,
-                    })?;
-                report.records.push(AgentHarnessPluginActivationRecord {
-                    plugin_id: binding.plugin_id.clone(),
-                    descriptor_hash: descriptor.descriptor_hash,
-                    activated: true,
-                    reason_code: "agent_harness_plugin.activated".to_owned(),
-                });
+                match build_plugin_agent_harness_adapter(
+                    binding,
+                    descriptor.clone(),
+                    runtime_policy,
+                ) {
+                    Ok((adapter, runtime_diagnostics)) => {
+                        registry.register(adapter).map_err(|source| {
+                            AgentHarnessPluginActivationError::Registry {
+                                plugin_id: binding.plugin_id.clone(),
+                                source,
+                            }
+                        })?;
+                        report.records.push(AgentHarnessPluginActivationRecord {
+                            plugin_id: binding.plugin_id.clone(),
+                            descriptor_hash: descriptor.descriptor_hash,
+                            activated: true,
+                            reason_code: "agent_harness_plugin.activated".to_owned(),
+                            runtime_diagnostics,
+                        });
+                    }
+                    Err(reason_code) => {
+                        report.ready = false;
+                        report.records.push(AgentHarnessPluginActivationRecord {
+                            plugin_id: binding.plugin_id.clone(),
+                            descriptor_hash: descriptor.descriptor_hash,
+                            activated: false,
+                            reason_code: reason_code.clone(),
+                            runtime_diagnostics: None,
+                        });
+                        if request.explicit {
+                            return Err(
+                                AgentHarnessPluginActivationError::ExplicitPluginNotActivatable {
+                                    plugin_id: binding.plugin_id.clone(),
+                                    reason_code,
+                                },
+                            );
+                        }
+                    }
+                }
             }
             AgentHarnessPluginActivationReason::Blocked(reason_code) => {
                 report.ready = false;
@@ -1404,6 +1476,7 @@ pub(crate) fn activate_agent_harness_plugins_before_selection(
                     descriptor_hash: descriptor.descriptor_hash,
                     activated: false,
                     reason_code: reason_code.clone(),
+                    runtime_diagnostics: None,
                 });
                 if request.explicit {
                     return Err(AgentHarnessPluginActivationError::ExplicitPluginNotActivatable {
@@ -1458,9 +1531,19 @@ fn agent_harness_plugin_activation_reason(
             "agent_harness_plugin.contract_rejected".to_owned(),
         );
     }
+    if entry.adapter.as_deref() != Some("plugins.abi_v2.agent_harness") {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.executable_adapter_missing".to_owned(),
+        );
+    }
     if !binding.typed_contracts.ready {
         return AgentHarnessPluginActivationReason::Blocked(
             "agent_harness_plugin.contract_report_not_ready".to_owned(),
+        );
+    }
+    if !is_agent_harness_test_contract(binding) && !binding.capability_diff.valid {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.capability_diff_invalid".to_owned(),
         );
     }
     AgentHarnessPluginActivationReason::Activatable
@@ -1486,31 +1569,266 @@ fn plugin_agent_harness_label(binding: &PluginBindingRecord) -> String {
         .unwrap_or_else(|| format!("Agent harness plugin {}", binding.plugin_id))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PluginAgentHarnessExecutionMode {
-    HostTestContract,
-    ProductionUnsupported,
+fn is_agent_harness_test_contract(binding: &PluginBindingRecord) -> bool {
+    #[cfg(not(test))]
+    {
+        let _ = binding;
+        false
+    }
+    #[cfg(test)]
+    {
+        let tagged_test = binding
+            .operator
+            .tags
+            .iter()
+            .any(|tag| tag.trim().eq_ignore_ascii_case(AGENT_HARNESS_TEST_CONTRACT_TAG));
+        let test_module =
+            binding.module_path.as_deref().is_some_and(|path| path.trim().starts_with("test://"));
+        let test_entrypoint = binding
+            .entrypoint
+            .as_deref()
+            .is_some_and(|entrypoint| entrypoint.trim() == "palyra_agent_harness_test");
+        tagged_test || test_module || test_entrypoint
+    }
 }
 
-fn plugin_agent_harness_execution_mode(
-    binding: &PluginBindingRecord,
-) -> PluginAgentHarnessExecutionMode {
-    let tagged_test = binding
-        .operator
-        .tags
-        .iter()
-        .any(|tag| tag.trim().eq_ignore_ascii_case(AGENT_HARNESS_TEST_CONTRACT_TAG));
-    let test_module =
-        binding.module_path.as_deref().is_some_and(|path| path.trim().starts_with("test://"));
-    let test_entrypoint = binding
-        .entrypoint
-        .as_deref()
-        .is_some_and(|entrypoint| entrypoint.trim() == "palyra_agent_harness_test");
-    if tagged_test || test_module || test_entrypoint {
-        PluginAgentHarnessExecutionMode::HostTestContract
-    } else {
-        PluginAgentHarnessExecutionMode::ProductionUnsupported
+#[derive(Debug)]
+enum PluginAgentHarnessExecutionMode {
+    HostTestContract,
+    Production(Box<ProductionPluginAgentHarness>),
+}
+
+#[derive(Debug)]
+struct ProductionPluginAgentHarness {
+    host: ExecutablePluginRuntimeHost,
+    binding: PluginBindingRecordV2,
+    invocation_timeout_ms: u64,
+}
+
+impl Drop for ProductionPluginAgentHarness {
+    fn drop(&mut self) {
+        let _ = self.host.dispose(&self.binding.binding_id, self.binding.runtime_generation);
     }
+}
+
+fn build_plugin_agent_harness_adapter(
+    binding: &PluginBindingRecord,
+    descriptor: AgentHarnessDescriptor,
+    runtime_policy: Option<&WasmPluginRunnerPolicy>,
+) -> std::result::Result<(PluginAgentHarnessAdapter, Option<PluginRuntimeDiagnosticsV2>), String> {
+    if is_agent_harness_test_contract(binding) {
+        return Ok((
+            PluginAgentHarnessAdapter {
+                descriptor,
+                execution_mode: PluginAgentHarnessExecutionMode::HostTestContract,
+            },
+            None,
+        ));
+    }
+    let runtime_policy =
+        runtime_policy.ok_or_else(|| "agent_harness_plugin.runtime_policy_required".to_owned())?;
+    let resolved = resolve_installed_skill_module(
+        binding.skill_id.as_str(),
+        binding.skill_version.as_deref(),
+        binding.module_path.as_deref(),
+        binding.entrypoint.as_deref(),
+        binding.tool_id.as_deref(),
+    )
+    .map_err(|error| plugin_runtime_resolution_reason(error.kind))?;
+    build_plugin_agent_harness_adapter_from_resolved(
+        binding,
+        descriptor,
+        runtime_policy,
+        resolved,
+        current_unix_ms().map_err(|_| "agent_harness_plugin.clock_unavailable".to_owned())?,
+    )
+}
+
+fn build_plugin_agent_harness_adapter_from_resolved(
+    binding: &PluginBindingRecord,
+    descriptor: AgentHarnessDescriptor,
+    runtime_policy: &WasmPluginRunnerPolicy,
+    resolved: ResolvedInstalledSkillModule,
+    issued_at_unix_ms: u64,
+) -> std::result::Result<(PluginAgentHarnessAdapter, Option<PluginRuntimeDiagnosticsV2>), String> {
+    let runtime_generation = PluginRuntimeGenerationV2::new(
+        u64::try_from(binding.updated_at_unix_ms.max(1)).unwrap_or(1),
+    )
+    .map_err(|_| "agent_harness_plugin.generation_invalid".to_owned())?;
+    let expires_at_unix_ms = issued_at_unix_ms
+        .checked_add(EXECUTABLE_PLUGIN_BINDING_TTL_MS)
+        .ok_or_else(|| "agent_harness_plugin.binding_expiry_invalid".to_owned())?;
+    let contract = ExecutablePluginContractKindV2::AgentHarness;
+    let operation = ExecutablePluginOperationV2::RunAgentAttempt;
+    let schema = executable_plugin_contract_schema_v2(contract);
+    let capability_handles = build_opaque_capability_handles(
+        &binding.capability_diff.effective,
+        runtime_generation,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    let binding_id =
+        PluginBindingIdV2::new(format!("binding:{}", sha256_hex(binding.plugin_id.as_bytes())))
+            .map_err(|_| "agent_harness_plugin.binding_id_invalid".to_owned())?;
+    let runtime_binding = PluginBindingRecordV2 {
+        binding_id,
+        contract,
+        operation,
+        runtime_generation,
+        input_schema_hash: schema.input_schema_hash,
+        output_schema_hash: schema.output_schema_hash,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+        granted_capability_handles: capability_handles,
+    };
+    let limits = installed_skill_runtime_limits(runtime_policy, &resolved)
+        .map_err(|error| plugin_runtime_resolution_reason(error.kind))?;
+    let host = ExecutablePluginRuntimeHost::new(runtime_policy, limits)
+        .map_err(plugin_runtime_host_reason)?;
+    host.bind(runtime_binding.clone(), resolved.module_bytes)
+        .map_err(plugin_runtime_host_reason)?;
+    let diagnostics = host.diagnostics().map_err(plugin_runtime_host_reason)?;
+    let invocation_timeout_ms = resolved
+        .manifest
+        .capabilities
+        .quotas
+        .wall_clock_timeout_ms
+        .clamp(1, DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS);
+    Ok((
+        PluginAgentHarnessAdapter {
+            descriptor,
+            execution_mode: PluginAgentHarnessExecutionMode::Production(Box::new(
+                ProductionPluginAgentHarness {
+                    host,
+                    binding: runtime_binding,
+                    invocation_timeout_ms,
+                },
+            )),
+        },
+        Some(diagnostics),
+    ))
+}
+
+fn build_opaque_capability_handles(
+    profile: &PluginCapabilityProfile,
+    runtime_generation: PluginRuntimeGenerationV2,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> std::result::Result<Vec<PluginCapabilityHandleV2>, String> {
+    let mut handles = Vec::new();
+    append_opaque_capability_handles(
+        &mut handles,
+        PluginCapabilityScopeV2::HttpHost,
+        "http",
+        profile.http_hosts.as_slice(),
+        runtime_generation,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    append_opaque_capability_handles(
+        &mut handles,
+        PluginCapabilityScopeV2::SecretLease,
+        "secret",
+        profile.secrets.as_slice(),
+        runtime_generation,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    append_opaque_capability_handles(
+        &mut handles,
+        PluginCapabilityScopeV2::StoragePrefix,
+        "storage",
+        profile.storage_prefixes.as_slice(),
+        runtime_generation,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    append_opaque_capability_handles(
+        &mut handles,
+        PluginCapabilityScopeV2::Channel,
+        "channel",
+        profile.channels.as_slice(),
+        runtime_generation,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+    )?;
+    Ok(handles)
+}
+
+fn append_opaque_capability_handles(
+    target: &mut Vec<PluginCapabilityHandleV2>,
+    scope: PluginCapabilityScopeV2,
+    scope_label: &str,
+    values: &[String],
+    runtime_generation: PluginRuntimeGenerationV2,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> std::result::Result<(), String> {
+    for value in values {
+        let scope_digest = sha256_hex(format!("{scope_label}:{value}").as_bytes());
+        let handle_id = PluginCapabilityHandleIdV2::new(format!(
+            "cap:{scope_label}:{}",
+            scope_digest.get(..32).unwrap_or(scope_digest.as_str())
+        ))
+        .map_err(|_| "agent_harness_plugin.capability_handle_invalid".to_owned())?;
+        let scope_hash = PluginSchemaHashV2::parse("scope_hash", scope_digest)
+            .map_err(|_| "agent_harness_plugin.capability_scope_invalid".to_owned())?;
+        let handle = PluginCapabilityHandleV2::new(
+            handle_id,
+            scope,
+            scope_hash,
+            runtime_generation,
+            expires_at_unix_ms,
+        )
+        .map_err(|_| "agent_harness_plugin.capability_handle_invalid".to_owned())?;
+        if handle.expires_at_unix_ms <= issued_at_unix_ms {
+            return Err("agent_harness_plugin.capability_handle_invalid".to_owned());
+        }
+        target.push(handle);
+    }
+    Ok(())
+}
+
+fn plugin_runtime_resolution_reason(
+    kind: crate::wasm_plugin_runner::WasmPluginRunErrorKind,
+) -> String {
+    match kind {
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::Disabled => {
+            "agent_harness_plugin.runtime_disabled".to_owned()
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::InvalidInput => {
+            "agent_harness_plugin.module_invalid".to_owned()
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::CapabilityDenied => {
+            "agent_harness_plugin.capability_denied".to_owned()
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::TimedOut => {
+            "agent_harness_plugin.runtime_timed_out".to_owned()
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::QuotaExceeded => {
+            "agent_harness_plugin.runtime_quota_exceeded".to_owned()
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::RuntimeFailure => {
+            "agent_harness_plugin.runtime_failed".to_owned()
+        }
+    }
+}
+
+fn plugin_runtime_host_reason(error: ExecutablePluginHostError) -> String {
+    match error {
+        ExecutablePluginHostError::Disabled => "agent_harness_plugin.runtime_disabled",
+        ExecutablePluginHostError::EmptyModule => "agent_harness_plugin.module_invalid",
+        ExecutablePluginHostError::ModuleTooLarge { .. } => "agent_harness_plugin.module_too_large",
+        ExecutablePluginHostError::RuntimeInitialization { .. } => {
+            "agent_harness_plugin.runtime_initialization_failed"
+        }
+        ExecutablePluginHostError::Invocation { ref source } => source.reason_code(),
+        ExecutablePluginHostError::DuplicateCall => "plugin.invocation.duplicate_call",
+        ExecutablePluginHostError::StateUnavailable => {
+            "agent_harness_plugin.runtime_state_unavailable"
+        }
+    }
+    .to_owned()
 }
 
 #[derive(Debug)]
@@ -1551,44 +1869,227 @@ impl AgentHarness for PluginAgentHarnessAdapter {
                 ],
                 final_message: Some("plugin harness test completed".to_owned()),
             },
-            PluginAgentHarnessExecutionMode::ProductionUnsupported => AgentHarnessRunOutcome {
-                status: "internal_error".to_owned(),
-                emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
-                final_message: None,
-            },
+            PluginAgentHarnessExecutionMode::Production(ref production) => {
+                run_production_plugin_agent_harness(production, attempt)
+            }
         }
     }
 }
 
-// Host-side adapter table: which contract kinds the daemon can bind and
-// which capability classes each may carry. Lifecycle hooks and policy signal
-// providers deliberately allow no capability classes (minimal-capability
-// contracts; pinned by tests). Keep in sync with
-// all_typed_plugin_contract_kinds in the plugins SDK.
+fn run_production_plugin_agent_harness(
+    production: &ProductionPluginAgentHarness,
+    attempt: crate::application::agent_harness::PreparedAgentAttempt<'_>,
+) -> AgentHarnessRunOutcome {
+    let now_unix_ms = match current_unix_ms() {
+        Ok(now_unix_ms) => now_unix_ms,
+        Err(()) => return plugin_agent_harness_failure("internal_error"),
+    };
+    let objective_hash = match prepared_attempt_objective_hash(&attempt) {
+        Ok(hash) => hash,
+        Err(()) => return plugin_agent_harness_failure("internal_error"),
+    };
+    let prepared_attempt_ref = format!(
+        "attempt:{}",
+        sha256_framed_hex(b"palyra.plugin.agent-harness.attempt.v2", &[attempt.run_id.as_bytes()])
+    );
+    let max_steps = u32::try_from(attempt.context_token_budget.div_ceil(1_024))
+        .unwrap_or(u32::MAX)
+        .clamp(1, 64);
+    let input_bytes =
+        match (AgentHarnessInvocationV2 { prepared_attempt_ref, objective_hash, max_steps })
+            .encode_core_bytes()
+        {
+            Ok(input_bytes) => input_bytes,
+            Err(_) => return plugin_agent_harness_failure("internal_error"),
+        };
+    let call_id = match PluginCallIdV2::new(format!(
+        "call:{}",
+        sha256_framed_hex(
+            b"palyra.plugin.agent-harness.call.v2",
+            &[attempt.run_id.as_bytes(), attempt.trace_context.as_bytes()],
+        )
+    )) {
+        Ok(call_id) => call_id,
+        Err(_) => return plugin_agent_harness_failure("internal_error"),
+    };
+    let deadline = match now_unix_ms.checked_add(production.invocation_timeout_ms) {
+        Some(deadline) => deadline,
+        None => return plugin_agent_harness_failure("internal_error"),
+    };
+    let request = PluginInvocationRequestV2 {
+        schema_version: 2,
+        call_id,
+        binding_id: production.binding.binding_id.clone(),
+        runtime_generation: production.binding.runtime_generation,
+        contract: production.binding.contract,
+        operation: production.binding.operation,
+        budget: PluginInvocationBudgetV2 {
+            absolute_deadline_unix_ms: deadline,
+            max_input_bytes: EXECUTABLE_PLUGIN_MAX_INPUT_BYTES,
+            max_output_bytes: EXECUTABLE_PLUGIN_MAX_OUTPUT_BYTES,
+            max_event_bytes: EXECUTABLE_PLUGIN_MAX_EVENT_BYTES,
+            max_events: EXECUTABLE_PLUGIN_MAX_EVENTS,
+        },
+        input_schema_hash: production.binding.input_schema_hash.clone(),
+        output_schema_hash: production.binding.output_schema_hash.clone(),
+        input_bytes,
+        granted_capability_handles: production.binding.granted_capability_handles.clone(),
+    };
+    let cancellation = PluginCoreWasmCancellationTokenV2::new();
+    let transcript = thread::scope(|scope| {
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let attempt_cancellation = attempt.cancellation.clone();
+        let guest_cancellation = cancellation.clone();
+        let call_id = request.call_id.clone();
+        let watcher = scope.spawn(move || loop {
+            if attempt_cancellation.is_cancelled() {
+                // The token closes the admission race before the host's active
+                // map is populated; cancel() also exercises the registered-call path.
+                guest_cancellation.cancel();
+                let _ = production.host.cancel(&call_id);
+                break;
+            }
+            match finished_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        });
+        let result = production.host.invoke(&request, now_unix_ms, cancellation);
+        let _ = finished_tx.send(());
+        if watcher.join().is_err() {
+            return Err(ExecutablePluginHostError::StateUnavailable);
+        }
+        result
+    });
+    let transcript = match transcript {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            return plugin_agent_harness_failure(match error {
+                ExecutablePluginHostError::Invocation { source }
+                    if source.code
+                        == palyra_plugins_sdk::PluginInvocationErrorCodeV2::Cancelled =>
+                {
+                    "cancelled"
+                }
+                _ => "internal_error",
+            });
+        }
+    };
+    match &transcript.terminal().outcome {
+        PluginInvocationTerminalOutcomeV2::Completed { output_bytes, .. } => {
+            match AgentHarnessResultV2::decode_core_bytes(output_bytes) {
+                Ok(result) => plugin_agent_harness_result(result),
+                Err(_) => {
+                    let _ = production.host.quarantine(
+                        &production.binding.binding_id,
+                        production.binding.runtime_generation,
+                    );
+                    plugin_agent_harness_failure("internal_error")
+                }
+            }
+        }
+        PluginInvocationTerminalOutcomeV2::Cancelled { .. } => {
+            plugin_agent_harness_failure("cancelled")
+        }
+        PluginInvocationTerminalOutcomeV2::Failed { .. } => {
+            plugin_agent_harness_failure("internal_error")
+        }
+    }
+}
+
+fn plugin_agent_harness_result(result: AgentHarnessResultV2) -> AgentHarnessRunOutcome {
+    match result.outcome {
+        AgentHarnessOutcomeV2::Completed => AgentHarnessRunOutcome {
+            status: "completed".to_owned(),
+            emitted_callbacks: vec![AgentHarnessCallbackKind::FinalOutcome],
+            final_message: None,
+        },
+        AgentHarnessOutcomeV2::HostCallbackRequired => AgentHarnessRunOutcome {
+            status: "blocked".to_owned(),
+            emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+            final_message: None,
+        },
+        AgentHarnessOutcomeV2::Declined => AgentHarnessRunOutcome {
+            status: "declined".to_owned(),
+            emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+            final_message: None,
+        },
+    }
+}
+
+fn plugin_agent_harness_failure(status: &str) -> AgentHarnessRunOutcome {
+    AgentHarnessRunOutcome {
+        status: status.to_owned(),
+        emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+        final_message: None,
+    }
+}
+
+fn prepared_attempt_objective_hash(
+    attempt: &crate::application::agent_harness::PreparedAgentAttempt<'_>,
+) -> std::result::Result<PluginSchemaHashV2, ()> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.plugin.agent-harness.objective.v2");
+    for value in [
+        attempt.session_id,
+        attempt.provider_id,
+        attempt.model_id,
+        attempt.reasoning_policy.unwrap_or_default(),
+        attempt.sandbox,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    let transcript = serde_json::to_vec(attempt.sanitized_transcript_view).map_err(|_| ())?;
+    let tool_surface = serde_json::to_vec(attempt.tool_surface).map_err(|_| ())?;
+    let tool_policy = serde_json::to_vec(attempt.tool_policy).map_err(|_| ())?;
+    for payload in [&transcript, &tool_surface, &tool_policy] {
+        let length = u64::try_from(payload.len()).map_err(|_| ())?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(payload);
+    }
+    PluginSchemaHashV2::parse("objective_hash", hex::encode(hasher.finalize())).map_err(|_| ())
+}
+
+fn sha256_framed_hex(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(field);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn current_unix_ms() -> std::result::Result<u64, ()> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| ())?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| ())
+}
+
+// The six executable kinds advertise their ABI v2 adapters. Routing strategy
+// remains a descriptor-only compatibility shim for existing bindings and CLI
+// workflows; accepting it here does not imply ABI v2 execution support. Other
+// descriptor-only kinds stay rejected until they satisfy the same conformance
+// template.
 fn supported_plugin_contract_adapters() -> Vec<TypedPluginContractAdapterSupport> {
     let data_capability_classes = vec![
         TypedPluginCapabilityClass::HttpHosts,
         TypedPluginCapabilityClass::Secrets,
         TypedPluginCapabilityClass::StoragePrefixes,
     ];
-    let channel_capability_classes = vec![TypedPluginCapabilityClass::Channels];
-    let storage_capability_classes = vec![TypedPluginCapabilityClass::StoragePrefixes];
-    let secret_capability_classes = vec![TypedPluginCapabilityClass::Secrets];
-    let connector_capability_classes = vec![
-        TypedPluginCapabilityClass::HttpHosts,
-        TypedPluginCapabilityClass::Secrets,
-        TypedPluginCapabilityClass::StoragePrefixes,
-        TypedPluginCapabilityClass::Channels,
-    ];
     vec![
         plugin_contract_adapter_support(
             TypedPluginContractKind::MemoryProvider,
-            "journal.memory_embedding_provider",
+            "plugins.abi_v2.memory_provider",
             data_capability_classes.clone(),
         ),
         plugin_contract_adapter_support(
             TypedPluginContractKind::ContextEngine,
-            "application.context_engine",
+            "plugins.abi_v2.context_engine",
             data_capability_classes.clone(),
         ),
         plugin_contract_adapter_support(
@@ -1598,62 +2099,22 @@ fn supported_plugin_contract_adapters() -> Vec<TypedPluginContractAdapterSupport
         ),
         plugin_contract_adapter_support(
             TypedPluginContractKind::RunLifecycleHook,
-            "runtime.run_lifecycle_hook",
+            "plugins.abi_v2.run_lifecycle_hook",
             Vec::new(),
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::CompactionProvider,
-            "application.compaction_provider",
-            data_capability_classes,
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::DiagnosticsProvider,
-            "operator.diagnostics_provider",
-            storage_capability_classes.clone(),
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::PolicySignalProvider,
-            "policy.signal_provider",
-            Vec::new(),
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::ChannelBindingProvider,
-            "channels.binding_provider",
-            channel_capability_classes.clone(),
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::DeliveryAdapter,
-            "channels.delivery_adapter",
-            channel_capability_classes,
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::SchedulerTaskProvider,
-            "runtime.scheduler_task_provider",
-            storage_capability_classes,
         ),
         plugin_contract_adapter_support(
             TypedPluginContractKind::ModelAuthProvider,
-            "auth.model_auth_provider",
-            secret_capability_classes,
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::ConnectorAdapter,
-            "connectors.adapter_sdk",
-            connector_capability_classes,
+            "plugins.abi_v2.model_auth_provider",
+            vec![TypedPluginCapabilityClass::Secrets],
         ),
         plugin_contract_adapter_support(
             TypedPluginContractKind::AgentHarness,
-            "runtime.agent_harness",
+            "plugins.abi_v2.agent_harness",
             Vec::new(),
         ),
         plugin_contract_adapter_support(
             TypedPluginContractKind::ToolResultMiddleware,
-            "runtime.tool_result_middleware",
-            Vec::new(),
-        ),
-        plugin_contract_adapter_support(
-            TypedPluginContractKind::PluginLifecycleHook,
-            "plugins.lifecycle_hook",
+            "plugins.abi_v2.tool_result_middleware",
             Vec::new(),
         ),
     ]
@@ -1726,8 +2187,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        activate_agent_harness_plugins_before_selection, build_plugin_capability_diff,
-        inspect_plugin_filesystem_safety, load_plugin_bindings_index,
+        activate_agent_harness_plugins_before_selection,
+        build_plugin_agent_harness_adapter_from_resolved, build_plugin_capability_diff,
+        current_unix_ms, inspect_plugin_filesystem_safety, load_plugin_bindings_index,
         negotiate_plugin_typed_contracts, plugin_bindings_index_path, redact_plugin_config_values,
         save_plugin_bindings_index, supported_plugin_contract_adapters,
         validate_plugin_config_instance, AgentHarnessPluginActivationError,
@@ -1739,19 +2201,53 @@ mod tests {
         AGENT_HARNESS_TEST_CONTRACT_TAG, PLUGIN_BINDINGS_LAYOUT_VERSION,
     };
     use crate::application::agent_harness::{
-        AgentHarnessCancellation, AgentHarnessRegistry, AgentHarnessSupportRequest,
-        PreparedAgentAttempt, PreparedAgentAttemptCallbacks,
+        AgentHarness, AgentHarnessCancellation, AgentHarnessDescriptor, AgentHarnessRegistry,
+        AgentHarnessSupportRequest, PreparedAgentAttempt, PreparedAgentAttemptCallbacks,
     };
-    use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
+    use crate::wasm_plugin_runner::{ResolvedInstalledSkillModule, WasmPluginRunnerPolicy};
     use palyra_common::runtime_contracts::AgentHarnessSelectionMode;
     use palyra_plugins_runtime::{
         TypedPluginContractMode, TypedPluginContractNegotiationEntry,
         TypedPluginContractNegotiationReport, TypedPluginContractStatus,
     };
     use palyra_plugins_sdk::{
-        all_typed_plugin_contract_kinds, TypedPluginCapabilityClass,
-        TypedPluginContractDeclaration, TypedPluginContractKind,
+        AgentHarnessOutcomeV2, AgentHarnessResultV2, TypedPluginCapabilityClass,
+        TypedPluginContractDeclaration, TypedPluginContractKind, EXECUTABLE_PLUGIN_CONTRACTS_V2,
     };
+    use palyra_skills::capability_grants_from_manifest;
+
+    const AGENT_HARNESS_V2_TEMPLATE: &str =
+        include_str!("../../palyra-plugins/runtime/tests/fixtures/agent_harness_v2.wat");
+    const EXECUTABLE_PLUGIN_REFERENCE_MODULES: [(TypedPluginContractKind, &[u8]); 6] = [
+        (
+            TypedPluginContractKind::AgentHarness,
+            include_bytes!("../../palyra-plugins/runtime/tests/fixtures/agent_harness_v2.wat"),
+        ),
+        (
+            TypedPluginContractKind::ContextEngine,
+            include_bytes!("../../palyra-plugins/runtime/tests/fixtures/context_engine_v2.wat"),
+        ),
+        (
+            TypedPluginContractKind::ToolResultMiddleware,
+            include_bytes!(
+                "../../palyra-plugins/runtime/tests/fixtures/tool_result_middleware_v2.wat"
+            ),
+        ),
+        (
+            TypedPluginContractKind::RunLifecycleHook,
+            include_bytes!("../../palyra-plugins/runtime/tests/fixtures/run_lifecycle_hook_v2.wat"),
+        ),
+        (
+            TypedPluginContractKind::MemoryProvider,
+            include_bytes!("../../palyra-plugins/runtime/tests/fixtures/memory_provider_v2.wat"),
+        ),
+        (
+            TypedPluginContractKind::ModelAuthProvider,
+            include_bytes!(
+                "../../palyra-plugins/runtime/tests/fixtures/model_auth_provider_v2.wat"
+            ),
+        ),
+    ];
 
     fn accepted_agent_harness_contract_report() -> TypedPluginContractNegotiationReport {
         TypedPluginContractNegotiationReport {
@@ -1761,7 +2257,7 @@ mod tests {
                 kind: TypedPluginContractKind::AgentHarness,
                 requested_version: 1,
                 status: TypedPluginContractStatus::Accepted,
-                adapter: Some("runtime.agent_harness".to_owned()),
+                adapter: Some("plugins.abi_v2.agent_harness".to_owned()),
                 descriptor: None,
                 reasons: Vec::new(),
             }],
@@ -1791,7 +2287,10 @@ mod tests {
                 ..PluginDiscoverySnapshot::default()
             },
             config: None,
-            capability_diff: PluginCapabilityDiffCache::default(),
+            capability_diff: PluginCapabilityDiffCache {
+                valid: true,
+                ..PluginCapabilityDiffCache::default()
+            },
             typed_contracts,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -1999,24 +2498,30 @@ mod tests {
     }
 
     #[test]
-    fn typed_plugin_host_adapters_cover_phase_seven_contracts() {
+    fn typed_plugin_host_adapters_publish_abi_v2_kinds_and_legacy_routing_shim() {
         let adapters = supported_plugin_contract_adapters();
         let adapter_kinds = adapters.iter().map(|adapter| adapter.kind).collect::<BTreeSet<_>>();
-        for kind in all_typed_plugin_contract_kinds() {
-            assert!(adapter_kinds.contains(&kind), "missing adapter for {}", kind.as_str());
-        }
+        let executable = BTreeSet::from([
+            TypedPluginContractKind::AgentHarness,
+            TypedPluginContractKind::ContextEngine,
+            TypedPluginContractKind::MemoryProvider,
+            TypedPluginContractKind::ModelAuthProvider,
+            TypedPluginContractKind::RunLifecycleHook,
+            TypedPluginContractKind::ToolResultMiddleware,
+        ]);
+        let mut negotiable = executable.clone();
+        negotiable.insert(TypedPluginContractKind::RoutingStrategy);
+        assert_eq!(EXECUTABLE_PLUGIN_CONTRACTS_V2.len(), executable.len());
+        assert_eq!(adapter_kinds, negotiable);
+        assert!(EXECUTABLE_PLUGIN_REFERENCE_MODULES
+            .iter()
+            .all(|(kind, module)| executable.contains(kind) && !module.is_empty()));
 
         let lifecycle = adapters
             .iter()
             .find(|adapter| adapter.kind == TypedPluginContractKind::RunLifecycleHook)
             .expect("run lifecycle hook adapter must be present");
         assert!(lifecycle.allowed_capability_classes.is_empty());
-
-        let delivery = adapters
-            .iter()
-            .find(|adapter| adapter.kind == TypedPluginContractKind::DeliveryAdapter)
-            .expect("delivery adapter must be present");
-        assert_eq!(delivery.allowed_capability_classes, vec![TypedPluginCapabilityClass::Channels]);
 
         let model_auth = adapters
             .iter()
@@ -2039,13 +2544,11 @@ mod tests {
 
     #[test]
     fn agent_harness_plugin_activation_registers_descriptor_before_selection() {
-        let index = PluginBindingsIndex {
-            entries: vec![agent_harness_binding(
-                "acme.agent_harness",
-                accepted_agent_harness_contract_report(),
-            )],
-            ..PluginBindingsIndex::default()
-        };
+        let mut binding =
+            agent_harness_binding("acme.agent_harness", accepted_agent_harness_contract_report());
+        binding.operator.tags.push(AGENT_HARNESS_TEST_CONTRACT_TAG.to_owned());
+        let index =
+            PluginBindingsIndex { entries: vec![binding], ..PluginBindingsIndex::default() };
         let mut registry =
             AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
 
@@ -2108,7 +2611,7 @@ mod tests {
     }
 
     #[test]
-    fn production_agent_harness_plugin_attempt_fails_closed() {
+    fn production_agent_harness_plugin_activation_requires_runtime_policy() {
         let index = PluginBindingsIndex {
             entries: vec![agent_harness_binding(
                 "acme.agent_harness",
@@ -2119,7 +2622,7 @@ mod tests {
         let mut registry =
             AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
 
-        activate_agent_harness_plugins_before_selection(
+        let error = activate_agent_harness_plugins_before_selection(
             &index,
             &mut registry,
             AgentHarnessPluginActivationRequest {
@@ -2127,24 +2630,67 @@ mod tests {
                 explicit: true,
             },
         )
-        .expect("accepted production harness plugin should activate");
-        let selected = registry
-            .select(&harness_selection_request(Some("acme.agent_harness"), false))
-            .expect("registered plugin harness should be selectable");
+        .expect_err("production activation without runtime policy must fail closed");
+
+        assert_eq!(
+            error,
+            AgentHarnessPluginActivationError::ExplicitPluginNotActivatable {
+                plugin_id: "acme.agent_harness".to_owned(),
+                reason_code: "agent_harness_plugin.runtime_policy_required".to_owned(),
+            }
+        );
+        assert!(registry.lookup("acme.agent_harness").is_none());
+    }
+
+    #[test]
+    fn production_agent_harness_plugin_invokes_real_abi_v2_module() {
+        let binding =
+            agent_harness_binding("acme.agent_harness", accepted_agent_harness_contract_report());
+        let manifest = plugin_manifest_with_operator_config(minimal_operator_config_properties());
+        let output = AgentHarnessResultV2 {
+            outcome: AgentHarnessOutcomeV2::Completed,
+            output_ref: Some("artifact-1".to_owned()),
+            steps_used: 2,
+        }
+        .encode_core_bytes()
+        .expect("fixture output should encode");
+        let module_bytes = materialize_agent_harness_fixture(&output);
+        let resolved = ResolvedInstalledSkillModule {
+            skill_id: binding.skill_id.clone(),
+            skill_version: binding.skill_version.clone().expect("fixture version should exist"),
+            capability_grants: capability_grants_from_manifest(&manifest),
+            manifest,
+            selected_tool: None,
+            module_path: "modules/plugin.wasm".to_owned(),
+            module_bytes,
+            entrypoint: "run".to_owned(),
+        };
+        let descriptor =
+            AgentHarnessDescriptor::new("acme.agent_harness", "Agent harness plugin", false);
+        let issued_at_unix_ms = current_unix_ms().expect("test clock should be available");
+        let (adapter, diagnostics) = build_plugin_agent_harness_adapter_from_resolved(
+            &binding,
+            descriptor,
+            &test_wasm_policy(),
+            resolved,
+            issued_at_unix_ms,
+        )
+        .expect("production adapter should bind a real module");
         let auth = json!({});
         let transcript = Vec::new();
         let tools = json!({});
         let policy = json!({});
 
-        let outcome = selected.harness.run_attempt(prepared_attempt(
-            &auth,
-            transcript.as_slice(),
-            &tools,
-            &policy,
-        ));
+        let outcome =
+            adapter.run_attempt(prepared_attempt(&auth, transcript.as_slice(), &tools, &policy));
 
-        assert_eq!(outcome.status, "internal_error");
+        assert_eq!(outcome.status, "completed");
         assert!(outcome.final_message.is_none());
+        let diagnostics = diagnostics.expect("production binding should expose diagnostics");
+        assert_eq!(diagnostics.bindings.len(), 1);
+        let serialized = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
+        assert!(!serialized.contains("artifact-1"));
+        assert!(!serialized.contains("run-1"));
     }
 
     #[test]
@@ -2202,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_plugin_negotiation_accepts_delivery_adapter_channel_capability() {
+    fn typed_plugin_negotiation_rejects_descriptor_only_delivery_adapter() {
         let mut manifest =
             plugin_manifest_with_operator_config(minimal_operator_config_properties());
         manifest.operator.plugin.contracts = vec![TypedPluginContractDeclaration {
@@ -2216,9 +2762,12 @@ mod tests {
                 ..PluginCapabilityProfile::default()
             },
         );
-        assert!(report.ready, "delivery adapter with channels should negotiate: {report:?}");
-        assert_eq!(report.entries[0].status, TypedPluginContractStatus::Accepted);
-        assert_eq!(report.entries[0].adapter.as_deref(), Some("channels.delivery_adapter"));
+        assert!(!report.ready, "descriptor-only contract must remain non-production");
+        assert_eq!(report.entries[0].status, TypedPluginContractStatus::Rejected);
+        assert!(report.entries[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not expose a typed adapter")));
     }
 
     #[test]
@@ -2598,5 +3147,29 @@ title = "API token"
 default = "test-token"
 redacted = true
 "#
+    }
+
+    fn materialize_agent_harness_fixture(output: &[u8]) -> Vec<u8> {
+        let escaped = output.iter().map(|byte| format!("\\{byte:02x}")).collect::<String>();
+        AGENT_HARNESS_V2_TEMPLATE
+            .replace("{{OUTPUT_LEN}}", output.len().to_string().as_str())
+            .replace("{{OUTPUT}}", &escaped)
+            .into_bytes()
+    }
+
+    fn test_wasm_policy() -> WasmPluginRunnerPolicy {
+        WasmPluginRunnerPolicy {
+            enabled: true,
+            allow_inline_modules: false,
+            max_module_size_bytes: 256 * 1024,
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+            allowed_http_hosts: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_storage_prefixes: Vec::new(),
+            allowed_channels: Vec::new(),
+        }
     }
 }

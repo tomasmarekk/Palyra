@@ -23,13 +23,13 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -78,7 +78,12 @@ use palyra_common::{
     },
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
-    runtime_contracts::{ProcessOwnershipKind, ProcessProvenance, ProcessProvenanceDisposition},
+    runtime_contracts::{
+        CleanupOutcome, CleanupReportV1, CleanupStepDisposition, CleanupStepKind,
+        CleanupStepRecord, ProcessLeaseV1, ProcessOwnershipKind, ProcessProvenance,
+        ProcessProvenanceDisposition, RuntimeGeneration, RuntimeInstanceId, RuntimeLeaseId,
+        RUNTIME_HANDLE_SCHEMA_VERSION,
+    },
 };
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
@@ -907,6 +912,275 @@ impl Drop for ManagedChildGuard {
             }
         }
     }
+}
+
+/// Exact launch plan for a long-lived stdio runtime owned by the daemon.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedStdioProcessConfig {
+    pub(crate) executable: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) generation: u64,
+    pub(crate) lease_duration: Duration,
+}
+
+/// Process-backed stdio runtime retaining the platform ownership anchor.
+pub(crate) struct ManagedStdioProcess {
+    child: ManagedChildGuard,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    lease: ProcessLeaseV1,
+}
+
+impl ManagedStdioProcess {
+    /// Returns the exact process lease captured before the runtime is acknowledged.
+    #[must_use]
+    pub(crate) const fn lease(&self) -> &ProcessLeaseV1 {
+        &self.lease
+    }
+
+    /// Transfers the child's stdin to the runtime transport actor.
+    pub(crate) fn take_stdin(&mut self) -> Result<ChildStdin, SandboxProcessRunError> {
+        self.stdin.take().ok_or_else(|| managed_stdio_error("stdin was already transferred"))
+    }
+
+    /// Transfers the child's stdout to the bounded frame reader.
+    pub(crate) fn take_stdout(&mut self) -> Result<ChildStdout, SandboxProcessRunError> {
+        self.stdout.take().ok_or_else(|| managed_stdio_error("stdout was already transferred"))
+    }
+
+    /// Transfers the child's stderr to the bounded diagnostic reader.
+    pub(crate) fn take_stderr(&mut self) -> Result<ChildStderr, SandboxProcessRunError> {
+        self.stderr.take().ok_or_else(|| managed_stdio_error("stderr was already transferred"))
+    }
+
+    /// Returns a terminal status when the direct process has exited.
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Closes I/O, terminates the owned process tree, and returns structured evidence.
+    pub(crate) fn cleanup(mut self, graceful_stop_attempted: bool) -> CleanupReportV1 {
+        let completed_at_unix_ms = unix_time_ms();
+        self.stdin.take();
+        self.stdout.take();
+        self.stderr.take();
+        let already_exited = self.child.try_wait().ok().flatten().is_some();
+        let cleanup_result = if already_exited {
+            Ok(Some(self.child.exit_status.expect("observed exit status must be retained")))
+        } else {
+            self.child.terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS))
+        };
+        #[cfg(windows)]
+        remove_windows_background_job(self.lease.pid);
+        let verified_absent = self.child.try_wait().ok().flatten().is_some()
+            || cleanup_result.as_ref().is_ok_and(Option::is_some);
+        let cleanup_failed = cleanup_result.is_err() || !verified_absent;
+        let mut steps = vec![
+            CleanupStepRecord {
+                ordinal: 0,
+                step: CleanupStepKind::GracefulStop,
+                disposition: if graceful_stop_attempted {
+                    CleanupStepDisposition::Completed
+                } else {
+                    CleanupStepDisposition::SkippedNotRequired
+                },
+                reason_code: if graceful_stop_attempted {
+                    "runtime.cleanup.graceful_stop_requested"
+                } else {
+                    "runtime.cleanup.graceful_stop_not_required"
+                }
+                .to_owned(),
+                evidence_sha256: None,
+                completed_at_unix_ms,
+            },
+            CleanupStepRecord {
+                ordinal: 1,
+                step: CleanupStepKind::CloseIo,
+                disposition: CleanupStepDisposition::Completed,
+                reason_code: "runtime.cleanup.io_closed".to_owned(),
+                evidence_sha256: None,
+                completed_at_unix_ms,
+            },
+            CleanupStepRecord {
+                ordinal: 2,
+                step: CleanupStepKind::KillTree,
+                disposition: if already_exited {
+                    CleanupStepDisposition::SkippedNotRequired
+                } else if cleanup_result.is_ok() {
+                    CleanupStepDisposition::Completed
+                } else {
+                    CleanupStepDisposition::Failed
+                },
+                reason_code: if already_exited {
+                    "runtime.cleanup.process_already_exited"
+                } else if cleanup_result.is_ok() {
+                    "runtime.cleanup.process_tree_terminated"
+                } else {
+                    "runtime.cleanup.process_tree_termination_failed"
+                }
+                .to_owned(),
+                evidence_sha256: None,
+                completed_at_unix_ms,
+            },
+            CleanupStepRecord {
+                ordinal: 3,
+                step: CleanupStepKind::ReleaseLease,
+                disposition: CleanupStepDisposition::Completed,
+                reason_code: "runtime.cleanup.lease_released".to_owned(),
+                evidence_sha256: None,
+                completed_at_unix_ms,
+            },
+            CleanupStepRecord {
+                ordinal: 4,
+                step: CleanupStepKind::VerifyAbsence,
+                disposition: if verified_absent {
+                    CleanupStepDisposition::Completed
+                } else {
+                    CleanupStepDisposition::Failed
+                },
+                reason_code: if verified_absent {
+                    "runtime.cleanup.absence_verified"
+                } else {
+                    "runtime.cleanup.absence_unverified"
+                }
+                .to_owned(),
+                evidence_sha256: None,
+                completed_at_unix_ms,
+            },
+        ];
+        for (ordinal, step) in steps.iter_mut().enumerate() {
+            step.ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
+        }
+        CleanupReportV1 {
+            schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+            report_id: format!("cleanup_{}", ulid::Ulid::new()),
+            instance_id: self.lease.instance_id.clone(),
+            lease_id: Some(self.lease.lease_id.clone()),
+            outcome: if cleanup_failed {
+                CleanupOutcome::Partial
+            } else {
+                CleanupOutcome::Completed
+            },
+            steps,
+            reason_code: if cleanup_failed {
+                "runtime.cleanup.partial"
+            } else {
+                "runtime.cleanup.completed"
+            }
+            .to_owned(),
+            completed_at_unix_ms,
+        }
+    }
+}
+
+/// Spawns a stdio runtime under the same process-tree ownership primitive as sandbox children.
+///
+/// # Errors
+/// Returns [`SandboxProcessRunError`] when the launch plan, process ownership,
+/// provenance capture, or stdio setup cannot be established before acknowledgement.
+pub(crate) fn spawn_managed_stdio_process(
+    config: &ManagedStdioProcessConfig,
+) -> Result<ManagedStdioProcess, SandboxProcessRunError> {
+    if !config.executable.is_absolute()
+        || !config.executable.is_file()
+        || !config.cwd.is_absolute()
+        || !config.cwd.is_dir()
+        || config.args.len() > MAX_ARGS_COUNT
+        || config.args.iter().any(|arg| arg.len() > MAX_ARG_LENGTH)
+        || config.env.len() > MAX_ENV_COUNT
+        || config.generation == 0
+        || config.lease_duration.is_zero()
+    {
+        return Err(managed_stdio_error("launch plan violates bounded process policy"));
+    }
+    let mut command = Command::new(config.executable.as_path());
+    command
+        .args(config.args.iter())
+        .current_dir(config.cwd.as_path())
+        .env_clear()
+        .envs(config.env.iter())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    configure_background_child_suspended(&mut command);
+    let child = command.spawn().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::SpawnFailed,
+        message: format!("managed stdio runtime spawn failed: {error}"),
+    })?;
+    let child = ManagedChildGuard::new(child);
+    #[cfg(windows)]
+    let mut child = prepare_windows_background_child(child)?;
+    #[cfg(not(windows))]
+    let mut child = child;
+    let pid = child.id();
+    let provenance = match capture_background_process_provenance_with_executable_sha256(pid, None) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            let _ = child.terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS));
+            #[cfg(windows)]
+            remove_windows_background_job(pid);
+            return Err(error);
+        }
+    };
+    let stdin = child
+        .child_mut()
+        .stdin
+        .take()
+        .ok_or_else(|| managed_stdio_error("managed stdio runtime stdin is unavailable"))?;
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or_else(|| managed_stdio_error("managed stdio runtime stdout is unavailable"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or_else(|| managed_stdio_error("managed stdio runtime stderr is unavailable"))?;
+    let issued_at_unix_ms = unix_time_ms();
+    let duration_ms = i64::try_from(config.lease_duration.as_millis()).unwrap_or(i64::MAX);
+    let lease = ProcessLeaseV1 {
+        schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
+        lease_id: RuntimeLeaseId::parse(&format!("lease_{}", ulid::Ulid::new()))
+            .map_err(|_| managed_stdio_error("failed to issue process lease identity"))?,
+        instance_id: RuntimeInstanceId::parse(&format!("instance_{}", ulid::Ulid::new()))
+            .map_err(|_| managed_stdio_error("failed to issue runtime instance identity"))?,
+        generation: RuntimeGeneration::new(config.generation)
+            .map_err(|_| managed_stdio_error("failed to issue runtime generation"))?,
+        pid,
+        provenance,
+        issued_at_unix_ms,
+        expires_at_unix_ms: issued_at_unix_ms.saturating_add(duration_ms),
+        verified_at_unix_ms: issued_at_unix_ms,
+    };
+    lease.validate().map_err(|error| {
+        managed_stdio_error(format!("managed stdio runtime lease is invalid: {error}").as_str())
+    })?;
+    Ok(ManagedStdioProcess {
+        child,
+        stdin: Some(stdin),
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+        lease,
+    })
+}
+
+fn managed_stdio_error(message: &str) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: message.to_owned(),
+    }
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 struct ForegroundProcessExecutionRequest<'a> {

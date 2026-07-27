@@ -7,5 +7,6 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     palyra_daemon::dispatch_internal_process_supervisor();
+    palyra_daemon::dispatch_internal_codex_app_server_bridge();
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(palyra_daemon::run())
 }
