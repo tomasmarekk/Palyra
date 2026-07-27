@@ -1110,6 +1110,46 @@ mod tests {
     }
 
     #[test]
+    fn load_hook_bindings_index_pins_deterministic_hook_order() {
+        let tempdir = tempdir().expect("temporary directory should be created");
+        let index_path = hook_bindings_index_path(tempdir.path());
+        fs::write(
+            index_path,
+            serde_json::to_vec(&json!({
+                "schema_version": HOOK_BINDINGS_LAYOUT_VERSION,
+                "updated_at_unix_ms": 1,
+                "entries": [
+                    {
+                        "hook_id": "z-last",
+                        "event": "run.before",
+                        "plugin_id": "plugin-z",
+                        "enabled": true,
+                        "operator": {},
+                        "created_at_unix_ms": 1,
+                        "updated_at_unix_ms": 1
+                    },
+                    {
+                        "hook_id": "a-first",
+                        "event": "run.before",
+                        "plugin_id": "plugin-a",
+                        "enabled": true,
+                        "operator": {},
+                        "created_at_unix_ms": 1,
+                        "updated_at_unix_ms": 1
+                    }
+                ]
+            }))
+            .expect("hook fixture should serialize"),
+        )
+        .expect("hook bindings index should be written");
+
+        let index =
+            load_hook_bindings_index(tempdir.path()).expect("hook bindings index should load");
+        let hook_ids = index.entries.iter().map(|entry| entry.hook_id.as_str()).collect::<Vec<_>>();
+        assert_eq!(hook_ids, vec!["a-first", "z-last"]);
+    }
+
+    #[test]
     fn normalize_hook_event_accepts_run_lifecycle_aliases() {
         assert_eq!(
             normalize_hook_event("before_run").expect("before_run alias should normalize"),

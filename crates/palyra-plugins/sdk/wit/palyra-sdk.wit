@@ -1,5 +1,10 @@
 package palyra:plugins/sdk@0.1.0;
 
+/// DEPRECATED compatibility contract.
+///
+/// New plugins should migrate to `palyra:plugins/sdk@0.2.0` and one of the
+/// capability-specific `*-plugin-v2` worlds in `palyra-sdk-v2.wit`. The host
+/// keeps this world only as an explicit, non-streaming v1 compatibility path.
 /// Host-provided capability handles exposed to sandboxed plugins.
 ///
 /// Plugins must treat returned integers as opaque handles. A value of `-1`

@@ -103,6 +103,12 @@ Invoke-ContractCheck `
     -Label "plugin SDK typed ABI fingerprint" `
     -CargoArgs @("test", "-p", "palyra-plugins-sdk", "typed_contract_abi_fingerprint_matches_golden", "--locked")
 Invoke-ContractCheck `
+    -Label "plugin executable ABI v2 snapshot" `
+    -CargoArgs @("test", "-p", "palyra-plugins-sdk", "executable_abi_v2_snapshot_matches_golden", "--locked")
+Invoke-ContractCheck `
+    -Label "plugin executable ABI v2 conformance" `
+    -CargoArgs @("test", "-p", "palyra-plugins-runtime", "--test", "abi_v2_conformance", "--locked")
+Invoke-ContractCheck `
     -Label "skill manifest public contract snapshot" `
     -CargoArgs @("test", "-p", "palyra-skills", "skill_manifest_contract_snapshot_matches_golden", "--locked")
 Invoke-ContractCheck `

@@ -78,6 +78,12 @@ run_contract_check \
   "plugin SDK typed ABI fingerprint" \
   "$CARGO_BIN" test -p palyra-plugins-sdk typed_contract_abi_fingerprint_matches_golden --locked
 run_contract_check \
+  "plugin executable ABI v2 snapshot" \
+  "$CARGO_BIN" test -p palyra-plugins-sdk executable_abi_v2_snapshot_matches_golden --locked
+run_contract_check \
+  "plugin executable ABI v2 conformance" \
+  "$CARGO_BIN" test -p palyra-plugins-runtime --test abi_v2_conformance --locked
+run_contract_check \
   "skill manifest public contract snapshot" \
   "$CARGO_BIN" test -p palyra-skills skill_manifest_contract_snapshot_matches_golden --locked
 run_contract_check \

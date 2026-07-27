@@ -9,6 +9,8 @@
 //! before any grant reaches the guest. Called from `tool_protocol` via
 //! `spawn_blocking`; execution here is synchronous.
 
+mod executable_v2;
+
 use std::{
     collections::BTreeSet,
     convert::TryFrom,
@@ -24,6 +26,8 @@ use palyra_skills::{
 };
 use serde::Deserialize;
 use serde_json::json;
+
+pub(crate) use executable_v2::{ExecutablePluginHostError, ExecutablePluginRuntimeHost};
 
 /// Runtime policy for the wasm plugin runner: enablement, inline-module
 /// opt-in, resource quotas, and the capability allowlists that bound what any
@@ -146,6 +150,38 @@ pub(crate) struct ResolvedInstalledSkillModule {
     pub(crate) module_path: String,
     pub(crate) module_bytes: Vec<u8>,
     pub(crate) entrypoint: String,
+}
+
+/// Derives executable limits from the strict intersection of daemon policy
+/// and the installed skill manifest.
+///
+/// # Errors
+/// Returns `InvalidInput` when a configured platform-sized limit cannot be
+/// represented on the current target.
+pub(crate) fn installed_skill_runtime_limits(
+    policy: &WasmPluginRunnerPolicy,
+    resolved: &ResolvedInstalledSkillModule,
+) -> Result<RuntimeLimits, WasmPluginRunError> {
+    Ok(RuntimeLimits {
+        fuel_budget: resolved.manifest.capabilities.quotas.fuel_budget.min(policy.fuel_budget),
+        max_memory_bytes: usize::try_from(
+            resolved.manifest.capabilities.quotas.max_memory_bytes.min(policy.max_memory_bytes),
+        )
+        .map_err(|_| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "wasm runtime memory quota exceeds platform usize range".to_owned(),
+        })?,
+        max_table_elements: usize::try_from(policy.max_table_elements).map_err(|_| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: "wasm runtime table quota exceeds platform usize range".to_owned(),
+            }
+        })?,
+        max_instances: usize::try_from(policy.max_instances).map_err(|_| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "wasm runtime instance quota exceeds platform usize range".to_owned(),
+        })?,
+    })
 }
 
 /// Parses, validates, resolves, and executes one `palyra.plugin.run` request.
@@ -590,31 +626,30 @@ fn execute_module(
 
     // Skill manifest quotas are min'ed with policy quotas: a skill cannot
     // request more fuel or memory than the daemon policy allows.
-    let limits = RuntimeLimits {
-        fuel_budget: installed_skill
-            .map(|skill| skill.manifest.capabilities.quotas.fuel_budget.min(policy.fuel_budget))
-            .unwrap_or(policy.fuel_budget),
-        max_memory_bytes: usize::try_from(
-            installed_skill
-                .map(|skill| {
-                    skill.manifest.capabilities.quotas.max_memory_bytes.min(policy.max_memory_bytes)
-                })
-                .unwrap_or(policy.max_memory_bytes),
-        )
-        .map_err(|_| WasmPluginRunError {
-            kind: WasmPluginRunErrorKind::InvalidInput,
-            message: "wasm runtime memory quota exceeds platform usize range".to_owned(),
-        })?,
-        max_table_elements: usize::try_from(policy.max_table_elements).map_err(|_| {
-            WasmPluginRunError {
-                kind: WasmPluginRunErrorKind::InvalidInput,
-                message: "wasm runtime table quota exceeds platform usize range".to_owned(),
-            }
-        })?,
-        max_instances: usize::try_from(policy.max_instances).map_err(|_| WasmPluginRunError {
-            kind: WasmPluginRunErrorKind::InvalidInput,
-            message: "wasm runtime instance quota exceeds platform usize range".to_owned(),
-        })?,
+    let limits = if let Some(skill) = installed_skill {
+        installed_skill_runtime_limits(policy, skill)?
+    } else {
+        RuntimeLimits {
+            fuel_budget: policy.fuel_budget,
+            max_memory_bytes: usize::try_from(policy.max_memory_bytes).map_err(|_| {
+                WasmPluginRunError {
+                    kind: WasmPluginRunErrorKind::InvalidInput,
+                    message: "wasm runtime memory quota exceeds platform usize range".to_owned(),
+                }
+            })?,
+            max_table_elements: usize::try_from(policy.max_table_elements).map_err(|_| {
+                WasmPluginRunError {
+                    kind: WasmPluginRunErrorKind::InvalidInput,
+                    message: "wasm runtime table quota exceeds platform usize range".to_owned(),
+                }
+            })?,
+            max_instances: usize::try_from(policy.max_instances).map_err(|_| {
+                WasmPluginRunError {
+                    kind: WasmPluginRunErrorKind::InvalidInput,
+                    message: "wasm runtime instance quota exceeds platform usize range".to_owned(),
+                }
+            })?,
+        }
     };
     let grants = CapabilityGrantSet {
         http_hosts: requested_http_hosts.clone(),

@@ -1,0 +1,121 @@
+package palyra:plugins/sdk@0.2.0;
+
+/// Shared invocation identities and bounded byte envelopes.
+interface invocation-types-v2 {
+  record schema-hash {
+    sha256: string,
+  }
+
+  record capability-handle {
+    opaque-id: string,
+    scope: string,
+    scope-hash: schema-hash,
+    runtime-generation: u64,
+    expires-at-unix-ms: u64,
+  }
+
+  record invocation-budget {
+    absolute-deadline-unix-ms: u64,
+    max-input-bytes: u32,
+    max-output-bytes: u32,
+    max-event-bytes: u32,
+    max-events: u32,
+  }
+
+  record invocation-request {
+    call-id: string,
+    binding-id: string,
+    runtime-generation: u64,
+    input-schema-hash: schema-hash,
+    output-schema-hash: schema-hash,
+    budget: invocation-budget,
+    input-bytes: list<u8>,
+    granted-capability-handles: list<capability-handle>,
+  }
+
+  record invocation-error {
+    reason-code: string,
+  }
+
+  record invocation-terminal {
+    output-schema-hash: schema-hash,
+    output-bytes: list<u8>,
+  }
+}
+
+/// Host event and cancellation surface shared by all v2 worlds.
+interface invocation-lifecycle-v2 {
+  use invocation-types-v2.{schema-hash};
+
+  accepted: func(call-id: string, binding-id: string, runtime-generation: u64);
+  emit-event: func(call-id: string, sequence: u32, schema: schema-hash, event: list<u8>) -> result<_, string>;
+  is-cancelled: func(call-id: string) -> bool;
+  cancel: func(call-id: string) -> result<_, string>;
+  dispose: func(binding-id: string, runtime-generation: u64) -> result<_, string>;
+}
+
+/// External harness invocation; tool and approval work remains host-mediated.
+interface agent-harness-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  invoke-agent-attempt: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+/// Context planning invocation over host-owned references.
+interface context-engine-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  plan-context: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+/// Tool-result transformation without mutation or approval authority changes.
+interface tool-result-middleware-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  transform-tool-result: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+/// Observer, annotator, filter, approval requester, blocker, or limited transformer hook.
+interface run-lifecycle-hook-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  decide-run-lifecycle: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+/// Candidate-only memory provider; candidates migrate through host policy before any durable write.
+interface memory-provider-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  provide-memory-candidates: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+/// Model authentication provider returning a credential-handle, never raw secret bytes.
+interface model-auth-provider-v2 {
+  use invocation-types-v2.{invocation-error, invocation-request, invocation-terminal};
+  resolve-credential-handle: func(request: invocation-request) -> result<invocation-terminal, invocation-error>;
+}
+
+world agent-harness-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export agent-harness-v2;
+}
+
+world context-engine-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export context-engine-v2;
+}
+
+world tool-result-middleware-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export tool-result-middleware-v2;
+}
+
+world run-lifecycle-hook-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export run-lifecycle-hook-v2;
+}
+
+world memory-provider-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export memory-provider-v2;
+}
+
+world model-auth-provider-plugin-v2 {
+  import invocation-lifecycle-v2;
+  export model-auth-provider-v2;
+}

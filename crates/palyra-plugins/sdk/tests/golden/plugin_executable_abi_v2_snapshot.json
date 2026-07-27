@@ -1,0 +1,69 @@
+{
+  "abi_version": "palyra.plugins.sdk.abi.v2",
+  "core_exports": [
+    "memory",
+    "palyra-abi-v2-alloc",
+    "palyra-abi-v2-invoke",
+    "palyra-abi-v2-dealloc"
+  ],
+  "core_wire_schema_version": 2,
+  "executable_contracts": [
+    {
+      "contract": "agent_harness",
+      "input_schema_hash": "8fa6dc9e8938d94c3562386431c7707348fcd753dfd36bc57040dac1d890ad80",
+      "input_schema_id": "palyra.plugin.agent_harness.invocation.v2",
+      "output_schema_hash": "2847c8e83f4bfe706552886fcac266456a8054884188914d5bf70f5fe1281d33",
+      "output_schema_id": "palyra.plugin.agent_harness.result.v2",
+      "timeout_disposition": "fail_closed"
+    },
+    {
+      "contract": "context_engine",
+      "input_schema_hash": "1db41fe674b882bb4eb0f662fc6b4ee6949f55be17534ae4f88058bb500f6c92",
+      "input_schema_id": "palyra.plugin.context_engine.invocation.v2",
+      "output_schema_hash": "51e0af9cc435f411fb41f89ab32f9f406bc2d05df1404c3c2cb1be40c06714e3",
+      "output_schema_id": "palyra.plugin.context_engine.result.v2",
+      "timeout_disposition": "fail_open"
+    },
+    {
+      "contract": "tool_result_middleware",
+      "input_schema_hash": "f0161348bcad632bd6c38c5920ce115b8f41ca2598b7a06d6917dc973291432f",
+      "input_schema_id": "palyra.plugin.tool_result_middleware.invocation.v2",
+      "output_schema_hash": "b97e31bb6cae139a1bb65b5f98b13121a6fb26a154043cd8b17bd93574412b0e",
+      "output_schema_id": "palyra.plugin.tool_result_middleware.result.v2",
+      "timeout_disposition": "fail_open"
+    },
+    {
+      "contract": "run_lifecycle_hook",
+      "input_schema_hash": "e8baac369785d0c7723245398c00cad3235aee1821063ac903d0b8d4b83481ad",
+      "input_schema_id": "palyra.plugin.run_lifecycle_hook.invocation.v2",
+      "output_schema_hash": "682d457aefda8c8187fd154dcdf1fb2dba0eb90509ac680425efd444b397b601",
+      "output_schema_id": "palyra.plugin.run_lifecycle_hook.result.v2",
+      "timeout_disposition": "fail_closed"
+    },
+    {
+      "contract": "memory_provider",
+      "input_schema_hash": "4eb8a8f667fe817e600c21af1ca04dcbb5f8e0fd92b4bc5b4c230c7cfb768fe8",
+      "input_schema_id": "palyra.plugin.memory_provider.invocation.v2",
+      "output_schema_hash": "1bb897494014e22666449638af8b0444d87d00063e25a72873fdb42d82ce96dd",
+      "output_schema_id": "palyra.plugin.memory_provider.candidates.v2",
+      "timeout_disposition": "fail_open"
+    },
+    {
+      "contract": "model_auth_provider",
+      "input_schema_hash": "3ab1b8db9ef88596a7ec475cbfb5d80e4df3cc2e6c37ebd104720cc1b5c74468",
+      "input_schema_id": "palyra.plugin.model_auth_provider.invocation.v2",
+      "output_schema_hash": "c1e7fe922a9b259419f9d8d9a8fcb7f91ef763f40a30115313005b417b2286c9",
+      "output_schema_id": "palyra.plugin.model_auth_provider.handle.v2",
+      "timeout_disposition": "fail_closed"
+    }
+  ],
+  "host_import_module": "palyra:plugins/abi-v2@2",
+  "migration": {
+    "legacy_abi_version": "palyra.plugins.sdk.abi.v1",
+    "legacy_production_bindings_allowed": false,
+    "legacy_wit_package_id": "palyra:plugins/sdk@0.1.0",
+    "migration_target": "palyra.plugins.sdk.abi.v2"
+  },
+  "schema_version": 2,
+  "wit_package_id": "palyra:plugins/sdk@0.2.0"
+}

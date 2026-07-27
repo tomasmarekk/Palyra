@@ -5,6 +5,10 @@
 //! host-capability imports defined by `palyra-plugins-sdk`. Also hosts the typed
 //! plugin contract negotiation performed against daemon adapters.
 
+mod abi_v2;
+
+pub use abi_v2::{PluginConformanceFixtureV2, PluginCoreWasmCancellationTokenV2, PluginRuntimeV2};
+
 use std::{collections::BTreeSet, sync::mpsc, time::Duration};
 
 use palyra_plugins_sdk::{
@@ -496,7 +500,7 @@ pub struct WasmRuntime {
     limits: RuntimeLimits,
 }
 
-fn build_runtime_engine() -> Result<Engine, RuntimeError> {
+pub(crate) fn build_runtime_engine() -> Result<Engine, RuntimeError> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
@@ -742,7 +746,7 @@ fn resolve_capability_handle(handles: &[i32], index: i32) -> i32 {
 
 // Epoch interruption requires 64-bit atomics; on targets without them the
 // deadline cannot be armed and bounded execution relies on fuel metering alone.
-fn configure_epoch_deadline(store: &mut Store<RuntimeStoreState>, timeout_enabled: bool) {
+pub(crate) fn configure_epoch_deadline<T>(store: &mut Store<T>, timeout_enabled: bool) {
     #[cfg(target_has_atomic = "64")]
     {
         let delta = if timeout_enabled {
@@ -757,7 +761,7 @@ fn configure_epoch_deadline(store: &mut Store<RuntimeStoreState>, timeout_enable
 }
 
 /// Cancels the timeout watchdog when dropped, before it can bump the epoch.
-struct EpochTimeoutGuard {
+pub(crate) struct EpochTimeoutGuard {
     cancel_tx: Option<mpsc::Sender<()>>,
 }
 
@@ -771,7 +775,7 @@ impl Drop for EpochTimeoutGuard {
 
 /// Spawns a watchdog thread that bumps the engine epoch after `timeout`,
 /// interrupting the store that was armed with a one-tick deadline.
-fn arm_epoch_timeout_guard(engine: Engine, timeout: Duration) -> EpochTimeoutGuard {
+pub(crate) fn arm_epoch_timeout_guard(engine: Engine, timeout: Duration) -> EpochTimeoutGuard {
     #[cfg(target_has_atomic = "64")]
     {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
@@ -814,11 +818,11 @@ fn map_execution_error_with_store(
     RuntimeError::Execution(error)
 }
 
-fn is_timeout_error(error: &wasmtime::Error) -> bool {
+pub(crate) fn is_timeout_error(error: &wasmtime::Error) -> bool {
     matches!(error.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt))
 }
 
-fn is_execution_limit_error(error: &wasmtime::Error, store: &Store<RuntimeStoreState>) -> bool {
+pub(crate) fn is_execution_limit_error<T>(error: &wasmtime::Error, store: &Store<T>) -> bool {
     // An exhausted fuel budget counts as a limit violation even when the failure
     // surfaces as a different trap first, and store-limit violations raised during
     // instantiation are only identifiable by their message text.
