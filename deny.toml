@@ -30,6 +30,9 @@ exceptions = [
   { crate = "auto_generate_cdp", allow = ["GPL-3.0-or-later"] },
   # Transitive through auto_generate_cdp -> ureq; scoped to this crate.
   { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+  # notify is the daemon's cross-platform config watcher; keep its permissive
+  # public-domain dedication scoped instead of admitting CC0 workspace-wide.
+  { crate = "notify", allow = ["CC0-1.0"] },
 ]
 
 [bans]
