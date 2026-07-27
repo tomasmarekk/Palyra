@@ -31,6 +31,10 @@ use palyra_daemon::application::{
 };
 use serde_json::{json, Value};
 
+// Startup verifies the large debug bridge binary before the attempt begins, so the
+// process-backed suite needs a budget above the transport's 45-second handshake bound.
+const PROCESS_CONFORMANCE_ATTEMPT_BUDGET_MS: i64 = 90_000;
+
 #[derive(Debug, Clone, Copy)]
 enum ApprovalMode {
     Deny,
@@ -569,7 +573,7 @@ fn request(
         run_id: format!("run-codex-{generation}"),
         session_id: format!("session-codex-{generation}"),
         generation,
-        deadline_unix_ms: now_unix_ms() + 10_000,
+        deadline_unix_ms: now_unix_ms().saturating_add(PROCESS_CONFORMANCE_ATTEMPT_BUDGET_MS),
         provider_id: "codex-fixture".to_owned(),
         model_id: model_id.to_owned(),
         context_token_budget: 16_384,
