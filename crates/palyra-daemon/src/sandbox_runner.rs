@@ -1105,7 +1105,7 @@ pub(crate) fn spawn_managed_stdio_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_child_process_group(&mut command);
+    configure_managed_stdio_process_ownership(&mut command);
     configure_background_child_suspended(&mut command);
     let child = command.spawn().map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::SpawnFailed,
@@ -8386,6 +8386,27 @@ fn configure_child_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_child_process_group(_command: &mut Command) {}
+
+// Managed runtimes retain the direct child as their ownership root. A new session makes both
+// the process-group and session anchors equal that PID, matching provenance verification.
+#[cfg(unix)]
+fn configure_managed_stdio_process_ownership(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: this closure runs after fork and before exec and calls only async-signal-safe
+    // `setsid`; failure aborts the spawn before any unowned runtime code can execute.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_managed_stdio_process_ownership(_command: &mut Command) {}
 
 // Windows has no pre-exec hook that can atomically attach a new process to a job. Starting the
 // initial thread suspended closes that ownership gap: user code cannot create descendants before
@@ -17117,6 +17138,31 @@ mod tests {
             disposition,
             palyra_common::runtime_contracts::ProcessProvenanceDisposition::Unsupported
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stdio_process_establishes_unix_session_anchor() {
+        let process = super::spawn_managed_stdio_process(&super::ManagedStdioProcessConfig {
+            executable: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_owned(), "read _".to_owned()],
+            cwd: PathBuf::from("/"),
+            env: BTreeMap::new(),
+            generation: 1,
+            lease_duration: Duration::from_secs(5),
+        })
+        .expect("managed stdio process should satisfy provenance admission");
+        let pid = process.lease().pid;
+        let unix_pid = super::unix_pid_from_u32(pid).expect("managed pid should fit pid_t");
+
+        // SAFETY: both calls inspect the live positive PID retained by `process`.
+        let process_group_id = unsafe { libc::getpgid(unix_pid) };
+        let session_id = unsafe { libc::getsid(unix_pid) };
+        assert_eq!(process_group_id, unix_pid);
+        assert_eq!(session_id, unix_pid);
+
+        let report = process.cleanup(false);
+        assert_eq!(report.outcome, palyra_common::runtime_contracts::CleanupOutcome::Completed);
     }
 
     #[cfg(unix)]
