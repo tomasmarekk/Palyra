@@ -127,11 +127,12 @@ async fn child_exit_without_terminal_is_observed_and_disposed() {
         exited,
         RuntimeTransportEvent::ChildExited { generation: 12, exit_code: Some(17) }
     ));
+    assert_eq!(transport.health().state, ManagedRuntimeHealthState::Crashed);
+    let report = transport.close().await.expect("close crashed fixture");
+    report.validate().expect("cleanup evidence");
+    assert_eq!(transport.health().state, ManagedRuntimeHealthState::Closed);
     let cleanup = recv_event(&mut events).await;
     assert!(matches!(cleanup, RuntimeTransportEvent::Cleanup { generation: 12, .. }));
-    assert_eq!(transport.health().state, ManagedRuntimeHealthState::Crashed);
-    transport.close().await.expect("close crashed fixture").validate().expect("cleanup evidence");
-    assert_eq!(transport.health().state, ManagedRuntimeHealthState::Closed);
 }
 
 #[tokio::test]

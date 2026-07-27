@@ -289,6 +289,29 @@ impl StdioRuntimeTransport {
             update(&mut health);
         }
     }
+
+    async fn finish_close_after_actor_exit(
+        &self,
+        running: &mut RunningRuntime,
+    ) -> Result<CleanupReportV1, RuntimeTransportError> {
+        if let Some(actor) = running.actor.take() {
+            tokio::task::spawn_blocking(move || actor.join())
+                .await
+                .map_err(|_| RuntimeTransportError::Unavailable)?
+                .map_err(|_| RuntimeTransportError::Unavailable)?;
+        }
+        let report = running
+            .cleanup_report
+            .lock()
+            .map_err(|_| RuntimeTransportError::Unavailable)?
+            .clone()
+            .ok_or(RuntimeTransportError::Unavailable)?;
+        self.update_health(|health| {
+            health.state = ManagedRuntimeHealthState::Closed;
+            health.last_reason_code = "runtime.transport.closed_after_exit".to_owned();
+        });
+        Ok(report)
+    }
 }
 
 #[async_trait]
@@ -488,29 +511,21 @@ impl RuntimeTransport for StdioRuntimeTransport {
                 return Err(RuntimeTransportError::Backpressure);
             }
             Err(TrySendError::Disconnected(_)) => {
-                if let Some(actor) = running.actor.take() {
-                    tokio::task::spawn_blocking(move || actor.join())
-                        .await
-                        .map_err(|_| RuntimeTransportError::Unavailable)?
-                        .map_err(|_| RuntimeTransportError::Unavailable)?;
-                }
-                let report = running
-                    .cleanup_report
-                    .lock()
-                    .map_err(|_| RuntimeTransportError::Unavailable)?
-                    .clone()
-                    .ok_or(RuntimeTransportError::Unavailable)?;
-                self.update_health(|health| {
-                    health.state = ManagedRuntimeHealthState::Closed;
-                    health.last_reason_code = "runtime.transport.closed_after_exit".to_owned();
-                });
-                return Ok(report);
+                return self.finish_close_after_actor_exit(&mut running).await;
             }
         }
-        let report = tokio::time::timeout(self.descriptor.command_timeout, receiver)
-            .await
-            .map_err(|_| RuntimeTransportError::CommandTimedOut)?
-            .map_err(|_| RuntimeTransportError::Unavailable)??;
+        let report = match tokio::time::timeout(self.descriptor.command_timeout, receiver).await {
+            Ok(Ok(result)) => result?,
+            // A spontaneous child exit can persist cleanup evidence before dropping the
+            // queued close acknowledgement, so recover that exact report from the actor.
+            Ok(Err(_)) => return self.finish_close_after_actor_exit(&mut running).await,
+            Err(_) => {
+                // Preserve the owned actor so a later close can still collect its evidence.
+                *self.running.lock().map_err(|_| RuntimeTransportError::Unavailable)? =
+                    Some(running);
+                return Err(RuntimeTransportError::CommandTimedOut);
+            }
+        };
         if let Some(actor) = running.actor.take() {
             tokio::task::spawn_blocking(move || actor.join())
                 .await
