@@ -816,6 +816,7 @@ mod tests {
             daemon: Default::default(),
             gateway: Default::default(),
             feature_rollouts: Default::default(),
+            acp_runtime: Default::default(),
             session_queue_policy: Default::default(),
             pruning_policy_matrix: Default::default(),
             retrieval_dual_path: Default::default(),

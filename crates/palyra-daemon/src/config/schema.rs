@@ -54,6 +54,11 @@ const DEFAULT_RETRIEVAL_PROMPT_BUDGET_TOKENS: u64 = 1_800;
 const DEFAULT_AUXILIARY_EXECUTOR_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
 const DEFAULT_AUXILIARY_MAX_TASKS_PER_SESSION: usize = 4;
 const DEFAULT_AUXILIARY_DEFAULT_BUDGET_TOKENS: u64 = 1_024;
+const DEFAULT_ACP_RUNTIME_MAX_PENDING_COMMANDS: usize = 16;
+const DEFAULT_ACP_RUNTIME_IDLE_TTL_MS: u64 = 5 * 60 * 1_000;
+const DEFAULT_ACP_RUNTIME_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_ACP_RUNTIME_COMMAND_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_ACP_RUNTIME_LEASE_DURATION_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_FLOW_ORCHESTRATION_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
 const DEFAULT_FLOW_CANCELLATION_GATE_ENABLED: bool = true;
 const DEFAULT_FLOW_MAX_RETRY_COUNT: u32 = 1;
@@ -164,6 +169,7 @@ pub struct LoadedConfig {
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
     pub feature_rollouts: FeatureRolloutsConfig,
+    pub acp_runtime: AcpRuntimeConfig,
     pub session_queue_policy: SessionQueuePolicyConfig,
     pub pruning_policy_matrix: PruningPolicyMatrixConfig,
     pub retrieval_dual_path: RetrievalDualPathConfig,
@@ -978,6 +984,63 @@ pub struct AgentHarnessConfig {
     pub id: String,
     pub enabled: bool,
     pub kind: String,
+}
+
+/// Trusted operator-owned ACP process registry.
+///
+/// Session data can select only an enabled `id` from this validated registry;
+/// it never supplies executable paths, arguments, or environment variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpRuntimeConfig {
+    pub max_pending_commands: usize,
+    pub idle_ttl_ms: u64,
+    pub backends: Vec<AcpRuntimeBackendConfig>,
+}
+
+impl Default for AcpRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_commands: DEFAULT_ACP_RUNTIME_MAX_PENDING_COMMANDS,
+            idle_ttl_ms: DEFAULT_ACP_RUNTIME_IDLE_TTL_MS,
+            backends: Vec::new(),
+        }
+    }
+}
+
+/// One validated ACP process descriptor from trusted daemon configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpRuntimeBackendConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub protocol_version: String,
+    pub capability_digest_sha256: String,
+    pub handshake_timeout_ms: u64,
+    pub command_timeout_ms: u64,
+    pub lease_duration_ms: u64,
+    pub fallback_backend_ids: Vec<String>,
+}
+
+impl AcpRuntimeBackendConfig {
+    /// Default startup deadline for a trusted backend declaration.
+    #[must_use]
+    pub const fn default_handshake_timeout_ms() -> u64 {
+        DEFAULT_ACP_RUNTIME_HANDSHAKE_TIMEOUT_MS
+    }
+
+    /// Default per-command deadline for a trusted backend declaration.
+    #[must_use]
+    pub const fn default_command_timeout_ms() -> u64 {
+        DEFAULT_ACP_RUNTIME_COMMAND_TIMEOUT_MS
+    }
+
+    /// Default process lease duration for a trusted backend declaration.
+    #[must_use]
+    pub const fn default_lease_duration_ms() -> u64 {
+        DEFAULT_ACP_RUNTIME_LEASE_DURATION_MS
+    }
 }
 
 /// Doctor check registry preview.

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use palyra_common::runtime_contracts::{
     AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpCommandResultEnvelope,
-    AcpCursor, AcpEventLedgerKind, AcpReplayCap, AcpScope, AcpSessionMode,
+    AcpCursor, AcpEventLedgerKind, AcpReplayCap, AcpScope, AcpSessionBindingRecord, AcpSessionMode,
     ConversationBindingSensitivity, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
     RealtimeCursor, RealtimeHandshakeRequest, RealtimeRole, RealtimeScope, StableErrorEnvelope,
     ACP_DEFAULT_REPLAY_MAX_EVENTS,
@@ -162,7 +162,11 @@ async fn execute_acp_command(
             session_compact_preview(state, request_context, client, &envelope).await
         }
         AcpCommand::SessionCompactApply => {
-            session_compact_apply(state, request_context, client, &envelope).await
+            if let Some(binding) = selected_live_runtime_binding(state, client, &envelope)? {
+                dispatch_live_runtime_command(state, client, binding, &envelope).await
+            } else {
+                session_compact_apply(state, request_context, client, &envelope).await
+            }
         }
         AcpCommand::SessionExplain => {
             session_explain(state, request_context, client, &envelope).await
@@ -170,12 +174,42 @@ async fn execute_acp_command(
         AcpCommand::SessionModeSet | AcpCommand::SessionConfigSet => {
             session_config_set(state, request_context, client, &envelope).await
         }
-        AcpCommand::RunCreate
-        | AcpCommand::RunGet
-        | AcpCommand::RunAbort
-        | AcpCommand::ApprovalList
-        | AcpCommand::ApprovalDecide => {
+        AcpCommand::RunCreate | AcpCommand::RunGet | AcpCommand::RunAbort => {
+            match selected_live_runtime_binding(state, client, &envelope)? {
+                Some(binding) => {
+                    dispatch_live_runtime_command(state, client, binding, &envelope).await
+                }
+                None => dispatch_via_command_router(state, request_context, client, envelope).await,
+            }
+        }
+        AcpCommand::ApprovalList => {
             dispatch_via_command_router(state, request_context, client, envelope).await
+        }
+        AcpCommand::ApprovalDecide => {
+            let live_binding = selected_live_runtime_binding(state, client, &envelope)?;
+            let approval_id = optional_string(&envelope.params, "approval_id");
+            let decision = optional_string(&envelope.params, "decision");
+            let command_id = envelope.request_id.clone();
+            let host_result =
+                dispatch_via_command_router(state, request_context, client, envelope).await?;
+            let Some(binding) = live_binding else {
+                return Ok(host_result);
+            };
+            let runtime_result = state
+                .acp_runtime
+                .live_manager()
+                .execute(
+                    &binding,
+                    command_id.as_str(),
+                    "permission",
+                    json!({
+                        "approval_id": approval_id,
+                        "decision": decision,
+                    }),
+                )
+                .await
+                .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))?;
+            Ok(json!({ "host": host_result, "runtime": runtime_result }))
         }
         AcpCommand::ApprovalRequest => {
             approval_request(state, request_context, client, &envelope).await
@@ -202,7 +236,108 @@ async fn acp_status(
 ) -> Result<Value, AcpDispatchError> {
     ensure_grant(client, AcpScope::SessionsRead, AcpCapability::RuntimeStatus)?;
     status::build_acp_status_payload(state, Some(client.owner_principal.as_str()))
+        .await
         .map_err(AcpDispatchError::Acp)
+}
+
+fn selected_live_runtime_binding(
+    state: &AppState,
+    client: &AcpClientContext,
+    envelope: &AcpCommandEnvelope,
+) -> Result<Option<AcpSessionBindingRecord>, AcpDispatchError> {
+    let binding = if let Some(binding_id) = optional_string(&envelope.params, "binding_id") {
+        Some(state.acp_runtime.get_session_binding(binding_id.as_str())?)
+    } else if let Some(acp_session_id) = optional_string(&envelope.params, "acp_session_id") {
+        Some(
+            state
+                .acp_runtime
+                .session_binding_for_acp(client.client_id.as_str(), acp_session_id.as_str())?,
+        )
+    } else {
+        None
+    };
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    state
+        .acp_runtime
+        .live_manager()
+        .selected_backend(&binding)
+        .map(|selection| selection.map(|_| binding))
+        .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))
+}
+
+async fn dispatch_live_runtime_command(
+    state: &AppState,
+    client: &AcpClientContext,
+    binding: AcpSessionBindingRecord,
+    envelope: &AcpCommandEnvelope,
+) -> Result<Value, AcpDispatchError> {
+    match envelope.command {
+        AcpCommand::RunCreate => {
+            ensure_grant(client, AcpScope::RunsWrite, AcpCapability::RunControl)?;
+            let prompt = required_string(&envelope.params, "prompt")?;
+            let command_id = optional_string(&envelope.params, "run_id")
+                .unwrap_or_else(|| envelope.request_id.clone());
+            let result = state
+                .acp_runtime
+                .live_manager()
+                .execute(
+                    &binding,
+                    command_id.as_str(),
+                    "prompt",
+                    json!({
+                        "prompt": prompt,
+                        "mode": binding.mode.as_str(),
+                    }),
+                )
+                .await
+                .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))?;
+            Ok(json!({
+                "run_id": command_id,
+                "runtime": result,
+            }))
+        }
+        AcpCommand::RunAbort => {
+            ensure_grant(client, AcpScope::RunsWrite, AcpCapability::RunControl)?;
+            let command_id = required_string(&envelope.params, "run_id")?;
+            state
+                .acp_runtime
+                .live_manager()
+                .cancel(&binding, command_id.as_str())
+                .await
+                .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))
+        }
+        AcpCommand::RunGet => {
+            ensure_scope(client, AcpScope::RunsRead)?;
+            let command_id = required_string(&envelope.params, "run_id")?;
+            let lifecycle =
+                state.acp_runtime.live_manager().lifecycle(command_id.as_str()).await.ok_or_else(
+                    || {
+                        AcpDispatchError::Stable(StableErrorEnvelope::new(
+                            "acp/runtime_command_not_found",
+                            format!("ACP runtime command '{command_id}' was not found"),
+                            "Refresh the ACP run state and retry with a current command id.",
+                        ))
+                    },
+                )?;
+            Ok(json!({ "run_id": command_id, "lifecycle": lifecycle }))
+        }
+        AcpCommand::SessionCompactApply => {
+            ensure_grant(client, AcpScope::SessionsWrite, AcpCapability::SessionCompact)?;
+            let command_id = envelope.request_id.clone();
+            let result = state
+                .acp_runtime
+                .live_manager()
+                .execute(&binding, command_id.as_str(), "compact", json!({}))
+                .await
+                .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))?;
+            Ok(json!({ "compaction_id": command_id, "runtime": result }))
+        }
+        _ => Err(AcpDispatchError::Acp(AcpRuntimeError::Compatibility {
+            message: "ACP live runtime command is not supported".to_owned(),
+        })),
+    }
 }
 
 async fn session_list(

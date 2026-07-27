@@ -798,6 +798,7 @@ pub struct RootFileConfig {
     pub gateway: Option<FileGatewayConfig>,
     pub gateway_access: Option<FileGatewayAccessConfig>,
     pub feature_rollouts: Option<FileFeatureRolloutsConfig>,
+    pub acp_runtime: Option<FileAcpRuntimeConfig>,
     pub session_queue_policy: Option<FileSessionQueuePolicyConfig>,
     pub pruning_policy_matrix: Option<FilePruningPolicyMatrixConfig>,
     pub retrieval_dual_path: Option<FileRetrievalDualPathConfig>,
@@ -1186,6 +1187,32 @@ pub struct FileAgentHarnessConfig {
     pub id: Option<String>,
     pub enabled: Option<bool>,
     pub kind: Option<String>,
+}
+
+/// `[acp_runtime]`: trusted operator-owned ACP process registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAcpRuntimeConfig {
+    pub max_pending_commands: Option<usize>,
+    pub idle_ttl_ms: Option<u64>,
+    pub backends: Option<Vec<FileAcpRuntimeBackendConfig>>,
+}
+
+/// One `[[acp_runtime.backends]]` trusted process declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAcpRuntimeBackendConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
+    pub executable: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub protocol_version: Option<String>,
+    pub capability_digest_sha256: Option<String>,
+    pub handshake_timeout_ms: Option<u64>,
+    pub command_timeout_ms: Option<u64>,
+    pub lease_duration_ms: Option<u64>,
+    pub fallback_backend_ids: Option<Vec<String>>,
 }
 
 /// `[doctor_check_registry]`: preview doctor check registry.

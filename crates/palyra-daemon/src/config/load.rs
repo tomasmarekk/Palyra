@@ -29,11 +29,12 @@ use palyra_common::{
         parse_document_with_migration, serialize_document_pretty, ConfigMigrationInfo,
     },
     daemon_config_schema::{
-        FileAgentHarnessConfig, FileContainerEnvBindingConfig, FileContainerExecutionProfileConfig,
-        FileContainerResourceLimitsConfig, FileContainerWorkspaceMountConfig,
-        FileDoctorCheckConfig, FileExecutionBackendProfileConfig, FileMcpCommandValue,
-        FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig,
-        FileMcpServerConfig, FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
+        FileAcpRuntimeBackendConfig, FileAgentHarnessConfig, FileContainerEnvBindingConfig,
+        FileContainerExecutionProfileConfig, FileContainerResourceLimitsConfig,
+        FileContainerWorkspaceMountConfig, FileDoctorCheckConfig,
+        FileExecutionBackendProfileConfig, FileMcpCommandValue, FileMcpEnvVaultRefConfig,
+        FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig, FileMcpServerConfig,
+        FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
         FileRetrievalSourceScoringProfile, FileSshWorkerExecutionProfileConfig, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
@@ -133,6 +134,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
     let mut feature_rollouts = FeatureRolloutsConfig::default();
+    let mut acp_runtime = AcpRuntimeConfig::default();
     let mut session_queue_policy = SessionQueuePolicyConfig::default();
     let mut pruning_policy_matrix = PruningPolicyMatrixConfig::default();
     let mut retrieval_dual_path = RetrievalDualPathConfig::default();
@@ -388,6 +390,27 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             }
             if let Some(enabled) = file_feature_rollouts.attack_surface_audit {
                 feature_rollouts.attack_surface_audit = FeatureRolloutSetting::from_config(enabled);
+            }
+        }
+        if let Some(file_acp_runtime) = parsed.acp_runtime {
+            if let Some(max_pending_commands) = file_acp_runtime.max_pending_commands {
+                acp_runtime.max_pending_commands = parse_bounded_usize(
+                    max_pending_commands,
+                    1,
+                    256,
+                    "acp_runtime.max_pending_commands",
+                )?;
+            }
+            if let Some(idle_ttl_ms) = file_acp_runtime.idle_ttl_ms {
+                acp_runtime.idle_ttl_ms =
+                    parse_bounded_u64(idle_ttl_ms, 1_000, 86_400_000, "acp_runtime.idle_ttl_ms")?;
+            }
+            if let Some(backends) = file_acp_runtime.backends {
+                acp_runtime.backends = backends
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_acp_runtime_backend(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
             }
         }
         if let Some(file_session_queue_policy) = parsed.session_queue_policy {
@@ -1526,6 +1549,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         source.push_str(" +env(PALYRA_DAEMON_PORT)");
     }
     super::runtime_kernel::apply_env(&mut daemon.runtime_kernel, &mut source)?;
+    apply_acp_runtime_env(&mut acp_runtime, &mut source)?;
 
     if let Ok(mode) = env::var("PALYRA_DEPLOYMENT_MODE") {
         deployment.mode = DeploymentMode::parse(mode.as_str(), "PALYRA_DEPLOYMENT_MODE")?;
@@ -2653,6 +2677,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             Some(resolve_state_relative_path(runtime_state_root.as_path(), state_dir));
     }
     validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
+    validate_acp_runtime_registry(&acp_runtime)?;
     // Without an explicit profile (file or env), derive it from the final
     // deployment mode and whether networked workers are in play.
     if !deployment_profile_explicit {
@@ -2673,6 +2698,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         daemon,
         gateway,
         feature_rollouts,
+        acp_runtime,
         session_queue_policy,
         pruning_policy_matrix,
         retrieval_dual_path,
@@ -2717,6 +2743,178 @@ fn parse_root_file_config(content: &str) -> Result<(RootFileConfig, ConfigMigrat
     let parsed: RootFileConfig =
         toml::from_str(&normalized).context("invalid daemon config schema")?;
     Ok((parsed, migration))
+}
+
+fn apply_acp_runtime_env(config: &mut AcpRuntimeConfig, source: &mut String) -> Result<()> {
+    const REQUIRED: &[&str] = &[
+        "PALYRA_ACP_RUNTIME_BACKEND_ID",
+        "PALYRA_ACP_RUNTIME_EXECUTABLE",
+        "PALYRA_ACP_RUNTIME_CWD",
+        "PALYRA_ACP_RUNTIME_PROTOCOL_VERSION",
+        "PALYRA_ACP_RUNTIME_CAPABILITY_SHA256",
+    ];
+    const OPTIONAL: &[&str] = &[
+        "PALYRA_ACP_RUNTIME_ARGS_JSON",
+        "PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON",
+        "PALYRA_ACP_RUNTIME_HANDSHAKE_TIMEOUT_MS",
+        "PALYRA_ACP_RUNTIME_COMMAND_TIMEOUT_MS",
+        "PALYRA_ACP_RUNTIME_LEASE_DURATION_MS",
+    ];
+    let any_present = REQUIRED.iter().chain(OPTIONAL).any(|name| env::var_os(name).is_some());
+    if !any_present {
+        return Ok(());
+    }
+    let required = |name: &str| {
+        env::var(name).with_context(|| {
+            format!("{name} is required when any PALYRA_ACP_RUNTIME_BACKEND_* override is set")
+        })
+    };
+    let parse_env_u64 = |name: &str, default: u64, minimum: u64, maximum: u64| {
+        let value = match env::var(name) {
+            Ok(raw) => raw.parse::<u64>().with_context(|| format!("{name} must be an integer"))?,
+            Err(env::VarError::NotPresent) => default,
+            Err(error) => return Err(anyhow::anyhow!("{name} is invalid: {error}")),
+        };
+        parse_bounded_u64(value, minimum, maximum, name)
+    };
+    let args = match env::var("PALYRA_ACP_RUNTIME_ARGS_JSON") {
+        Ok(raw) => parse_acp_runtime_args(
+            serde_json::from_str::<Vec<String>>(raw.as_str())
+                .context("PALYRA_ACP_RUNTIME_ARGS_JSON must be a JSON string array")?,
+            "PALYRA_ACP_RUNTIME_ARGS_JSON",
+        )?,
+        Err(env::VarError::NotPresent) => Vec::new(),
+        Err(error) => {
+            return Err(anyhow::anyhow!("PALYRA_ACP_RUNTIME_ARGS_JSON is invalid: {error}"))
+        }
+    };
+    let fallback_backend_ids = match env::var("PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON") {
+        Ok(raw) => serde_json::from_str::<Vec<String>>(raw.as_str())
+            .context("PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON must be a JSON string array")?
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                parse_registry_identifier(
+                    candidate.as_str(),
+                    format!("PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON[{index}]").as_str(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Err(env::VarError::NotPresent) => Vec::new(),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON is invalid: {error}"
+            ));
+        }
+    };
+    let backend = AcpRuntimeBackendConfig {
+        id: parse_registry_identifier(
+            required("PALYRA_ACP_RUNTIME_BACKEND_ID")?.as_str(),
+            "PALYRA_ACP_RUNTIME_BACKEND_ID",
+        )?,
+        enabled: true,
+        executable: parse_existing_absolute_path(
+            Some(required("PALYRA_ACP_RUNTIME_EXECUTABLE")?),
+            "PALYRA_ACP_RUNTIME_EXECUTABLE",
+            true,
+        )?,
+        args,
+        cwd: parse_existing_absolute_path(
+            Some(required("PALYRA_ACP_RUNTIME_CWD")?),
+            "PALYRA_ACP_RUNTIME_CWD",
+            false,
+        )?,
+        protocol_version: parse_required_bounded_text(
+            Some(required("PALYRA_ACP_RUNTIME_PROTOCOL_VERSION")?),
+            "PALYRA_ACP_RUNTIME_PROTOCOL_VERSION",
+            128,
+        )?,
+        capability_digest_sha256: parse_sha256_digest(
+            Some(required("PALYRA_ACP_RUNTIME_CAPABILITY_SHA256")?),
+            "PALYRA_ACP_RUNTIME_CAPABILITY_SHA256",
+        )?,
+        handshake_timeout_ms: parse_env_u64(
+            "PALYRA_ACP_RUNTIME_HANDSHAKE_TIMEOUT_MS",
+            AcpRuntimeBackendConfig::default_handshake_timeout_ms(),
+            100,
+            60_000,
+        )?,
+        command_timeout_ms: parse_env_u64(
+            "PALYRA_ACP_RUNTIME_COMMAND_TIMEOUT_MS",
+            AcpRuntimeBackendConfig::default_command_timeout_ms(),
+            100,
+            3_600_000,
+        )?,
+        lease_duration_ms: parse_env_u64(
+            "PALYRA_ACP_RUNTIME_LEASE_DURATION_MS",
+            AcpRuntimeBackendConfig::default_lease_duration_ms(),
+            1_000,
+            86_400_000,
+        )?,
+        fallback_backend_ids,
+    };
+    config.backends.retain(|candidate| candidate.id != backend.id);
+    config.backends.push(backend);
+    for name in REQUIRED.iter().chain(OPTIONAL).filter(|name| env::var_os(name).is_some()) {
+        source.push_str(format!(" +env({name})").as_str());
+    }
+    Ok(())
+}
+
+fn validate_acp_runtime_registry(config: &AcpRuntimeConfig) -> Result<()> {
+    if config.backends.len() > 32 {
+        anyhow::bail!(
+            "acp_runtime.backends exceeds maximum entries ({} > 32)",
+            config.backends.len()
+        );
+    }
+    let mut ids = HashSet::new();
+    for backend in &config.backends {
+        if !ids.insert(backend.id.as_str()) {
+            anyhow::bail!("acp_runtime.backends contains duplicate id '{}'", backend.id);
+        }
+    }
+    for backend in &config.backends {
+        let mut fallbacks = HashSet::new();
+        for candidate in &backend.fallback_backend_ids {
+            if candidate == &backend.id {
+                anyhow::bail!("acp_runtime backend '{}' cannot fall back to itself", backend.id);
+            }
+            if !ids.contains(candidate.as_str()) {
+                anyhow::bail!(
+                    "acp_runtime backend '{}' names unknown fallback '{}'",
+                    backend.id,
+                    candidate
+                );
+            }
+            if !fallbacks.insert(candidate.as_str()) {
+                anyhow::bail!(
+                    "acp_runtime backend '{}' repeats fallback '{}'",
+                    backend.id,
+                    candidate
+                );
+            }
+        }
+    }
+    for backend in &config.backends {
+        let mut visited = HashSet::new();
+        let mut pending =
+            backend.fallback_backend_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        while let Some(candidate_id) = pending.pop() {
+            if candidate_id == backend.id {
+                anyhow::bail!("acp_runtime fallback chain contains a cycle at '{}'", backend.id);
+            }
+            if !visited.insert(candidate_id) {
+                continue;
+            }
+            let candidate =
+                config.backends.iter().find(|entry| entry.id == candidate_id).ok_or_else(|| {
+                    anyhow::anyhow!("acp_runtime fallback registry changed during validation")
+                })?;
+            pending.extend(candidate.fallback_backend_ids.iter().map(String::as_str));
+        }
+    }
+    Ok(())
 }
 
 /// Applies a feature-rollout env override on top of `current`. The env value
@@ -3087,6 +3285,134 @@ fn parse_agent_harness_config(
         enabled: entry.enabled.unwrap_or(false),
         kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
     })
+}
+
+fn parse_acp_runtime_backend(
+    entry: FileAcpRuntimeBackendConfig,
+    index: usize,
+) -> Result<AcpRuntimeBackendConfig> {
+    let source_name = format!("acp_runtime.backends[{index}]");
+    let id = parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?;
+    let executable = parse_existing_absolute_path(
+        entry.executable,
+        format!("{source_name}.executable").as_str(),
+        true,
+    )?;
+    let cwd =
+        parse_existing_absolute_path(entry.cwd, format!("{source_name}.cwd").as_str(), false)?;
+    let protocol_version = parse_required_bounded_text(
+        entry.protocol_version,
+        format!("{source_name}.protocol_version").as_str(),
+        128,
+    )?;
+    let capability_digest_sha256 = parse_sha256_digest(
+        entry.capability_digest_sha256,
+        format!("{source_name}.capability_digest_sha256").as_str(),
+    )?;
+    let args = parse_acp_runtime_args(
+        entry.args.unwrap_or_default(),
+        format!("{source_name}.args").as_str(),
+    )?;
+    let fallback_backend_ids = entry
+        .fallback_backend_ids
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(fallback_index, candidate)| {
+            parse_registry_identifier(
+                candidate.as_str(),
+                format!("{source_name}.fallback_backend_ids[{fallback_index}]").as_str(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AcpRuntimeBackendConfig {
+        id,
+        enabled: entry.enabled.unwrap_or(false),
+        executable,
+        args,
+        cwd,
+        protocol_version,
+        capability_digest_sha256,
+        handshake_timeout_ms: parse_bounded_u64(
+            entry
+                .handshake_timeout_ms
+                .unwrap_or_else(AcpRuntimeBackendConfig::default_handshake_timeout_ms),
+            100,
+            60_000,
+            format!("{source_name}.handshake_timeout_ms").as_str(),
+        )?,
+        command_timeout_ms: parse_bounded_u64(
+            entry
+                .command_timeout_ms
+                .unwrap_or_else(AcpRuntimeBackendConfig::default_command_timeout_ms),
+            100,
+            3_600_000,
+            format!("{source_name}.command_timeout_ms").as_str(),
+        )?,
+        lease_duration_ms: parse_bounded_u64(
+            entry
+                .lease_duration_ms
+                .unwrap_or_else(AcpRuntimeBackendConfig::default_lease_duration_ms),
+            1_000,
+            86_400_000,
+            format!("{source_name}.lease_duration_ms").as_str(),
+        )?,
+        fallback_backend_ids,
+    })
+}
+
+fn parse_existing_absolute_path(
+    raw: Option<String>,
+    source_name: &str,
+    require_file: bool,
+) -> Result<PathBuf> {
+    let raw = raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required"))?;
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        anyhow::bail!("{source_name} must be an absolute path");
+    }
+    let canonical = fs::canonicalize(path.as_path())
+        .with_context(|| format!("{source_name} must identify an existing path"))?;
+    if (require_file && !canonical.is_file()) || (!require_file && !canonical.is_dir()) {
+        anyhow::bail!(
+            "{source_name} must identify an existing {}",
+            if require_file { "file" } else { "directory" }
+        );
+    }
+    Ok(canonical)
+}
+
+fn parse_required_bounded_text(
+    raw: Option<String>,
+    source_name: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let value = raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required"))?;
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
+        anyhow::bail!("{source_name} must contain 1..={max_bytes} safe text bytes");
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_sha256_digest(raw: Option<String>, source_name: &str) -> Result<String> {
+    let value = parse_required_bounded_text(raw, source_name, 64)?.to_ascii_lowercase();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{source_name} must be exactly 64 hexadecimal characters");
+    }
+    Ok(value)
+}
+
+fn parse_acp_runtime_args(args: Vec<String>, source_name: &str) -> Result<Vec<String>> {
+    if args.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 128)", args.len());
+    }
+    for (index, arg) in args.iter().enumerate() {
+        if arg.len() > 4_096 || arg.contains('\0') {
+            anyhow::bail!("{source_name}[{index}] exceeds the safe argument contract");
+        }
+    }
+    Ok(args)
 }
 
 fn parse_doctor_check_config(
@@ -5322,6 +5648,20 @@ fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).with_context(|| format!("{name} exceeds platform usize range"))
 }
 
+fn parse_bounded_u64(value: u64, minimum: u64, maximum: u64, name: &str) -> Result<u64> {
+    if !(minimum..=maximum).contains(&value) {
+        anyhow::bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(value)
+}
+
+fn parse_bounded_usize(value: usize, minimum: usize, maximum: usize, name: &str) -> Result<usize> {
+    if !(minimum..=maximum).contains(&value) {
+        anyhow::bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(value)
+}
+
 /// Parses the default memory TTL: negative values are rejected and `0` is
 /// the documented "no default expiry" sentinel, mapped to `None`.
 fn parse_default_memory_ttl_ms(value: i64, name: &str) -> Result<Option<i64>> {
@@ -5490,12 +5830,13 @@ mod tests {
 
     use super::{
         apply_feature_rollout_env_override, legacy_process_runner_path_access_mode, load_config,
-        parse_anthropic_base_url, parse_anthropic_model, parse_broadcast_strategy,
-        parse_browser_service_endpoint, parse_canvas_host_public_base_url,
-        parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
-        parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
-        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
-        parse_journal_db_path, parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
+        parse_acp_runtime_backend, parse_anthropic_base_url, parse_anthropic_model,
+        parse_broadcast_strategy, parse_browser_service_endpoint,
+        parse_canvas_host_public_base_url, parse_channel_routing_rule,
+        parse_content_type_allowlist, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
+        parse_direct_message_policy, parse_dns_suffix_allowlist, parse_exact_vault_ref_allowlist,
+        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
+        parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
         parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
         parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
         parse_optional_auth_profile_id, parse_optional_browser_state_dir,
@@ -5506,9 +5847,10 @@ mod tests {
         parse_provider_reasoning_effort, parse_provider_service_tier, parse_roadmap_preview_mode,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_structured_secret_ref_field,
         parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
-        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
-        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
-        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
+        validate_acp_runtime_registry, validate_runtime_preview_config, AcpRuntimeBackendConfig,
+        AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig, BrowserServiceConfig,
+        CanvasHostConfig, ChannelRouterConfig, CronConfig, DeliveryArbitrationConfig,
+        DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig, FlowOrchestrationConfig,
         GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
         MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
         ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
@@ -8622,5 +8964,82 @@ state_dir = "browserd-state"
             error.to_string().contains("5 or 6 fields"),
             "error should explain expected cron field count: {error}"
         );
+    }
+
+    #[test]
+    fn acp_runtime_backend_keeps_argv_structured_and_validates_digest() {
+        let executable = std::env::current_exe().expect("test executable");
+        let cwd = executable.parent().expect("test executable parent");
+        let parsed = parse_acp_runtime_backend(
+            FileAcpRuntimeBackendConfig {
+                id: Some("native-acp".to_owned()),
+                enabled: Some(true),
+                executable: Some(executable.display().to_string()),
+                args: Some(vec!["--profile".to_owned(), "one value".to_owned()]),
+                cwd: Some(cwd.display().to_string()),
+                protocol_version: Some("acp.v1".to_owned()),
+                capability_digest_sha256: Some("a".repeat(64)),
+                handshake_timeout_ms: None,
+                command_timeout_ms: None,
+                lease_duration_ms: None,
+                fallback_backend_ids: Some(Vec::new()),
+            },
+            0,
+        )
+        .expect("trusted backend should parse");
+
+        assert_eq!(parsed.args, ["--profile", "one value"]);
+        assert_eq!(parsed.capability_digest_sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn acp_runtime_backend_rejects_relative_executable() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let error = parse_acp_runtime_backend(
+            FileAcpRuntimeBackendConfig {
+                id: Some("native-acp".to_owned()),
+                enabled: Some(true),
+                executable: Some("client-owned.exe".to_owned()),
+                args: None,
+                cwd: Some(cwd.display().to_string()),
+                protocol_version: Some("acp.v1".to_owned()),
+                capability_digest_sha256: Some("a".repeat(64)),
+                handshake_timeout_ms: None,
+                command_timeout_ms: None,
+                lease_duration_ms: None,
+                fallback_backend_ids: None,
+            },
+            0,
+        )
+        .expect_err("relative executable must fail closed");
+
+        assert!(error.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn acp_runtime_registry_rejects_unknown_fallback() {
+        let executable = std::env::current_exe().expect("test executable");
+        let cwd = executable.parent().expect("test executable parent").to_path_buf();
+        let config = AcpRuntimeConfig {
+            max_pending_commands: 4,
+            idle_ttl_ms: 60_000,
+            backends: vec![AcpRuntimeBackendConfig {
+                id: "primary".to_owned(),
+                enabled: true,
+                executable,
+                args: Vec::new(),
+                cwd,
+                protocol_version: "acp.v1".to_owned(),
+                capability_digest_sha256: "a".repeat(64),
+                handshake_timeout_ms: 1_000,
+                command_timeout_ms: 5_000,
+                lease_duration_ms: 60_000,
+                fallback_backend_ids: vec!["missing".to_owned()],
+            }],
+        };
+
+        let error =
+            validate_acp_runtime_registry(&config).expect_err("unknown fallback must fail closed");
+        assert!(error.to_string().contains("unknown fallback"));
     }
 }

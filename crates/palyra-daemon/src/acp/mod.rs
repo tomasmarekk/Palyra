@@ -39,6 +39,7 @@ use thiserror::Error;
 use ulid::Ulid;
 use validation::{normalize_scope_strings, normalize_state_root};
 
+use crate::config::AcpRuntimeConfig;
 use crate::{sha256_hex, unix_ms_now};
 
 const ACP_BINDINGS_LAYOUT_VERSION: u32 = 1;
@@ -396,6 +397,7 @@ pub(crate) struct AcpRuntime {
     index_path: PathBuf,
     index: Mutex<AcpBindingsIndex>,
     rate_limits: Mutex<BTreeMap<String, RateLimitBucket>>,
+    live_manager: live_runtime_manager::AcpLiveRuntimeManager,
 }
 
 // Fixed-window counter; coarse but sufficient for a local console surface.
@@ -416,7 +418,21 @@ impl AcpRuntime {
     /// Fails on an invalid root path (empty or traversal components), on
     /// directory/permission hardening failures, or when an existing index
     /// cannot be read, parsed, or validated.
+    #[cfg(test)]
     pub(crate) fn open(root: PathBuf) -> AcpRuntimeResult<Self> {
+        Self::open_with_live_runtime(root, false, AcpRuntimeConfig::default())
+    }
+
+    /// Opens ACP state with the trusted live-runtime registry.
+    ///
+    /// # Errors
+    /// Returns the same storage errors as [`Self::open`] and rejects invalid
+    /// persisted live-runtime binding metadata.
+    pub(crate) fn open_with_live_runtime(
+        root: PathBuf,
+        rollout_enabled: bool,
+        live_config: AcpRuntimeConfig,
+    ) -> AcpRuntimeResult<Self> {
         let root = normalize_state_root(root.as_path())?;
         create_state_dir(root.as_path())?;
         let root = fs::canonicalize(root.as_path()).map_err(|source| AcpRuntimeError::Io {
@@ -434,17 +450,28 @@ impl AcpRuntime {
         if changed {
             save_index(root.as_path(), &index)?;
         }
+        let live_manager = live_runtime_manager::AcpLiveRuntimeManager::open(
+            root.as_path(),
+            rollout_enabled,
+            live_config,
+        )?;
         Ok(Self {
             root,
             index_path,
             index: Mutex::new(index),
             rate_limits: Mutex::new(BTreeMap::new()),
+            live_manager,
         })
     }
 
     /// Canonicalized ACP state root directory.
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    /// Live ACP runtime manager backed only by trusted daemon configuration.
+    pub(crate) fn live_manager(&self) -> &live_runtime_manager::AcpLiveRuntimeManager {
+        &self.live_manager
     }
 
     /// ACP protocol versions this daemon accepts.
@@ -1707,6 +1734,16 @@ fn reject_sensitive_config(config: &Value) -> AcpRuntimeResult<()> {
             ),
         });
     }
+    path.clear();
+    if value_contains_untrusted_launch_key(config, &mut path) {
+        return Err(AcpRuntimeError::InvalidField {
+            field: "config",
+            message: format!(
+                "config cannot supply ACP process launch authority ({})",
+                path.into_iter().collect::<Vec<_>>().join(".")
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -1734,6 +1771,47 @@ fn value_contains_sensitive_key(value: &Value, path: &mut VecDeque<String>) -> b
         }
         _ => false,
     }
+}
+
+fn value_contains_untrusted_launch_key(value: &Value, path: &mut VecDeque<String>) -> bool {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                path.push_back(key.clone());
+                if is_untrusted_launch_key(key) || value_contains_untrusted_launch_key(child, path)
+                {
+                    return true;
+                }
+                path.pop_back();
+            }
+            false
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push_back(index.to_string());
+                if value_contains_untrusted_launch_key(child, path) {
+                    return true;
+                }
+                path.pop_back();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn is_untrusted_launch_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "executable"
+            | "runtime_executable"
+            | "runtime_args"
+            | "runtime_cwd"
+            | "runtime_env"
+            | "runtime_capability_digest"
+            | "runtime_protocol_version"
+            | "runtime_backend_candidates"
+    )
 }
 
 // Substring matching is intentionally aggressive: a false positive only makes
@@ -2148,6 +2226,7 @@ fn conflict_kinds_for_conversation(
     kinds.into_iter().collect()
 }
 
+pub(crate) mod live_runtime_manager;
 mod permission_relay;
 mod replay_translator;
 mod runtime_registry;

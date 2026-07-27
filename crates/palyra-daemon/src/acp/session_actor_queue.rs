@@ -161,6 +161,35 @@ impl AcpSessionActorQueue {
         )
     }
 
+    pub(crate) fn cancel_and_promote(
+        &mut self,
+        turn_id: &str,
+        policy: AcpSessionActorQueuePolicy,
+    ) -> AcpTurnQueueDecision {
+        self.active.remove(turn_id);
+        self.pending.retain(|turn| turn.turn_id != turn_id);
+        self.promote_pending(policy);
+        self.decision(
+            AcpTurnQueueDecisionKind::Cancelled,
+            vec![
+                AcpTurnQueueReasonCode::CancellationClosedStream,
+                AcpTurnQueueReasonCode::HandleReleased,
+            ],
+            true,
+            true,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn is_active(&self, turn_id: &str) -> bool {
+        self.active.contains_key(turn_id)
+    }
+
+    #[must_use]
+    pub(crate) fn contains(&self, turn_id: &str) -> bool {
+        self.active.contains_key(turn_id) || self.pending.iter().any(|turn| turn.turn_id == turn_id)
+    }
+
     #[must_use]
     pub(crate) fn active_turn_count(&self) -> usize {
         self.active.len()

@@ -18,11 +18,12 @@ pub(crate) async fn console_acp_status_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     build_acp_status_payload(&state, Some(session.context.principal.as_str()))
+        .await
         .map(Json)
         .map_err(acp_runtime_response)
 }
 
-pub(super) fn build_acp_status_payload(
+pub(super) async fn build_acp_status_payload(
     state: &AppState,
     owner_principal: Option<&str>,
 ) -> Result<Value, crate::acp::AcpRuntimeError> {
@@ -75,6 +76,7 @@ pub(super) fn build_acp_status_payload(
         .collect::<Vec<_>>();
     let oldest_sequence = visible_ledger_events.iter().map(|entry| entry.sequence).min();
     let newest_sequence = visible_ledger_events.iter().map(|entry| entry.sequence).max();
+    let live_runtime_health = state.acp_runtime.live_manager().health().await;
     Ok(json!({
         "protocol": state.acp_runtime.protocol_range(),
         "root": state.acp_runtime.root().display().to_string(),
@@ -91,6 +93,9 @@ pub(super) fn build_acp_status_payload(
             "oldest_sequence": oldest_sequence,
             "newest_sequence": newest_sequence,
             "sessions_with_events": visible_session_keys.len(),
+        },
+        "live_runtime": {
+            "handles": live_runtime_health,
         },
         "methods": acp_method_descriptors(),
     }))

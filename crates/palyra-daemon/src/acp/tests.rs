@@ -309,6 +309,31 @@ fn config_rejects_secret_bearing_keys() {
 }
 
 #[test]
+fn config_rejects_client_owned_runtime_launch_metadata() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let runtime = AcpRuntime::open(tempdir.path().join("acp")).expect("runtime should open");
+
+    let error = runtime
+        .upsert_session_binding(AcpSessionBindingUpsert {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_key: "repo:C:/work/palyra".to_owned(),
+            session_label: None,
+            mode: AcpSessionMode::Normal,
+            config: json!({
+                "runtime_backend": "trusted-id",
+                "runtime_executable": "C:/client/owned.exe",
+            }),
+            cursor: AcpCursor::default(),
+        })
+        .expect_err("client-owned process launch metadata should be rejected");
+
+    assert_eq!(error.stable_code(), "acp/invalid_field");
+    assert!(error.to_string().contains("process launch authority"));
+}
+
+#[test]
 fn conversation_binding_rejects_excessive_scope_count() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let runtime = AcpRuntime::open(tempdir.path().join("acp")).expect("runtime should open");
@@ -425,6 +450,12 @@ fn conversation_binding_repair_apply_skips_principal_mismatch_manual_actions() {
             event_ledger: Vec::new(),
         }),
         rate_limits: Mutex::new(BTreeMap::new()),
+        live_manager: live_runtime_manager::AcpLiveRuntimeManager::open(
+            root.as_path(),
+            false,
+            AcpRuntimeConfig::default(),
+        )
+        .expect("live manager should initialize"),
     };
 
     let applied = runtime.apply_conversation_binding_repair().expect("repair should apply");
