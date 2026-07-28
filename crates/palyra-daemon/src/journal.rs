@@ -79,6 +79,7 @@ use crate::{
     retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
 };
 
+pub(crate) mod autonomous_wakes;
 pub(crate) mod autonomy;
 pub mod child_completion;
 pub(crate) mod commitment_candidates;
@@ -98,6 +99,10 @@ pub(crate) mod state_health;
 pub(crate) mod stuck_run_remediation;
 pub(crate) mod wait_coordinator;
 
+pub(crate) use autonomous_wakes::{
+    AutonomousWakeAdmissionRecord, AutonomousWakeAdmissionRequest, AutonomousWakeDecision,
+    AutonomousWakeDiagnostics, AUTONOMOUS_WAKE_SCHEMA_VERSION,
+};
 pub use autonomy::{
     ChildWakeSubscriptionCreateRequest, ParentSuspensionCreateRequest,
     ParentSuspensionReconcileReport, ParentSuspensionRecord, ParentSuspensionWakeOutcome,
@@ -7528,6 +7533,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 90,
         name: "commitment_candidates_v2",
         sql: commitment_candidates::MIGRATION_90_SQL,
+    },
+    Migration {
+        version: 91,
+        name: "autonomous_wake_governance",
+        sql: autonomous_wakes::MIGRATION_91_SQL,
     },
 ];
 

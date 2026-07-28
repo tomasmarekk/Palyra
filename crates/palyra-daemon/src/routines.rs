@@ -32,9 +32,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod execution_governance;
 pub(crate) mod operations;
 mod suggestion_guard;
 
+use execution_governance::normalize_execution;
+pub use execution_governance::{
+    apply_routine_execution_governance, evaluate_routine_wake_predicate,
+    preserve_routine_execution_governance, routine_active_hours_contains,
+    routine_execution_governance_projection, RoutineExecutionConfig,
+    RoutineExecutionGovernanceOverrides, RoutineExecutionMode, RoutinePreflightProbe,
+    RoutineProbeKind, RoutineProbeObservation, WakePredicateDecision, WakePredicateOutcome,
+};
 use operations::{
     routine_lease_ledger_entry, RoutineLeasePolicy, DEFAULT_ROUTINE_CATCH_UP_STAGGER_MS,
     DEFAULT_ROUTINE_MAX_MISSED_JOBS_PER_RESTART, DEFAULT_ROUTINE_MAX_RUN_DURATION_MS,
@@ -763,35 +772,6 @@ impl RoutineDispatchMode {
             Self::Normal => "normal",
             Self::TestRun => "test_run",
             Self::Replay => "replay",
-        }
-    }
-}
-
-/// Execution settings of a routine: session reuse, optional pinned procedure/skill/provider
-/// profiles, and the tool-access posture.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RoutineExecutionConfig {
-    #[serde(default)]
-    pub run_mode: RoutineRunMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub procedure_profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_profile_id: Option<String>,
-    #[serde(default)]
-    pub execution_posture: RoutineExecutionPosture,
-}
-
-impl Default for RoutineExecutionConfig {
-    fn default() -> Self {
-        Self {
-            run_mode: RoutineRunMode::SameSession,
-            procedure_profile_id: None,
-            skill_profile_id: None,
-            provider_profile_id: None,
-            execution_posture: RoutineExecutionPosture::Standard,
         }
     }
 }
@@ -2941,27 +2921,6 @@ fn normalize_routine_run_metadata_upsert(
         safety_note: request.safety_note.and_then(trim_to_option),
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
-    })
-}
-
-fn normalize_execution(
-    execution: RoutineExecutionConfig,
-) -> Result<RoutineExecutionConfig, RoutineRegistryError> {
-    Ok(RoutineExecutionConfig {
-        run_mode: execution.run_mode,
-        procedure_profile_id: execution
-            .procedure_profile_id
-            .map(|value| normalize_identifier(value.as_str(), "execution.procedure_profile_id"))
-            .transpose()?,
-        skill_profile_id: execution
-            .skill_profile_id
-            .map(|value| normalize_identifier(value.as_str(), "execution.skill_profile_id"))
-            .transpose()?,
-        provider_profile_id: execution
-            .provider_profile_id
-            .map(|value| normalize_identifier(value.as_str(), "execution.provider_profile_id"))
-            .transpose()?,
-        execution_posture: execution.execution_posture,
     })
 }
 

@@ -13,7 +13,7 @@
 //! the run terminates with a `needs_continuation` summary that points back at
 //! the run tape.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 
 use palyra_common::{
     metadata_trace::{metadata_trace_id_sha256, MetadataTraceIdDomainV1},
@@ -106,7 +106,8 @@ use crate::{
     application::tool_registry::{
         build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
         snapshot_to_provider_request_value, tool_catalog_tape_payload,
-        ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolExposureSurface,
+        ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolCatalogPolicySnapshot,
+        ToolExposureSurface,
     },
     commitments::{
         build_commitment_create_plan, select_post_turn_commitment_extraction,
@@ -1880,9 +1881,18 @@ async fn build_run_stream_tool_catalog_snapshot(
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     maybe_delay_run_stream_phase_for_tests(RunLoopPhase::ToolCatalogSnapshot, allow_test_delay)
         .await;
+    let routine_allowlist = routine_tool_allowlist(runtime_state, run_id).await?;
+    let narrowed_policy = routine_allowlist
+        .as_ref()
+        .map(|allowed| {
+            narrow_routine_tool_catalog_policy(&runtime_state.config.tool_catalog_policy, allowed)
+        })
+        .transpose()?;
+    let catalog_policy =
+        narrowed_policy.as_ref().unwrap_or(&runtime_state.config.tool_catalog_policy);
     Ok(build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
-        catalog_policy: &runtime_state.config.tool_catalog_policy,
+        catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
         browser_service_configured: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {
@@ -1899,6 +1909,60 @@ async fn build_run_stream_tool_catalog_snapshot(
         remaining_tool_budget: None,
         created_at_unix_ms,
     }))
+}
+
+async fn routine_tool_allowlist(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Result<Option<Vec<String>>, Status> {
+    let parameter_delta = match runtime_state.cached_run_parameter_delta_json(run_id) {
+        Some(value) => Some(value),
+        None => runtime_state
+            .orchestrator_run_status_snapshot(run_id.to_owned())
+            .await?
+            .and_then(|run| run.parameter_delta_json),
+    };
+    let Some(raw) = parameter_delta else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<Value>(raw.as_str()).map_err(|error| {
+        Status::invalid_argument(format!("routine parameter delta is invalid JSON: {error}"))
+    })?;
+    let Some(allowed) = parsed.pointer("/routine/tool_profile/allowed_tools") else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Vec<String>>(allowed.clone()).map(Some).map_err(|error| {
+        Status::invalid_argument(format!("routine tool profile is invalid: {error}"))
+    })
+}
+
+fn narrow_routine_tool_catalog_policy(
+    base: &ToolCatalogPolicySnapshot,
+    requested_tools: &[String],
+) -> Result<ToolCatalogPolicySnapshot, Status> {
+    let global = base
+        .profile_expansion
+        .effective_allowed_tools
+        .iter()
+        .map(|tool| tool.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let requested = requested_tools
+        .iter()
+        .map(|tool| tool.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if let Some(tool) = requested.iter().find(|tool| !global.contains(*tool)) {
+        return Err(Status::permission_denied(format!(
+            "routine tool profile cannot widen the global catalog with {tool}"
+        )));
+    }
+    let mut narrowed = base.clone();
+    narrowed.profile_expansion.profiles.clear();
+    narrowed.profile_expansion.profile_expansions.clear();
+    narrowed.profile_expansion.extra_tools.clear();
+    narrowed.profile_expansion.disabled_tools.clear();
+    narrowed.profile_expansion.explicit_allowed_tools = requested.iter().cloned().collect();
+    narrowed.profile_expansion.effective_allowed_tools = requested.into_iter().collect();
+    Ok(narrowed)
 }
 
 async fn record_run_stream_tool_catalog_snapshot(
@@ -3510,6 +3574,54 @@ async fn send_deferred_final_reply_tokens(
     Ok(())
 }
 
+async fn append_routine_autonomous_wake_provenance(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    parameter_delta_json: Option<&str>,
+) -> Result<(), Status> {
+    let Some(raw) = parameter_delta_json else {
+        return Ok(());
+    };
+    let parsed = serde_json::from_str::<Value>(raw).map_err(|error| {
+        Status::invalid_argument(format!("invalid routine provenance: {error}"))
+    })?;
+    let Some(routine) = parsed.pointer("/routine") else {
+        return Ok(());
+    };
+    let Some(autonomous_wake) = routine.pointer("/autonomous_wake") else {
+        return Ok(());
+    };
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        "autonomous_wake.provenance",
+        json!({
+            "schema_version": 1,
+            "routine_id": routine.pointer("/routine_id"),
+            "job_id": routine.pointer("/job_id"),
+            "execution_mode": routine.pointer("/execution_mode"),
+            "wake_governance_authoritative": routine
+                .pointer("/wake_governance_authoritative"),
+            "preflight": routine.pointer("/preflight"),
+            "autonomous_wake": autonomous_wake,
+            "tool_profile_id": routine.pointer("/tool_profile/profile_id"),
+            "context_source_count": routine
+                .pointer("/context_sources")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            "reason_code": routine
+                .pointer("/autonomous_wake/reason_code")
+                .and_then(Value::as_str)
+                .unwrap_or("wake.schedule_due"),
+            "redaction_level": "metadata_only",
+        })
+        .to_string(),
+    )
+    .await
+}
+
 #[allow(clippy::result_large_err)]
 async fn persist_accepted_final_reply(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -4483,6 +4595,13 @@ async fn process_run_stream_message_inner(
             ));
         }
     };
+    append_routine_autonomous_wake_provenance(
+        runtime_state,
+        run_id.as_str(),
+        tape_seq,
+        parameter_delta_json.as_deref(),
+    )
+    .await?;
     if let Some(admission) = v2_admission {
         let tool_catalog = first_turn_tool_catalog_snapshot.take().ok_or_else(|| {
             Status::internal("V2 runtime requires the admitted tool-catalog snapshot")
@@ -8235,33 +8354,34 @@ mod tests {
         incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
         incomplete_terminal_outcome_message, is_browser_tool_name,
         is_run_stream_response_channel_closed, length_recovery_prompt,
-        normalized_provider_stream_from_output_v2, phase_heartbeat_interval,
-        provider_error_partial_summary, provider_model_override_for_routing,
-        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
-        provider_request_timeout_message, provider_request_timeout_status,
-        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
-        provider_turn_anomaly_from_response_failure, provider_turn_anomaly_from_status,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
-        run_stream_agent_harness_selection_mode, run_stream_harness_cancelled_tape_events,
-        run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
-        run_stream_harness_started_payload, run_stream_harness_terminal_event,
-        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
-        run_stream_harness_terminal_payload, selected_v2_shadow_route_semantics,
-        shadow_catalog_matches_selected_v2_route, should_emit_budget_exhausted_partial_summary,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome,
-        RunStreamProviderRequestExecution, RunStreamProviderRequestOutcome,
-        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
-        CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT, MAX_LENGTH_RECOVERY_ATTEMPTS,
-        RUNTIME_SELECTED_METADATA_EVENT, RUN_STREAM_HARNESS_RUNTIME_POLICY,
-        TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS, TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        narrow_routine_tool_catalog_policy, normalized_provider_stream_from_output_v2,
+        phase_heartbeat_interval, provider_error_partial_summary,
+        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
+        provider_request_deadline_timeout, provider_request_timeout_message,
+        provider_request_timeout_status, provider_status_recovery_decision_payload,
+        provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
+        provider_turn_anomaly_from_status, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+        run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
+        run_stream_harness_cancelled_tape_events, run_stream_harness_cleanup_payload,
+        run_stream_harness_selection_payload, run_stream_harness_started_payload,
+        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
+        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+        selected_v2_shadow_route_semantics, shadow_catalog_matches_selected_v2_route,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+        RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+        RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
+        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT,
+        MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
+        RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
+        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::agent_harness::{
@@ -8316,6 +8436,47 @@ mod tests {
         started: mpsc::Sender<()>,
         release: Arc<Notify>,
         status: ProviderStatusSnapshot,
+    }
+
+    #[test]
+    fn routine_tool_profile_only_narrows_the_global_catalog() {
+        let base = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&[
+            "palyra.fs.read_file".to_owned(),
+            "palyra.fs.list_dir".to_owned(),
+        ]);
+
+        let narrowed =
+            narrow_routine_tool_catalog_policy(&base, &["PALYRA.FS.READ_FILE".to_owned()])
+                .expect("global allowlisted tool should be accepted");
+
+        assert_eq!(
+            narrowed.profile_expansion.effective_allowed_tools,
+            vec!["palyra.fs.read_file".to_owned()]
+        );
+        assert_eq!(
+            narrowed.profile_expansion.explicit_allowed_tools,
+            vec!["palyra.fs.read_file".to_owned()]
+        );
+        assert!(narrowed.profile_expansion.profiles.is_empty());
+
+        let widened =
+            narrow_routine_tool_catalog_policy(&base, &["palyra.fs.apply_patch".to_owned()])
+                .expect_err("routine profile must not widen the global catalog");
+        assert_eq!(widened.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn empty_global_tool_catalog_stays_deny_all_for_routines() {
+        let base = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&[]);
+
+        let empty = narrow_routine_tool_catalog_policy(&base, &[])
+            .expect("an empty routine profile may preserve deny-all");
+        assert!(empty.profile_expansion.effective_allowed_tools.is_empty());
+
+        let widened =
+            narrow_routine_tool_catalog_policy(&base, &["palyra.fs.read_file".to_owned()])
+                .expect_err("deny-all global policy must remain authoritative");
+        assert_eq!(widened.code(), Code::PermissionDenied);
     }
 
     impl ModelProvider for BlockingProvider {

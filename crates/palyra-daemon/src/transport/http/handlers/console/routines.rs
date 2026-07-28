@@ -37,18 +37,19 @@ use crate::{
         CronRunStatus, CronScheduleType,
     },
     routines::{
-        build_routine_export_bundle, cron_routine_preview_audit_projection,
-        default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
-        normalize_file_watch_trigger_payload, routine_allows_sensitive_tools,
+        apply_routine_execution_governance, build_routine_export_bundle,
+        cron_routine_preview_audit_projection, default_outcome_from_cron_status, join_run_metadata,
+        natural_language_schedule_preview, normalize_file_watch_trigger_payload,
+        preserve_routine_execution_governance, routine_allows_sensitive_tools,
         routine_approval_policy_with_auto_enable_guard, routine_capability_profile_projection,
-        routine_delivery_preview, routine_templates, shadow_manual_schedule_payload_json,
-        validate_routine_export_bundle, validate_routine_prompt_self_contained,
-        CronRoutinePreviewAuditInput, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineDispatchMode, RoutineExecutionConfig,
-        RoutineExecutionPosture, RoutineExportBundle, RoutineMetadataRecord, RoutineMetadataUpsert,
-        RoutineQuietHours, RoutineRegistryError, RoutineRunMetadataUpsert, RoutineRunMode,
-        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
-        ROUTINE_TEMPLATE_PACK_VERSION,
+        routine_delivery_preview, routine_execution_governance_projection, routine_templates,
+        shadow_manual_schedule_payload_json, validate_routine_export_bundle,
+        validate_routine_prompt_self_contained, CronRoutinePreviewAuditInput, RoutineApprovalMode,
+        RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode, RoutineDispatchMode,
+        RoutineExecutionConfig, RoutineExecutionGovernanceOverrides, RoutineExecutionPosture,
+        RoutineExportBundle, RoutineMetadataRecord, RoutineMetadataUpsert, RoutineQuietHours,
+        RoutineRegistryError, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
+        RoutineSilentPolicy, RoutineTriggerKind, ROUTINE_TEMPLATE_PACK_VERSION,
     },
     *,
 };
@@ -150,6 +151,8 @@ pub(crate) struct ConsoleRoutineUpsertRequest {
     provider_profile_id: Option<String>,
     #[serde(default)]
     execution_posture: Option<String>,
+    #[serde(default)]
+    execution_governance: Option<RoutineExecutionGovernanceOverrides>,
     #[serde(default)]
     quiet_hours_start: Option<String>,
     #[serde(default)]
@@ -528,6 +531,8 @@ pub(crate) async fn console_routine_upsert_handler(
     if let Some(job) = existing_job.as_ref() {
         ensure_job_owner(job, session.context.principal.as_str())?;
     }
+    let existing_metadata =
+        state.routines.get_routine(routine_id.as_str()).map_err(routine_registry_error_response)?;
 
     let schedule = resolve_routine_schedule(
         &payload,
@@ -551,6 +556,14 @@ pub(crate) async fn console_routine_upsert_handler(
         payload.provider_profile_id.clone(),
         payload.execution_posture.as_deref(),
     )?;
+    let execution = if let Some(governance) = payload.execution_governance {
+        apply_routine_execution_governance(execution, governance)
+            .map_err(routine_registry_error_response)?
+    } else if let Some(metadata) = existing_metadata.as_ref() {
+        preserve_routine_execution_governance(execution, &metadata.execution)
+    } else {
+        execution
+    };
     validate_routine_prompt_self_contained(payload.prompt.as_str(), &execution)
         .map_err(routine_registry_error_response)?;
     let delivery = parse_delivery(
@@ -2511,6 +2524,7 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
         "trigger_payload": serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str()).unwrap_or_else(|_| json!({ "raw": metadata.trigger_payload_json })),
         "run_mode": metadata.execution.run_mode.as_str(),
         "execution_posture": metadata.execution.execution_posture.as_str(),
+        "execution_governance": routine_execution_governance_projection(&metadata.execution),
         "procedure_profile_id": metadata.execution.procedure_profile_id,
         "skill_profile_id": metadata.execution.skill_profile_id,
         "provider_profile_id": metadata.execution.provider_profile_id,
@@ -2969,6 +2983,7 @@ fn parse_execution_config(
         skill_profile_id: normalize_optional_text(skill_profile_id.as_deref()),
         provider_profile_id: normalize_optional_text(provider_profile_id.as_deref()),
         execution_posture,
+        ..RoutineExecutionConfig::default()
     })
 }
 
@@ -3655,6 +3670,7 @@ mod tests {
             skill_profile_id: None,
             provider_profile_id: None,
             execution_posture: None,
+            execution_governance: None,
             quiet_hours_start: None,
             quiet_hours_end: None,
             quiet_hours_timezone: None,

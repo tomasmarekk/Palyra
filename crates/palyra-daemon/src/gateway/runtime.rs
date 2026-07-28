@@ -15791,6 +15791,46 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("cron read worker panicked"))?
     }
 
+    /// Atomically admits or rejects one scheduler-owned autonomous wake.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn admit_autonomous_wake(
+        self: &Arc<Self>,
+        request: AutonomousWakeAdmissionRequest,
+    ) -> Result<AutonomousWakeAdmissionRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .admit_autonomous_wake(&request)
+                .map_err(|error| map_cron_store_error("admit autonomous wake", error))
+        })
+        .await
+        .map_err(|_| Status::internal("autonomous wake admission worker panicked"))?
+    }
+
+    /// Returns owner-scoped autonomous wake admission counts and last reason.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn autonomous_wake_diagnostics(
+        self: &Arc<Self>,
+        owner_principal: String,
+    ) -> Result<crate::journal::AutonomousWakeDiagnostics, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .autonomous_wake_diagnostics(owner_principal.as_str())
+                .map_err(|error| map_cron_store_error("read autonomous wake diagnostics", error))
+        })
+        .await
+        .map_err(|_| Status::internal("autonomous wake diagnostics worker panicked"))?
+    }
+
     /// Lists cron jobs with cursor pagination and optional enabled/owner/channel filters.
     ///
     /// # Errors

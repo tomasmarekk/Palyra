@@ -42,15 +42,17 @@ use crate::{
         routine_lease_policy_from_job, routine_startup_catch_up_plan,
     },
     routines::{
-        default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
-        normalize_file_watch_trigger_payload, routine_allows_sensitive_tools,
+        apply_routine_execution_governance, default_outcome_from_cron_status, join_run_metadata,
+        natural_language_schedule_preview, normalize_file_watch_trigger_payload,
+        preserve_routine_execution_governance, routine_allows_sensitive_tools,
         routine_approval_policy_with_auto_enable_guard, routine_delivery_preview,
-        shadow_manual_schedule_payload_json, validate_routine_prompt_self_contained,
-        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
-        RoutineDispatchMode, RoutineExecutionConfig, RoutineExecutionPosture,
-        RoutineMetadataRecord, RoutineMetadataUpsert, RoutineQuietHours, RoutineRegistry,
-        RoutineRegistryError, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind,
+        routine_execution_governance_projection, shadow_manual_schedule_payload_json,
+        validate_routine_prompt_self_contained, RoutineApprovalMode, RoutineApprovalPolicy,
+        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineDispatchMode, RoutineExecutionConfig,
+        RoutineExecutionGovernanceOverrides, RoutineExecutionPosture, RoutineMetadataRecord,
+        RoutineMetadataUpsert, RoutineQuietHours, RoutineRegistry, RoutineRegistryError,
+        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineSilentPolicy,
+        RoutineTriggerKind,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::proto::palyra::cron::v1 as cron_v1,
@@ -955,6 +957,15 @@ async fn upsert_routine(
             optional_string_field(payload, "provider_profile_id"),
             requested_execution_posture.as_deref(),
         )?,
+    };
+    let execution = if let Some(governance) = payload.get("execution_governance").cloned() {
+        let governance = serde_json::from_value::<RoutineExecutionGovernanceOverrides>(governance)
+            .map_err(|error| format!("execution_governance is invalid: {error}"))?;
+        apply_routine_execution_governance(execution, governance).map_err(map_registry_error)?
+    } else if let Some(metadata) = existing_metadata.as_ref() {
+        preserve_routine_execution_governance(execution, &metadata.execution)
+    } else {
+        execution
     };
     validate_routine_prompt_self_contained(prompt.as_str(), &execution)
         .map_err(map_registry_error)?;
@@ -2112,6 +2123,7 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
         "trigger_payload": serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str()).unwrap_or_else(|_| json!({ "raw": metadata.trigger_payload_json })),
         "run_mode": metadata.execution.run_mode.as_str(),
         "execution_posture": metadata.execution.execution_posture.as_str(),
+        "execution_governance": routine_execution_governance_projection(&metadata.execution),
         "procedure_profile_id": metadata.execution.procedure_profile_id,
         "skill_profile_id": metadata.execution.skill_profile_id,
         "provider_profile_id": metadata.execution.provider_profile_id,
@@ -2884,6 +2896,7 @@ fn parse_execution_config(
         skill_profile_id,
         provider_profile_id,
         execution_posture,
+        ..RoutineExecutionConfig::default()
     })
 }
 

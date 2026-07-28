@@ -661,6 +661,84 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({"type":"string","enum":["standard","sensitive_tools"],"description":"Use sensitive_tools only when a routine needs audited sensitive tools during scheduled or manual runs; this posture requires before_enable or before_first_run approval."}),
                     ),
                     (
+                        "execution_governance",
+                        json!({
+                            "type":"object",
+                            "description":"Optional governed autonomous execution contract. Providing this object explicitly activates authoritative wake gates for the routine; legacy records remain shadow-only. no_agent and probe_then_agent require a closed daemon_health probe and a schema-valid predicate; no arbitrary command or shell probe is accepted.",
+                            "additionalProperties":false,
+                            "properties":{
+                                "authoritative":{"type":"boolean","description":"Defaults to true when this object is supplied. Set false with execution_mode=agent to roll back to shadow-only wake decisions without deleting durable evidence."},
+                                "execution_mode":{"type":"string","enum":["agent","no_agent","probe_then_agent"]},
+                                "preflight_probe":{
+                                    "type":"object",
+                                    "additionalProperties":false,
+                                    "required":["kind","timeout_ms","output_max_bytes"],
+                                    "properties":{
+                                        "kind":{"type":"string","enum":["daemon_health"]},
+                                        "timeout_ms":{"type":"integer","minimum":1,"maximum":30000},
+                                        "output_max_bytes":{"type":"integer","minimum":1,"maximum":16384}
+                                    }
+                                },
+                                "wake_predicate":{
+                                    "oneOf":[
+                                        {
+                                            "type":"object",
+                                            "additionalProperties":false,
+                                            "required":["operator"],
+                                            "properties":{"operator":{"const":"probe_healthy"}}
+                                        },
+                                        {
+                                            "type":"object",
+                                            "additionalProperties":false,
+                                            "required":["operator","pointer","expected"],
+                                            "properties":{
+                                                "operator":{"const":"json_pointer_equals"},
+                                                "pointer":{"type":"string","maxLength":256},
+                                                "expected":{}
+                                            }
+                                        }
+                                    ]
+                                },
+                                "context_sources":{
+                                    "type":"array",
+                                    "maxItems":16,
+                                    "items":{
+                                        "type":"object",
+                                        "additionalProperties":false,
+                                        "required":["artifact_id","sha256","sensitivity","max_bytes"],
+                                        "properties":{
+                                            "artifact_id":{"type":"string"},
+                                            "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                                            "sensitivity":{"type":"string","enum":["public","personal","sensitive"]},
+                                            "max_bytes":{"type":"integer","minimum":1,"maximum":262144}
+                                        }
+                                    }
+                                },
+                                "tool_profile":{
+                                    "type":"object",
+                                    "additionalProperties":false,
+                                    "required":["profile_id","allowed_tools"],
+                                    "properties":{
+                                        "profile_id":{"type":"string"},
+                                        "allowed_tools":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":256}}
+                                    }
+                                },
+                                "active_hours":{
+                                    "type":"object",
+                                    "additionalProperties":false,
+                                    "required":["start_minute_of_day","end_minute_of_day","timezone"],
+                                    "properties":{
+                                        "start_minute_of_day":{"type":"integer","minimum":0,"maximum":1439},
+                                        "end_minute_of_day":{"type":"integer","minimum":0,"maximum":1439},
+                                        "timezone":{"type":"string","description":"utc or an IANA timezone such as Europe/Prague"}
+                                    }
+                                },
+                                "flood_window_ms":{"type":"integer","minimum":60000,"maximum":86400000},
+                                "flood_max_wakes":{"type":"integer","minimum":1,"maximum":100}
+                            }
+                        }),
+                    ),
+                    (
                         "approval_mode",
                         json!({"type":"string","enum":["none","before_enable","before_first_run"],"description":"Approval gate for routine activation. Use before_enable or before_first_run with execution_posture=sensitive_tools; none is only for standard routines."}),
                     ),
@@ -2676,6 +2754,28 @@ mod tests {
             .pointer("/properties/max_runs")
             .expect("max_runs should be visible to models");
         assert_eq!(max_runs.pointer("/minimum").and_then(serde_json::Value::as_i64), Some(1));
+        let execution_modes = entry
+            .input_schema
+            .pointer("/properties/execution_governance/properties/execution_mode/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("governed execution modes should be visible to models");
+        assert_eq!(
+            execution_modes,
+            &vec![
+                serde_json::json!("agent"),
+                serde_json::json!("no_agent"),
+                serde_json::json!("probe_then_agent"),
+            ]
+        );
+        assert_eq!(
+            entry
+                .input_schema
+                .pointer(
+                    "/properties/execution_governance/properties/preflight_probe/properties/kind/enum/0"
+                )
+                .and_then(serde_json::Value::as_str),
+            Some("daemon_health")
+        );
     }
 
     #[test]

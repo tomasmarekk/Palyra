@@ -132,6 +132,9 @@ pub(crate) async fn console_diagnostics_handler(
     )
     .await?;
     let heartbeat_delivery_payload = collect_console_heartbeat_delivery_diagnostics();
+    let autonomous_wake_payload =
+        collect_console_autonomous_wake_diagnostics(&state, session.context.principal.as_str())
+            .await?;
     let routine_capability_profile_payload =
         collect_console_routine_capability_profile_diagnostics();
     let cron_routine_preview_audit_payload =
@@ -386,6 +389,7 @@ pub(crate) async fn console_diagnostics_handler(
         "replay_continuity": replay_continuity_payload,
         "commitment_inference": commitment_inference_payload,
         "heartbeat_delivery": heartbeat_delivery_payload,
+        "autonomous_wake_governance": autonomous_wake_payload,
         "routine_capability_profile": routine_capability_profile_payload,
         "cron_routine_preview_audit": cron_routine_preview_audit_payload,
         "turn_control": turn_control_payload,
@@ -1926,6 +1930,36 @@ async fn collect_console_commitment_inference_diagnostics(
             "candidate_only": true,
         },
         "owner_scoped_counts": candidate_counts,
+    }))
+}
+
+/// Summarizes owner-scoped scheduler wake governance without prompt content.
+async fn collect_console_autonomous_wake_diagnostics(
+    state: &AppState,
+    owner_principal: &str,
+) -> Result<Value, Response> {
+    let counts = state
+        .runtime
+        .autonomous_wake_diagnostics(owner_principal.to_owned())
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(json!({
+        "schema_version": crate::journal::AUTONOMOUS_WAKE_SCHEMA_VERSION,
+        "scheduler": "cron",
+        "audit_ledger": "autonomous_wake_admissions_v1",
+        "coalescing_fence": "autonomous_wake_claims_v1",
+        "default_rollout": "shadow",
+        "authoritative_activation": "explicit_execution_governance",
+        "gates": [
+            "active_hours",
+            "user_priority",
+            "coalescing",
+            "cooldown",
+            "flood_budget",
+        ],
+        "reason_provenance_event": "autonomous_wake.provenance",
+        "redaction_level": "metadata_only",
+        "owner_scoped_counts": counts,
     }))
 }
 

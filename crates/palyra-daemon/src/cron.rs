@@ -29,6 +29,7 @@ use chrono_tz::Tz;
 use futures::FutureExt;
 use palyra_common::{
     default_identity_store_root, default_state_root,
+    redaction::redact_diagnostic_text,
     versioned_json::{
         migrate_updated_at_metadata_v0_to_v1, parse_versioned_json, VersionedJsonFormat,
     },
@@ -62,7 +63,8 @@ use crate::{
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalRiskLevel,
-        ApprovalSubjectType, CronConcurrencyPolicy, CronJobRecord, CronJobUpdatePatch,
+        ApprovalSubjectType, AutonomousWakeAdmissionRecord, AutonomousWakeAdmissionRequest,
+        AutonomousWakeDecision, CronConcurrencyPolicy, CronJobRecord, CronJobUpdatePatch,
         CronMisfirePolicy, CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest,
         CronRunStatus, CronScheduleType, MemoryRetentionPolicy, OrchestratorCancelRequest,
         OrchestratorRunStatusSnapshot, OrchestratorSessionQuickControlsUpdateRequest,
@@ -70,9 +72,12 @@ use crate::{
     },
     objectives::{ObjectiveLifecycleRecord, ObjectiveRecord, ObjectiveState, ObjectiveUpsert},
     routines::{
-        evaluate_file_watch_change, parse_file_watch_config, routine_allows_sensitive_tools,
-        RoutineApprovalMode, RoutineDispatchMode, RoutineMetadataRecord, RoutineMetadataUpsert,
-        RoutineRunMetadataUpsert, RoutineRunMode, RoutineTriggerKind,
+        evaluate_file_watch_change, evaluate_routine_wake_predicate, parse_file_watch_config,
+        routine_active_hours_contains, routine_allows_sensitive_tools, RoutineApprovalMode,
+        RoutineDispatchMode, RoutineExecutionConfig, RoutineExecutionMode, RoutineMetadataRecord,
+        RoutineMetadataUpsert, RoutinePreflightProbe, RoutineProbeKind, RoutineProbeObservation,
+        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineTriggerKind,
+        WakePredicateDecision, WakePredicateOutcome,
     },
 };
 
@@ -2821,6 +2826,154 @@ async fn persist_file_watch_observation(
     Ok(())
 }
 
+fn autonomous_wake_coalescing_key(job: &CronJobRecord, options: &TriggerJobOptions) -> String {
+    options.routine_trigger_dedupe_key.clone().unwrap_or_else(|| {
+        if job.queued_run {
+            format!("queue:{}:{}", job.job_id, job.updated_at_unix_ms)
+        } else {
+            format!(
+                "schedule:{}:{}",
+                job.job_id,
+                job.next_run_at_unix_ms.unwrap_or(job.updated_at_unix_ms)
+            )
+        }
+    })
+}
+
+fn autonomous_wake_block_message(decision: AutonomousWakeDecision) -> &'static str {
+    match decision {
+        AutonomousWakeDecision::Admitted => "autonomous wake admitted",
+        AutonomousWakeDecision::Coalesced => {
+            "autonomous wake coalesced with an existing schedule claim"
+        }
+        AutonomousWakeDecision::Cooldown => "autonomous wake skipped during routine cooldown",
+        AutonomousWakeDecision::FloodGuard => {
+            "autonomous wake skipped because the owner flood budget is exhausted"
+        }
+        AutonomousWakeDecision::OutsideActiveHours => {
+            "autonomous wake skipped outside configured active hours"
+        }
+        AutonomousWakeDecision::UserPreempted => {
+            "autonomous wake skipped because queued user input has priority"
+        }
+    }
+}
+
+const fn autonomous_wake_blocks_dispatch(
+    authoritative: bool,
+    decision: AutonomousWakeDecision,
+) -> bool {
+    authoritative && !decision.admitted()
+}
+
+fn merge_autonomous_wake_parameter_delta(
+    existing: Option<&str>,
+    admission: &AutonomousWakeAdmissionRecord,
+) -> Result<String, Status> {
+    let overlay = json!({
+        "routine": {
+            "autonomous_wake": {
+                "schema_version": admission.schema_version,
+                "admission_id": admission.admission_id,
+                "authoritative": admission.authoritative,
+                "decision": admission.decision,
+                "reason_code": admission.reason_code,
+                "related_admission_id": admission.related_admission_id,
+                "coalescing_key": admission.coalescing_key,
+                "occurred_at_unix_ms": admission.occurred_at_unix_ms,
+                "cooldown_ms": admission.cooldown_ms,
+                "flood_window_ms": admission.flood_window_ms,
+                "flood_max_wakes": admission.flood_max_wakes,
+                "redaction_level": "metadata_only",
+            }
+        }
+    })
+    .to_string();
+    let Some(existing) = existing else {
+        return Ok(overlay);
+    };
+    merge_parameter_delta_json(existing, overlay.as_str())
+        .ok_or_else(|| Status::invalid_argument("routine parameter delta must be a JSON object"))
+}
+
+async fn govern_scheduled_autonomous_wake(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+    options: &mut TriggerJobOptions,
+) -> Result<Option<DispatchOutcome>, Status> {
+    let Ok(runtime) = state.routines_runtime_config() else {
+        return Ok(None);
+    };
+    let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
+        Status::internal(format!("failed to load routine metadata for wake admission: {error}"))
+    })?
+    else {
+        return Ok(None);
+    };
+    let occurred_at_unix_ms = now_unix_ms()?;
+    let active_hours_allowed = routine
+        .execution
+        .active_hours
+        .as_ref()
+        .map(|active_hours| routine_active_hours_contains(active_hours, occurred_at_unix_ms))
+        .transpose()
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "routine active-hours evaluation failed closed: {error}"
+            ))
+        })?
+        .unwrap_or(true);
+    let coalescing_key = autonomous_wake_coalescing_key(job, options);
+    let admission = state
+        .admit_autonomous_wake(AutonomousWakeAdmissionRequest {
+            owner_principal: job.owner_principal.clone(),
+            routine_id: routine.routine_id.clone(),
+            job_id: job.job_id.clone(),
+            coalescing_key: coalescing_key.clone(),
+            execution_mode: routine.execution.execution_mode.as_str().to_owned(),
+            authoritative: routine.execution.wake_governance_authoritative,
+            active_hours_allowed,
+            cooldown_ms: routine.cooldown_ms,
+            flood_window_ms: routine.execution.flood_window_ms,
+            flood_max_wakes: routine.execution.flood_max_wakes,
+            evidence_json: json!({
+                "schema_version": 1,
+                "source": "cron_scheduler",
+                "trigger_kind": options
+                    .routine_trigger_kind
+                    .unwrap_or(RoutineTriggerKind::Schedule)
+                    .as_str(),
+                "scheduled_for_unix_ms": job.next_run_at_unix_ms,
+                "active_hours_configured": routine.execution.active_hours.is_some(),
+                "authoritative": routine.execution.wake_governance_authoritative,
+                "user_priority_fence": true,
+                "redaction_level": "metadata_only",
+            })
+            .to_string(),
+            occurred_at_unix_ms,
+        })
+        .await?;
+    if autonomous_wake_blocks_dispatch(admission.authoritative, admission.decision) {
+        let message = autonomous_wake_block_message(admission.decision);
+        return register_terminal(
+            state,
+            job.job_id.as_str(),
+            CronRunStatus::Skipped,
+            admission.reason_code.as_str(),
+            message,
+        )
+        .await
+        .map(Some);
+    }
+    options.parameter_delta_json = Some(merge_autonomous_wake_parameter_delta(
+        options.parameter_delta_json.as_deref(),
+        &admission,
+    )?);
+    options.routine_trigger_reason.get_or_insert_with(|| admission.reason_code.clone());
+    options.routine_trigger_dedupe_key = Some(coalescing_key);
+    Ok(None)
+}
+
 /// Runs every dispatch gate in order (run-slot budget, objective budget, file
 /// watch evaluation, policy, first-run approval, concurrency) and, when all
 /// pass, journals an Accepted run and spawns the retry loop.
@@ -2970,6 +3123,13 @@ async fn dispatch_job(
     {
         persist_file_watch_observation(Arc::clone(&state), &job, trigger_config_update_json)
             .await?;
+    }
+    if !manual_trigger {
+        if let Some(outcome) =
+            govern_scheduled_autonomous_wake(Arc::clone(&state), &job, &mut options).await?
+        {
+            return Ok(outcome);
+        }
     }
 
     let run_id = Ulid::new().to_string();
@@ -3375,6 +3535,7 @@ struct EffectiveCronExecutionRequest {
     model_profile_override: Option<String>,
     parameter_delta_json: Option<String>,
     origin_kind: String,
+    execution: RoutineExecutionConfig,
 }
 
 /// Merges [`TriggerJobOptions`] (highest precedence) with the linked routine
@@ -3407,6 +3568,8 @@ fn build_effective_cron_execution_request(
         merged_parameter_delta_json(routine.as_ref(), job, options.parameter_delta_json.as_deref());
     let session_key = effective_cron_session_key(job, run_id, run_mode);
     let session_label = effective_cron_session_label(job, options, run_mode);
+    let mut effective_execution = execution.cloned().unwrap_or_default();
+    effective_execution.run_mode = run_mode;
     Ok(EffectiveCronExecutionRequest {
         session_key,
         session_label,
@@ -3414,6 +3577,7 @@ fn build_effective_cron_execution_request(
         model_profile_override,
         parameter_delta_json,
         origin_kind: options.origin_kind.clone().unwrap_or_else(|| "cron".to_owned()),
+        execution: effective_execution,
     })
 }
 
@@ -3428,6 +3592,15 @@ fn routine_parameter_delta_json(record: &RoutineMetadataRecord, job: &CronJobRec
             "procedure_profile_id": record.execution.procedure_profile_id,
             "skill_profile_id": record.execution.skill_profile_id,
             "provider_profile_id": record.execution.provider_profile_id,
+            "execution_mode": record.execution.execution_mode.as_str(),
+            "wake_governance_authoritative": record.execution.wake_governance_authoritative,
+            "preflight_probe": record.execution.preflight_probe,
+            "wake_predicate": record.execution.wake_predicate,
+            "context_sources": record.execution.context_sources,
+            "tool_profile": record.execution.tool_profile,
+            "active_hours": record.execution.active_hours,
+            "flood_window_ms": record.execution.flood_window_ms,
+            "flood_max_wakes": record.execution.flood_max_wakes,
             "silent_policy": record.delivery.silent_policy.as_str(),
             "delivery_mode": record.delivery.mode.as_str(),
             "failure_delivery_mode": record.delivery.failure_mode.unwrap_or(record.delivery.mode).as_str(),
@@ -3579,6 +3752,217 @@ fn effective_cron_session_label(
     }
 }
 
+fn execute_routine_preflight_probe(
+    state: &GatewayRuntimeState,
+    probe: &RoutinePreflightProbe,
+) -> Result<RoutineProbeObservation, Status> {
+    let started = Instant::now();
+    let output = match probe.kind {
+        RoutineProbeKind::DaemonHealth => {
+            let healthy = state.routines_runtime_config().is_ok();
+            json!({
+                "kind": "daemon_health",
+                "healthy": healthy,
+                "scheduler": "available",
+            })
+        }
+    };
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if duration_ms > probe.timeout_ms {
+        return Err(Status::deadline_exceeded("routine preflight probe exceeded its timeout"));
+    }
+    let healthy = output.pointer("/healthy").and_then(Value::as_bool).unwrap_or(false);
+    let redacted = redact_diagnostic_text(output.to_string().as_str());
+    let bounded = bounded_probe_output(redacted.as_str(), probe.output_max_bytes);
+    let output = serde_json::from_str::<Value>(bounded.as_str()).unwrap_or_else(|_| {
+        json!({
+            "truncated": true,
+            "preview": bounded,
+        })
+    });
+    let output_sha256 = hex::encode(Sha256::digest(output.to_string().as_bytes()));
+    Ok(RoutineProbeObservation {
+        healthy,
+        output,
+        output_sha256,
+        summary: if healthy {
+            "daemon health probe passed".to_owned()
+        } else {
+            "daemon health probe failed".to_owned()
+        },
+        duration_ms,
+    })
+}
+
+fn bounded_probe_output(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned()
+}
+
+fn merge_routine_preflight_parameter_delta(
+    existing: Option<&str>,
+    execution: &RoutineExecutionConfig,
+    outcome: &WakePredicateOutcome,
+) -> Result<Option<String>, Status> {
+    let mut payload = match existing {
+        Some(raw) => serde_json::from_str::<Value>(raw).map_err(|error| {
+            Status::invalid_argument(format!("routine parameter delta is invalid JSON: {error}"))
+        })?,
+        None => json!({}),
+    };
+    if !payload.is_object() {
+        return Err(Status::invalid_argument("routine parameter delta must be a JSON object"));
+    }
+    if payload.pointer("/routine").is_none() {
+        payload["routine"] = json!({});
+    }
+    payload["routine"]["preflight"] = json!({
+        "schema_version": 1,
+        "execution_mode": execution.execution_mode.as_str(),
+        "predicate_outcome": outcome,
+        "context_sources": execution.context_sources,
+        "tool_profile_id": execution.tool_profile.as_ref().map(|profile| profile.profile_id.as_str()),
+        "redaction_level": "metadata_only",
+    });
+    serde_json::to_string(&payload)
+        .map(Some)
+        .map_err(|error| Status::internal(format!("failed to encode routine preflight: {error}")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostOnlyRoutineTerminalProjection {
+    status: CronRunStatus,
+    routine_outcome: RoutineRunOutcomeKind,
+    reason_code: String,
+    model_tokens_in: u64,
+    model_tokens_out: u64,
+    tool_calls: u64,
+    tool_denies: u64,
+}
+
+fn host_only_routine_terminal_projection(
+    mode: RoutineExecutionMode,
+    outcome: &WakePredicateOutcome,
+) -> Option<HostOnlyRoutineTerminalProjection> {
+    let (status, routine_outcome, reason_code) = match mode {
+        RoutineExecutionMode::NoAgent => (
+            CronRunStatus::Succeeded,
+            RoutineRunOutcomeKind::SuccessNoOp,
+            "wake.no_agent_health_check".to_owned(),
+        ),
+        RoutineExecutionMode::ProbeThenAgent
+            if outcome.decision != WakePredicateDecision::Matched =>
+        {
+            (CronRunStatus::Skipped, RoutineRunOutcomeKind::Skipped, outcome.reason_code.clone())
+        }
+        RoutineExecutionMode::Agent | RoutineExecutionMode::ProbeThenAgent => return None,
+    };
+    Some(HostOnlyRoutineTerminalProjection {
+        status,
+        routine_outcome,
+        reason_code,
+        model_tokens_in: 0,
+        model_tokens_out: 0,
+        tool_calls: 0,
+        tool_denies: 0,
+    })
+}
+
+async fn finalize_host_only_routine_attempt(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+    run_id: String,
+    options: &TriggerJobOptions,
+    predicate_outcome: &WakePredicateOutcome,
+    projection: HostOnlyRoutineTerminalProjection,
+) -> Result<CronRunStatus, Status> {
+    state
+        .finalize_cron_run(CronRunFinalizeRequest {
+            run_id: run_id.clone(),
+            status: CronRunStatus::Running,
+            error_kind: None,
+            error_message_redacted: None,
+            model_tokens_in: projection.model_tokens_in,
+            model_tokens_out: projection.model_tokens_out,
+            tool_calls: projection.tool_calls,
+            tool_denies: projection.tool_denies,
+            orchestrator_run_id: None,
+            session_id: None,
+        })
+        .await?;
+    record_routine_probe_outcome(
+        state.as_ref(),
+        job,
+        run_id.as_str(),
+        options,
+        projection.routine_outcome,
+        predicate_outcome,
+        projection.reason_code.as_str(),
+    )?;
+    state
+        .finalize_cron_run(CronRunFinalizeRequest {
+            run_id,
+            status: projection.status,
+            error_kind: (projection.status != CronRunStatus::Succeeded)
+                .then(|| projection.reason_code.clone()),
+            error_message_redacted: (projection.status != CronRunStatus::Succeeded)
+                .then(|| predicate_outcome.summary.clone()),
+            model_tokens_in: projection.model_tokens_in,
+            model_tokens_out: projection.model_tokens_out,
+            tool_calls: projection.tool_calls,
+            tool_denies: projection.tool_denies,
+            orchestrator_run_id: None,
+            session_id: None,
+        })
+        .await?;
+    Ok(projection.status)
+}
+
+fn record_routine_probe_outcome(
+    state: &GatewayRuntimeState,
+    job: &CronJobRecord,
+    run_id: &str,
+    options: &TriggerJobOptions,
+    outcome: RoutineRunOutcomeKind,
+    predicate_outcome: &WakePredicateOutcome,
+    reason_code: &str,
+) -> Result<(), Status> {
+    let Ok(runtime) = state.routines_runtime_config() else {
+        return Ok(());
+    };
+    let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
+        Status::internal(format!("failed to load routine metadata for probe outcome: {error}"))
+    })?
+    else {
+        return Ok(());
+    };
+    let mut upsert = scheduled_routine_run_metadata_upsert(job, &routine, run_id, options)?;
+    upsert.outcome_override = Some(outcome);
+    upsert.outcome_message = Some(predicate_outcome.summary.clone());
+    upsert.output_delivered = Some(false);
+    upsert.safety_note = Some(
+        json!({
+            "schema_version": 1,
+            "reason_code": reason_code,
+            "predicate_outcome": predicate_outcome,
+            "model_invoked": false,
+            "tool_calls": 0,
+            "redaction_level": "metadata_only",
+        })
+        .to_string(),
+    );
+    runtime.registry.upsert_run_metadata(upsert).map_err(|error| {
+        Status::internal(format!("failed to persist routine probe outcome: {error}"))
+    })?;
+    Ok(())
+}
+
 /// Runs one attempt end to end: resolves the session, journals the transition
 /// to Running, streams the orchestrator run, and finalizes the run record
 /// with the observed terminal status and usage.
@@ -3591,11 +3975,42 @@ async fn execute_single_job_attempt(
     attempt: u32,
     options: &TriggerJobOptions,
 ) -> Result<CronRunStatus, Status> {
+    let mut effective =
+        build_effective_cron_execution_request(state.as_ref(), job, run_id.as_str(), options)?;
+    if effective.execution.execution_mode != RoutineExecutionMode::Agent {
+        let probe = execute_routine_preflight_probe(
+            state.as_ref(),
+            effective.execution.preflight_probe.as_ref().ok_or_else(|| {
+                Status::failed_precondition("governed execution mode requires a preflight probe")
+            })?,
+        )?;
+        let predicate = effective.execution.wake_predicate.as_ref().ok_or_else(|| {
+            Status::failed_precondition("governed execution mode requires a wake predicate")
+        })?;
+        let predicate_outcome = evaluate_routine_wake_predicate(predicate, &probe);
+        effective.parameter_delta_json = merge_routine_preflight_parameter_delta(
+            effective.parameter_delta_json.as_deref(),
+            &effective.execution,
+            &predicate_outcome,
+        )?;
+        if let Some(projection) = host_only_routine_terminal_projection(
+            effective.execution.execution_mode,
+            &predicate_outcome,
+        ) {
+            return finalize_host_only_routine_attempt(
+                state,
+                job,
+                run_id,
+                options,
+                &predicate_outcome,
+                projection,
+            )
+            .await;
+        }
+    }
     let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url)
         .await
         .map_err(|error| Status::unavailable(format!("failed to connect gateway: {error}")))?;
-    let effective =
-        build_effective_cron_execution_request(state.as_ref(), job, run_id.as_str(), options)?;
 
     let mut resolve_request = Request::new(gateway_v1::ResolveSessionRequest {
         v: 1,
@@ -4192,6 +4607,11 @@ fn build_cron_prompt(
         .as_deref()
         .map(format_trigger_payload_metadata)
         .unwrap_or_default();
+    let governed_context_metadata = options
+        .parameter_delta_json
+        .as_deref()
+        .and_then(format_governed_context_metadata)
+        .unwrap_or_default();
     format!(
         "[cron job {name}]\n\
          Scheduled trigger metadata:\n\
@@ -4201,6 +4621,7 @@ fn build_cron_prompt(
          - triggered_at_unix_ms: {triggered_at_unix_ms}\n\n\
          {workdir_metadata}\
          {trigger_payload_metadata}\
+         {governed_context_metadata}\
          Use the trigger metadata as the current time for this scheduled run when the routine asks for dates or timestamps. If workdir is present, treat it as the project root for relative outputs and pass it as cwd to process tools. If the routine reaches a stop condition, use routine_id with palyra.routines.control to pause or update this routine. For file_watch triggers, inspect the changed path from trigger_payload before deciding what to do.\n\n\
          {prompt}",
         name = job.name,
@@ -4208,6 +4629,20 @@ fn build_cron_prompt(
         job_id = job.job_id,
         prompt = job.prompt,
     )
+}
+
+fn format_governed_context_metadata(parameter_delta_json: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(parameter_delta_json).ok()?;
+    let routine = parsed.pointer("/routine")?;
+    let metadata = json!({
+        "execution_mode": routine.pointer("/execution_mode"),
+        "preflight": routine.pointer("/preflight"),
+        "context_sources": routine.pointer("/context_sources"),
+        "tool_profile_id": routine.pointer("/tool_profile/profile_id"),
+    })
+    .to_string();
+    let prompt_safe = metadata.chars().flat_map(char::escape_default).collect::<String>();
+    Some(format!("         - governed_execution: {prompt_safe}\n"))
 }
 
 /// Escapes control characters so job-provided text cannot inject fake lines
@@ -4426,20 +4861,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        budgeted_cron_run_count, budgeted_objective_run_count, build_cron_prompt,
-        build_scheduler_health_snapshot, compute_misfire_recovery_plan, compute_next_run_after,
+        autonomous_wake_blocks_dispatch, autonomous_wake_coalescing_key, budgeted_cron_run_count,
+        budgeted_objective_run_count, build_cron_prompt, build_scheduler_health_snapshot,
+        compute_misfire_recovery_plan, compute_next_run_after,
         cron_completion_candidate_for_tool_proposal, cron_job_allows_read_only_noop_success,
         cron_job_requires_completion_tool, cron_misfire_audit_payload,
         cron_reconciliation_projection, cron_terminal_status_from_stream,
         decide_concurrency_policy, effective_cron_session_key, effective_cron_session_label,
-        load_periodic_reaudit_skills_index, max_runs_for_job, merged_parameter_delta_json,
-        normalize_schedule, now_unix_ms_or_fallback, panicked_cron_run_finalize_request,
-        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
-        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
-        routines_automation_enabled, scheduled_routine_approval_matches,
-        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
-        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
-        should_disable_exhausted_scheduled_one_shot,
+        host_only_routine_terminal_projection, load_periodic_reaudit_skills_index,
+        max_runs_for_job, merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
+        panicked_cron_run_finalize_request, parse_skill_reaudit_interval, periodic_reaudit_targets,
+        reserved_cron_run_slot_count, routine_approval_subject_id, routine_gate_error_kind,
+        routine_parameter_delta_json, routines_automation_enabled,
+        scheduled_routine_approval_matches, scheduled_routine_requires_first_run_approval,
+        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
+        scheduler_retry_backoff_delay_ms, should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronReconciliationDecision, CronReconciliationInput, CronReconciliationReasonCode,
@@ -4453,13 +4889,15 @@ mod tests {
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
     use crate::journal::{
         ApprovalDecision, ApprovalPolicySnapshot, ApprovalPromptRecord, ApprovalRecord,
-        ApprovalRiskLevel, ApprovalSubjectType, CronConcurrencyPolicy, CronJobRecord,
-        CronMisfirePolicy, CronRetryPolicy, CronRunRecord, CronRunStatus, CronScheduleType,
+        ApprovalRiskLevel, ApprovalSubjectType, AutonomousWakeDecision, CronConcurrencyPolicy,
+        CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord, CronRunStatus,
+        CronScheduleType,
     };
     use crate::routines::{
         RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
-        RoutineExecutionConfig, RoutineMetadataRecord, RoutineRunMode, RoutineSilentPolicy,
-        RoutineTriggerKind,
+        RoutineExecutionConfig, RoutineExecutionMode, RoutineMetadataRecord, RoutineRunMode,
+        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind, WakePredicateDecision,
+        WakePredicateOutcome,
     };
     use serde_json::json;
     use tonic::{Code, Status};
@@ -4512,6 +4950,58 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms,
         }
+    }
+
+    #[test]
+    fn autonomous_wake_coalescing_key_tracks_due_tick_and_queue_generation() {
+        let scheduled = sample_every_job("job-health", Some(42_000), CronMisfirePolicy::Skip);
+        assert_eq!(
+            autonomous_wake_coalescing_key(&scheduled, &TriggerJobOptions::default()),
+            "schedule:job-health:42000"
+        );
+
+        let queued = CronJobRecord { queued_run: true, updated_at_unix_ms: 77_000, ..scheduled };
+        assert_eq!(
+            autonomous_wake_coalescing_key(&queued, &TriggerJobOptions::default()),
+            "queue:job-health:77000"
+        );
+        assert_eq!(
+            autonomous_wake_coalescing_key(
+                &queued,
+                &TriggerJobOptions {
+                    routine_trigger_dedupe_key: Some("file_watch:job-health:digest".to_owned()),
+                    ..TriggerJobOptions::default()
+                }
+            ),
+            "file_watch:job-health:digest"
+        );
+        assert!(!autonomous_wake_blocks_dispatch(false, AutonomousWakeDecision::FloodGuard));
+        assert!(autonomous_wake_blocks_dispatch(true, AutonomousWakeDecision::FloodGuard));
+        assert!(!autonomous_wake_blocks_dispatch(true, AutonomousWakeDecision::Admitted));
+    }
+
+    #[test]
+    fn no_agent_health_projection_never_invokes_model_or_tools() {
+        let outcome = WakePredicateOutcome {
+            schema_version: 1,
+            decision: WakePredicateDecision::NotMatched,
+            reason_code: "wake.predicate_false".to_owned(),
+            output_sha256: "a".repeat(64),
+            summary: "daemon health predicate did not match".to_owned(),
+            duration_ms: 1,
+        };
+
+        let projected =
+            host_only_routine_terminal_projection(RoutineExecutionMode::NoAgent, &outcome)
+                .expect("no-agent execution must terminate in the host");
+
+        assert_eq!(projected.status, CronRunStatus::Succeeded);
+        assert_eq!(projected.routine_outcome, RoutineRunOutcomeKind::SuccessNoOp);
+        assert_eq!(projected.reason_code, "wake.no_agent_health_check");
+        assert_eq!(projected.model_tokens_in, 0);
+        assert_eq!(projected.model_tokens_out, 0);
+        assert_eq!(projected.tool_calls, 0);
+        assert_eq!(projected.tool_denies, 0);
     }
 
     #[test]
