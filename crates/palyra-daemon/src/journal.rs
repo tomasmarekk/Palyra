@@ -80,6 +80,7 @@ use crate::{
 };
 
 pub(crate) mod autonomy;
+pub mod child_completion;
 pub(crate) mod lifecycle;
 mod metadata_trace;
 pub(crate) mod restart;
@@ -98,6 +99,7 @@ pub use autonomy::{
     ParentSuspensionReconcileReport, ParentSuspensionRecord, ParentSuspensionWakeOutcome,
     ParentWaitPolicy,
 };
+pub use child_completion::ChildCompletionReconcileReport;
 pub use session_operations::{
     ScopedSessionRuntimeGeneration, SessionModelCommandKind, SessionModelCommandRecord,
     SessionModelCommandReserveOutcome, SessionModelCommandReserveRequest,
@@ -7492,6 +7494,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "model_visible_session_operations",
         sql: session_operations::MIGRATION_85_SQL,
     },
+    Migration {
+        version: 86,
+        name: "child_completion_announce",
+        sql: child_completion::MIGRATION_86_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -13890,46 +13897,6 @@ impl JournalStore {
         self.append_orchestrator_tape_event_with_runtime_projection(request, None).map(|_| ())
     }
 
-    /// Appends one detached-child event only while its exact parent generation
-    /// remains current.
-    ///
-    /// The generation comparison and tape insert share one immediate
-    /// transaction. `false` is a stale-authority outcome and guarantees that
-    /// no tape row was inserted.
-    pub(crate) fn append_orchestrator_tape_event_if_parent_generation(
-        &self,
-        request: &OrchestratorTapeAppendRequest,
-        parent_guard: &OrchestratorParentGenerationGuard,
-    ) -> Result<bool, JournalError> {
-        if request.run_id != parent_guard.run_id {
-            return Err(JournalError::InvalidArgument(
-                "guarded parent tape request targets a different run".to_owned(),
-            ));
-        }
-        let now = current_unix_ms()?;
-        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (matches, _) = shared_runtime::runtime_generation_fence_matches_tx(
-            &transaction,
-            parent_guard.session_id.as_str(),
-            parent_guard.run_id.as_str(),
-            RuntimeGenerationLane::Run,
-            parent_guard.expected_generation,
-        )?;
-        if !matches {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        append_orchestrator_tape_event_tx(
-            &transaction,
-            self.config.max_payload_bytes,
-            request,
-            now,
-        )?;
-        transaction.commit()?;
-        Ok(true)
-    }
-
     /// Atomically appends one tape event and its optional generation-aware projection.
     ///
     /// The projection is checked and sequenced in the same transaction as the
@@ -18632,6 +18599,7 @@ impl JournalStore {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = update_orchestrator_background_task_from_worker_tx(&transaction, request)?;
+        child_completion::materialize_child_completion_tx(&transaction, &record, None)?;
         transaction.commit()?;
         Ok(record)
     }
@@ -18672,6 +18640,11 @@ impl JournalStore {
             return Ok(None);
         }
         let record = update_orchestrator_background_task_from_worker_tx(&transaction, request)?;
+        child_completion::materialize_child_completion_tx(
+            &transaction,
+            &record,
+            Some(parent_guard.expected_generation),
+        )?;
         transaction.commit()?;
         Ok(Some(record))
     }
@@ -42090,25 +42063,6 @@ mod tests {
                 &parent_guard,
             )
             .expect("stale metadata mutation should classify"));
-        let tape_sequence = i64::try_from(
-            store
-                .orchestrator_run_status_snapshot(parent_run_id)
-                .expect("parent snapshot should load")
-                .expect("parent should exist")
-                .tape_events,
-        )
-        .expect("tape sequence should fit");
-        assert!(!store
-            .append_orchestrator_tape_event_if_parent_generation(
-                &OrchestratorTapeAppendRequest {
-                    run_id: parent_run_id.to_owned(),
-                    seq: tape_sequence,
-                    event_type: "child_run_merged".to_owned(),
-                    payload_json: r#"{"stale":true}"#.to_owned(),
-                },
-                &parent_guard,
-            )
-            .expect("stale tape mutation should classify"));
         assert!(store
             .update_orchestrator_background_task_from_worker_if_parent_generation(
                 &OrchestratorBackgroundTaskWorkerUpdateRequest {

@@ -2897,6 +2897,10 @@ pub async fn run() -> Result<()> {
         )
         .await
         .context("failed to reconcile orphaned background tasks during startup")?;
+    let startup_child_completion_recovery = runtime
+        .reconcile_child_completions()
+        .await
+        .context("failed to reconcile durable child completions during startup")?;
     let startup_parent_suspension_recovery = runtime
         .reconcile_parent_suspensions()
         .await
@@ -3186,6 +3190,9 @@ pub async fn run() -> Result<()> {
         || startup_background_task_recovery.failed_count > 0
         || startup_parent_suspension_recovery.matched_child_count > 0
         || startup_parent_suspension_recovery.timed_out_count > 0
+        || startup_child_completion_recovery.delivered_announcements > 0
+        || startup_child_completion_recovery.stale_announcements > 0
+        || startup_child_completion_recovery.manual_review_announcements > 0
         || startup_process_lease_reconciliation.inspected_count > 0
         || startup_process_lease_reconciliation.pending_cleanup_inspected_count > 0
         || !startup_networked_worker_expiry.is_empty()
@@ -3210,6 +3217,17 @@ pub async fn run() -> Result<()> {
             parent_suspension_continuations_queued =
                 startup_parent_suspension_recovery.continuation_queued_count,
             parent_suspensions_timed_out = startup_parent_suspension_recovery.timed_out_count,
+            child_orphans_classified = startup_child_completion_recovery.classified_orphans,
+            child_announcements_delivered =
+                startup_child_completion_recovery.delivered_announcements,
+            child_announcements_nested_deferred =
+                startup_child_completion_recovery.deferred_for_nested_children,
+            child_announcements_stale =
+                startup_child_completion_recovery.stale_announcements,
+            child_announcements_cancelled =
+                startup_child_completion_recovery.cancelled_announcements,
+            child_announcements_manual_review =
+                startup_child_completion_recovery.manual_review_announcements,
             process_leases_inspected = startup_process_lease_reconciliation.inspected_count,
             process_leases_closed = startup_process_lease_reconciliation.closed_count,
             process_leases_orphaned = startup_process_lease_reconciliation.orphaned_count,

@@ -88,12 +88,12 @@ use crate::journal::state_health::{
     JournalWalCheckpointReport, SidecarIndexDescriptor,
 };
 use crate::journal::{
-    CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest,
-    CommitmentDeliveryAttemptRecord, CommitmentEventRecord, CommitmentListFilter, CommitmentRecord,
-    CommitmentSourceRecord, CommitmentUpdateRequest, FlowBundleRecord, FlowCreateRequest,
-    FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest,
-    FlowDependencyStartupAuditReport, FlowListFilter, FlowRecord, FlowStepRecord,
-    FlowStepUpdateRequest, FlowTransitionRequest, IdempotencyBeginRequest,
+    ChildCompletionReconcileReport, CommitmentCreateRequest,
+    CommitmentDeliveryAttemptCreateRequest, CommitmentDeliveryAttemptRecord, CommitmentEventRecord,
+    CommitmentListFilter, CommitmentRecord, CommitmentSourceRecord, CommitmentUpdateRequest,
+    FlowBundleRecord, FlowCreateRequest, FlowDependenciesQuarantineRequest,
+    FlowDependenciesRepairRequest, FlowDependencyStartupAuditReport, FlowListFilter, FlowRecord,
+    FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest, IdempotencyBeginRequest,
     IdempotencyCompleteRequest, IdempotencyFailRequest, LearningCandidateCreateRequest,
     LearningCandidateEvalCreateRequest, LearningCandidateEvalRecord,
     LearningCandidateHistoryRecord, LearningCandidateListFilter, LearningCandidateRecord,
@@ -11761,22 +11761,6 @@ impl GatewayRuntimeState {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
-    fn append_orchestrator_tape_event_if_parent_generation_blocking(
-        &self,
-        request: &OrchestratorTapeAppendRequest,
-        parent_guard: &OrchestratorParentGenerationGuard,
-    ) -> Result<bool, Status> {
-        self.journal_store
-            .append_orchestrator_tape_event_if_parent_generation(request, parent_guard)
-            .map_err(|error| {
-                map_orchestrator_store_error(
-                    "append orchestrator tape under parent generation",
-                    error,
-                )
-            })
-    }
-
     fn shared_runtime_tape_projection(
         &self,
         request: &OrchestratorTapeAppendRequest,
@@ -12743,31 +12727,6 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("orchestrator tape worker panicked"))??;
         self.counters.orchestrator_tape_events.fetch_add(1, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// Appends a detached-child event under exact parent-generation authority.
-    ///
-    /// `false` is a stale-generation suppression and does not increment the
-    /// durable tape counter.
-    #[allow(clippy::result_large_err)]
-    pub(crate) async fn append_orchestrator_tape_event_if_parent_generation(
-        self: &Arc<Self>,
-        request: OrchestratorTapeAppendRequest,
-        parent_guard: OrchestratorParentGenerationGuard,
-    ) -> Result<bool, Status> {
-        let state = Arc::clone(self);
-        let appended = tokio::task::spawn_blocking(move || {
-            state.append_orchestrator_tape_event_if_parent_generation_blocking(
-                &request,
-                &parent_guard,
-            )
-        })
-        .await
-        .map_err(|_| Status::internal("guarded orchestrator tape worker panicked"))??;
-        if appended {
-            self.counters.orchestrator_tape_events.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(appended)
     }
 
     #[allow(clippy::result_large_err)]
@@ -14875,6 +14834,23 @@ impl GatewayRuntimeState {
             .await
             .map_err(|_| Status::internal("parent suspension reconciliation worker panicked"))?
             .map_err(|error| map_orchestrator_store_error("reconcile parent suspensions", error))
+    }
+
+    /// Reconciles durable child-completion envelopes, orphan classifications,
+    /// and exactly-once parent announcement delivery.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error or `internal` if the blocking worker
+    /// panics.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn reconcile_child_completions(
+        self: &Arc<Self>,
+    ) -> Result<ChildCompletionReconcileReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.journal_store.reconcile_child_completions())
+            .await
+            .map_err(|_| Status::internal("child completion reconciliation worker panicked"))?
+            .map_err(|error| map_orchestrator_store_error("reconcile child completions", error))
     }
 
     #[allow(clippy::result_large_err)]

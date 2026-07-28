@@ -1932,12 +1932,21 @@ async fn run_background_task_stream(
     // only when no snapshot exists at all.
     let run_snapshot = runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?;
     if let Some(run) = run_snapshot.as_ref() {
+        let mut merge_delivery = None;
         let durable_task = load_current_background_task_execution(runtime, task).await?;
         if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
             return Ok(());
         }
         let run_with_merge = if let Some(delegation) = task.delegation.as_ref() {
-            let merge_result = build_merge_result(runtime, run, delegation).await?;
+            let mut merge_result = build_merge_result(runtime, run, delegation).await?;
+            let (delivery_policy, delivery_decision) =
+                evaluate_delivery_arbitration_for_merge(runtime, task, run, &merge_result).await?;
+            if delivery_holds_merge_result(&delivery_decision) {
+                merge_result.approval_required = true;
+                merge_result.approval_summary.approval_required = true;
+                merge_result.approval_summary.approval_pending = true;
+                merge_result.status = DelegationMergeStatus::ApprovalRequired.as_str().to_owned();
+            }
             let durable_task = load_current_background_task_execution(runtime, task).await?;
             if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
                 return Ok(());
@@ -1971,10 +1980,7 @@ async fn run_background_task_stream(
             if !precheck_child_completion_parent_generation(runtime, &durable_task, run_id).await? {
                 return Ok(());
             }
-            if !append_parent_merge_event(runtime, &durable_task, run, &merge_result).await? {
-                suppress_stale_child_completion(runtime, &durable_task, run_id, None).await?;
-                return Ok(());
-            }
+            merge_delivery = Some((merge_result, delivery_policy, delivery_decision));
             refreshed.unwrap_or_else(|| run.clone())
         } else {
             run.clone()
@@ -1991,6 +1997,17 @@ async fn run_background_task_stream(
         .await?
         {
             return Ok(());
+        }
+        if let Some((merge_result, delivery_policy, delivery_decision)) = merge_delivery {
+            append_child_merge_completion(
+                runtime,
+                &durable_task,
+                &run_with_merge,
+                &merge_result,
+                &delivery_policy,
+                &delivery_decision,
+            )
+            .await?;
         }
         if let Some(error_message) = stream_error {
             warn!(
@@ -2386,6 +2403,7 @@ async fn finalize_task_from_run_if_parent_generation_current(
         suppress_stale_child_completion(runtime, task, child_run_id, None).await?;
         return Ok(false);
     };
+    runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
@@ -2407,6 +2425,7 @@ async fn finalize_task_from_run(
         return Ok(());
     };
     let updated = runtime.update_orchestrator_background_task_from_worker(update).await?;
+    runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
@@ -3348,29 +3367,26 @@ async fn append_parent_spawned_event(
     .await
 }
 
-/// Emits the merge outcome to the parent tape and the child lifecycle stream.
+/// Emits the post-commit merge outcome to the child lifecycle stream.
 ///
-/// When delivery arbitration holds the output for final review, the payloads
-/// carry only the hold reason; the merge result itself is withheld until
-/// released (pinned by tests).
-async fn append_parent_merge_event(
+/// The durable completion outbox owns parent delivery. This observer runs only
+/// after terminal task persistence and withholds held results from lifecycle
+/// payloads until review releases them.
+async fn append_child_merge_completion(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     merge_result: &DelegationMergeResult,
-) -> Result<bool, Status> {
-    let Some(parent_run_id) = task.parent_run_id.as_deref() else {
-        return Ok(true);
-    };
+    delivery_policy: &DeliveryPolicySet,
+    delivery_decision: &DeliveryDecision,
+) -> Result<(), Status> {
     let event_type = match run.state.as_str() {
         "done" => "child_run_merged",
         "failed" => "child_run_failed",
         "cancelled" => "child_run_cancelled",
         _ => "child_run_merged",
     };
-    let (delivery_policy, delivery_decision) =
-        evaluate_delivery_arbitration_for_merge(runtime, task, run, merge_result).await?;
-    let hold_for_review = delivery_holds_merge_result(&delivery_decision);
+    let hold_for_review = delivery_holds_merge_result(delivery_decision);
     let merge_status = if hold_for_review {
         DelegationMergeStatus::ApprovalRequired
     } else {
@@ -3396,37 +3412,16 @@ async fn append_parent_merge_event(
         event_type,
         delegated_reason,
     )?;
-    let graph_explain =
-        build_delegated_run_graph(parent_run_id.to_owned(), vec![delegated_run.clone()])
-            .explain_json();
     let merge_preview = merge_preview_json(run, merge_result);
     let delegated_run_snapshot = delegated_run.safe_snapshot_json();
     let payload_context = MergeDeliveryPayloadContext {
-        task_id: task.task_id.as_str(),
-        child_run_id: run.run_id.as_str(),
-        child_state: run.state.as_str(),
         legacy_event_type: event_type,
         merge_result,
         merge_preview: &merge_preview,
         delegated_run: &delegated_run_snapshot,
-        graph_explain: &graph_explain,
-        delivery_decision: &delivery_decision,
+        delivery_decision,
     };
-    let parent_event_type = if hold_for_review { "child_run_delivery_held" } else { event_type };
-    let parent_guard = child_completion_parent_generation_guard(task)?;
-    let appended = append_parent_tape_event_if_parent_generation(
-        runtime,
-        parent_run_id,
-        parent_event_type,
-        parent_merge_event_payload(&payload_context),
-        parent_guard.as_ref(),
-    )
-    .await?;
-    if !appended {
-        return Ok(false);
-    }
-    emit_delivery_arbitration_audit(runtime, task, run, &delivery_policy, &delivery_decision)
-        .await?;
+    emit_delivery_arbitration_audit(runtime, task, run, delivery_policy, delivery_decision).await?;
     let (child_event_type, child_state) = if hold_for_review {
         ("child_review_required", "waiting_for_approval")
     } else {
@@ -3447,52 +3442,20 @@ async fn append_parent_merge_event(
         child_merge_lifecycle_details(&payload_context),
     )
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 fn delivery_holds_merge_result(decision: &DeliveryDecision) -> bool {
     matches!(decision.action, DeliveryDecisionAction::HoldForReview)
 }
 
-/// Shared inputs for building parent-tape and child-lifecycle merge payloads.
+/// Shared inputs for building the bounded child-lifecycle merge payload.
 struct MergeDeliveryPayloadContext<'a> {
-    task_id: &'a str,
-    child_run_id: &'a str,
-    child_state: &'a str,
     legacy_event_type: &'a str,
     merge_result: &'a DelegationMergeResult,
     merge_preview: &'a Value,
     delegated_run: &'a Value,
-    graph_explain: &'a Value,
     delivery_decision: &'a DeliveryDecision,
-}
-
-fn parent_merge_event_payload(context: &MergeDeliveryPayloadContext<'_>) -> Value {
-    if delivery_holds_merge_result(context.delivery_decision) {
-        return json!({
-            "task_id": context.task_id,
-            "child_run_id": context.child_run_id,
-            "child_state": context.child_state,
-            "merge_held": true,
-            "hold_reason": context.delivery_decision.reason.as_str(),
-            "delegated_run": context.delegated_run,
-            "graph_explain": context.graph_explain,
-            "delivery_review": delivery_review_summary(&context.merge_result.approval_summary),
-            "delivery_arbitration": context.delivery_decision.explain_json.clone(),
-        });
-    }
-
-    json!({
-        "task_id": context.task_id,
-        "child_run_id": context.child_run_id,
-        "child_state": context.child_state,
-        "merge_result": context.merge_result,
-        "merge_preview": context.merge_preview,
-        "delegated_run": context.delegated_run,
-        "graph_explain": context.graph_explain,
-        "delivery_review": delivery_review_summary(&context.merge_result.approval_summary),
-        "delivery_arbitration": context.delivery_decision.explain_json.clone(),
-    })
 }
 
 fn child_merge_lifecycle_details(context: &MergeDeliveryPayloadContext<'_>) -> Value {
@@ -3798,54 +3761,6 @@ async fn append_parent_tape_event(
     Err(Status::aborted(format!("failed to append parent tape event '{event_type}' after retries")))
 }
 
-/// Appends a parent tape event with the generation fence evaluated in the
-/// journal transaction that inserts the row.
-///
-/// `false` is returned only when a supplied parent authority was superseded;
-/// sequence conflicts retain the same bounded retry behavior as legacy
-/// background tape writes.
-async fn append_parent_tape_event_if_parent_generation(
-    runtime: &Arc<GatewayRuntimeState>,
-    parent_run_id: &str,
-    event_type: &str,
-    payload: Value,
-    parent_guard: Option<&OrchestratorParentGenerationGuard>,
-) -> Result<bool, Status> {
-    let Some(parent_guard) = parent_guard else {
-        append_parent_tape_event(runtime, parent_run_id, event_type, payload).await?;
-        return Ok(true);
-    };
-    for _ in 0..3 {
-        let Some(run) = runtime.orchestrator_run_status_snapshot(parent_run_id.to_owned()).await?
-        else {
-            return Ok(true);
-        };
-        if !parent_tape_accepts_background_event(run.state.as_str()) {
-            return Ok(true);
-        }
-        let seq = i64::try_from(run.tape_events).unwrap_or(i64::MAX);
-        match runtime
-            .append_orchestrator_tape_event_if_parent_generation(
-                OrchestratorTapeAppendRequest {
-                    run_id: parent_run_id.to_owned(),
-                    seq,
-                    event_type: event_type.to_owned(),
-                    payload_json: payload.to_string(),
-                },
-                parent_guard.clone(),
-            )
-            .await
-        {
-            Ok(appended) => return Ok(appended),
-            Err(error) if error.code() == Code::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(Status::aborted(format!(
-        "failed to append guarded parent tape event '{event_type}' after retries"
-    )))
-}
-
 /// Background events may only land on a parent tape after the parent run is
 /// terminal; appending earlier would race the orchestrator's own writes for
 /// the same sequence numbers (pinned by tests).
@@ -4004,8 +3919,8 @@ mod tests {
         dispatch_auxiliary_executor_task, ensure_child_task_context_permits_dispatch,
         evaluate_delegation_scheduler_limits, expire_child_task_cancellation_context,
         finalize_task_from_run, finalize_task_from_run_if_parent_generation_current,
-        inject_background_metadata, parent_merge_event_payload,
-        parent_tape_accepts_background_event, pending_child_cancel_reason, process_background_task,
+        inject_background_metadata, parent_tape_accepts_background_event,
+        pending_child_cancel_reason, process_background_task,
         reconcile_attached_child_with_invalid_contract, replace_background_task_snapshot,
         request_attached_child_expiry_cancel, run_background_task_stream,
         running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
@@ -4672,27 +4587,13 @@ mod tests {
 
         let merge_preview = json!({ "summary": "unreviewed child output" });
         let delegated_run = json!({ "state": "waiting_for_approval" });
-        let graph_explain = json!({ "nodes": [] });
         let context = MergeDeliveryPayloadContext {
-            task_id: "task-1",
-            child_run_id: "child-run",
-            child_state: "done",
             legacy_event_type: "child_run_merged",
             merge_result: &merge_result,
             merge_preview: &merge_preview,
             delegated_run: &delegated_run,
-            graph_explain: &graph_explain,
             delivery_decision: &decision,
         };
-
-        let parent_payload = parent_merge_event_payload(&context);
-        assert_eq!(parent_payload.get("merge_held").and_then(|value| value.as_bool()), Some(true));
-        assert_eq!(
-            parent_payload.get("hold_reason").and_then(|value| value.as_str()),
-            Some("final_review_required")
-        );
-        assert!(parent_payload.get("merge_result").is_none());
-        assert!(parent_payload.get("merge_preview").is_none());
 
         let child_details = child_merge_lifecycle_details(&context);
         assert_eq!(child_details.get("merge_held").and_then(|value| value.as_bool()), Some(true));
