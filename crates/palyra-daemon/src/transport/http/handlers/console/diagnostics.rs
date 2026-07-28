@@ -126,7 +126,11 @@ pub(crate) async fn console_diagnostics_handler(
     let task_projection_payload = collect_console_task_projection_diagnostics();
     let task_reconciler_payload = collect_console_task_reconciler_diagnostics();
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
-    let commitment_inference_payload = collect_console_commitment_inference_diagnostics();
+    let commitment_inference_payload = collect_console_commitment_inference_diagnostics(
+        &state,
+        session.context.principal.as_str(),
+    )
+    .await?;
     let heartbeat_delivery_payload = collect_console_heartbeat_delivery_diagnostics();
     let routine_capability_profile_payload =
         collect_console_routine_capability_profile_diagnostics();
@@ -1889,11 +1893,19 @@ fn collect_console_replay_continuity_diagnostics() -> Value {
 }
 
 /// Summarizes the opt-in inferred commitment candidate contract for operators.
-fn collect_console_commitment_inference_diagnostics() -> Value {
-    json!({
+async fn collect_console_commitment_inference_diagnostics(
+    state: &AppState,
+    owner_principal: &str,
+) -> Result<Value, Response> {
+    let candidate_counts = state
+        .runtime
+        .commitment_candidate_v2_diagnostics(owner_principal.to_owned())
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(json!({
         "schema_version": crate::commitments::HYBRID_INFERRED_COMMITMENTS_SCHEMA_VERSION,
         "rollout_mode": crate::commitments::HYBRID_INFERRED_COMMITMENTS_ROLLOUT_OBSERVE_ONLY,
-        "audit_ledger": "commitments_source_evidence",
+        "audit_ledger": "commitment_candidates_v2",
         "read_model_endpoint": "/console/v1/commitments",
         "extract_request_field": "include_inferred",
         "default_enabled": false,
@@ -1905,8 +1917,16 @@ fn collect_console_commitment_inference_diagnostics() -> Value {
             "failed": crate::commitments::HYBRID_INFERRED_COMMITMENTS_EVENT_FAILED,
         },
         "redaction_level": crate::commitments::HYBRID_INFERRED_COMMITMENTS_REDACTION_LEVEL,
-        "runtime_behavior": "operator_opt_in_review_candidates_only",
-    })
+        "runtime_behavior": "bounded_post_turn_review_candidates_only",
+        "post_turn": {
+            "schema_version": crate::commitments::POST_TURN_COMMITMENT_EXTRACTION_SCHEMA_VERSION,
+            "rollout_mode": crate::commitments::POST_TURN_COMMITMENT_EXTRACTION_ROLLOUT,
+            "metadata_trace_event": crate::commitments::POST_TURN_COMMITMENT_EXTRACTION_EVENT,
+            "selection": "deterministic_sampling_and_value_heuristic",
+            "candidate_only": true,
+        },
+        "owner_scoped_counts": candidate_counts,
+    }))
 }
 
 /// Summarizes the observe-only heartbeat delivery projection contract.

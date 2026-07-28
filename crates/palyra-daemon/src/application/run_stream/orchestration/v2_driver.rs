@@ -1860,9 +1860,25 @@ async fn settle_v2_receipt(
     let deferred_reply = retained_text
         .as_deref()
         .map(|text| V2DeferredReplyProjection::prepare(run_id, text, *model_token_tape_events));
-    let terminal_tape_events = deferred_reply
+    let mut terminal_tape_events = deferred_reply
         .as_ref()
         .map_or_else(Vec::new, |projection| projection.terminal_tape_events.clone());
+    if let Some(text) = retained_text.as_deref() {
+        let commitment_projection = super::persist_post_turn_commitment_candidates(
+            runtime_state,
+            request_context,
+            session_id,
+            run_id,
+            text,
+        )
+        .await;
+        terminal_tape_events.push(OrchestratorTerminalTapeEvent {
+            event_type: crate::commitments::POST_TURN_COMMITMENT_EXTRACTION_EVENT.to_owned(),
+            payload_json: serde_json::to_string(&commitment_projection).map_err(|error| {
+                Status::internal(format!("failed to encode commitment projection: {error}"))
+            })?,
+        });
+    }
     // The receipt acknowledges an already-durable kernel terminal event. Close
     // the outer lifecycle before host projection can fail; cancel cannot reclassify it.
     let (projection, lifecycle_settlement) = converge_authoritative_v2_lifecycle(

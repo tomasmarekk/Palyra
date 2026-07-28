@@ -88,7 +88,7 @@ use crate::journal::state_health::{
     JournalWalCheckpointReport, SidecarIndexDescriptor,
 };
 use crate::journal::{
-    ChildCompletionReconcileReport, CommitmentCreateRequest,
+    ChildCompletionReconcileReport, CommitmentCandidateV2Diagnostics, CommitmentCreateRequest,
     CommitmentDeliveryAttemptCreateRequest, CommitmentDeliveryAttemptRecord, CommitmentEventRecord,
     CommitmentListFilter, CommitmentRecord, CommitmentSourceRecord, CommitmentUpdateRequest,
     FlowBundleRecord, FlowCreateRequest, FlowDependenciesQuarantineRequest,
@@ -15060,6 +15060,28 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.create_commitment_blocking(&request))
             .await
             .map_err(|_| Status::internal("commitment create worker panicked"))?
+    }
+
+    /// Returns owner-scoped, redacted V2 commitment candidate counts.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn commitment_candidate_v2_diagnostics(
+        self: &Arc<Self>,
+        owner_principal: String,
+    ) -> Result<CommitmentCandidateV2Diagnostics, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .commitment_candidate_v2_diagnostics(owner_principal.as_str())
+                .map_err(|error| {
+                    map_orchestrator_store_error("read commitment candidate diagnostics", error)
+                })
+        })
+        .await
+        .map_err(|_| Status::internal("commitment candidate diagnostics worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

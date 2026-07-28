@@ -81,6 +81,7 @@ use crate::{
 
 pub(crate) mod autonomy;
 pub mod child_completion;
+pub(crate) mod commitment_candidates;
 pub(crate) mod lifecycle;
 mod metadata_trace;
 pub(crate) mod objective_continuation;
@@ -103,6 +104,10 @@ pub use autonomy::{
     ParentWaitPolicy,
 };
 pub use child_completion::ChildCompletionReconcileReport;
+pub(crate) use commitment_candidates::{
+    CommitmentCandidateSensitivity, CommitmentCandidateV2, CommitmentCandidateV2Diagnostics,
+    CommitmentEvidenceSpanV2, COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
+};
 pub(crate) use objective_guards::{
     ObjectiveGuardDisposition, ObjectiveGuardEvaluation, ObjectiveGuardEvaluationRequest,
     ObjectiveGuardPolicy, ObjectiveProgressObservation, ObjectiveVerificationStatus,
@@ -3560,6 +3565,7 @@ pub struct CommitmentCreateRequest {
     pub tape_start_seq: Option<i64>,
     pub tape_end_seq: Option<i64>,
     pub evidence_json: String,
+    pub candidate_v2: Option<CommitmentCandidateV2>,
     pub actor_principal: String,
 }
 
@@ -7517,6 +7523,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 89,
         name: "objective_guards_and_plan_links",
         sql: objective_guards::MIGRATION_89_SQL,
+    },
+    Migration {
+        version: 90,
+        name: "commitment_candidates_v2",
+        sql: commitment_candidates::MIGRATION_90_SQL,
     },
 ];
 
@@ -20524,10 +20535,46 @@ impl JournalStore {
                 "confidence_bps must be in 0..=10000".to_owned(),
             ));
         }
+        if let Some(candidate) = request.candidate_v2.as_ref() {
+            commitment_candidates::validate_candidate(candidate)?;
+            if request.status != "proposed" || request.approval_requirement != "manual_review" {
+                return Err(JournalError::InvalidArgument(
+                    "V2 commitment candidates must remain proposed and require manual_review"
+                        .to_owned(),
+                ));
+            }
+            if candidate.confidence_bps != request.confidence_bps
+                || candidate.recurrence_json != request.recurrence_json
+            {
+                return Err(JournalError::InvalidArgument(
+                    "V2 commitment candidate evidence must match the commitment request".to_owned(),
+                ));
+            }
+            let scheduler_binding =
+                serde_json::from_str::<Value>(request.scheduler_binding_json.as_str())?;
+            if scheduler_binding.pointer("/type").and_then(Value::as_str) != Some("none")
+                || scheduler_binding.pointer("/state").and_then(Value::as_str)
+                    != Some("awaiting_review")
+            {
+                return Err(JournalError::InvalidArgument(
+                    "V2 commitment candidates cannot have an authoritative scheduler binding"
+                        .to_owned(),
+                ));
+            }
+        }
 
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let transaction = guard.transaction()?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(candidate) = request.candidate_v2.as_ref() {
+            if let Some(existing) = commitment_candidates::query_deduped_commitment(
+                &transaction,
+                request.owner_principal.as_str(),
+                candidate.dedupe_key.as_str(),
+            )? {
+                return Ok(existing);
+            }
+        }
         match transaction.execute(
             r#"
                 INSERT INTO commitments (
@@ -20610,6 +20657,9 @@ impl JournalStore {
                 created_at_unix_ms: now,
             },
         )?;
+        if let Some(candidate) = request.candidate_v2.as_ref() {
+            commitment_candidates::insert_candidate(&transaction, request, candidate, now)?;
+        }
         insert_commitment_event(
             &transaction,
             CommitmentEventInsert {
@@ -33504,7 +33554,8 @@ mod tests {
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
         ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType,
         ApprovalsListFilter, BackgroundTaskChildResolution, CanvasStateTransitionRequest,
-        CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter,
+        CommitmentCandidateSensitivity, CommitmentCandidateV2, CommitmentCreateRequest,
+        CommitmentDeliveryAttemptCreateRequest, CommitmentEvidenceSpanV2, CommitmentListFilter,
         CommitmentUpdateRequest, CompatResponseUpsertRequest, CronConcurrencyPolicy,
         CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
         CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
@@ -33551,8 +33602,9 @@ mod tests {
         TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter, WorkItemCreateRequest,
         WorkItemUpdateRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
         WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest,
-        WorkspaceSearchRequest, CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS,
-        MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
+        WorkspaceSearchRequest, COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
+        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
+        MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
         NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
         NETWORKED_WORKER_EXPIRY_MAX_ENTRIES, NETWORKED_WORKER_FLEET_MAX_ENTRIES,
         RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
@@ -47241,6 +47293,7 @@ mod tests {
                 tape_start_seq: Some(1),
                 tape_end_seq: Some(3),
                 evidence_json: r#"{"quote":"Remind me tomorrow"}"#.to_owned(),
+                candidate_v2: None,
                 actor_principal: "user:ops".to_owned(),
             })
             .expect("commitment should be created");
@@ -47312,6 +47365,101 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn commitment_candidate_dedupe_survives_dismissal_and_reopen() {
+        let db_path = temp_db_path();
+        let config = test_journal_config(db_path.clone(), false);
+        let store = JournalStore::open(config.clone()).expect("journal store should open");
+        let request = |commitment_id: &str| CommitmentCreateRequest {
+            commitment_id: commitment_id.to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            run_id: None,
+            user_wording: "I will send the report every week".to_owned(),
+            normalized_action: "i will send the report every week".to_owned(),
+            due_condition_json: r#"{"type":"unspecified"}"#.to_owned(),
+            recurrence_json:
+                r#"{"type":"interval","unit":"week","every":1,"review_required":true}"#.to_owned(),
+            channel_binding_json: r#"{"type":"console_review"}"#.to_owned(),
+            approval_requirement: "manual_review".to_owned(),
+            privacy_label: "user_visible".to_owned(),
+            status: "proposed".to_owned(),
+            confidence_bps: 7_500,
+            extraction_model: "deterministic.commitment-extractor.v2".to_owned(),
+            review_reason: "test".to_owned(),
+            scheduler_binding_json:
+                r#"{"type":"none","state":"awaiting_review","candidate_kind":"explicit"}"#
+                    .to_owned(),
+            due_at_unix_ms: None,
+            source_kind: "post_run_text".to_owned(),
+            tape_start_seq: None,
+            tape_end_seq: None,
+            evidence_json: r#"{"source":"redacted"}"#.to_owned(),
+            candidate_v2: Some(CommitmentCandidateV2 {
+                schema_version: COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
+                evidence_span: CommitmentEvidenceSpanV2 {
+                    start_byte: 0,
+                    end_byte: 34,
+                    redacted_text_sha256: "a".repeat(64),
+                },
+                confidence_bps: 7_500,
+                recurrence_json:
+                    r#"{"type":"interval","unit":"week","every":1,"review_required":true}"#
+                        .to_owned(),
+                sensitivity: CommitmentCandidateSensitivity::General,
+                dedupe_key: "b".repeat(64),
+                extraction_reason_code: "hybrid_commitments.explicit_language".to_owned(),
+                selection_reason_code: "commitment.extraction.high_value".to_owned(),
+                value_score_bps: 9_000,
+                sample_bucket_bps: 42,
+                source_sha256: "c".repeat(64),
+            }),
+            actor_principal: "system:commitment-extractor".to_owned(),
+        };
+
+        let first = store.create_commitment(&request("candidate-1")).expect("first candidate");
+        store
+            .update_commitment(&CommitmentUpdateRequest {
+                commitment_id: first.commitment_id.clone(),
+                expected_status: Some("proposed".to_owned()),
+                status: Some("dismissed".to_owned()),
+                user_wording: None,
+                normalized_action: None,
+                due_condition_json: None,
+                recurrence_json: None,
+                channel_binding_json: None,
+                approval_requirement: None,
+                privacy_label: None,
+                review_reason: None,
+                scheduler_binding_json: None,
+                due_at_unix_ms: None,
+                scheduled_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                actor_principal: "user:ops".to_owned(),
+                event_type: "commitment.dismissed".to_owned(),
+                summary: "dismissed".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .expect("candidate should be dismissed");
+        let duplicate =
+            store.create_commitment(&request("candidate-2")).expect("duplicate should replay");
+        assert_eq!(duplicate.commitment_id, first.commitment_id);
+        assert_eq!(duplicate.status, "dismissed");
+        drop(store);
+
+        let reopened = JournalStore::open(config).expect("journal should reopen");
+        let after_reopen =
+            reopened.create_commitment(&request("candidate-3")).expect("dedupe should survive");
+        assert_eq!(after_reopen.commitment_id, first.commitment_id);
+        let diagnostics = reopened
+            .commitment_candidate_v2_diagnostics("user:ops")
+            .expect("candidate diagnostics should load");
+        assert_eq!(diagnostics.total_candidates, 1);
+        assert_eq!(diagnostics.recurring_candidates, 1);
     }
 
     #[test]

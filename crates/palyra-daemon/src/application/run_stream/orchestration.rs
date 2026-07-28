@@ -108,6 +108,11 @@ use crate::{
         snapshot_to_provider_request_value, tool_catalog_tape_payload,
         ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolExposureSurface,
     },
+    commitments::{
+        build_commitment_create_plan, select_post_turn_commitment_extraction,
+        CommitmentExtractionInput, PostTurnCommitmentExtractionProjection,
+        POST_TURN_COMMITMENT_EXTRACTION_EVENT,
+    },
     delegation::DelegationSnapshot,
     gateway::{
         canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort,
@@ -3515,6 +3520,24 @@ async fn persist_accepted_final_reply(
     reply_text: &str,
 ) -> Result<(), Status> {
     persist_run_stream_reply_text(runtime_state, run_id, tape_seq, reply_text).await?;
+    let commitment_projection = persist_post_turn_commitment_candidates(
+        runtime_state,
+        request_context,
+        session_id_for_message,
+        run_id,
+        reply_text,
+    )
+    .await;
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        POST_TURN_COMMITMENT_EXTRACTION_EVENT,
+        serde_json::to_string(&commitment_projection).map_err(|error| {
+            Status::internal(format!("failed to encode commitment projection: {error}"))
+        })?,
+    )
+    .await?;
     persist_accepted_final_reply_side_effects(
         runtime_state,
         request_context,
@@ -3524,6 +3547,56 @@ async fn persist_accepted_final_reply(
     )
     .await;
     Ok(())
+}
+
+async fn persist_post_turn_commitment_candidates(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    reply_text: &str,
+) -> PostTurnCommitmentExtractionProjection {
+    let mut decision = select_post_turn_commitment_extraction(run_id, reply_text);
+    if !decision.projection.selected {
+        return decision.projection;
+    }
+    let plan = build_commitment_create_plan(
+        &CommitmentExtractionInput {
+            owner_principal: request_context.principal.clone(),
+            device_id: request_context.device_id.clone(),
+            channel: request_context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            run_id: Some(run_id.to_owned()),
+            source_text: decision.source_text,
+            extraction_model: Some("deterministic.commitment-extractor.v2".to_owned()),
+            include_inferred: false,
+            auxiliary_selection: Some(decision.selection),
+        },
+        "system:commitment-extractor",
+    );
+    for request in plan.requests {
+        let requested_id = request.commitment_id.clone();
+        match runtime_state.create_commitment(request).await {
+            Ok(record) if record.commitment_id == requested_id => {
+                decision.projection.extracted_candidates =
+                    decision.projection.extracted_candidates.saturating_add(1);
+            }
+            Ok(_) => {
+                decision.projection.deduplicated_candidates =
+                    decision.projection.deduplicated_candidates.saturating_add(1);
+            }
+            Err(error) => {
+                warn!(
+                    run_id,
+                    status_code = ?error.code(),
+                    "post-turn commitment candidate persistence failed"
+                );
+                decision.projection.failed_candidates =
+                    decision.projection.failed_candidates.saturating_add(1);
+            }
+        }
+    }
+    decision.projection
 }
 
 async fn persist_accepted_final_reply_side_effects(

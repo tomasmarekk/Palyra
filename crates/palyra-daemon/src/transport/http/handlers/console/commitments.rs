@@ -210,6 +210,7 @@ pub(crate) async fn console_commitments_extract_handler(
         source_text: body.source_text,
         extraction_model: body.extraction_model,
         include_inferred: body.include_inferred,
+        auxiliary_selection: None,
     };
     let plan = build_commitment_create_plan(&input, session.context.principal.as_str());
     let mut commitments = Vec::new();
