@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio::{sync::mpsc, time::timeout};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::{
@@ -86,6 +86,10 @@ use crate::{
 };
 
 const RUN_STREAM_TRAILING_MESSAGE_GRACE: Duration = Duration::from_millis(10);
+
+fn is_stale_trailing_approval_response(message: &common_v1::RunStreamRequest) -> bool {
+    message.input.is_none() && message.tool_approval_response.is_some()
+}
 
 /// Tonic service adapter for the main Palyra gateway protocol.
 #[derive(Clone)]
@@ -2286,11 +2290,28 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     RunStreamMessageProcessingOutcome::Terminate => return,
                     RunStreamMessageProcessingOutcome::Suspended => return,
                     RunStreamMessageProcessingOutcome::Continue => {
-                        match timeout(RUN_STREAM_TRAILING_MESSAGE_GRACE, stream.next()).await {
-                            Ok(Some(next_item)) => {
-                                pending_item = Some(next_item);
+                        loop {
+                            match timeout(RUN_STREAM_TRAILING_MESSAGE_GRACE, stream.next()).await {
+                                Ok(Some(Ok(message)))
+                                    if is_stale_trailing_approval_response(&message) =>
+                                {
+                                    // A console decision is persisted before its mirrored stream
+                                    // response arrives. If durable resolution won that race, the
+                                    // mirror is stale and must not start another model turn.
+                                    debug!(
+                                        run_id = active_run_id.as_deref().unwrap_or("unknown"),
+                                        "discarded stale trailing tool approval response"
+                                    );
+                                }
+                                Ok(Some(next_item)) => {
+                                    pending_item = Some(next_item);
+                                    break;
+                                }
+                                Ok(None) | Err(_) => break,
                             }
-                            Ok(None) | Err(_) => break,
+                        }
+                        if pending_item.is_none() {
+                            break;
                         }
                     }
                 }

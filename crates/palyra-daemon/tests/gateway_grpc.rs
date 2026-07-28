@@ -8680,8 +8680,13 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
             "payload": "external-approval-decision"
         }),
     )?;
-    let (openai_base_url, _request_count, server_handle) =
-        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"approval flow complete"}}]}"#
+            .to_owned();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, response_body),
+        ScriptedOpenAiResponse::immediate(200, final_response),
+    ])?;
     let console_principal = "admin:web-console";
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
@@ -8721,6 +8726,8 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
     let mut saw_approval_request = false;
     let mut saw_external_approval_response = false;
     let mut saw_tool_result = false;
+    let mut saw_done = false;
+    let mut model_tokens = Vec::new();
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(8), response_stream.next())
             .await
@@ -8776,11 +8783,16 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
                     );
                     saw_tool_result = true;
                 }
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
                 _ => {}
             }
-        }
-        if saw_approval_request && saw_external_approval_response && saw_tool_result {
-            break;
         }
     }
 
@@ -8790,6 +8802,13 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
         "external console decision should be reflected back into the active RunStream"
     );
     assert!(saw_tool_result, "externally approved tool call should continue to execution");
+    assert_eq!(model_tokens.concat(), "approval flow complete");
+    assert!(saw_done, "external approval run should reach terminal success");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        2,
+        "the mirrored approval response must not start a third provider turn"
+    );
 
     drop(request_sender);
     server_handle.join().expect("scripted openai server thread should exit");
