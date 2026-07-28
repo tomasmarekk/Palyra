@@ -38,9 +38,9 @@ bash "$ROOT_DIR/scripts/test/ensure-js-workspace.sh"
 
 bash "$ROOT_DIR/scripts/test/ensure-desktop-ui.sh"
 
-"$CARGO_BIN" test -p palyra-daemon --locked retention_housekeeping
-"$CARGO_BIN" test -p palyra-auth --locked refresh_due_profiles_marks_transport_failure_without_retry_spam
-"$CARGO_BIN" test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked desktop_refresh_payload_reuses_single_snapshot_build_for_home_and_onboarding_views
-"$CARGO_BIN" test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked support_bundle_export_plan_capture_does_not_hold_supervisor_lock
+"$CARGO_BIN" test -p palyra-daemon --lib --locked retention_housekeeping
+"$CARGO_BIN" test -p palyra-auth --lib --locked refresh_due_profiles_marks_transport_failure_without_retry_spam
+"$CARGO_BIN" test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked desktop_refresh_payload_reuses_single_snapshot_build_for_home_and_onboarding_views
+"$CARGO_BIN" test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked support_bundle_export_plan_capture_does_not_hold_supervisor_lock
 
 npm run web:perf-smoke
