@@ -18,6 +18,7 @@ pub(crate) mod os_file;
 pub(crate) mod plan;
 pub(crate) mod process_registry;
 pub(crate) mod routines;
+pub(crate) mod session_operations;
 pub(crate) mod tool_program;
 pub(crate) mod tool_rpc;
 pub(crate) mod workspace_file;

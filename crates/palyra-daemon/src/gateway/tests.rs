@@ -2109,6 +2109,7 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
 
     let outcome = state
         .admit_session_queued_input(SessionQueueAdmissionRequest {
+            queued_input_id: None,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             origin_run_id: None,

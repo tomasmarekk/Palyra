@@ -161,6 +161,9 @@ const SAFE_CHAT_PROFILE_TOOLS: &[&str] = &[
     "palyra.clarify.ask",
     "palyra.routines.query",
     "palyra.delegation.query",
+    "sessions_list",
+    "sessions_status",
+    "sessions_history",
     "palyra.artifact.read",
     "palyra.image.observe",
 ];
@@ -231,6 +234,13 @@ const AUTOMATION_PROFILE_TOOLS: &[&str] = &[
     "palyra.delegation.control",
     "sessions_spawn",
     "sessions_yield",
+    "sessions_list",
+    "sessions_status",
+    "sessions_history",
+    "sessions_send",
+    "sessions_steer",
+    "sessions_interrupt",
+    "sessions_switch_model",
     "palyra.http.fetch",
     "palyra.browser.session.create",
     "palyra.browser.session.close",
@@ -483,7 +493,18 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.delegation.control" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
-        "sessions_spawn" | "sessions_yield" => {
+        "sessions_list" | "sessions_status" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "sessions_history" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "sessions_spawn"
+        | "sessions_yield"
+        | "sessions_send"
+        | "sessions_steer"
+        | "sessions_interrupt"
+        | "sessions_switch_model" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.plan.manage" => {
@@ -770,6 +791,20 @@ mod tests {
 
         assert!(report.effective_allowed_tools.contains(&"sessions_spawn".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"sessions_yield".to_owned()));
+        for tool_name in [
+            "sessions_list",
+            "sessions_status",
+            "sessions_history",
+            "sessions_send",
+            "sessions_steer",
+            "sessions_interrupt",
+            "sessions_switch_model",
+        ] {
+            assert!(
+                report.effective_allowed_tools.contains(&tool_name.to_owned()),
+                "automation profile should expose {tool_name}"
+            );
+        }
     }
 
     #[test]

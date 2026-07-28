@@ -139,7 +139,9 @@ use crate::journal::{
     RuntimeHealthProbeReconciliationMode, RuntimeHealthProbeReconciliationOutcome,
     RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
     RuntimeHealthQuarantineClearOutcome, RuntimeHealthQuarantineClearRequest,
-    RuntimeStaleEventDiagnosticRequest, SessionProjectContextStateCopyRequest,
+    RuntimeStaleEventDiagnosticRequest, ScopedSessionRuntimeGeneration, SessionModelCommandRecord,
+    SessionModelCommandReserveOutcome, SessionModelCommandReserveRequest,
+    SessionModelCommandSettlementRequest, SessionProjectContextStateCopyRequest,
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
     SessionSearchOutcome, SessionSearchRequest, SessionWriteLeaseRecord, SharedRuntimeDiagnostics,
     SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
@@ -938,6 +940,7 @@ pub struct OrchestratorRunWaitOutcome {
 /// Request for the shared session queue admission path.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionQueueAdmissionRequest {
+    pub(crate) queued_input_id: Option<String>,
     pub(crate) session_id: String,
     pub(crate) run_id: String,
     pub(crate) origin_run_id: Option<String>,
@@ -12420,7 +12423,7 @@ impl GatewayRuntimeState {
             Status::failed_precondition("runtime generation exceeds the journal integer range")
         })?;
         let timestamp_unix_ms = current_unix_ms();
-        let queued_input_id = Ulid::new().to_string();
+        let queued_input_id = request.queued_input_id.unwrap_or_else(|| Ulid::new().to_string());
         let queued_state = if !decision.accepted {
             QueuedInputState::Overflowed
         } else if decision.decision == QueueDecision::Defer {
@@ -13411,6 +13414,124 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn list_bounded_orchestrator_session_transcript_blocking(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<OrchestratorSessionTranscriptRecord>, Status> {
+        self.journal_store.list_bounded_orchestrator_session_transcript(session_id, limit).map_err(
+            |error| {
+                map_orchestrator_store_error("load bounded orchestrator session transcript", error)
+            },
+        )
+    }
+
+    /// Loads only the newest bounded transcript window for a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_bounded_orchestrator_session_transcript(
+        self: &Arc<Self>,
+        session_id: String,
+        limit: usize,
+    ) -> Result<Vec<OrchestratorSessionTranscriptRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_bounded_orchestrator_session_transcript_blocking(session_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("bounded orchestrator transcript worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_scoped_session_runtime_generations_blocking(
+        &self,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<ScopedSessionRuntimeGeneration>, Status> {
+        self.journal_store
+            .list_scoped_session_runtime_generations(principal, device_id, channel)
+            .map_err(|error| {
+                map_orchestrator_store_error("list scoped session runtime generations", error)
+            })
+    }
+
+    /// Lists active run generations for one exact session owner scope.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_scoped_session_runtime_generations(
+        self: &Arc<Self>,
+        principal: String,
+        device_id: String,
+        channel: Option<String>,
+    ) -> Result<Vec<ScopedSessionRuntimeGeneration>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_scoped_session_runtime_generations_blocking(
+                principal.as_str(),
+                device_id.as_str(),
+                channel.as_deref(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("session generation list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn reserve_session_model_command_blocking(
+        &self,
+        request: &SessionModelCommandReserveRequest,
+    ) -> Result<SessionModelCommandReserveOutcome, Status> {
+        self.journal_store.reserve_session_model_command(request).map_err(|error| {
+            map_orchestrator_store_error("reserve model-visible session command", error)
+        })
+    }
+
+    /// Reserves a model-visible session command before its queue/control effect.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn reserve_session_model_command(
+        self: &Arc<Self>,
+        request: SessionModelCommandReserveRequest,
+    ) -> Result<SessionModelCommandReserveOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.reserve_session_model_command_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("session command reservation worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn settle_session_model_command_blocking(
+        &self,
+        request: &SessionModelCommandSettlementRequest,
+    ) -> Result<SessionModelCommandRecord, Status> {
+        self.journal_store.settle_session_model_command(request).map_err(|error| {
+            map_orchestrator_store_error("settle model-visible session command", error)
+        })
+    }
+
+    /// Attaches the observable queue/control result to a reserved command.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn settle_session_model_command(
+        self: &Arc<Self>,
+        request: SessionModelCommandSettlementRequest,
+    ) -> Result<SessionModelCommandRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.settle_session_model_command_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("session command settlement worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn latest_orchestrator_session_transcript_event_blocking(
         &self,
         session_id: &str,
@@ -13546,6 +13667,33 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator queued input worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn orchestrator_queued_input_by_id_blocking(
+        &self,
+        queued_input_id: &str,
+    ) -> Result<Option<OrchestratorQueuedInputRecord>, Status> {
+        self.journal_store
+            .orchestrator_queued_input_by_id(queued_input_id)
+            .map_err(|error| map_orchestrator_store_error("load queued orchestrator input", error))
+    }
+
+    /// Loads one durable queued input for command replay reconciliation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn orchestrator_queued_input_by_id(
+        self: &Arc<Self>,
+        queued_input_id: String,
+    ) -> Result<Option<OrchestratorQueuedInputRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.orchestrator_queued_input_by_id_blocking(queued_input_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("queued input lookup worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

@@ -1024,6 +1024,21 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "delegation_scope".to_owned(),
             execution_manifest: None,
         },
+        "sessions_list"
+        | "sessions_status"
+        | "sessions_history"
+        | "sessions_send"
+        | "sessions_steer"
+        | "sessions_interrupt"
+        | "sessions_switch_model" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("{tool_name} requires gateway session operations runtime context"),
+            timed_out: false,
+            executor: "session_operations_runtime".to_owned(),
+            sandbox_enforcement: "session_lineage_scope".to_owned(),
+            execution_manifest: None,
+        },
         "palyra.artifact.read" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1233,6 +1248,13 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.delegation.control"
                 | "sessions_spawn"
                 | "sessions_yield"
+                | "sessions_list"
+                | "sessions_status"
+                | "sessions_history"
+                | "sessions_send"
+                | "sessions_steer"
+                | "sessions_interrupt"
+                | "sessions_switch_model"
                 | "palyra.artifact.read"
                 | "palyra.image.observe"
                 | "palyra.http.fetch"
@@ -1339,8 +1361,28 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
             | "palyra.delegation.control"
             | "sessions_spawn"
             | "sessions_yield"
+            | "sessions_list"
+            | "sessions_status"
+            | "sessions_history"
+            | "sessions_send"
+            | "sessions_steer"
+            | "sessions_interrupt"
+            | "sessions_switch_model"
     ) {
-        "delegation_runtime".to_owned()
+        if matches!(
+            tool_name,
+            "sessions_list"
+                | "sessions_status"
+                | "sessions_history"
+                | "sessions_send"
+                | "sessions_steer"
+                | "sessions_interrupt"
+                | "sessions_switch_model"
+        ) {
+            "session_operations_runtime".to_owned()
+        } else {
+            "delegation_runtime".to_owned()
+        }
     } else if tool_name == "palyra.artifact.read" {
         "gateway_artifacts".to_owned()
     } else if tool_name == "palyra.plugin.run" {
@@ -1375,9 +1417,16 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.routines.query" => MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES,
         "palyra.routines.control" => MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES,
         "palyra.delegation.query" => MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES,
-        "palyra.delegation.control" | "sessions_spawn" | "sessions_yield" => {
-            MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES
-        }
+        "palyra.delegation.control"
+        | "sessions_spawn"
+        | "sessions_yield"
+        | "sessions_list"
+        | "sessions_status"
+        | "sessions_history"
+        | "sessions_send"
+        | "sessions_steer"
+        | "sessions_interrupt"
+        | "sessions_switch_model" => MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES,
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
         tool_name if is_mcp_utility_tool(tool_name) => MAX_MCP_UTILITY_TOOL_INPUT_BYTES,
@@ -1467,8 +1516,28 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
             | "palyra.delegation.control"
             | "sessions_spawn"
             | "sessions_yield"
+            | "sessions_list"
+            | "sessions_status"
+            | "sessions_history"
+            | "sessions_send"
+            | "sessions_steer"
+            | "sessions_interrupt"
+            | "sessions_switch_model"
     ) {
-        "delegation_scope".to_owned()
+        if matches!(
+            tool_name,
+            "sessions_list"
+                | "sessions_status"
+                | "sessions_history"
+                | "sessions_send"
+                | "sessions_steer"
+                | "sessions_interrupt"
+                | "sessions_switch_model"
+        ) {
+            "session_lineage_scope".to_owned()
+        } else {
+            "delegation_scope".to_owned()
+        }
     } else {
         "none".to_owned()
     }
@@ -2871,6 +2940,38 @@ mod tests {
             );
             assert_eq!(outcome.attestation.executor, "delegation_runtime");
             assert_eq!(outcome.attestation.sandbox_enforcement, "delegation_scope");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_session_operation_tools_require_gateway_runtime_context() {
+        for tool_name in [
+            "sessions_list",
+            "sessions_status",
+            "sessions_history",
+            "sessions_send",
+            "sessions_steer",
+            "sessions_interrupt",
+            "sessions_switch_model",
+        ] {
+            let config = ToolCallConfig {
+                allowed_tools: vec![tool_name.to_owned()],
+                max_calls_per_run: 1,
+                execution_timeout_ms: 250,
+                process_runner: default_process_runner_policy(),
+                wasm_runtime: default_wasm_runtime_policy(),
+            };
+            let outcome =
+                execute_tool_call(&config, "01ARZ3NDEKTSV4RRFFQ69G5FAD", tool_name, br#"{}"#).await;
+
+            assert!(!outcome.success, "generic tool executor should not run {tool_name}");
+            assert!(
+                outcome.error.contains("requires gateway session operations runtime context"),
+                "session executor error should be explicit: {}",
+                outcome.error
+            );
+            assert_eq!(outcome.attestation.executor, "session_operations_runtime");
+            assert_eq!(outcome.attestation.sandbox_enforcement, "session_lineage_scope");
         }
     }
 

@@ -242,6 +242,13 @@ pub(crate) const DELEGATION_QUERY_TOOL_NAME: &str = "palyra.delegation.query";
 pub(crate) const DELEGATION_CONTROL_TOOL_NAME: &str = "palyra.delegation.control";
 pub(crate) const SESSIONS_SPAWN_TOOL_NAME: &str = "sessions_spawn";
 pub(crate) const SESSIONS_YIELD_TOOL_NAME: &str = "sessions_yield";
+pub(crate) const SESSIONS_LIST_TOOL_NAME: &str = "sessions_list";
+pub(crate) const SESSIONS_STATUS_TOOL_NAME: &str = "sessions_status";
+pub(crate) const SESSIONS_HISTORY_TOOL_NAME: &str = "sessions_history";
+pub(crate) const SESSIONS_SEND_TOOL_NAME: &str = "sessions_send";
+pub(crate) const SESSIONS_STEER_TOOL_NAME: &str = "sessions_steer";
+pub(crate) const SESSIONS_INTERRUPT_TOOL_NAME: &str = "sessions_interrupt";
+pub(crate) const SESSIONS_SWITCH_MODEL_TOOL_NAME: &str = "sessions_switch_model";
 pub(crate) const PLAN_MANAGE_TOOL_NAME: &str = "palyra.plan.manage";
 pub(crate) const WORKSPACE_READ_FILE_TOOL_NAME: &str = "palyra.fs.read_file";
 pub(crate) const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "palyra.fs.list_dir";
@@ -1056,6 +1063,24 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             proposal_id,
             input_json,
             controls.child_task_parent_context.as_ref(),
+        )
+        .await
+    } else if matches!(
+        tool_name,
+        SESSIONS_LIST_TOOL_NAME
+            | SESSIONS_STATUS_TOOL_NAME
+            | SESSIONS_HISTORY_TOOL_NAME
+            | SESSIONS_SEND_TOOL_NAME
+            | SESSIONS_STEER_TOOL_NAME
+            | SESSIONS_INTERRUPT_TOOL_NAME
+            | SESSIONS_SWITCH_MODEL_TOOL_NAME
+    ) {
+        crate::application::tool_runtime::session_operations::execute_session_operation_tool(
+            runtime_state,
+            context,
+            tool_name,
+            proposal_id,
+            input_json,
         )
         .await
     } else if tool_name == PLAN_MANAGE_TOOL_NAME {

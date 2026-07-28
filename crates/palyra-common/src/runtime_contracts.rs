@@ -115,6 +115,7 @@ mod generation;
 mod handles;
 mod health;
 mod identities;
+mod session_operations;
 mod side_effects;
 
 pub use compatibility::*;
@@ -125,6 +126,7 @@ pub use generation::*;
 pub use handles::*;
 pub use health::*;
 pub use identities::*;
+pub use session_operations::*;
 pub use side_effects::*;
 
 use serde::{Deserialize, Serialize};

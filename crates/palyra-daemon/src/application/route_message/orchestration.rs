@@ -517,6 +517,7 @@ pub(crate) async fn handle_routed_route_message(
             plan.route_target.as_ref().and_then(|target| target.agent_id.clone());
         let queue_outcome = runtime_state
             .admit_session_queued_input(SessionQueueAdmissionRequest {
+                queued_input_id: None,
                 session_id: session_id.clone(),
                 run_id: active_run_id.clone(),
                 origin_run_id: Some(active_run_id.clone()),

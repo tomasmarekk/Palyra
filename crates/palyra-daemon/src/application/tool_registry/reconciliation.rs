@@ -311,6 +311,9 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         | "palyra.code.outline"
         | "palyra.delegation.query"
         | "sessions_yield"
+        | "sessions_list"
+        | "sessions_status"
+        | "sessions_history"
         | "palyra.process.status"
         | "palyra.process.list"
         | "palyra.browser.wait_for"
@@ -339,7 +342,11 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         }
         "palyra.http.fetch" => http_fetch_effect(input_json),
         "palyra.clarify.ask" => BuiltinToolEffectResolution::mutation(ToolMutationClass::Delivery),
+        "sessions_send" => BuiltinToolEffectResolution::mutation(ToolMutationClass::Delivery),
         "palyra.delegation.control" | "sessions_spawn" => {
+            BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
+        }
+        "sessions_steer" | "sessions_interrupt" | "sessions_switch_model" => {
             BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
         }
         "palyra.plan.manage" => plan_manage_effect(input_json),

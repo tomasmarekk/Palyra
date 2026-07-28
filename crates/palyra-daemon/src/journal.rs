@@ -87,6 +87,7 @@ mod retrieval_index_status;
 pub(crate) mod run_admission;
 pub(crate) mod runtime_finalization;
 pub(crate) mod runtime_kernel;
+pub(crate) mod session_operations;
 mod shared_runtime;
 pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
@@ -96,6 +97,11 @@ pub use autonomy::{
     ChildWakeSubscriptionCreateRequest, ParentSuspensionCreateRequest,
     ParentSuspensionReconcileReport, ParentSuspensionRecord, ParentSuspensionWakeOutcome,
     ParentWaitPolicy,
+};
+pub use session_operations::{
+    ScopedSessionRuntimeGeneration, SessionModelCommandKind, SessionModelCommandRecord,
+    SessionModelCommandReserveOutcome, SessionModelCommandReserveRequest,
+    SessionModelCommandSettlementRequest,
 };
 use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
 pub use shared_runtime::{
@@ -7481,6 +7487,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: stuck_run_remediation::MIGRATION_83_SQL,
     },
     Migration { version: 84, name: "durable_parent_suspension", sql: autonomy::MIGRATION_84_SQL },
+    Migration {
+        version: 85,
+        name: "model_visible_session_operations",
+        sql: session_operations::MIGRATION_85_SQL,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the

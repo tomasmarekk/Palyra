@@ -1126,6 +1126,197 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "sessions_list",
+            "List policy-scoped current and descendant sessions with bounded status, generation, budget, progress, and ownership-token metadata.",
+            object_schema(
+                &[],
+                vec![(
+                    "limit",
+                    json!({"type":"integer","minimum":1,"maximum":64,"description":"Maximum related session summaries to return. Defaults to 32."}),
+                )],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "sessions_status",
+            "Read the bounded status of the current session or an authorized direct child session.",
+            object_schema(
+                &["target_session_id"],
+                vec![
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Opaque session id returned by sessions_list or sessions_spawn."}),
+                    ),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":64,"description":"Reserved for compatible bounded status expansion."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "sessions_history",
+            "Read a bounded, redacted, source-referenced history window for the current session or an authorized direct child.",
+            object_schema(
+                &["target_session_id"],
+                vec![
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Opaque session id returned by sessions_list or sessions_spawn."}),
+                    ),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":32,"description":"Maximum transcript events to return. Defaults to 16."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
+            "sessions_send",
+            "Queue a bounded, redacted message for an authorized direct child through the durable session queue.",
+            object_schema(
+                &["request_id", "target_session_id", "ownership_token", "message"],
+                vec![
+                    (
+                        "request_id",
+                        json!({"type":"string","maxLength":128,"description":"Caller-stable idempotency key for this send."}),
+                    ),
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Direct child session id."}),
+                    ),
+                    (
+                        "ownership_token",
+                        json!({"type":"string","maxLength":128,"description":"Opaque task capability returned by sessions_spawn or sessions_list."}),
+                    ),
+                    (
+                        "message",
+                        json!({"type":"string","maxLength":4096,"description":"Message queued for the child; secrets are redacted before persistence."}),
+                    ),
+                    (
+                        "expected_generation",
+                        json!({"type":"integer","minimum":1,"description":"Optional target generation observed through sessions_status."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "sessions_steer",
+            "Steer an authorized child at a safe boundary with explicit generation fencing and durable supersede evidence.",
+            object_schema(
+                &["request_id", "target_session_id", "ownership_token", "instruction"],
+                vec![
+                    (
+                        "request_id",
+                        json!({"type":"string","maxLength":128,"description":"Caller-stable idempotency key for this steer."}),
+                    ),
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Authorized child session id."}),
+                    ),
+                    (
+                        "ownership_token",
+                        json!({"type":"string","maxLength":128,"description":"Opaque task capability returned by sessions_spawn or sessions_list."}),
+                    ),
+                    (
+                        "instruction",
+                        json!({"type":"string","maxLength":8192,"description":"Replacement guidance for the child generation."}),
+                    ),
+                    (
+                        "expected_generation",
+                        json!({"type":"integer","minimum":1,"description":"Optional target generation observed through sessions_status."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "sessions_interrupt",
+            "Terminally cancel an authorized child without automatically restarting it.",
+            object_schema(
+                &["request_id", "target_session_id", "ownership_token"],
+                vec![
+                    (
+                        "request_id",
+                        json!({"type":"string","maxLength":128,"description":"Caller-stable idempotency key for this interrupt."}),
+                    ),
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Authorized child session id."}),
+                    ),
+                    (
+                        "ownership_token",
+                        json!({"type":"string","maxLength":128,"description":"Opaque task capability returned by sessions_spawn or sessions_list."}),
+                    ),
+                    (
+                        "reason",
+                        json!({"type":"string","maxLength":4096,"description":"Optional redacted cancellation reason."}),
+                    ),
+                    (
+                        "expected_generation",
+                        json!({"type":"integer","minimum":1,"description":"Optional target generation observed through sessions_status."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "sessions_switch_model",
+            "Switch an authorized child to a session-scoped model route, superseding the old generation at a safe boundary.",
+            object_schema(
+                &[
+                    "request_id",
+                    "target_session_id",
+                    "ownership_token",
+                    "model_profile",
+                ],
+                vec![
+                    (
+                        "request_id",
+                        json!({"type":"string","maxLength":128,"description":"Caller-stable idempotency key for this switch."}),
+                    ),
+                    (
+                        "target_session_id",
+                        json!({"type":"string","maxLength":128,"description":"Authorized child session id."}),
+                    ),
+                    (
+                        "ownership_token",
+                        json!({"type":"string","maxLength":128,"description":"Opaque task capability returned by sessions_spawn or sessions_list."}),
+                    ),
+                    (
+                        "model_profile",
+                        json!({"type":"string","maxLength":128,"description":"Allowed session model profile selected for the replacement generation."}),
+                    ),
+                    (
+                        "instruction",
+                        json!({"type":"string","maxLength":8192,"description":"Optional replacement-generation guidance."}),
+                    ),
+                    (
+                        "expected_generation",
+                        json!({"type":"integer","minimum":1,"description":"Optional target generation observed through sessions_status."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.http.fetch",
             "Fetch an HTTP(S) URL through Palyra SSRF, header and content-type guardrails.",
             object_schema(
@@ -2118,6 +2309,37 @@ mod tests {
             Some("summary")
         );
         assert!(entry.input_schema.pointer("/properties/partial_ok").is_some());
+    }
+
+    #[test]
+    fn session_read_tools_are_typed_and_read_only() {
+        for tool_name in ["sessions_list", "sessions_status", "sessions_history"] {
+            let entry = registry_entry(tool_name).expect("session read tool should exist");
+            assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+        }
+        let history = registry_entry("sessions_history").expect("history tool should exist");
+        assert!(history.input_schema.pointer("/properties/target_session_id").is_some());
+        assert_eq!(history.input_schema["properties"]["limit"]["maximum"], 32);
+    }
+
+    #[test]
+    fn session_mutation_tools_require_ownership_and_idempotency() {
+        for tool_name in
+            ["sessions_send", "sessions_steer", "sessions_interrupt", "sessions_switch_model"]
+        {
+            let entry = registry_entry(tool_name).expect("session mutation tool should exist");
+            assert_eq!(entry.approval_posture, ToolApprovalPosture::ApprovalRequired);
+            assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
+            let required = entry
+                .input_schema
+                .pointer("/required")
+                .and_then(serde_json::Value::as_array)
+                .expect("required fields should be visible");
+            assert!(required.iter().any(|value| value.as_str() == Some("request_id")));
+            assert!(required.iter().any(|value| value.as_str() == Some("target_session_id")));
+            assert!(required.iter().any(|value| value.as_str() == Some("ownership_token")));
+            assert!(entry.input_schema.pointer("/properties/expected_generation").is_some());
+        }
     }
 
     #[test]
