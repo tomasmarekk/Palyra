@@ -530,9 +530,23 @@ pub(crate) async fn await_tool_approval_response(
     approval_id: &str,
 ) -> Result<ToolApprovalOutcome, Status> {
     loop {
-        // Both branches are cancel-safe: `Streaming::next` yields whole
-        // messages and runtime notifications are only latency hints. The
-        // bounded timer covers receiver lag without a high-frequency poll.
+        // Register before reading durable state because `notify_waiters` does
+        // not retain a permit when no waiter exists. This ordering closes the
+        // check-then-wait race for fast external approval decisions.
+        let decision_notified = runtime_state.orchestrator_run_notify.notified();
+        tokio::pin!(decision_notified);
+        decision_notified.as_mut().enable();
+        if runtime_state.is_orchestrator_cancel_requested(expected_run_id.to_owned()).await? {
+            return Err(Status::cancelled(CANCELLED_REASON));
+        }
+        if let Some(outcome) =
+            resolved_tool_approval_record_outcome(runtime_state, approval_id).await?
+        {
+            return Ok(outcome);
+        }
+
+        // Every branch is cancel-safe: `Streaming::next` yields whole
+        // messages, and the bounded timer covers notification receiver lag.
         tokio::select! {
             item = stream.next() => {
                 let Some(item) = item else {
@@ -551,24 +565,8 @@ pub(crate) async fn await_tool_approval_response(
                     return Ok(outcome);
                 }
             }
-            () = async {
-                tokio::select! {
-                    () = runtime_state.orchestrator_run_notify.notified() => {}
-                    () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL) => {}
-                }
-            } => {
-                if runtime_state
-                    .is_orchestrator_cancel_requested(expected_run_id.to_owned())
-                    .await?
-                {
-                    return Err(Status::cancelled(CANCELLED_REASON));
-                }
-                if let Some(outcome) =
-                    resolved_tool_approval_record_outcome(runtime_state, approval_id).await?
-                {
-                    return Ok(outcome);
-                }
-            }
+            () = &mut decision_notified => {}
+            () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL) => {}
         }
     }
 }

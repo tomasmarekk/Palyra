@@ -8724,7 +8724,13 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(8), response_stream.next())
             .await
-            .context("external approval stream stalled before active tool call resumed")?;
+            .with_context(|| {
+                format!(
+                    "external approval stream stalled before active tool call resumed: \
+                     request={saw_approval_request} response={saw_external_approval_response} \
+                     tool_result={saw_tool_result}"
+                )
+            })?;
         let Some(event) = next_event else {
             break;
         };
