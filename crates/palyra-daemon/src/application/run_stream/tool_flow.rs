@@ -94,7 +94,7 @@ use crate::{
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
         RunStreamToolExecutionOutcome, SharedToolBudget, ToolApprovalOutcome,
         ToolRuntimeDispatchControls, ToolRuntimeExecutionContext, PROCESS_RUNNER_TOOL_NAME,
-        SESSIONS_SPAWN_TOOL_NAME, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+        SESSIONS_SPAWN_TOOL_NAME, SESSIONS_YIELD_TOOL_NAME, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     },
     journal::{
         ApprovalCreateRequest, ApprovalResolveRequest, OrchestratorTapeAppendRequest,
@@ -250,6 +250,8 @@ pub(crate) enum RunStreamToolProposalPreparationOutcome {
 pub(crate) enum RunStreamPreparedToolExecutionBatchOutcome {
     /// Outcomes for every proposal, in the original proposal order.
     Completed(Vec<RunStreamToolExecutionOutcome>),
+    /// A durable parent suspension committed; this provider turn must stop.
+    Suspended,
     /// A terminal settlement won mid-batch; the state machine already follows it.
     Terminal(RunLifecycleState),
 }
@@ -1142,6 +1144,9 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                 RunStreamPreparedToolExecutionBatchOutcome::Terminal(state) => {
                     return Ok(RunStreamPreparedToolExecutionBatchOutcome::Terminal(state));
                 }
+                RunStreamPreparedToolExecutionBatchOutcome::Suspended => {
+                    return Ok(RunStreamPreparedToolExecutionBatchOutcome::Suspended);
+                }
             }
         } else {
             for prepared in group.tools {
@@ -1174,6 +1179,9 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                     }
                     RunStreamToolExecutionOutcome::Terminal(state) => {
                         return Ok(RunStreamPreparedToolExecutionBatchOutcome::Terminal(state));
+                    }
+                    RunStreamToolExecutionOutcome::Suspended => {
+                        return Ok(RunStreamPreparedToolExecutionBatchOutcome::Suspended);
                     }
                 }
             }
@@ -1595,6 +1603,9 @@ async fn execute_parallel_prepared_tool_group(
         .await?;
         if let Some(error) = execution_outcome.post_execution_error {
             return Err(error);
+        }
+        if matches!(completed, RunStreamToolExecutionOutcome::Suspended) {
+            return Ok(RunStreamPreparedToolExecutionBatchOutcome::Suspended);
         }
         finalized.push(completed);
     }
@@ -3576,6 +3587,7 @@ async fn commit_and_publish_projected_tool_execution_outcome(
     side_effect_fence: Option<&ActiveToolSideEffectFence>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, ToolOutcomeFinalizationError> {
+    let suspended = sessions_yield_suspended(prepared.tool_name.as_str(), &execution_outcome);
     let transition_is_atomic =
         side_effect_fence.is_some() && !execution_outcome.attestation.timed_out;
     if transition_is_atomic {
@@ -3657,12 +3669,26 @@ async fn commit_and_publish_projected_tool_execution_outcome(
         "run_stream_tool_result",
     )
     .await;
+    if suspended {
+        return Ok(RunStreamToolExecutionOutcome::Suspended);
+    }
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: prepared.proposal_id.clone(),
         tool_name: prepared.tool_name.clone(),
         input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
+}
+
+fn sessions_yield_suspended(tool_name: &str, outcome: &ToolExecutionOutcome) -> bool {
+    if tool_name != SESSIONS_YIELD_TOOL_NAME || !outcome.success {
+        return false;
+    }
+    serde_json::from_slice::<Value>(outcome.output_json.as_slice())
+        .ok()
+        .and_then(|output| output.get("yield_outcome").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("suspended")
 }
 
 #[allow(clippy::result_large_err)]

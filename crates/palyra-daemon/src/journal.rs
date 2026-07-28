@@ -79,6 +79,7 @@ use crate::{
     retrieval::{MemoryEmbeddingsPosture, MemoryEmbeddingsRuntimeProfile},
 };
 
+pub(crate) mod autonomy;
 pub(crate) mod lifecycle;
 mod metadata_trace;
 pub(crate) mod restart;
@@ -91,6 +92,11 @@ pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
 pub(crate) mod stuck_run_remediation;
 
+pub use autonomy::{
+    ChildWakeSubscriptionCreateRequest, ParentSuspensionCreateRequest,
+    ParentSuspensionReconcileReport, ParentSuspensionRecord, ParentSuspensionWakeOutcome,
+    ParentWaitPolicy,
+};
 use shared_runtime::{append_runtime_event_tx, invalidate_runtime_generation_tx};
 pub use shared_runtime::{
     NetworkedWorkerDeliveryReservationOutcome, NetworkedWorkerDeliveryReservationRequest,
@@ -7474,6 +7480,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "stuck_run_remediation",
         sql: stuck_run_remediation::MIGRATION_83_SQL,
     },
+    Migration { version: 84, name: "durable_parent_suspension", sql: autonomy::MIGRATION_84_SQL },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -12503,6 +12510,9 @@ impl JournalStore {
                 },
                 now,
             )?;
+        }
+        if state.is_terminal() {
+            autonomy::settle_parent_suspension_for_parent_terminal_tx(&guard, run_id, state, now)?;
         }
         let defer_metadata_trace_terminalization =
             state.is_terminal() && run_has_nonterminal_process_handles_tx(&guard, run_id)?;

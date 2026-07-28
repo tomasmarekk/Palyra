@@ -6,11 +6,7 @@
 //! (`gateway::execute_tool_with_runtime_dispatch`); every free-text field is
 //! redacted before it becomes model-visible output.
 
-use std::{
-    collections::BTreeSet,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 use palyra_common::{
     redaction::{redact_auth_error, redact_url_segments_in_text},
@@ -36,9 +32,10 @@ use crate::{
         SESSIONS_YIELD_TOOL_NAME,
     },
     journal::{
-        BackgroundTaskChildResolution, OrchestratorBackgroundTaskCreateRequest,
-        OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
-        OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
+        BackgroundTaskChildResolution, ChildWakeSubscriptionCreateRequest,
+        OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
+        OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
+        OrchestratorCancelRequest, ParentSuspensionCreateRequest, ParentWaitPolicy,
     },
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -47,7 +44,6 @@ const DELEGATION_TOOL_EXECUTOR: &str = "delegation_runtime";
 const DELEGATION_TOOL_SANDBOX: &str = "delegation_scope";
 const MAX_DELEGATION_TOOL_TASKS: usize = 256;
 const MAX_SESSIONS_YIELD_TIMEOUT_MS: u64 = 30_000;
-const SESSIONS_YIELD_POLL_INTERVAL_MS: u64 = 100;
 
 /// Combined input shape for both delegation tools; each operation reads only
 /// the fields it needs and ignores the rest.
@@ -618,26 +614,127 @@ async fn create_sessions_yield(
     context: ToolRuntimeExecutionContext<'_>,
     input: &SessionsYieldInput,
 ) -> Result<Value, Status> {
-    let timeout_ms = input.timeout_ms.unwrap_or(0).min(MAX_SESSIONS_YIELD_TIMEOUT_MS);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        let output = sessions_yield_snapshot(runtime, context, input, timeout_ms).await?;
-        let complete = output.get("complete").and_then(Value::as_bool).unwrap_or(false);
-        if complete {
-            return Ok(output);
-        }
-        if timeout_ms == 0 || Instant::now() >= deadline {
-            if !input.partial_ok.unwrap_or(true) {
-                return Err(Status::deadline_exceeded(
-                    "sessions_yield timed out before all selected child runs completed",
-                ));
-            }
-            return Ok(output);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining.min(Duration::from_millis(SESSIONS_YIELD_POLL_INTERVAL_MS)))
-            .await;
+    let timeout_ms = input
+        .timeout_ms
+        .unwrap_or(MAX_SESSIONS_YIELD_TIMEOUT_MS)
+        .min(MAX_SESSIONS_YIELD_TIMEOUT_MS);
+    let mut output = sessions_yield_snapshot(runtime, context, input, timeout_ms).await?;
+    let complete = output.get("complete").and_then(Value::as_bool).unwrap_or(false);
+    if complete {
+        output["yield_outcome"] = Value::String("immediate_terminal".to_owned());
+        return Ok(output);
     }
+    if timeout_ms == 0 {
+        if !input.partial_ok.unwrap_or(true) {
+            return Err(Status::deadline_exceeded(
+                "sessions_yield found unfinished child runs and zero wait timeout",
+            ));
+        }
+        output["yield_outcome"] = Value::String("partial_snapshot".to_owned());
+        return Ok(output);
+    }
+    let subscriptions = sessions_yield_pending_subscriptions(runtime, context, input).await?;
+    let pending_count = output.get("pending").and_then(Value::as_array).map_or(0, Vec::len);
+    if subscriptions.len() != pending_count || subscriptions.is_empty() {
+        if !input.partial_ok.unwrap_or(true) {
+            return Err(Status::failed_precondition(
+                "sessions_yield cannot durably subscribe to every requested child",
+            ));
+        }
+        output["yield_outcome"] = Value::String("partial_snapshot".to_owned());
+        return Ok(output);
+    }
+    let suspension = match runtime
+        .suspend_parent_for_children(ParentSuspensionCreateRequest {
+            parent_run_id: context.run_id.to_owned(),
+            parent_session_id: context.session_id.to_owned(),
+            owner_principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            wait_policy: ParentWaitPolicy::All,
+            timeout_ms: i64::try_from(timeout_ms).unwrap_or(i64::MAX),
+            children: subscriptions,
+        })
+        .await
+    {
+        Ok(suspension) => suspension,
+        Err(error) => {
+            let mut refreshed =
+                sessions_yield_snapshot(runtime, context, input, timeout_ms).await?;
+            if refreshed.get("complete").and_then(Value::as_bool).unwrap_or(false) {
+                refreshed["yield_outcome"] = Value::String("immediate_terminal".to_owned());
+                return Ok(refreshed);
+            }
+            return Err(error);
+        }
+    };
+    output["yield_outcome"] = Value::String("suspended".to_owned());
+    output["suspension_id"] = Value::String(suspension.suspension_id);
+    output["checkpoint_ref"] = Value::String(suspension.checkpoint_ref);
+    output["checkpoint_sha256"] = Value::String(suspension.checkpoint_sha256);
+    output["reason_code"] = Value::String(suspension.reason_code);
+    output["deadline_unix_ms"] = Value::from(suspension.deadline_unix_ms);
+    Ok(output)
+}
+
+async fn sessions_yield_pending_subscriptions(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    input: &SessionsYieldInput,
+) -> Result<Vec<ChildWakeSubscriptionCreateRequest>, Status> {
+    let child_run_ids = normalize_id_list(input.child_run_ids.as_slice());
+    let task_ids = normalize_id_list(input.task_ids.as_slice());
+    let requested_child_run_ids = child_run_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let requested_task_ids = task_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let requested_specific_children =
+        !requested_child_run_ids.is_empty() || !requested_task_ids.is_empty();
+    let filter = DelegationToolInput {
+        operation: "list".to_owned(),
+        objective: None,
+        profile_id: None,
+        template_id: None,
+        parent_run_id: None,
+        session_id: Some(context.session_id.to_owned()),
+        task_id: None,
+        run_id: None,
+        reason: None,
+        priority: None,
+        budget_tokens: None,
+        max_attempts: None,
+        execution_mode: None,
+        group_id: None,
+        model_profile: None,
+        memory_scope: None,
+        tool_allowlist: Vec::new(),
+        skill_allowlist: Vec::new(),
+        approval_required: None,
+        max_concurrent_children: None,
+        max_children_per_parent: None,
+        max_total_children: None,
+        max_parallel_groups: None,
+        max_depth: None,
+        max_budget_share_bps: None,
+        child_timeout_ms: None,
+        include_completed: Some(true),
+    };
+    let tasks = scoped_delegation_tasks(runtime, context, &filter, true).await?;
+    Ok(tasks
+        .into_iter()
+        .filter(|task| {
+            sessions_yield_selects_task(
+                task,
+                context.run_id,
+                requested_specific_children,
+                &requested_child_run_ids,
+                &requested_task_ids,
+            ) && !sessions_yield_task_terminal(task, None)
+        })
+        .map(|task| ChildWakeSubscriptionCreateRequest {
+            task_id: task.task_id,
+            child_run_id: task.target_run_id.or(task.planned_child_run_id),
+            expected_task_generation: task.execution_generation,
+        })
+        .collect())
 }
 
 async fn sessions_yield_snapshot(

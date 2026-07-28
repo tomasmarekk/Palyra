@@ -2897,6 +2897,10 @@ pub async fn run() -> Result<()> {
         )
         .await
         .context("failed to reconcile orphaned background tasks during startup")?;
+    let startup_parent_suspension_recovery = runtime
+        .reconcile_parent_suspensions()
+        .await
+        .context("failed to reconcile durable parent suspensions during startup")?;
     let startup_process_lease_reconciliation = runtime
         .reconcile_persisted_process_leases_async()
         .await
@@ -3180,6 +3184,8 @@ pub async fn run() -> Result<()> {
         .context("failed to release daemon startup recovery barrier")?;
     if startup_run_recovery.scanned_count > 0
         || startup_background_task_recovery.failed_count > 0
+        || startup_parent_suspension_recovery.matched_child_count > 0
+        || startup_parent_suspension_recovery.timed_out_count > 0
         || startup_process_lease_reconciliation.inspected_count > 0
         || startup_process_lease_reconciliation.pending_cleanup_inspected_count > 0
         || !startup_networked_worker_expiry.is_empty()
@@ -3199,6 +3205,11 @@ pub async fn run() -> Result<()> {
             confirmation_required_count = startup_run_recovery.confirmation_required_count,
             failed_background_task_count = startup_background_task_recovery.failed_count,
             failed_background_task_ids = ?startup_background_task_recovery.failed_task_ids,
+            parent_suspension_children_matched =
+                startup_parent_suspension_recovery.matched_child_count,
+            parent_suspension_continuations_queued =
+                startup_parent_suspension_recovery.continuation_queued_count,
+            parent_suspensions_timed_out = startup_parent_suspension_recovery.timed_out_count,
             process_leases_inspected = startup_process_lease_reconciliation.inspected_count,
             process_leases_closed = startup_process_lease_reconciliation.closed_count,
             process_leases_orphaned = startup_process_lease_reconciliation.orphaned_count,

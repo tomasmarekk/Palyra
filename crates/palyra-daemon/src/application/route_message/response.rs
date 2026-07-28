@@ -223,6 +223,11 @@ pub(crate) async fn process_route_provider_response(
         .await?
         {
             RunStreamProviderEventOutcome::Continue => {}
+            RunStreamProviderEventOutcome::Suspended => {
+                return Err(Status::failed_precondition(
+                    "route-message provider surface cannot suspend a parent run",
+                ));
+            }
             RunStreamProviderEventOutcome::Terminal(state) => {
                 return Ok(RouteProviderResponseProcessingOutcome::Terminal {
                     state,

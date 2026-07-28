@@ -65,6 +65,7 @@ pub(crate) enum RunStreamProviderEventGateOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventOutcome {
     Continue,
+    Suspended,
     Terminal(RunLifecycleState),
 }
 
@@ -77,6 +78,7 @@ pub(crate) enum RunStreamProviderEventsOutcome {
         summary_tokens: Vec<String>,
         tool_results: Vec<RunStreamToolResultForModel>,
     },
+    Suspended,
     Terminal(RunLifecycleState),
 }
 
@@ -416,6 +418,9 @@ pub(crate) async fn process_provider_event_for_surface(
                     RunStreamToolExecutionOutcome::Terminal(state) => {
                         Ok(RunStreamProviderEventOutcome::Terminal(state))
                     }
+                    RunStreamToolExecutionOutcome::Suspended => {
+                        Ok(RunStreamProviderEventOutcome::Suspended)
+                    }
                 }
             }
             ProviderEventSurface::RouteMessage(context) => {
@@ -538,6 +543,9 @@ pub(crate) async fn process_run_stream_provider_events(
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
+                    RunStreamProviderEventOutcome::Suspended => {
+                        return Ok(RunStreamProviderEventsOutcome::Suspended);
+                    }
                     RunStreamProviderEventOutcome::Terminal(state) => {
                         return Ok(RunStreamProviderEventsOutcome::Terminal(state));
                     }
@@ -569,6 +577,9 @@ pub(crate) async fn process_run_stream_provider_events(
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
+                    RunStreamProviderEventOutcome::Suspended => {
+                        return Ok(RunStreamProviderEventsOutcome::Suspended);
+                    }
                     RunStreamProviderEventOutcome::Terminal(state) => {
                         return Ok(RunStreamProviderEventsOutcome::Terminal(state));
                     }
@@ -599,6 +610,9 @@ pub(crate) async fn process_run_stream_provider_events(
     .await?
     {
         RunStreamProviderEventOutcome::Continue => {}
+        RunStreamProviderEventOutcome::Suspended => {
+            return Ok(RunStreamProviderEventsOutcome::Suspended);
+        }
         RunStreamProviderEventOutcome::Terminal(state) => {
             return Ok(RunStreamProviderEventsOutcome::Terminal(state));
         }
@@ -703,12 +717,18 @@ async fn flush_pending_run_stream_tool_proposals(
                 .await?
                 {
                     RunStreamProviderEventOutcome::Continue => {}
+                    RunStreamProviderEventOutcome::Suspended => {
+                        return Ok(RunStreamProviderEventOutcome::Suspended);
+                    }
                     RunStreamProviderEventOutcome::Terminal(state) => {
                         return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
                 }
                 match push_run_stream_tool_execution_outcome(tool_results, outcome) {
                     RunStreamProviderEventOutcome::Continue => {}
+                    RunStreamProviderEventOutcome::Suspended => {
+                        return Ok(RunStreamProviderEventOutcome::Suspended);
+                    }
                     RunStreamProviderEventOutcome::Terminal(state) => {
                         return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
@@ -771,6 +791,9 @@ async fn flush_prepared_run_stream_tool_batch(
             for outcome in outcomes {
                 match push_run_stream_tool_execution_outcome(tool_results, outcome) {
                     RunStreamProviderEventOutcome::Continue => {}
+                    RunStreamProviderEventOutcome::Suspended => {
+                        return Ok(RunStreamProviderEventOutcome::Suspended);
+                    }
                     RunStreamProviderEventOutcome::Terminal(state) => {
                         return Ok(RunStreamProviderEventOutcome::Terminal(state));
                     }
@@ -780,6 +803,9 @@ async fn flush_prepared_run_stream_tool_batch(
         }
         RunStreamPreparedToolExecutionBatchOutcome::Terminal(state) => {
             Ok(RunStreamProviderEventOutcome::Terminal(state))
+        }
+        RunStreamPreparedToolExecutionBatchOutcome::Suspended => {
+            Ok(RunStreamProviderEventOutcome::Suspended)
         }
     }
 }
@@ -807,6 +833,7 @@ fn push_run_stream_tool_execution_outcome(
         RunStreamToolExecutionOutcome::Terminal(state) => {
             RunStreamProviderEventOutcome::Terminal(state)
         }
+        RunStreamToolExecutionOutcome::Suspended => RunStreamProviderEventOutcome::Suspended,
     }
 }
 

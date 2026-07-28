@@ -2382,10 +2382,11 @@ async fn finalize_task_from_run_if_parent_generation_current(
     let updated = runtime
         .update_orchestrator_background_task_from_worker_if_parent_generation(update, parent_guard)
         .await?;
-    if updated.is_none() {
+    let Some(updated) = updated else {
         suppress_stale_child_completion(runtime, task, child_run_id, None).await?;
         return Ok(false);
-    }
+    };
+    runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),
@@ -2405,7 +2406,8 @@ async fn finalize_task_from_run(
     let Some(update) = background_task_worker_completion_update(task, run, fallback_state) else {
         return Ok(());
     };
-    runtime.update_orchestrator_background_task_from_worker(update).await?;
+    let updated = runtime.update_orchestrator_background_task_from_worker(update).await?;
+    runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),

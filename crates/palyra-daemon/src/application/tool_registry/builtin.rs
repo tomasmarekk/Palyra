@@ -1095,7 +1095,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "sessions_yield",
-            "Wait briefly for delegated Palyra child runs and return durable completion summaries without manual polling.",
+            "Durably suspend the current parent until delegated child completion, releasing the session lane and resuming through wake admission.",
             object_schema(
                 &[],
                 vec![
@@ -1109,7 +1109,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "timeout_ms",
-                        json!({"type":"integer","minimum":0,"maximum":30000,"description":"Maximum time to wait for completions. Defaults to 0 for an immediate durable snapshot."}),
+                        json!({"type":"integer","minimum":0,"maximum":30000,"description":"Durable suspension deadline. Defaults to 30000; zero returns an immediate snapshot without suspending."}),
                     ),
                     (
                         "return_mode",
@@ -1117,7 +1117,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "partial_ok",
-                        json!({"type":"boolean","description":"Defaults to true. When false, the tool returns a deadline error if any selected child is still pending at timeout."}),
+                        json!({"type":"boolean","description":"Defaults to true. When false, pending targets must all have durable child subscriptions or the call fails closed."}),
                     ),
                 ],
                 false,

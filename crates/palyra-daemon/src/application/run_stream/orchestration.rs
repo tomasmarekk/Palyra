@@ -380,6 +380,8 @@ struct RunStreamProviderRequestExecution {
 pub(crate) enum RunStreamMessageProcessingOutcome {
     /// The run finished cleanly; the stream may accept follow-up messages.
     Continue,
+    /// The run committed a durable wait and released its session lane.
+    Suspended,
     /// The run reached a terminal state; the stream loop must stop.
     Terminate,
 }
@@ -471,6 +473,8 @@ pub(crate) enum RunStreamProviderResponseOutcome {
         /// emitted by the caller once the reply is accepted as final.
         final_reply_tokens_deferred: bool,
     },
+    /// A tool committed durable parent suspension; no further model round runs.
+    Suspended,
     /// The turn is unusable; the loop decides between recovery and termination.
     Failed {
         message: String,
@@ -3159,6 +3163,11 @@ fn run_stream_harness_terminal_from_outcome(
 ) -> RunStreamHarnessTerminal {
     match outcome {
         Ok(RunStreamMessageProcessingOutcome::Continue) => RunStreamHarnessTerminal {
+            status: AgentHarnessAttemptTerminalStatus::Completed,
+            classification: AgentHarnessAttemptClassification::Ok,
+            replay_safety: AgentHarnessAttemptReplaySafety::Unknown,
+        },
+        Ok(RunStreamMessageProcessingOutcome::Suspended) => RunStreamHarnessTerminal {
             status: AgentHarnessAttemptTerminalStatus::Completed,
             classification: AgentHarnessAttemptClassification::Ok,
             replay_safety: AgentHarnessAttemptReplaySafety::Unknown,
@@ -6129,6 +6138,30 @@ async fn process_run_stream_message_inner(
                 .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
+            RunStreamProviderResponseOutcome::Suspended => {
+                if context_engine_enabled {
+                    crate::application::context_lifecycle::record_after_turn(
+                        runtime_state,
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        tape_seq,
+                        lifecycle_prompt_tokens,
+                        lifecycle_completion_tokens,
+                        0,
+                        Some(lifecycle_finish_reason),
+                    )
+                    .await?;
+                }
+                send_run_loop_status_with_tape(
+                    sender,
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    "suspended_waiting_child",
+                )
+                .await?;
+                return Ok(RunStreamMessageProcessingOutcome::Suspended);
+            }
             RunStreamProviderResponseOutcome::Terminal(_) => {
                 if context_engine_enabled {
                     crate::application::context_lifecycle::record_after_turn(
@@ -6260,6 +6293,9 @@ async fn process_run_stream_provider_response(
     {
         RunStreamProviderEventsOutcome::Completed { summary_tokens, tool_results } => {
             (summary_tokens, tool_results)
+        }
+        RunStreamProviderEventsOutcome::Suspended => {
+            return Ok(RunStreamProviderResponseOutcome::Suspended);
         }
         RunStreamProviderEventsOutcome::Terminal(state) => {
             return Ok(RunStreamProviderResponseOutcome::Terminal(state));

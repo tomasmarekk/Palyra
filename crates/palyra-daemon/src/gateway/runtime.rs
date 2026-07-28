@@ -122,9 +122,11 @@ use crate::journal::{
     OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
     OrchestratorStartupBackgroundTaskRecoveryReport, OrchestratorStartupRunRecoveryReport,
     OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
-    OrchestratorUsageSummary, PersistedProcessLeaseRecord, ProgressDraftEventRecord,
-    ProgressDraftListFilter, ProgressDraftRecord, ProgressDraftTapeEventRequest,
-    ProviderAttemptCompletionOutcome, ProviderAttemptCompletionRequest,
+    OrchestratorUsageSummary, ParentSuspensionCreateRequest, ParentSuspensionReconcileReport,
+    ParentSuspensionRecord, ParentSuspensionWakeOutcome, PersistedProcessLeaseRecord,
+    ProgressDraftEventRecord, ProgressDraftListFilter, ProgressDraftRecord,
+    ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
+    ProviderAttemptCompletionRequest,
     ProviderAttemptRuntimeAuthority as JournalProviderAttemptRuntimeAuthority,
     ProviderAttemptStartRequest, ProviderConfigurationAttemptCompletionOutcome,
     ProviderConfigurationAttemptCompletionRequest,
@@ -1174,6 +1176,7 @@ pub(crate) enum RunStreamToolExecutionOutcome {
         input_json: Vec<u8>,
         outcome: crate::tool_protocol::ToolExecutionOutcome,
     },
+    Suspended,
     Terminal(RunLifecycleState),
 }
 
@@ -14648,6 +14651,82 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("guarded background task worker callback panicked"))?
+    }
+
+    /// Persists a parent checkpoint and child subscriptions before releasing
+    /// the active run generation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error or `internal` if the blocking worker
+    /// panics.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn suspend_parent_for_children(
+        self: &Arc<Self>,
+        request: ParentSuspensionCreateRequest,
+    ) -> Result<ParentSuspensionRecord, Status> {
+        let state = Arc::clone(self);
+        let record = tokio::task::spawn_blocking(move || {
+            state.journal_store.suspend_parent_for_children(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("parent suspension worker panicked"))?
+        .map_err(|error| map_orchestrator_store_error("suspend parent for children", error))?;
+        self.orchestrator_run_notify.notify_waiters();
+        let deadline_unix_ms = record.deadline_unix_ms;
+        let state = Arc::clone(self);
+        let _deadline_task = tokio::spawn(async move {
+            let delay_ms = deadline_unix_ms.saturating_sub(current_unix_ms()).max(0) as u64;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            if let Ok(report) = state.reconcile_parent_suspensions().await {
+                if report.continuation_queued_count > 0 || report.timed_out_count > 0 {
+                    state.orchestrator_run_notify.notify_waiters();
+                }
+            }
+        });
+        Ok(record)
+    }
+
+    /// Applies one terminal child task to all matching durable parent
+    /// subscriptions and wakes dispatchers after a continuation commit.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error or `internal` if the blocking worker
+    /// panics.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn settle_parent_suspensions_for_child(
+        self: &Arc<Self>,
+        task_id: String,
+    ) -> Result<Vec<ParentSuspensionWakeOutcome>, Status> {
+        let state = Arc::clone(self);
+        let outcomes = tokio::task::spawn_blocking(move || {
+            state.journal_store.settle_parent_suspensions_for_child(task_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("parent wake worker panicked"))?
+        .map_err(|error| map_orchestrator_store_error("wake suspended parent", error))?;
+        if outcomes.iter().any(|outcome| {
+            matches!(outcome, ParentSuspensionWakeOutcome::ContinuationQueued { .. })
+        }) {
+            self.orchestrator_run_notify.notify_waiters();
+        }
+        Ok(outcomes)
+    }
+
+    /// Reconciles terminal child evidence and expired parent deadlines after a
+    /// restart or deadline notification.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error or `internal` if the blocking worker
+    /// panics.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn reconcile_parent_suspensions(
+        self: &Arc<Self>,
+    ) -> Result<ParentSuspensionReconcileReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.journal_store.reconcile_parent_suspensions())
+            .await
+            .map_err(|_| Status::internal("parent suspension reconciliation worker panicked"))?
+            .map_err(|error| map_orchestrator_store_error("reconcile parent suspensions", error))
     }
 
     #[allow(clippy::result_large_err)]

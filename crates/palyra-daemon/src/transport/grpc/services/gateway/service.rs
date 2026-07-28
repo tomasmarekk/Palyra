@@ -2284,6 +2284,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 };
                 match outcome {
                     RunStreamMessageProcessingOutcome::Terminate => return,
+                    RunStreamMessageProcessingOutcome::Suspended => return,
                     RunStreamMessageProcessingOutcome::Continue => {
                         match timeout(RUN_STREAM_TRAILING_MESSAGE_GRACE, stream.next()).await {
                             Ok(Some(next_item)) => {
