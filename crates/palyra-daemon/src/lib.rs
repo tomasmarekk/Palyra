@@ -3269,6 +3269,18 @@ pub async fn run() -> Result<()> {
         scheduler_wake: Arc::clone(&scheduler_wake),
         timezone_mode: loaded.cron.timezone,
     });
+    let objective_continuation_recovery =
+        application::objective_continuation::reconcile_startup(&runtime).await?;
+    tracing::info!(
+        objective_attempts_scanned = objective_continuation_recovery.scanned,
+        objective_judge_tasks_repaired = objective_continuation_recovery.judge_tasks_repaired,
+        objective_decisions_applied = objective_continuation_recovery.decisions_applied,
+        objective_continuations_repaired = objective_continuation_recovery.continuations_repaired,
+        objective_attempts_paused = objective_continuation_recovery.paused,
+        objective_recovery_errors = objective_continuation_recovery.errors,
+        reason_code = "objective.continuation.startup_reconciled",
+        "completed bounded objective continuation recovery"
+    );
     let _cron_scheduler_task = supervise_lifecycle_subsystem_task(
         &runtime,
         application::daemon_lifecycle::LifecycleSubsystem::Scheduler,

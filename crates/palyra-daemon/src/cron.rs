@@ -49,7 +49,10 @@ use ulid::Ulid;
 
 use crate::{
     access_control::{AccessRegistry, FEATURE_ROUTINES_AUTOMATION},
-    application::run_stream::admission_ingress::register_cron_ingress,
+    application::{
+        objective_continuation::schedule_after_cron_terminal,
+        run_stream::admission_ingress::register_cron_ingress,
+    },
     config::MemoryRetentionConfig,
     gateway::{
         proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1},
@@ -3202,10 +3205,18 @@ async fn run_job_with_retries(
                     return Ok(());
                 }
                 if cron_max_runs_exhausted {
+                    if !budget_exhausted && terminal_status == CronRunStatus::Succeeded {
+                        schedule_after_cron_terminal(&state, job.job_id.as_str(), run_id.as_str())
+                            .await?;
+                    }
                     wake_signal.notify_one();
                     return Ok(());
                 }
                 if terminal_status == CronRunStatus::Succeeded {
+                    if !budget_exhausted {
+                        schedule_after_cron_terminal(&state, job.job_id.as_str(), run_id.as_str())
+                            .await?;
+                    }
                     wake_signal.notify_one();
                     return Ok(());
                 }

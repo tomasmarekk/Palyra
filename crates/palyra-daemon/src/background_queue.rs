@@ -46,6 +46,9 @@ use crate::{
             MergedDeliveryProgress, DELIVERY_ARBITRATION_POLICY_ID,
         },
         learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
+        objective_continuation::{
+            admit_claimed_continuation_task, reconcile_terminal_task as reconcile_objective_task,
+        },
         run_stream::admission_ingress::{
             register_delegation_ingress, register_internal_ingress, DelegationIngressRegistration,
         },
@@ -775,6 +778,9 @@ async fn dispatch_background_task(
         .or_else(|| task.planned_child_run_id.clone())
         .unwrap_or_else(|| Ulid::new().to_string());
     let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
+    if !admit_claimed_continuation_task(runtime, &task).await? {
+        return Ok(());
+    }
     let runtime = Arc::clone(runtime);
     let auth = auth.clone();
     let grpc_url = grpc_url.to_owned();
@@ -979,11 +985,21 @@ async fn persist_auxiliary_task_terminal_update(
 ) {
     let execution_generation = update.execution_generation;
     match runtime.update_orchestrator_background_task_from_worker(update).await {
-        Ok(_) => runtime.clear_self_healing_heartbeat_if_generation(
-            WorkHeartbeatKind::BackgroundTask,
-            task_id,
-            execution_generation,
-        ),
+        Ok(updated) => {
+            if let Err(error) = reconcile_objective_task(runtime, &updated).await {
+                warn!(
+                    task_id,
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "objective continuation task reconciliation failed"
+                );
+            }
+            runtime.clear_self_healing_heartbeat_if_generation(
+                WorkHeartbeatKind::BackgroundTask,
+                task_id,
+                execution_generation,
+            );
+        }
         Err(error) => warn!(
             task_id,
             status_code = ?error.code(),
@@ -2405,6 +2421,7 @@ async fn finalize_task_from_run_if_parent_generation_current(
     };
     runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
+    reconcile_objective_task(runtime, &updated).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),
@@ -2427,6 +2444,7 @@ async fn finalize_task_from_run(
     let updated = runtime.update_orchestrator_background_task_from_worker(update).await?;
     runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
+    reconcile_objective_task(runtime, &updated).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),

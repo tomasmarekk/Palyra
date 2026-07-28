@@ -83,6 +83,7 @@ pub(crate) mod autonomy;
 pub mod child_completion;
 pub(crate) mod lifecycle;
 mod metadata_trace;
+pub(crate) mod objective_continuation;
 pub(crate) mod restart;
 mod retrieval_index_status;
 pub(crate) mod run_admission;
@@ -7498,6 +7499,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 86,
         name: "child_completion_announce",
         sql: child_completion::MIGRATION_86_SQL,
+    },
+    Migration {
+        version: 87,
+        name: "objective_continuation",
+        sql: objective_continuation::MIGRATION_87_SQL,
     },
 ];
 

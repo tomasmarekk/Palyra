@@ -45,6 +45,7 @@ pub mod memory_provider;
 pub mod multimodal_context;
 pub mod native_compaction_handoff;
 pub mod native_harness_relay;
+pub(crate) mod objective_continuation;
 pub mod outbound_lifecycle;
 pub mod plan_state;
 pub mod progress_draft;

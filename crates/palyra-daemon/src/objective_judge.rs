@@ -22,7 +22,8 @@ const OBJECTIVE_JUDGE_REASON_CODE: &str = "objective_judge_auxiliary_loop";
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObjectiveJudgeStatus {
     Done,
-    NotDone,
+    #[serde(rename = "not_done", alias = "continue")]
+    Continue,
     Blocked,
     NeedsUser,
     Wait,
@@ -32,7 +33,7 @@ impl ObjectiveJudgeStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Done => "done",
-            Self::NotDone => "not_done",
+            Self::Continue => "not_done",
             Self::Blocked => "blocked",
             Self::NeedsUser => "needs_user",
             Self::Wait => "wait",
@@ -40,7 +41,7 @@ impl ObjectiveJudgeStatus {
     }
 
     pub(crate) const fn all() -> [Self; 5] {
-        [Self::Done, Self::NotDone, Self::Blocked, Self::NeedsUser, Self::Wait]
+        [Self::Done, Self::Continue, Self::Blocked, Self::NeedsUser, Self::Wait]
     }
 }
 
@@ -367,7 +368,7 @@ fn finalization_decision_from_judge(
             output.summary.clone(),
             "objective_finalization_review.pass".to_owned(),
         ),
-        ObjectiveJudgeStatus::NotDone
+        ObjectiveJudgeStatus::Continue
         | ObjectiveJudgeStatus::Blocked
         | ObjectiveJudgeStatus::Wait => (
             ObjectiveFinalizationDecision::NeedsRevision,
@@ -418,7 +419,7 @@ fn parse_objective_judge_output(
     if output.status == ObjectiveJudgeStatus::Done {
         let missing = missing_required_evidence(input, output.evidence_refs.as_slice());
         if !missing.is_empty() {
-            output.status = ObjectiveJudgeStatus::NotDone;
+            output.status = ObjectiveJudgeStatus::Continue;
             output.degraded = true;
             output.reason_code = "objective_judge_missing_required_evidence".to_owned();
             output.missing_evidence = merge_refs(output.missing_evidence, missing);
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn objective_judge_status_wire_values_are_stable() {
         assert_eq!(ObjectiveJudgeStatus::Done.as_str(), "done");
-        assert_eq!(ObjectiveJudgeStatus::NotDone.as_str(), "not_done");
+        assert_eq!(ObjectiveJudgeStatus::Continue.as_str(), "not_done");
         assert_eq!(ObjectiveJudgeStatus::Blocked.as_str(), "blocked");
         assert_eq!(ObjectiveJudgeStatus::NeedsUser.as_str(), "needs_user");
         assert_eq!(ObjectiveJudgeStatus::Wait.as_str(), "wait");
@@ -692,7 +693,7 @@ mod tests {
     fn finalization_review_requests_bounded_revision() {
         let review = build_objective_finalization_review(
             finalization_input(),
-            Some(&judge_output(ObjectiveJudgeStatus::NotDone, false)),
+            Some(&judge_output(ObjectiveJudgeStatus::Continue, false)),
         );
 
         assert_eq!(review.decision, ObjectiveFinalizationDecision::NeedsRevision);
