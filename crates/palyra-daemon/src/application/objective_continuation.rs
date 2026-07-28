@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn objective_outcome_evidence_is_utf8_safe_and_bounded() {
         let summary = objective_outcome_evidence_summary(
-            &[format!("evidence:{}", "ž".repeat(2_000))],
+            &[format!("evidence:{}", "\u{017e}".repeat(2_000))],
             None,
             None,
         )
