@@ -223,6 +223,39 @@ pub(crate) async fn console_webhook_dispatch_handler(
             "event is required for webhook dispatch",
         ));
     }
+    let wake_identity = payload.dedupe_key.as_deref().unwrap_or(event);
+    let wake_digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        format!(
+            "{}:{}:{}:{}",
+            integration.integration_id, integration.provider, event, wake_identity
+        )
+        .as_bytes(),
+    ));
+    crate::application::wake_coordinator::emit_wake_event(
+        &state.runtime,
+        crate::journal::wait_coordinator::WakeEventRequest {
+            source_event_id: format!("wake:webhook:{}", &wake_digest[..48]),
+            source_kind: crate::journal::wait_coordinator::WaitBarrierKind::Webhook
+                .as_str()
+                .to_owned(),
+            source_id: integration.integration_id.clone(),
+            source_generation: 1,
+            reason_code: "wake.webhook.accepted".to_owned(),
+            evidence_json: json!({
+                "schema_version": 1,
+                "integration_id": integration.integration_id,
+                "provider": integration.provider,
+                "event_sha256": hex::encode(
+                    <sha2::Sha256 as sha2::Digest>::digest(event.as_bytes())
+                ),
+                "dedupe_sha256": wake_digest,
+            })
+            .to_string(),
+            occurred_at_unix_ms: crate::gateway::current_unix_ms(),
+        },
+    )
+    .await
+    .map_err(runtime_status_response)?;
     let dispatches = super::routines::dispatch_webhook_event_routines(
         &state,
         session.context.principal.as_str(),

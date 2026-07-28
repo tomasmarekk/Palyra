@@ -570,9 +570,12 @@ impl JournalStore {
         let current = load_objective_attempt_tx(&transaction, attempt_id)?.ok_or_else(|| {
             JournalError::InvalidArgument("objective attempt does not exist".to_owned())
         })?;
-        if current.decision != ObjectiveContinuationDecision::Continue {
+        if !matches!(
+            current.decision,
+            ObjectiveContinuationDecision::Continue | ObjectiveContinuationDecision::Wait
+        ) {
             return Err(JournalError::InvalidArgument(
-                "only a continue decision can reserve a continuation task".to_owned(),
+                "only continue or wait can reserve a continuation task".to_owned(),
             ));
         }
         if let Some(existing) = current.continuation_task_id.as_deref() {
@@ -622,7 +625,7 @@ impl JournalStore {
             attempt_id,
             Some(current.state.as_str()),
             "continuation_enqueue_pending",
-            ObjectiveContinuationDecision::Continue,
+            current.decision,
             reason_code,
             current.evidence_refs_json.as_str(),
             now,
@@ -652,7 +655,11 @@ impl JournalStore {
         let allowed = match target_state {
             "continuation_enqueued" => {
                 current.state == "continuation_enqueue_pending"
-                    && current.decision == ObjectiveContinuationDecision::Continue
+                    && matches!(
+                        current.decision,
+                        ObjectiveContinuationDecision::Continue
+                            | ObjectiveContinuationDecision::Wait
+                    )
             }
             "settled" => {
                 matches!(current.state.as_str(), "decision_pending" | "continuation_enqueued")

@@ -215,7 +215,7 @@ pub(crate) const APPROVAL_PROMPT_TIMEOUT_SECONDS: u32 = 15 * 60;
 pub(crate) const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 pub(crate) const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration =
     Duration::from_secs(APPROVAL_PROMPT_TIMEOUT_SECONDS as u64);
-const TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const PROCESS_INPUT_WRITE_TIMEOUT_MS: u64 = 1_500;
 pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
     "skill execution blocked by security gate";
@@ -510,7 +510,7 @@ pub(crate) fn matching_tool_approval_response_id(
 
 /// Waits for a tool approval decision from either of the two valid sources:
 /// an inline response on the run stream, or an external resolution of the
-/// approval record (console/web), discovered by polling.
+/// approval record (console/web), announced through the shared runtime signal.
 ///
 /// Loops until a decision exists; the overall deadline is owned by the
 /// caller. If the client stream ends first, the outcome falls back to the
@@ -531,7 +531,8 @@ pub(crate) async fn await_tool_approval_response(
 ) -> Result<ToolApprovalOutcome, Status> {
     loop {
         // Both branches are cancel-safe: `Streaming::next` yields whole
-        // messages and the sleep branch only triggers a fresh record poll.
+        // messages and runtime notifications are only latency hints. The
+        // bounded timer covers receiver lag without a high-frequency poll.
         tokio::select! {
             item = stream.next() => {
                 let Some(item) = item else {
@@ -550,7 +551,12 @@ pub(crate) async fn await_tool_approval_response(
                     return Ok(outcome);
                 }
             }
-            () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL) => {
+            () = async {
+                tokio::select! {
+                    () = runtime_state.orchestrator_run_notify.notified() => {}
+                    () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL) => {}
+                }
+            } => {
                 if runtime_state
                     .is_orchestrator_cancel_requested(expected_run_id.to_owned())
                     .await?

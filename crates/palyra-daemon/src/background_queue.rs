@@ -52,6 +52,7 @@ use crate::{
         run_stream::admission_ingress::{
             register_delegation_ingress, register_internal_ingress, DelegationIngressRegistration,
         },
+        wake_coordinator::{admit_claimed_wake_task, reconcile_terminal_wake_task},
     },
     auxiliary_executor::{execute_auxiliary_task, AuxiliaryExecutionRequest, AuxiliaryTaskType},
     delegation::{
@@ -119,6 +120,7 @@ pub(crate) fn spawn_background_queue_loop(
                 warn!(status_code = ?error.code(), status_message = %error.message(), "background queue poll failed");
             }
             tokio::select! {
+                () = runtime.orchestrator_run_notify.notified() => {}
                 () = tokio::time::sleep(BACKGROUND_QUEUE_IDLE_SLEEP) => {}
                 changed = lifecycle.changed() => {
                     if changed.is_err() || lifecycle.borrow().phase.stops_subsystems() {
@@ -778,6 +780,9 @@ async fn dispatch_background_task(
         .or_else(|| task.planned_child_run_id.clone())
         .unwrap_or_else(|| Ulid::new().to_string());
     let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
+    if !admit_claimed_wake_task(runtime, &task).await? {
+        return Ok(());
+    }
     if !admit_claimed_continuation_task(runtime, &task).await? {
         return Ok(());
     }
@@ -992,6 +997,14 @@ async fn persist_auxiliary_task_terminal_update(
                     status_code = ?error.code(),
                     status_message = %error.message(),
                     "objective continuation task reconciliation failed"
+                );
+            }
+            if let Err(error) = reconcile_terminal_wake_task(runtime, &updated).await {
+                warn!(
+                    task_id,
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "wake task reconciliation failed"
                 );
             }
             runtime.clear_self_healing_heartbeat_if_generation(
@@ -1661,6 +1674,9 @@ async fn run_background_task_stream(
 ) -> Result<(), Status> {
     ensure_child_task_context_permits_dispatch(runtime, task, crate::gateway::current_unix_ms())
         .await?;
+    if !admit_claimed_wake_task(runtime, task).await? {
+        return Ok(());
+    }
     let mut client =
         gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url.to_owned())
             .await
@@ -2422,6 +2438,7 @@ async fn finalize_task_from_run_if_parent_generation_current(
     runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     reconcile_objective_task(runtime, &updated).await?;
+    reconcile_terminal_wake_task(runtime, &updated).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),
@@ -2445,6 +2462,7 @@ async fn finalize_task_from_run(
     runtime.reconcile_child_completions().await?;
     runtime.settle_parent_suspensions_for_child(updated.task_id.clone()).await?;
     reconcile_objective_task(runtime, &updated).await?;
+    reconcile_terminal_wake_task(runtime, &updated).await?;
     runtime.clear_self_healing_heartbeat_if_generation(
         WorkHeartbeatKind::BackgroundTask,
         task.task_id.as_str(),

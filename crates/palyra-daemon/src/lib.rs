@@ -3281,6 +3281,8 @@ pub async fn run() -> Result<()> {
         reason_code = "objective.continuation.startup_reconciled",
         "completed bounded objective continuation recovery"
     );
+    let _wake_coordinator_task =
+        application::wake_coordinator::spawn_wake_coordinator(runtime.clone());
     let _cron_scheduler_task = supervise_lifecycle_subsystem_task(
         &runtime,
         application::daemon_lifecycle::LifecycleSubsystem::Scheduler,

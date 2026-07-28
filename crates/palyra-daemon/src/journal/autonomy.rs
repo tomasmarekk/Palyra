@@ -332,6 +332,43 @@ impl JournalStore {
                 ],
             )?;
         }
+        wait_coordinator::register_wait_barrier_tx(
+            &transaction,
+            &wait_coordinator::WaitBarrierCreateRequest {
+                barrier_id: Ulid::new().to_string(),
+                owner_kind: "parent_suspension".to_owned(),
+                owner_id: suspension_id.clone(),
+                session_id: request.parent_session_id.clone(),
+                root_run_id: Some(request.parent_run_id.clone()),
+                barrier_kind: wait_coordinator::WaitBarrierKind::DelegationChild,
+                source_kind: wait_coordinator::WaitBarrierKind::DelegationChild.as_str().to_owned(),
+                source_id: suspension_id.clone(),
+                // The specialized M049 transaction still owns the parent task
+                // insertion; the generic barrier records and coalesces the
+                // same wake without allocating a second continuation.
+                wake_decision: wait_coordinator::WakeDecision::DeliveryOnly,
+                continuation_prompt: Some(
+                    "Continue the suspended parent objective using the durable child completion \
+                     evidence."
+                        .to_owned(),
+                ),
+                budget_tokens: PARENT_WAKE_BUDGET_TOKENS.unsigned_abs(),
+                attempt_generation: generation.generation.get(),
+                wake_at_unix_ms: None,
+                expires_at_unix_ms: Some(deadline_unix_ms),
+                liveness_probe_json: json!({
+                    "schema_version": PARENT_SUSPENSION_SCHEMA_VERSION,
+                    "suspension_id": suspension_id,
+                    "wait_policy": request.wait_policy.as_str(),
+                    "child_count": request.children.len(),
+                })
+                .to_string(),
+                active_hours_json: None,
+                stale_policy: "cancel".to_owned(),
+                reason_code: PARENT_SUSPENDED_REASON_CODE.to_owned(),
+            },
+            now,
+        )?;
         let updated = transaction.execute(
             r#"
                 UPDATE orchestrator_runs
@@ -924,6 +961,29 @@ fn satisfy_parent_suspension_tx(
             remaining_children: remaining_children.max(0) as u64,
         });
     }
+
+    wait_coordinator::emit_wake_event_tx(
+        connection,
+        &wait_coordinator::WakeEventRequest {
+            source_event_id: format!(
+                "wake:parent_suspension:{}:{}:{}",
+                suspension_id, source_task.task_id, source_task.execution_generation
+            ),
+            source_kind: wait_coordinator::WaitBarrierKind::DelegationChild.as_str().to_owned(),
+            source_id: suspension_id.to_owned(),
+            source_generation: suspension.parent_generation,
+            reason_code: PARENT_WAKE_REASON_CODE.to_owned(),
+            evidence_json: json!({
+                "schema_version": PARENT_SUSPENSION_SCHEMA_VERSION,
+                "suspension_id": suspension_id,
+                "source_task_id": source_task.task_id,
+                "source_task_generation": source_task.execution_generation,
+                "remaining_children": remaining_children,
+            })
+            .to_string(),
+            occurred_at_unix_ms: now,
+        },
+    )?;
 
     let wake_intent_id = Ulid::new().to_string();
     let continuation_task_id = Ulid::new().to_string();

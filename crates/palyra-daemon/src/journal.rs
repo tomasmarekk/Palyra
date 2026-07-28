@@ -94,6 +94,7 @@ mod shared_runtime;
 pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
 pub(crate) mod stuck_run_remediation;
+pub(crate) mod wait_coordinator;
 
 pub use autonomy::{
     ChildWakeSubscriptionCreateRequest, ParentSuspensionCreateRequest,
@@ -7505,7 +7506,49 @@ const MIGRATIONS: &[Migration] = &[
         name: "objective_continuation",
         sql: objective_continuation::MIGRATION_87_SQL,
     },
+    Migration { version: 88, name: "wait_coordinator", sql: wait_coordinator::MIGRATION_88_SQL },
 ];
+
+fn emit_background_task_wake_events_tx(
+    connection: &Connection,
+    task: &OrchestratorBackgroundTaskRecord,
+) -> Result<(), JournalError> {
+    if !matches!(task.state.as_str(), "succeeded" | "failed" | "cancelled" | "expired") {
+        return Ok(());
+    }
+    let source_generation = task.execution_generation.max(1);
+    let evidence_json = json!({
+        "schema_version": 1,
+        "task_id": task.task_id,
+        "state": task.state,
+        "execution_generation": source_generation,
+    })
+    .to_string();
+    for kind in [
+        wait_coordinator::WaitBarrierKind::BackgroundTask,
+        wait_coordinator::WaitBarrierKind::DelegationChild,
+    ] {
+        wait_coordinator::emit_wake_event_tx(
+            connection,
+            &wait_coordinator::WakeEventRequest {
+                source_event_id: format!(
+                    "wake:{}:{}:{}:{}",
+                    kind.as_str(),
+                    task.task_id,
+                    source_generation,
+                    task.state
+                ),
+                source_kind: kind.as_str().to_owned(),
+                source_id: task.task_id.clone(),
+                source_generation,
+                reason_code: format!("wake.{}.terminal", kind.as_str()),
+                evidence_json: evidence_json.clone(),
+                occurred_at_unix_ms: task.completed_at_unix_ms.unwrap_or(task.updated_at_unix_ms),
+            },
+        )?;
+    }
+    Ok(())
+}
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
 // `impl JournalStore` block below. The `_tx` suffix marks helpers that expect
@@ -14666,8 +14709,9 @@ impl JournalStore {
         let digest = sha256_hex(request.content.as_slice());
         let retention_json = serialize_json_field(&request.retention, "retention_json")?;
         let size_bytes = u64::try_from(content_len).unwrap_or(u64::MAX);
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        match guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match transaction.execute(
             r#"
                 INSERT INTO tool_result_artifacts (
                     artifact_ulid,
@@ -14707,21 +14751,49 @@ impl JournalStore {
                 if request.retention.legal_hold { 1_i64 } else { 0_i64 },
             ],
         ) {
-            Ok(_) => Ok(ToolResultArtifactRef {
-                artifact_id: request.artifact_id.clone(),
-                digest_sha256: digest,
-                mime_type: request.mime_type.clone(),
-                size_bytes,
-                sensitivity: request.sensitivity,
-                retention: request.retention.clone(),
-                origin_tool_call_id: request.proposal_id.clone(),
-                tool_name: request.tool_name.clone(),
-                run_id: request.run_id.clone(),
-                session_id: request.session_id.clone(),
-                storage_backend: "sqlite_local".to_owned(),
-                redacted_preview: request.redacted_preview.clone(),
-                created_at_unix_ms: now,
-            }),
+            Ok(_) => {
+                wait_coordinator::emit_wake_event_tx(
+                    &transaction,
+                    &wait_coordinator::WakeEventRequest {
+                        source_event_id: format!(
+                            "wake:external_artifact:{}",
+                            request.artifact_id
+                        ),
+                        source_kind: wait_coordinator::WaitBarrierKind::ExternalArtifact
+                            .as_str()
+                            .to_owned(),
+                        source_id: request.artifact_id.clone(),
+                        source_generation: 1,
+                        reason_code: "wake.external_artifact.created".to_owned(),
+                        evidence_json: json!({
+                            "schema_version": 1,
+                            "artifact_id": request.artifact_id,
+                            "digest_sha256": digest,
+                            "size_bytes": size_bytes,
+                            "sensitivity": request.sensitivity.as_str(),
+                        })
+                        .to_string(),
+                        occurred_at_unix_ms: now,
+                    },
+                )?;
+                let artifact = ToolResultArtifactRef {
+                    artifact_id: request.artifact_id.clone(),
+                    digest_sha256: digest,
+                    mime_type: request.mime_type.clone(),
+                    size_bytes,
+                    sensitivity: request.sensitivity,
+                    retention: request.retention.clone(),
+                    origin_tool_call_id: request.proposal_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    run_id: request.run_id.clone(),
+                    session_id: request.session_id.clone(),
+                    storage_backend: "sqlite_local".to_owned(),
+                    redacted_preview: request.redacted_preview.clone(),
+                    created_at_unix_ms: now,
+                };
+                transaction.commit()?;
+                Ok(artifact)
+            }
             Err(rusqlite::Error::SqliteFailure(error, message))
                 if error.code == ErrorCode::ConstraintViolation
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
@@ -16123,8 +16195,9 @@ impl JournalStore {
             None
         };
         let terminal_at_unix_ms = queued_state.is_terminal().then_some(now);
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             r#"
                 INSERT INTO orchestrator_queued_inputs (
                     queued_input_ulid,
@@ -16184,7 +16257,42 @@ impl JournalStore {
                 now,
             ],
         )?;
-        Ok(OrchestratorQueuedInputRecord {
+        if !queued_state.is_terminal() {
+            wait_coordinator::emit_wake_event_tx(
+                &transaction,
+                &wait_coordinator::WakeEventRequest {
+                    source_event_id: format!("wake:user_input:{}", request.queued_input_id),
+                    source_kind: wait_coordinator::WaitBarrierKind::UserInput.as_str().to_owned(),
+                    source_id: request.session_id.clone(),
+                    source_generation: u64::try_from(
+                        request.expected_active_generation.unwrap_or(1).max(1),
+                    )
+                    .unwrap_or(1),
+                    reason_code: "wake.user_input.accepted".to_owned(),
+                    evidence_json: json!({
+                        "schema_version": 1,
+                        "queued_input_id": request.queued_input_id,
+                        "session_id": request.session_id,
+                        "priority_lane": request.priority_lane,
+                    })
+                    .to_string(),
+                    occurred_at_unix_ms: now,
+                },
+            )?;
+            transaction.execute(
+                r#"
+                    UPDATE wake_intents_v1
+                    SET decision = 'cancel', state = 'cancelled',
+                        delivery_outcome = 'user_preempted',
+                        delivered_at_unix_ms = ?2, updated_at_unix_ms = ?2
+                    WHERE session_ulid = ?1
+                      AND state IN ('pending', 'deferred')
+                      AND decision IN ('run', 'defer', 'coalesce')
+                "#,
+                params![request.session_id, now],
+            )?;
+        }
+        let record = OrchestratorQueuedInputRecord {
             queued_input_id: request.queued_input_id.clone(),
             run_id: request.run_id.clone(),
             session_id: request.session_id.clone(),
@@ -16211,7 +16319,9 @@ impl JournalStore {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             origin_run_id: request.origin_run_id.clone(),
-        })
+        };
+        transaction.commit()?;
+        Ok(record)
     }
 
     /// Compares and sets a queued input's lifecycle state and decision metadata.
@@ -18606,6 +18716,7 @@ impl JournalStore {
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = update_orchestrator_background_task_from_worker_tx(&transaction, request)?;
         child_completion::materialize_child_completion_tx(&transaction, &record, None)?;
+        emit_background_task_wake_events_tx(&transaction, &record)?;
         transaction.commit()?;
         Ok(record)
     }
@@ -18651,6 +18762,7 @@ impl JournalStore {
             &record,
             Some(parent_guard.expected_generation),
         )?;
+        emit_background_task_wake_events_tx(&transaction, &record)?;
         transaction.commit()?;
         Ok(Some(record))
     }
@@ -19513,6 +19625,30 @@ impl JournalStore {
                 created_at_unix_ms: now,
             },
         )?;
+        if matches!(next_state, "succeeded" | "failed" | "cancelled" | "skipped") {
+            wait_coordinator::emit_wake_event_tx(
+                &transaction,
+                &wait_coordinator::WakeEventRequest {
+                    source_event_id: format!(
+                        "wake:flow_step:{}:{}:{}",
+                        request.flow_id, request.step_id, next_revision
+                    ),
+                    source_kind: wait_coordinator::WaitBarrierKind::FlowStep.as_str().to_owned(),
+                    source_id: format!("{}:{}", request.flow_id, request.step_id),
+                    source_generation: u64::try_from(next_revision.max(1)).unwrap_or(1),
+                    reason_code: "wake.flow_step.terminal".to_owned(),
+                    evidence_json: json!({
+                        "schema_version": 1,
+                        "flow_id": request.flow_id,
+                        "step_id": request.step_id,
+                        "state": next_state,
+                        "flow_revision": next_revision,
+                    })
+                    .to_string(),
+                    occurred_at_unix_ms: now,
+                },
+            )?;
+        }
         transaction.commit()?;
         drop(guard);
         self.get_flow_step(request.flow_id.as_str(), request.step_id.as_str())?.ok_or_else(|| {
@@ -23241,8 +23377,9 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let decision_reason =
             sanitize_object_text_field("reason", request.decision_reason.as_str())?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let updated = guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
             r#"
                 UPDATE approvals
                 SET
@@ -23265,7 +23402,7 @@ impl JournalStore {
             ],
         )?;
         let record =
-            load_approval_by_id(&guard, request.approval_id.as_str())?.ok_or_else(|| {
+            load_approval_by_id(&transaction, request.approval_id.as_str())?.ok_or_else(|| {
                 JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
             })?;
         if updated == 0 && record.decision.is_none() {
@@ -23273,6 +23410,30 @@ impl JournalStore {
                 approval_id: request.approval_id.clone(),
             });
         }
+        if updated == 1 {
+            wait_coordinator::emit_wake_event_tx(
+                &transaction,
+                &wait_coordinator::WakeEventRequest {
+                    source_event_id: format!(
+                        "wake:approval:{}:{}",
+                        request.approval_id,
+                        request.decision.as_str()
+                    ),
+                    source_kind: wait_coordinator::WaitBarrierKind::Approval.as_str().to_owned(),
+                    source_id: request.approval_id.clone(),
+                    source_generation: 1,
+                    reason_code: "wake.approval.resolved".to_owned(),
+                    evidence_json: json!({
+                        "schema_version": 1,
+                        "approval_id": request.approval_id,
+                        "decision": request.decision.as_str(),
+                    })
+                    .to_string(),
+                    occurred_at_unix_ms: now,
+                },
+            )?;
+        }
+        transaction.commit()?;
         Ok(record)
     }
 

@@ -5710,6 +5710,7 @@ impl GatewayRuntimeState {
         let first_result =
             self.journal_store.finalize_process_cleanup(&descriptor, &effective_report);
         let Err(first_error) = first_result else {
+            self.orchestrator_run_notify.notify_waiters();
             return Ok(());
         };
         if !may_race_first_writer {
@@ -5729,7 +5730,9 @@ impl GatewayRuntimeState {
         descriptor.updated_at_unix_ms = effective_report.completed_at_unix_ms;
         self.journal_store
             .finalize_process_cleanup(&descriptor, &effective_report)
-            .map_err(|error| map_orchestrator_store_error("replay raced process cleanup", error))
+            .map_err(|error| map_orchestrator_store_error("replay raced process cleanup", error))?;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(())
     }
 
     /// Closes the terminal metadata trace after run-owned cleanup has emitted its evidence.
@@ -12949,9 +12952,13 @@ impl GatewayRuntimeState {
         request: ToolResultArtifactCreateRequest,
     ) -> Result<ToolResultArtifactRef, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || state.create_tool_result_artifact_blocking(&request))
-            .await
-            .map_err(|_| Status::internal("tool result artifact create worker panicked"))?
+        let artifact = tokio::task::spawn_blocking(move || {
+            state.create_tool_result_artifact_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("tool result artifact create worker panicked"))??;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(artifact)
     }
 
     /// Maximum artifact payload size accepted by the journal store.
@@ -13621,11 +13628,13 @@ impl GatewayRuntimeState {
         request: OrchestratorQueuedInputCreateRequest,
     ) -> Result<OrchestratorQueuedInputRecord, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        let record = tokio::task::spawn_blocking(move || {
             state.create_orchestrator_queued_input_blocking(&request)
         })
         .await
-        .map_err(|_| Status::internal("orchestrator queued input worker panicked"))?
+        .map_err(|_| Status::internal("orchestrator queued input worker panicked"))??;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(record)
     }
 
     #[allow(clippy::result_large_err)]
@@ -14529,9 +14538,11 @@ impl GatewayRuntimeState {
         request: FlowStepUpdateRequest,
     ) -> Result<FlowStepRecord, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || state.update_flow_step_blocking(&request))
+        let step = tokio::task::spawn_blocking(move || state.update_flow_step_blocking(&request))
             .await
-            .map_err(|_| Status::internal("flow step update worker panicked"))?
+            .map_err(|_| Status::internal("flow step update worker panicked"))??;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(step)
     }
 
     #[allow(clippy::result_large_err)]
@@ -14734,11 +14745,13 @@ impl GatewayRuntimeState {
         request: OrchestratorBackgroundTaskWorkerUpdateRequest,
     ) -> Result<OrchestratorBackgroundTaskRecord, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        let record = tokio::task::spawn_blocking(move || {
             state.update_orchestrator_background_task_from_worker_blocking(&request)
         })
         .await
-        .map_err(|_| Status::internal("orchestrator background task worker callback panicked"))?
+        .map_err(|_| Status::internal("orchestrator background task worker callback panicked"))??;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(record)
     }
 
     /// Applies a child worker callback under both execution-generation and
@@ -14750,14 +14763,16 @@ impl GatewayRuntimeState {
         parent_guard: OrchestratorParentGenerationGuard,
     ) -> Result<Option<OrchestratorBackgroundTaskRecord>, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        let record = tokio::task::spawn_blocking(move || {
             state.update_orchestrator_background_task_from_worker_if_parent_generation_blocking(
                 &request,
                 &parent_guard,
             )
         })
         .await
-        .map_err(|_| Status::internal("guarded background task worker callback panicked"))?
+        .map_err(|_| Status::internal("guarded background task worker callback panicked"))??;
+        self.orchestrator_run_notify.notify_waiters();
+        Ok(record)
     }
 
     /// Persists a parent checkpoint and child subscriptions before releasing
@@ -14779,17 +14794,6 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("parent suspension worker panicked"))?
         .map_err(|error| map_orchestrator_store_error("suspend parent for children", error))?;
         self.orchestrator_run_notify.notify_waiters();
-        let deadline_unix_ms = record.deadline_unix_ms;
-        let state = Arc::clone(self);
-        let _deadline_task = tokio::spawn(async move {
-            let delay_ms = deadline_unix_ms.saturating_sub(current_unix_ms()).max(0) as u64;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            if let Ok(report) = state.reconcile_parent_suspensions().await {
-                if report.continuation_queued_count > 0 || report.timed_out_count > 0 {
-                    state.orchestrator_run_notify.notify_waiters();
-                }
-            }
-        });
         Ok(record)
     }
 
@@ -16127,6 +16131,7 @@ impl GatewayRuntimeState {
                 &cached_outcome,
             );
         }
+        self.orchestrator_run_notify.notify_waiters();
         Ok(result)
     }
 

@@ -18,8 +18,7 @@ use crate::{
     journal::{
         objective_continuation::{
             ObjectiveAttemptReserveRequest, ObjectiveContinuationAttemptRecord,
-            ObjectiveContinuationDecision, ObjectiveContinuationTaskReserveOutcome,
-            ObjectiveJudgeDecisionRequest,
+            ObjectiveContinuationDecision, ObjectiveJudgeDecisionRequest,
         },
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
         OrchestratorBackgroundTaskWorkerUpdateRequest, OrchestratorRunStatusSnapshot,
@@ -483,13 +482,7 @@ async fn apply_decision(
             .await
         }
         ObjectiveContinuationDecision::Wait => {
-            pause_attempt(
-                runtime,
-                &attempt,
-                "objective.continuation.wait",
-                "Objective judge requested a bounded wait.",
-            )
-            .await
+            crate::application::wake_coordinator::register_objective_wait(runtime, &attempt).await
         }
         ObjectiveContinuationDecision::Blocked => {
             pause_attempt(
@@ -501,6 +494,8 @@ async fn apply_decision(
             .await
         }
         ObjectiveContinuationDecision::NeedsUser => {
+            crate::application::wake_coordinator::register_objective_user_input(runtime, &attempt)
+                .await?;
             pause_attempt(
                 runtime,
                 &attempt,
@@ -573,44 +568,7 @@ async fn continue_after_decision(
         )
         .await;
     }
-    let continuation_task_id =
-        attempt.continuation_task_id.clone().unwrap_or_else(|| Ulid::new().to_string());
-    let runtime_for_reserve = Arc::clone(runtime);
-    let attempt_id = attempt.attempt_id.clone();
-    let task_id = continuation_task_id.clone();
-    let reservation = tokio::task::spawn_blocking(move || {
-        runtime_for_reserve
-            .journal_store
-            .reserve_objective_continuation_task(
-                attempt_id.as_str(),
-                task_id.as_str(),
-                "objective.continuation.task_reserved",
-            )
-            .map_err(objective_journal_status)
-    })
-    .await
-    .map_err(|_| Status::internal("objective continuation reservation worker panicked"))??;
-    let reserved = match reservation {
-        ObjectiveContinuationTaskReserveOutcome::Reserved(record) => record,
-        ObjectiveContinuationTaskReserveOutcome::UserPreempted(record) => {
-            return pause_attempt(
-                runtime,
-                &record,
-                "objective.continuation.user_preempted",
-                "Queued user input preempted autonomous continuation.",
-            )
-            .await;
-        }
-    };
-    ensure_continuation_task(runtime, &reserved).await?;
-    mark_attempt_applied(
-        runtime,
-        reserved.attempt_id,
-        "continuation_enqueued",
-        "objective.continuation.task_enqueued",
-    )
-    .await?;
-    Ok(())
+    crate::application::wake_coordinator::register_objective_wait(runtime, attempt).await
 }
 
 async fn ensure_continuation_task(

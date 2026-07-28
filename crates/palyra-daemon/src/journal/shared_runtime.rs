@@ -28,8 +28,8 @@ use crate::delegation::DelegationSnapshot;
 use super::{
     append_or_replay_orchestrator_tape_event_tx, compute_hash, current_unix_ms, redact_value,
     runtime_kernel::ensure_runtime_rollback_allows_new_side_effect_tx, sanitize_payload,
-    JournalAppendRequest, JournalError, JournalStore, OrchestratorTapeAppendRequest,
-    NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
+    wait_coordinator, JournalAppendRequest, JournalError, JournalStore,
+    OrchestratorTapeAppendRequest, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
     NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES, NETWORKED_WORKER_EXPIRY_MAX_ENTRIES,
     NETWORKED_WORKER_FLEET_MAX_ENTRIES,
 };
@@ -5543,6 +5543,7 @@ impl JournalStore {
                 && step.disposition
                     == palyra_common::runtime_contracts::CleanupStepDisposition::Completed
         });
+        let mut terminal_pid = None;
         if descriptor.state == RuntimeHandleState::Closed {
             if report.outcome != CleanupOutcome::Completed || !absence_verified {
                 return Err(JournalError::InvalidArgument(
@@ -5556,13 +5557,19 @@ impl JournalStore {
             })?;
             let stored_lease = transaction
                 .query_row(
-                    "SELECT instance_ulid, generation FROM runtime_process_leases WHERE lease_ulid = ?1",
+                    "SELECT instance_ulid, generation, pid FROM runtime_process_leases WHERE lease_ulid = ?1",
                     params![lease_id.as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .optional()?;
             match stored_lease {
-                Some((instance_id, generation))
+                Some((instance_id, generation, pid))
                     if instance_id == descriptor.instance_id.as_str()
                         && generation == stored_generation =>
                 {
@@ -5575,6 +5582,7 @@ impl JournalStore {
                             "process cleanup lost exact lease retirement authority".to_owned(),
                         ));
                     }
+                    terminal_pid = Some(pid);
                 }
                 None if report_replayed => {}
                 _ => {
@@ -5590,6 +5598,50 @@ impl JournalStore {
             descriptor,
             report,
         )?;
+        if let Some(pid) = terminal_pid {
+            let evidence_json = serde_json::json!({
+                "schema_version": 1,
+                "instance_id": descriptor.instance_id.as_str(),
+                "generation": descriptor.generation.get(),
+                "pid": pid,
+                "cleanup_report_id": report.report_id.as_str(),
+                "absence_verified": true,
+            })
+            .to_string();
+            for (kind, source_id) in [
+                (
+                    wait_coordinator::WaitBarrierKind::ProcessSession,
+                    descriptor.instance_id.as_str().to_owned(),
+                ),
+                (
+                    wait_coordinator::WaitBarrierKind::TerminalPid,
+                    format!(
+                        "{}:{}:{}",
+                        pid,
+                        descriptor.instance_id.as_str(),
+                        descriptor.generation.get()
+                    ),
+                ),
+            ] {
+                wait_coordinator::emit_wake_event_tx(
+                    &transaction,
+                    &wait_coordinator::WakeEventRequest {
+                        source_event_id: format!(
+                            "wake:{}:{}:{}",
+                            kind.as_str(),
+                            descriptor.instance_id.as_str(),
+                            descriptor.generation.get()
+                        ),
+                        source_kind: kind.as_str().to_owned(),
+                        source_id,
+                        source_generation: descriptor.generation.get(),
+                        reason_code: "wake.process.cleanup_verified".to_owned(),
+                        evidence_json: evidence_json.clone(),
+                        occurred_at_unix_ms: descriptor.updated_at_unix_ms,
+                    },
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
