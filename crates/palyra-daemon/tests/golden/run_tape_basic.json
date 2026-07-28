@@ -56,11 +56,16 @@
   },
   {
     "seq": 11,
+    "event_type": "commitment.extraction.decision",
+    "payload_json": "{\"schema_version\":2,\"rollout_mode\":\"bounded_candidate_only\",\"selected\":false,\"reason_code\":\"commitment.extraction.no_signal\",\"value_score_bps\":0,\"sample_bucket_bps\":7400,\"source_bytes\":16,\"source_truncated\":false,\"source_sha256\":\"64989ccbf3efa9c84e2afe7cee9bc5828bf0fcb91e44f8c1e591638a2c2e90e3\",\"candidate_only\":true,\"approval_requirement\":\"manual_review\",\"extracted_candidates\":0,\"deduplicated_candidates\":0,\"failed_candidates\":0}"
+  },
+  {
+    "seq": 12,
     "event_type": "status",
     "payload_json": "{\"kind\":\"in_progress\",\"message\":\"progress:agent_loop.terminated\"}"
   },
   {
-    "seq": 12,
+    "seq": 13,
     "event_type": "status",
     "payload_json": "{\"kind\":\"done\",\"message\":\"completed\"}"
   }
