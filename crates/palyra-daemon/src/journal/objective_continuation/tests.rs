@@ -71,6 +71,39 @@ fn open_store(db_path: PathBuf) -> JournalStore {
     .expect("journal store should open")
 }
 
+fn guard_request(
+    fixture: &AttemptFixture,
+    decision: ObjectiveContinuationDecision,
+) -> ObjectiveGuardEvaluationRequest {
+    ObjectiveGuardEvaluationRequest {
+        policy: ObjectiveGuardPolicy::default(),
+        observation: ObjectiveProgressObservation {
+            attempt_id: fixture.request.attempt_id.clone(),
+            objective_id: fixture.request.objective_id.clone(),
+            session_id: fixture.request.session_id.clone(),
+            root_run_id: fixture.request.root_run_id.clone(),
+            source_run_id: fixture.request.source_run_id.clone(),
+            source_run_generation: fixture.request.source_run_generation,
+            decision,
+            runs_delta: 1,
+            turns_delta: 1,
+            provider_calls_delta: 1,
+            tokens_delta: 1,
+            cost_micros_delta: 0,
+            wall_time_ms_delta: 1,
+            progress_detected: true,
+            progress_sha256: Some("b".repeat(64)),
+            plan_sha256: None,
+            tool_error_sha256: None,
+            parse_failure: false,
+            verification_status: ObjectiveVerificationStatus::Unknown,
+            verification_reason_code: None,
+            verification_evidence_json: r#"["artifact:one"]"#.to_owned(),
+            missing_artifacts_json: "[]".to_owned(),
+        },
+    }
+}
+
 #[test]
 fn objective_attempt_reservation_is_deduplicated_across_reopen() {
     let fixture = fixture();
@@ -115,6 +148,7 @@ fn judge_decision_is_first_writer_wins_and_replay_visible() {
         next_action: Some("Collect the missing evidence.".to_owned()),
         retry_count: 0,
         next_eligible_at_unix_ms: None,
+        guard: guard_request(&fixture, ObjectiveContinuationDecision::Continue),
     };
     let settled = fixture
         .store
@@ -151,6 +185,7 @@ fn continuation_task_reservation_survives_restart_without_duplication() {
             next_action: Some("Continue safely.".to_owned()),
             retry_count: 0,
             next_eligible_at_unix_ms: None,
+            guard: guard_request(&fixture, ObjectiveContinuationDecision::Continue),
         })
         .expect("decision should settle");
     let continuation_task_id = Ulid::new().to_string();
@@ -202,6 +237,7 @@ fn pending_user_input_preempts_continuation_reservation_atomically() {
             next_action: Some("Continue safely.".to_owned()),
             retry_count: 0,
             next_eligible_at_unix_ms: None,
+            guard: guard_request(&fixture, ObjectiveContinuationDecision::Continue),
         })
         .expect("decision should settle");
     fixture

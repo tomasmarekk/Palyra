@@ -1451,11 +1451,17 @@ fn collect_console_objectives_diagnostics(
             })
         })
         .collect::<Vec<_>>();
+    let guard = state.runtime.journal_store.objective_guard_diagnostics().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to collect objective guard diagnostics: {error}"
+        )))
+    })?;
     Ok(json!({
         "count": objectives.len(),
         "by_state": by_state,
         "by_kind": by_kind,
         "recent": recent,
+        "guard": guard,
     }))
 }
 
@@ -1684,12 +1690,19 @@ fn collect_console_agent_plan_diagnostics(
             })
         })
         .collect::<Vec<_>>();
+    let objective_guards =
+        state.runtime.journal_store.objective_guard_diagnostics().map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to collect plan-link diagnostics: {error}"
+            )))
+        })?;
 
     Ok(json!({
         "schema_version": crate::application::plan_state::AGENT_PLAN_SCHEMA_VERSION,
         "rollout_enabled": state.runtime.config.feature_rollouts.agent_plan_state.enabled,
         "rollout_source": state.runtime.config.feature_rollouts.agent_plan_state.source,
         "active_count": active.len(),
+        "effective_auto_plan_count": objective_guards.auto_plans_total,
         "sampled_count": terminal.len(),
         "by_status": by_status,
         "recent": recent_items,

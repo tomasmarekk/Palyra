@@ -3,15 +3,20 @@
 //! The store facade keeps tool/runtime code from depending directly on the
 //! journal schema while rollout remains conservative.
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tonic::Status;
 use ulid::Ulid;
 
-use crate::journal::{
-    AgentPlanCreateRequest, AgentPlanEventRecord, AgentPlanItemRecord, AgentPlanListFilter,
-    AgentPlanUpdateRequest, JournalError, JournalStore,
+use crate::{
+    gateway::GatewayRuntimeState,
+    journal::{
+        AgentPlanCreateRequest, AgentPlanEventRecord, AgentPlanItemRecord, AgentPlanListFilter,
+        AgentPlanUpdateRequest, JournalError, JournalStore, V2ComplexPlanEnsureOutcome,
+        V2ComplexPlanEnsureRequest,
+    },
 };
 
 pub const AGENT_PLAN_SCHEMA_VERSION: u64 = 1;
@@ -20,6 +25,8 @@ pub const AGENT_PLAN_UPDATED_EVENT: &str = "agent.plan.updated";
 pub const AGENT_PLAN_COMPLETED_EVENT: &str = "agent.plan.completed";
 pub const AGENT_PLAN_BLOCKED_EVENT: &str = "agent.plan.blocked";
 pub const AGENT_PLAN_TOOL_INVOKED_EVENT: &str = "agent.plan.tool_invoked";
+pub(crate) const V2_COMPLEX_PLAN_REASON: &str = "agent.plan.v2_complex_auto_initialized";
+const V2_COMPLEXITY_THRESHOLD: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,6 +284,123 @@ impl<'a> AgentPlanStore<'a> {
     }
 }
 
+/// Host-owned inputs for authoritative-V2 complex plan initialization.
+#[derive(Debug, Clone)]
+pub(crate) struct V2ComplexPlanContext<'a> {
+    pub(crate) authoritative_v2: bool,
+    pub(crate) complexity_score: f64,
+    pub(crate) session_id: &'a str,
+    pub(crate) run_id: &'a str,
+    pub(crate) parameter_delta_json: Option<&'a str>,
+    pub(crate) owner_principal: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) channel: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ObjectiveContinuationPlanScope {
+    objective_id: String,
+    root_run_id: String,
+}
+
+/// Atomically initializes the minimal non-authoritative plan for a complex,
+/// authoritative RuntimeKernelV2 run.
+///
+/// # Errors
+/// Returns a runtime status when the durable plan/link transaction fails.
+pub(crate) async fn ensure_authoritative_v2_complex_plan(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: V2ComplexPlanContext<'_>,
+) -> Result<Option<V2ComplexPlanEnsureOutcome>, Status> {
+    let objective_scope = objective_continuation_plan_scope(context.parameter_delta_json);
+    if !should_auto_initialize_v2_plan(
+        context.authoritative_v2,
+        context.complexity_score,
+        objective_scope.is_some(),
+    ) {
+        return Ok(None);
+    }
+    let root_run_id =
+        objective_scope.as_ref().map(|scope| scope.root_run_id.as_str()).unwrap_or(context.run_id);
+    let objective_id = objective_scope
+        .as_ref()
+        .map(|scope| scope.objective_id.clone())
+        .unwrap_or_else(|| format!("run:{root_run_id}"));
+    let (title, focus) = if let Some(scope) = objective_scope.as_ref() {
+        objective_plan_descriptor(runtime, scope.objective_id.as_str()).await?
+    } else {
+        (
+            "Track complex task progress".to_owned(),
+            "Maintain a durable, non-authoritative progress checklist.".to_owned(),
+        )
+    };
+    let request = V2ComplexPlanEnsureRequest {
+        plan_item_id: Ulid::new().to_string(),
+        objective_id,
+        session_id: context.session_id.to_owned(),
+        root_run_id: root_run_id.to_owned(),
+        source_run_id: context.run_id.to_owned(),
+        owner_principal: context.owner_principal.to_owned(),
+        device_id: context.device_id.to_owned(),
+        channel: context.channel.map(ToOwned::to_owned),
+        actor_principal: context.owner_principal.to_owned(),
+        title,
+        focus,
+    };
+    let state = Arc::clone(runtime);
+    tokio::task::spawn_blocking(move || {
+        state
+            .journal_store
+            .ensure_v2_complex_plan(&request)
+            .map(Some)
+            .map_err(|error| Status::internal(format!("V2 plan initialization failed: {error}")))
+    })
+    .await
+    .map_err(|_| Status::internal("V2 plan initialization worker panicked"))?
+}
+
+async fn objective_plan_descriptor(
+    runtime: &Arc<GatewayRuntimeState>,
+    objective_id: &str,
+) -> Result<(String, String), Status> {
+    let registry = Arc::clone(&runtime.routines_runtime_config()?.objectives);
+    let objective_id = objective_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let objective = registry
+            .get_objective(objective_id.as_str())
+            .map_err(|error| Status::internal(format!("objective plan lookup failed: {error}")))?
+            .ok_or_else(|| Status::failed_precondition("objective plan scope no longer exists"))?;
+        let focus = objective
+            .current_focus
+            .or(objective.next_recommended_step)
+            .or(objective.success_criteria)
+            .unwrap_or_else(|| "Verify the objective completion contract.".to_owned());
+        Ok(("Track objective progress".to_owned(), focus))
+    })
+    .await
+    .map_err(|_| Status::internal("objective plan lookup worker panicked"))?
+}
+
+fn should_auto_initialize_v2_plan(
+    authoritative_v2: bool,
+    complexity_score: f64,
+    objective_continuation: bool,
+) -> bool {
+    authoritative_v2
+        && (objective_continuation
+            || (complexity_score.is_finite() && complexity_score >= V2_COMPLEXITY_THRESHOLD))
+}
+
+fn objective_continuation_plan_scope(
+    parameter_delta_json: Option<&str>,
+) -> Option<ObjectiveContinuationPlanScope> {
+    let value = serde_json::from_str::<Value>(parameter_delta_json?).ok()?;
+    let candidate = value
+        .get("objective_continuation")
+        .or_else(|| value.get("parameter_delta")?.get("objective_continuation"))?;
+    serde_json::from_value(candidate.clone()).ok()
+}
+
 fn item_from_record(record: AgentPlanItemRecord) -> Result<AgentPlanItem, JournalError> {
     Ok(AgentPlanItem {
         schema_version: AGENT_PLAN_SCHEMA_VERSION,
@@ -360,5 +484,28 @@ mod tests {
         assert_eq!(AgentPlanStatus::Completed.update_event_type(), AGENT_PLAN_COMPLETED_EVENT);
         assert_eq!(AgentPlanStatus::Cancelled.update_event_type(), AGENT_PLAN_UPDATED_EVENT);
         assert!(AgentPlanStatus::Completed.is_terminal());
+    }
+
+    #[test]
+    fn v2_complex_plan_heuristic_is_authoritative_and_bounded() {
+        assert!(should_auto_initialize_v2_plan(true, 0.75, false));
+        assert!(should_auto_initialize_v2_plan(true, 0.10, true));
+        assert!(!should_auto_initialize_v2_plan(false, 1.0, true));
+        assert!(!should_auto_initialize_v2_plan(true, 0.74, false));
+        assert!(!should_auto_initialize_v2_plan(true, f64::NAN, false));
+    }
+
+    #[test]
+    fn objective_scope_parses_direct_and_wrapped_parameter_delta() {
+        let direct = objective_continuation_plan_scope(Some(
+            r#"{"objective_continuation":{"objective_id":"objective","root_run_id":"root"}}"#,
+        ))
+        .expect("direct objective scope should parse");
+        let wrapped = objective_continuation_plan_scope(Some(
+            r#"{"parameter_delta":{"objective_continuation":{"objective_id":"objective","root_run_id":"root"}}}"#,
+        ))
+        .expect("wrapped objective scope should parse");
+
+        assert_eq!(direct, wrapped);
     }
 }

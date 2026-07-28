@@ -1149,6 +1149,7 @@ fn compute_objective_health(
     let health = match objective.state {
         ObjectiveState::Archived => "archived",
         ObjectiveState::Cancelled => "cancelled",
+        ObjectiveState::Completed => "completed",
         ObjectiveState::Paused => "paused",
         ObjectiveState::Draft => "draft",
         ObjectiveState::Active => match status {
@@ -1430,9 +1431,12 @@ async fn apply_fire_action(
     objective: &mut ObjectiveRecord,
     reason: Option<String>,
 ) -> Result<(), Response> {
-    if matches!(objective.state, ObjectiveState::Cancelled | ObjectiveState::Archived) {
+    if matches!(
+        objective.state,
+        ObjectiveState::Cancelled | ObjectiveState::Archived | ObjectiveState::Completed
+    ) {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
-            "cancelled or archived objectives cannot be fired",
+            "terminal objectives cannot be fired",
         )));
     }
     if !objective.automation.enabled {
@@ -1505,15 +1509,15 @@ async fn apply_pause_action(
 }
 
 /// Applies the `resume` action: re-enables automation and reactivates the
-/// objective; archived objectives stay archived.
+/// objective; completed and archived objectives remain terminal.
 async fn apply_resume_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
     reason: Option<String>,
 ) -> Result<(), Response> {
-    if objective.state == ObjectiveState::Archived {
+    if matches!(objective.state, ObjectiveState::Archived | ObjectiveState::Completed) {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
-            "archived objectives cannot be resumed",
+            "archived or completed objectives cannot be resumed",
         )));
     }
     let from_state = objective.state;
@@ -1691,9 +1695,12 @@ fn apply_lifecycle_workspace_projection(
 ) -> Result<(), tonic::Status> {
     match action {
         "fire" => {
-            if matches!(objective.state, ObjectiveState::Cancelled | ObjectiveState::Archived) {
+            if matches!(
+                objective.state,
+                ObjectiveState::Cancelled | ObjectiveState::Archived | ObjectiveState::Completed
+            ) {
                 return Err(tonic::Status::failed_precondition(
-                    "cancelled or archived objectives cannot be fired",
+                    "terminal objectives cannot be fired",
                 ));
             }
             if !objective.automation.enabled {
@@ -1708,9 +1715,9 @@ fn apply_lifecycle_workspace_projection(
             objective.automation.enabled = false;
         }
         "resume" => {
-            if objective.state == ObjectiveState::Archived {
+            if matches!(objective.state, ObjectiveState::Archived | ObjectiveState::Completed) {
                 return Err(tonic::Status::failed_precondition(
-                    "archived objectives cannot be resumed",
+                    "archived or completed objectives cannot be resumed",
                 ));
             }
             objective.state = ObjectiveState::Active;
@@ -1934,7 +1941,12 @@ fn owner_objective_block_updates(
                 entries: objectives
                     .iter()
                     .filter(|entry| {
-                        !matches!(entry.state, ObjectiveState::Archived | ObjectiveState::Cancelled)
+                        !matches!(
+                            entry.state,
+                            ObjectiveState::Archived
+                                | ObjectiveState::Cancelled
+                                | ObjectiveState::Completed
+                        )
                     })
                     .map(|entry| {
                         managed_entry(

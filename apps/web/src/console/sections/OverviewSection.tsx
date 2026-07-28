@@ -1440,6 +1440,7 @@ function primaryLifecycleAction(objective: JsonObject): LifecycleAction | null {
     case "paused":
     case "draft":
       return "resume";
+    case "completed":
     case "cancelled":
     case "archived":
       return null;

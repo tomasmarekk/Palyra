@@ -3026,17 +3026,20 @@ async fn build_agent_plan_context_segment(
     context: &RequestContext,
     session_id: &str,
 ) -> Result<Option<ContextSegment>, Status> {
-    if !runtime_state.config.feature_rollouts.agent_plan_state.enabled {
-        return Ok(None);
-    }
+    let rollout_enabled = runtime_state.config.feature_rollouts.agent_plan_state.enabled;
     let state = Arc::clone(runtime_state);
     let principal = context.principal.clone();
     let device_id = context.device_id.clone();
     let channel = context.channel.clone();
     let session_id = session_id.to_owned();
     let items = tokio::task::spawn_blocking(move || {
+        if !rollout_enabled
+            && !state.journal_store.has_active_v2_complex_plan_for_session(session_id.as_str())?
+        {
+            return Ok(Vec::new());
+        }
         let store = crate::application::plan_state::AgentPlanStore::new(&state.journal_store);
-        store.list_items(&crate::application::plan_state::AgentPlanQuery {
+        let mut items = store.list_items(&crate::application::plan_state::AgentPlanQuery {
             owner_principal: Some(principal),
             device_id: Some(device_id),
             channel,
@@ -3045,7 +3048,13 @@ async fn build_agent_plan_context_segment(
             status: None,
             include_terminal: false,
             limit: AGENT_PLAN_CONTEXT_ITEM_LIMIT,
-        })
+        })?;
+        if !rollout_enabled {
+            items.retain(|item| {
+                item.reason_code == crate::application::plan_state::V2_COMPLEX_PLAN_REASON
+            });
+        }
+        Ok::<_, crate::journal::JournalError>(items)
     })
     .await
     .map_err(|_| Status::internal("agent plan context worker panicked"))?

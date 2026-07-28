@@ -133,10 +133,15 @@ fn execute_plan_manage_blocking(
 ) -> Result<PlanManageOutput, String> {
     request.actor_principal = context.principal.clone();
     let rollout_enabled = runtime_state.config.feature_rollouts.agent_plan_state.enabled;
+    let effective_enabled = rollout_enabled
+        || runtime_state
+            .journal_store
+            .has_active_v2_complex_plan_for_session(context.session_id.as_str())
+            .map_err(|error| format!("failed to inspect effective plan state: {error}"))?;
     let store = AgentPlanStore::new(&runtime_state.journal_store);
-    let mut output = PlanManageOutput::new(request.operation, rollout_enabled);
+    let mut output = PlanManageOutput::new(request.operation, effective_enabled);
 
-    if request.operation.is_mutating() && !rollout_enabled {
+    if request.operation.is_mutating() && !effective_enabled {
         output.rejected_items.push(PlanManageRejection {
             item_id: None,
             reason_code: "agent_plan_state_rollout_disabled".to_owned(),

@@ -225,6 +225,7 @@ pub(crate) struct ObjectiveJudgeDecisionRequest {
     pub(crate) next_action: Option<String>,
     pub(crate) retry_count: u64,
     pub(crate) next_eligible_at_unix_ms: Option<i64>,
+    pub(crate) guard: super::ObjectiveGuardEvaluationRequest,
 }
 
 /// Outcome of reserving a continuation under the session-input priority fence.
@@ -501,6 +502,11 @@ impl JournalStore {
                     "objective judge replay conflicts with committed decision".to_owned(),
                 ));
             }
+            super::objective_guards::evaluate_objective_guard_tx(
+                &transaction,
+                &request.guard,
+                now,
+            )?;
             transaction.commit()?;
             return Ok(current);
         }
@@ -546,6 +552,7 @@ impl JournalStore {
             request.evidence_refs_json.as_str(),
             now,
         )?;
+        super::objective_guards::evaluate_objective_guard_tx(&transaction, &request.guard, now)?;
         let record = load_objective_attempt_tx(&transaction, current.attempt_id.as_str())?
             .ok_or_else(|| {
                 JournalError::InvalidArgument(

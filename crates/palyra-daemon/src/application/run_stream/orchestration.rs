@@ -4205,6 +4205,22 @@ async fn process_run_stream_message_inner(
             false
         }
     };
+    drop(
+        crate::application::plan_state::ensure_authoritative_v2_complex_plan(
+            runtime_state,
+            crate::application::plan_state::V2ComplexPlanContext {
+                authoritative_v2: v2_runtime_active,
+                complexity_score: routing_decision.complexity_score,
+                session_id: session_id_for_message.as_str(),
+                run_id: run_id.as_str(),
+                parameter_delta_json: parameter_delta_json.as_deref(),
+                owner_principal: request_context.principal.as_str(),
+                device_id: request_context.device_id.as_str(),
+                channel: request_context.channel.as_deref(),
+            },
+        )
+        .await?,
+    );
     let context_engine_enabled =
         runtime_state.config.feature_rollouts.context_engine.enabled || v2_runtime_active;
     let prepare_request = PrepareModelProviderInputRequest {

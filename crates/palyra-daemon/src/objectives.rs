@@ -85,6 +85,8 @@ pub enum ObjectiveState {
     Draft,
     Active,
     Paused,
+    /// Verified terminal success that remains visible until explicitly archived.
+    Completed,
     Cancelled,
     Archived,
 }
@@ -97,6 +99,7 @@ impl ObjectiveState {
             Self::Draft => "draft",
             Self::Active => "active",
             Self::Paused => "paused",
+            Self::Completed => "completed",
             Self::Cancelled => "cancelled",
             Self::Archived => "archived",
         }
@@ -1369,6 +1372,20 @@ mod tests {
             fetched.contract.success_criteria.items[0].description,
             "Objective board renders current focus and health."
         );
+    }
+
+    #[test]
+    fn completed_objective_round_trips_as_terminal_success() {
+        let state_root = temp_state_root();
+        let registry = ObjectiveRegistry::open(state_root.as_path()).expect("registry should open");
+        let mut record = sample_record();
+        record.state = ObjectiveState::Completed;
+        let completed =
+            registry.upsert_objective(ObjectiveUpsert { record }).expect("objective should save");
+
+        assert_eq!(completed.state, ObjectiveState::Completed);
+        assert_eq!(completed.state.as_str(), "completed");
+        assert!(completed.archived_at_unix_ms.is_none());
     }
 
     #[test]

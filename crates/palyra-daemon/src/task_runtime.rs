@@ -840,8 +840,8 @@ impl TaskRuntime {
         }
 
         let mut plan_progress = None;
-        if runtime.config.feature_rollouts.agent_plan_state.enabled {
-            let plan_items = list_agent_plan_items(runtime, &filter, limit).await?;
+        let plan_items = list_agent_plan_items(runtime, &filter, limit).await?;
+        if !plan_items.is_empty() || runtime.config.feature_rollouts.agent_plan_state.enabled {
             plan_progress = Some(plan_progress_checkpoint(plan_items.as_slice(), true));
             for item in plan_items {
                 push_if_visible(&mut tasks, agent_plan_task_run(item)?, &filter);
@@ -1178,7 +1178,13 @@ async fn list_agent_plan_items(
     };
     tokio::task::spawn_blocking(move || {
         let store = AgentPlanStore::new(&state.journal_store);
-        store.list_items(&query)
+        let mut items = store.list_items(&query)?;
+        if !state.config.feature_rollouts.agent_plan_state.enabled {
+            items.retain(|item| {
+                item.reason_code == crate::application::plan_state::V2_COMPLEX_PLAN_REASON
+            });
+        }
+        Ok::<_, crate::journal::JournalError>(items)
     })
     .await
     .map_err(|_| Status::internal("agent plan task list worker panicked"))?
@@ -1190,14 +1196,16 @@ async fn get_agent_plan_item(
     runtime: &Arc<GatewayRuntimeState>,
     plan_item_id: &str,
 ) -> Result<Option<AgentPlanItem>, Status> {
-    if !runtime.config.feature_rollouts.agent_plan_state.enabled {
-        return Ok(None);
-    }
+    let rollout_enabled = runtime.config.feature_rollouts.agent_plan_state.enabled;
     let state = Arc::clone(runtime);
     let plan_item_id = plan_item_id.to_owned();
     tokio::task::spawn_blocking(move || {
         let store = AgentPlanStore::new(&state.journal_store);
-        store.get_item(plan_item_id.as_str())
+        let item = store.get_item(plan_item_id.as_str())?;
+        Ok::<_, crate::journal::JournalError>(item.filter(|item| {
+            rollout_enabled
+                || item.reason_code == crate::application::plan_state::V2_COMPLEX_PLAN_REASON
+        }))
     })
     .await
     .map_err(|_| Status::internal("agent plan task get worker panicked"))?

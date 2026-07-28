@@ -84,6 +84,7 @@ pub mod child_completion;
 pub(crate) mod lifecycle;
 mod metadata_trace;
 pub(crate) mod objective_continuation;
+pub(crate) mod objective_guards;
 pub(crate) mod restart;
 mod retrieval_index_status;
 pub(crate) mod run_admission;
@@ -102,6 +103,11 @@ pub use autonomy::{
     ParentWaitPolicy,
 };
 pub use child_completion::ChildCompletionReconcileReport;
+pub(crate) use objective_guards::{
+    ObjectiveGuardDisposition, ObjectiveGuardEvaluation, ObjectiveGuardEvaluationRequest,
+    ObjectiveGuardPolicy, ObjectiveProgressObservation, ObjectiveVerificationStatus,
+    V2ComplexPlanEnsureOutcome, V2ComplexPlanEnsureRequest,
+};
 pub use session_operations::{
     ScopedSessionRuntimeGeneration, SessionModelCommandKind, SessionModelCommandRecord,
     SessionModelCommandReserveOutcome, SessionModelCommandReserveRequest,
@@ -7507,6 +7513,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: objective_continuation::MIGRATION_87_SQL,
     },
     Migration { version: 88, name: "wait_coordinator", sql: wait_coordinator::MIGRATION_88_SQL },
+    Migration {
+        version: 89,
+        name: "objective_guards_and_plan_links",
+        sql: objective_guards::MIGRATION_89_SQL,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(
@@ -16258,6 +16269,12 @@ impl JournalStore {
             ],
         )?;
         if !queued_state.is_terminal() {
+            objective_guards::objective_guard_reset_for_session_tx(
+                &transaction,
+                request.session_id.as_str(),
+                "objective.guard.user_correction_reset",
+                now,
+            )?;
             wait_coordinator::emit_wake_event_tx(
                 &transaction,
                 &wait_coordinator::WakeEventRequest {

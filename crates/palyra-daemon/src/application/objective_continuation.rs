@@ -20,13 +20,14 @@ use crate::{
             ObjectiveAttemptReserveRequest, ObjectiveContinuationAttemptRecord,
             ObjectiveContinuationDecision, ObjectiveJudgeDecisionRequest,
         },
+        ObjectiveGuardDisposition, ObjectiveGuardEvaluation,
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
         OrchestratorBackgroundTaskWorkerUpdateRequest, OrchestratorRunStatusSnapshot,
     },
     objective_judge::{ObjectiveJudgeInput, ObjectiveJudgeOutput, ObjectiveJudgeStatus},
     objectives::{
-        ObjectiveAttemptRecord, ObjectiveLifecycleRecord, ObjectiveRecord, ObjectiveState,
-        ObjectiveUpsert,
+        ObjectiveAttemptRecord, ObjectiveFinalizationMode, ObjectiveLifecycleRecord,
+        ObjectiveRecord, ObjectiveState, ObjectiveUpsert,
     },
 };
 
@@ -112,7 +113,7 @@ pub(crate) async fn reconcile_terminal_task(
     task: &OrchestratorBackgroundTaskRecord,
 ) -> Result<bool, Status> {
     if let Some(attempt) = objective_attempt_for_judge_task(runtime, task.task_id.clone()).await? {
-        let decision = judge_decision_from_task(task, &attempt)?;
+        let decision = judge_decision_from_task(runtime, task, &attempt).await?;
         let settled = settle_judge_decision(runtime, decision).await?;
         apply_decision(runtime, settled).await?;
         return Ok(true);
@@ -470,16 +471,23 @@ async fn apply_decision(
     attempt: ObjectiveContinuationAttemptRecord,
 ) -> Result<(), Status> {
     project_attempt(runtime, &attempt).await?;
+    let guard = objective_guard_evaluation(runtime, attempt.attempt_id.clone()).await?.ok_or_else(
+        || Status::failed_precondition("objective decision is missing its guard evaluation"),
+    )?;
+    if guard.disposition == ObjectiveGuardDisposition::Pause {
+        return pause_guarded_attempt(
+            runtime,
+            &attempt,
+            guard.reason_code.as_str(),
+            objective_guard_pause_summary(&guard),
+            &guard,
+        )
+        .await;
+    }
     match attempt.decision {
         ObjectiveContinuationDecision::Continue => continue_after_decision(runtime, &attempt).await,
         ObjectiveContinuationDecision::Done => {
-            pause_attempt(
-                runtime,
-                &attempt,
-                "objective.continuation.verification_pending",
-                "Objective judge reported done; final verification is pending.",
-            )
-            .await
+            finalize_after_decision(runtime, &attempt, &guard).await
         }
         ObjectiveContinuationDecision::Wait => {
             crate::application::wake_coordinator::register_objective_wait(runtime, &attempt).await
@@ -654,8 +662,90 @@ async fn pause_attempt(
     reason_code: &str,
     summary: &str,
 ) -> Result<(), Status> {
-    update_objective_projection(runtime, attempt, Some((reason_code, summary))).await?;
+    update_objective_projection(
+        runtime,
+        attempt,
+        ObjectiveProjectionTransition::Paused { reason_code, summary, guard: None },
+    )
+    .await?;
     mark_attempt_applied(runtime, attempt.attempt_id.clone(), "settled", reason_code).await?;
+    Ok(())
+}
+
+async fn pause_guarded_attempt(
+    runtime: &Arc<GatewayRuntimeState>,
+    attempt: &ObjectiveContinuationAttemptRecord,
+    reason_code: &str,
+    summary: &str,
+    guard: &ObjectiveGuardEvaluation,
+) -> Result<(), Status> {
+    update_objective_projection(
+        runtime,
+        attempt,
+        ObjectiveProjectionTransition::Paused { reason_code, summary, guard: Some(guard) },
+    )
+    .await?;
+    mark_attempt_applied(runtime, attempt.attempt_id.clone(), "settled", reason_code).await?;
+    Ok(())
+}
+
+async fn finalize_after_decision(
+    runtime: &Arc<GatewayRuntimeState>,
+    attempt: &ObjectiveContinuationAttemptRecord,
+    guard: &ObjectiveGuardEvaluation,
+) -> Result<(), Status> {
+    let objective = load_objective(runtime, attempt.objective_id.clone())
+        .await?
+        .ok_or_else(|| Status::not_found("objective no longer exists"))?;
+    match objective.contract.finalization_policy.mode {
+        ObjectiveFinalizationMode::AutomaticWhenSatisfied => {
+            complete_attempt(runtime, attempt, guard).await
+        }
+        ObjectiveFinalizationMode::ManualReview => {
+            pause_guarded_attempt(
+                runtime,
+                attempt,
+                "objective.continuation.manual_review_required",
+                "Objective verification passed and awaits manual review.",
+                guard,
+            )
+            .await
+        }
+        ObjectiveFinalizationMode::NeverAutomatic => {
+            pause_guarded_attempt(
+                runtime,
+                attempt,
+                "objective.continuation.automatic_finalization_disabled",
+                "Objective verification passed, but its contract forbids automatic completion.",
+                guard,
+            )
+            .await
+        }
+    }
+}
+
+async fn complete_attempt(
+    runtime: &Arc<GatewayRuntimeState>,
+    attempt: &ObjectiveContinuationAttemptRecord,
+    guard: &ObjectiveGuardEvaluation,
+) -> Result<(), Status> {
+    update_objective_projection(
+        runtime,
+        attempt,
+        ObjectiveProjectionTransition::Completed {
+            reason_code: guard.reason_code.as_str(),
+            summary: "Objective completion passed persisted verification and runaway guards.",
+            guard,
+        },
+    )
+    .await?;
+    mark_attempt_applied(
+        runtime,
+        attempt.attempt_id.clone(),
+        "settled",
+        guard.reason_code.as_str(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -663,18 +753,43 @@ async fn project_attempt(
     runtime: &Arc<GatewayRuntimeState>,
     attempt: &ObjectiveContinuationAttemptRecord,
 ) -> Result<(), Status> {
-    update_objective_projection(runtime, attempt, None).await
+    update_objective_projection(runtime, attempt, ObjectiveProjectionTransition::None).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectiveProjectionTransition<'a> {
+    None,
+    Paused { reason_code: &'a str, summary: &'a str, guard: Option<&'a ObjectiveGuardEvaluation> },
+    Completed { reason_code: &'a str, summary: &'a str, guard: &'a ObjectiveGuardEvaluation },
 }
 
 async fn update_objective_projection(
     runtime: &Arc<GatewayRuntimeState>,
     attempt: &ObjectiveContinuationAttemptRecord,
-    pause: Option<(&str, &str)>,
+    transition: ObjectiveProjectionTransition<'_>,
 ) -> Result<(), Status> {
     let config = runtime.routines_runtime_config()?;
     let registry = Arc::clone(&config.objectives);
     let attempt = attempt.clone();
-    let pause = pause.map(|(reason, summary)| (reason.to_owned(), summary.to_owned()));
+    let transition = match transition {
+        ObjectiveProjectionTransition::None => None,
+        ObjectiveProjectionTransition::Paused { reason_code, summary, guard } => Some((
+            ObjectiveState::Paused,
+            "objective_continuation_paused".to_owned(),
+            reason_code.to_owned(),
+            summary.to_owned(),
+            guard.map(|guard| guard.fingerprint.verification_evidence_json.clone()),
+            guard.map(|guard| guard.fingerprint.missing_artifacts_json.clone()),
+        )),
+        ObjectiveProjectionTransition::Completed { reason_code, summary, guard } => Some((
+            ObjectiveState::Completed,
+            "objective_continuation_completed".to_owned(),
+            reason_code.to_owned(),
+            summary.to_owned(),
+            Some(guard.fingerprint.verification_evidence_json.clone()),
+            Some(guard.fingerprint.missing_artifacts_json.clone()),
+        )),
+    };
     tokio::task::spawn_blocking(move || {
         let Some(mut objective) = registry
             .get_objective(attempt.objective_id.as_str())
@@ -685,15 +800,18 @@ async fn update_objective_projection(
         let evidence_refs =
             serde_json::from_str::<Vec<String>>(attempt.evidence_refs_json.as_str())
                 .unwrap_or_default();
-        let projected_attempt = ObjectiveAttemptRecord {
+        let mut projected_attempt = ObjectiveAttemptRecord {
             attempt_id: attempt.attempt_id.clone(),
             run_id: Some(attempt.source_run_id.clone()),
             session_id: Some(attempt.session_id.clone()),
             status: attempt.decision.as_str().to_owned(),
             outcome_kind: Some(attempt.reason_code.clone()),
             summary: attempt.summary_text.clone(),
-            learned: (!evidence_refs.is_empty())
-                .then(|| format!("Evidence refs: {}", evidence_refs.join(", "))),
+            learned: objective_outcome_evidence_summary(
+                evidence_refs.as_slice(),
+                transition.as_ref().and_then(|entry| entry.4.as_deref()),
+                transition.as_ref().and_then(|entry| entry.5.as_deref()),
+            ),
             recommended_next_step: attempt.next_action.clone(),
             created_at_unix_ms: attempt.created_at_unix_ms,
             completed_at_unix_ms: Some(attempt.updated_at_unix_ms),
@@ -707,22 +825,32 @@ async fn update_objective_projection(
         } else {
             objective.attempt_history.push(projected_attempt.clone());
         }
-        objective.last_attempt = Some(projected_attempt);
+        objective.last_attempt = Some(projected_attempt.clone());
         if !objective.linked_run_ids.contains(&attempt.source_run_id) {
             objective.linked_run_ids.push(attempt.source_run_id.clone());
         }
         objective.next_recommended_step = attempt.next_action.clone();
-        if let Some((reason_code, summary)) = pause {
+        if let Some((to_state, action, reason_code, summary, _, _)) = transition {
+            projected_attempt.status = to_state.as_str().to_owned();
+            projected_attempt.outcome_kind = Some(reason_code.clone());
+            if let Some(existing) = objective
+                .attempt_history
+                .iter_mut()
+                .find(|record| record.attempt_id == projected_attempt.attempt_id)
+            {
+                *existing = projected_attempt.clone();
+            }
+            objective.last_attempt = Some(projected_attempt);
             let from_state = objective.state;
-            objective.state = ObjectiveState::Paused;
+            objective.state = to_state;
             objective.automation.enabled = false;
             if !objective.lifecycle_history.iter().any(|event| event.event_id == attempt.attempt_id)
             {
                 objective.lifecycle_history.push(ObjectiveLifecycleRecord {
                     event_id: attempt.attempt_id.clone(),
-                    action: "objective_continuation_paused".to_owned(),
+                    action,
                     from_state: Some(from_state),
-                    to_state: ObjectiveState::Paused,
+                    to_state,
                     reason: Some(format!("{reason_code}: {summary}")),
                     run_id: Some(attempt.source_run_id.clone()),
                     occurred_at_unix_ms: attempt.updated_at_unix_ms,
@@ -738,7 +866,39 @@ async fn update_objective_projection(
     .map_err(|_| Status::internal("objective projection worker panicked"))?
 }
 
-fn judge_decision_from_task(
+fn objective_outcome_evidence_summary(
+    judge_evidence_refs: &[String],
+    verification_evidence_json: Option<&str>,
+    missing_artifacts_json: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if !judge_evidence_refs.is_empty() {
+        parts.push(format!("Judge evidence: {}", judge_evidence_refs.join(", ")));
+    }
+    if let Some(verification) = verification_evidence_json.filter(|value| *value != "null") {
+        parts.push(format!("Verification: {verification}"));
+    }
+    if let Some(missing) = missing_artifacts_json.filter(|value| *value != "[]") {
+        parts.push(format!("Missing artifacts: {missing}"));
+    }
+    (!parts.is_empty()).then(|| truncate_utf8_bytes(parts.join("; "), 2_000))
+}
+
+fn truncate_utf8_bytes(mut value: String, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value;
+    }
+    let mut end = maximum.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str("...");
+    value
+}
+
+async fn judge_decision_from_task(
+    runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
     attempt: &ObjectiveContinuationAttemptRecord,
 ) -> Result<ObjectiveJudgeDecisionRequest, Status> {
@@ -791,6 +951,18 @@ fn judge_decision_from_task(
         };
     let evidence_refs_json = serde_json::to_string(&evidence_refs)
         .map_err(|error| Status::internal(format!("failed to encode judge evidence: {error}")))?;
+    let objective = load_objective(runtime, attempt.objective_id.clone())
+        .await?
+        .ok_or_else(|| Status::not_found("objective no longer exists"))?;
+    let guard = crate::application::objective_guards::build_objective_guard_request(
+        runtime,
+        &objective,
+        attempt,
+        decision,
+        retry_count > 0,
+        evidence_refs_json.as_str(),
+    )
+    .await?;
     Ok(ObjectiveJudgeDecisionRequest {
         judge_task_id: task.task_id.clone(),
         decision,
@@ -800,6 +972,7 @@ fn judge_decision_from_task(
         next_action,
         retry_count,
         next_eligible_at_unix_ms: next_eligible,
+        guard,
     })
 }
 
@@ -896,6 +1069,31 @@ async fn objective_runtime_binding(
     .map_err(|_| Status::internal("objective runtime binding lookup worker panicked"))?
 }
 
+async fn objective_guard_evaluation(
+    runtime: &Arc<GatewayRuntimeState>,
+    attempt_id: String,
+) -> Result<Option<ObjectiveGuardEvaluation>, Status> {
+    let runtime = Arc::clone(runtime);
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .journal_store
+            .objective_guard_evaluation_for_attempt(attempt_id.as_str())
+            .map_err(objective_journal_status)
+    })
+    .await
+    .map_err(|_| Status::internal("objective guard lookup worker panicked"))?
+}
+
+fn objective_guard_pause_summary(guard: &ObjectiveGuardEvaluation) -> &'static str {
+    if guard.reason_code.starts_with("objective.guard.budget.") {
+        "Objective continuation exhausted its durable cross-run budget."
+    } else if guard.reason_code.starts_with("objective.guard.verification_") {
+        "Objective completion is missing persisted verification evidence."
+    } else {
+        "Objective continuation paused after repeated non-progress evidence."
+    }
+}
+
 async fn load_objective(
     runtime: &Arc<GatewayRuntimeState>,
     objective_id: String,
@@ -941,4 +1139,36 @@ fn objective_journal_status(error: crate::journal::JournalError) -> Status {
 
 fn objective_registry_status(error: crate::objectives::ObjectiveRegistryError) -> Status {
     Status::internal(format!("objective registry error: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objective_outcome_preserves_verification_and_missing_artifacts() {
+        let summary = objective_outcome_evidence_summary(
+            &["test:judge".to_owned()],
+            Some(r#"{"status":"verified","evidence_refs":["test:runtime"]}"#),
+            Some(r#"["artifact:missing"]"#),
+        )
+        .expect("objective outcome should contain evidence");
+
+        assert!(summary.contains("test:judge"));
+        assert!(summary.contains("\"status\":\"verified\""));
+        assert!(summary.contains("artifact:missing"));
+    }
+
+    #[test]
+    fn objective_outcome_evidence_is_utf8_safe_and_bounded() {
+        let summary = objective_outcome_evidence_summary(
+            &[format!("evidence:{}", "ž".repeat(2_000))],
+            None,
+            None,
+        )
+        .expect("objective outcome should contain evidence");
+
+        assert!(summary.len() <= 2_000);
+        assert!(summary.ends_with("..."));
+    }
 }

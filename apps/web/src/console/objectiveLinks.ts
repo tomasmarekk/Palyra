@@ -148,6 +148,7 @@ function objectiveStateScore(state: string): number {
       return 3;
     case "draft":
       return 2;
+    case "completed":
     case "cancelled":
       return 1;
     case "archived":

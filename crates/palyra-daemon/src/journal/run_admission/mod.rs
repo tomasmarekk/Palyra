@@ -11,7 +11,7 @@ use palyra_common::runtime_contracts::{
     GenerationLeaseV1, RuntimeActorKind, RuntimeActorRef, RuntimeGeneration, RuntimeGenerationLane,
     RuntimeGenerationTransitionKind,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use ulid::Ulid;
@@ -1641,7 +1641,7 @@ struct QueuedInputInsert<'a> {
 }
 
 fn insert_queued_input_tx(
-    connection: &Connection,
+    connection: &Transaction<'_>,
     insert: QueuedInputInsert<'_>,
 ) -> Result<(), JournalError> {
     let QueuedInputInsert { request, input, session_id, active_run_id, disposition, reason, now } =
@@ -1679,6 +1679,14 @@ fn insert_queued_input_tx(
             }))?,
         ],
     )?;
+    if state == "pending" {
+        super::objective_guards::objective_guard_reset_for_session_tx(
+            connection,
+            session_id,
+            "objective.guard.user_correction_reset",
+            now,
+        )?;
+    }
     Ok(())
 }
 

@@ -2353,7 +2353,10 @@ fn linked_objective_for_job(
 }
 
 const fn objective_lifecycle_blocks_dispatch(state: ObjectiveState) -> bool {
-    matches!(state, ObjectiveState::Archived | ObjectiveState::Cancelled)
+    matches!(
+        state,
+        ObjectiveState::Archived | ObjectiveState::Cancelled | ObjectiveState::Completed
+    )
 }
 
 fn terminal_objective_for_job(
@@ -2454,9 +2457,9 @@ async fn apply_objective_budget_exhaustion(
 
     let mut objective = exhaustion.objective.clone();
     let from_state = objective.state;
-    // Archived/cancelled objectives keep their state; anything else is paused
-    // so the operator re-arms the budget deliberately instead of silently.
-    let to_state = if matches!(from_state, ObjectiveState::Archived | ObjectiveState::Cancelled) {
+    // Terminal objectives keep their state; anything else is paused so the
+    // operator re-arms the budget deliberately instead of silently.
+    let to_state = if objective_lifecycle_blocks_dispatch(from_state) {
         from_state
     } else {
         ObjectiveState::Paused
