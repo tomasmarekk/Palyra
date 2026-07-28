@@ -1250,7 +1250,16 @@ fn anthropic_catalog_exposes_routines_control_trigger_payload() {
         .tools
         .iter()
         .find(|tool| tool.name == "palyra.routines.control")
-        .expect("routines control should stay visible for Anthropic-compatible providers");
+        .unwrap_or_else(|| {
+            panic!(
+                "routines control should stay visible for Anthropic-compatible providers, filtered={:?}",
+                snapshot
+                    .filtered_tools
+                    .iter()
+                    .filter(|tool| tool.name == "palyra.routines.control")
+                    .collect::<Vec<_>>()
+            )
+        });
     assert!(
         !snapshot.filtered_tools.iter().any(|tool| {
             tool.name == "palyra.routines.control"

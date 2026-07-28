@@ -680,24 +680,18 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                                     }
                                 },
                                 "wake_predicate":{
-                                    "oneOf":[
-                                        {
-                                            "type":"object",
-                                            "additionalProperties":false,
-                                            "required":["operator"],
-                                            "properties":{"operator":{"const":"probe_healthy"}}
-                                        },
-                                        {
-                                            "type":"object",
-                                            "additionalProperties":false,
-                                            "required":["operator","pointer","expected"],
-                                            "properties":{
-                                                "operator":{"const":"json_pointer_equals"},
-                                                "pointer":{"type":"string","maxLength":256},
-                                                "expected":{}
-                                            }
+                                    "type":"object",
+                                    "description":"Closed predicate. json_pointer_equals additionally requires pointer and expected; runtime validation rejects missing or extra variant fields.",
+                                    "additionalProperties":false,
+                                    "required":["operator"],
+                                    "properties":{
+                                        "operator":{"type":"string","enum":["probe_healthy","json_pointer_equals"]},
+                                        "pointer":{"type":"string","maxLength":256},
+                                        "expected":{
+                                            "type":"boolean",
+                                            "description":"Expected daemon-health boolean. Broader JSON predicates remain available through the console API."
                                         }
-                                    ]
+                                    }
                                 },
                                 "context_sources":{
                                     "type":"array",
@@ -708,7 +702,12 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                                         "required":["artifact_id","sha256","sensitivity","max_bytes"],
                                         "properties":{
                                             "artifact_id":{"type":"string"},
-                                            "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                                            "sha256":{
+                                                "type":"string",
+                                                "minLength":64,
+                                                "maxLength":64,
+                                                "description":"Lowercase hexadecimal SHA-256 digest; runtime validation rejects non-hex input."
+                                            },
                                             "sensitivity":{"type":"string","enum":["public","personal","sensitive"]},
                                             "max_bytes":{"type":"integer","minimum":1,"maximum":262144}
                                         }
@@ -2775,6 +2774,18 @@ mod tests {
                 )
                 .and_then(serde_json::Value::as_str),
             Some("daemon_health")
+        );
+        assert_eq!(
+            entry
+                .input_schema
+                .pointer(
+                    "/properties/execution_governance/properties/wake_predicate/properties/operator/enum"
+                )
+                .and_then(serde_json::Value::as_array),
+            Some(&vec![
+                serde_json::json!("probe_healthy"),
+                serde_json::json!("json_pointer_equals"),
+            ])
         );
     }
 
