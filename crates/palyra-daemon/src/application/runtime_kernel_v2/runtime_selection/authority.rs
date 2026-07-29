@@ -74,7 +74,7 @@ impl HostVerifiedSessionAuthorityMigration {
     }
 }
 
-/// Sealed host-issued admission input accepted by M018.
+/// Sealed host-issued input accepted by runtime admission.
 ///
 /// Only the runtime-kernel dispatcher can issue this proof in production.
 /// Transport payloads cannot directly select an origin, assert access, replace
@@ -263,10 +263,10 @@ pub(crate) struct HostVerifiedRunAdmissionParts {
     pub(crate) queue_intent: Option<AdmissionQueueIntent>,
 }
 
-/// Non-forgeable persisted M018 admission binding consumed by selection.
+/// Non-forgeable persisted admission binding consumed by selection.
 ///
-/// M018 must construct this only after the exact runtime-authority decision and admission
-/// snapshot have been durably committed. It is neither cloneable nor serde.
+/// The admission controller constructs this only after the exact runtime-authority
+/// decision and snapshot have been durably committed. It is neither cloneable nor serde.
 pub(crate) struct PersistedAdmissionAuthorityToken {
     decision: RuntimeAuthorityDecisionV1,
     admission_snapshot_digest: SelectionDigest,
@@ -287,7 +287,7 @@ impl fmt::Debug for PersistedAdmissionAuthorityToken {
 }
 
 impl PersistedAdmissionAuthorityToken {
-    /// Internal constructor reached only through the verified M018 bridge.
+    /// Internal constructor reached only through the verified admission bridge.
     fn from_persisted_decision(
         decision: RuntimeAuthorityDecisionV1,
         admission_snapshot_digest: SelectionDigest,
@@ -322,7 +322,7 @@ impl fmt::Debug for HostRuntimeSelectionAuthorityProof {
 }
 
 impl HostRuntimeSelectionAuthorityProof {
-    /// Consumes exact committed M018 authority after rechecking its active lease.
+    /// Consumes exact committed admission authority after rechecking its active lease.
     ///
     /// The admission token is non-cloneable and can only be created after the
     /// journal commit. Selection repeats the active-lease check so a stale token
@@ -409,7 +409,7 @@ impl HostRuntimeSelectionAuthorityProof {
         Self::from_persisted_v2_admission(journal, admission, epochs)
     }
 
-    /// Binds a persisted M018 admission decision to the exact active Run lease.
+    /// Binds a persisted admission decision to the exact active Run lease.
     ///
     /// The host must obtain the lease from the journal's active-generation
     /// check. No caller-provided clock participates in grant issuance.

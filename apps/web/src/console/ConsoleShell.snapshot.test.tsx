@@ -11,7 +11,7 @@ afterEach(() => {
 });
 
 describe("ConsoleShell layout coverage", () => {
-  it("renders deterministic shell navigation for the M56 parity surface", () => {
+  it("renders deterministic shell navigation for the parity surface", () => {
     const app = {
       session: {
         principal: "admin:web-console",

@@ -1,5 +1,5 @@
-# Promotion evidence for the production shadow observer. M024 must bind the
-# policy profile to explicit enrollment before this gate can turn green.
+# Promotion evidence for the production shadow observer. The runtime must bind
+# the policy profile to explicit enrollment before this gate can turn green.
 schema_version: 5
 id: runtime_kernel_v2.shadow_differential
 title: Legacy-authoritative RuntimeKernelV2 shadow differential

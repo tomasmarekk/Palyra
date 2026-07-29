@@ -34,7 +34,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M56 config, access, and support surfaces", () => {
+describe("config, access, and support surfaces", () => {
   it("keeps config page read-only until the operator explicitly inspects or validates", async () => {
     let inspectCalls = 0;
     let validateCalls = 0;

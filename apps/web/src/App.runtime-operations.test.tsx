@@ -48,7 +48,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M56 runtime and operations surfaces", () => {
+describe("runtime and operations surfaces", () => {
   const runtimeWorkflowTimeoutMs = 120_000;
 
   it(

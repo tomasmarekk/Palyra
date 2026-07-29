@@ -1,4 +1,4 @@
-//! Durable agent plan state facade for model-visible planning milestones.
+//! Durable agent plan state facade for model-visible planning.
 //!
 //! The store facade keeps tool/runtime code from depending directly on the
 //! journal schema while rollout remains conservative.

@@ -16,7 +16,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M35 web console app", () => {
+describe("web console app", () => {
   it("requires authentication before showing privileged pages", async () => {
     window.localStorage.removeItem("palyra.console.theme");
     const fetchMock = createQueuedFetch(

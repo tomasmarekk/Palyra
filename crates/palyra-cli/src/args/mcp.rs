@@ -1,6 +1,6 @@
 //! Arguments for `palyra mcp`: external MCP registry management plus the
 //! stdio MCP server facade. `serve` exposes Palyra to external MCP clients;
-//! registry subcommands only edit local config for later import milestones.
+//! registry subcommands only edit local config; live import is unavailable.
 
 use clap::{Args, Subcommand, ValueEnum};
 

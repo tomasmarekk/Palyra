@@ -1256,7 +1256,7 @@ describe("ConsoleApiClient", () => {
     expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
-  it("supports M52 control-plane domains with additive CSRF behavior", async () => {
+  it("supports control-plane domains with additive CSRF behavior", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
       jsonResponse({
@@ -1337,7 +1337,7 @@ describe("ConsoleApiClient", () => {
     expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
-  it("supports M56 config, access, and support contract additions", async () => {
+  it("supports config, access, and support contract additions", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
       jsonResponse({
@@ -1454,7 +1454,7 @@ describe("ConsoleApiClient", () => {
     );
   });
 
-  it("supports M56 runtime operations contract additions", async () => {
+  it("supports runtime operations contract additions", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
       jsonResponse({

@@ -17,7 +17,7 @@ $report = Get-Content -Raw -Encoding UTF8 $fullPath
 foreach ($required in @(
     "# Release Acceptance Dashboard",
     "Stable candidates:",
-    "Roadmap checkbox policy:",
+    "Acceptance policy:",
     "Runbooks: [Runtime Incident Runbooks](runtime_incident_runbooks.md)",
     "| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |"
 )) {

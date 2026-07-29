@@ -129,7 +129,7 @@ pub(super) const MIGRATION_74_SQL: &str = r#"
 
 /// Migration 82: durable arbitration lineage and append-only startup recovery outcomes.
 pub(super) const MIGRATION_82_SQL: &str = r#"
-    ALTER TABLE runtime_delivery_links_v2 RENAME TO runtime_delivery_links_v2_m81;
+    ALTER TABLE runtime_delivery_links_v2 RENAME TO runtime_delivery_links_v2_legacy;
     DROP TRIGGER IF EXISTS trg_runtime_delivery_links_v2_prevent_update;
     DROP TRIGGER IF EXISTS trg_runtime_delivery_links_v2_prevent_delete;
     CREATE TABLE runtime_delivery_links_v2 (
@@ -162,8 +162,8 @@ pub(super) const MIGRATION_82_SQL: &str = r#"
         outbox_envelope_id, evidence_sha256, reason_code,
         native_message_id_sha256, observed_at_unix_ms, link_json,
         link_sha256, schema_version
-    FROM runtime_delivery_links_v2_m81;
-    DROP TABLE runtime_delivery_links_v2_m81;
+    FROM runtime_delivery_links_v2_legacy;
+    DROP TABLE runtime_delivery_links_v2_legacy;
     CREATE INDEX idx_runtime_delivery_links_intent
         ON runtime_delivery_links_v2(delivery_intent_ulid, link_index ASC);
 

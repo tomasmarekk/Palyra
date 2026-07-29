@@ -1,6 +1,6 @@
 //! Replay-continuity policy for provider and user transcript reconstruction.
 //!
-//! The policy is observe-only in this milestone: it records whether provider
+//! The policy is observe-only: it records whether provider
 //! history and user transcript evidence would be safe to replay, without
 //! changing the existing provider dispatch or startup recovery behavior.
 

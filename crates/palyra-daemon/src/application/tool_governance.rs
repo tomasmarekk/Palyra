@@ -1,6 +1,6 @@
 //! Host-owned tool governance helpers for the run-stream path.
 //!
-//! This module keeps Phase 3 governance state machine pieces close to the
+//! This module keeps governance state-machine pieces close to the
 //! existing tool execution flow without creating a second executor. The
 //! helpers build deterministic reports, signatures, synthetic results, and
 //! middleware projections that callers can attach to tape/journal events.

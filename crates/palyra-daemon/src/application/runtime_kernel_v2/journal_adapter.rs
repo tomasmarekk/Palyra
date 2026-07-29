@@ -1,6 +1,6 @@
 //! Private journal capability used by the host harness event sink.
 //!
-//! This adapter is the only M020 component allowed to commit prepared M017
+//! This adapter is the only component allowed to commit prepared kernel
 //! transitions and restore the immutable kernel from the committed snapshot.
 
 use std::sync::Arc;

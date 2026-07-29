@@ -620,7 +620,7 @@ pub(crate) struct ExecutionBackendRunnerSelection {
     pub(crate) capabilities: Vec<String>,
 }
 
-/// Minimal runner manifest used before the full backend attestation milestone.
+/// Minimal runner manifest used until full backend attestation is available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendRunnerManifest {
     pub(crate) backend_id: String,

@@ -1,4 +1,4 @@
-# Generated Protocol Stubs (M04)
+# Generated Protocol Stubs
 
 These files are generated from `.proto` contracts in `schemas/proto/`.
 

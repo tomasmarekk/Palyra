@@ -182,7 +182,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `nodes invoke` | `nested_surface` | `done` | `verified` | `nodes-invoke-help.txt` | - | - | - |
 | `onboarding wizard` | `nested_surface` | `done` | `verified` | `onboarding-wizard-help.txt` | - | `--flow`, `--non-interactive`, `--accept-risk` | - |
 | `webhooks test` | `nested_surface` | `done` | `verified` | `webhooks-test-help.txt` | - | - | - |
-| `browser console` | `placeholder_surface` | `partial` | `verified` | `browser-console-help.txt` | - | `--output` | M42 kept a structured placeholder so the CLI tree stays stable before real console export lands. |
+| `browser console` | `placeholder_surface` | `partial` | `verified` | `browser-console-help.txt` | - | `--output` | The structured placeholder keeps the CLI tree stable until console export lands. |
 | `browser pdf` | `placeholder_surface` | `partial` | `verified` | `browser-pdf-help.txt` | - | `--output` | The command is discoverable and testable, but the implementation remains intentionally incomplete. |
 | `browser select` | `placeholder_surface` | `partial` | `verified` | `browser-select-help.txt` | - | `--selector`, `--value` | - |
 | `browser highlight` | `placeholder_surface` | `partial` | `verified` | `browser-highlight-help.txt` | - | `--selector` | - |

@@ -78,8 +78,8 @@ pub(crate) enum EmbeddedFinalizationError {
 
 /// Run-owned state adapter that retains all payload-bearing phase material.
 ///
-/// M024 constructs this adapter beside its provider turn state. The canonical
-/// wrapper below invokes M017 services while this boundary supplies requests,
+/// The run stream constructs this adapter beside its provider turn state. The
+/// canonical wrapper below invokes transition services while this boundary supplies requests,
 /// interprets retained provider responses, and stores opaque results.
 pub(crate) trait EmbeddedAttemptHostState: Send + Sync {
     fn context_request<'a>(
@@ -209,7 +209,7 @@ pub(crate) trait EmbeddedAttemptPhaseServices: Send + Sync {
     fn kernel_failure(&self, reason_code: &'static str) -> RuntimeErrorEnvelopeV1;
 }
 
-/// Production adapter over the canonical M017 phase services.
+/// Production adapter over the canonical attempt transition services.
 struct CanonicalEmbeddedAttemptPhaseServices {
     context: Arc<RuntimeKernelContext>,
     state: Arc<dyn EmbeddedAttemptHostState>,

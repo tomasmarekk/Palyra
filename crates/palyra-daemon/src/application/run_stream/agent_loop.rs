@@ -466,7 +466,7 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
 
 /// Terminal decision for the final answer contract.
 ///
-/// The contract is observe-only in this milestone: it gives objective
+/// The contract is observe-only: it gives objective
 /// finalization and replay consumers a stable judgment without changing the
 /// run state machine or bypassing existing policy/tool gates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

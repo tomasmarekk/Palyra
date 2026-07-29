@@ -87,7 +87,7 @@ pub(crate) fn spawn_wake_coordinator(
 pub(crate) async fn reconcile_wakes(
     runtime: &Arc<GatewayRuntimeState>,
 ) -> Result<WakeCoordinatorReport, Status> {
-    // M049 remains the atomic parent-continuation projection. Its bounded
+    // The parent-continuation projection remains atomic. Its bounded
     // reconciliation shares this coordinator's earliest persisted deadline,
     // replacing one Tokio timer per suspended parent.
     runtime.reconcile_parent_suspensions().await?;

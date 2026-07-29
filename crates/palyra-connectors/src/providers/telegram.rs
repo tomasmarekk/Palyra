@@ -1,4 +1,4 @@
-//! Telegram connector stub for the deferred-provider roadmap slot.
+//! Telegram connector stub for a provider that is not yet available.
 //!
 //! Publishes deferred capability metadata so the registry and console can describe Telegram
 //! truthfully, while every outbound send permanently fails until a real adapter ships.
@@ -22,8 +22,7 @@ pub struct TelegramConnectorAdapter;
 
 /// Registry hook publishing the deferred Telegram provider's runtime metadata.
 pub(crate) fn provider_descriptor() -> ConnectorProviderDescriptor {
-    let reason =
-        "telegram connector is deferred in the roadmap and unavailable in the current runtime";
+    let reason = "telegram connector is unavailable in the current runtime";
     ConnectorProviderDescriptor {
         kind: ConnectorKind::Telegram,
         availability: ConnectorAvailability::Deferred,
@@ -68,7 +67,7 @@ impl ConnectorAdapter for TelegramConnectorAdapter {
         _request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         Ok(DeliveryOutcome::PermanentFailure {
-            reason: "telegram connector is deferred in roadmap and unavailable in M40".to_owned(),
+            reason: "telegram connector is unavailable in the current runtime".to_owned(),
         })
     }
 }

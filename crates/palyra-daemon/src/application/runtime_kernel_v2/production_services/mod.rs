@@ -348,7 +348,7 @@ struct AttemptCursor {
     context: Option<ContextAssemblyResult>,
 }
 
-/// Concrete payload-retaining implementation of M020's host-state boundary.
+/// Concrete payload-retaining implementation of the host-state boundary.
 pub(crate) struct ProductionAttemptHostState {
     retention: Arc<ProductionPayloadRetention>,
     context_request: ContextAssemblyRequest,

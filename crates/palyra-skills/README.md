@@ -1,6 +1,6 @@
 # palyra-skills
 
-`palyra-skills` provides the M20 skill artifact contract:
+`palyra-skills` provides the versioned skill artifact contract:
 
 - parse + validate versioned `skill.toml`
 - build signed `.palyra-skill` ZIP artifacts

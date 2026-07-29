@@ -2880,7 +2880,7 @@ fn redacted_config_summary(redacted_document: &Value) -> Value {
             object.keys().filter(|key| key.as_str() != "version").cloned().collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let roadmap_preview_modes = [
+    let runtime_preview_modes = [
         "api_facade.mode",
         "mcp_servers.mode",
         "execution_backend_profiles.mode",
@@ -2906,7 +2906,7 @@ fn redacted_config_summary(redacted_document: &Value) -> Value {
     json!({
         "schema_version": 1,
         "top_level_sections": top_level_sections,
-        "roadmap_preview_modes": roadmap_preview_modes,
+        "runtime_preview_modes": runtime_preview_modes,
         "secret_fields_redacted": secret_fields_redacted,
     })
 }
@@ -15366,7 +15366,7 @@ mod diagnostics_bundle_tests {
                 redacted_summary: Some(json!({
                     "schema_version": 1,
                     "top_level_sections": ["model_provider"],
-                    "roadmap_preview_modes": {},
+                    "runtime_preview_modes": {},
                     "secret_fields_redacted": [
                         "model_provider.openai_api_key",
                         "model_provider.openai_api_key_vault_ref"

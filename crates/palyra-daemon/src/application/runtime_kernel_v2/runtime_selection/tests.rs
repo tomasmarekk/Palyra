@@ -315,7 +315,7 @@ fn health_wire_rejects_more_than_total_bound() {
 }
 
 #[test]
-fn progress_fence_matches_m024_side_effect_predicate() {
+fn progress_fence_matches_side_effect_predicate() {
     assert!(!RuntimeSelectionProgressV1::new(
         OutputProgressV1::NoOutput,
         Some(SideEffectFenceState::IntentRecorded)

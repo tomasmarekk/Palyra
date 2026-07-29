@@ -223,7 +223,7 @@ pub(crate) fn redact_router_preview_session_key(payload: &mut Value) {
 /// Renders the pinned text lines for the connector list.
 pub(crate) fn render_list_lines(payload: &Value) -> Vec<String> {
     // Deferred connectors are hidden entirely (including from the count):
-    // they are roadmap placeholders, not operable channels.
+    // they are unavailable placeholders, not operable channels.
     let connectors = payload
         .get("connectors")
         .and_then(Value::as_array)
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn render_channels_status_includes_m58_operations_snapshot() {
+    fn render_channels_status_includes_operations_snapshot() {
         let lines = render_status_lines(&json!({
             "connector": {
                 "connector_id": "discord:default",

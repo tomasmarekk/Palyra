@@ -175,7 +175,7 @@ impl RuntimeKernelDispatcher {
         self.resolver.diagnostics()
     }
 
-    /// Seals an authenticated console request for the sole M018 admission controller.
+    /// Seals an authenticated console request for the sole admission controller.
     ///
     /// Only the authenticated run-stream ingress may call this entry point.
     #[must_use]
@@ -195,7 +195,7 @@ impl RuntimeKernelDispatcher {
         )
     }
 
-    /// Seals an authenticated connector request for the sole M018 admission controller.
+    /// Seals an authenticated connector request for the sole admission controller.
     ///
     /// Only the channel route after connector and ownership validation may call
     /// this entry point.
@@ -216,7 +216,7 @@ impl RuntimeKernelDispatcher {
         )
     }
 
-    /// Seals scheduler-owned provenance for the sole M018 admission controller.
+    /// Seals scheduler-owned provenance for the sole admission controller.
     ///
     /// Only the scheduler path may supply the originating run identifier.
     #[must_use]
@@ -237,7 +237,7 @@ impl RuntimeKernelDispatcher {
         )
     }
 
-    /// Seals daemon-owned task provenance for the sole M018 admission controller.
+    /// Seals daemon-owned task provenance for the sole admission controller.
     ///
     /// Only the background queue may call this entry point after resolving the
     /// authenticated task principal from host state.
@@ -259,7 +259,7 @@ impl RuntimeKernelDispatcher {
         )
     }
 
-    /// Seals validated child-run provenance for the sole M018 admission controller.
+    /// Seals validated child-run provenance for the sole admission controller.
     ///
     /// Only child-session delegation code may call this entry point after the
     /// delegated authority document has been authenticated.
@@ -330,8 +330,8 @@ impl RuntimeKernelDispatcher {
     ///
     /// Keep-pinned policy reuses durable authority. Safe-boundary migration is
     /// sealed here, compare-and-swapped in the journal, then re-read before the
-    /// returned intent can be consumed. M018 binds a V2 intent to the Run
-    /// generation allocated in the same admission transaction.
+    /// returned intent can be consumed. Admission binds a V2 intent to the Run
+    /// generation allocated in the same transaction.
     ///
     /// # Errors
     /// Returns [`RuntimeDispatcherError`] for invalid stored pin evidence,
@@ -421,8 +421,8 @@ impl RuntimeKernelDispatcher {
 
     /// Converts the exact post-admission decision into one closed execution route.
     ///
-    /// This must be called only with the decision returned by committed M018
-    /// evidence after the actual Run generation is known.
+    /// This must be called only with the decision returned by committed
+    /// admission evidence after the actual Run generation is known.
     pub(crate) fn dispatch_decision(
         &self,
         authority: RuntimeAuthorityDecisionV1,

@@ -8,8 +8,6 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 ## Shared Evidence
 
 - Release status: [Release Acceptance Dashboard](release_acceptance_dashboard.md)
-- Runtime boundaries and security invariants:
-  [Runtime boundary decision matrix](runtime_boundary_decision_matrix.md)
 - Runtime path diagnostics: inspect `/console/v1/diagnostics` under
   `run_runtime_path` and `runtime_diagnostics.run_runtime_path`.
 - Support bundle diagnostics: export with

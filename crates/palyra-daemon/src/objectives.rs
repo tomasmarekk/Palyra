@@ -255,7 +255,7 @@ fn default_final_answer_required() -> bool {
 ///
 /// The contract is passive state: it is safe to render into model context as
 /// non-authoritative progress metadata, while runtime enforcement is left to
-/// the objective judge and finalization milestones that consume this schema.
+/// the objective judge and finalization workflows that consume this schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveContract {

@@ -64,7 +64,7 @@ impl RunStreamAdmissionIngress {
         matches!(&self.kind, RunStreamAdmissionIngressKind::Delegation { .. })
     }
 
-    /// Issues the sole sealed input accepted by the M018 admission controller.
+    /// Issues the sole sealed input accepted by the runtime admission controller.
     ///
     /// The returned proof carries host-established provenance; none of its
     /// origin authority is derived from `RunStreamRequest.origin_kind`.

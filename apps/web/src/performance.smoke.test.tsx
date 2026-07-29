@@ -9,7 +9,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("M62 web performance smoke", () => {
+describe("web performance smoke", () => {
   it("coalesces assistant transcript updates per run instead of appending duplicate entries", () => {
     const assistantEntries = new Map<string, string>();
 

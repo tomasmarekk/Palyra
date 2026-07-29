@@ -2125,10 +2125,10 @@ fn spawn_palyrad_with_dynamic_ports(
     let mut last_error = None;
 
     for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
-        let journal_db_path = unique_temp_path("palyra-cli-m59-journal", "sqlite3");
-        let state_root_dir = unique_temp_dir_path("palyra-cli-m59-state-root");
+        let journal_db_path = unique_temp_path("palyra-cli-workflow-journal", "sqlite3");
+        let state_root_dir = unique_temp_dir_path("palyra-cli-workflow-state-root");
         let vault_dir = state_root_dir.join("vault");
-        let identity_store_dir = unique_temp_dir_path("palyra-cli-m59-identity");
+        let identity_store_dir = unique_temp_dir_path("palyra-cli-workflow-identity");
         fs::create_dir_all(&state_root_dir)
             .with_context(|| format!("failed to create {}", state_root_dir.display()))?;
         fs::create_dir_all(&vault_dir)

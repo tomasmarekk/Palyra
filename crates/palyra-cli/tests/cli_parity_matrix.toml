@@ -1714,7 +1714,7 @@ path = "browser console"
 category = "placeholder_surface"
 status = "partial"
 summary = "Console export placeholder is intentionally present but unsupported."
-notes = "M42 kept a structured placeholder so the CLI tree stays stable before real console export lands."
+notes = "The structured placeholder keeps the CLI tree stable until console export lands."
 required_flags = ["output"]
 
 [entries.snapshot]

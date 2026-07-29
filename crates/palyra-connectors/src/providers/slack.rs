@@ -1,4 +1,4 @@
-//! Slack connector stub for the deferred-provider roadmap slot.
+//! Slack connector stub for a provider that is not yet available.
 //!
 //! Publishes deferred capability metadata so the registry and console can describe Slack
 //! truthfully, while every outbound send permanently fails until a real adapter ships.
@@ -22,8 +22,7 @@ pub struct SlackConnectorAdapter;
 
 /// Registry hook publishing the deferred Slack provider's runtime metadata.
 pub(crate) fn provider_descriptor() -> ConnectorProviderDescriptor {
-    let reason =
-        "slack connector is deferred in the roadmap and unavailable in the current runtime";
+    let reason = "slack connector is unavailable in the current runtime";
     ConnectorProviderDescriptor {
         kind: ConnectorKind::Slack,
         availability: ConnectorAvailability::Deferred,
@@ -68,7 +67,7 @@ impl ConnectorAdapter for SlackConnectorAdapter {
         _request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         Ok(DeliveryOutcome::PermanentFailure {
-            reason: "slack connector is deferred in roadmap and unavailable in M40".to_owned(),
+            reason: "slack connector is unavailable in the current runtime".to_owned(),
         })
     }
 }

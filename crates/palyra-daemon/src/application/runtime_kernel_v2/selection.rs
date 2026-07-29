@@ -291,8 +291,8 @@ impl SessionCanarySelector {
 
 /// Generation-free result of the single host rollout/sampling decision.
 ///
-/// The value carries no identity, bucket, or key material. M018 binds it to
-/// the generation allocated inside the admission transaction.
+/// The value carries no identity, bucket, or key material. Runtime admission
+/// binds it to the generation allocated inside the admission transaction.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedRuntimeAuthorityIntent {
     profile: RuntimeKernelVersion,

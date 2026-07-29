@@ -1440,7 +1440,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_registry_contains_phase_8_sweepers() {
+    fn default_registry_contains_expected_sweepers() {
         let registry = MaintenanceRegistry::default();
         let task_ids = registry
             .definitions()

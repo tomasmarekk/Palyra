@@ -3,7 +3,7 @@
 //! The service intentionally records metadata only: it looks for known
 //! manifests, touched-file languages, and suggested verification commands
 //! without reading arbitrary source files or exposing absolute workspace
-//! paths. Later verification milestones can consume this stable contract
+//! paths. Verification workflows can consume this stable contract
 //! without turning repository metadata into instructions.
 
 use std::{

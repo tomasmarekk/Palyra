@@ -2584,7 +2584,7 @@ fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() 
     assert_eq!(
         refresh.get("state").and_then(Value::as_str),
         Some("refreshed"),
-        "expired OAuth credentials should refresh immediately through the M54 refresh action: {refresh}"
+        "expired OAuth credentials should refresh immediately through the refresh action: {refresh}"
     );
 
     let reconnect = post_console_json(

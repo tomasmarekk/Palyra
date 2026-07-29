@@ -19,7 +19,7 @@ export function createDemoDocument(): A2uiDocument {
       ],
       exit_criteria: [
         "Disable the track if control-plane diagnostics or support bundle export lose fidelity.",
-        "Retire the track if it cannot justify clear operator value after the core roadmap lands.",
+        "Retire the track if it cannot justify clear operator value after the core runtime stabilizes.",
       ],
     },
     components: [

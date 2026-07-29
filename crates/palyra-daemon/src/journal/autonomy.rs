@@ -343,8 +343,8 @@ impl JournalStore {
                 barrier_kind: wait_coordinator::WaitBarrierKind::DelegationChild,
                 source_kind: wait_coordinator::WaitBarrierKind::DelegationChild.as_str().to_owned(),
                 source_id: suspension_id.clone(),
-                // The specialized M049 transaction still owns the parent task
-                // insertion; the generic barrier records and coalesces the
+                // The specialized suspension transaction still owns the parent
+                // task insertion; the generic barrier records and coalesces the
                 // same wake without allocating a second continuation.
                 wake_decision: wait_coordinator::WakeDecision::DeliveryOnly,
                 continuation_prompt: Some(

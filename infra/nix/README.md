@@ -1,3 +1,3 @@
 # Nix baseline
 
-Nix-based reproducible development shell will be expanded after M01.
+The Nix-based reproducible development shell remains intentionally minimal.

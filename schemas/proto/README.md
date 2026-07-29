@@ -1,4 +1,4 @@
-# Protobuf Schemas (M04)
+# Protobuf Schemas
 
 Canonical protobuf API surfaces live under `schemas/proto/palyra/v1/`:
 

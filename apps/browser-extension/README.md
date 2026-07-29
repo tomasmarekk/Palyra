@@ -1,6 +1,6 @@
 # Palyra Browser Extension (Relay Companion v1)
 
-This directory ships a minimal Manifest V3 extension artifact for M37 relay workflows.
+This directory ships a minimal Manifest V3 extension artifact for browser relay workflows.
 
 The extension is intentionally narrow:
 

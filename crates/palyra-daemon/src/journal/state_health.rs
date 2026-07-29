@@ -1,6 +1,6 @@
 //! State doctor, repair, and replay-fixture contracts for the journal store.
 //!
-//! Keeps Phase 1 state-foundation logic outside the large `journal.rs` facade while preserving
+//! Keeps state-foundation logic outside the large `journal.rs` facade while preserving
 //! `JournalStore` as the stable API used by daemon runtime and transport handlers.
 
 use std::{

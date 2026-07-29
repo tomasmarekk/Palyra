@@ -96,9 +96,9 @@ export function capabilityCatalogFixture() {
     ],
     migration_notes: [
       {
-        id: "m56-capability-exposure",
+        id: "capability-exposure",
         message:
-          "M56 publishes dashboard exposure and CLI handoff metadata for every current capability.",
+          "Every current capability publishes dashboard exposure and CLI handoff metadata.",
       },
     ],
   };

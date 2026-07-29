@@ -30,7 +30,7 @@ use super::runtime_selection::{
     SealedToolCatalogSelectionV1, SelectionDigest, SelectionEpochsV1, SessionOverridePolicyV1,
 };
 
-/// Exact provider binding selected by the sealed M019 projection.
+/// Exact provider binding selected by the sealed runtime projection.
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedProductionProviderBinding {
     pub(crate) provider_id: String,

@@ -9,7 +9,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M54 web auth surface", () => {
+describe("web auth surface", () => {
   it("connects an OpenAI API key profile and refreshes the auth surface", async () => {
     const state = createAuthSurfaceState();
     let apiKeyConnectBody = "";

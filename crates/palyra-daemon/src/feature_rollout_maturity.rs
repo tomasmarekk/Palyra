@@ -1733,7 +1733,7 @@ pub(crate) struct ReleaseManualOverride {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReleaseMilestoneStatus {
+pub(crate) struct ReleaseReadinessStatus {
     pub(crate) area: String,
     pub(crate) code_complete: bool,
     pub(crate) acceptance_complete: bool,
@@ -1745,7 +1745,7 @@ const STABLE_CANDIDATE_REQUIRED_GATE_IDS: [&str; 4] =
 pub(crate) struct ReleaseDashboardInput<'a> {
     pub(crate) generated_at_unix_ms: i64,
     pub(crate) gates: &'a [ReleaseAcceptanceGate],
-    pub(crate) milestone_statuses: &'a [ReleaseMilestoneStatus],
+    pub(crate) readiness_statuses: &'a [ReleaseReadinessStatus],
     pub(crate) usage: Option<&'a FeatureUsageSnapshot>,
 }
 
@@ -1753,8 +1753,8 @@ pub(crate) fn build_release_acceptance_dashboard(
     config: &FeatureRolloutsConfig,
     input: ReleaseDashboardInput<'_>,
 ) -> Value {
-    let milestone_statuses = input
-        .milestone_statuses
+    let readiness_statuses = input
+        .readiness_statuses
         .iter()
         .map(|status| (status.area.as_str(), status))
         .collect::<BTreeMap<_, _>>();
@@ -1776,7 +1776,7 @@ pub(crate) fn build_release_acceptance_dashboard(
                     release_dashboard_area_report(
                         *descriptor,
                         config,
-                        &milestone_statuses,
+                        &readiness_statuses,
                         input.gates,
                         input.usage,
                     )
@@ -1820,7 +1820,7 @@ pub(crate) fn build_release_acceptance_dashboard(
         "failing_gates": failing_gates,
         "manual_overrides": manual_overrides,
         "maturity_summary": build_feature_rollout_maturity_summary_v1_base(config),
-        "roadmap_checkbox_policy": "roadmap acceptance complete does not imply stable candidate",
+        "acceptance_policy": "component acceptance does not imply stable candidate",
     })
 }
 
@@ -1852,13 +1852,13 @@ fn build_release_dashboard_contract(
             }),
         },
     ];
-    let milestones = [
-        ReleaseMilestoneStatus {
+    let readiness = [
+        ReleaseReadinessStatus {
             area: "replay_capture".to_owned(),
             code_complete: true,
             acceptance_complete: false,
         },
-        ReleaseMilestoneStatus {
+        ReleaseReadinessStatus {
             area: "agent_harness_runtime".to_owned(),
             code_complete: true,
             acceptance_complete: false,
@@ -1870,7 +1870,7 @@ fn build_release_dashboard_contract(
         ReleaseDashboardInput {
             generated_at_unix_ms: 0,
             gates: gates.as_slice(),
-            milestone_statuses: milestones.as_slice(),
+            readiness_statuses: readiness.as_slice(),
             usage,
         },
     );
@@ -1922,7 +1922,7 @@ fn render_release_acceptance_dashboard_markdown_v1(dashboard: &Value) -> String 
         "- Stable candidates: {}\n",
         dashboard.get("stable_candidate_count").and_then(Value::as_u64).unwrap_or_default()
     ));
-    output.push_str("- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n");
+    output.push_str("- Acceptance policy: component acceptance is not stable by itself\n\n");
     output.push_str("| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |\n");
     output.push_str("| --- | --- | --- | --- | --- | --- |\n");
     if let Some(areas) = dashboard.get("areas").and_then(Value::as_array) {
@@ -1959,7 +1959,7 @@ pub(crate) fn render_release_acceptance_dashboard_markdown(dashboard: &Value) ->
         "- Stable candidates: {}\n",
         dashboard.get("stable_candidate_count").and_then(Value::as_u64).unwrap_or_default()
     ));
-    output.push_str("- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n");
+    output.push_str("- Acceptance policy: component acceptance is not stable by itself\n\n");
     output.push_str(
         "| Area | Legacy maturity | Promotion | Code complete | Tested | Stable candidate | Blockers |\n",
     );
@@ -1991,12 +1991,12 @@ pub(crate) fn render_release_acceptance_dashboard_markdown(dashboard: &Value) ->
 fn release_dashboard_area_report(
     descriptor: FeatureRolloutDescriptor,
     config: &FeatureRolloutsConfig,
-    milestone_statuses: &BTreeMap<&str, &ReleaseMilestoneStatus>,
+    readiness_statuses: &BTreeMap<&str, &ReleaseReadinessStatus>,
     gates: &[ReleaseAcceptanceGate],
     usage: Option<&FeatureUsageSnapshot>,
 ) -> Value {
     let flag = descriptor.flag.as_str();
-    let status = milestone_statuses.get(flag).copied();
+    let status = readiness_statuses.get(flag).copied();
     let area_gates = gates.iter().filter(|gate| gate.area == flag).collect::<Vec<_>>();
     let failing_required_gates = area_gates
         .iter()
@@ -2134,7 +2134,7 @@ mod tests {
         validate_feature_rollout_maturity_descriptors, FeatureRolloutDescriptor,
         FeatureRolloutFlag, FeatureRolloutMaturity, FeatureRolloutMaturityValidationError,
         ReleaseAcceptanceGate, ReleaseDashboardInput, ReleaseManualOverride,
-        ReleaseMilestoneStatus, DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS,
+        ReleaseReadinessStatus, DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS,
         NO_DEPRECATED_ALIASES, NO_STABLE_DEPENDENCIES, STABLE_CANDIDATE_REQUIRED_GATE_IDS,
     };
     use crate::{
@@ -2682,7 +2682,7 @@ mod tests {
             release_gate("replay_capture", "replay-redaction", true, true),
             release_gate("replay_capture", "replay-fixtures", false, true),
         ];
-        let milestones = vec![ReleaseMilestoneStatus {
+        let readiness = vec![ReleaseReadinessStatus {
             area: "replay_capture".to_owned(),
             code_complete: true,
             acceptance_complete: true,
@@ -2692,7 +2692,7 @@ mod tests {
             ReleaseDashboardInput {
                 generated_at_unix_ms: 1_730_000_000_000,
                 gates: gates.as_slice(),
-                milestone_statuses: milestones.as_slice(),
+                readiness_statuses: readiness.as_slice(),
                 usage: None,
             },
         );
@@ -2715,7 +2715,7 @@ mod tests {
             release_gate("compaction_safeguard", "direct-hot-path", true, true),
             release_gate("compaction_safeguard", "no-hidden-fallback", true, true),
         ];
-        let milestones = vec![ReleaseMilestoneStatus {
+        let readiness = vec![ReleaseReadinessStatus {
             area: "compaction_safeguard".to_owned(),
             code_complete: true,
             acceptance_complete: true,
@@ -2725,7 +2725,7 @@ mod tests {
             ReleaseDashboardInput {
                 generated_at_unix_ms: 1_730_000_000_000,
                 gates: gates.as_slice(),
-                milestone_statuses: milestones.as_slice(),
+                readiness_statuses: readiness.as_slice(),
                 usage: None,
             },
         );
@@ -2749,7 +2749,7 @@ mod tests {
             .into_iter()
             .map(|id| release_gate("compaction_safeguard", id, true, true))
             .collect::<Vec<_>>();
-        let milestones = vec![ReleaseMilestoneStatus {
+        let readiness = vec![ReleaseReadinessStatus {
             area: "compaction_safeguard".to_owned(),
             code_complete: true,
             acceptance_complete: true,
@@ -2771,7 +2771,7 @@ mod tests {
             ReleaseDashboardInput {
                 generated_at_unix_ms: 1_730_000_000_000,
                 gates: gates.as_slice(),
-                milestone_statuses: milestones.as_slice(),
+                readiness_statuses: readiness.as_slice(),
                 usage: Some(&usage),
             },
         );
@@ -2804,7 +2804,7 @@ mod tests {
             reason_code: "release_review.exception".to_owned(),
         });
         let gates = vec![gate];
-        let milestones = vec![ReleaseMilestoneStatus {
+        let readiness = vec![ReleaseReadinessStatus {
             area: "agent_harness_runtime".to_owned(),
             code_complete: true,
             acceptance_complete: true,
@@ -2814,7 +2814,7 @@ mod tests {
             ReleaseDashboardInput {
                 generated_at_unix_ms: 1_730_000_000_000,
                 gates: gates.as_slice(),
-                milestone_statuses: milestones.as_slice(),
+                readiness_statuses: readiness.as_slice(),
                 usage: None,
             },
         );

@@ -1,6 +1,6 @@
-# Fuzzing Harness Skeleton (M03)
+# Fuzzing Harness Skeleton
 
-This folder contains parser-focused fuzz targets required by M03:
+This folder contains parser-focused fuzz targets for the supported input contracts:
 
 - `config_path_parser`
 - `a2ui_json_parser`

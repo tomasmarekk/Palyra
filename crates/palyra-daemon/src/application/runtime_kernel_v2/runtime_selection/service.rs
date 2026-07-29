@@ -87,7 +87,7 @@ pub(crate) enum RuntimeSelectionError {
     NoCandidate(SelectionComponentKindV1),
 }
 
-/// Durable M018 admission snapshot reference.
+/// Durable runtime-admission snapshot reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionSnapshotReferenceV1 {

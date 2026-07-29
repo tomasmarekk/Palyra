@@ -1,4 +1,4 @@
-//! Host-owned projection from typed harness observations into M017 transitions.
+//! Host-owned projection from typed harness observations into kernel transitions.
 //!
 //! This module constructs canonical events, commits them through the private
 //! journal capability, and restores the kernel before acknowledging progress.
@@ -1085,7 +1085,7 @@ mod tests {
             },
         ))
         .await
-        .expect("M022 committed delivery observation is accepted");
+        .expect("committed delivery observation is accepted");
         sink.terminal(completed(7)).await.expect("committed delivery permits completion");
 
         let names = journal.events().into_iter().map(|event| event.event_name).collect::<Vec<_>>();
