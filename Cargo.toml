@@ -50,6 +50,7 @@ hex = "0.4.3"
 hkdf = "0.13.0"
 lopdf = { version = "0.43.0", default-features = false, features = ["chrono", "jiff", "rayon"] }
 notify = "8.2.0"
+portable-pty = "0.9.0"
 quick-xml = "0.41.0"
 ring = "0.17.14"
 proptest = "1.11.0"

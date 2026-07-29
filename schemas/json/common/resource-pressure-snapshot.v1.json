@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/resource-pressure-snapshot.v1.json",
+  "title": "Palyra Resource Pressure Snapshot V1",
+  "description": "Bounded accounting snapshot and deterministic background-first relief proposal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "resources",
+    "required",
+    "capacity_available",
+    "eviction_plan",
+    "reason_code",
+    "observed_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "resources": { "$ref": "#/$defs/resourceSnapshot" },
+    "required": { "$ref": "#/$defs/resourceUnits" },
+    "capacity_available": { "type": "boolean" },
+    "eviction_plan": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/evictionDecision" }
+    },
+    "reason_code": { "$ref": "#/$defs/reasonCode" },
+    "observed_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "resourceUnits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "processes",
+        "memory_bytes",
+        "file_descriptors",
+        "sockets",
+        "spool_bytes",
+        "concurrency"
+      ],
+      "properties": {
+        "processes": { "$ref": "#/$defs/u64" },
+        "memory_bytes": { "$ref": "#/$defs/u64" },
+        "file_descriptors": { "$ref": "#/$defs/u64" },
+        "sockets": { "$ref": "#/$defs/u64" },
+        "spool_bytes": { "$ref": "#/$defs/u64" },
+        "concurrency": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "resourceSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "limit",
+        "active_leases",
+        "owner_usage"
+      ],
+      "properties": {
+        "used": { "$ref": "#/$defs/resourceUnits" },
+        "limit": { "$ref": "#/$defs/resourceUnits" },
+        "active_leases": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "owner_usage": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "additionalProperties": { "$ref": "#/$defs/resourceUnits" }
+        }
+      }
+    },
+    "evictionDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "owner_id",
+        "service",
+        "priority",
+        "released",
+        "reason_code"
+      ],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "owner_id": { "$ref": "#/$defs/id" },
+        "service": {
+          "enum": [
+            "process",
+            "pty",
+            "lsp",
+            "mcp",
+            "external_runtime",
+            "worktree"
+          ]
+        },
+        "priority": {
+          "enum": [
+            "interactive",
+            "foreground",
+            "idle_service",
+            "background_fanout"
+          ]
+        },
+        "released": { "$ref": "#/$defs/resourceUnits" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": ".*\\S.*"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    }
+  },
+  "x-palyra-limits": {
+    "eviction_plan_max": 32,
+    "owner_usage_max": 4096
+  }
+}

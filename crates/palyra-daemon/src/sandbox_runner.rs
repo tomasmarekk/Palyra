@@ -630,6 +630,22 @@ pub fn process_runner_allows_host_access(policy: &SandboxProcessRunnerPolicy) ->
         )
 }
 
+/// Returns whether an exact host-owned managed command may reuse the current
+/// process-tool policy without weakening its sandbox posture.
+///
+/// The managed coding supervisor executes directly on the host, so this
+/// adapter is available only when the existing process policy already grants
+/// host access and independently approves the requested executable (including
+/// the interpreter opt-in).
+#[must_use]
+pub(crate) fn process_runner_permits_managed_command(
+    policy: &SandboxProcessRunnerPolicy,
+    command: &str,
+) -> bool {
+    process_runner_allows_host_access(policy)
+        && validate_allowed_executable(policy, command).is_ok()
+}
+
 fn validate_supported_target_runtime(
     process_risk: &ProcessRiskReport,
 ) -> Result<(), SandboxProcessRunError> {
@@ -3444,6 +3460,17 @@ fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
         || redacted_text != value;
 
     RedactedProcessOutputText { text: redacted_text, redacted, redaction_reasons }
+}
+
+/// Applies the canonical process-output redaction boundary for another
+/// host-owned runtime component.
+///
+/// The tuple keeps the private redaction implementation out of public
+/// contracts while ensuring every model-visible process projection uses the
+/// same URL, credential, secret, and export-safety policy.
+pub(crate) fn redact_process_output_projection(value: &str) -> (String, bool, Vec<String>) {
+    let redacted = redacted_process_output_text(value);
+    (redacted.text, redacted.redacted, redacted.redaction_reasons)
 }
 
 fn process_redaction_reason_codes(

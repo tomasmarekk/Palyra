@@ -50,6 +50,7 @@ prost.workspace = true
 libc.workspace = true
 lopdf.workspace = true
 notify.workspace = true
+portable-pty.workspace = true
 quick-xml.workspace = true
 quinn.workspace = true
 serde.workspace = true

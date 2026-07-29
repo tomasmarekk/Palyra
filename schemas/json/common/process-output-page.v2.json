@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/process-output-page.v2.json",
+  "title": "Redacted process output page v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "chunks",
+    "next_cursor",
+    "last_returned_cursor",
+    "has_more",
+    "cursor_reset",
+    "truncated"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "chunks": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/chunk" }
+    },
+    "next_cursor": { "$ref": "#/$defs/u64" },
+    "last_returned_cursor": { "$ref": "#/$defs/u64" },
+    "has_more": { "type": "boolean" },
+    "cursor_reset": { "type": "boolean" },
+    "truncated": { "type": "boolean" }
+  },
+  "$defs": {
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "sequence",
+        "stream",
+        "captured_at_unix_ms",
+        "byte_count",
+        "text_projection",
+        "redacted",
+        "redaction_reason_codes"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "sequence": { "$ref": "#/$defs/u64" },
+        "stream": {
+          "enum": [
+            "stdout",
+            "stderr"
+          ]
+        },
+        "captured_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8192
+        },
+        "text_projection": {
+          "type": "string",
+          "maxLength": 32768
+        },
+        "redacted": { "type": "boolean" },
+        "redaction_reason_codes": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/reasonCode" }
+        }
+      }
+    }
+  },
+  "x-palyra-bounds": {
+    "page_chunks_max": 4096,
+    "chunk_bytes_max": 8192,
+    "projection_chars_max": 32768
+  },
+  "x-palyra-privacy": {
+    "raw_bytes": "forbidden",
+    "environment_values": "forbidden",
+    "projection": "canonical_redacted_text"
+  }
+}

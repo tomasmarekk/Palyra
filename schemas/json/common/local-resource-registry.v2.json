@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/local-resource-registry.v2.json",
+  "title": "Palyra Local Resource Registry V2",
+  "description": "Bounded durable resource leases, latest pressure evidence, and pressure-action outcomes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "updated_at_unix_ms",
+    "leases",
+    "last_pressure",
+    "pressure_actions"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "updated_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+    "leases": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/lease" }
+    },
+    "last_pressure": {
+      "oneOf": [
+        { "$ref": "resource-pressure-snapshot.v1.json" },
+        { "type": "null" }
+      ]
+    },
+    "pressure_actions": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/pressureAction" }
+    }
+  },
+  "$defs": {
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": ".*\\S.*"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "resourceUnits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "processes",
+        "memory_bytes",
+        "file_descriptors",
+        "sockets",
+        "spool_bytes",
+        "concurrency"
+      ],
+      "properties": {
+        "processes": { "$ref": "#/$defs/u64" },
+        "memory_bytes": { "$ref": "#/$defs/u64" },
+        "file_descriptors": { "$ref": "#/$defs/u64" },
+        "sockets": { "$ref": "#/$defs/u64" },
+        "spool_bytes": { "$ref": "#/$defs/u64" },
+        "concurrency": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "evictionDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "owner_id",
+        "service",
+        "priority",
+        "released",
+        "reason_code"
+      ],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "owner_id": { "$ref": "#/$defs/id" },
+        "service": { "$ref": "#/$defs/service" },
+        "priority": { "$ref": "#/$defs/priority" },
+        "released": { "$ref": "#/$defs/resourceUnits" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "pressureAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "decision",
+        "state",
+        "reason_code",
+        "observed_at_unix_ms"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "decision": { "$ref": "#/$defs/evictionDecision" },
+        "state": {
+          "enum": [
+            "applied",
+            "skipped",
+            "failed"
+          ]
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" },
+        "observed_at_unix_ms": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "lease_id",
+        "owner_id",
+        "generation",
+        "service",
+        "priority",
+        "granted",
+        "issued_at_unix_ms",
+        "expires_at_unix_ms",
+        "updated_at_unix_ms",
+        "state",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "lease_id": { "$ref": "#/$defs/id" },
+        "owner_id": { "$ref": "#/$defs/id" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "service": { "$ref": "#/$defs/service" },
+        "priority": { "$ref": "#/$defs/priority" },
+        "granted": { "$ref": "#/$defs/resourceUnits" },
+        "issued_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "expires_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "updated_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "state": {
+          "enum": [
+            "active",
+            "revoked",
+            "released",
+            "expired"
+          ]
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "service": {
+      "enum": [
+        "process",
+        "pty",
+        "lsp",
+        "mcp",
+        "external_runtime",
+        "worktree"
+      ]
+    },
+    "priority": {
+      "enum": [
+        "interactive",
+        "foreground",
+        "idle_service",
+        "background_fanout"
+      ]
+    }
+  },
+  "x-palyra-limits": {
+    "lease_records_max": 4096,
+    "pressure_actions_max": 32
+  }
+}
