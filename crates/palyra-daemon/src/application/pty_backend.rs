@@ -33,6 +33,41 @@ const MAX_PTY_ARGUMENTS: usize = 256;
 const MAX_PTY_ARGUMENT_BYTES: usize = 16 * 1024;
 const MAX_PTY_ENVIRONMENT_KEYS: usize = 256;
 const MAX_OSC_CLASSIFIER_BYTES: usize = 256;
+#[cfg(windows)]
+const CONPTY_CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+#[cfg(windows)]
+const CONPTY_CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct ConPtyStartupHandshake {
+    cursor_query_prefix_len: usize,
+    cursor_query_seen: bool,
+    failure: Option<String>,
+}
+
+#[cfg(windows)]
+impl ConPtyStartupHandshake {
+    fn observe_cursor_query(&mut self, bytes: &[u8]) -> bool {
+        if self.cursor_query_seen {
+            return false;
+        }
+        for byte in bytes {
+            if *byte == CONPTY_CURSOR_POSITION_QUERY[self.cursor_query_prefix_len] {
+                self.cursor_query_prefix_len = self.cursor_query_prefix_len.saturating_add(1);
+            } else {
+                self.cursor_query_prefix_len =
+                    usize::from(*byte == CONPTY_CURSOR_POSITION_QUERY[0]);
+            }
+            if self.cursor_query_prefix_len == CONPTY_CURSOR_POSITION_QUERY.len() {
+                self.cursor_query_prefix_len = 0;
+                self.cursor_query_seen = true;
+                return true;
+            }
+        }
+        false
+    }
+}
 
 /// Native terminal implementation selected for the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +554,8 @@ pub struct NativePtySession {
     settled: bool,
     resource_governor: LocalResourceGovernor,
     resource_lease: Option<ResourceLeaseV1>,
+    #[cfg(windows)]
+    startup_handshake: ConPtyStartupHandshake,
     #[cfg(unix)]
     process_group_id: i32,
     #[cfg(windows)]
@@ -628,6 +665,8 @@ impl NativePtySession {
             settled: false,
             resource_governor,
             resource_lease: Some(resource_lease),
+            #[cfg(windows)]
+            startup_handshake: ConPtyStartupHandshake::default(),
             #[cfg(unix)]
             process_group_id,
             #[cfg(windows)]
@@ -797,6 +836,10 @@ impl NativePtySession {
             return Ok(None);
         }
         self.drain_output();
+        #[cfg(windows)]
+        if let Some(error) = self.startup_handshake.failure.as_ref() {
+            return Err(PtyBackendError::Io(error.clone()));
+        }
         if self.exit_status.is_none() {
             self.poll_child_exit()?;
         }
@@ -880,6 +923,8 @@ impl NativePtySession {
     }
 
     fn append_output(&mut self, bytes: &[u8]) {
+        #[cfg(windows)]
+        self.service_conpty_startup_handshake(bytes);
         self.last_output_at = Instant::now();
         let sequence = self.descriptor.next_cursor.saturating_add(1);
         self.descriptor.next_cursor = sequence;
@@ -895,6 +940,31 @@ impl NativePtySession {
         }
         let safe_text = self.sanitizer.project(bytes);
         self.pending_safe_text.push_str(safe_text.as_str());
+    }
+
+    #[cfg(windows)]
+    fn service_conpty_startup_handshake(&mut self, bytes: &[u8]) {
+        if !self.startup_handshake.observe_cursor_query(bytes) {
+            return;
+        }
+        // portable-pty enables ConPTY cursor inheritance, which blocks client startup until the
+        // terminal answers this device-status query. Palyra has no inherited cursor, so origin is
+        // the deterministic response and the control exchange stays outside user-visible text.
+        let response = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "ConPTY requested cursor inheritance after input closed".to_owned())
+            .and_then(|writer| {
+                writer
+                    .write_all(CONPTY_CURSOR_POSITION_RESPONSE)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| {
+                        format!("failed to complete ConPTY cursor inheritance: {error}")
+                    })
+            });
+        if let Err(error) = response {
+            self.startup_handshake.failure = Some(error);
+        }
     }
 
     fn poll_child_exit(&mut self) -> Result<(), PtyBackendError> {
@@ -1237,6 +1307,15 @@ mod tests {
         assert_eq!(sanitizer.report.invalid_utf8_segments, 0);
         assert_eq!(sanitizer.project(&[0xff]), "\u{fffd}");
         assert_eq!(sanitizer.report.invalid_utf8_segments, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_startup_handshake_detects_a_split_cursor_query_once() {
+        let mut handshake = ConPtyStartupHandshake::default();
+        assert!(!handshake.observe_cursor_query(b"\x1b[x\x1b[6"));
+        assert!(handshake.observe_cursor_query(b"n"));
+        assert!(!handshake.observe_cursor_query(b"\x1b[6n"));
     }
 
     #[test]
