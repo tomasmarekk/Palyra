@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/diagnostics-baseline.v2.json",
+  "title": "Palyra Diagnostics Baseline V2",
+  "description": "Bounded immutable descriptor for diagnostics captured immediately before a source edit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "baseline_id",
+    "handle_id",
+    "server_generation",
+    "documents",
+    "artifact",
+    "created_at_unix_ms",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "baseline_id": { "$ref": "#/$defs/id" },
+    "handle_id": { "$ref": "#/$defs/id" },
+    "server_generation": { "$ref": "#/$defs/u64" },
+    "documents": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/documentGeneration" }
+    },
+    "artifact": { "$ref": "#/$defs/artifact" },
+    "created_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reason_code": { "$ref": "#/$defs/reasonCode" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": ".*\\S.*"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "documentGeneration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "uri_sha256",
+        "document_version",
+        "diagnostic_count",
+        "diagnostics_sha256"
+      ],
+      "properties": {
+        "relative_path": { "$ref": "#/$defs/relativePath" },
+        "uri_sha256": { "$ref": "#/$defs/sha256" },
+        "document_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diagnostic_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2048
+        },
+        "diagnostics_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "sha256",
+        "byte_count",
+        "content_type"
+      ],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16777216
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$"
+        }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "documents_max": 128,
+    "diagnostics_per_document_max": 2048,
+    "artifact_bytes_max": 16777216
+  }
+}

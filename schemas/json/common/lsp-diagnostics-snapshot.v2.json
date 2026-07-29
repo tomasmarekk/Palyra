@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/lsp-diagnostics-snapshot.v2.json",
+  "title": "Palyra LSP Diagnostics Snapshot V2",
+  "description": "Closed operator projection of language-service health with host identities hashed and server capabilities omitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "handles",
+    "broken_servers",
+    "active_servers",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "handles": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/handle" }
+    },
+    "broken_servers": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/brokenServer" }
+    },
+    "active_servers": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+    },
+    "reason_code": { "$ref": "#/$defs/reasonCode" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "language": {
+      "enum": [
+        "rust",
+        "type_script",
+        "python"
+      ]
+    },
+    "lifecycle": {
+      "enum": [
+        "starting",
+        "ready",
+        "broken",
+        "stopped",
+        "evicted"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "handle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "handle_id_sha256",
+        "workspace_root_sha256",
+        "worktree_id_sha256",
+        "language",
+        "toolchain_fingerprint_sha256",
+        "process_session_id_sha256",
+        "generation",
+        "lifecycle",
+        "capabilities_present",
+        "capabilities_bytes",
+        "restart_count",
+        "last_diagnostics_at_unix_ms",
+        "last_used_at_unix_ms",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "handle_id_sha256": { "$ref": "#/$defs/sha256" },
+        "workspace_root_sha256": { "$ref": "#/$defs/sha256" },
+        "worktree_id_sha256": { "$ref": "#/$defs/sha256" },
+        "language": { "$ref": "#/$defs/language" },
+        "toolchain_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+        "process_session_id_sha256": { "$ref": "#/$defs/sha256" },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "capabilities_present": { "type": "boolean" },
+        "capabilities_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "restart_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "last_diagnostics_at_unix_ms": {
+          "oneOf": [
+            { "$ref": "#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        },
+        "last_used_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "brokenServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_root_sha256",
+        "language",
+        "toolchain_fingerprint_sha256",
+        "failure_count",
+        "retry_after_unix_ms",
+        "manual_reset_required",
+        "reason_code"
+      ],
+      "properties": {
+        "workspace_root_sha256": { "$ref": "#/$defs/sha256" },
+        "language": { "$ref": "#/$defs/language" },
+        "toolchain_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+        "failure_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "retry_after_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "manual_reset_required": { "type": "boolean" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "handles_max": 512,
+    "broken_servers_max": 512,
+    "active_servers_max": 16
+  },
+  "x-palyra-prohibits": [
+    "raw_capabilities",
+    "raw_handle_ids",
+    "raw_worktree_ids",
+    "raw_process_session_ids",
+    "workspace_paths",
+    "server_commands",
+    "environment_values"
+  ]
+}

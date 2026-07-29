@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/diagnostics-delta.v2.json",
+  "title": "Palyra Diagnostics Delta V2",
+  "description": "Generation-aware and bounded classification of diagnostics observed after a source edit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "baseline_id",
+    "handle_id",
+    "baseline_server_generation",
+    "result_server_generation",
+    "status",
+    "documents",
+    "introduced",
+    "resolved",
+    "unchanged",
+    "introduced_count",
+    "resolved_count",
+    "unchanged_count",
+    "blocking_introduced_count",
+    "truncated",
+    "full_diagnostics_artifact",
+    "fallback",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "baseline_id": { "$ref": "#/$defs/id" },
+    "handle_id": { "$ref": "#/$defs/id" },
+    "baseline_server_generation": { "$ref": "#/$defs/u64" },
+    "result_server_generation": {
+      "oneOf": [
+        { "$ref": "#/$defs/u64" },
+        { "type": "null" }
+      ]
+    },
+    "status": {
+      "enum": [
+        "verified",
+        "blocking_diagnostics",
+        "diagnostics_timed_out",
+        "server_generation_changed",
+        "fallback_required"
+      ]
+    },
+    "documents": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/documentGeneration" }
+    },
+    "introduced": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "resolved": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "unchanged": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/unchangedDiagnostic" }
+    },
+    "introduced_count": { "$ref": "#/$defs/diagnosticCount" },
+    "resolved_count": { "$ref": "#/$defs/diagnosticCount" },
+    "unchanged_count": { "$ref": "#/$defs/diagnosticCount" },
+    "blocking_introduced_count": { "$ref": "#/$defs/diagnosticCount" },
+    "truncated": { "type": "boolean" },
+    "full_diagnostics_artifact": {
+      "oneOf": [
+        { "$ref": "#/$defs/artifact" },
+        { "type": "null" }
+      ]
+    },
+    "fallback": {
+      "oneOf": [
+        { "$ref": "#/$defs/fallback" },
+        { "type": "null" }
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/reasonCode" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": ".*\\S.*"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "diagnosticCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 262144
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_line",
+        "start_character",
+        "end_line",
+        "end_character"
+      ],
+      "properties": {
+        "start_line": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "start_character": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "end_character": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "identity_sha256",
+        "range",
+        "severity",
+        "code",
+        "source",
+        "message",
+        "text_truncated"
+      ],
+      "properties": {
+        "relative_path": { "$ref": "#/$defs/relativePath" },
+        "identity_sha256": { "$ref": "#/$defs/sha256" },
+        "range": { "$ref": "#/$defs/range" },
+        "severity": {
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ]
+        },
+        "code": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 128
+            },
+            { "type": "null" }
+          ]
+        },
+        "source": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 128
+            },
+            { "type": "null" }
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "text_truncated": { "type": "boolean" }
+      }
+    },
+    "unchangedDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before",
+        "after",
+        "line_shift",
+        "character_shift"
+      ],
+      "properties": {
+        "before": { "$ref": "#/$defs/diagnostic" },
+        "after": { "$ref": "#/$defs/diagnostic" },
+        "line_shift": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "character_shift": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "documentGeneration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "uri_sha256",
+        "document_version",
+        "diagnostic_count",
+        "diagnostics_sha256"
+      ],
+      "properties": {
+        "relative_path": { "$ref": "#/$defs/relativePath" },
+        "uri_sha256": { "$ref": "#/$defs/sha256" },
+        "document_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diagnostic_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2048
+        },
+        "diagnostics_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "sha256",
+        "byte_count",
+        "content_type"
+      ],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16777216
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$"
+        }
+      }
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "command_label",
+        "reason_code"
+      ],
+      "properties": {
+        "tool": {
+          "enum": [
+            "cargo_check",
+            "tsc_no_emit",
+            "pyright"
+          ]
+        },
+        "command_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "documents_max": 128,
+    "visible_items_per_classification_max": 128,
+    "diagnostics_per_document_max": 2048,
+    "artifact_bytes_max": 16777216,
+    "reason_codes_max": 32
+  }
+}

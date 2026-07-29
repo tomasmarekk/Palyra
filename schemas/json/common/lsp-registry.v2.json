@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/lsp-registry.v2.json",
+  "title": "Palyra LSP Registry V2",
+  "description": "Bounded durable metadata for process-backed workspace language servers and their broken-server cache.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "handles",
+    "broken_servers",
+    "updated_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "handles": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/handle" }
+    },
+    "broken_servers": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/brokenServer" }
+    },
+    "updated_at_unix_ms": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": ".*\\S.*"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "language": {
+      "enum": [
+        "rust",
+        "type_script",
+        "python"
+      ]
+    },
+    "lifecycle": {
+      "enum": [
+        "starting",
+        "ready",
+        "broken",
+        "stopped",
+        "evicted"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "capabilitySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "present",
+        "serialized_bytes",
+        "text_document_sync",
+        "diagnostic_provider",
+        "workspace_folders"
+      ],
+      "properties": {
+        "present": { "type": "boolean" },
+        "serialized_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576
+        },
+        "text_document_sync": { "type": "boolean" },
+        "diagnostic_provider": { "type": "boolean" },
+        "workspace_folders": { "type": "boolean" }
+      }
+    },
+    "handle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "handle_id",
+        "workspace_root_sha256",
+        "worktree_id",
+        "language",
+        "toolchain_fingerprint",
+        "process_session_id",
+        "generation",
+        "lifecycle",
+        "capabilities",
+        "restart_count",
+        "last_diagnostics_at_unix_ms",
+        "last_used_at_unix_ms",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "handle_id": { "$ref": "#/$defs/id" },
+        "workspace_root_sha256": { "$ref": "#/$defs/sha256" },
+        "worktree_id": { "$ref": "#/$defs/id" },
+        "language": { "$ref": "#/$defs/language" },
+        "toolchain_fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "process_session_id": { "$ref": "#/$defs/id" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "capabilities": { "$ref": "#/$defs/capabilitySummary" },
+        "restart_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "last_diagnostics_at_unix_ms": {
+          "oneOf": [
+            { "$ref": "#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        },
+        "last_used_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "brokenServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_root_sha256",
+        "language",
+        "toolchain_fingerprint",
+        "failure_count",
+        "retry_after_unix_ms",
+        "manual_reset_required",
+        "reason_code"
+      ],
+      "properties": {
+        "workspace_root_sha256": { "$ref": "#/$defs/sha256" },
+        "language": { "$ref": "#/$defs/language" },
+        "toolchain_fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "failure_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "retry_after_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "manual_reset_required": { "type": "boolean" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "handles_max": 512,
+    "broken_servers_max": 512,
+    "capability_message_bytes_max": 1048576
+  },
+  "x-palyra-prohibits": [
+    "workspace_paths",
+    "server_commands",
+    "environment_values",
+    "raw_server_capabilities",
+    "live_process_handles"
+  ]
+}
