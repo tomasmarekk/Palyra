@@ -1112,6 +1112,13 @@ pub(crate) fn spawn_managed_stdio_process(
     {
         return Err(managed_stdio_error("launch plan violates bounded process policy"));
     }
+    #[cfg(unix)]
+    let executable_sha256 = sha256_file_bounded(config.executable.as_path()).map_err(|error| {
+        SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: format!("failed to hash managed stdio runtime executable: {error}"),
+        }
+    })?;
     let mut command = Command::new(config.executable.as_path());
     command
         .args(config.args.iter())
@@ -1133,7 +1140,16 @@ pub(crate) fn spawn_managed_stdio_process(
     #[cfg(not(windows))]
     let mut child = child;
     let pid = child.id();
-    let provenance = match capture_background_process_provenance_with_executable_sha256(pid, None) {
+    // A short-lived command can exit after its start token is read but before `/proc/<pid>/exe`
+    // is resolved, so Unix provenance uses the validated launch image hashed before spawning.
+    #[cfg(unix)]
+    let trusted_executable_sha256 = Some(executable_sha256.as_str());
+    #[cfg(not(unix))]
+    let trusted_executable_sha256 = None;
+    let provenance = match capture_background_process_provenance_with_executable_sha256(
+        pid,
+        trusted_executable_sha256,
+    ) {
         Ok(provenance) => provenance,
         Err(error) => {
             let _ = child.terminate_and_reap(Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS));
@@ -1451,9 +1467,19 @@ static REGISTERED_BACKGROUND_PROCESSES: OnceLock<Mutex<HashMap<u32, RegisteredBa
 static FORCED_RETAINED_BACKGROUND_CLEANUP_FAILURES: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
 impl BackgroundProcessRuntimeStatus {
-    /// Returns true while either the direct pid or any tracked descendant is alive.
+    /// Returns true while the tracked ownership domain has a live process.
+    ///
+    /// On Unix an unreaped root zombie still answers a direct PID probe, but it
+    /// must not keep an otherwise empty process group logically active.
     pub(crate) fn alive(self) -> bool {
-        self.process_tree_alive || self.direct_pid_alive
+        #[cfg(unix)]
+        {
+            self.process_tree_alive
+        }
+        #[cfg(not(unix))]
+        {
+            self.process_tree_alive || self.direct_pid_alive
+        }
     }
 
     /// Returns whether the registered ownership-root pid is still alive.
@@ -17265,12 +17291,11 @@ mod tests {
                 .expect("raw process-group probe should work"),
             "signal-zero must demonstrate why the zombie-aware snapshot is required"
         );
-        assert!(!super::unix_process_group_is_alive(group_id)
-            .expect("zombie-aware process-group probe should work"));
-        assert!(
-            super::process_id_is_alive(group_id).expect("zombie direct-pid probe should work"),
-            "the unreaped zombie should demonstrate why direct-pid absence is not required"
-        );
+        let status = super::background_process_runtime_status(group_id)
+            .expect("zombie-aware runtime status should work");
+        assert!(status.direct_pid_alive());
+        assert!(!status.process_tree_alive());
+        assert!(!status.alive(), "an unreaped zombie is not a live ownership domain");
         assert!(
             super::wait_for_owned_background_tree_inactive_for_identity(
                 group_id,
