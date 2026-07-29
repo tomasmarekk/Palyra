@@ -23,6 +23,8 @@
 //! - Counters are relaxed atomics; they feed status snapshots, never control
 //!   flow.
 
+mod managed_coding;
+
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1299,7 +1301,7 @@ pub struct GatewayJournalConfigSnapshot {
 /// Externally constructed collaborators injected into
 /// [`GatewayRuntimeState::new_with_provider`].
 #[rustfmt::skip]
-pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub auth_runtime: Option<Arc<AuthRuntimeState>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime, pub(crate) runtime_kernel_dispatcher: Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher> }
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub auth_runtime: Option<Arc<AuthRuntimeState>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore, pub fault_injection: QaFaultRuntime, pub(crate) runtime_kernel_dispatcher: Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher>, pub(crate) managed_coding_services: Option<Arc<crate::application::managed_coding_services::ManagedCodingRuntimeServices>> }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProviderHealthAuthorityKey {
@@ -2853,6 +2855,8 @@ pub struct GatewayRuntimeState {
         Arc<crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher>,
     runtime_shadow_diagnostics:
         crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics,
+    managed_coding_services:
+        Option<Arc<crate::application::managed_coding_services::ManagedCodingRuntimeServices>>,
     pub(crate) journal_store: JournalStore,
     pub(crate) daemon_lifecycle: DaemonLifecycleController,
     daemon_lifecycle_transition_lock: Mutex<()>,
@@ -4380,7 +4384,7 @@ impl GatewayRuntimeState {
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
-        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, auth_runtime: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection, runtime_kernel_dispatcher: Arc::new(crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::legacy_default().expect("legacy runtime dispatcher should initialize")) };
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, auth_profile_registry: None, auth_runtime: None, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()), conversation_bindings: ConversationBindingStore::open_temp(), fault_injection, runtime_kernel_dispatcher: Arc::new(crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::legacy_default().expect("legacy runtime dispatcher should initialize")), managed_coding_services: None };
         Self::new_with_provider(
             config,
             journal_config,
@@ -4409,7 +4413,7 @@ impl GatewayRuntimeState {
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
         #[rustfmt::skip]
-        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, auth_runtime, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection, runtime_kernel_dispatcher } = dependencies;
+        let GatewayRuntimeDependencies { model_provider, vault, auth_profile_registry, auth_runtime, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index, conversation_bindings, fault_injection, runtime_kernel_dispatcher, managed_coding_services } = dependencies;
         let credential_availability = auth_runtime.map(|auth_runtime| {
             CredentialAvailabilityService::new(auth_runtime, Arc::clone(&vault))
         });
@@ -4525,7 +4529,7 @@ impl GatewayRuntimeState {
             current_unix_ms(),
         )?;
         let daemon_lifecycle_startup = journal_store.begin_daemon_lifecycle_startup()?;
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
                 version: build.version.to_owned(),
@@ -4630,6 +4634,7 @@ impl GatewayRuntimeState {
             runtime_kernel_dispatcher,
             runtime_shadow_diagnostics:
                 crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics::default(),
+            managed_coding_services,
             journal_store,
             daemon_lifecycle: DaemonLifecycleController::new(daemon_lifecycle_startup),
             daemon_lifecycle_transition_lock: Mutex::new(()),
@@ -4699,7 +4704,9 @@ impl GatewayRuntimeState {
             conversation_bindings,
             observability: Arc::new(crate::observability::ObservabilityState::default()),
             self_healing: Arc::new(SelfHealingState::new()),
-        }))
+        });
+        state.install_managed_coding_wake_bridge()?;
+        Ok(state)
     }
 
     // Counter recorders and run cleanup bookkeeping. The `record_*` methods
@@ -7677,7 +7684,7 @@ impl GatewayRuntimeState {
     ///
     /// # Errors
     /// `invalid_argument` when the requested repair is outside the supported
-    /// Phase 1 FTS-only contract, or `internal` when the repair fails.
+    /// FTS-only compatibility contract, or `internal` when the repair fails.
     #[allow(clippy::result_large_err)]
     pub(crate) fn repair_journal_state_blocking(
         &self,
@@ -10662,14 +10669,31 @@ impl GatewayRuntimeState {
     ) -> Result<(), Status> {
         let run_id = request.run_id.clone();
         let parameter_delta_json = request.parameter_delta_json.clone();
+        let persisted_request = request.clone();
         let state = Arc::clone(self);
-        let inserted =
-            tokio::task::spawn_blocking(move || state.start_orchestrator_run_blocking(&request))
-                .await
-                .map_err(|_| Status::internal("orchestrator run worker panicked"))??;
+        let inserted = tokio::task::spawn_blocking(move || {
+            state.start_orchestrator_run_blocking(&persisted_request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator run worker panicked"))??;
         self.remember_run_parameter_delta_json(run_id.as_str(), parameter_delta_json.as_deref());
         if inserted {
             self.counters.orchestrator_runs_started.fetch_add(1, Ordering::Relaxed);
+            let state = Arc::clone(self);
+            let admission =
+                tokio::task::spawn_blocking(move || state.admit_managed_coding_run(&request))
+                    .await
+                    .map_err(|_| Status::internal("managed coding admission worker panicked"))?;
+            if admission.is_err() {
+                let message = "managed coding workspace admission failed".to_owned();
+                self.update_orchestrator_run_state(
+                    run_id.clone(),
+                    RunLifecycleState::Failed,
+                    Some(message.clone()),
+                )
+                .await?;
+                return Err(Status::failed_precondition(message));
+            }
         }
         self.orchestrator_run_notify.notify_waiters();
         Ok(())

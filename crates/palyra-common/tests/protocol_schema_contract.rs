@@ -178,6 +178,25 @@ fn shared_runtime_schemas_are_versioned_closed_and_bounded() -> Result<()> {
         ("cleanup-report.v1.json", 1_u64),
         ("runtime-state-compatibility-report.v1.json", 1_u64),
         ("continuity-campaign-report.v1.json", 1_u64),
+        ("process-session-record.v2.json", 2_u64),
+        ("process-output-page.v2.json", 2_u64),
+        ("pty-session-descriptor.v1.json", 1_u64),
+        ("local-resource-registry.v2.json", 2_u64),
+        ("resource-pressure-snapshot.v1.json", 1_u64),
+        ("managed-worktree-registry.v2.json", 2_u64),
+        ("worktree-snapshot-descriptor.v1.json", 1_u64),
+        ("worktree-restore-report.v1.json", 1_u64),
+        ("lsp-registry.v2.json", 2_u64),
+        ("lsp-diagnostics-snapshot.v2.json", 2_u64),
+        ("diagnostics-baseline.v2.json", 2_u64),
+        ("diagnostics-delta.v2.json", 2_u64),
+        ("coding-runtime-capability-report.v2.json", 2_u64),
+        ("coding-patch-outcome.v2.json", 2_u64),
+        ("coding-command-status.v2.json", 2_u64),
+        ("coding-task-cleanup-outcome.v2.json", 2_u64),
+        ("coding-runtime-soak-report.v1.json", 1_u64),
+        ("managed-coding-diagnostics.v1.json", 1_u64),
+        ("managed-coding-recovery.v1.json", 1_u64),
     ];
 
     for (name, expected_version) in contracts {
@@ -225,6 +244,54 @@ fn shared_runtime_schemas_are_versioned_closed_and_bounded() -> Result<()> {
         .context("compatibility admission must document operational scope")?;
     assert!(description.contains("Serving admission requires ready"));
     assert!(description.contains("offline inspection and migration tooling"));
+
+    Ok(())
+}
+
+#[test]
+fn operator_lsp_diagnostics_schema_excludes_raw_runtime_state() -> Result<()> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .context("failed to resolve repository root")?;
+    let schema_path = repo_root
+        .join("schemas")
+        .join("json")
+        .join("common")
+        .join("lsp-diagnostics-snapshot.v2.json");
+    let content = fs::read_to_string(&schema_path)
+        .with_context(|| format!("failed to read {}", schema_path.display()))?;
+    let schema: Value = serde_json::from_str(content.as_str())
+        .with_context(|| format!("failed to parse {}", schema_path.display()))?;
+
+    let handle_properties =
+        schema
+            .pointer("/$defs/handle/properties")
+            .and_then(Value::as_object)
+            .context("LSP diagnostics schema must define closed handle properties")?;
+    for prohibited in
+        ["handle_id", "worktree_id", "process_session_id", "capabilities", "workspace_root"]
+    {
+        assert!(
+            !handle_properties.contains_key(prohibited),
+            "operator LSP diagnostics schema must exclude {prohibited}"
+        );
+    }
+    for required_hash in ["handle_id_sha256", "worktree_id_sha256", "process_session_id_sha256"] {
+        assert!(
+            handle_properties.contains_key(required_hash),
+            "operator LSP diagnostics schema must include {required_hash}"
+        );
+    }
+    assert_eq!(
+        schema.pointer("/$defs/handle/additionalProperties").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        schema.pointer("/$defs/brokenServer/additionalProperties").and_then(Value::as_bool),
+        Some(false)
+    );
 
     Ok(())
 }

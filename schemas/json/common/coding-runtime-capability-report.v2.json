@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/coding-runtime-capability-report.v2.json",
+  "title": "Palyra Coding Runtime Capability Report V2",
+  "description": "Truthful task-scoped capability and fallback posture for an integrated coding runtime.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workspace_admission",
+    "workspace_isolation",
+    "process_supervisor",
+    "native_pty",
+    "persistent_lsp",
+    "objective_wait_bridge",
+    "fallback_matrix",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "workspace_admission": {
+      "enum": [
+        "explicit",
+        "policy"
+      ]
+    },
+    "workspace_isolation": {
+      "enum": [
+        "managed_worktree",
+        "in_place_explicit"
+      ]
+    },
+    "process_supervisor": { "$ref": "#/$defs/status" },
+    "native_pty": { "$ref": "#/$defs/status" },
+    "persistent_lsp": { "$ref": "#/$defs/status" },
+    "objective_wait_bridge": { "$ref": "#/$defs/status" },
+    "fallback_matrix": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/fallbackEntry" }
+    },
+    "reason_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/reasonCode" }
+    }
+  },
+  "$defs": {
+    "status": {
+      "enum": [
+        "active",
+        "configured",
+        "degraded",
+        "disabled",
+        "blocked"
+      ]
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "fallbackEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "fallback",
+        "active",
+        "reason_code"
+      ],
+      "properties": {
+        "capability": { "$ref": "#/$defs/label" },
+        "fallback": {
+          "oneOf": [
+            { "$ref": "#/$defs/label" },
+            { "type": "null" }
+          ]
+        },
+        "active": { "type": "boolean" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "fallback_entries_max": 16,
+    "reason_codes_max": 32
+  }
+}

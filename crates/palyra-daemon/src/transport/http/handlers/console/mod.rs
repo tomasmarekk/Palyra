@@ -26,6 +26,7 @@ pub(crate) mod inventory;
 pub(crate) mod jobs;
 pub(crate) mod logs;
 pub(crate) mod maintenance;
+pub(crate) mod managed_coding;
 pub(crate) mod memory;
 pub(crate) mod memory_external_index;
 pub(crate) mod metadata_trace;

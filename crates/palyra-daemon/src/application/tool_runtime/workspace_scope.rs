@@ -88,6 +88,9 @@ pub(crate) async fn workspace_roots_with_run_launch_context(
     run_id: &str,
     workspace_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
+    if let Some(root) = runtime_state.managed_coding_workspace_root(run_id) {
+        return vec![root];
+    }
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
     merge_launch_workspace_roots(workspace_roots, launch_roots)
 }
@@ -100,6 +103,9 @@ pub(crate) async fn workspace_roots_with_run_launch_context_for_agent_source(
     workspace_roots: &[PathBuf],
     _source: AgentResolutionSource,
 ) -> Vec<PathBuf> {
+    if let Some(root) = runtime_state.managed_coding_workspace_root(run_id) {
+        return vec![root];
+    }
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
     merge_launch_workspace_roots(workspace_roots, launch_roots)
 }
@@ -151,6 +157,9 @@ pub(crate) async fn run_launch_context_primary_workspace_root(
     run_id: &str,
     workspace_roots: &[PathBuf],
 ) -> Option<PathBuf> {
+    if let Some(root) = runtime_state.managed_coding_workspace_root(run_id) {
+        return Some(root);
+    }
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
     let launch_roots = filter_launch_workspace_roots(launch_roots, workspace_roots);
     launch_roots.launch_cwd.or_else(|| launch_roots.extra_roots.into_iter().next())
@@ -244,7 +253,7 @@ fn push_launch_workspace_file_grant(grants: &mut Vec<PathBuf>, raw_file: &str) {
 ///
 /// Launch roots are advisory, so invalid entries are skipped (`None`) rather
 /// than failing the run.
-fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
+pub(crate) fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
     let raw_root = raw_root.trim();
     if raw_root.is_empty() || raw_root.chars().any(char::is_control) {
         return None;

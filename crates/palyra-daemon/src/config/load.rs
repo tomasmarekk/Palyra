@@ -57,7 +57,7 @@ use palyra_common::{
         TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV, VERIFICATION_RUNTIME_ROLLOUT_ENV,
     },
     parse_config_path,
-    runtime_preview::{parse_runtime_preview_mode, RuntimePreviewMode},
+    runtime_preview::{parse_runtime_preview_mode as parse_preview_mode_value, RuntimePreviewMode},
     secret_refs::{SecretRef, SecretSource},
     tool_catalog::{
         expand_toolset_profiles, normalize_configured_tool_names, ToolCatalogExposureMode,
@@ -143,12 +143,12 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
     let mut delivery_arbitration = DeliveryArbitrationConfig::default();
     let mut replay_capture = ReplayCaptureConfig::default();
     let mut networked_workers = NetworkedWorkersConfig::default();
-    let mut api_facade = RoadmapPreviewSectionConfig::default();
+    let mut api_facade = RuntimePreviewSectionConfig::default();
     let mut mcp_servers = McpServersConfig::default();
     let mut execution_backend_profiles = ExecutionBackendProfilesConfig::default();
-    let mut qa_lab = RoadmapPreviewSectionConfig::default();
+    let mut qa_lab = RuntimePreviewSectionConfig::default();
     let mut observability_exporters = ObservabilityExportersConfig::default();
-    let mut hook_policy = RoadmapPreviewSectionConfig::default();
+    let mut hook_policy = RuntimePreviewSectionConfig::default();
     let mut agent_harness_registry = AgentHarnessRegistryConfig::default();
     let mut doctor_check_registry = DoctorCheckRegistryConfig::default();
     let mut cron = CronConfig::default();
@@ -557,7 +557,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         }
         if let Some(file_api_facade) = parsed.api_facade {
             if let Some(mode) = file_api_facade.mode {
-                api_facade.mode = parse_roadmap_preview_mode(mode.as_str(), "api_facade.mode")?;
+                api_facade.mode = parse_runtime_preview_mode(mode.as_str(), "api_facade.mode")?;
             }
         }
         let file_mcp_servers = match (parsed.mcp, parsed.mcp_servers) {
@@ -572,7 +572,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         };
         if let Some((section_name, file_mcp_servers)) = file_mcp_servers {
             if let Some(mode) = file_mcp_servers.mode {
-                mcp_servers.mode = parse_roadmap_preview_mode(
+                mcp_servers.mode = parse_runtime_preview_mode(
                     mode.as_str(),
                     format!("{section_name}.mode").as_str(),
                 )?;
@@ -590,7 +590,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         if let Some(file_execution_backend_profiles) = parsed.execution_backend_profiles {
             if let Some(mode) = file_execution_backend_profiles.mode {
                 execution_backend_profiles.mode =
-                    parse_roadmap_preview_mode(mode.as_str(), "execution_backend_profiles.mode")?;
+                    parse_runtime_preview_mode(mode.as_str(), "execution_backend_profiles.mode")?;
             }
             if let Some(profiles) = file_execution_backend_profiles.profiles {
                 execution_backend_profiles.profiles = profiles
@@ -602,13 +602,13 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         }
         if let Some(file_qa_lab) = parsed.qa_lab {
             if let Some(mode) = file_qa_lab.mode {
-                qa_lab.mode = parse_roadmap_preview_mode(mode.as_str(), "qa_lab.mode")?;
+                qa_lab.mode = parse_runtime_preview_mode(mode.as_str(), "qa_lab.mode")?;
             }
         }
         if let Some(file_observability_exporters) = parsed.observability_exporters {
             if let Some(mode) = file_observability_exporters.mode {
                 observability_exporters.mode =
-                    parse_roadmap_preview_mode(mode.as_str(), "observability_exporters.mode")?;
+                    parse_runtime_preview_mode(mode.as_str(), "observability_exporters.mode")?;
             }
             if let Some(exporters) = file_observability_exporters.exporters {
                 observability_exporters.exporters = exporters
@@ -620,13 +620,13 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         }
         if let Some(file_hook_policy) = parsed.hook_policy {
             if let Some(mode) = file_hook_policy.mode {
-                hook_policy.mode = parse_roadmap_preview_mode(mode.as_str(), "hook_policy.mode")?;
+                hook_policy.mode = parse_runtime_preview_mode(mode.as_str(), "hook_policy.mode")?;
             }
         }
         if let Some(file_agent_harness_registry) = parsed.agent_harness_registry {
             if let Some(mode) = file_agent_harness_registry.mode {
                 agent_harness_registry.mode =
-                    parse_roadmap_preview_mode(mode.as_str(), "agent_harness_registry.mode")?;
+                    parse_runtime_preview_mode(mode.as_str(), "agent_harness_registry.mode")?;
             }
             if let Some(harnesses) = file_agent_harness_registry.harnesses {
                 agent_harness_registry.harnesses = harnesses
@@ -639,7 +639,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         if let Some(file_doctor_check_registry) = parsed.doctor_check_registry {
             if let Some(mode) = file_doctor_check_registry.mode {
                 doctor_check_registry.mode =
-                    parse_roadmap_preview_mode(mode.as_str(), "doctor_check_registry.mode")?;
+                    parse_runtime_preview_mode(mode.as_str(), "doctor_check_registry.mode")?;
             }
             if let Some(checks) = file_doctor_check_registry.checks {
                 doctor_check_registry.checks = checks
@@ -1104,6 +1104,9 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             if let Some(file_code_intel) = file_tool_call.code_intel {
                 if let Some(enabled) = file_code_intel.enabled {
                     tool_call.code_intel.enabled = enabled;
+                }
+                if let Some(allow_network) = file_code_intel.allow_network {
+                    tool_call.code_intel.allow_network = allow_network;
                 }
                 if let Some(workspace_root) = file_code_intel.workspace_root {
                     tool_call.code_intel.workspace_root =
@@ -1686,39 +1689,39 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         source.push_str(" +env(PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED)");
     }
 
-    api_facade.mode = apply_roadmap_preview_mode_env_override(
+    api_facade.mode = apply_runtime_preview_mode_env_override(
         api_facade.mode,
         "PALYRA_API_FACADE_MODE",
         &mut source,
     )?;
-    mcp_servers.mode = apply_roadmap_preview_mode_env_override(
+    mcp_servers.mode = apply_runtime_preview_mode_env_override(
         mcp_servers.mode,
         "PALYRA_MCP_SERVERS_MODE",
         &mut source,
     )?;
-    execution_backend_profiles.mode = apply_roadmap_preview_mode_env_override(
+    execution_backend_profiles.mode = apply_runtime_preview_mode_env_override(
         execution_backend_profiles.mode,
         "PALYRA_EXECUTION_BACKEND_PROFILES_MODE",
         &mut source,
     )?;
     qa_lab.mode =
-        apply_roadmap_preview_mode_env_override(qa_lab.mode, "PALYRA_QA_LAB_MODE", &mut source)?;
-    observability_exporters.mode = apply_roadmap_preview_mode_env_override(
+        apply_runtime_preview_mode_env_override(qa_lab.mode, "PALYRA_QA_LAB_MODE", &mut source)?;
+    observability_exporters.mode = apply_runtime_preview_mode_env_override(
         observability_exporters.mode,
         "PALYRA_OBSERVABILITY_EXPORTERS_MODE",
         &mut source,
     )?;
-    hook_policy.mode = apply_roadmap_preview_mode_env_override(
+    hook_policy.mode = apply_runtime_preview_mode_env_override(
         hook_policy.mode,
         "PALYRA_HOOK_POLICY_MODE",
         &mut source,
     )?;
-    agent_harness_registry.mode = apply_roadmap_preview_mode_env_override(
+    agent_harness_registry.mode = apply_runtime_preview_mode_env_override(
         agent_harness_registry.mode,
         "PALYRA_AGENT_HARNESS_REGISTRY_MODE",
         &mut source,
     )?;
-    doctor_check_registry.mode = apply_roadmap_preview_mode_env_override(
+    doctor_check_registry.mode = apply_runtime_preview_mode_env_override(
         doctor_check_registry.mode,
         "PALYRA_DOCTOR_CHECK_REGISTRY_MODE",
         &mut source,
@@ -2933,7 +2936,7 @@ fn apply_feature_rollout_env_override(
     Ok(FeatureRolloutSetting::from_env(enabled))
 }
 
-fn apply_roadmap_preview_mode_env_override(
+fn apply_runtime_preview_mode_env_override(
     current: RuntimePreviewMode,
     env_name: &'static str,
     source: &mut String,
@@ -2941,13 +2944,13 @@ fn apply_roadmap_preview_mode_env_override(
     let Ok(raw) = env::var(env_name) else {
         return Ok(current);
     };
-    let mode = parse_roadmap_preview_mode(raw.as_str(), env_name)?;
+    let mode = parse_runtime_preview_mode(raw.as_str(), env_name)?;
     source.push_str(&format!(" +env({env_name})"));
     Ok(mode)
 }
 
-fn parse_roadmap_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePreviewMode> {
-    let mode = parse_runtime_preview_mode(raw, source_name)?;
+fn parse_runtime_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePreviewMode> {
+    let mode = parse_preview_mode_value(raw, source_name)?;
     if matches!(mode, RuntimePreviewMode::Enabled) {
         anyhow::bail!(
             "{source_name}=enabled is reserved until the section reaches its maturity gate; use disabled or preview_only"
@@ -5844,16 +5847,16 @@ mod tests {
         parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
         parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
         parse_process_runner_path_access_mode, parse_process_runner_tier,
-        parse_provider_reasoning_effort, parse_provider_service_tier, parse_roadmap_preview_mode,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_structured_secret_ref_field,
-        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
-        validate_acp_runtime_registry, validate_runtime_preview_config, AcpRuntimeBackendConfig,
-        AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig, BrowserServiceConfig,
-        CanvasHostConfig, ChannelRouterConfig, CronConfig, DeliveryArbitrationConfig,
-        DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig, FlowOrchestrationConfig,
-        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
-        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
-        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        parse_provider_reasoning_effort, parse_provider_service_tier, parse_root_file_config,
+        parse_runtime_preview_mode, parse_storage_prefix_allowlist,
+        parse_structured_secret_ref_field, parse_tool_allowlist, parse_vault_dir,
+        parse_vault_ref_allowlist, validate_acp_runtime_registry, validate_runtime_preview_config,
+        AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
+        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig,
+        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
+        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
         RetrievalDualPathConfig, RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig,
         ToolCallConfig,
     };
@@ -6234,9 +6237,9 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_preview_modes_reject_enabled_until_maturity_gate() {
-        let error = parse_roadmap_preview_mode("enabled", "mcp_servers.mode")
-            .expect_err("roadmap preview sections should not be fully enabled yet");
+    fn runtime_preview_modes_reject_enabled_until_maturity_gate() {
+        let error = parse_runtime_preview_mode("enabled", "mcp_servers.mode")
+            .expect_err("runtime preview sections should not be fully enabled yet");
         let rendered = error.to_string();
         assert!(rendered.contains("mcp_servers.mode=enabled"));
         assert!(rendered.contains("maturity gate"));
@@ -6875,6 +6878,10 @@ mod tests {
         );
         assert!(!config.code_intel.enabled, "code diagnostics must default to disabled");
         assert!(
+            !config.code_intel.allow_network,
+            "language-service network access must default to denied"
+        );
+        assert!(
             config.code_intel.workspace_root.is_none(),
             "code diagnostics workspace root should default to active workspace roots"
         );
@@ -7052,6 +7059,7 @@ mod tests {
             r#"
             [tool_call.code_intel]
             enabled = true
+            allow_network = true
             workspace_root = "workspace"
             rust_analyzer_binary = "ra-fixture"
             typescript_server_binary = "ts-fixture"
@@ -7066,6 +7074,7 @@ mod tests {
         let tool_call = parsed.tool_call.expect("tool_call section should be present");
         let code_intel = tool_call.code_intel.expect("code_intel section should be present");
         assert_eq!(code_intel.enabled, Some(true));
+        assert_eq!(code_intel.allow_network, Some(true));
         assert_eq!(code_intel.workspace_root.as_deref(), Some("workspace"));
         assert_eq!(code_intel.rust_analyzer_binary.as_deref(), Some("ra-fixture"));
         assert_eq!(code_intel.typescript_server_binary.as_deref(), Some("ts-fixture"));
@@ -7561,6 +7570,7 @@ require_auth = false
 
 [tool_call.code_intel]
 enabled = true
+allow_network = true
 workspace_root = "workspace"
 rust_analyzer_binary = "ra-fixture"
 typescript_server_binary = "ts-fixture"
@@ -7581,6 +7591,7 @@ idle_reap_ms = 60000
         let loaded = super::load_config().expect("code-intel config should load");
 
         assert!(loaded.tool_call.code_intel.enabled);
+        assert!(loaded.tool_call.code_intel.allow_network);
         assert_eq!(loaded.tool_call.code_intel.workspace_root, Some(PathBuf::from("workspace")));
         assert_eq!(loaded.tool_call.code_intel.rust_analyzer_binary, "ra-fixture");
         assert_eq!(loaded.tool_call.code_intel.typescript_server_binary, "ts-fixture");

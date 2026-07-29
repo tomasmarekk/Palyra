@@ -30,6 +30,7 @@
     "hooks",
     "learning",
     "lifecycle",
+    "managed_coding",
     "mcp",
     "media",
     "memory",
@@ -49,7 +50,6 @@
     "runtime_diagnostics",
     "runtime_health",
     "runtime_kernel",
-    "runtime_roadmap",
     "runtime_watchdog",
     "session_write_leases",
     "shared_runtime",
@@ -719,16 +719,16 @@
   ],
   "migration_notes": [
     {
-      "id": "m52-page-meta",
-      "message": "M52 adds typed contract/page/error metadata while preserving legacy response keys for existing dashboard consumers."
+      "id": "page-metadata",
+      "message": "Typed contract, page, and error metadata preserve legacy response keys for existing dashboard consumers."
     },
     {
-      "id": "m52-openai-contract",
-      "message": "OpenAI provider auth endpoints publish the control-plane contract in M52; interactive OAuth bootstrap/callback UX is completed in M54."
+      "id": "openai-auth-contract",
+      "message": "OpenAI provider auth endpoints publish the control-plane contract and interactive OAuth bootstrap and callback flow."
     },
     {
-      "id": "m56-capability-exposure",
-      "message": "M56 expands capability catalog entries with dashboard section ownership and CLI handoff metadata so the dashboard can surface direct actions, read-only handoffs, and internal-only capabilities explicitly."
+      "id": "capability-exposure",
+      "message": "Capability catalog entries include dashboard ownership and CLI handoff metadata so direct actions, read-only handoffs, and internal-only capabilities remain explicit."
     }
   ],
   "feature_rollouts": {
@@ -4845,8 +4845,8 @@
         "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
         "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
       },
-      "roadmap_checkbox_policy": "roadmap acceptance complete does not imply stable candidate",
-      "markdown_preview": "# Release Acceptance Dashboard\n\n- P0 areas: 8\n- Stable candidates: 0\n- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |\n| --- | --- | --- | --- | --- | --- |\n| agent_harness_runtime | preview_only | true | false | false | harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing; harness lifecycle and transcript mirroring require production qualification; rollout is not active in the current process; failing required gates: harness-conformance; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; execution_gate_pipeline_v2 |\n| execution_gate_pipeline_v2 | preview_only | false | false | false | execution gate v2 must keep denial and degraded outcomes byte-stable before production; denial and degraded outcomes require release qualification; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| provider_recovery | preview_only | false | false | false | recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes; feature_rollouts.provider_recovery does not select the established recovery state machine and cannot activate a candidate hot path; retry classification and failover require production qualification; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| replay_capture | preview_only | true | false | false | runtime decision capture must respect replay redaction limits; decision capture redaction and replay compatibility require production evidence; rollout is not active in the current process; failing required gates: replay-fixtures; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; run_trace_v1 |\n| verification_runtime | preview_only | false | false | false | verification evidence must remain redacted and durable before stable rollout; verification_finalizer_not_rollout_gated: final verification guard remains outside the rollout-controlled execution path; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| compaction_safeguard | gated_production | false | false | false | compaction decisions must be replay-safe and expose bounded evidence; stable promotion requires qualified production-window usage evidence; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| advisor_fanout | preview_only | false | false | false | advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization; feature_rollouts.advisor_fanout has no production caller or wired activation boundary; budget governance and non-authoritative finalization require production evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| lsp_service | preview_only | false | false | false | LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it; the rollout lacks a wired runtime activation path and lifecycle evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n"
+      "acceptance_policy": "component acceptance does not imply stable candidate",
+      "markdown_preview": "# Release Acceptance Dashboard\n\n- P0 areas: 8\n- Stable candidates: 0\n- Acceptance policy: component acceptance is not stable by itself\n\n| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |\n| --- | --- | --- | --- | --- | --- |\n| agent_harness_runtime | preview_only | true | false | false | harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing; harness lifecycle and transcript mirroring require production qualification; rollout is not active in the current process; failing required gates: harness-conformance; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; execution_gate_pipeline_v2 |\n| execution_gate_pipeline_v2 | preview_only | false | false | false | execution gate v2 must keep denial and degraded outcomes byte-stable before production; denial and degraded outcomes require release qualification; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| provider_recovery | preview_only | false | false | false | recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes; feature_rollouts.provider_recovery does not select the established recovery state machine and cannot activate a candidate hot path; retry classification and failover require production qualification; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| replay_capture | preview_only | true | false | false | runtime decision capture must respect replay redaction limits; decision capture redaction and replay compatibility require production evidence; rollout is not active in the current process; failing required gates: replay-fixtures; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; run_trace_v1 |\n| verification_runtime | preview_only | false | false | false | verification evidence must remain redacted and durable before stable rollout; verification_finalizer_not_rollout_gated: final verification guard remains outside the rollout-controlled execution path; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| compaction_safeguard | gated_production | false | false | false | compaction decisions must be replay-safe and expose bounded evidence; stable promotion requires qualified production-window usage evidence; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| advisor_fanout | preview_only | false | false | false | advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization; feature_rollouts.advisor_fanout has no production caller or wired activation boundary; budget governance and non-authoritative finalization require production evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| lsp_service | preview_only | false | false | false | LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it; the rollout lacks a wired runtime activation path and lifecycle evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n"
     }
   },
   "feature_rollout_maturity_v2": {
@@ -5411,8 +5411,8 @@
         "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
         "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
       },
-      "roadmap_checkbox_policy": "roadmap acceptance complete does not imply stable candidate",
-      "markdown_preview": "# Release Acceptance Dashboard\n\n- P0 areas: 8\n- Stable candidates: 0\n- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n| Area | Legacy maturity | Promotion | Code complete | Tested | Stable candidate | Blockers |\n| --- | --- | --- | --- | --- | --- | --- |\n| agent_harness_runtime | preview_only | canary | true | false | false | harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing; harness lifecycle and transcript mirroring require production qualification; rollout is not active in the current process; failing required gates: harness-conformance; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; execution_gate_pipeline_v2 |\n| execution_gate_pipeline_v2 | preview_only | canary | false | false | false | execution gate v2 must keep denial and degraded outcomes byte-stable before production; denial and degraded outcomes require release qualification; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| provider_recovery | preview_only | contract_only | false | false | false | recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes; feature_rollouts.provider_recovery does not select the established recovery state machine and cannot activate a candidate hot path; retry classification and failover require production qualification; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| replay_capture | preview_only | canary | true | false | false | runtime decision capture must respect replay redaction limits; decision capture redaction and replay compatibility require production evidence; rollout is not active in the current process; failing required gates: replay-fixtures; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; run_trace_v1 |\n| verification_runtime | preview_only | canary | false | false | false | verification evidence must remain redacted and durable before stable rollout; verification_finalizer_not_rollout_gated: final verification guard remains outside the rollout-controlled execution path; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| compaction_safeguard | gated_production | gated_production | false | false | false | compaction decisions must be replay-safe and expose bounded evidence; stable promotion requires qualified production-window usage evidence; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| advisor_fanout | preview_only | contract_only | false | false | false | advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization; feature_rollouts.advisor_fanout has no production caller or wired activation boundary; budget governance and non-authoritative finalization require production evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| lsp_service | preview_only | contract_only | false | false | false | LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it; the rollout lacks a wired runtime activation path and lifecycle evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n"
+      "acceptance_policy": "component acceptance does not imply stable candidate",
+      "markdown_preview": "# Release Acceptance Dashboard\n\n- P0 areas: 8\n- Stable candidates: 0\n- Acceptance policy: component acceptance is not stable by itself\n\n| Area | Legacy maturity | Promotion | Code complete | Tested | Stable candidate | Blockers |\n| --- | --- | --- | --- | --- | --- | --- |\n| agent_harness_runtime | preview_only | canary | true | false | false | harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing; harness lifecycle and transcript mirroring require production qualification; rollout is not active in the current process; failing required gates: harness-conformance; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; execution_gate_pipeline_v2 |\n| execution_gate_pipeline_v2 | preview_only | canary | false | false | false | execution gate v2 must keep denial and degraded outcomes byte-stable before production; denial and degraded outcomes require release qualification; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| provider_recovery | preview_only | contract_only | false | false | false | recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes; feature_rollouts.provider_recovery does not select the established recovery state machine and cannot activate a candidate hot path; retry classification and failover require production qualification; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| replay_capture | preview_only | canary | true | false | false | runtime decision capture must respect replay redaction limits; decision capture redaction and replay compatibility require production evidence; rollout is not active in the current process; failing required gates: replay-fixtures; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window; run_trace_v1 |\n| verification_runtime | preview_only | canary | false | false | false | verification evidence must remain redacted and durable before stable rollout; verification_finalizer_not_rollout_gated: final verification guard remains outside the rollout-controlled execution path; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| compaction_safeguard | gated_production | gated_production | false | false | false | compaction decisions must be replay-safe and expose bounded evidence; stable promotion requires qualified production-window usage evidence; rollout is not active in the current process; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| advisor_fanout | preview_only | contract_only | false | false | false | advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization; feature_rollouts.advisor_fanout has no production caller or wired activation boundary; budget governance and non-authoritative finalization require production evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n| lsp_service | preview_only | contract_only | false | false | false | LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it; the rollout lacks a wired runtime activation path and lifecycle evidence; rollout setting is non-authoritative and cannot activate the capability; missing passed stable-evidence gates: direct-hot-path, no-hidden-fallback, qualified-production-window, sli-window |\n"
     }
   },
   "method_registry": {
@@ -9359,6 +9359,90 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/coding/recovery",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.coding.recovery",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.coding.recovery.request.method-registry.v1",
+        "request_schema_hash": "378552befa9879f8803a33016f510b58e8bbcbbe865e03f8a1c6816260737f81",
+        "response_schema_id": "console.get.console.v1.coding.recovery.response.method-registry.v1",
+        "response_schema_hash": "90925a22664317f6e545b82cb5d0dbb6c99fb39ca99387f96f4fa0c9a6c4ed3c",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/coding/snapshots/{snapshot_id}",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.coding.snapshots.by_snapshot_id",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.coding.snapshots.by_snapshot_id.request.method-registry.v1",
+        "request_schema_hash": "49bfb900ad62019c9b86cc495f2a24f67fc654bb1fd629800d0f6c6d588681de",
+        "response_schema_id": "console.get.console.v1.coding.snapshots.by_snapshot_id.response.method-registry.v1",
+        "response_schema_hash": "cd703882ac0944f7a158fd913d6f3d8963a2777fe06772b18174241e5901dfda",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/coding/snapshots/{snapshot_id}/gc",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.coding.snapshots.by_snapshot_id.gc",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.coding.snapshots.by_snapshot_id.gc.request.method-registry.v1",
+        "request_schema_hash": "bbae7621548c11c812d3b60fc678875b1c9dc732eea56b086693985da02ec18b",
+        "response_schema_id": "console.post.console.v1.coding.snapshots.by_snapshot_id.gc.response.method-registry.v1",
+        "response_schema_hash": "c30d990136e2fb97cd9abb68230988481fec0067def9b70881edd455efb78061",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/coding/snapshots/{snapshot_id}/restore",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.coding.snapshots.by_snapshot_id.restore",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.coding.snapshots.by_snapshot_id.restore.request.method-registry.v1",
+        "request_schema_hash": "46f0a6c7873dd0a35d2aea12b766facce74a4498ce53e2a2ef0d6e03459d852e",
+        "response_schema_id": "console.post.console.v1.coding.snapshots.by_snapshot_id.restore.response.method-registry.v1",
+        "response_schema_hash": "13dcb55a125004ed1b1643522146698e9fe5c4d2163816e1495db373d158212b",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/coding/worktrees/{worktree_id}/force-cleanup",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.coding.worktrees.by_worktree_id.force_cleanup",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.coding.worktrees.by_worktree_id.force_cleanup.request.method-registry.v1",
+        "request_schema_hash": "4d1e03af413bd49811c0993a79f7206627ca48c603b6c41551ffdbb465cb755e",
+        "response_schema_id": "console.post.console.v1.coding.worktrees.by_worktree_id.force_cleanup.response.method-registry.v1",
+        "response_schema_hash": "dcf2f7ba5b0f0a28f77fc0441d6f08d3f61b82e0d8faa3e868b2aed12e640ff8",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/coding/worktrees/{worktree_id}/retain",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.coding.worktrees.by_worktree_id.retain",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.coding.worktrees.by_worktree_id.retain.request.method-registry.v1",
+        "request_schema_hash": "4099099c81d9616726bba92b8921902f7d498c486a8b8901974d89ec7af283a0",
+        "response_schema_id": "console.post.console.v1.coding.worktrees.by_worktree_id.retain.response.method-registry.v1",
+        "response_schema_hash": "b534d731208c83c2d9d51c54571dcaf89c9677ae9d61955625b100362c73c0a6",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/commitments",
         "http_method": "GET",
         "method_name": "console.get.console.v1.commitments",
@@ -12783,1172 +12867,6 @@
       }
     ]
   },
-  "runtime_roadmap": {
-    "schema_version": 1,
-    "capabilities": [
-      {
-        "schema_version": 1,
-        "capability": "baseline_contracts",
-        "label": "Baseline contracts",
-        "summary": "Defines the shared metadata contract used before roadmap runtime loops execute.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "reason_code_taxonomy",
-        "label": "Reason code taxonomy",
-        "summary": "Keeps roadmap reason codes stable across journal, replay, diagnostics, and tests.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "journal_schema_extension",
-        "label": "Journal schema extension",
-        "summary": "Uses the existing journal append log with typed payload envelopes.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "runtime_loop_rollout_config",
-        "label": "Runtime loop rollout config",
-        "summary": "Registers default-off rollout gates for new agent-runtime behavior.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "replay_regression_harness",
-        "label": "Replay regression harness",
-        "summary": "Defines shared replay and regression fixture contracts for roadmap work.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "milestone_implementation_style",
-        "label": "Milestone implementation style",
-        "summary": "Documents the conservative implementation style expected for roadmap milestones.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "integration_smoke_validation",
-        "label": "Integration smoke validation",
-        "summary": "Pins smoke targets for journal, run-stream, fixture, and diagnostics integration points.",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "agent_harness_runtime",
-        "label": "Agent harness runtime",
-        "summary": "Guards agent harness selection, lifecycle, callbacks, transcripts, and authority fences.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME",
-        "rollout_config_path": "feature_rollouts.agent_harness_runtime",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "inline_runtime_hooks",
-        "label": "Inline runtime hooks",
-        "summary": "Guards inline hook invocation points before they enter the critical run loop.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS",
-        "rollout_config_path": "feature_rollouts.inline_runtime_hooks",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "tool_result_middleware",
-        "label": "Tool result middleware",
-        "summary": "Guards tool-result middleware before model-visible projection changes.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE",
-        "rollout_config_path": "feature_rollouts.tool_result_middleware",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "tool_repair",
-        "label": "Tool repair",
-        "summary": "Guards tool-call repair parsing and proposal recovery.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR",
-        "rollout_config_path": "feature_rollouts.tool_repair",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "provider_stream_normalizer",
-        "label": "Provider stream normalizer",
-        "summary": "Guards provider stream normalization before tool proposal flow.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
-        "rollout_config_path": "feature_rollouts.provider_stream_normalizer",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "provider_recovery",
-        "label": "Provider recovery",
-        "summary": "Guards bounded provider retry, repair, auth failover, and terminal recovery decisions.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY",
-        "rollout_config_path": "feature_rollouts.provider_recovery",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "terminal_sessions",
-        "label": "Terminal sessions",
-        "summary": "Guards persistent terminal process handles, cwd/env state, and cleanup evidence.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS",
-        "rollout_config_path": "feature_rollouts.terminal_sessions",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "browser_rescue",
-        "label": "Browser rescue",
-        "summary": "Guards browser vision, dialog, CDP, and multimodal rescue boundaries.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESCUE",
-        "rollout_config_path": "feature_rollouts.browser_rescue",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "lsp_service",
-        "label": "LSP service",
-        "summary": "Guards code-intelligence service lifecycle, diagnostics, and workspace scoping.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_LSP_SERVICE",
-        "rollout_config_path": "feature_rollouts.lsp_service",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "advisor_fanout",
-        "label": "Advisor fanout",
-        "summary": "Guards advisor fanout, trace attribution, budget governance, and non-authoritative reviews.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT",
-        "rollout_config_path": "feature_rollouts.advisor_fanout",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "acp_runtime",
-        "label": "ACP runtime",
-        "summary": "Guards ACP runtime actor queues, permissions, replay, and native handoff boundaries.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_ACP_RUNTIME",
-        "rollout_config_path": "feature_rollouts.acp_runtime",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "channel_turn_kernel",
-        "label": "Channel turn kernel",
-        "summary": "Guards channel turn admission, debounce, history, and delivery lifecycle work.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
-        "rollout_config_path": "feature_rollouts.channel_turn_kernel",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "agent_plan_state",
-        "label": "Agent plan state",
-        "summary": "Guards model-visible plan state and progress checkpoints.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE",
-        "rollout_config_path": "feature_rollouts.agent_plan_state",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "objective_judge",
-        "label": "Objective judge",
-        "summary": "Guards auxiliary objective completion judging.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
-        "rollout_config_path": "feature_rollouts.objective_judge",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "verification_runtime",
-        "label": "Verification runtime",
-        "summary": "Guards evidence ledger, verify-before-finish, and diagnostics status.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME",
-        "rollout_config_path": "feature_rollouts.verification_runtime",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "progress_drafts",
-        "label": "Progress drafts",
-        "summary": "Guards durable progress drafts and long-running turn visibility.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS",
-        "rollout_config_path": "feature_rollouts.progress_drafts",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "compaction_safeguard",
-        "label": "Compaction safeguard",
-        "summary": "Guards compaction checkpoints and rollback decisions.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD",
-        "rollout_config_path": "feature_rollouts.compaction_safeguard",
-        "default_enabled": false
-      },
-      {
-        "schema_version": 1,
-        "capability": "attack_surface_audit",
-        "label": "Attack surface audit",
-        "summary": "Guards attack-surface graphing and outbound sanitizer previews.",
-        "rollout_env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT",
-        "rollout_config_path": "feature_rollouts.attack_surface_audit",
-        "default_enabled": false
-      }
-    ],
-    "boundary_taxonomy": [
-      {
-        "schema_version": 1,
-        "family": "harness",
-        "event_name": "harness.selection.decision",
-        "severity": "info",
-        "retryability": "non_retryable",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "agent_harness_runtime",
-        "metadata_keys": [
-          "harness_id",
-          "selection_mode",
-          "support_outcome"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "hook",
-        "event_name": "hook.lifecycle.observed",
-        "severity": "info",
-        "retryability": "operator_action_required",
-        "visibility_policy": "operator_diagnostics",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "inline_runtime_hooks",
-        "metadata_keys": [
-          "hook_id",
-          "phase",
-          "decision_kind"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "middleware",
-        "event_name": "tool.middleware.projected",
-        "severity": "info",
-        "retryability": "non_retryable",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "tool_result_middleware",
-        "metadata_keys": [
-          "tool_name",
-          "middleware_id",
-          "visibility"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "middleware",
-        "event_name": "tool.middleware.failed",
-        "severity": "warning",
-        "retryability": "non_retryable",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "tool_result_middleware",
-        "metadata_keys": [
-          "tool_name",
-          "middleware_id",
-          "failure_code"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "provider_stream",
-        "event_name": "provider.stream.normalized",
-        "severity": "info",
-        "retryability": "retryable",
-        "visibility_policy": "internal_diagnostics",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "provider_stream_normalizer",
-        "metadata_keys": [
-          "provider_kind",
-          "chunk_count",
-          "repair_count"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "turn_recovery",
-        "event_name": "turn.recovery.retry_planned",
-        "severity": "warning",
-        "retryability": "retryable",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "provider_recovery",
-        "metadata_keys": [
-          "provider_kind",
-          "recovery_recipe",
-          "attempt_index"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "terminal",
-        "event_name": "terminal.session.lifecycle",
-        "severity": "info",
-        "retryability": "operator_action_required",
-        "visibility_policy": "operator_diagnostics",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "terminal_sessions",
-        "metadata_keys": [
-          "session_handle",
-          "state",
-          "cleanup_evidence"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "browser_rescue",
-        "event_name": "browser.rescue.requested",
-        "severity": "warning",
-        "retryability": "operator_action_required",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "browser_rescue",
-        "metadata_keys": [
-          "profile_id",
-          "rescue_kind",
-          "policy_decision"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "lsp",
-        "event_name": "lsp.lifecycle.changed",
-        "severity": "info",
-        "retryability": "retryable",
-        "visibility_policy": "operator_diagnostics",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "lsp_service",
-        "metadata_keys": [
-          "workspace_root",
-          "language_id",
-          "state"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "acp",
-        "event_name": "acp.runtime.actor_queued",
-        "severity": "info",
-        "retryability": "retryable",
-        "visibility_policy": "audit_and_replay",
-        "redaction_boundary": "metadata_only",
-        "rollout_capability": "acp_runtime",
-        "metadata_keys": [
-          "session_id",
-          "actor_id",
-          "permission_state"
-        ]
-      },
-      {
-        "schema_version": 1,
-        "family": "learning",
-        "event_name": "learning.candidate.reviewed",
-        "severity": "info",
-        "retryability": "non_retryable",
-        "visibility_policy": "operator_diagnostics",
-        "redaction_boundary": "metadata_only",
-        "metadata_keys": [
-          "candidate_kind",
-          "scope",
-          "decision"
-        ]
-      }
-    ],
-    "invariant_contract": {
-      "schema_version": 1,
-      "authority": "host_runtime",
-      "journal_authoritative": true,
-      "diagnostics_authoritative": false,
-      "descriptors": [
-        {
-          "invariant": "exactly_one_terminal_event",
-          "violation_reason_code": "runtime.invariant.exactly_one_terminal_event",
-          "subsystem": "runtime_kernel",
-          "phase": "finalization",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::closed_generation_requires_exactly_one_terminal_event"
-        },
-        {
-          "invariant": "one_active_generation",
-          "violation_reason_code": "runtime.invariant.one_active_generation",
-          "subsystem": "runtime_kernel",
-          "phase": "admission",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::active_generation_is_single_owner"
-        },
-        {
-          "invariant": "no_automatic_duplicate_side_effect",
-          "violation_reason_code": "runtime.invariant.no_automatic_duplicate_side_effect",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::unresolved_side_effect_is_not_automatically_replayed"
-        },
-        {
-          "invariant": "durable_intent_before_effect",
-          "violation_reason_code": "runtime.invariant.durable_intent_before_effect",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::effect_requires_prior_durable_intent"
-        },
-        {
-          "invariant": "durable_delivery_intent_before_send",
-          "violation_reason_code": "runtime.invariant.durable_delivery_intent_before_send",
-          "subsystem": "delivery",
-          "phase": "delivery_send",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::delivery_send_requires_prior_durable_intent"
-        },
-        {
-          "invariant": "unknown_outcome_distinct",
-          "violation_reason_code": "runtime.invariant.unknown_outcome_distinct",
-          "subsystem": "recovery",
-          "phase": "recovery",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::unknown_outcome_is_not_success_or_failure"
-        }
-      ]
-    },
-    "error_taxonomy": {
-      "snapshot_version": "runtime-error-envelope.v1",
-      "changelog_note": "Adds a strict metadata-only runtime error taxonomy, binding invariant registry, and exact legacy compatibility map without changing frozen public error envelopes.",
-      "schema_version": 1,
-      "schema_path": "schemas/json/common/runtime-error-envelope.v1.json",
-      "deny_unknown_fields": true,
-      "raw_provider_payload_allowed": false,
-      "raw_stderr_allowed": false,
-      "reason_code_max_bytes": 128,
-      "safe_message_max_bytes": 2048,
-      "recovery_hint_max_bytes": 512,
-      "required_fields": [
-        "schema_version",
-        "class",
-        "reason_code",
-        "subsystem",
-        "phase",
-        "retryability",
-        "security_class",
-        "user_visibility",
-        "output_emitted",
-        "side_effect_may_have_occurred",
-        "safe_message",
-        "recovery_hint"
-      ],
-      "classes": [
-        "invalid_request",
-        "policy_denied",
-        "approval_required",
-        "auth_unavailable",
-        "provider_retryable",
-        "provider_terminal",
-        "tool_execution_unknown",
-        "plugin_contract_violation",
-        "recovery_blocked",
-        "delivery_unknown",
-        "cancelled",
-        "internal_invariant_violation"
-      ],
-      "subsystems": [
-        "runtime_kernel",
-        "run_stream",
-        "control_plane",
-        "auth",
-        "provider",
-        "policy",
-        "approval",
-        "tool",
-        "plugin",
-        "recovery",
-        "delivery",
-        "background_queue",
-        "session",
-        "worker",
-        "mcp",
-        "browser"
-      ],
-      "phases": [
-        "request_validation",
-        "admission",
-        "queueing",
-        "runtime_selection",
-        "context_assembly",
-        "provider_call",
-        "provider_recovery",
-        "provider_finalization",
-        "policy_evaluation",
-        "tool_validation",
-        "tool_gate",
-        "approval",
-        "tool_execution",
-        "result_projection",
-        "compaction",
-        "verification",
-        "recovery",
-        "delivery_intent",
-        "delivery_queue",
-        "delivery_send",
-        "delivery_acknowledgement",
-        "finalization",
-        "cancellation",
-        "plugin_negotiation",
-        "plugin_host_call_authorization",
-        "plugin_execution",
-        "internal"
-      ],
-      "retryability": [
-        "not_retryable",
-        "safe_same_request",
-        "safe_after_backoff",
-        "requires_credential_refresh",
-        "requires_request_transform",
-        "requires_context_compaction",
-        "requires_provider_failover",
-        "requires_approval",
-        "requires_idempotency_guard",
-        "requires_operator_review"
-      ],
-      "security_classes": [
-        "public",
-        "operator",
-        "internal",
-        "sensitive"
-      ],
-      "user_visibility": [
-        "silent",
-        "status_only",
-        "safe_message",
-        "action_required"
-      ],
-      "terminal_outcomes": [
-        {
-          "outcome": "completed",
-          "phase": "finalization",
-          "reason_code": "runtime.terminal.completed"
-        },
-        {
-          "outcome": "failed",
-          "phase": "finalization",
-          "reason_code": "runtime.terminal.failed"
-        },
-        {
-          "outcome": "cancelled",
-          "phase": "cancellation",
-          "reason_code": "runtime.terminal.cancelled"
-        },
-        {
-          "outcome": "timed_out",
-          "phase": "finalization",
-          "reason_code": "runtime.terminal.timed_out"
-        }
-      ],
-      "invariants": [
-        {
-          "invariant": "exactly_one_terminal_event",
-          "violation_reason_code": "runtime.invariant.exactly_one_terminal_event",
-          "subsystem": "runtime_kernel",
-          "phase": "finalization",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::closed_generation_requires_exactly_one_terminal_event"
-        },
-        {
-          "invariant": "one_active_generation",
-          "violation_reason_code": "runtime.invariant.one_active_generation",
-          "subsystem": "runtime_kernel",
-          "phase": "admission",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::active_generation_is_single_owner"
-        },
-        {
-          "invariant": "no_automatic_duplicate_side_effect",
-          "violation_reason_code": "runtime.invariant.no_automatic_duplicate_side_effect",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::unresolved_side_effect_is_not_automatically_replayed"
-        },
-        {
-          "invariant": "durable_intent_before_effect",
-          "violation_reason_code": "runtime.invariant.durable_intent_before_effect",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::effect_requires_prior_durable_intent"
-        },
-        {
-          "invariant": "durable_delivery_intent_before_send",
-          "violation_reason_code": "runtime.invariant.durable_delivery_intent_before_send",
-          "subsystem": "delivery",
-          "phase": "delivery_send",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::delivery_send_requires_prior_durable_intent"
-        },
-        {
-          "invariant": "unknown_outcome_distinct",
-          "violation_reason_code": "runtime.invariant.unknown_outcome_distinct",
-          "subsystem": "recovery",
-          "phase": "recovery",
-          "evidence_test": "runtime_contracts::error_taxonomy::tests::unknown_outcome_is_not_success_or_failure"
-        }
-      ],
-      "legacy_compatibility": [
-        {
-          "legacy_reason_code": "provider.recovery.retry_after",
-          "class": "provider_retryable",
-          "subsystem": "provider",
-          "phase": "provider_recovery",
-          "retryability": "safe_after_backoff",
-          "security_class": "sensitive",
-          "user_visibility": "status_only"
-        },
-        {
-          "legacy_reason_code": "provider.recovery.fail_closed",
-          "class": "provider_terminal",
-          "subsystem": "provider",
-          "phase": "provider_finalization",
-          "retryability": "not_retryable",
-          "security_class": "sensitive",
-          "user_visibility": "safe_message"
-        },
-        {
-          "legacy_reason_code": "provider.recovery.refresh_credential",
-          "class": "auth_unavailable",
-          "subsystem": "auth",
-          "phase": "provider_recovery",
-          "retryability": "requires_credential_refresh",
-          "security_class": "sensitive",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "tool_catalog.invalid_json",
-          "class": "invalid_request",
-          "subsystem": "tool",
-          "phase": "tool_validation",
-          "retryability": "not_retryable",
-          "security_class": "internal",
-          "user_visibility": "safe_message"
-        },
-        {
-          "legacy_reason_code": "tool_replay.mutating_timeout_requires_guard",
-          "class": "tool_execution_unknown",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "retryability": "requires_idempotency_guard",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "approval.pending",
-          "class": "approval_required",
-          "subsystem": "approval",
-          "phase": "approval",
-          "retryability": "requires_approval",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "approval.required",
-          "class": "approval_required",
-          "subsystem": "approval",
-          "phase": "approval",
-          "retryability": "requires_approval",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "approval.denied",
-          "class": "policy_denied",
-          "subsystem": "approval",
-          "phase": "approval",
-          "retryability": "not_retryable",
-          "security_class": "internal",
-          "user_visibility": "safe_message"
-        },
-        {
-          "legacy_reason_code": "platform_outcome_unknown",
-          "class": "delivery_unknown",
-          "subsystem": "delivery",
-          "phase": "delivery_acknowledgement",
-          "retryability": "requires_idempotency_guard",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "channel.delivery.deferred_retry.concurrency_limit",
-          "class": "recovery_blocked",
-          "subsystem": "delivery",
-          "phase": "delivery_queue",
-          "retryability": "safe_after_backoff",
-          "security_class": "internal",
-          "user_visibility": "status_only"
-        },
-        {
-          "legacy_reason_code": "agent_harness_plugin.contract_missing",
-          "class": "plugin_contract_violation",
-          "subsystem": "plugin",
-          "phase": "plugin_negotiation",
-          "retryability": "not_retryable",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "agent_harness_plugin.contract_rejected",
-          "class": "plugin_contract_violation",
-          "subsystem": "plugin",
-          "phase": "plugin_negotiation",
-          "retryability": "not_retryable",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "plugin.host_call.denied.service_grant_missing",
-          "class": "policy_denied",
-          "subsystem": "plugin",
-          "phase": "plugin_host_call_authorization",
-          "retryability": "not_retryable",
-          "security_class": "sensitive",
-          "user_visibility": "safe_message"
-        },
-        {
-          "legacy_reason_code": "workspace_patch.execution_failed",
-          "class": "recovery_blocked",
-          "subsystem": "tool",
-          "phase": "tool_execution",
-          "retryability": "requires_operator_review",
-          "security_class": "internal",
-          "user_visibility": "action_required"
-        },
-        {
-          "legacy_reason_code": "runtime.invariant.phase_mismatch",
-          "class": "internal_invariant_violation",
-          "subsystem": "runtime_kernel",
-          "phase": "internal",
-          "retryability": "not_retryable",
-          "security_class": "internal",
-          "user_visibility": "status_only"
-        }
-      ],
-      "legacy_projection": {
-        "new_to_palyra_error": "total",
-        "palyra_error_to_new": "fallible_typed_category_or_exact_reason_code",
-        "message_text_classification_allowed": false,
-        "mass_reason_code_rename_required": false
-      }
-    },
-    "runtime_error_metadata_trace": {
-      "event_name": "run.runtime_path_summary",
-      "terminal_reason_field": "terminal_reason",
-      "stable_reason_code_required": true,
-      "full_error_envelope_embedded": false,
-      "schema_version": 1,
-      "status": "always_on",
-      "storage": "append_only_segments",
-      "segment_statuses": [
-        "complete",
-        "interrupted",
-        "corrupt_suffix_isolated"
-      ],
-      "redaction_level": "metadata_only",
-      "failure_signal": "counters.metadata_trace_failures",
-      "terminal_reason_source_event": "run.runtime_path_summary",
-      "rich_trace_approval_required": true,
-      "reason_code": "runtime.error_contract.trace_projection_ready",
-      "always_on_reason_code": "metadata_trace.always_on.ready"
-    },
-    "host_authority": {
-      "valid": true,
-      "checklist": [
-        {
-          "schema_version": 1,
-          "interface": "harness",
-          "integration_boundary": "harness callbacks report decisions; host owns run state, transcript, gate, and journal writes",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "harness.selection.decision",
-            "harness.lifecycle.completed"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "hooks",
-          "integration_boundary": "hooks observe or request bounded changes; host owns policy, approvals, and side effects",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "hook.lifecycle.observed",
-            "hook.policy.denied"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "mcp",
-          "integration_boundary": "MCP tool servers expose descriptors; host owns credential binding, approval, sandbox, and tape",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "mcp.tool.requested",
-            "mcp.tool.denied"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "codex_adapter",
-          "integration_boundary": "Codex adapter bridges protocol messages; host owns transcript persistence and execution gates",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "codex.adapter.requested",
-            "codex.adapter.rejected"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "terminal",
-          "integration_boundary": "terminal sessions expose bounded process handles; host owns cwd/env validation, sandbox, and cleanup",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "terminal.session.lifecycle",
-            "terminal.command.denied"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "remote_worker",
-          "integration_boundary": "remote workers execute leased work only; host owns policy, attestation, credentials, and journal commits",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "worker.lease.issued",
-            "worker.execution.denied"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "interface": "advisor_fanout",
-          "integration_boundary": "advisors return non-authoritative reviews; host owns approvals, final transcript, and mutation execution",
-          "denied_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "host_owned_authorities": [
-            "credentials",
-            "approvals",
-            "transcript",
-            "sandbox",
-            "journal",
-            "tool_execution"
-          ],
-          "audit_event_samples": [
-            "advisor.fanout.requested",
-            "advisor.finding.recorded"
-          ]
-        }
-      ]
-    },
-    "backend_runtime_fixtures": {
-      "valid": true,
-      "projection": {
-        "schema_version": 1,
-        "fixtures_total": 7,
-        "areas": [
-          "run_loop",
-          "provider_stream",
-          "tool_call",
-          "file_patch",
-          "lsp",
-          "compaction",
-          "execution_backends"
-        ],
-        "expected_runtime_paths": [
-          "compaction_safeguard",
-          "execution_backend_security_matrix",
-          "file_patch_verification",
-          "lsp_service",
-          "provider_stream_normalizer",
-          "run_runtime_path_summary",
-          "tool_gate"
-        ],
-        "expected_journal_events": [
-          "compaction.safeguard.recorded",
-          "execution_backend.parity.cleanup_verified",
-          "execution_backend.parity.forbidden_fallback_checked",
-          "file.patch.intent",
-          "harness.selection.decision",
-          "lsp.diagnostics.delta",
-          "lsp.lifecycle.changed",
-          "provider.stream.normalized",
-          "run.runtime_path_summary",
-          "tool.call.completed",
-          "tool.gate.decision",
-          "turn.recovery.retry_planned",
-          "verification.evidence.recorded"
-        ]
-      },
-      "fixtures": [
-        {
-          "schema_version": 1,
-          "fixture_id": "run_loop_terminal_summary",
-          "area": "run_loop",
-          "source_path": "fixtures/golden/runtime_roadmap_phase1_trajectories.json",
-          "risk_classification": "p0_host_owned_runtime",
-          "expected_runtime_path": "run_runtime_path_summary",
-          "expected_terminal_state": "done",
-          "expected_journal_events": [
-            "run.runtime_path_summary",
-            "harness.selection.decision"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "fixtures/golden/runtime_roadmap_phase1_trajectories.json"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "provider_stream_malformed_chunk",
-          "area": "provider_stream",
-          "source_path": "qa/scenarios/provider/malformed_sse_chunk.yaml",
-          "risk_classification": "p0_provider_recovery",
-          "expected_runtime_path": "provider_stream_normalizer",
-          "expected_terminal_state": "failed",
-          "expected_journal_events": [
-            "provider.stream.normalized",
-            "turn.recovery.retry_planned"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "fixtures/provider_compat/p0_provider_compat_pack.yaml"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "tool_call_approval_followthrough",
-          "area": "tool_call",
-          "source_path": "qa/scenarios/approval_turn_tool_followthrough.yaml",
-          "risk_classification": "p0_mutating_tool_gate",
-          "expected_runtime_path": "tool_gate",
-          "expected_terminal_state": "done",
-          "expected_journal_events": [
-            "tool.gate.decision",
-            "tool.call.completed"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "qa/scenarios/tool_result_redaction.yaml"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "file_patch_premature_final",
-          "area": "file_patch",
-          "source_path": "qa/scenarios/provider/premature_final_after_patch.yaml",
-          "risk_classification": "p0_file_mutation_recovery",
-          "expected_runtime_path": "file_patch_verification",
-          "expected_terminal_state": "failed",
-          "expected_journal_events": [
-            "file.patch.intent",
-            "verification.evidence.recorded"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "qa/scenarios/process_background_verification.yaml"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "lsp_rust_workspace_scope",
-          "area": "lsp",
-          "source_path": "fixtures/code-intel/rust/src/lib.rs",
-          "risk_classification": "p1_workspace_scoped_code_intel",
-          "expected_runtime_path": "lsp_service",
-          "expected_terminal_state": "done",
-          "expected_journal_events": [
-            "lsp.lifecycle.changed",
-            "lsp.diagnostics.delta"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "fixtures/code-intel/rust/src/lib.rs"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "compaction_retry_mutating_tool",
-          "area": "compaction",
-          "source_path": "qa/scenarios/compaction_retry_mutating_tool.yaml",
-          "risk_classification": "p0_replay_safe_compaction",
-          "expected_runtime_path": "compaction_safeguard",
-          "expected_terminal_state": "done",
-          "expected_journal_events": [
-            "compaction.safeguard.recorded",
-            "tool.gate.decision"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "qa/scenarios/compaction_retry_mutating_tool.yaml"
-          ]
-        },
-        {
-          "schema_version": 1,
-          "fixture_id": "execution_backend_security_matrix",
-          "area": "execution_backends",
-          "source_path": "fixtures/golden/execution_backend_security_matrix.json",
-          "risk_classification": "p0_execution_backend_security",
-          "expected_runtime_path": "execution_backend_security_matrix",
-          "expected_terminal_state": "blocked_until_suite_passed",
-          "expected_journal_events": [
-            "execution_backend.parity.cleanup_verified",
-            "execution_backend.parity.forbidden_fallback_checked"
-          ],
-          "redaction_boundary": "metadata_only",
-          "evidence_refs": [
-            "qa/scenarios/execution_backends/backend_parity.yaml",
-            "fixtures/golden/execution_backend_security_matrix.json"
-          ]
-        }
-      ]
-    },
-    "phase0_harness": {
-      "valid": true,
-      "projection": {
-        "schema_version": 1,
-        "fixtures_total": 3,
-        "smoke_targets_total": 6,
-        "capabilities": [
-          "replay_regression_harness",
-          "milestone_implementation_style",
-          "integration_smoke_validation"
-        ],
-        "journal_event_names": [
-          "runtime_roadmap.contract.completed",
-          "runtime_roadmap.harness.completed"
-        ],
-        "reason_codes": [
-          "runtime_roadmap.fixture.replay_regression_accepted",
-          "runtime_roadmap.implementation_style.documented",
-          "runtime_roadmap.integration_smoke.target_verified"
-        ],
-        "evidence_refs": [
-          "crates/palyra-common/src/runtime_roadmap.rs",
-          "crates/palyra-common/tests/release_eval_contract.rs",
-          "crates/palyra-daemon/src/application/run_stream/tape.rs",
-          "crates/palyra-daemon/src/journal.rs",
-          "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
-          "fixtures/golden/release_eval_inventory.json"
-        ]
-      }
-    },
-    "phase1_trajectories": {
-      "valid": true,
-      "projection": {
-        "schema_version": 1,
-        "fixtures_total": 3,
-        "provider_chunks_total": 4,
-        "tool_calls_total": 1,
-        "malformed_provider_fixtures": 1,
-        "event_names": [
-          "harness.selection.decision",
-          "provider.stream.normalized",
-          "tool.middleware.projected",
-          "turn.recovery.retry_planned"
-        ],
-        "enabled_capabilities": [
-          "agent_harness_runtime",
-          "tool_result_middleware",
-          "provider_stream_normalizer",
-          "provider_recovery"
-        ]
-      }
-    }
-  },
   "runtime_controls": {
     "schema_version": 1,
     "state": "mixed",
@@ -14286,7 +13204,7 @@
           "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
           "crates/palyra-daemon/src/runtime_diagnostics.rs"
         ],
-        "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+        "reason": "runtime sections, health, metrics, observability, and feature rollout payloads"
       },
       {
         "surface": "runtime_preview_controls",
@@ -14345,7 +13263,7 @@
         "reason": "local, desktop, Docker, networked worker, and SSH backend posture"
       }
     ],
-    "roadmap_area_map": [
+    "product_area_map": [
       {
         "area": "api",
         "status": "production",
@@ -14362,9 +13280,9 @@
         "status": "scaffold",
         "evidence": [
           "cli family: mcp",
-          "roadmap phase 5"
+          "runtime mode: scaffold"
         ],
-        "reason": "MCP serve is discoverable, while external MCP import/supervision remains roadmap work"
+        "reason": "MCP serve is discoverable, while external MCP import and supervision are unavailable"
       },
       {
         "area": "subagents",
@@ -14389,7 +13307,7 @@
         "area": "qa_lab",
         "status": "scaffold",
         "evidence": [
-          "runtime_roadmap.phase0_harness",
+          "runtime QA fixtures",
           "fixtures/golden/release_eval_inventory.json"
         ],
         "reason": "regression fixtures exist before the dedicated QA Lab manifest and runner"
@@ -14432,11 +13350,11 @@
       "diagnostics_sections": 56,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
-      "method_registry_methods": 517,
+      "method_registry_methods": 523,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
-    "roadmap_area_status_counts": {
+    "product_area_status_counts": {
       "preview": 3,
       "production": 2,
       "scaffold": 3
@@ -14464,7 +13382,7 @@
         "admin": 60,
         "canvas": 5,
         "compat": 16,
-        "console": 433,
+        "console": 439,
         "public": 2,
         "realtime": 1
       }

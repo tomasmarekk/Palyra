@@ -990,6 +990,44 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
 
     let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
 
+    let recovery_without_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/coding/recovery"))
+        .send()
+        .context("failed to call coding recovery inventory without a session")?;
+    assert_eq!(
+        recovery_without_session.status().as_u16(),
+        403,
+        "coding recovery inventory must require a console session"
+    );
+
+    let recovery_with_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/coding/recovery"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call coding recovery inventory with a session")?;
+    assert_ne!(
+        recovery_with_session.status().as_u16(),
+        403,
+        "read-only coding recovery inventory must not require a CSRF token"
+    );
+
+    let recovery_mutation_without_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/coding/worktrees/worktree-test/retain"
+        ))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "schema_version": 1,
+            "generation": 1,
+        }))
+        .send()
+        .context("failed to call coding recovery mutation without csrf")?;
+    assert_eq!(
+        recovery_mutation_without_csrf.status().as_u16(),
+        403,
+        "coding recovery mutations must require a CSRF token"
+    );
+
     let session_response = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/session"))
         .header("Cookie", cookie.clone())
@@ -3825,7 +3863,7 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
             .pointer("/feature_rollouts/tool_repair/config_path")
             .and_then(Value::as_str),
         Some("feature_rollouts.tool_repair"),
-        "diagnostics should expose the roadmap rollout config path for tool repair"
+        "diagnostics should expose the runtime rollout config path for tool repair"
     );
     assert_eq!(
         diagnostics_response
@@ -3907,53 +3945,6 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
             }),
         "deprecated rollout guidance must direct migration instead of activation"
     );
-    assert_eq!(
-        diagnostics_response.pointer("/runtime_roadmap/schema_version").and_then(Value::as_u64),
-        Some(1),
-        "diagnostics should expose the runtime roadmap contract schema version"
-    );
-    assert!(
-        diagnostics_response
-            .pointer("/runtime_roadmap/capabilities")
-            .and_then(Value::as_array)
-            .is_some_and(|capabilities| {
-                capabilities.iter().any(|capability| {
-                    capability.get("capability").and_then(Value::as_str) == Some("tool_repair")
-                })
-            }),
-        "diagnostics should publish the tool repair roadmap capability"
-    );
-    assert_eq!(
-        diagnostics_response
-            .pointer("/runtime_roadmap/invariant_contract/descriptors")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(6),
-        "diagnostics should publish every frozen runtime invariant"
-    );
-    assert_eq!(
-        diagnostics_response
-            .pointer("/runtime_roadmap/error_taxonomy/classes")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(12),
-        "diagnostics should publish the complete runtime error taxonomy"
-    );
-    assert_eq!(
-        diagnostics_response
-            .pointer("/runtime_roadmap/runtime_error_metadata_trace/event_name")
-            .and_then(Value::as_str),
-        Some("run.runtime_path_summary"),
-        "diagnostics should identify the existing terminal metadata event"
-    );
-    assert_eq!(
-        diagnostics_response
-            .pointer("/runtime_roadmap/runtime_error_metadata_trace/stable_reason_code_required")
-            .and_then(Value::as_bool),
-        Some(true),
-        "terminal metadata diagnostics should require stable reason codes"
-    );
-
     let initial_events = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/events?limit=5"))
         .header("Cookie", cookie.clone())
@@ -4455,8 +4446,8 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
     let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
 
     for (key, secret) in [
-        ("m051_openai_a", b"sk-m051-console-key-a".as_slice()),
-        ("m051_openai_b", b"sk-m051-console-key-b".as_slice()),
+        ("console_openai_a", b"sk-console-key-a".as_slice()),
+        ("console_openai_b", b"sk-console-key-b".as_slice()),
     ] {
         client
             .post(format!("http://127.0.0.1:{admin_port}/console/v1/secrets"))
@@ -4473,9 +4464,10 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
             .with_context(|| format!("console secret set returned non-success status for {key}"))?;
     }
 
-    for (profile_id, vault_ref) in
-        [("m051-openai-a", "global/m051_openai_a"), ("m051-openai-b", "global/m051_openai_b")]
-    {
+    for (profile_id, vault_ref) in [
+        ("console-openai-a", "global/console_openai_a"),
+        ("console-openai-b", "global/console_openai_b"),
+    ] {
         let saved = client
             .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/profiles"))
             .header("Cookie", cookie.clone())
@@ -4514,7 +4506,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .header("Cookie", cookie.clone())
         .json(&json!({
             "provider_kind": "openai",
-            "profile_ids": ["m051-openai-b", "m051-openai-a"],
+            "profile_ids": ["console-openai-b", "console-openai-a"],
         }))
         .send()
         .context("failed to call auth profile order without csrf")?;
@@ -4530,7 +4522,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .header("x-palyra-csrf-token", csrf_token.clone())
         .json(&json!({
             "provider_kind": "openai",
-            "profile_ids": ["m051-openai-b", "m051-openai-a"],
+            "profile_ids": ["console-openai-b", "console-openai-a"],
         }))
         .send()
         .context("failed to set auth profile order")?
@@ -4540,7 +4532,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .context("failed to parse auth profile order response json")?;
     assert_eq!(
         order.pointer("/order/profile_ids/0").and_then(Value::as_str),
-        Some("m051-openai-b"),
+        Some("console-openai-b"),
         "auth profile order response should preserve operator ordering"
     );
 
@@ -4559,13 +4551,13 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .context("failed to parse auth profile selection explain response json")?;
     assert_eq!(
         selection.pointer("/selection/selected_profile_id").and_then(Value::as_str),
-        Some("m051-openai-b"),
+        Some("console-openai-b"),
         "selection explain should use persisted profile order when explicit order is absent"
     );
     assert!(
         selection.pointer("/selection/candidates").and_then(Value::as_array).is_some_and(
             |candidates| candidates.iter().any(|candidate| {
-                candidate.get("profile_id").and_then(Value::as_str) == Some("m051-openai-b")
+                candidate.get("profile_id").and_then(Value::as_str) == Some("console-openai-b")
                     && candidate.get("selected").and_then(Value::as_bool) == Some(true)
                     && candidate.get("reason_code").and_then(Value::as_str) == Some("eligible")
             })
@@ -4605,7 +4597,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
     assert!(
         doctor.get("profiles").and_then(Value::as_array).is_some_and(|profiles| {
             profiles.iter().any(|profile| {
-                profile.get("profile_id").and_then(Value::as_str) == Some("m051-openai-b")
+                profile.get("profile_id").and_then(Value::as_str) == Some("console-openai-b")
                     && profile.get("doctor_hint").is_none_or(Value::is_null)
             })
         }),
@@ -4614,7 +4606,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
 
     let cleared = client
         .post(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/auth/profiles/m051-openai-b/cooldown/clear"
+            "http://127.0.0.1:{admin_port}/console/v1/auth/profiles/console-openai-b/cooldown/clear"
         ))
         .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token)
@@ -4626,7 +4618,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .context("failed to parse auth profile cooldown clear response json")?;
     assert_eq!(
         cleared.pointer("/runtime/profile_id").and_then(Value::as_str),
-        Some("m051-openai-b"),
+        Some("console-openai-b"),
         "cooldown clear should return the runtime record it updated"
     );
     assert!(
@@ -4645,7 +4637,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
         .context("failed to parse auth audit response json")?;
     assert_eq!(
         audit.pointer("/profile_order/profile_ids/0").and_then(Value::as_str),
-        Some("m051-openai-b"),
+        Some("console-openai-b"),
         "auth audit should include the persisted provider order"
     );
     let audit_events = audit
@@ -4668,8 +4660,8 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
     );
     let redacted_audit = audit.to_string();
     assert!(
-        !redacted_audit.contains("sk-m051-console-key-a")
-            && !redacted_audit.contains("sk-m051-console-key-b"),
+        !redacted_audit.contains("sk-console-key-a")
+            && !redacted_audit.contains("sk-console-key-b"),
         "auth audit output must not include vault secret material"
     );
 
@@ -4677,7 +4669,7 @@ fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Resul
 }
 
 #[test]
-fn console_m52_control_plane_domains_publish_contract_metadata() -> Result<()> {
+fn console_control_plane_domains_publish_contract_metadata() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -4921,7 +4913,7 @@ fn console_m52_control_plane_domains_publish_contract_metadata() -> Result<()> {
 }
 
 #[test]
-fn console_m52_error_envelope_exposes_validation_metadata() -> Result<()> {
+fn console_error_envelope_exposes_validation_metadata() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;

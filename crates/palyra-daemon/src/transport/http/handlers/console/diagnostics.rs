@@ -17,13 +17,6 @@ use crate::*;
 use palyra_common::feature_rollouts::DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV;
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
-use palyra_common::runtime_roadmap::{
-    assert_host_authority_checklist_denies_direct_runtime_authority,
-    backend_runtime_fixture_taxonomy, project_backend_runtime_fixture_taxonomy,
-    runtime_boundary_event_taxonomy, runtime_host_authority_checklist,
-    runtime_roadmap_capability_catalog, runtime_roadmap_phase0_harness_projection,
-    runtime_roadmap_phase1_trajectory_projection, RUNTIME_ROADMAP_SCHEMA_VERSION,
-};
 
 // Keeps CLI helper subprocesses (doctor, support-bundle export) from flashing
 // a console window when the daemon runs as a desktop-supervised process.
@@ -158,6 +151,7 @@ pub(crate) async fn console_diagnostics_handler(
     )
     .map_err(runtime_status_response)?;
     let networked_workers_payload = collect_console_networked_worker_diagnostics(&state);
+    let managed_coding_payload = state.runtime.managed_coding_diagnostics_snapshot();
     let runtime_controls_payload = serde_json::to_value(
         crate::runtime_preview_controls::build_runtime_preview_config_snapshot(
             &state.runtime.config,
@@ -410,7 +404,6 @@ pub(crate) async fn console_diagnostics_handler(
             &state.runtime.config.feature_rollouts,
             &feature_usage,
         ),
-        "runtime_roadmap": collect_console_runtime_roadmap_diagnostics(),
         "context_engine": context_engine_payload,
         "verification": verification_payload,
         "runtime_controls": runtime_controls_payload,
@@ -418,6 +411,7 @@ pub(crate) async fn console_diagnostics_handler(
         "execution_backends": execution_backends_payload,
         "execution_environment_inventory": execution_environment_inventory_payload,
         "networked_workers": networked_workers_payload,
+        "managed_coding": managed_coding_payload,
         "canvas_experiments": canvas_experiments_payload,
         "observability": observability_payload,
         "memory": memory_payload,
@@ -1291,74 +1285,6 @@ fn collect_console_feature_rollouts_diagnostics(
         );
     }
     payload
-}
-
-/// Reports the shared runtime-roadmap contract catalog used by upcoming
-/// runtime-loop work.
-fn collect_console_runtime_roadmap_diagnostics() -> Value {
-    let runtime_error_contract =
-        crate::runtime_diagnostics::build_runtime_error_contract_diagnostics();
-    let phase0_harness = match runtime_roadmap_phase0_harness_projection() {
-        Ok(projection) => json!({
-            "valid": true,
-            "projection": projection,
-        }),
-        Err(error) => json!({
-            "valid": false,
-            "error": error.to_string(),
-        }),
-    };
-    let phase1_trajectories = match runtime_roadmap_phase1_trajectory_projection() {
-        Ok(projection) => json!({
-            "valid": true,
-            "projection": projection,
-        }),
-        Err(error) => json!({
-            "valid": false,
-            "error": error.to_string(),
-        }),
-    };
-    let authority_checklist = runtime_host_authority_checklist();
-    let host_authority = match assert_host_authority_checklist_denies_direct_runtime_authority(
-        authority_checklist.as_slice(),
-    ) {
-        Ok(()) => json!({
-            "valid": true,
-            "checklist": authority_checklist,
-        }),
-        Err(error) => json!({
-            "valid": false,
-            "error": error.to_string(),
-            "checklist": authority_checklist,
-        }),
-    };
-    let backend_fixtures = backend_runtime_fixture_taxonomy();
-    let backend_runtime_fixtures =
-        match project_backend_runtime_fixture_taxonomy(backend_fixtures.as_slice()) {
-            Ok(projection) => json!({
-                "valid": true,
-                "projection": projection,
-                "fixtures": backend_fixtures,
-            }),
-            Err(error) => json!({
-                "valid": false,
-                "error": error.to_string(),
-                "fixtures": backend_fixtures,
-            }),
-        };
-
-    json!({
-        "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
-        "capabilities": runtime_roadmap_capability_catalog(),
-        "boundary_taxonomy": runtime_boundary_event_taxonomy(),
-        "invariant_contract": runtime_error_contract["invariant_contract"].clone(),
-        "error_taxonomy": runtime_error_contract["error_taxonomy"].clone(),
-        "runtime_error_metadata_trace": runtime_error_contract["metadata_trace"].clone(),
-        "host_authority": host_authority,
-        "backend_runtime_fixtures": backend_runtime_fixtures,
-        "phase0_harness": phase0_harness,
-        "phase1_trajectories": phase1_trajectories,
-    })
 }
 
 /// Builds context-engine diagnostics from the in-memory trace ring buffer;
@@ -6005,16 +5931,16 @@ pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCata
         ],
         migration_notes: vec![
             control_plane::CapabilityMigrationNote {
-                id: "m52-page-meta".to_owned(),
-                message: "M52 adds typed contract/page/error metadata while preserving legacy response keys for existing dashboard consumers.".to_owned(),
+                id: "page-metadata".to_owned(),
+                message: "Typed contract, page, and error metadata preserve legacy response keys for existing dashboard consumers.".to_owned(),
             },
             control_plane::CapabilityMigrationNote {
-                id: "m52-openai-contract".to_owned(),
-                message: "OpenAI provider auth endpoints publish the control-plane contract in M52; interactive OAuth bootstrap/callback UX is completed in M54.".to_owned(),
+                id: "openai-auth-contract".to_owned(),
+                message: "OpenAI provider auth endpoints publish the control-plane contract and interactive OAuth bootstrap and callback flow.".to_owned(),
             },
             control_plane::CapabilityMigrationNote {
-                id: "m56-capability-exposure".to_owned(),
-                message: "M56 expands capability catalog entries with dashboard section ownership and CLI handoff metadata so the dashboard can surface direct actions, read-only handoffs, and internal-only capabilities explicitly.".to_owned(),
+                id: "capability-exposure".to_owned(),
+                message: "Capability catalog entries include dashboard ownership and CLI handoff metadata so direct actions, read-only handoffs, and internal-only capabilities remain explicit.".to_owned(),
             },
         ],
     })

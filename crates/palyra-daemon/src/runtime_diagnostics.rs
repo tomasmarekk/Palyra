@@ -80,6 +80,83 @@ pub(crate) const RUNTIME_ERROR_DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the test-only ABI contract snapshot suite.
 #[cfg(test)]
 pub(crate) const CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Compatibility identity for the managed coding contract snapshot.
+#[cfg(test)]
+const MANAGED_CODING_CONTRACT_SNAPSHOT_VERSION: &str = "managed-coding-contracts.v1";
+
+#[cfg(test)]
+const MANAGED_CODING_SCHEMA_SOURCES: &[(&str, &str)] = &[
+    (
+        "process_session_record",
+        include_str!("../../../schemas/json/common/process-session-record.v2.json"),
+    ),
+    (
+        "process_output_page",
+        include_str!("../../../schemas/json/common/process-output-page.v2.json"),
+    ),
+    (
+        "pty_session_descriptor",
+        include_str!("../../../schemas/json/common/pty-session-descriptor.v1.json"),
+    ),
+    (
+        "local_resource_registry",
+        include_str!("../../../schemas/json/common/local-resource-registry.v2.json"),
+    ),
+    (
+        "resource_pressure_snapshot",
+        include_str!("../../../schemas/json/common/resource-pressure-snapshot.v1.json"),
+    ),
+    (
+        "managed_worktree_registry",
+        include_str!("../../../schemas/json/common/managed-worktree-registry.v2.json"),
+    ),
+    (
+        "worktree_snapshot_descriptor",
+        include_str!("../../../schemas/json/common/worktree-snapshot-descriptor.v1.json"),
+    ),
+    (
+        "worktree_restore_report",
+        include_str!("../../../schemas/json/common/worktree-restore-report.v1.json"),
+    ),
+    ("lsp_registry", include_str!("../../../schemas/json/common/lsp-registry.v2.json")),
+    (
+        "lsp_diagnostics_snapshot",
+        include_str!("../../../schemas/json/common/lsp-diagnostics-snapshot.v2.json"),
+    ),
+    (
+        "diagnostics_baseline",
+        include_str!("../../../schemas/json/common/diagnostics-baseline.v2.json"),
+    ),
+    ("diagnostics_delta", include_str!("../../../schemas/json/common/diagnostics-delta.v2.json")),
+    (
+        "coding_runtime_capability_report",
+        include_str!("../../../schemas/json/common/coding-runtime-capability-report.v2.json"),
+    ),
+    (
+        "coding_patch_outcome",
+        include_str!("../../../schemas/json/common/coding-patch-outcome.v2.json"),
+    ),
+    (
+        "coding_command_status",
+        include_str!("../../../schemas/json/common/coding-command-status.v2.json"),
+    ),
+    (
+        "coding_task_cleanup_outcome",
+        include_str!("../../../schemas/json/common/coding-task-cleanup-outcome.v2.json"),
+    ),
+    (
+        "managed_coding_diagnostics",
+        include_str!("../../../schemas/json/common/managed-coding-diagnostics.v1.json"),
+    ),
+    (
+        "managed_coding_recovery",
+        include_str!("../../../schemas/json/common/managed-coding-recovery.v1.json"),
+    ),
+    (
+        "coding_runtime_soak_report",
+        include_str!("../../../schemas/json/common/coding-runtime-soak-report.v1.json"),
+    ),
+];
 
 // An active tool job whose heartbeat (or start) is older than this is
 // reported as stale/stuck by the jobs component and the watchdog.
@@ -2088,6 +2165,404 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
     })
 }
 
+/// Builds the closed compatibility snapshot for managed coding schemas,
+/// wire values, degradation behavior, bounds, and privacy guarantees.
+#[cfg(test)]
+pub(crate) fn build_managed_coding_contract_snapshot() -> Value {
+    let schema_contracts = MANAGED_CODING_SCHEMA_SOURCES
+        .iter()
+        .map(|(name, source)| managed_coding_schema_contract(name, source))
+        .collect::<Vec<_>>();
+    let soak_baseline: Value =
+        serde_json::from_str(include_str!("../../../qa/baselines/coding-runtime-warm-lsp.v1.json"))
+            .expect("managed coding soak baseline is valid JSON");
+
+    json!({
+        "snapshot_version": MANAGED_CODING_CONTRACT_SNAPSHOT_VERSION,
+        "schema_contracts": schema_contracts,
+        "wire_enums": {
+            "capability_status": ["active", "configured", "degraded", "disabled", "blocked"],
+            "coding_command_backend": ["process", "native_pty", "process_without_pty"],
+            "coding_command_lifecycle": ["running", "completed", "failed"],
+            "diagnostic_severity": ["error", "warning", "information", "hint"],
+            "diagnostics_delta_status": [
+                "verified",
+                "blocking_diagnostics",
+                "diagnostics_timed_out",
+                "server_generation_changed",
+                "fallback_required"
+            ],
+            "diagnostics_fallback_tool": ["cargo_check", "tsc_no_emit", "pyright"],
+            "lsp_language": ["rust", "type_script", "python"],
+            "lsp_server_lifecycle": ["starting", "ready", "broken", "stopped", "evicted"],
+            "managed_coding_diagnostics_status": ["available", "unavailable"],
+            "managed_worktree_lifecycle": [
+                "creating",
+                "active",
+                "removing",
+                "retained",
+                "failed",
+                "removed"
+            ],
+            "process_ownership_kind": [
+                "unix_process_group",
+                "windows_job_object",
+                "remote_execution_instance"
+            ],
+            "process_session_state": [
+                "running",
+                "draining",
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "cleanup_failed",
+                "orphaned"
+            ],
+            "pty_backend": ["unix_pty", "windows_con_pty"],
+            "resource_lease_state": ["active", "revoked", "released", "expired"],
+            "resource_pressure_action_state": ["applied", "skipped", "failed"],
+            "resource_priority": [
+                "interactive",
+                "foreground",
+                "idle_service",
+                "background_fanout"
+            ],
+            "resource_service": ["process", "pty", "lsp", "mcp", "external_runtime", "worktree"],
+            "snapshot_entry_kind": ["tracked", "allowed_untracked"],
+            "snapshot_gc_decision": ["removed", "blocked_by_active_lease", "retained"],
+            "workspace_admission": ["explicit", "policy"],
+            "workspace_isolation": ["managed_worktree", "in_place_explicit"],
+            "worktree_disposition": ["removed", "dirty_retained", "in_place_preserved"]
+        },
+        "fallback_matrix": [
+            {
+                "capability": "managed_worktree",
+                "primary": "managed_worktree",
+                "fallback": "in_place_workspace",
+                "fallback_authority": "host_policy_only",
+                "primary_reason": "coding.managed_worktree_active",
+                "fallback_reason": "coding.workspace_in_place_explicit"
+            },
+            {
+                "capability": "native_pty",
+                "primary": "native_pty",
+                "fallback": "process_without_pty",
+                "fallback_authority": "host_policy_only",
+                "primary_reason": "coding.pty_configured",
+                "fallback_reason": "coding.pty_disabled_process_fallback"
+            },
+            {
+                "capability": "persistent_lsp",
+                "primary": "persistent_lsp",
+                "fallback": "compiler_cli",
+                "fallback_authority": "host_policy_only",
+                "primary_reason": "coding.lsp_active",
+                "fallback_reason": "coding.lsp_cli_fallback_active"
+            },
+            {
+                "capability": "process_supervisor",
+                "primary": "managed_process_actor",
+                "fallback": null,
+                "fallback_authority": "none",
+                "unavailable_outcome": "blocked"
+            },
+            {
+                "capability": "objective_wait_bridge",
+                "primary": "durable_wait_barrier",
+                "fallback": null,
+                "fallback_authority": "none",
+                "unavailable_outcome": "blocked"
+            },
+            {
+                "capability": "patch_verification",
+                "primary": "generation_aware_lsp_delta",
+                "fallback": "host_selected_compiler_cli",
+                "fallback_authority": "host_policy_only",
+                "unavailable_outcome": "fallback_required"
+            }
+        ],
+        "reason_taxonomy": {
+            "format": "lowercase_dot_separated",
+            "families": [
+                "coding",
+                "lsp",
+                "managed_worktree",
+                "process",
+                "resource"
+            ],
+            "coding": [
+                "coding.cleanup_clean_removed",
+                "coding.cleanup_dirty_retained",
+                "coding.cleanup_dirty_snapshotted_removed",
+                "coding.cleanup_in_place_preserved",
+                "coding.command_actor_failed",
+                "coding.command_local_wait_timed_out",
+                "coding.command_running",
+                "coding.diagnostics_serialization_failed",
+                "coding.dirty_worktree_retained",
+                "coding.lsp_active",
+                "coding.lsp_cli_fallback_active",
+                "coding.lsp_unavailable",
+                "coding.managed_worktree_active",
+                "coding.operator_retained",
+                "coding.patch_blocking_diagnostics",
+                "coding.patch_cli_fallback_required",
+                "coding.patch_diagnostics_timeout",
+                "coding.patch_lsp_generation_changed",
+                "coding.patch_lsp_verified",
+                "coding.process_actor_failed",
+                "coding.process_command_failed",
+                "coding.process_command_succeeded",
+                "coding.process_completed",
+                "coding.process_completion_wake_failed",
+                "coding.process_monitor_spawn_failed",
+                "coding.process_wait_registered",
+                "coding.pty_actor_failed",
+                "coding.pty_command_failed",
+                "coding.pty_command_succeeded",
+                "coding.pty_configured",
+                "coding.pty_disabled_process_fallback",
+                "coding.pty_unavailable_process_fallback",
+                "coding.recovery_inventory_loaded",
+                "coding.restart_dirty_worktree_retained",
+                "coding.restart_reconciled_without_pid_adoption",
+                "coding.runtime_available",
+                "coding.runtime_unavailable",
+                "coding.snapshot_active_lease",
+                "coding.snapshot_removed",
+                "coding.snapshot_retained",
+                "coding.terminal_completed",
+                "coding.terminal_completion_wake_failed",
+                "coding.terminal_monitor_spawn_failed",
+                "coding.terminal_running",
+                "coding.terminal_wait_registered",
+                "coding.wait_bridge_failed",
+                "coding.workspace_explicitly_selected",
+                "coding.workspace_in_place_explicit",
+                "coding.workspace_policy_selected",
+                "coding_runtime.soak_completed",
+                "coding_runtime.warm_lsp_baseline"
+            ],
+            "lsp": [
+                "lsp.active",
+                "lsp.capabilities_oversized",
+                "lsp.daemon_shutdown",
+                "lsp.diagnostics_baseline_captured",
+                "lsp.diagnostics_delta_blocking",
+                "lsp.diagnostics_delta_verified",
+                "lsp.diagnostics_generation_changed",
+                "lsp.diagnostics_server_unavailable",
+                "lsp.diagnostics_timeout",
+                "lsp.document_diagnostics_pending",
+                "lsp.document_synchronized",
+                "lsp.idle_reaped",
+                "lsp.initialize_pending",
+                "lsp.initialized",
+                "lsp.json_rpc_error",
+                "lsp.malformed_frame",
+                "lsp.no_active_servers",
+                "lsp.oversized_frame",
+                "lsp.request_completed",
+                "lsp.request_timeout",
+                "lsp.resource_pressure_evicted",
+                "lsp.restart_requires_relaunch",
+                "lsp.rollback_diagnostics_timeout",
+                "lsp.rollback_synchronized",
+                "lsp.server_crashed",
+                "lsp.supervisor_failure"
+            ],
+            "managed_worktree": [
+                "managed_worktree.create_failed_cleanup_required",
+                "managed_worktree.create_failed_cleanup_verified",
+                "managed_worktree.create_intent",
+                "managed_worktree.created",
+                "managed_worktree.dirty_retained",
+                "managed_worktree.remove_intent",
+                "managed_worktree.removed",
+                "managed_worktree.run_attached",
+                "managed_worktree.run_detached",
+                "managed_worktree.status_refreshed"
+            ],
+            "process": [
+                "process.adoption.authority_unavailable",
+                "process.adoption.identity_mismatch",
+                "process.adoption.provenance_mismatch",
+                "process.cancelled",
+                "process.completed",
+                "process.exited_successfully",
+                "process.exited_unsuccessfully",
+                "process.interrupted",
+                "process.no_output_timeout",
+                "process.persistence_failed",
+                "process.resource_release_failed",
+                "process.restart_requires_verified_adoption",
+                "process.supervisor_shutdown",
+                "process.timeout",
+                "process.wait_failed"
+            ],
+            "resource": [
+                "resource.admitted",
+                "resource.capacity_available",
+                "resource.lease_expired",
+                "resource.lsp_eviction_applied",
+                "resource.lsp_eviction_failed",
+                "resource.pressure_action_unowned",
+                "resource.pressure_detected",
+                "resource.pressure_revocation_proposed",
+                "resource.released",
+                "resource.renewed",
+                "resource.restart_requires_reacquire"
+            ]
+        },
+        "hard_limits": {
+            "command_argument_bytes": 16_384,
+            "command_arguments": 256,
+            "command_environment_keys": 256,
+            "command_output_chunks": 512,
+            "diagnostic_artifact_bytes": 16_777_216,
+            "diagnostic_artifacts": 4_096,
+            "diagnostics_per_document": 2_048,
+            "diagnostics_visible_delta_items": 128,
+            "git_operation_timeout_ms": 60_000,
+            "identity_bytes": 128,
+            "lsp_active_servers": 16,
+            "lsp_header_bytes": 8_192,
+            "lsp_message_bytes": 1_048_576,
+            "lsp_notifications": 512,
+            "managed_tasks": 64,
+            "patch_files": 128,
+            "pending_patch_verifications": 128,
+            "process_artifact_bytes_per_session": 16_777_216,
+            "process_drain_allowance_ms": 5_000,
+            "process_output_chunk_bytes": 8_192,
+            "process_output_page_chunks": 4_096,
+            "process_output_projection_chars": 32_768,
+            "process_retained_bytes_per_session": 4_194_304,
+            "process_retained_chunks_per_session": 512,
+            "process_sessions": 64,
+            "resource_lease_records": 4_096,
+            "resource_pressure_actions": 32,
+            "source_file_bytes": 8_388_608,
+            "worktree_attached_runs": 64,
+            "worktree_records": 512,
+            "worktree_snapshot_bytes": 67_108_864,
+            "worktree_snapshot_file_bytes": 8_388_608,
+            "worktree_snapshot_files": 512
+        },
+        "soak_baseline": soak_baseline,
+        "privacy_invariants": {
+            "caller_supplied_commands_are_not_executed": true,
+            "diagnostic_text_is_absent_from_operator_health": true,
+            "durable_environment_values_are_forbidden": true,
+            "durable_live_os_handles_are_forbidden": true,
+            "durable_raw_process_and_terminal_output_is_forbidden": true,
+            "operator_diagnostics_hash_internal_identities": true,
+            "operator_diagnostics_omit_host_paths": true,
+            "pid_without_verified_authority_is_never_adopted": true,
+            "recovery_inventory_is_content_free": true,
+            "secret_like_snapshots_are_rejected_before_persistence": true,
+            "server_capabilities_are_summarized_then_discarded": true,
+            "snapshot_paths_are_workspace_relative": true
+        },
+        "compatibility_policy": {
+            "closed_wire_contracts": true,
+            "existing_version_semantics_are_immutable": true,
+            "migration": "explicit_versioned_adapter_only",
+            "required_field_change": "new_schema_version_and_migration_note",
+            "snapshot_change": "version_bump_and_migration_note",
+            "unknown_fields": "reject",
+            "unknown_schema_versions": "reject_before_rewrite_or_mutation",
+            "wire_enum_growth": "new_schema_version_and_migration_note"
+        }
+    })
+}
+
+#[cfg(test)]
+fn managed_coding_schema_contract(name: &str, source: &str) -> Value {
+    let schema: Value = serde_json::from_str(source).expect("managed coding schema is valid JSON");
+    let mut wire_enums = BTreeMap::new();
+    let mut required_field_sets = BTreeMap::new();
+    collect_managed_coding_schema_shape(&schema, "", &mut wire_enums, &mut required_field_sets);
+    json!({
+        "name": name,
+        "schema_id": schema
+            .get("$id")
+            .cloned()
+            .expect("managed coding schema has an ID"),
+        "schema_version": schema
+            .pointer("/properties/schema_version/const")
+            .cloned()
+            .expect("managed coding schema has a closed version"),
+        "required_fields": schema
+            .get("required")
+            .cloned()
+            .expect("managed coding schema declares required fields"),
+        "declared_limits": schema
+            .get("x-palyra-limits")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "declared_bounds": schema
+            .get("x-palyra-bounds")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "declared_prohibitions": schema
+            .get("x-palyra-prohibits")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "declared_privacy": schema
+            .get("x-palyra-privacy")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "required_field_sets": required_field_sets,
+        "wire_enums": wire_enums
+    })
+}
+
+#[cfg(test)]
+fn collect_managed_coding_schema_shape(
+    value: &Value,
+    pointer: &str,
+    enums: &mut BTreeMap<String, Value>,
+    required_field_sets: &mut BTreeMap<String, Value>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(values) = object.get("enum") {
+                enums.insert(pointer.to_owned(), values.clone());
+            }
+            if let Some(fields) = object.get("required") {
+                required_field_sets.insert(
+                    if pointer.is_empty() { "/".to_owned() } else { pointer.to_owned() },
+                    fields.clone(),
+                );
+            }
+            for (key, child) in
+                object.iter().filter(|(key, _)| !matches!(key.as_str(), "enum" | "required"))
+            {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_managed_coding_schema_shape(
+                    child,
+                    &format!("{pointer}/{escaped}"),
+                    enums,
+                    required_field_sets,
+                );
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_managed_coding_schema_shape(
+                    child,
+                    &format!("{pointer}/{index}"),
+                    enums,
+                    required_field_sets,
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 fn daemon_health_component(status: &GatewayStatusSnapshot) -> RuntimeHealthComponentSnapshot {
     let mut reasons = Vec::new();
     if status.status != "ok" {
@@ -3208,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_snapshot_suite_covers_phase11_abi_surfaces() {
+    fn contract_snapshot_suite_covers_plugin_abi_surfaces() {
         let snapshot = build_contract_snapshot_suite();
         assert_eq!(snapshot["schema_version"], CONTRACT_SNAPSHOT_SCHEMA_VERSION);
         assert!(snapshot["provider_abi"]["required_fields"]
@@ -3242,5 +3717,27 @@ mod tests {
             snapshot["channel_command_abi"]["native_spec_count"].as_u64().unwrap_or_default() > 0
         );
         assert_eq!(snapshot["memory_provider_abi"]["redaction_required"], true);
+    }
+
+    #[test]
+    fn managed_coding_contract_snapshot_matches_golden() {
+        let actual = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&build_managed_coding_contract_snapshot())
+                .expect("managed coding contract snapshot serializes")
+        );
+        let golden = include_str!("../tests/golden/managed_coding_contract_snapshot.json")
+            .replace("\r\n", "\n");
+        if std::env::var_os("PALYRA_UPDATE_CONTRACT_SNAPSHOTS").is_some() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/managed_coding_contract_snapshot.json");
+            std::fs::write(path, actual.as_bytes())
+                .expect("managed coding contract golden can be updated");
+            return;
+        }
+        assert_eq!(
+            actual, golden,
+            "managed coding contract drift requires a snapshot version bump and migration note"
+        );
     }
 }

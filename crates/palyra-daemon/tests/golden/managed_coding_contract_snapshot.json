@@ -1,0 +1,1745 @@
+{
+  "snapshot_version": "managed-coding-contracts.v1",
+  "schema_contracts": [
+    {
+      "name": "process_session_record",
+      "schema_id": "https://schemas.palyra.local/common/process-session-record.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "process_session_id",
+        "owner",
+        "command",
+        "process_lease",
+        "state",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "deadline_at_unix_ms",
+        "no_output_deadline_at_unix_ms",
+        "last_output_at_unix_ms",
+        "first_retained_cursor",
+        "next_cursor",
+        "retained_output_bytes",
+        "output_truncated",
+        "outcome"
+      ],
+      "declared_limits": {
+        "active_sessions_max": 64,
+        "retained_chunks_per_session_max": 512,
+        "retained_output_bytes_max": 4194304,
+        "artifact_bytes_max": 16777216
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "raw_process_output",
+        "raw_environment_values",
+        "pid_only_authority",
+        "serialized_live_os_handles"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "process_session_id",
+          "owner",
+          "command",
+          "process_lease",
+          "state",
+          "created_at_unix_ms",
+          "updated_at_unix_ms",
+          "deadline_at_unix_ms",
+          "no_output_deadline_at_unix_ms",
+          "last_output_at_unix_ms",
+          "first_retained_cursor",
+          "next_cursor",
+          "retained_output_bytes",
+          "output_truncated",
+          "outcome"
+        ],
+        "/$defs/command": [
+          "command_sha256",
+          "executable_label",
+          "executable_sha256",
+          "redacted_argv_preview",
+          "cwd_sha256",
+          "environment_key_names",
+          "backend"
+        ],
+        "/$defs/outcome": [
+          "exit_code",
+          "reason_code",
+          "completed_at_unix_ms",
+          "cleanup_verified"
+        ],
+        "/$defs/owner": [
+          "session_id",
+          "run_id",
+          "turn_id",
+          "agent_id",
+          "correlation_id"
+        ],
+        "/$defs/processLease": [
+          "schema_version",
+          "lease_id",
+          "instance_id",
+          "generation",
+          "pid",
+          "provenance",
+          "issued_at_unix_ms",
+          "expires_at_unix_ms",
+          "verified_at_unix_ms"
+        ],
+        "/$defs/provenance": [
+          "ownership_kind",
+          "start_token",
+          "executable_sha256",
+          "owner_nonce",
+          "ownership_identity_sha256"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/provenance/properties/ownership_kind": [
+          "unix_process_group",
+          "windows_job_object",
+          "remote_execution_instance"
+        ],
+        "/properties/state": [
+          "running",
+          "draining",
+          "succeeded",
+          "failed",
+          "timed_out",
+          "cancelled",
+          "cleanup_failed",
+          "orphaned"
+        ]
+      }
+    },
+    {
+      "name": "process_output_page",
+      "schema_id": "https://schemas.palyra.dev/common/process-output-page.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "chunks",
+        "next_cursor",
+        "last_returned_cursor",
+        "has_more",
+        "cursor_reset",
+        "truncated"
+      ],
+      "declared_limits": null,
+      "declared_bounds": {
+        "page_chunks_max": 4096,
+        "chunk_bytes_max": 8192,
+        "projection_chars_max": 32768
+      },
+      "declared_prohibitions": null,
+      "declared_privacy": {
+        "raw_bytes": "forbidden",
+        "environment_values": "forbidden",
+        "projection": "canonical_redacted_text"
+      },
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "chunks",
+          "next_cursor",
+          "last_returned_cursor",
+          "has_more",
+          "cursor_reset",
+          "truncated"
+        ],
+        "/$defs/chunk": [
+          "schema_version",
+          "sequence",
+          "stream",
+          "captured_at_unix_ms",
+          "byte_count",
+          "text_projection",
+          "redacted",
+          "redaction_reason_codes"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/chunk/properties/stream": [
+          "stdout",
+          "stderr"
+        ]
+      }
+    },
+    {
+      "name": "pty_session_descriptor",
+      "schema_id": "https://schemas.palyra.dev/common/pty-session-descriptor.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "pty_session_id",
+        "owner_id",
+        "owner_generation",
+        "backend",
+        "pid",
+        "size",
+        "created_at_unix_ms",
+        "next_cursor",
+        "raw_output_truncated",
+        "pty_active"
+      ],
+      "declared_limits": null,
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": {
+        "projection": "internal_durable_metadata",
+        "forbidden_fields": [
+          "argv",
+          "environment_values",
+          "raw_output",
+          "terminal_input"
+        ]
+      },
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "pty_session_id",
+          "owner_id",
+          "owner_generation",
+          "backend",
+          "pid",
+          "size",
+          "created_at_unix_ms",
+          "next_cursor",
+          "raw_output_truncated",
+          "pty_active"
+        ],
+        "/$defs/size": [
+          "rows",
+          "cols",
+          "pixel_width",
+          "pixel_height"
+        ]
+      },
+      "wire_enums": {
+        "/properties/backend": [
+          "unix_pty",
+          "windows_con_pty"
+        ]
+      }
+    },
+    {
+      "name": "local_resource_registry",
+      "schema_id": "https://schemas.palyra.local/common/local-resource-registry.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "updated_at_unix_ms",
+        "leases",
+        "last_pressure",
+        "pressure_actions"
+      ],
+      "declared_limits": {
+        "lease_records_max": 4096,
+        "pressure_actions_max": 32
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "updated_at_unix_ms",
+          "leases",
+          "last_pressure",
+          "pressure_actions"
+        ],
+        "/$defs/evictionDecision": [
+          "lease_id",
+          "owner_id",
+          "service",
+          "priority",
+          "released",
+          "reason_code"
+        ],
+        "/$defs/lease": [
+          "schema_version",
+          "lease_id",
+          "owner_id",
+          "generation",
+          "service",
+          "priority",
+          "granted",
+          "issued_at_unix_ms",
+          "expires_at_unix_ms",
+          "updated_at_unix_ms",
+          "state",
+          "reason_code"
+        ],
+        "/$defs/pressureAction": [
+          "schema_version",
+          "decision",
+          "state",
+          "reason_code",
+          "observed_at_unix_ms"
+        ],
+        "/$defs/resourceUnits": [
+          "processes",
+          "memory_bytes",
+          "file_descriptors",
+          "sockets",
+          "spool_bytes",
+          "concurrency"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/lease/properties/state": [
+          "active",
+          "revoked",
+          "released",
+          "expired"
+        ],
+        "/$defs/pressureAction/properties/state": [
+          "applied",
+          "skipped",
+          "failed"
+        ],
+        "/$defs/priority": [
+          "interactive",
+          "foreground",
+          "idle_service",
+          "background_fanout"
+        ],
+        "/$defs/service": [
+          "process",
+          "pty",
+          "lsp",
+          "mcp",
+          "external_runtime",
+          "worktree"
+        ]
+      }
+    },
+    {
+      "name": "resource_pressure_snapshot",
+      "schema_id": "https://schemas.palyra.local/common/resource-pressure-snapshot.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "resources",
+        "required",
+        "capacity_available",
+        "eviction_plan",
+        "reason_code",
+        "observed_at_unix_ms"
+      ],
+      "declared_limits": {
+        "eviction_plan_max": 32,
+        "owner_usage_max": 4096
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "resources",
+          "required",
+          "capacity_available",
+          "eviction_plan",
+          "reason_code",
+          "observed_at_unix_ms"
+        ],
+        "/$defs/evictionDecision": [
+          "lease_id",
+          "owner_id",
+          "service",
+          "priority",
+          "released",
+          "reason_code"
+        ],
+        "/$defs/resourceSnapshot": [
+          "used",
+          "limit",
+          "active_leases",
+          "owner_usage"
+        ],
+        "/$defs/resourceUnits": [
+          "processes",
+          "memory_bytes",
+          "file_descriptors",
+          "sockets",
+          "spool_bytes",
+          "concurrency"
+        ],
+        "/properties": {
+          "$ref": "#/$defs/resourceUnits"
+        }
+      },
+      "wire_enums": {
+        "/$defs/evictionDecision/properties/priority": [
+          "interactive",
+          "foreground",
+          "idle_service",
+          "background_fanout"
+        ],
+        "/$defs/evictionDecision/properties/service": [
+          "process",
+          "pty",
+          "lsp",
+          "mcp",
+          "external_runtime",
+          "worktree"
+        ]
+      }
+    },
+    {
+      "name": "managed_worktree_registry",
+      "schema_id": "https://schemas.palyra.local/common/managed-worktree-registry.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "updated_at_unix_ms",
+        "records"
+      ],
+      "declared_limits": {
+        "records_max": 512,
+        "attached_runs_per_worktree_max": 64
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "symlink_targets",
+        "serialized_live_git_processes"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "updated_at_unix_ms",
+          "records"
+        ],
+        "/$defs/record": [
+          "schema_version",
+          "worktree_id",
+          "generation",
+          "source_repo",
+          "worktree_path",
+          "branch",
+          "base_ref",
+          "lifecycle",
+          "dirty",
+          "locked_by_run",
+          "attached_run_ids",
+          "created_at_unix_ms",
+          "updated_at_unix_ms",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/record/properties/lifecycle": [
+          "creating",
+          "active",
+          "removing",
+          "retained",
+          "failed",
+          "removed"
+        ]
+      }
+    },
+    {
+      "name": "worktree_snapshot_descriptor",
+      "schema_id": "https://schemas.palyra.local/common/worktree-snapshot-descriptor.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "snapshot_id",
+        "worktree_id",
+        "worktree_generation",
+        "base_commit",
+        "index_sha256",
+        "index_artifact_file",
+        "entries",
+        "total_bytes",
+        "created_at_unix_ms"
+      ],
+      "declared_limits": {
+        "entries_max": 512,
+        "file_bytes_max": 8388608,
+        "snapshot_bytes_max": 67108864
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "ignored_paths",
+        "symlinks",
+        "nested_repositories",
+        "sensitive_paths",
+        "secret_like_content"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "snapshot_id",
+          "worktree_id",
+          "worktree_generation",
+          "base_commit",
+          "index_sha256",
+          "index_artifact_file",
+          "entries",
+          "total_bytes",
+          "created_at_unix_ms"
+        ],
+        "/$defs/entry": [
+          "path",
+          "kind",
+          "exists",
+          "size_bytes",
+          "content_sha256",
+          "artifact_file",
+          "unix_mode",
+          "readonly"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/entry/properties/kind": [
+          "tracked",
+          "allowed_untracked"
+        ]
+      }
+    },
+    {
+      "name": "worktree_restore_report",
+      "schema_id": "https://schemas.palyra.local/common/worktree-restore-report.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "snapshot_id",
+        "worktree_id",
+        "base_commit",
+        "restored_paths",
+        "index_restored",
+        "completed_at_unix_ms"
+      ],
+      "declared_limits": {
+        "restored_paths_max": 512
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "snapshot_id",
+          "worktree_id",
+          "base_commit",
+          "restored_paths",
+          "index_restored",
+          "completed_at_unix_ms"
+        ]
+      },
+      "wire_enums": {}
+    },
+    {
+      "name": "lsp_registry",
+      "schema_id": "https://schemas.palyra.local/common/lsp-registry.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "handles",
+        "broken_servers",
+        "updated_at_unix_ms"
+      ],
+      "declared_limits": {
+        "handles_max": 512,
+        "broken_servers_max": 512,
+        "capability_message_bytes_max": 1048576
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "workspace_paths",
+        "server_commands",
+        "environment_values",
+        "raw_server_capabilities",
+        "live_process_handles"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "handles",
+          "broken_servers",
+          "updated_at_unix_ms"
+        ],
+        "/$defs/brokenServer": [
+          "workspace_root_sha256",
+          "language",
+          "toolchain_fingerprint",
+          "failure_count",
+          "retry_after_unix_ms",
+          "manual_reset_required",
+          "reason_code"
+        ],
+        "/$defs/capabilitySummary": [
+          "present",
+          "serialized_bytes",
+          "text_document_sync",
+          "diagnostic_provider",
+          "workspace_folders"
+        ],
+        "/$defs/handle": [
+          "schema_version",
+          "handle_id",
+          "workspace_root_sha256",
+          "worktree_id",
+          "language",
+          "toolchain_fingerprint",
+          "process_session_id",
+          "generation",
+          "lifecycle",
+          "capabilities",
+          "restart_count",
+          "last_diagnostics_at_unix_ms",
+          "last_used_at_unix_ms",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/language": [
+          "rust",
+          "type_script",
+          "python"
+        ],
+        "/$defs/lifecycle": [
+          "starting",
+          "ready",
+          "broken",
+          "stopped",
+          "evicted"
+        ]
+      }
+    },
+    {
+      "name": "lsp_diagnostics_snapshot",
+      "schema_id": "https://schemas.palyra.local/common/lsp-diagnostics-snapshot.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "handles",
+        "broken_servers",
+        "active_servers",
+        "reason_code"
+      ],
+      "declared_limits": {
+        "handles_max": 512,
+        "broken_servers_max": 512,
+        "active_servers_max": 16
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "raw_capabilities",
+        "raw_handle_ids",
+        "raw_worktree_ids",
+        "raw_process_session_ids",
+        "workspace_paths",
+        "server_commands",
+        "environment_values"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "handles",
+          "broken_servers",
+          "active_servers",
+          "reason_code"
+        ],
+        "/$defs/brokenServer": [
+          "workspace_root_sha256",
+          "language",
+          "toolchain_fingerprint_sha256",
+          "failure_count",
+          "retry_after_unix_ms",
+          "manual_reset_required",
+          "reason_code"
+        ],
+        "/$defs/handle": [
+          "schema_version",
+          "handle_id_sha256",
+          "workspace_root_sha256",
+          "worktree_id_sha256",
+          "language",
+          "toolchain_fingerprint_sha256",
+          "process_session_id_sha256",
+          "generation",
+          "lifecycle",
+          "capabilities_present",
+          "capabilities_bytes",
+          "restart_count",
+          "last_diagnostics_at_unix_ms",
+          "last_used_at_unix_ms",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/language": [
+          "rust",
+          "type_script",
+          "python"
+        ],
+        "/$defs/lifecycle": [
+          "starting",
+          "ready",
+          "broken",
+          "stopped",
+          "evicted"
+        ]
+      }
+    },
+    {
+      "name": "diagnostics_baseline",
+      "schema_id": "https://schemas.palyra.local/common/diagnostics-baseline.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "baseline_id",
+        "handle_id",
+        "server_generation",
+        "documents",
+        "artifact",
+        "created_at_unix_ms",
+        "reason_code"
+      ],
+      "declared_limits": {
+        "documents_max": 128,
+        "diagnostics_per_document_max": 2048,
+        "artifact_bytes_max": 16777216
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "baseline_id",
+          "handle_id",
+          "server_generation",
+          "documents",
+          "artifact",
+          "created_at_unix_ms",
+          "reason_code"
+        ],
+        "/$defs/artifact": [
+          "artifact_id",
+          "sha256",
+          "byte_count",
+          "content_type"
+        ],
+        "/$defs/documentGeneration": [
+          "relative_path",
+          "uri_sha256",
+          "document_version",
+          "diagnostic_count",
+          "diagnostics_sha256"
+        ]
+      },
+      "wire_enums": {}
+    },
+    {
+      "name": "diagnostics_delta",
+      "schema_id": "https://schemas.palyra.local/common/diagnostics-delta.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "baseline_id",
+        "handle_id",
+        "baseline_server_generation",
+        "result_server_generation",
+        "status",
+        "documents",
+        "introduced",
+        "resolved",
+        "unchanged",
+        "introduced_count",
+        "resolved_count",
+        "unchanged_count",
+        "blocking_introduced_count",
+        "truncated",
+        "full_diagnostics_artifact",
+        "fallback",
+        "reason_codes"
+      ],
+      "declared_limits": {
+        "documents_max": 128,
+        "visible_items_per_classification_max": 128,
+        "diagnostics_per_document_max": 2048,
+        "artifact_bytes_max": 16777216,
+        "reason_codes_max": 32
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "baseline_id",
+          "handle_id",
+          "baseline_server_generation",
+          "result_server_generation",
+          "status",
+          "documents",
+          "introduced",
+          "resolved",
+          "unchanged",
+          "introduced_count",
+          "resolved_count",
+          "unchanged_count",
+          "blocking_introduced_count",
+          "truncated",
+          "full_diagnostics_artifact",
+          "fallback",
+          "reason_codes"
+        ],
+        "/$defs/artifact": [
+          "artifact_id",
+          "sha256",
+          "byte_count",
+          "content_type"
+        ],
+        "/$defs/diagnostic": [
+          "relative_path",
+          "identity_sha256",
+          "range",
+          "severity",
+          "code",
+          "source",
+          "message",
+          "text_truncated"
+        ],
+        "/$defs/documentGeneration": [
+          "relative_path",
+          "uri_sha256",
+          "document_version",
+          "diagnostic_count",
+          "diagnostics_sha256"
+        ],
+        "/$defs/fallback": [
+          "tool",
+          "command_label",
+          "reason_code"
+        ],
+        "/$defs/range": [
+          "start_line",
+          "start_character",
+          "end_line",
+          "end_character"
+        ],
+        "/$defs/unchangedDiagnostic": [
+          "before",
+          "after",
+          "line_shift",
+          "character_shift"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/diagnostic/properties/severity": [
+          "error",
+          "warning",
+          "information",
+          "hint"
+        ],
+        "/$defs/fallback/properties/tool": [
+          "cargo_check",
+          "tsc_no_emit",
+          "pyright"
+        ],
+        "/properties/status": [
+          "verified",
+          "blocking_diagnostics",
+          "diagnostics_timed_out",
+          "server_generation_changed",
+          "fallback_required"
+        ]
+      }
+    },
+    {
+      "name": "coding_runtime_capability_report",
+      "schema_id": "https://schemas.palyra.local/common/coding-runtime-capability-report.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "workspace_admission",
+        "workspace_isolation",
+        "process_supervisor",
+        "native_pty",
+        "persistent_lsp",
+        "objective_wait_bridge",
+        "fallback_matrix",
+        "reason_codes"
+      ],
+      "declared_limits": {
+        "fallback_entries_max": 16,
+        "reason_codes_max": 32
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "workspace_admission",
+          "workspace_isolation",
+          "process_supervisor",
+          "native_pty",
+          "persistent_lsp",
+          "objective_wait_bridge",
+          "fallback_matrix",
+          "reason_codes"
+        ],
+        "/$defs/fallbackEntry": [
+          "capability",
+          "fallback",
+          "active",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/status": [
+          "active",
+          "configured",
+          "degraded",
+          "disabled",
+          "blocked"
+        ],
+        "/properties/workspace_admission": [
+          "explicit",
+          "policy"
+        ],
+        "/properties/workspace_isolation": [
+          "managed_worktree",
+          "in_place_explicit"
+        ]
+      }
+    },
+    {
+      "name": "coding_patch_outcome",
+      "schema_id": "https://schemas.palyra.local/common/coding-patch-outcome.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "task_id",
+        "applied_files",
+        "diagnostics",
+        "fallback",
+        "applied",
+        "diagnostics_verified",
+        "evidence_refs",
+        "reason_codes"
+      ],
+      "declared_limits": {
+        "applied_files_max": 128,
+        "evidence_refs_max": 64,
+        "reason_codes_max": 32
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "task_id",
+          "applied_files",
+          "diagnostics",
+          "fallback",
+          "applied",
+          "diagnostics_verified",
+          "evidence_refs",
+          "reason_codes"
+        ],
+        "/$defs/fallback": [
+          "tool",
+          "command_label",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/fallback/properties/tool": [
+          "cargo_check",
+          "tsc_no_emit",
+          "pyright"
+        ]
+      }
+    },
+    {
+      "name": "coding_command_status",
+      "schema_id": "https://schemas.palyra.local/common/coding-command-status.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "handle",
+        "outcome",
+        "failure_reason_code"
+      ],
+      "declared_limits": {
+        "evidence_refs_max": 64,
+        "reason_codes_max": 32,
+        "wake_intents_max": 64
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "caller_supplied_commands",
+        "raw_process_output",
+        "raw_terminal_output",
+        "environment_values"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "handle",
+          "outcome",
+          "failure_reason_code"
+        ],
+        "/$defs/handle": [
+          "schema_version",
+          "task_id",
+          "command_id",
+          "execution_id",
+          "backend",
+          "pty_backend",
+          "lifecycle",
+          "wait_barrier",
+          "reason_codes"
+        ],
+        "/$defs/outcome": [
+          "schema_version",
+          "task_id",
+          "command_id",
+          "backend",
+          "pty_backend",
+          "execution_id",
+          "process_state",
+          "exit_code",
+          "cleanup_verified",
+          "output_truncated",
+          "wake",
+          "evidence_refs",
+          "reason_codes"
+        ],
+        "/$defs/waitBarrier": [
+          "barrier_id",
+          "process_session_id",
+          "reason_code"
+        ],
+        "/$defs/wake": [
+          "barrier_id",
+          "wake_intent_count",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/backend": [
+          "process",
+          "native_pty",
+          "process_without_pty"
+        ],
+        "/$defs/handle/properties/lifecycle": [
+          "running",
+          "completed",
+          "failed"
+        ],
+        "/$defs/processState": [
+          "running",
+          "draining",
+          "succeeded",
+          "failed",
+          "timed_out",
+          "cancelled",
+          "cleanup_failed",
+          "orphaned"
+        ],
+        "/$defs/ptyBackend": [
+          "unix_pty",
+          "windows_con_pty"
+        ]
+      }
+    },
+    {
+      "name": "coding_task_cleanup_outcome",
+      "schema_id": "https://schemas.palyra.local/common/coding-task-cleanup-outcome.v2.json",
+      "schema_version": 2,
+      "required_fields": [
+        "schema_version",
+        "task_id",
+        "lsp_settled",
+        "active_process_count",
+        "worktree_lock_released",
+        "worktree_disposition",
+        "snapshot_id",
+        "evidence_refs",
+        "reason_codes"
+      ],
+      "declared_limits": {
+        "active_processes_max": 64,
+        "evidence_refs_max": 64,
+        "reason_codes_max": 32
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "task_id",
+          "lsp_settled",
+          "active_process_count",
+          "worktree_lock_released",
+          "worktree_disposition",
+          "snapshot_id",
+          "evidence_refs",
+          "reason_codes"
+        ]
+      },
+      "wire_enums": {
+        "/properties/worktree_disposition": [
+          "removed",
+          "dirty_retained",
+          "in_place_preserved"
+        ]
+      }
+    },
+    {
+      "name": "managed_coding_diagnostics",
+      "schema_id": "https://schemas.palyra.local/common/managed-coding-diagnostics.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "status",
+        "reason_code"
+      ],
+      "declared_limits": {
+        "active_tasks_max": 64,
+        "pressure_actions_max": 32,
+        "worktrees_max": 512
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "raw_owner_ids",
+        "raw_process_ids",
+        "raw_worktree_paths",
+        "raw_server_capabilities",
+        "environment_values",
+        "diagnostic_text",
+        "process_output"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "status",
+          "reason_code"
+        ],
+        "/$defs/pressure": [
+          "schema_version",
+          "required",
+          "capacity_available",
+          "eviction_plan",
+          "reason_code",
+          "observed_at_unix_ms"
+        ],
+        "/$defs/pressure/properties": {
+          "$ref": "#/$defs/units"
+        },
+        "/$defs/pressureAction": [
+          "schema_version",
+          "lease_id_sha256",
+          "owner_id_sha256",
+          "service",
+          "priority",
+          "released",
+          "state",
+          "reason_code",
+          "observed_at_unix_ms"
+        ],
+        "/$defs/pressureDecision": [
+          "lease_id_sha256",
+          "owner_id_sha256",
+          "service",
+          "priority",
+          "released",
+          "reason_code"
+        ],
+        "/$defs/resources": [
+          "used",
+          "limit",
+          "active_leases",
+          "owner_count"
+        ],
+        "/$defs/units": [
+          "processes",
+          "memory_bytes",
+          "file_descriptors",
+          "sockets",
+          "spool_bytes",
+          "concurrency"
+        ],
+        "/$defs/worktrees": [
+          "active",
+          "dirty",
+          "locked",
+          "retained_snapshots"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/pressureAction/properties/state": [
+          "applied",
+          "skipped",
+          "failed"
+        ],
+        "/$defs/priority": [
+          "interactive",
+          "foreground",
+          "idle_service",
+          "background_fanout"
+        ],
+        "/$defs/service": [
+          "process",
+          "pty",
+          "lsp",
+          "mcp",
+          "external_runtime",
+          "worktree"
+        ],
+        "/properties/status": [
+          "available",
+          "unavailable"
+        ]
+      }
+    },
+    {
+      "name": "managed_coding_recovery",
+      "schema_id": "https://schemas.palyra.local/common/managed-coding-recovery.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "worktrees",
+        "snapshots",
+        "reason_code"
+      ],
+      "declared_limits": {
+        "worktrees_max": 512,
+        "snapshots_max": 512,
+        "snapshot_entries_max": 512,
+        "snapshot_total_bytes_max": 67108864
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": [
+        "raw_host_paths",
+        "attached_run_ids",
+        "snapshot_content",
+        "git_index_bytes",
+        "process_authority",
+        "environment_values"
+      ],
+      "declared_privacy": null,
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "worktrees",
+          "snapshots",
+          "reason_code"
+        ],
+        "/$defs/snapshotGcOutcome": [
+          "schema_version",
+          "snapshot_id",
+          "decision",
+          "force_requested",
+          "reason_code"
+        ],
+        "/$defs/snapshotSummary": [
+          "schema_version",
+          "snapshot_id",
+          "worktree_id",
+          "worktree_generation",
+          "base_commit",
+          "entry_count",
+          "total_bytes",
+          "created_at_unix_ms"
+        ],
+        "/$defs/worktreeMutation": [
+          "schema_version",
+          "worktree_id",
+          "generation",
+          "lifecycle",
+          "dirty",
+          "reason_code"
+        ],
+        "/$defs/worktreeSummary": [
+          "schema_version",
+          "worktree_id",
+          "generation",
+          "source_repo_sha256",
+          "worktree_path_sha256",
+          "branch",
+          "base_ref",
+          "lifecycle",
+          "dirty",
+          "locked",
+          "attached_run_count",
+          "created_at_unix_ms",
+          "updated_at_unix_ms",
+          "reason_code"
+        ]
+      },
+      "wire_enums": {
+        "/$defs/lifecycle": [
+          "creating",
+          "active",
+          "removing",
+          "retained",
+          "failed",
+          "removed"
+        ],
+        "/$defs/snapshotGcOutcome/properties/decision": [
+          "removed",
+          "blocked_by_active_lease",
+          "retained"
+        ]
+      }
+    },
+    {
+      "name": "coding_runtime_soak_report",
+      "schema_id": "https://schemas.palyra.dev/common/coding-runtime-soak-report.v1.json",
+      "schema_version": 1,
+      "required_fields": [
+        "schema_version",
+        "reason_code",
+        "iterations",
+        "patch_observations",
+        "warm_lsp_generation",
+        "introduced_total",
+        "resolved_total",
+        "patch_latency_p50_ms",
+        "patch_latency_p95_ms",
+        "patch_latency_max_ms",
+        "cleanup_active_process_count",
+        "cleanup_lsp_settled",
+        "remaining_resource_leases"
+      ],
+      "declared_limits": {
+        "iterations_max": 64,
+        "patch_observations_max": 128,
+        "latency_ms_max": 120000
+      },
+      "declared_bounds": null,
+      "declared_prohibitions": null,
+      "declared_privacy": {
+        "forbidden_fields": [
+          "workspace_path",
+          "executable",
+          "command_args",
+          "process_output",
+          "diagnostics_text",
+          "task_id",
+          "run_id",
+          "session_id"
+        ]
+      },
+      "required_field_sets": {
+        "/": [
+          "schema_version",
+          "reason_code",
+          "iterations",
+          "patch_observations",
+          "warm_lsp_generation",
+          "introduced_total",
+          "resolved_total",
+          "patch_latency_p50_ms",
+          "patch_latency_p95_ms",
+          "patch_latency_max_ms",
+          "cleanup_active_process_count",
+          "cleanup_lsp_settled",
+          "remaining_resource_leases"
+        ]
+      },
+      "wire_enums": {}
+    }
+  ],
+  "wire_enums": {
+    "capability_status": [
+      "active",
+      "configured",
+      "degraded",
+      "disabled",
+      "blocked"
+    ],
+    "coding_command_backend": [
+      "process",
+      "native_pty",
+      "process_without_pty"
+    ],
+    "coding_command_lifecycle": [
+      "running",
+      "completed",
+      "failed"
+    ],
+    "diagnostic_severity": [
+      "error",
+      "warning",
+      "information",
+      "hint"
+    ],
+    "diagnostics_delta_status": [
+      "verified",
+      "blocking_diagnostics",
+      "diagnostics_timed_out",
+      "server_generation_changed",
+      "fallback_required"
+    ],
+    "diagnostics_fallback_tool": [
+      "cargo_check",
+      "tsc_no_emit",
+      "pyright"
+    ],
+    "lsp_language": [
+      "rust",
+      "type_script",
+      "python"
+    ],
+    "lsp_server_lifecycle": [
+      "starting",
+      "ready",
+      "broken",
+      "stopped",
+      "evicted"
+    ],
+    "managed_coding_diagnostics_status": [
+      "available",
+      "unavailable"
+    ],
+    "managed_worktree_lifecycle": [
+      "creating",
+      "active",
+      "removing",
+      "retained",
+      "failed",
+      "removed"
+    ],
+    "process_ownership_kind": [
+      "unix_process_group",
+      "windows_job_object",
+      "remote_execution_instance"
+    ],
+    "process_session_state": [
+      "running",
+      "draining",
+      "succeeded",
+      "failed",
+      "timed_out",
+      "cancelled",
+      "cleanup_failed",
+      "orphaned"
+    ],
+    "pty_backend": [
+      "unix_pty",
+      "windows_con_pty"
+    ],
+    "resource_lease_state": [
+      "active",
+      "revoked",
+      "released",
+      "expired"
+    ],
+    "resource_pressure_action_state": [
+      "applied",
+      "skipped",
+      "failed"
+    ],
+    "resource_priority": [
+      "interactive",
+      "foreground",
+      "idle_service",
+      "background_fanout"
+    ],
+    "resource_service": [
+      "process",
+      "pty",
+      "lsp",
+      "mcp",
+      "external_runtime",
+      "worktree"
+    ],
+    "snapshot_entry_kind": [
+      "tracked",
+      "allowed_untracked"
+    ],
+    "snapshot_gc_decision": [
+      "removed",
+      "blocked_by_active_lease",
+      "retained"
+    ],
+    "workspace_admission": [
+      "explicit",
+      "policy"
+    ],
+    "workspace_isolation": [
+      "managed_worktree",
+      "in_place_explicit"
+    ],
+    "worktree_disposition": [
+      "removed",
+      "dirty_retained",
+      "in_place_preserved"
+    ]
+  },
+  "fallback_matrix": [
+    {
+      "capability": "managed_worktree",
+      "primary": "managed_worktree",
+      "fallback": "in_place_workspace",
+      "fallback_authority": "host_policy_only",
+      "primary_reason": "coding.managed_worktree_active",
+      "fallback_reason": "coding.workspace_in_place_explicit"
+    },
+    {
+      "capability": "native_pty",
+      "primary": "native_pty",
+      "fallback": "process_without_pty",
+      "fallback_authority": "host_policy_only",
+      "primary_reason": "coding.pty_configured",
+      "fallback_reason": "coding.pty_disabled_process_fallback"
+    },
+    {
+      "capability": "persistent_lsp",
+      "primary": "persistent_lsp",
+      "fallback": "compiler_cli",
+      "fallback_authority": "host_policy_only",
+      "primary_reason": "coding.lsp_active",
+      "fallback_reason": "coding.lsp_cli_fallback_active"
+    },
+    {
+      "capability": "process_supervisor",
+      "primary": "managed_process_actor",
+      "fallback": null,
+      "fallback_authority": "none",
+      "unavailable_outcome": "blocked"
+    },
+    {
+      "capability": "objective_wait_bridge",
+      "primary": "durable_wait_barrier",
+      "fallback": null,
+      "fallback_authority": "none",
+      "unavailable_outcome": "blocked"
+    },
+    {
+      "capability": "patch_verification",
+      "primary": "generation_aware_lsp_delta",
+      "fallback": "host_selected_compiler_cli",
+      "fallback_authority": "host_policy_only",
+      "unavailable_outcome": "fallback_required"
+    }
+  ],
+  "reason_taxonomy": {
+    "format": "lowercase_dot_separated",
+    "families": [
+      "coding",
+      "lsp",
+      "managed_worktree",
+      "process",
+      "resource"
+    ],
+    "coding": [
+      "coding.cleanup_clean_removed",
+      "coding.cleanup_dirty_retained",
+      "coding.cleanup_dirty_snapshotted_removed",
+      "coding.cleanup_in_place_preserved",
+      "coding.command_actor_failed",
+      "coding.command_local_wait_timed_out",
+      "coding.command_running",
+      "coding.diagnostics_serialization_failed",
+      "coding.dirty_worktree_retained",
+      "coding.lsp_active",
+      "coding.lsp_cli_fallback_active",
+      "coding.lsp_unavailable",
+      "coding.managed_worktree_active",
+      "coding.operator_retained",
+      "coding.patch_blocking_diagnostics",
+      "coding.patch_cli_fallback_required",
+      "coding.patch_diagnostics_timeout",
+      "coding.patch_lsp_generation_changed",
+      "coding.patch_lsp_verified",
+      "coding.process_actor_failed",
+      "coding.process_command_failed",
+      "coding.process_command_succeeded",
+      "coding.process_completed",
+      "coding.process_completion_wake_failed",
+      "coding.process_monitor_spawn_failed",
+      "coding.process_wait_registered",
+      "coding.pty_actor_failed",
+      "coding.pty_command_failed",
+      "coding.pty_command_succeeded",
+      "coding.pty_configured",
+      "coding.pty_disabled_process_fallback",
+      "coding.pty_unavailable_process_fallback",
+      "coding.recovery_inventory_loaded",
+      "coding.restart_dirty_worktree_retained",
+      "coding.restart_reconciled_without_pid_adoption",
+      "coding.runtime_available",
+      "coding.runtime_unavailable",
+      "coding.snapshot_active_lease",
+      "coding.snapshot_removed",
+      "coding.snapshot_retained",
+      "coding.terminal_completed",
+      "coding.terminal_completion_wake_failed",
+      "coding.terminal_monitor_spawn_failed",
+      "coding.terminal_running",
+      "coding.terminal_wait_registered",
+      "coding.wait_bridge_failed",
+      "coding.workspace_explicitly_selected",
+      "coding.workspace_in_place_explicit",
+      "coding.workspace_policy_selected",
+      "coding_runtime.soak_completed",
+      "coding_runtime.warm_lsp_baseline"
+    ],
+    "lsp": [
+      "lsp.active",
+      "lsp.capabilities_oversized",
+      "lsp.daemon_shutdown",
+      "lsp.diagnostics_baseline_captured",
+      "lsp.diagnostics_delta_blocking",
+      "lsp.diagnostics_delta_verified",
+      "lsp.diagnostics_generation_changed",
+      "lsp.diagnostics_server_unavailable",
+      "lsp.diagnostics_timeout",
+      "lsp.document_diagnostics_pending",
+      "lsp.document_synchronized",
+      "lsp.idle_reaped",
+      "lsp.initialize_pending",
+      "lsp.initialized",
+      "lsp.json_rpc_error",
+      "lsp.malformed_frame",
+      "lsp.no_active_servers",
+      "lsp.oversized_frame",
+      "lsp.request_completed",
+      "lsp.request_timeout",
+      "lsp.resource_pressure_evicted",
+      "lsp.restart_requires_relaunch",
+      "lsp.rollback_diagnostics_timeout",
+      "lsp.rollback_synchronized",
+      "lsp.server_crashed",
+      "lsp.supervisor_failure"
+    ],
+    "managed_worktree": [
+      "managed_worktree.create_failed_cleanup_required",
+      "managed_worktree.create_failed_cleanup_verified",
+      "managed_worktree.create_intent",
+      "managed_worktree.created",
+      "managed_worktree.dirty_retained",
+      "managed_worktree.remove_intent",
+      "managed_worktree.removed",
+      "managed_worktree.run_attached",
+      "managed_worktree.run_detached",
+      "managed_worktree.status_refreshed"
+    ],
+    "process": [
+      "process.adoption.authority_unavailable",
+      "process.adoption.identity_mismatch",
+      "process.adoption.provenance_mismatch",
+      "process.cancelled",
+      "process.completed",
+      "process.exited_successfully",
+      "process.exited_unsuccessfully",
+      "process.interrupted",
+      "process.no_output_timeout",
+      "process.persistence_failed",
+      "process.resource_release_failed",
+      "process.restart_requires_verified_adoption",
+      "process.supervisor_shutdown",
+      "process.timeout",
+      "process.wait_failed"
+    ],
+    "resource": [
+      "resource.admitted",
+      "resource.capacity_available",
+      "resource.lease_expired",
+      "resource.lsp_eviction_applied",
+      "resource.lsp_eviction_failed",
+      "resource.pressure_action_unowned",
+      "resource.pressure_detected",
+      "resource.pressure_revocation_proposed",
+      "resource.released",
+      "resource.renewed",
+      "resource.restart_requires_reacquire"
+    ]
+  },
+  "hard_limits": {
+    "command_argument_bytes": 16384,
+    "command_arguments": 256,
+    "command_environment_keys": 256,
+    "command_output_chunks": 512,
+    "diagnostic_artifact_bytes": 16777216,
+    "diagnostic_artifacts": 4096,
+    "diagnostics_per_document": 2048,
+    "diagnostics_visible_delta_items": 128,
+    "git_operation_timeout_ms": 60000,
+    "identity_bytes": 128,
+    "lsp_active_servers": 16,
+    "lsp_header_bytes": 8192,
+    "lsp_message_bytes": 1048576,
+    "lsp_notifications": 512,
+    "managed_tasks": 64,
+    "patch_files": 128,
+    "pending_patch_verifications": 128,
+    "process_artifact_bytes_per_session": 16777216,
+    "process_drain_allowance_ms": 5000,
+    "process_output_chunk_bytes": 8192,
+    "process_output_page_chunks": 4096,
+    "process_output_projection_chars": 32768,
+    "process_retained_bytes_per_session": 4194304,
+    "process_retained_chunks_per_session": 512,
+    "process_sessions": 64,
+    "resource_lease_records": 4096,
+    "resource_pressure_actions": 32,
+    "source_file_bytes": 8388608,
+    "worktree_attached_runs": 64,
+    "worktree_records": 512,
+    "worktree_snapshot_bytes": 67108864,
+    "worktree_snapshot_file_bytes": 8388608,
+    "worktree_snapshot_files": 512
+  },
+  "soak_baseline": {
+    "schema_version": 1,
+    "reason_code": "coding_runtime.warm_lsp_baseline",
+    "supported_runner_os": [
+      "linux",
+      "macos",
+      "windows"
+    ],
+    "ci_iterations": 12,
+    "max_iterations": 64,
+    "max_patch_latency_p95_ms": 2000,
+    "required_cleanup_active_process_count": 0,
+    "required_cleanup_lsp_settled": true,
+    "required_remaining_resource_leases": 0
+  },
+  "privacy_invariants": {
+    "caller_supplied_commands_are_not_executed": true,
+    "diagnostic_text_is_absent_from_operator_health": true,
+    "durable_environment_values_are_forbidden": true,
+    "durable_live_os_handles_are_forbidden": true,
+    "durable_raw_process_and_terminal_output_is_forbidden": true,
+    "operator_diagnostics_hash_internal_identities": true,
+    "operator_diagnostics_omit_host_paths": true,
+    "pid_without_verified_authority_is_never_adopted": true,
+    "recovery_inventory_is_content_free": true,
+    "secret_like_snapshots_are_rejected_before_persistence": true,
+    "server_capabilities_are_summarized_then_discarded": true,
+    "snapshot_paths_are_workspace_relative": true
+  },
+  "compatibility_policy": {
+    "closed_wire_contracts": true,
+    "existing_version_semantics_are_immutable": true,
+    "migration": "explicit_versioned_adapter_only",
+    "required_field_change": "new_schema_version_and_migration_note",
+    "snapshot_change": "version_bump_and_migration_note",
+    "unknown_fields": "reject",
+    "unknown_schema_versions": "reject_before_rewrite_or_mutation",
+    "wire_enum_growth": "new_schema_version_and_migration_note"
+  }
+}

@@ -233,7 +233,6 @@ fn build_current_state_inventory_snapshot(
         "feature_rollout_maturity": diagnostics.get("feature_rollout_maturity").cloned().unwrap_or(Value::Null),
         "feature_rollout_maturity_v2": diagnostics.get("feature_rollout_maturity_v2").cloned().unwrap_or(Value::Null),
         "method_registry": method_registry,
-        "runtime_roadmap": diagnostics.get("runtime_roadmap").cloned().unwrap_or(Value::Null),
         "runtime_controls": {
             "schema_version": runtime_controls.remove("schema_version").unwrap_or(Value::Null),
             "state": runtime_controls.remove("state").unwrap_or(Value::Null),
@@ -315,8 +314,8 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
     let method_registry_scopes = required_array(snapshot, "/method_registry/scopes")?;
     let runtime_controls = required_object(snapshot, "/runtime_controls")?;
     let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
-    let roadmap_area_map = roadmap_area_map();
-    let status_counts = count_roadmap_area_statuses(roadmap_area_map.as_slice())?;
+    let product_area_map = product_area_map();
+    let status_counts = count_product_area_statuses(product_area_map.as_slice())?;
 
     Ok(json!({
         "schema_version": 1,
@@ -327,7 +326,7 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
         "golden_snapshot": "crates/palyra-daemon/tests/golden/current_state_inventory.json",
         "human_report": "crates/palyra-daemon/tests/golden/current_state_inventory_report.md",
         "source_of_truth": runtime_audit_source_map(),
-        "roadmap_area_map": roadmap_area_map,
+        "product_area_map": product_area_map,
         "surface_counts": {
             "capability_catalog_entries": capabilities.len(),
             "cli_families": cli_families.len(),
@@ -343,7 +342,7 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
             "method_registry_scopes": method_registry_scopes.len(),
             "runtime_control_capabilities": runtime_control_capabilities.len(),
         },
-        "roadmap_area_status_counts": status_counts,
+        "product_area_status_counts": status_counts,
         "feature_rollout_counts": count_feature_rollouts(feature_rollouts)?,
         "feature_rollout_maturity": {
             "schema_version": feature_rollout_maturity.get("schema_version").cloned().unwrap_or(Value::Null),
@@ -378,7 +377,7 @@ fn build_runtime_audit_manifest(snapshot: &Value) -> Result<Value> {
         "schema_version": 1,
         "manifest_id": "runtime_audit_manifest.v1",
         "baseline_schema_version": baseline.get("schema_version").cloned().unwrap_or(Value::Null),
-        "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for roadmap drift review",
+        "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for drift review",
         "goldens": {
             "snapshot": baseline.get("golden_snapshot").cloned().unwrap_or(Value::Null),
             "human_report": baseline.get("human_report").cloned().unwrap_or(Value::Null),
@@ -392,7 +391,7 @@ fn build_runtime_audit_manifest(snapshot: &Value) -> Result<Value> {
                 .cloned()
                 .unwrap_or(Value::Null),
             "runtime_controls": baseline.get("runtime_control_state_counts").cloned().unwrap_or(Value::Null),
-            "roadmap_area_status": baseline.get("roadmap_area_status_counts").cloned().unwrap_or(Value::Null),
+            "product_area_status": baseline.get("product_area_status_counts").cloned().unwrap_or(Value::Null),
         },
         "source_of_truth": baseline.get("source_of_truth").cloned().unwrap_or(Value::Null),
         "priority_areas": [
@@ -419,21 +418,21 @@ fn build_runtime_audit_manifest(snapshot: &Value) -> Result<Value> {
         "non_goal_metrics": [
             {
                 "metric": "connector_count",
-                "reason": "connector inventory growth is outside this backend runtime maturity phase"
+                "reason": "connector inventory growth is outside backend runtime maturity evaluation"
             },
             {
                 "metric": "skill_count",
-                "reason": "skill inventory growth is outside this backend runtime maturity phase"
+                "reason": "skill inventory growth is outside backend runtime maturity evaluation"
             },
             {
                 "metric": "provider_count",
-                "reason": "provider inventory growth is outside this backend runtime maturity phase"
+                "reason": "provider inventory growth is outside backend runtime maturity evaluation"
             }
         ],
         "verification": {
             "drift_check": "cargo test -p palyra-daemon --test current_state_inventory --locked",
             "update_goldens": baseline.get("generation_commands").cloned().unwrap_or(Value::Null),
-            "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as phase success criteria"
+            "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as maturity success criteria"
         }
     }))
 }
@@ -455,7 +454,7 @@ fn runtime_audit_source_map() -> Vec<Value> {
                 "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
                 "crates/palyra-daemon/src/runtime_diagnostics.rs"
             ],
-            "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+            "reason": "runtime sections, health, metrics, observability, and feature rollout payloads"
         }),
         json!({
             "surface": "runtime_preview_controls",
@@ -516,7 +515,7 @@ fn runtime_audit_source_map() -> Vec<Value> {
     ]
 }
 
-fn roadmap_area_map() -> Vec<Value> {
+fn product_area_map() -> Vec<Value> {
     vec![
         json!({
             "area": "api",
@@ -527,8 +526,8 @@ fn roadmap_area_map() -> Vec<Value> {
         json!({
             "area": "mcp",
             "status": "scaffold",
-            "evidence": ["cli family: mcp", "roadmap phase 5"],
-            "reason": "MCP serve is discoverable, while external MCP import/supervision remains roadmap work"
+            "evidence": ["cli family: mcp", "runtime mode: scaffold"],
+            "reason": "MCP serve is discoverable, while external MCP import and supervision are unavailable"
         }),
         json!({
             "area": "subagents",
@@ -545,7 +544,7 @@ fn roadmap_area_map() -> Vec<Value> {
         json!({
             "area": "qa_lab",
             "status": "scaffold",
-            "evidence": ["runtime_roadmap.phase0_harness", "fixtures/golden/release_eval_inventory.json"],
+            "evidence": ["runtime QA fixtures", "fixtures/golden/release_eval_inventory.json"],
             "reason": "regression fixtures exist before the dedicated QA Lab manifest and runner"
         }),
         json!({
@@ -659,18 +658,18 @@ fn count_runtime_control_states(capabilities: &[Value]) -> Result<BTreeMap<Strin
     Ok(counts)
 }
 
-fn count_roadmap_area_statuses(areas: &[Value]) -> Result<BTreeMap<String, usize>> {
+fn count_product_area_statuses(areas: &[Value]) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for area in areas {
         let status = area
             .get("status")
             .and_then(Value::as_str)
-            .context("roadmap area should expose status")?;
+            .context("product area should expose status")?;
         match status {
             "production" | "preview" | "disabled" | "scaffold" => {
                 *counts.entry(status.to_owned()).or_default() += 1;
             }
-            other => bail!("unknown roadmap area status {other}"),
+            other => bail!("unknown product area status {other}"),
         }
     }
     Ok(counts)
@@ -687,7 +686,7 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     let method_registry_methods = required_array(snapshot, "/method_registry/methods")?;
     let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
     let source_of_truth = required_array(baseline, "/source_of_truth")?;
-    let roadmap_areas = required_array(baseline, "/roadmap_area_map")?;
+    let product_areas = required_array(baseline, "/product_area_map")?;
 
     let registered_compat_routes = compat_routes
         .iter()
@@ -750,14 +749,14 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     push_count_row(
         &mut report,
         "production",
-        required_usize(baseline, "/roadmap_area_status_counts/production")?,
-        "roadmap area source map",
+        required_usize(baseline, "/product_area_status_counts/production")?,
+        "product area source map",
     );
     push_count_row(
         &mut report,
         "preview",
-        required_usize(baseline, "/roadmap_area_status_counts/preview")?,
-        "roadmap area source map",
+        required_usize(baseline, "/product_area_status_counts/preview")?,
+        "product area source map",
     );
     push_count_row(
         &mut report,
@@ -769,8 +768,8 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     push_count_row(
         &mut report,
         "scaffold",
-        required_usize(baseline, "/roadmap_area_status_counts/scaffold")?,
-        "roadmap area source map",
+        required_usize(baseline, "/product_area_status_counts/scaffold")?,
+        "product area source map",
     );
     report.push('\n');
 
@@ -790,10 +789,10 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     }
     report.push('\n');
 
-    report.push_str("## Roadmap Area Map\n\n");
+    report.push_str("## Product Area Map\n\n");
     report.push_str("| Area | Status | Evidence | Reason |\n");
     report.push_str("| --- | --- | --- | --- |\n");
-    for area in roadmap_areas {
+    for area in product_areas {
         report.push_str(
             format!(
                 "| `{}` | `{}` | {} | {} |\n",

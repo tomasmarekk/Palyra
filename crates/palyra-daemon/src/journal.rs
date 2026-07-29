@@ -7539,6 +7539,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "autonomous_wake_governance",
         sql: autonomous_wakes::MIGRATION_91_SQL,
     },
+    Migration {
+        version: 92,
+        name: "managed_coding_lifecycle_observations",
+        sql: lifecycle::MIGRATION_92_SQL,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(

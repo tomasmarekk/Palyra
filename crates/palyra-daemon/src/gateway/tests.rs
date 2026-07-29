@@ -25,6 +25,7 @@ use palyra_common::qa_fault_injection::{
     QA_FAULT_LAUNCH_SCHEMA_VERSION,
 };
 use palyra_common::{
+    process_runner_input::parse_process_runner_tool_input,
     runtime_contracts::{
         AuxiliaryTaskKind, AuxiliaryTaskState, CleanupOutcome, CleanupReportV1,
         CleanupStepDisposition, CleanupStepKind, CleanupStepRecord, FlowState, FlowStepState,
@@ -103,7 +104,8 @@ fn provider_attempt_admission_exhaustion_maps_to_resource_exhausted() {
 use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access,
-    has_windows_absolute_path_prefix, ingest_memory_best_effort, map_provider_error,
+    has_windows_absolute_path_prefix, ingest_memory_best_effort,
+    managed_coding_process_input_is_compatible, map_provider_error,
     matching_tool_approval_response_id, process_run_verification_output_summary,
     process_runner_input_should_use_active_root, process_runner_input_should_use_launch_root,
     process_runner_input_with_facade_mapping, process_runner_input_with_path_env,
@@ -119,6 +121,29 @@ use super::{
     TOOL_APPROVAL_RESPONSE_TIMEOUT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
     VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
+
+#[test]
+fn managed_coding_process_adapter_accepts_only_plain_foreground_requests() {
+    let foreground = parse_process_runner_tool_input(
+        br#"{"command":"cargo","args":["check","--workspace","--locked"],"cwd":"workspace"}"#,
+    )
+    .expect("fixed foreground request should parse");
+    assert!(managed_coding_process_input_is_compatible(&foreground));
+
+    for incompatible in [
+        br#"{"command":"cargo","args":["check"],"background":true}"#.as_slice(),
+        br#"{"command":"cargo","args":["check"],"timeout_ms":1000}"#.as_slice(),
+        br#"{"command":"cargo","args":["check"],"env":{"RUST_LOG":"debug"}}"#.as_slice(),
+        br#"{"command":"cargo","args":["check"],"cwd":"subdir"}"#.as_slice(),
+        br#"{"command":"cargo","args":["check"],"pty":true}"#.as_slice(),
+        br#"{"command":"cargo","args":["check"],"requested_egress_hosts":["example.com"]}"#
+            .as_slice(),
+    ] {
+        let parsed = parse_process_runner_tool_input(incompatible)
+            .expect("incompatible request should parse");
+        assert!(!managed_coding_process_input_is_compatible(&parsed));
+    }
+}
 use crate::application::run_stream::{
     cancellation::transition_run_stream_to_cancelled,
     orchestration::{finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome},

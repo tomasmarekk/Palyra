@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/coding-runtime-soak-report.v1.json",
+  "title": "Coding runtime soak report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "reason_code",
+    "iterations",
+    "patch_observations",
+    "warm_lsp_generation",
+    "introduced_total",
+    "resolved_total",
+    "patch_latency_p50_ms",
+    "patch_latency_p95_ms",
+    "patch_latency_max_ms",
+    "cleanup_active_process_count",
+    "cleanup_lsp_settled",
+    "remaining_resource_leases"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "reason_code": { "const": "coding_runtime.soak_completed" },
+    "iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "patch_observations": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 128
+    },
+    "warm_lsp_generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "introduced_total": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 64
+    },
+    "resolved_total": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 64
+    },
+    "patch_latency_p50_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 120000
+    },
+    "patch_latency_p95_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 120000
+    },
+    "patch_latency_max_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 120000
+    },
+    "cleanup_active_process_count": { "const": 0 },
+    "cleanup_lsp_settled": { "const": true },
+    "remaining_resource_leases": { "const": 0 }
+  },
+  "x-palyra-limits": {
+    "iterations_max": 64,
+    "patch_observations_max": 128,
+    "latency_ms_max": 120000
+  },
+  "x-palyra-privacy": {
+    "forbidden_fields": [
+      "workspace_path",
+      "executable",
+      "command_args",
+      "process_output",
+      "diagnostics_text",
+      "task_id",
+      "run_id",
+      "session_id"
+    ]
+  }
+}

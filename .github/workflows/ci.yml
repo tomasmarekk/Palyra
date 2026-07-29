@@ -84,6 +84,27 @@ jobs:
         if: matrix.mode != 'build'
         run: cargo test --workspace --locked
 
+      - name: Coding runtime warm-LSP soak (Unix)
+        if: ${{ matrix.mode != 'build' && runner.os != 'Windows' }}
+        env:
+          PALYRA_CODING_RUNTIME_SOAK_ITERATIONS: "12"
+          PALYRA_CODING_RUNTIME_SOAK_REPORT: target/qa-lab/coding-runtime/coding-runtime-soak.json
+        run: bash scripts/test/run-coding-runtime-soak.sh
+
+      - name: Coding runtime warm-LSP soak (Windows)
+        if: ${{ matrix.mode != 'build' && runner.os == 'Windows' }}
+        shell: pwsh
+        run: ./scripts/test/run-coding-runtime-soak.ps1 -Iterations 12
+
+      - name: Upload coding runtime soak evidence
+        if: ${{ always() && matrix.mode != 'build' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coding-runtime-soak-${{ matrix.os }}
+          path: target/qa-lab/coding-runtime/coding-runtime-soak.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Unix process supervisor topology and protocol regressions
         if: ${{ matrix.mode == 'test' && (runner.os == 'Linux' || runner.os == 'macOS') }}
         run: bash scripts/test/run-unix-process-supervisor-regressions.sh

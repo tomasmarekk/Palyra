@@ -353,6 +353,30 @@ pub(crate) async fn execute_workspace_patch_tool(
         );
     }
 
+    let managed_patch_paths = planned_outcome
+        .files_touched
+        .iter()
+        .flat_map(|file| std::iter::once(file.path.as_str()).chain(file.moved_from.as_deref()))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let managed_patch_ticket = if managed_patch_paths.is_empty() {
+        None
+    } else {
+        match runtime_state.prepare_managed_coding_patch(run_id, managed_patch_paths.as_slice()) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                return workspace_patch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.fs.apply_patch could not establish managed coding diagnostics baseline"
+                        .to_owned(),
+                );
+            }
+        }
+    };
+
     let mut mutation_outcome = checkpoint_flow::execute_workspace_patch_mutation(
         runtime_state,
         WorkspacePatchMutationRequest {
@@ -373,11 +397,62 @@ pub(crate) async fn execute_workspace_patch_tool(
         },
     )
     .await;
+    let mut verification_failed = false;
+    if let Some(ticket) = managed_patch_ticket {
+        if mutation_outcome.success {
+            let (diagnostics, verified) =
+                match runtime_state.complete_managed_coding_patch(ticket.ticket_id.as_str()) {
+                    Ok(Some(outcome)) => {
+                        let verified = outcome.diagnostics_verified;
+                        let diagnostics = serde_json::to_value(outcome)
+                            .unwrap_or_else(|_| managed_coding_verification_failure());
+                        (diagnostics, verified)
+                    }
+                    Ok(None) | Err(_) => (managed_coding_verification_failure(), false),
+                };
+            mutation_outcome.output_json =
+                attach_managed_coding_diagnostics(mutation_outcome.output_json, diagnostics);
+            verification_failed = !verified;
+        } else {
+            runtime_state.cancel_managed_coding_patch(ticket.ticket_id.as_str());
+        }
+    }
     if !file_view_report.diagnostics.is_empty() {
         mutation_outcome.output_json =
             attach_file_view_report_to_output(mutation_outcome.output_json, &file_view_report);
     }
-    mutation_outcome
+    if verification_failed {
+        mutation_outcome.success = false;
+        mutation_outcome.error =
+            "palyra.fs.apply_patch applied the mutation, but managed coding verification did not pass; resolve the reported diagnostics before completing the coding objective"
+                .to_owned();
+    }
+    workspace_patch_tool_execution_outcome(
+        proposal_id,
+        input_json,
+        mutation_outcome.success,
+        mutation_outcome.output_json,
+        mutation_outcome.error,
+    )
+}
+
+fn managed_coding_verification_failure() -> Value {
+    json!({
+        "schema_version": 2,
+        "diagnostics_verified": false,
+        "reason_codes": ["coding.patch_verification_failed"],
+    })
+}
+
+fn attach_managed_coding_diagnostics(output_json: Vec<u8>, diagnostics: Value) -> Vec<u8> {
+    let Ok(mut output) = serde_json::from_slice::<Value>(output_json.as_slice()) else {
+        return output_json;
+    };
+    let Some(output) = output.as_object_mut() else {
+        return output_json;
+    };
+    output.insert("coding_diagnostics".to_owned(), diagnostics);
+    serde_json::to_vec(output).unwrap_or(output_json)
 }
 
 fn workspace_patch_planning_request(

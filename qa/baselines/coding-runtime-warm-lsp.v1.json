@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "reason_code": "coding_runtime.warm_lsp_baseline",
+  "supported_runner_os": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "ci_iterations": 12,
+  "max_iterations": 64,
+  "max_patch_latency_p95_ms": 2000,
+  "required_cleanup_active_process_count": 0,
+  "required_cleanup_lsp_settled": true,
+  "required_remaining_resource_leases": 0
+}

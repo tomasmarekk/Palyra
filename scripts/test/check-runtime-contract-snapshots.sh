@@ -91,7 +91,11 @@ run_contract_check \
   "$CARGO_BIN" test -p palyra-policy explain_diagnostics_reports_safe_reason_code_and_hints --locked
 run_contract_check \
   "daemon aggregate runtime ABI snapshot" \
-  "$CARGO_BIN" test -p palyra-daemon runtime_diagnostics::tests::contract_snapshot_suite_covers_phase11_abi_surfaces --locked
+  "$CARGO_BIN" test -p palyra-daemon runtime_diagnostics::tests::contract_snapshot_suite_covers_plugin_abi_surfaces --locked
+run_exact_contract_check \
+  "managed coding compatibility snapshot" \
+  "runtime_diagnostics::tests::managed_coding_contract_snapshot_matches_golden" \
+  "$CARGO_BIN" test -p palyra-daemon --lib runtime_diagnostics::tests::managed_coding_contract_snapshot_matches_golden --locked -- --exact
 run_exact_contract_check \
   "feature rollout promotion manifest contract" \
   "feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid" \

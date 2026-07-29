@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/coding-task-cleanup-outcome.v2.json",
+  "title": "Palyra Coding Task Cleanup Outcome V2",
+  "description": "Bounded cleanup evidence emitted after language services and supervised commands have settled.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "lsp_settled",
+    "active_process_count",
+    "worktree_lock_released",
+    "worktree_disposition",
+    "snapshot_id",
+    "evidence_refs",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "task_id": { "$ref": "#/$defs/id" },
+    "lsp_settled": { "type": "boolean" },
+    "active_process_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 64
+    },
+    "worktree_lock_released": { "type": "boolean" },
+    "worktree_disposition": {
+      "enum": [
+        "removed",
+        "dirty_retained",
+        "in_place_preserved"
+      ]
+    },
+    "snapshot_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
+    "evidence_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/evidenceRef" }
+    },
+    "reason_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/reasonCode" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "evidenceRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.:/-]*$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    }
+  },
+  "x-palyra-limits": {
+    "active_processes_max": 64,
+    "evidence_refs_max": 64,
+    "reason_codes_max": 32
+  }
+}

@@ -1,4 +1,4 @@
-# JSON Schemas (M04)
+# JSON Schemas
 
 Canonical JSON schemas are split into:
 
@@ -16,3 +16,33 @@ when they are not public envelopes. `runtime-error-envelope.v1.json` is one such
 contract: it closes unknown fields, carries only bounded redacted text, and keeps
 retry and side-effect uncertainty as typed metadata rather than message-derived
 behavior.
+
+Managed coding runtime contracts are split by durable or operator-visible
+responsibility:
+
+- `process-session-record.v2.json`, `process-output-page.v2.json`,
+  `local-resource-registry.v2.json`, and `resource-pressure-snapshot.v1.json`
+  pin supervised-process and local-capacity persistence plus bounded redacted
+  cursor pages without raw output, environment values, or live handle
+  authority.
+- `pty-session-descriptor.v1.json` pins native Unix PTY and Windows ConPTY
+  metadata while raw terminal bytes and input remain local-only.
+- `managed-worktree-registry.v2.json`,
+  `worktree-snapshot-descriptor.v1.json`, and
+  `worktree-restore-report.v1.json` pin bounded Git isolation and lossless
+  snapshot recovery metadata.
+- `lsp-registry.v2.json`, `diagnostics-baseline.v2.json`, and
+  `diagnostics-delta.v2.json` pin process-backed language-service state and
+  generation-aware edit verification. `lsp-diagnostics-snapshot.v2.json` is
+  the closed operator projection; it exposes hashed identities and capability
+  size evidence instead of raw capability payloads.
+- `coding-runtime-capability-report.v2.json`,
+  `coding-patch-outcome.v2.json`, `coding-command-status.v2.json`, and
+  `coding-task-cleanup-outcome.v2.json` pin integrated capability, mutation,
+  command, and cleanup results.
+- `managed-coding-diagnostics.v1.json` and
+  `managed-coding-recovery.v1.json` pin the redacted operator health projection
+  and typed recovery inventory without exposing raw process or workspace
+  identities.
+- `coding-runtime-soak-report.v1.json` pins bounded cross-platform warm
+  language-service performance and cleanup evidence.

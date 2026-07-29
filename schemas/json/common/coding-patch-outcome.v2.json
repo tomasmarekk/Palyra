@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/coding-patch-outcome.v2.json",
+  "title": "Palyra Coding Patch Outcome V2",
+  "description": "Bounded source-edit outcome with generation-aware diagnostics or an explicit host-selected fallback.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "applied_files",
+    "diagnostics",
+    "fallback",
+    "applied",
+    "diagnostics_verified",
+    "evidence_refs",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "task_id": { "$ref": "#/$defs/id" },
+    "applied_files": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relativePath" }
+    },
+    "diagnostics": {
+      "oneOf": [
+        { "$ref": "diagnostics-delta.v2.json" },
+        { "type": "null" }
+      ]
+    },
+    "fallback": {
+      "oneOf": [
+        { "$ref": "#/$defs/fallback" },
+        { "type": "null" }
+      ]
+    },
+    "applied": { "type": "boolean" },
+    "diagnostics_verified": { "type": "boolean" },
+    "evidence_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/evidenceRef" }
+    },
+    "reason_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/reasonCode" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "evidenceRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.:/-]*$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "command_label",
+        "reason_code"
+      ],
+      "properties": {
+        "tool": {
+          "enum": [
+            "cargo_check",
+            "tsc_no_emit",
+            "pyright"
+          ]
+        },
+        "command_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "applied_files_max": 128,
+    "evidence_refs_max": 64,
+    "reason_codes_max": 32
+  }
+}

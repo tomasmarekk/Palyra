@@ -807,13 +807,13 @@ pub struct RootFileConfig {
     pub delivery_arbitration: Option<FileDeliveryArbitrationConfig>,
     pub replay_capture: Option<FileReplayCaptureConfig>,
     pub networked_workers: Option<FileNetworkedWorkersConfig>,
-    pub api_facade: Option<FileRoadmapPreviewSectionConfig>,
+    pub api_facade: Option<FileRuntimePreviewSectionConfig>,
     pub mcp: Option<FileMcpServersConfig>,
     pub mcp_servers: Option<FileMcpServersConfig>,
     pub execution_backend_profiles: Option<FileExecutionBackendProfilesConfig>,
-    pub qa_lab: Option<FileRoadmapPreviewSectionConfig>,
+    pub qa_lab: Option<FileRuntimePreviewSectionConfig>,
     pub observability_exporters: Option<FileObservabilityExportersConfig>,
-    pub hook_policy: Option<FileRoadmapPreviewSectionConfig>,
+    pub hook_policy: Option<FileRuntimePreviewSectionConfig>,
     pub agent_harness_registry: Option<FileAgentHarnessRegistryConfig>,
     pub doctor_check_registry: Option<FileDoctorCheckRegistryConfig>,
     pub cron: Option<FileCronConfig>,
@@ -1001,11 +1001,11 @@ pub struct FileNetworkedWorkersConfig {
     pub expected_artifact_digest_sha256: Option<String>,
 }
 
-/// Shared shape for roadmap sections that are present only as preview
-/// gates until their implementation milestones mature.
+/// Shared shape for runtime sections that are available only behind preview
+/// gates until their production acceptance criteria are met.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileRoadmapPreviewSectionConfig {
+pub struct FileRuntimePreviewSectionConfig {
     pub mode: Option<String>,
 }
 
@@ -1470,6 +1470,7 @@ pub struct FileToolCallConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileCodeIntelConfig {
     pub enabled: Option<bool>,
+    pub allow_network: Option<bool>,
     pub workspace_root: Option<String>,
     pub rust_analyzer_binary: Option<String>,
     pub typescript_server_binary: Option<String>,
@@ -2082,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_preview_sections_parse_expected_fields() {
+    fn runtime_preview_sections_parse_expected_fields() {
         let parsed: RootFileConfig = toml::from_str(
             r#"
             [api_facade]
@@ -2185,7 +2186,7 @@ mod tests {
             enabled = false
             "#,
         )
-        .expect("roadmap preview sections should parse");
+        .expect("runtime preview sections should parse");
 
         assert_eq!(
             parsed.api_facade.as_ref().and_then(|value| value.mode.as_deref()),
@@ -2276,8 +2277,8 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_preview_config_schema_snapshot_has_safe_defaults() {
-        let roadmap_categories = [
+    fn runtime_preview_config_schema_snapshot_has_safe_defaults() {
+        let runtime_categories = [
             "api_facade",
             "mcp_servers",
             "execution_backend_profiles",
@@ -2289,7 +2290,7 @@ mod tests {
         ];
         let snapshot = config_schema_entries()
             .iter()
-            .filter(|entry| roadmap_categories.contains(&entry.category))
+            .filter(|entry| runtime_categories.contains(&entry.category))
             .map(|entry| {
                 json!({
                     "path": entry.path,
@@ -2499,6 +2500,7 @@ mod tests {
             r#"
             [tool_call.code_intel]
             enabled = true
+            allow_network = true
             workspace_root = "workspace"
             rust_analyzer_binary = "rust-analyzer"
             typescript_server_binary = "typescript-language-server"
@@ -2517,6 +2519,7 @@ mod tests {
             .and_then(|tool_call| tool_call.code_intel.as_ref())
             .expect("code_intel section should be present");
         assert_eq!(code_intel.enabled, Some(true));
+        assert_eq!(code_intel.allow_network, Some(true));
         assert_eq!(code_intel.workspace_root.as_deref(), Some("workspace"));
         assert_eq!(code_intel.rust_analyzer_binary.as_deref(), Some("rust-analyzer"));
         assert_eq!(

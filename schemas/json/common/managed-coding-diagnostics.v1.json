@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/managed-coding-diagnostics.v1.json",
+  "title": "Palyra Managed Coding Diagnostics V1",
+  "description": "Closed redacted operator diagnostics for managed coding services.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": {
+      "enum": [
+        "available",
+        "unavailable"
+      ]
+    },
+    "active_tasks": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 64
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "coding-runtime-capability-report.v2.json"
+      }
+    },
+    "resources": { "$ref": "#/$defs/resources" },
+    "pressure": {
+      "oneOf": [
+        { "$ref": "#/$defs/pressure" },
+        { "type": "null" }
+      ]
+    },
+    "pressure_actions": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/pressureAction" }
+    },
+    "worktrees": { "$ref": "#/$defs/worktrees" },
+    "language_services": {
+      "oneOf": [
+        { "$ref": "lsp-diagnostics-snapshot.v2.json" },
+        { "type": "null" }
+      ]
+    },
+    "reason_code": { "$ref": "#/$defs/reasonCode" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "processes",
+        "memory_bytes",
+        "file_descriptors",
+        "sockets",
+        "spool_bytes",
+        "concurrency"
+      ],
+      "properties": {
+        "processes": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 17179869184
+        },
+        "file_descriptors": { "type": "integer", "minimum": 0, "maximum": 8192 },
+        "sockets": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "spool_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 536870912
+        },
+        "concurrency": { "type": "integer", "minimum": 0, "maximum": 256 }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "limit",
+        "active_leases",
+        "owner_count"
+      ],
+      "properties": {
+        "used": { "$ref": "#/$defs/units" },
+        "limit": { "$ref": "#/$defs/units" },
+        "active_leases": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "owner_count": { "type": "integer", "minimum": 0, "maximum": 4096 }
+      }
+    },
+    "service": {
+      "enum": [
+        "process",
+        "pty",
+        "lsp",
+        "mcp",
+        "external_runtime",
+        "worktree"
+      ]
+    },
+    "priority": {
+      "enum": [
+        "interactive",
+        "foreground",
+        "idle_service",
+        "background_fanout"
+      ]
+    },
+    "pressureDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id_sha256",
+        "owner_id_sha256",
+        "service",
+        "priority",
+        "released",
+        "reason_code"
+      ],
+      "properties": {
+        "lease_id_sha256": { "$ref": "#/$defs/sha256" },
+        "owner_id_sha256": { "$ref": "#/$defs/sha256" },
+        "service": { "$ref": "#/$defs/service" },
+        "priority": { "$ref": "#/$defs/priority" },
+        "released": { "$ref": "#/$defs/units" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "pressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "required",
+        "capacity_available",
+        "eviction_plan",
+        "reason_code",
+        "observed_at_unix_ms"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "required": { "$ref": "#/$defs/units" },
+        "capacity_available": { "type": "boolean" },
+        "eviction_plan": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/pressureDecision" }
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" },
+        "observed_at_unix_ms": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "pressureAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "lease_id_sha256",
+        "owner_id_sha256",
+        "service",
+        "priority",
+        "released",
+        "state",
+        "reason_code",
+        "observed_at_unix_ms"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "lease_id_sha256": { "$ref": "#/$defs/sha256" },
+        "owner_id_sha256": { "$ref": "#/$defs/sha256" },
+        "service": { "$ref": "#/$defs/service" },
+        "priority": { "$ref": "#/$defs/priority" },
+        "released": { "$ref": "#/$defs/units" },
+        "state": {
+          "enum": [
+            "applied",
+            "skipped",
+            "failed"
+          ]
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" },
+        "observed_at_unix_ms": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "worktrees": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active",
+        "dirty",
+        "locked",
+        "retained_snapshots"
+      ],
+      "properties": {
+        "active": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "dirty": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "locked": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "retained_snapshots": { "type": "integer", "minimum": 0, "maximum": 512 }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "active_tasks_max": 64,
+    "pressure_actions_max": 32,
+    "worktrees_max": 512
+  },
+  "x-palyra-prohibits": [
+    "raw_owner_ids",
+    "raw_process_ids",
+    "raw_worktree_paths",
+    "raw_server_capabilities",
+    "environment_values",
+    "diagnostic_text",
+    "process_output"
+  ]
+}

@@ -1224,6 +1224,28 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             config.execution_timeout_ms =
                 config.execution_timeout_ms.min(u64::try_from(remaining_ms).unwrap_or(1));
         }
+        if let Some(outcome) = maybe_execute_managed_coding_command(
+            runtime_state,
+            context,
+            proposal_id,
+            tool_name,
+            input_json,
+            facade_input_json.as_slice(),
+            &config,
+        )
+        .await
+        {
+            record_process_run_verification_classification(
+                runtime_state,
+                context,
+                proposal_id,
+                &config,
+                facade_input_json.as_slice(),
+                &outcome,
+            )
+            .await;
+            return outcome;
+        }
         let execution_input_json = process_runner_input_with_launch_context_env(
             runtime_state,
             context,
@@ -1520,6 +1542,147 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else {
         execute_tool_call(&runtime_state.config.tool_call, proposal_id, tool_name, input_json).await
     }
+}
+
+async fn maybe_execute_managed_coding_command(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    attested_input_json: &[u8],
+    canonical_input_json: &[u8],
+    config: &ToolCallConfig,
+) -> Option<ToolExecutionOutcome> {
+    if context.execution_backend != ExecutionBackendPreference::LocalSandbox
+        || !config.process_runner.enabled
+        || !runtime_state.has_managed_coding_run(context.run_id)
+    {
+        return None;
+    }
+    let input = parse_process_runner_tool_input(canonical_input_json).ok()?;
+    if !managed_coding_process_input_is_compatible(&input)
+        || !crate::sandbox_runner::process_runner_permits_managed_command(
+            &config.process_runner,
+            input.command.as_str(),
+        )
+    {
+        return None;
+    }
+
+    let state = Arc::clone(runtime_state);
+    let run_id = context.run_id.to_owned();
+    let command = input.command.clone();
+    let args = input.args.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        state.run_matching_managed_coding_command(run_id.as_str(), command.as_str(), &args)
+    })
+    .await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(Ok(Some(execution))) => {
+            let success =
+                execution.outcome.exit_code == Some(0) && execution.outcome.cleanup_verified;
+            let reason_codes = execution.outcome.reason_codes.clone();
+            let stdout_bytes = execution.output.safe_text.len();
+            let error = if success {
+                String::new()
+            } else {
+                reason_codes.first().cloned().unwrap_or_else(|| "coding.command_failed".to_owned())
+            };
+            let output_json = serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "exit_code": execution.outcome.exit_code,
+                "stdout": execution.output.safe_text,
+                "stderr": "",
+                "stdout_truncated": execution.output.truncated,
+                "stderr_truncated": false,
+                "stdout_redacted": execution.output.redacted,
+                "stderr_redacted": false,
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": 0,
+                "duration_ms": duration_ms,
+                "tier": "b",
+                "sandbox_backend": "managed_coding_process_supervisor",
+                "managed_coding": {
+                    "schema_version": execution.outcome.schema_version,
+                    "command_id": execution.outcome.command_id,
+                    "execution_id": execution.outcome.execution_id,
+                    "backend": execution.outcome.backend,
+                    "process_state": execution.outcome.process_state,
+                    "cleanup_verified": execution.outcome.cleanup_verified,
+                    "output_cursor": execution.output.next_cursor,
+                    "cursor_reset": execution.output.cursor_reset,
+                    "reason_codes": reason_codes,
+                    "evidence_refs": execution.outcome.evidence_refs,
+                },
+                "runtime_request": {
+                    "schema_version": 1,
+                    "notify_on_complete": false,
+                    "watch_pattern_count": 0,
+                    "provided_env_key_count": 0,
+                    "elevated_intent": false,
+                    "managed_worktree": true,
+                },
+            }))
+            .unwrap_or_else(|_| br#"{"schema_version":2,"exit_code":null}"#.to_vec());
+            Some(build_tool_execution_outcome(
+                proposal_id,
+                tool_name,
+                attested_input_json,
+                success,
+                output_json,
+                error,
+                false,
+                "managed_coding_process_supervisor".to_owned(),
+                "explicit_host_policy_managed_worktree".to_owned(),
+            ))
+        }
+        Ok(Ok(None)) => None,
+        Ok(Err(error)) => Some(build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            attested_input_json,
+            false,
+            br#"{"schema_version":2,"exit_code":null}"#.to_vec(),
+            error.to_string(),
+            false,
+            "managed_coding_process_supervisor".to_owned(),
+            "explicit_host_policy_managed_worktree".to_owned(),
+        )),
+        Err(error) => Some(build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            attested_input_json,
+            false,
+            br#"{"schema_version":2,"exit_code":null}"#.to_vec(),
+            format!("managed coding process worker failed: {error}"),
+            false,
+            "managed_coding_process_supervisor".to_owned(),
+            "explicit_host_policy_managed_worktree".to_owned(),
+        )),
+    }
+}
+
+fn managed_coding_process_input_is_compatible(
+    input: &palyra_common::process_runner_input::ProcessRunnerToolInput,
+) -> bool {
+    process_runner_cwd_uses_workspace_alias(input.cwd.as_deref())
+        && input.env.is_empty()
+        && input.prepend_path.is_empty()
+        && input.requested_egress_hosts.is_empty()
+        && input.timeout_ms.is_none()
+        && !input.background
+        && !input.notify_on_complete
+        && input.watch_patterns.is_empty()
+        && !input.interactive
+        && !input.stdin
+        && !input.pty
+        && input.port_hints.is_empty()
+        && !input.effective_lifetime_mode().is_detached_handoff()
+        && !input.keep_running_after_run
+        && input.env_profile_id.is_none()
+        && !input.elevated_intent
 }
 
 // Tracks run-owned resources so cleanup_run_resources can reap them when the run reaches a
@@ -3945,6 +4108,7 @@ pub(crate) async fn cleanup_run_resources(
     run_id: &str,
     reason: &str,
 ) -> RunCleanupSummary {
+    let has_managed_coding_run = runtime_state.has_managed_coding_run(run_id);
     let browser_session_ids = runtime_state.take_run_browser_sessions(run_id);
     let (background_processes, background_snapshot_warning) =
         match runtime_state.list_run_background_processes_for_cleanup(run_id).await {
@@ -3966,6 +4130,16 @@ pub(crate) async fn cleanup_run_resources(
         && background_processes.is_empty()
         && detached_resources.is_empty()
     {
+        let managed_coding_warning = if background_snapshot_warning.is_none() {
+            cleanup_managed_coding_runtime(runtime_state, run_id).await
+        } else if has_managed_coding_run {
+            Some(
+                "managed coding workspace retained because process ownership could not be loaded"
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         if let Err(error) = runtime_state.finalize_orchestrator_run_metadata_trace(run_id) {
             warn!(
                 run_id,
@@ -3973,7 +4147,12 @@ pub(crate) async fn cleanup_run_resources(
                 "failed to finalize metadata trace after empty run cleanup"
             );
         }
-        return RunCleanupSummary { cleanup_warning: background_snapshot_warning };
+        return RunCleanupSummary {
+            cleanup_warning: merge_cleanup_warnings(
+                managed_coding_warning,
+                background_snapshot_warning,
+            ),
+        };
     }
 
     let browser_session_count = browser_session_ids.len();
@@ -4260,6 +4439,20 @@ pub(crate) async fn cleanup_run_resources(
         }
     }
 
+    let managed_coding_warning = if !has_managed_coding_run {
+        None
+    } else if background_snapshot_warning.is_none()
+        && background_process_outcomes.iter().all(|outcome| outcome.alive_after == Some(false))
+        && detached_background_process_outcomes.iter().all(|outcome| outcome.alive == Some(false))
+    {
+        cleanup_managed_coding_runtime(runtime_state, run_id).await
+    } else {
+        warn!(run_id, "retained managed coding workspace because process cleanup was not verified");
+        Some(
+            "managed coding workspace retained because process cleanup was not verified".to_owned(),
+        )
+    };
+
     append_run_cleanup_tape_event(
         runtime_state,
         RunCleanupTapeEvent {
@@ -4293,9 +4486,36 @@ pub(crate) async fn cleanup_run_resources(
 
     RunCleanupSummary {
         cleanup_warning: merge_cleanup_warnings(
-            background_snapshot_warning,
+            merge_cleanup_warnings(managed_coding_warning, background_snapshot_warning),
             detached_background_cleanup_warning(detached_background_process_outcomes.as_slice()),
         ),
+    }
+}
+
+async fn cleanup_managed_coding_runtime(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Option<String> {
+    let state = Arc::clone(runtime_state);
+    let managed_run_id = run_id.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        state.cleanup_managed_coding_run(managed_run_id.as_str())
+    })
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            warn!(
+                run_id,
+                error = %error,
+                "failed to clean up managed coding workspace"
+            );
+            Some("managed coding workspace cleanup failed".to_owned())
+        }
+        Err(_) => {
+            warn!(run_id, "managed coding workspace cleanup worker panicked");
+            Some("managed coding workspace cleanup worker failed".to_owned())
+        }
     }
 }
 

@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/managed-coding-recovery.v1.json",
+  "title": "Palyra Managed Coding Recovery Inventory V1",
+  "description": "Bounded content-free operator inventory for managed worktrees and retained snapshots.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "worktrees",
+    "snapshots",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "worktrees": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/worktreeSummary" }
+    },
+    "snapshots": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/snapshotSummary" }
+    },
+    "reason_code": { "$ref": "#/$defs/reasonCode" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "lifecycle": {
+      "enum": [
+        "creating",
+        "active",
+        "removing",
+        "retained",
+        "failed",
+        "removed"
+      ]
+    },
+    "worktreeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "worktree_id",
+        "generation",
+        "source_repo_sha256",
+        "worktree_path_sha256",
+        "branch",
+        "base_ref",
+        "lifecycle",
+        "dirty",
+        "locked",
+        "attached_run_count",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "worktree_id": { "$ref": "#/$defs/id" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "source_repo_sha256": { "$ref": "#/$defs/sha256" },
+        "worktree_path_sha256": { "$ref": "#/$defs/sha256" },
+        "branch": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "base_ref": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "dirty": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "attached_run_count": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "created_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "updated_at_unix_ms": { "$ref": "#/$defs/timestamp" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "snapshotSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "snapshot_id",
+        "worktree_id",
+        "worktree_generation",
+        "base_commit",
+        "entry_count",
+        "total_bytes",
+        "created_at_unix_ms"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "snapshot_id": { "$ref": "#/$defs/id" },
+        "worktree_id": { "$ref": "#/$defs/id" },
+        "worktree_generation": { "type": "integer", "minimum": 1 },
+        "base_commit": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{40,64}$",
+          "maxLength": 64
+        },
+        "entry_count": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        },
+        "created_at_unix_ms": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "worktreeMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "worktree_id",
+        "generation",
+        "lifecycle",
+        "dirty",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "worktree_id": { "$ref": "#/$defs/id" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "dirty": { "type": "boolean" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "snapshotGcOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "snapshot_id",
+        "decision",
+        "force_requested",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "snapshot_id": { "$ref": "#/$defs/id" },
+        "decision": {
+          "enum": [
+            "removed",
+            "blocked_by_active_lease",
+            "retained"
+          ]
+        },
+        "force_requested": { "type": "boolean" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "worktrees_max": 512,
+    "snapshots_max": 512,
+    "snapshot_entries_max": 512,
+    "snapshot_total_bytes_max": 67108864
+  },
+  "x-palyra-prohibits": [
+    "raw_host_paths",
+    "attached_run_ids",
+    "snapshot_content",
+    "git_index_bytes",
+    "process_authority",
+    "environment_values"
+  ]
+}

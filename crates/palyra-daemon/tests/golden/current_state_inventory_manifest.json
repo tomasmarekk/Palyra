@@ -2,7 +2,7 @@
   "schema_version": 1,
   "manifest_id": "runtime_audit_manifest.v1",
   "baseline_schema_version": 1,
-  "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for roadmap drift review",
+  "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for drift review",
   "goldens": {
     "snapshot": "crates/palyra-daemon/tests/golden/current_state_inventory.json",
     "human_report": "crates/palyra-daemon/tests/golden/current_state_inventory_report.md",
@@ -31,7 +31,7 @@
       "enabled": 0,
       "preview_only": 6
     },
-    "roadmap_area_status": {
+    "product_area_status": {
       "preview": 3,
       "production": 2,
       "scaffold": 3
@@ -53,7 +53,7 @@
         "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
         "crates/palyra-daemon/src/runtime_diagnostics.rs"
       ],
-      "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+      "reason": "runtime sections, health, metrics, observability, and feature rollout payloads"
     },
     {
       "surface": "runtime_preview_controls",
@@ -143,15 +143,15 @@
   "non_goal_metrics": [
     {
       "metric": "connector_count",
-      "reason": "connector inventory growth is outside this backend runtime maturity phase"
+      "reason": "connector inventory growth is outside backend runtime maturity evaluation"
     },
     {
       "metric": "skill_count",
-      "reason": "skill inventory growth is outside this backend runtime maturity phase"
+      "reason": "skill inventory growth is outside backend runtime maturity evaluation"
     },
     {
       "metric": "provider_count",
-      "reason": "provider inventory growth is outside this backend runtime maturity phase"
+      "reason": "provider inventory growth is outside backend runtime maturity evaluation"
     }
   ],
   "verification": {
@@ -160,6 +160,6 @@
       "pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1",
       "bash scripts/dev/generate-runtime-audit-baseline.sh"
     ],
-    "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as phase success criteria"
+    "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as maturity success criteria"
   }
 }

@@ -116,7 +116,11 @@ Invoke-ContractCheck `
     -CargoArgs @("test", "-p", "palyra-policy", "explain_diagnostics_reports_safe_reason_code_and_hints", "--locked")
 Invoke-ContractCheck `
     -Label "daemon aggregate runtime ABI snapshot" `
-    -CargoArgs @("test", "-p", "palyra-daemon", "runtime_diagnostics::tests::contract_snapshot_suite_covers_phase11_abi_surfaces", "--locked")
+    -CargoArgs @("test", "-p", "palyra-daemon", "runtime_diagnostics::tests::contract_snapshot_suite_covers_plugin_abi_surfaces", "--locked")
+Invoke-ExactContractCheck `
+    -Label "managed coding compatibility snapshot" `
+    -ExpectedTest "runtime_diagnostics::tests::managed_coding_contract_snapshot_matches_golden" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "--lib", "runtime_diagnostics::tests::managed_coding_contract_snapshot_matches_golden", "--locked", "--", "--exact")
 Invoke-ExactContractCheck `
     -Label "feature rollout promotion manifest contract" `
     -ExpectedTest "feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid" `

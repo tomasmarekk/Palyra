@@ -18,7 +18,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 - Capability catalog entries: `32`
 - CLI families: `60`
-- Method registry entries: `517`
+- Method registry entries: `523`
 - Compat routes registered: `16/16`
 - Feature rollout flags: `35`
 - Runtime preview controls: `8` capabilities
@@ -28,17 +28,17 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 | Bucket | Count | Source |
 | --- | ---: | --- |
-| `production` | `2` | roadmap area source map |
-| `preview` | `3` | roadmap area source map |
+| `production` | `2` | product area source map |
+| `preview` | `3` | product area source map |
 | `disabled` | `2` | runtime_controls effective_state |
-| `scaffold` | `3` | roadmap area source map |
+| `scaffold` | `3` | product area source map |
 
 ## Source Of Truth
 
 | Surface | Source paths | Why Palyra tracks it |
 | --- | --- | --- |
 | `capability_catalog` | `crates/palyra-daemon/src/transport/http/handlers/console/auth.rs`, `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`, `crates/palyra-control-plane/src/models.rs` | public capability ids, surfaces, mutation classes, and contract paths |
-| `runtime_diagnostics` | `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`, `crates/palyra-daemon/src/runtime_diagnostics.rs` | runtime sections, health, metrics, roadmap, observability, and feature rollout payloads |
+| `runtime_diagnostics` | `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`, `crates/palyra-daemon/src/runtime_diagnostics.rs` | runtime sections, health, metrics, observability, and feature rollout payloads |
 | `runtime_preview_controls` | `crates/palyra-daemon/src/runtime_preview_controls.rs`, `crates/palyra-common/src/runtime_preview.rs`, `crates/palyra-daemon/src/config/schema.rs` | preview capability modes, rollout gates, activation blockers, and shared wire names |
 | `feature_rollout_maturity` | `crates/palyra-daemon/src/feature_rollout_maturity.rs`, `crates/palyra-daemon/src/feature_rollout_maturity/manifest.rs`, `crates/palyra-daemon/src/feature_rollout_maturity/manifest/state_validation.rs`, `crates/palyra-daemon/src/feature_usage.rs`, `crates/palyra-daemon/src/config/schema.rs`, `infra/release/feature-rollout-promotions.json`, `schemas/json/common/feature-rollout-promotion-manifest.v1.json`, `crates/palyra-daemon/tests/current_state_inventory.rs` | rollout contract, execution, promotion, observed usage, support lifecycle, and evidence gates |
 | `method_registry` | `crates/palyra-daemon/src/method_registry.rs`, `crates/palyra-daemon/src/transport/http/router.rs`, `crates/palyra-daemon/src/access_control.rs` | public method descriptors, route scopes, schema hashes, streaming flags, and idempotency support |
@@ -46,15 +46,15 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 | `cli_families` | `crates/palyra-cli/tests/cli_parity_matrix.toml`, `crates/palyra-cli/tests/cli_parity_report.md` | top-level CLI families and parity status used by operator handoff surfaces |
 | `execution_backends` | `crates/palyra-daemon/src/execution_backends.rs`, `crates/palyra-daemon/src/application/tool_runtime` | local, desktop, Docker, networked worker, and SSH backend posture |
 
-## Roadmap Area Map
+## Product Area Map
 
 | Area | Status | Evidence | Reason |
 | --- | --- | --- | --- |
 | `api` | `production` | `/console/v1/control-plane/capabilities`, `/v1/models`, `/v1/chat/completions`, `/v1/responses` | console and compat routes are registered in the live daemon harness |
-| `mcp` | `scaffold` | `cli family: mcp`, `roadmap phase 5` | MCP serve is discoverable, while external MCP import/supervision remains roadmap work |
+| `mcp` | `scaffold` | `cli family: mcp`, `runtime mode: scaffold` | MCP serve is discoverable, while external MCP import and supervision are unavailable |
 | `subagents` | `preview` | `runtime_controls.auxiliary_executor`, `cli: sessions subagents`, `session snapshot subagent_records` | delegated work and durable subagent record projections exist behind preview controls |
 | `execution_backends` | `preview` | `execution_backends`, `runtime_controls.networked_workers` | local sandbox is available, while remote backends and workers remain gated or disabled |
-| `qa_lab` | `scaffold` | `runtime_roadmap.phase0_harness`, `fixtures/golden/release_eval_inventory.json` | regression fixtures exist before the dedicated QA Lab manifest and runner |
+| `qa_lab` | `scaffold` | `runtime QA fixtures`, `fixtures/golden/release_eval_inventory.json` | regression fixtures exist before the dedicated QA Lab manifest and runner |
 | `hooks` | `preview` | `capability: hooks`, `cli family: hooks` | basic hook operability is exposed before the full agent hook taxonomy |
 | `observability` | `production` | `/console/v1/diagnostics`, `runtime_health`, `agent_runtime_metrics`, `opentelemetry` | diagnostics and metrics sections are emitted by the live daemon harness |
 | `provider_recovery` | `scaffold` | `feature_rollouts.provider_stream_normalizer`, `feature_rollouts.tool_repair` | recovery flags are visible but default-off before classifier and stream-normalizer work |

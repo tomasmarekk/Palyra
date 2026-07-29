@@ -706,6 +706,30 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/networked-workers/{worker_id}/force-cleanup",
             post(console::diagnostics::console_networked_worker_force_cleanup_handler),
         )
+        .route(
+            "/console/v1/coding/recovery",
+            get(console::managed_coding::console_managed_coding_recovery_inventory_handler),
+        )
+        .route(
+            "/console/v1/coding/snapshots/{snapshot_id}",
+            get(console::managed_coding::console_managed_coding_snapshot_handler),
+        )
+        .route(
+            "/console/v1/coding/snapshots/{snapshot_id}/restore",
+            post(console::managed_coding::console_managed_coding_snapshot_restore_handler),
+        )
+        .route(
+            "/console/v1/coding/snapshots/{snapshot_id}/gc",
+            post(console::managed_coding::console_managed_coding_snapshot_gc_handler),
+        )
+        .route(
+            "/console/v1/coding/worktrees/{worktree_id}/retain",
+            post(console::managed_coding::console_managed_coding_worktree_retain_handler),
+        )
+        .route(
+            "/console/v1/coding/worktrees/{worktree_id}/force-cleanup",
+            post(console::managed_coding::console_managed_coding_worktree_cleanup_handler),
+        )
         .route("/console/v1/doctor/jobs", get(console::doctor::console_doctor_jobs_list_handler))
         .route("/console/v1/doctor/jobs", post(console::doctor::console_doctor_job_create_handler))
         .route(

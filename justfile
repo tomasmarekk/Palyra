@@ -106,6 +106,9 @@ push-gate-full:
 deterministic-soak:
     bash scripts/test/run-deterministic-soak.sh
 
+coding-runtime-soak:
+    bash scripts/test/run-coding-runtime-soak.sh
+
 performance-smoke:
     bash scripts/test/run-performance-smoke.sh
 

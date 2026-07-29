@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/coding-command-status.v2.json",
+  "title": "Palyra Coding Command Status V2",
+  "description": "Bounded poll result for one non-blocking command admitted from host-owned policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "handle",
+    "outcome",
+    "failure_reason_code"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "handle": { "$ref": "#/$defs/handle" },
+    "outcome": {
+      "oneOf": [
+        { "$ref": "#/$defs/outcome" },
+        { "type": "null" }
+      ]
+    },
+    "failure_reason_code": {
+      "oneOf": [
+        { "$ref": "#/$defs/reasonCode" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "evidenceRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.:/-]*$"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "backend": {
+      "enum": [
+        "process",
+        "native_pty",
+        "process_without_pty"
+      ]
+    },
+    "ptyBackend": {
+      "enum": [
+        "unix_pty",
+        "windows_con_pty"
+      ]
+    },
+    "processState": {
+      "enum": [
+        "running",
+        "draining",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "cleanup_failed",
+        "orphaned"
+      ]
+    },
+    "reasonCodes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/reasonCode" }
+    },
+    "waitBarrier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "barrier_id",
+        "process_session_id",
+        "reason_code"
+      ],
+      "properties": {
+        "barrier_id": { "$ref": "#/$defs/id" },
+        "process_session_id": { "$ref": "#/$defs/id" },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "handle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_id",
+        "command_id",
+        "execution_id",
+        "backend",
+        "pty_backend",
+        "lifecycle",
+        "wait_barrier",
+        "reason_codes"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "task_id": { "$ref": "#/$defs/id" },
+        "command_id": { "$ref": "#/$defs/id" },
+        "execution_id": { "$ref": "#/$defs/id" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "pty_backend": {
+          "oneOf": [
+            { "$ref": "#/$defs/ptyBackend" },
+            { "type": "null" }
+          ]
+        },
+        "lifecycle": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "wait_barrier": {
+          "oneOf": [
+            { "$ref": "#/$defs/waitBarrier" },
+            { "type": "null" }
+          ]
+        },
+        "reason_codes": { "$ref": "#/$defs/reasonCodes" }
+      }
+    },
+    "wake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "barrier_id",
+        "wake_intent_count",
+        "reason_code"
+      ],
+      "properties": {
+        "barrier_id": { "$ref": "#/$defs/id" },
+        "wake_intent_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_id",
+        "command_id",
+        "backend",
+        "pty_backend",
+        "execution_id",
+        "process_state",
+        "exit_code",
+        "cleanup_verified",
+        "output_truncated",
+        "wake",
+        "evidence_refs",
+        "reason_codes"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "task_id": { "$ref": "#/$defs/id" },
+        "command_id": { "$ref": "#/$defs/id" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "pty_backend": {
+          "oneOf": [
+            { "$ref": "#/$defs/ptyBackend" },
+            { "type": "null" }
+          ]
+        },
+        "execution_id": { "$ref": "#/$defs/id" },
+        "process_state": {
+          "oneOf": [
+            { "$ref": "#/$defs/processState" },
+            { "type": "null" }
+          ]
+        },
+        "exit_code": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": -9223372036854775808,
+              "maximum": 9223372036854775807
+            },
+            { "type": "null" }
+          ]
+        },
+        "cleanup_verified": { "type": "boolean" },
+        "output_truncated": { "type": "boolean" },
+        "wake": {
+          "oneOf": [
+            { "$ref": "#/$defs/wake" },
+            { "type": "null" }
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "reason_codes": { "$ref": "#/$defs/reasonCodes" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "evidence_refs_max": 64,
+    "reason_codes_max": 32,
+    "wake_intents_max": 64
+  },
+  "x-palyra-prohibits": [
+    "caller_supplied_commands",
+    "raw_process_output",
+    "raw_terminal_output",
+    "environment_values"
+  ]
+}

@@ -71,7 +71,7 @@ const DEFAULT_REPLAY_MAX_EVENTS_PER_RUN: usize = 128;
 const DEFAULT_NETWORKED_WORKERS_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
 const DEFAULT_NETWORKED_WORKERS_LEASE_TTL_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_NETWORKED_WORKERS_REQUIRE_ATTESTATION: bool = true;
-const DEFAULT_ROADMAP_PREVIEW_SECTION_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
+const DEFAULT_RUNTIME_PREVIEW_SECTION_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
 const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
 const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
 const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -178,12 +178,12 @@ pub struct LoadedConfig {
     pub delivery_arbitration: DeliveryArbitrationConfig,
     pub replay_capture: ReplayCaptureConfig,
     pub networked_workers: NetworkedWorkersConfig,
-    pub api_facade: RoadmapPreviewSectionConfig,
+    pub api_facade: RuntimePreviewSectionConfig,
     pub mcp_servers: McpServersConfig,
     pub execution_backend_profiles: ExecutionBackendProfilesConfig,
-    pub qa_lab: RoadmapPreviewSectionConfig,
+    pub qa_lab: RuntimePreviewSectionConfig,
     pub observability_exporters: ObservabilityExportersConfig,
-    pub hook_policy: RoadmapPreviewSectionConfig,
+    pub hook_policy: RuntimePreviewSectionConfig,
     pub agent_harness_registry: AgentHarnessRegistryConfig,
     pub doctor_check_registry: DoctorCheckRegistryConfig,
     pub cron: CronConfig,
@@ -727,16 +727,16 @@ impl Default for NetworkedWorkersConfig {
     }
 }
 
-/// Minimal preview section used for roadmap areas that are declared in config
+/// Minimal preview section used for runtime areas that are declared in config
 /// before their runtime implementation is allowed to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoadmapPreviewSectionConfig {
+pub struct RuntimePreviewSectionConfig {
     pub mode: RuntimePreviewMode,
 }
 
-impl Default for RoadmapPreviewSectionConfig {
+impl Default for RuntimePreviewSectionConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE }
     }
 }
 
@@ -750,7 +750,7 @@ pub struct McpServersConfig {
 
 impl Default for McpServersConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, servers: Vec::new() }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE, servers: Vec::new() }
     }
 }
 
@@ -879,7 +879,7 @@ pub struct ExecutionBackendProfilesConfig {
 
 impl Default for ExecutionBackendProfilesConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, profiles: Vec::new() }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE, profiles: Vec::new() }
     }
 }
 
@@ -953,7 +953,7 @@ pub struct ObservabilityExportersConfig {
 
 impl Default for ObservabilityExportersConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, exporters: Vec::new() }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE, exporters: Vec::new() }
     }
 }
 
@@ -974,7 +974,7 @@ pub struct AgentHarnessRegistryConfig {
 
 impl Default for AgentHarnessRegistryConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, harnesses: Vec::new() }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE, harnesses: Vec::new() }
     }
 }
 
@@ -1052,7 +1052,7 @@ pub struct DoctorCheckRegistryConfig {
 
 impl Default for DoctorCheckRegistryConfig {
     fn default() -> Self {
-        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, checks: Vec::new() }
+        Self { mode: DEFAULT_RUNTIME_PREVIEW_SECTION_MODE, checks: Vec::new() }
     }
 }
 
@@ -1122,6 +1122,7 @@ pub struct ToolCallConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeIntelConfig {
     pub enabled: bool,
+    pub allow_network: bool,
     pub workspace_root: Option<PathBuf>,
     pub rust_analyzer_binary: String,
     pub typescript_server_binary: String,
@@ -1421,6 +1422,7 @@ impl Default for CodeIntelConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_network: false,
             workspace_root: None,
             rust_analyzer_binary: "rust-analyzer".to_owned(),
             typescript_server_binary: "typescript-language-server".to_owned(),

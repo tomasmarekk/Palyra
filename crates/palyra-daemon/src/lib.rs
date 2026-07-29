@@ -116,7 +116,7 @@ mod wasm_plugin_runner;
 mod webhooks;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     fs,
     net::{IpAddr, SocketAddr},
@@ -2280,6 +2280,167 @@ fn supervise_lifecycle_subsystem_task(
     }))
 }
 
+fn spawn_managed_coding_lifecycle(
+    runtime: Arc<GatewayRuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
+        loop {
+            let phase = lifecycle.borrow().phase;
+            if matches!(
+                phase,
+                application::daemon_lifecycle::DaemonLifecyclePhase::DrainingSubsystems
+                    | application::daemon_lifecycle::DaemonLifecyclePhase::ShutdownRequested
+            ) {
+                break;
+            }
+            if lifecycle.changed().await.is_err() {
+                return;
+            }
+        }
+        let shutdown_runtime = Arc::clone(&runtime);
+        match tokio::task::spawn_blocking(move || {
+            shutdown_runtime.shutdown_managed_coding_services()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "managed coding services did not drain cleanly");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "managed coding drain worker failed");
+            }
+        }
+    })
+}
+
+fn managed_coding_command_environment() -> BTreeMap<String, String> {
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "TMP",
+        "TEMP",
+        "SYSTEMROOT",
+        "COMSPEC",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_owned(), value)))
+    .collect()
+}
+
+fn managed_coding_command_policies() -> Vec<application::coding_runtime::CodingCommandPolicyV2> {
+    use application::local_resource_governor::ResourceUnitsV1;
+
+    let environment = managed_coding_command_environment();
+    let resources = ResourceUnitsV1 {
+        processes: 1,
+        memory_bytes: 2 * 1024 * 1024 * 1024,
+        file_descriptors: 256,
+        sockets: 0,
+        spool_bytes: 16 * 1024 * 1024,
+        concurrency: 1,
+    };
+    let mut policies = Vec::new();
+    if let Some(cargo) = application::managed_coding_services::resolve_trusted_executable("cargo") {
+        for (command_id, args) in [
+            ("rust-check", vec!["check", "--workspace", "--locked"]),
+            ("rust-test", vec!["test", "--workspace", "--locked"]),
+        ] {
+            policies.push(application::coding_runtime::CodingCommandPolicyV2 {
+                command_id: command_id.to_owned(),
+                executable: cargo.clone(),
+                args: args.into_iter().map(str::to_owned).collect(),
+                env: environment.clone(),
+                requires_terminal: false,
+                timeout: Duration::from_secs(30 * 60),
+                no_output_timeout: Some(Duration::from_secs(5 * 60)),
+                resource_units: resources,
+            });
+        }
+    }
+    if let Some(npm) = application::managed_coding_services::resolve_trusted_executable("npm") {
+        policies.push(application::coding_runtime::CodingCommandPolicyV2 {
+            command_id: "typescript-check".to_owned(),
+            executable: npm,
+            args: vec!["run".to_owned(), "check".to_owned(), "--if-present".to_owned()],
+            env: environment.clone(),
+            requires_terminal: false,
+            timeout: Duration::from_secs(15 * 60),
+            no_output_timeout: Some(Duration::from_secs(5 * 60)),
+            resource_units: resources,
+        });
+    }
+    let python = application::managed_coding_services::resolve_trusted_executable("python")
+        .or_else(|| application::managed_coding_services::resolve_trusted_executable("python3"));
+    if let Some(python) = python {
+        policies.push(application::coding_runtime::CodingCommandPolicyV2 {
+            command_id: "python-check".to_owned(),
+            executable: python.clone(),
+            args: vec!["-m".to_owned(), "compileall".to_owned(), "-q".to_owned(), ".".to_owned()],
+            env: environment.clone(),
+            requires_terminal: false,
+            timeout: Duration::from_secs(10 * 60),
+            no_output_timeout: Some(Duration::from_secs(2 * 60)),
+            resource_units: resources,
+        });
+        policies.push(application::coding_runtime::CodingCommandPolicyV2 {
+            command_id: "python-repl".to_owned(),
+            executable: python,
+            args: vec!["-q".to_owned()],
+            env: environment,
+            requires_terminal: true,
+            timeout: Duration::from_secs(30 * 60),
+            no_output_timeout: None,
+            resource_units: resources,
+        });
+    }
+    policies
+}
+
+fn managed_coding_lsp_policies(
+    code_intel: &config::CodeIntelConfig,
+) -> Vec<application::lsp_workspace_supervisor::LspServerCommandPolicyV2> {
+    use application::lsp_workspace_supervisor::{LspLanguageV2, LspServerCommandPolicyV2};
+
+    if !code_intel.enabled {
+        return Vec::new();
+    }
+    [
+        (LspLanguageV2::Rust, code_intel.rust_analyzer_binary.as_str(), Vec::new()),
+        (
+            LspLanguageV2::TypeScript,
+            code_intel.typescript_server_binary.as_str(),
+            vec!["--stdio".to_owned()],
+        ),
+        (LspLanguageV2::Python, code_intel.pyright_binary.as_str(), vec!["--stdio".to_owned()]),
+    ]
+    .into_iter()
+    .filter_map(|(language, configured, args)| {
+        let executable =
+            application::managed_coding_services::resolve_trusted_configured_executable(
+                configured,
+            )?;
+        let toolchain_fingerprint =
+            application::managed_coding_services::executable_fingerprint(executable.as_path())
+                .ok()?;
+        Some(LspServerCommandPolicyV2 {
+            language,
+            executable,
+            args,
+            env: managed_coding_command_environment(),
+            toolchain_fingerprint,
+            network_allowed: code_intel.allow_network,
+        })
+    })
+    .collect()
+}
+
 fn spawn_networked_worker_expiry_loop(
     runtime: Arc<GatewayRuntimeState>,
 ) -> tokio::task::JoinHandle<()> {
@@ -2686,6 +2847,44 @@ pub async fn run() -> Result<()> {
     }
     #[rustfmt::skip]
     let external_retrieval_index = Arc::new(ExternalRetrievalRuntime::default());
+    let trusted_git = application::managed_coding_services::resolve_trusted_executable("git");
+    let trusted_git_missing = trusted_git.is_none();
+    let managed_coding_services = trusted_git.and_then(|git_executable| {
+        let state_parent = loaded.storage.journal_db_path.parent()?;
+        let state_root = state_parent.join("managed-coding-runtime");
+        let lsp_policies = managed_coding_lsp_policies(&loaded.tool_call.code_intel);
+        match application::managed_coding_services::ManagedCodingRuntimeServices::open(
+            application::managed_coding_services::ManagedCodingServicesConfig {
+                managed_worktree_root: state_root.join("worktrees"),
+                state_root,
+                git_executable,
+                profile: application::coding_runtime::CodingExecutionProfileV2 {
+                    managed_worktree_enabled: true,
+                    in_place_workspace_fallback_allowed: false,
+                    persistent_lsp_enabled: loaded.tool_call.code_intel.enabled,
+                    cli_diagnostics_fallback_allowed: true,
+                    native_pty_enabled: true,
+                    process_fallback_without_pty_allowed: true,
+                    retain_dirty_worktrees: true,
+                },
+                command_policies: managed_coding_command_policies(),
+                lsp_policies,
+                // Denied-network policies remain configured but degrade to
+                // CLI verification until a host isolation backend is proven.
+                lsp_network_isolation_verified: false,
+                lsp_idle_ttl: Duration::from_millis(loaded.tool_call.code_intel.idle_reap_ms),
+            },
+        ) {
+            Ok(services) => Some(Arc::new(services)),
+            Err(error) => {
+                warn!(error = %error, "managed coding runtime is unavailable");
+                None
+            }
+        }
+    });
+    if managed_coding_services.is_none() && trusted_git_missing {
+        warn!("managed coding runtime is unavailable because trusted Git was not resolved");
+    }
     let runtime = GatewayRuntimeState::new_with_provider(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
@@ -2849,6 +3048,7 @@ pub async fn run() -> Result<()> {
             conversation_bindings,
             fault_injection: qa_fault_runtime,
             runtime_kernel_dispatcher,
+            managed_coding_services,
         },
     )
     .context("failed to initialize gateway runtime state")?;
@@ -3360,6 +3560,11 @@ pub async fn run() -> Result<()> {
         &runtime,
         application::daemon_lifecycle::LifecycleSubsystem::RuntimeHealth,
         spawn_runtime_health_reconciliation_loop(runtime.clone()),
+    )?;
+    let _managed_coding_lifecycle_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::ManagedCoding,
+        spawn_managed_coding_lifecycle(runtime.clone()),
     )?;
     let _process_lease_reconciliation_task = supervise_lifecycle_subsystem_task(
         &runtime,
@@ -5745,7 +5950,7 @@ mod tests {
             .expect("default onboarding payload should parse");
         assert!(
             matches!(plan.inbound_scope, DiscordOnboardingScope::DmOnly),
-            "M45 onboarding should default to DM-only scope"
+            "onboarding should default to DM-only scope"
         );
         assert!(plan.require_mention, "safe baseline should require mention by default");
         assert!(
