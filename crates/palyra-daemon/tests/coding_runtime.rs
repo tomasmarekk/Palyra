@@ -775,9 +775,13 @@ fn lsp_config(root: &Path) -> LspWorkspaceSupervisorConfig {
 }
 
 fn lsp_policy(language: LspLanguageV2) -> LspServerCommandPolicyV2 {
-    let mut env = BTreeMap::from([("PALYRA_LSP_FIXTURE_MODE".to_owned(), "normal".to_owned())]);
+    let env = BTreeMap::from([("PALYRA_LSP_FIXTURE_MODE".to_owned(), "normal".to_owned())]);
     #[cfg(windows)]
-    env.extend(windows_environment());
+    let env = {
+        let mut env = env;
+        env.extend(windows_environment());
+        env
+    };
     LspServerCommandPolicyV2 {
         language,
         executable: PathBuf::from(env!("CARGO_BIN_EXE_palyra-lsp-fixture")),
