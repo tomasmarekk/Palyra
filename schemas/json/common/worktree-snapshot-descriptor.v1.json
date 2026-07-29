@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/worktree-snapshot-descriptor.v1.json",
+  "title": "Palyra Worktree Snapshot Descriptor V1",
+  "description": "Bounded metadata for a lossless owner-only dirty-worktree snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "worktree_id",
+    "worktree_generation",
+    "base_commit",
+    "index_sha256",
+    "index_artifact_file",
+    "entries",
+    "total_bytes",
+    "created_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "snapshot_id": { "$ref": "#/$defs/id" },
+    "worktree_id": { "$ref": "#/$defs/id" },
+    "worktree_generation": { "$ref": "#/$defs/u64" },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{40,64}$",
+      "maxLength": 64
+    },
+    "index_sha256": { "$ref": "#/$defs/sha256" },
+    "index_artifact_file": { "$ref": "#/$defs/artifactFile" },
+    "entries": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "total_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 67108864
+    },
+    "created_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "maxLength": 64
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "artifactFile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "exists",
+        "size_bytes",
+        "content_sha256",
+        "artifact_file",
+        "unix_mode",
+        "readonly"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "kind": {
+          "enum": [
+            "tracked",
+            "allowed_untracked"
+          ]
+        },
+        "exists": { "type": "boolean" },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8388608
+        },
+        "content_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "artifact_file": {
+          "oneOf": [
+            { "$ref": "#/$defs/artifactFile" },
+            { "type": "null" }
+          ]
+        },
+        "unix_mode": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            { "type": "null" }
+          ]
+        },
+        "readonly": { "type": "boolean" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "entries_max": 512,
+    "file_bytes_max": 8388608,
+    "snapshot_bytes_max": 67108864
+  },
+  "x-palyra-prohibits": [
+    "ignored_paths",
+    "symlinks",
+    "nested_repositories",
+    "sensitive_paths",
+    "secret_like_content"
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/worktree-restore-report.v1.json",
+  "title": "Palyra Worktree Restore Report V1",
+  "description": "Bounded verification evidence for restoring a worktree snapshot and its exact Git index.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "worktree_id",
+    "base_commit",
+    "restored_paths",
+    "index_restored",
+    "completed_at_unix_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "snapshot_id": { "$ref": "#/$defs/id" },
+    "worktree_id": { "$ref": "#/$defs/id" },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{40,64}$",
+      "maxLength": 64
+    },
+    "restored_paths": {
+      "type": "array",
+      "maxItems": 512,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relativePath" }
+    },
+    "index_restored": { "type": "boolean" },
+    "completed_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    }
+  },
+  "x-palyra-limits": {
+    "restored_paths_max": 512
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.local/common/managed-worktree-registry.v2.json",
+  "title": "Palyra Managed Worktree Registry V2",
+  "description": "Bounded durable records for host-managed Git worktrees and their mutation generations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "updated_at_unix_ms",
+    "records"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "updated_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "records": {
+      "type": "object",
+      "maxProperties": 512,
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": { "$ref": "#/$defs/record" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": ".*\\S.*"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "pattern": ".*\\S.*"
+    },
+    "reasonCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "worktree_id",
+        "generation",
+        "source_repo",
+        "worktree_path",
+        "branch",
+        "base_ref",
+        "lifecycle",
+        "dirty",
+        "locked_by_run",
+        "attached_run_ids",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "worktree_id": { "$ref": "#/$defs/id" },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "source_repo": { "$ref": "#/$defs/path" },
+        "worktree_path": { "$ref": "#/$defs/path" },
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "base_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lifecycle": {
+          "enum": [
+            "creating",
+            "active",
+            "removing",
+            "retained",
+            "failed",
+            "removed"
+          ]
+        },
+        "dirty": { "type": "boolean" },
+        "locked_by_run": {
+          "oneOf": [
+            { "$ref": "#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
+        "attached_run_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "created_at_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason_code": { "$ref": "#/$defs/reasonCode" }
+      }
+    }
+  },
+  "x-palyra-limits": {
+    "records_max": 512,
+    "attached_runs_per_worktree_max": 64
+  },
+  "x-palyra-prohibits": [
+    "symlink_targets",
+    "serialized_live_git_processes"
+  ]
+}
