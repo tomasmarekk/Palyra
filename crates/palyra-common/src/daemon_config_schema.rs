@@ -1988,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_preview_sections_parse_expected_fields() {
+    fn execution_preview_sections_parse_expected_fields() {
         let parsed: RootFileConfig = toml::from_str(
             r#"
             [session_queue_policy]
@@ -2083,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_preview_sections_parse_expected_fields() {
+    fn runtime_service_preview_sections_parse_expected_fields() {
         let parsed: RootFileConfig = toml::from_str(
             r#"
             [api_facade]
