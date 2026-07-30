@@ -1136,12 +1136,13 @@ pub(crate) fn spawn_managed_stdio_process(
     })?;
     let child = ManagedChildGuard::new(child);
     #[cfg(windows)]
-    let mut child = prepare_windows_background_child(child)?;
+    let mut child = bind_windows_background_child(child)?;
     #[cfg(not(windows))]
     let mut child = child;
     let pid = child.id();
-    // A short-lived command can exit after its start token is read but before `/proc/<pid>/exe`
-    // is resolved, so Unix provenance uses the validated launch image hashed before spawning.
+    // A short-lived Unix command can exit after its start token is read but before its image
+    // metadata is resolved, so use the validated launch image hashed before spawning. Windows
+    // keeps the child suspended below and verifies the actual loaded image instead.
     #[cfg(unix)]
     let trusted_executable_sha256 = Some(executable_sha256.as_str());
     #[cfg(not(unix))]
@@ -1158,6 +1159,20 @@ pub(crate) fn spawn_managed_stdio_process(
             return Err(error);
         }
     };
+    // Windows launches the child suspended and binds the kill-on-close job first. Keeping the
+    // initial thread suspended through provenance capture prevents short-lived commands from
+    // exiting before their exact ownership identity is durably available.
+    #[cfg(windows)]
+    if let Err(resume_error) = resume_windows_background_child(&child) {
+        let cleanup = terminate_background_child(child);
+        remove_windows_background_job(pid);
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "managed stdio runtime {pid} could not resume after provenance capture: {resume_error}; bounded owned-tree cleanup verification: {cleanup:?}"
+            ),
+        });
+    }
     let stdin = child
         .child_mut()
         .stdin
