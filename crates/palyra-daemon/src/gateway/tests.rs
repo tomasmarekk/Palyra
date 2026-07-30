@@ -86,6 +86,10 @@ use ulid::Ulid;
 
 use super::vault::vault_get_requires_approval;
 
+// These bounds catch deadlocks without treating loaded cross-platform test scheduling as a
+// performance assertion.
+const ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[test]
 fn provider_attempt_admission_exhaustion_maps_to_resource_exhausted() {
     let error = ProviderError::RequestFailed {
@@ -2292,7 +2296,7 @@ async fn grpc_run_stream_provider_supersession_suppresses_stale_output_and_settl
         events
     });
 
-    tokio::time::timeout(Duration::from_secs(5), stale_started_rx.recv())
+    tokio::time::timeout(ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT, stale_started_rx.recv())
         .await
         .expect("generation N should start before timeout")
         .expect("generation N start signal should arrive");
@@ -2308,14 +2312,15 @@ async fn grpc_run_stream_provider_supersession_suppresses_stale_output_and_settl
     assert!(replacement_generation > stale_generation);
     stale_release.notify_one();
 
-    let events = tokio::time::timeout(Duration::from_secs(10), collector)
+    let events = tokio::time::timeout(ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT, collector)
         .await
         .expect("RunStream should complete after provider replacement")
         .expect("RunStream collector should join");
-    let replacement_request = tokio::time::timeout(Duration::from_secs(5), replacement_rx.recv())
-        .await
-        .expect("generation N+1 should receive one request")
-        .expect("generation N+1 request should arrive");
+    let replacement_request =
+        tokio::time::timeout(ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT, replacement_rx.recv())
+            .await
+            .expect("generation N+1 should receive one request")
+            .expect("generation N+1 request should arrive");
     assert_eq!(replacement_request.model_override.as_deref(), Some("gpt-4o-mini"));
     assert!(replacement_rx.try_recv().is_err(), "generation N+1 must be called exactly once");
 
@@ -8671,7 +8676,8 @@ async fn dispatch_node_worker_failure_case(
     let worker_runtime_state = Arc::clone(&state);
     let worker_id_for_task = worker_id.clone();
     let remote_worker = tokio::spawn(async move {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT;
+        loop {
             if let Some(dispatch) = worker_node_runtime
                 .next_capability_dispatch(
                     worker_id_for_task.as_str(),
@@ -8768,9 +8774,12 @@ async fn dispatch_node_worker_failure_case(
                 }
                 return (dispatch.request_id, remote_request_id);
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote worker did not receive node dispatch"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("remote worker did not receive node dispatch");
     });
 
     let outcome = super::execute_tool_with_runtime_dispatch(
