@@ -17406,8 +17406,10 @@ mod tests {
             .expect("unreaped child identity lookup should succeed")
             .expect("unreaped child should retain its stable identity");
         assert!(start_token.starts_with("macos:"));
-        super::verify_live_ownership_anchor(pid)
-            .expect("unreaped managed child should retain its ownership anchors");
+        let repeated_start_token = super::current_process_start_token(pid)
+            .expect("repeated unreaped child identity lookup should succeed")
+            .expect("unreaped child should retain its stable identity");
+        assert_eq!(repeated_start_token, start_token);
 
         let status = child
             .wait_for_exit(Duration::from_secs(5))
