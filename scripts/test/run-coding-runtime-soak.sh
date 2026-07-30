@@ -13,7 +13,11 @@ if [[ ! "$ITERATIONS" =~ ^[0-9]+$ ]] || ((ITERATIONS < 1 || ITERATIONS > 64)); t
 fi
 
 cd "$ROOT_DIR"
+if [[ "$REPORT_PATH" != /* ]]; then
+  REPORT_PATH="$ROOT_DIR/$REPORT_PATH"
+fi
 mkdir -p "$(dirname "$REPORT_PATH")"
+REPORT_PATH="$(cd "$(dirname "$REPORT_PATH")" && pwd)/$(basename "$REPORT_PATH")"
 export PALYRA_CODING_RUNTIME_SOAK_ITERATIONS="$ITERATIONS"
 export PALYRA_CODING_RUNTIME_SOAK_REPORT="$REPORT_PATH"
 

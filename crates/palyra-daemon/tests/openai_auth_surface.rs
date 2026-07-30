@@ -3367,7 +3367,12 @@ fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &str) ->
 }
 
 fn http_client() -> Result<Client> {
-    Client::builder().timeout(Duration::from_secs(4)).build().context("failed to build HTTP client")
+    // Compat run waits allow a five-second server deadline, so the test
+    // transport must outlive it even when a shared CI runner is saturated.
+    Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")
 }
 
 fn get_console_json(client: &Client, admin_port: u16, path: &str, cookie: &str) -> Result<Value> {
