@@ -2126,9 +2126,19 @@ fn current_process_start_token(pid: u32) -> io::Result<Option<String>> {
     let mut information = std::mem::MaybeUninit::<MacProcessUniqueInfo>::zeroed();
     let information_size = i32::try_from(std::mem::size_of::<MacProcessUniqueInfo>())
         .map_err(|_| io::Error::other("macOS process identity buffer is invalid"))?;
+    // A managed child may finish before provenance capture while its retained `Child` still
+    // reserves the exact PID. Darwin moves that unreaped process to `zombproc`; a nonzero
+    // argument makes PROC_PIDUNIQIDENTIFIERINFO search both live and zombie records, preserving
+    // the kernel-issued unique identity without synthesizing a reusable numeric-PID token.
     // SAFETY: the buffer exactly matches PROC_PIDUNIQIDENTIFIERINFO's fixed ABI.
     let read = unsafe {
-        macos_proc_pidinfo(process_id, 17, 0, information.as_mut_ptr().cast(), information_size)
+        macos_proc_pidinfo(
+            process_id,
+            17,
+            MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
+            information.as_mut_ptr().cast(),
+            information_size,
+        )
     };
     if read <= 0 {
         let error = io::Error::last_os_error();
@@ -17353,6 +17363,57 @@ mod tests {
             .expect_err("a full libproc buffer must remain ambiguous")
             .to_string()
             .contains("capacity"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_start_token_includes_unreaped_short_lived_children() {
+        let mut command = Command::new("/usr/bin/true");
+        super::configure_managed_stdio_process_ownership(&mut command);
+        let mut child = ManagedChildGuard::new_reap_only(
+            command.spawn().expect("short-lived managed child should spawn"),
+        );
+        let pid = child.id();
+        let process_id = super::unix_pid_from_u32(pid).expect("child pid should fit pid_t");
+        let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .expect("macOS process information size should fit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            // SAFETY: the exact child remains unreaped and `information` is the fixed writable
+            // PROC_PIDTBSDINFO ABI buffer for the validated positive PID.
+            let read = unsafe {
+                super::macos_proc_pidinfo(
+                    process_id,
+                    libc::PROC_PIDTBSDINFO,
+                    super::MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
+                    information.as_mut_ptr().cast(),
+                    information_size,
+                )
+            };
+            if read == information_size {
+                // SAFETY: proc_pidinfo reported a complete fixed-size structure.
+                let information = unsafe { information.assume_init() };
+                if information.pbi_status == libc::SZOMB {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "short-lived child should become a zombie");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let start_token = super::current_process_start_token(pid)
+            .expect("unreaped child identity lookup should succeed")
+            .expect("unreaped child should retain its stable identity");
+        assert!(start_token.starts_with("macos:"));
+        super::verify_live_ownership_anchor(pid)
+            .expect("unreaped managed child should retain its ownership anchors");
+
+        let status = child
+            .wait_for_exit(Duration::from_secs(5))
+            .expect("short-lived child reap should succeed")
+            .expect("short-lived child should be waitable");
+        assert!(status.success());
     }
 
     #[cfg(target_os = "macos")]
