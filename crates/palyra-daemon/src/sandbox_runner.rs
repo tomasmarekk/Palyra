@@ -2014,12 +2014,22 @@ fn verify_live_ownership_anchor(pid: u32) -> io::Result<()> {
     // SAFETY: getpgid reads process metadata for a validated positive pid.
     let process_group_id = unsafe { libc::getpgid(process_id) };
     if process_group_id < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return verify_macos_zombie_ownership_anchor(pid);
+        }
+        return Err(error);
     }
     // SAFETY: getsid reads process metadata for a validated positive pid.
     let session_id = unsafe { libc::getsid(process_id) };
     if session_id < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return verify_macos_zombie_ownership_anchor(pid);
+        }
+        return Err(error);
     }
     if process_group_id == process_id && session_id == process_id {
         return Ok(());
@@ -2027,6 +2037,42 @@ fn verify_live_ownership_anchor(pid: u32) -> io::Result<()> {
     Err(io::Error::other(format!(
         "pid {pid} has process group {process_group_id} and session {session_id}, expected both anchors to equal {pid}"
     )))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_zombie_ownership_anchor(pid: u32) -> io::Result<()> {
+    let process_id = unix_pid_from_u32(pid)?;
+    let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| io::Error::other("macOS process information buffer is invalid"))?;
+    // Darwin removes an unreaped child from getpgid/getsid visibility after exit, while libproc
+    // retains its exact zombie record. Successful spawn already proves the pre-exec setsid call;
+    // require that same reserved PID to remain its process-group leader before accepting it.
+    // SAFETY: `information` is the fixed writable PROC_PIDTBSDINFO ABI buffer.
+    let read = unsafe {
+        macos_proc_pidinfo(
+            process_id,
+            libc::PROC_PIDTBSDINFO,
+            MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
+            information.as_mut_ptr().cast(),
+            information_size,
+        )
+    };
+    if read <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if read != information_size {
+        return Err(io::Error::other("macOS process information response was incomplete"));
+    }
+    // SAFETY: proc_pidinfo reported a complete fixed-size structure.
+    let information = unsafe { information.assume_init() };
+    if information.pbi_status == libc::SZOMB
+        && information.pbi_pid == pid
+        && information.pbi_pgid == pid
+    {
+        return Ok(());
+    }
+    Err(io::Error::other(format!("macOS pid {pid} is not the exact exited ownership anchor")))
 }
 
 #[cfg(windows)]
@@ -17425,12 +17471,33 @@ mod tests {
             .expect("repeated unreaped child identity lookup should succeed")
             .expect("unreaped child should retain its stable identity");
         assert_eq!(repeated_start_token, start_token);
+        super::verify_live_ownership_anchor(pid)
+            .expect("unreaped child should retain its exact ownership anchor");
 
         let status = child
             .wait_for_exit(Duration::from_secs(5))
             .expect("short-lived child reap should succeed")
             .expect("short-lived child should be waitable");
         assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_stdio_process_admits_short_lived_macos_children() {
+        for generation in 1..=32 {
+            let process = super::spawn_managed_stdio_process(&super::ManagedStdioProcessConfig {
+                executable: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                cwd: PathBuf::from("/"),
+                env: BTreeMap::new(),
+                generation,
+                lease_duration: Duration::from_secs(5),
+            })
+            .expect("short-lived managed child should satisfy provenance admission");
+            assert!(process.lease().provenance.start_token.starts_with("macos:"));
+            let report = process.cleanup(false);
+            assert_eq!(report.outcome, palyra_common::runtime_contracts::CleanupOutcome::Completed);
+        }
     }
 
     #[cfg(target_os = "macos")]
