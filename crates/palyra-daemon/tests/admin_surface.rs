@@ -42,8 +42,10 @@ fn admin_status_requires_token_and_context() -> Result<()> {
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
+    // Status assembles the complete runtime diagnostic projection. Keep this a deadlock bound
+    // instead of a saturated-runner performance assertion for the package-wide parallel suite.
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build HTTP client")?;
