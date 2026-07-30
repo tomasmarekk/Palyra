@@ -8849,6 +8849,10 @@ async fn networked_worker_node_failures_reconcile_exact_dispatch_claim() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority() {
+    // The worker must release the payload before the timeout fires; loaded cross-platform runners
+    // can otherwise turn this state-transition test into a scheduler performance assertion.
+    const IN_FLIGHT_DISPATCH_TIMEOUT_MS: u64 = 10_000;
+
     let state = build_test_runtime_state(false);
     let worker_id = "worker-runtime-inflight-timeout";
     let required_capability = "tool:palyra.fs.read_file";
@@ -8882,12 +8886,17 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
         )
         .expect("worker node should register");
     state.configure_networked_worker_remote_dispatcher(Arc::new(
-        NodeRuntimeNetworkedWorkerDispatcher::with_dispatch_timeout(Arc::clone(&node_runtime), 100),
+        NodeRuntimeNetworkedWorkerDispatcher::with_dispatch_timeout(
+            Arc::clone(&node_runtime),
+            IN_FLIGHT_DISPATCH_TIMEOUT_MS,
+        ),
     ));
 
     let worker_node_runtime = Arc::clone(&node_runtime);
     let worker_runtime_state = Arc::clone(&state);
+    let (worker_ready_tx, worker_ready_rx) = tokio::sync::oneshot::channel();
     let remote_worker = tokio::spawn(async move {
+        worker_ready_tx.send(()).expect("remote worker readiness receiver should remain open");
         let deadline = tokio::time::Instant::now() + ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT;
         loop {
             if let Some(dispatch) = worker_node_runtime
@@ -8925,6 +8934,10 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     });
+    tokio::time::timeout(ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT, worker_ready_rx)
+        .await
+        .expect("remote worker should become ready before timeout")
+        .expect("remote worker readiness signal should arrive");
 
     let outcome = tokio::time::timeout(
         ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT,
