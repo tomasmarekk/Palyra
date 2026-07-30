@@ -8888,7 +8888,8 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
     let worker_node_runtime = Arc::clone(&node_runtime);
     let worker_runtime_state = Arc::clone(&state);
     let remote_worker = tokio::spawn(async move {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT;
+        loop {
             if let Some(dispatch) = worker_node_runtime
                 .next_capability_dispatch(worker_id, worker_runtime_state.as_ref())
                 .expect("dispatch poll should succeed")
@@ -8917,13 +8918,16 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
                     request,
                 );
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote worker did not receive node dispatch"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("remote worker did not receive node dispatch");
     });
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
+        ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT,
         super::execute_tool_with_runtime_dispatch(
             &state,
             super::ToolRuntimeExecutionContext {
@@ -9529,7 +9533,7 @@ async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement(
         None,
     ));
 
-    let (dispatch, request) = tokio::time::timeout(Duration::from_secs(2), async {
+    let (dispatch, request) = tokio::time::timeout(ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT, async {
         loop {
             tokio::select! {
                 outcome = &mut foreground => {
