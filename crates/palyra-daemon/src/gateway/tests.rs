@@ -2866,7 +2866,10 @@ async fn wait_for_cron_run_terminal_status(
     state: &std::sync::Arc<GatewayRuntimeState>,
     run_id: &str,
 ) -> CronRunStatus {
-    for _ in 0..100 {
+    // This is a deadlock bound for a background run, not a scheduler-performance assertion.
+    // The full daemon suite can saturate the multi-threaded runtime on slower CI hosts.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         if let Some(run) =
             state.cron_run(run_id.to_owned()).await.expect("cron run lookup should succeed")
         {
@@ -2874,9 +2877,11 @@ async fn wait_for_cron_run_terminal_status(
                 return run.status;
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("cron run {run_id} did not reach a terminal state");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("cron run {run_id} did not reach a terminal state");
 }
 
 fn default_backend_selection() -> ToolProposalBackendSelection {
