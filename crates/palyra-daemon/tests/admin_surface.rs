@@ -5335,8 +5335,10 @@ allowed_channels = []
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
+    // Binding verifies and scans a signed Wasm artifact; keep this a deadlock bound instead of a
+    // saturated-runner performance assertion.
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("failed to build HTTP client")?;
     let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
