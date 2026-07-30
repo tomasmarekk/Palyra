@@ -9151,7 +9151,8 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
     let worker_runtime_state = Arc::clone(&state);
     let worker_id_for_task = worker_id.to_owned();
     let remote_worker = tokio::spawn(async move {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT;
+        loop {
             if let Some(dispatch) = worker_node_runtime
                 .next_capability_dispatch(
                     worker_id_for_task.as_str(),
@@ -9400,9 +9401,12 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
                 );
                 return (dispatch.request_id, remote_request_id);
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote worker did not receive node dispatch"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("remote worker did not receive node dispatch");
     });
 
     let outcome = super::execute_tool_with_runtime_dispatch(
