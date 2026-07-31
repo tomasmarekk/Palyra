@@ -32,7 +32,7 @@ use crate::{
     },
     domain::work_graph::{
         WorkBudgetV1, WorkGraphConcurrencyPolicy, WorkGraphCreateRequest, WorkGraphOwnerScopeV1,
-        WorkGraphState, WorkItemSpecV1, WorkItemState,
+        WorkGraphState, WorkItemSpecV1,
     },
     gateway::GatewayRuntimeState,
     journal::{
@@ -784,33 +784,37 @@ impl FlowCoordinator {
             ) {
                 return Ok(None);
             }
-            let mapped_state = match snapshot.graph.state {
-                WorkGraphState::Active => FlowStepState::Running,
-                WorkGraphState::Succeeded => FlowStepState::Succeeded,
-                WorkGraphState::Cancelled => FlowStepState::Cancelled,
-                WorkGraphState::Failed | WorkGraphState::Invalid | WorkGraphState::Archived => {
-                    FlowStepState::Failed
-                }
-            };
+            let mapped_state = work_graph_flow_step_state(snapshot.graph.state);
             if Some(mapped_state) != state {
                 let terminal = mapped_state.is_terminal();
-                let output_json = terminal.then(|| {
-                    let succeeded = snapshot
-                        .items
-                        .iter()
-                        .filter(|item| item.state == WorkItemState::Succeeded)
-                        .count();
-                    json!({
-                        "schema_version": 1,
-                        "work_graph_id": graph_id,
-                        "state": snapshot.graph.state,
-                        "revision": snapshot.graph.revision,
-                        "item_count": snapshot.items.len(),
-                        "succeeded_item_count": succeeded,
-                        "reason_code": snapshot.graph.reason_code,
-                    })
-                    .to_string()
-                });
+                let output_json = if terminal {
+                    let summary = runtime
+                        .work_graph_terminal_summary(
+                            flow.owner_principal.clone(),
+                            graph_id.to_owned(),
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            Status::failed_precondition(
+                                "terminal work graph summary is unavailable in the flow scope",
+                            )
+                        })?;
+                    Some(
+                        json!({
+                            "schema_version": 1,
+                            "work_graph_terminal": summary,
+                            "objective_focus_id": summary.objective_id,
+                            "delivery_arbitration": {
+                                "candidate_kind": "work_graph_terminal_summary",
+                                "payload_posture": "bounded_handoffs_only",
+                                "raw_child_transcripts_included": false,
+                            },
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    None
+                };
                 runtime
                     .update_flow_step(FlowStepUpdateRequest {
                         flow_id: flow.flow_id.clone(),
@@ -1507,6 +1511,17 @@ fn map_run_state(value: &str) -> Option<FlowStepState> {
     }
 }
 
+fn work_graph_flow_step_state(state: WorkGraphState) -> FlowStepState {
+    match state {
+        WorkGraphState::Active => FlowStepState::Running,
+        WorkGraphState::Succeeded => FlowStepState::Succeeded,
+        WorkGraphState::Cancelled => FlowStepState::Cancelled,
+        WorkGraphState::Failed | WorkGraphState::Invalid | WorkGraphState::Archived => {
+            FlowStepState::Failed
+        }
+    }
+}
+
 fn same_flow_scope(
     flow: &FlowRecord,
     principal: &str,
@@ -1816,6 +1831,16 @@ mod tests {
         assert_eq!(map_auxiliary_task_state("running"), Some(FlowStepState::Running));
         assert_eq!(map_auxiliary_task_state("succeeded"), Some(FlowStepState::Succeeded));
         assert_eq!(map_auxiliary_task_state("expired"), Some(FlowStepState::TimedOut));
+    }
+
+    #[test]
+    fn work_graph_flow_step_waits_until_graph_is_terminal() {
+        assert_eq!(work_graph_flow_step_state(WorkGraphState::Active), FlowStepState::Running);
+        assert_eq!(work_graph_flow_step_state(WorkGraphState::Succeeded), FlowStepState::Succeeded);
+        assert_eq!(work_graph_flow_step_state(WorkGraphState::Cancelled), FlowStepState::Cancelled);
+        for state in [WorkGraphState::Failed, WorkGraphState::Invalid, WorkGraphState::Archived] {
+            assert_eq!(work_graph_flow_step_state(state), FlowStepState::Failed);
+        }
     }
 
     #[test]

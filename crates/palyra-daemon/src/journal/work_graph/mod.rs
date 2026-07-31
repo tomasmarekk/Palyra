@@ -7,6 +7,8 @@ mod claim_migration;
 mod claims;
 mod concurrency;
 mod concurrency_migration;
+mod handoff;
+mod handoff_migration;
 mod migration;
 mod storage;
 
@@ -15,6 +17,7 @@ mod tests;
 
 pub(super) const MIGRATION_94_SQL: &str = claim_migration::SQL;
 pub(super) const MIGRATION_95_SQL: &str = concurrency_migration::SQL;
+pub(super) const MIGRATION_96_SQL: &str = handoff_migration::SQL;
 pub(super) const MIGRATION_93_SQL: &str = migration::SQL;
 
-pub(crate) use storage::WorkGraphSnapshotV1;
+pub(crate) use storage::{WorkGraphEventRecordV1, WorkGraphSnapshotV1};

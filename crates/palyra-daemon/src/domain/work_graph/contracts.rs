@@ -365,7 +365,6 @@ pub(crate) mod reason {
     pub(crate) const DEPENDENCY_FAILED: &str = "work_graph.dependency_failed";
     pub(crate) const INVALID_GRAPH: &str = "work_graph.invalid";
     pub(crate) const INVALID_TRANSITION: &str = "work_graph.invalid_transition";
-    pub(crate) const STALE_REVISION: &str = "work_graph.stale_revision";
 }
 
 /// Fail-closed validation error with a stable reason code.

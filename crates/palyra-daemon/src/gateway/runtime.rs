@@ -80,12 +80,17 @@ use crate::application::{
         decide_turn_control_request, ControlActivePhase, TurnControlAction,
         TurnControlApplyOutcome, TurnControlDecision, TurnControlOperation, TurnControlRequest,
     },
-    work_graph_coordinator::WorkGraphResourceCoordinator,
+    work_graph_coordinator::{WorkGraphCancellationReportV1, WorkGraphResourceCoordinator},
 };
 use crate::domain::work_graph::{
-    ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, WorkClaimSettlementOutcome,
-    WorkClaimSettlementRequest, WorkGraphCreateRequest, WorkItemTransitionOutcome,
-    WorkItemTransitionRequest,
+    ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, StaleReclaimDecision,
+    StaleReclaimRequest, WorkClaimSettlementOutcome, WorkClaimSettlementRequest,
+    WorkGraphClaimDiagnosticsV1, WorkGraphCommentCreateRequest, WorkGraphCommentRecordV1,
+    WorkGraphCreateRequest, WorkGraphListEntryV1, WorkGraphReviewOutcomeV1, WorkGraphReviewRequest,
+    WorkGraphTerminalSummaryV1, WorkItemHandoffCommitOutcome, WorkItemHandoffCreateRequest,
+    WorkItemHandoffEnvelopeV1, WorkItemHeartbeatOutcome, WorkItemHeartbeatRequest,
+    WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest, WorkItemTransitionOutcome,
+    WorkItemTransitionRequest, WorkRuntimeLiveness,
 };
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsagePath, FeatureUsageRegistry, FeatureUsageSnapshot,
@@ -95,7 +100,7 @@ use crate::journal::state_health::{
     JournalStateRepairReport, JournalStateRepairRequest, JournalWalCheckpointMode,
     JournalWalCheckpointReport, SidecarIndexDescriptor,
 };
-use crate::journal::work_graph::WorkGraphSnapshotV1;
+use crate::journal::work_graph::{WorkGraphEventRecordV1, WorkGraphSnapshotV1};
 use crate::journal::{
     ChildCompletionReconcileReport, CommitmentCandidateV2Diagnostics, CommitmentCreateRequest,
     CommitmentDeliveryAttemptCreateRequest, CommitmentDeliveryAttemptRecord, CommitmentEventRecord,
@@ -14554,6 +14559,473 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.settle_work_item_claim_blocking(&request))
             .await
             .map_err(|_| Status::internal("work graph settlement worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn heartbeat_work_item_blocking(
+        &self,
+        request: &WorkItemHeartbeatRequest,
+    ) -> Result<WorkItemHeartbeatOutcome, Status> {
+        self.journal_store
+            .heartbeat_work_item(request)
+            .map_err(|error| map_orchestrator_store_error("heartbeat work graph item", error))
+    }
+
+    /// Renews one exact current claim generation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn heartbeat_work_item(
+        self: &Arc<Self>,
+        request: WorkItemHeartbeatRequest,
+    ) -> Result<WorkItemHeartbeatOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.heartbeat_work_item_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph heartbeat worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_work_item_side_effect_fence_blocking(
+        &self,
+        request: &WorkItemSideEffectFenceRequest,
+    ) -> Result<WorkItemSideEffectFenceOutcome, Status> {
+        self.journal_store.record_work_item_side_effect_fence(request).map_err(|error| {
+            map_orchestrator_store_error("record work item side-effect fence", error)
+        })
+    }
+
+    /// Advances host knowledge for side effects under one exact claim generation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn record_work_item_side_effect_fence(
+        self: &Arc<Self>,
+        request: WorkItemSideEffectFenceRequest,
+    ) -> Result<WorkItemSideEffectFenceOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.record_work_item_side_effect_fence_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("work graph side-effect worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn reconcile_stale_work_item_blocking(
+        &self,
+        graph_id: &str,
+        work_item_id: &str,
+        actor_principal: &str,
+    ) -> Result<StaleReclaimDecision, Status> {
+        let snapshot = self
+            .journal_store
+            .work_graph_snapshot(graph_id)
+            .map_err(|error| map_orchestrator_store_error("load stale work item", error))?
+            .ok_or_else(|| Status::not_found("WorkGraph was not found"))?;
+        let item = snapshot
+            .items
+            .iter()
+            .find(|item| item.work_item_id == work_item_id)
+            .ok_or_else(|| Status::not_found("WorkGraph item was not found"))?;
+        let claim = item
+            .claim
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("WorkGraph item has no active claim"))?;
+        let run =
+            self.journal_store.orchestrator_run_status_snapshot(claim.worker_id.as_str()).map_err(
+                |error| map_orchestrator_store_error("load work item worker liveness", error),
+            )?;
+        let liveness = match run {
+            Some(run)
+                if crate::orchestrator::RunLifecycleState::from_str(run.state.as_str())
+                    .is_some_and(crate::orchestrator::RunLifecycleState::is_terminal) =>
+            {
+                WorkRuntimeLiveness::Dead
+            }
+            Some(_) => WorkRuntimeLiveness::Alive,
+            None => WorkRuntimeLiveness::Dead,
+        };
+        let resource_lease =
+            claim.resource_lease_id.as_ref().map(|lease_id| (lease_id.clone(), claim.generation));
+        let decision = self
+            .journal_store
+            .reclaim_stale_work_item(&StaleReclaimRequest {
+                graph_id: graph_id.to_owned(),
+                work_item_id: work_item_id.to_owned(),
+                expected_item_revision: item.revision,
+                expected_generation: claim.generation,
+                runtime_instance_id: claim.runtime_instance_id.clone(),
+                process_start_token: claim.process_start_token.clone(),
+                liveness,
+                observed_side_effect_fence: claim.side_effect_fence,
+                actor_principal: actor_principal.to_owned(),
+            })
+            .map_err(|error| map_orchestrator_store_error("reconcile stale work item", error))?;
+        if matches!(
+            decision,
+            StaleReclaimDecision::Reclaimed { .. } | StaleReclaimDecision::RequiresReview { .. }
+        ) {
+            if let Some((lease_id, generation)) = resource_lease {
+                let services = self.managed_coding_services.as_ref().ok_or_else(|| {
+                    Status::failed_precondition("work graph resource governor is unavailable")
+                })?;
+                services
+                    .resource_governor()
+                    .release(lease_id.as_str(), generation)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Reconciles one stale claim after the host determines worker liveness and fence posture.
+    ///
+    /// # Errors
+    /// Returns the mapped journal/resource error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn reconcile_stale_work_item(
+        self: &Arc<Self>,
+        graph_id: String,
+        work_item_id: String,
+        actor_principal: String,
+    ) -> Result<StaleReclaimDecision, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.reconcile_stale_work_item_blocking(
+                graph_id.as_str(),
+                work_item_id.as_str(),
+                actor_principal.as_str(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("work graph stale reconciliation worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn cancel_work_graph_blocking(
+        &self,
+        graph_id: &str,
+        expected_graph_revision: u64,
+        actor_principal: &str,
+    ) -> Result<WorkGraphCancellationReportV1, Status> {
+        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
+            Status::failed_precondition("work graph resource governor is unavailable")
+        })?;
+        WorkGraphResourceCoordinator::new(services.resource_governor())
+            .cancel_work_graph_workers(
+                &self.journal_store,
+                graph_id,
+                expected_graph_revision,
+                actor_principal,
+            )
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
+    /// Cancels a graph, persists run cancellation fanout, and releases charged resources.
+    ///
+    /// # Errors
+    /// Returns a mapped durable/resource failure, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn cancel_work_graph(
+        self: &Arc<Self>,
+        graph_id: String,
+        expected_graph_revision: u64,
+        actor_principal: String,
+    ) -> Result<WorkGraphCancellationReportV1, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.cancel_work_graph_blocking(
+                graph_id.as_str(),
+                expected_graph_revision,
+                actor_principal.as_str(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("work graph cancellation worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_work_item_handoff_blocking(
+        &self,
+        request: &WorkItemHandoffCreateRequest,
+    ) -> Result<WorkItemHandoffCommitOutcome, Status> {
+        self.journal_store
+            .record_work_item_handoff(request)
+            .map_err(|error| map_orchestrator_store_error("record work item handoff", error))
+    }
+
+    /// Persists a bounded handoff for one current claim generation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn record_work_item_handoff(
+        self: &Arc<Self>,
+        request: WorkItemHandoffCreateRequest,
+    ) -> Result<WorkItemHandoffCommitOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.record_work_item_handoff_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph handoff worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_work_graph_comment_blocking(
+        &self,
+        request: &WorkGraphCommentCreateRequest,
+    ) -> Result<WorkGraphCommentRecordV1, Status> {
+        self.journal_store
+            .create_work_graph_comment(request)
+            .map_err(|error| map_orchestrator_store_error("create work graph comment", error))
+    }
+
+    /// Appends one owner/current-worker scoped WorkGraph comment.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn create_work_graph_comment(
+        self: &Arc<Self>,
+        request: WorkGraphCommentCreateRequest,
+    ) -> Result<WorkGraphCommentRecordV1, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_work_graph_comment_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph comment worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn review_work_item_handoff_blocking(
+        &self,
+        request: &WorkGraphReviewRequest,
+    ) -> Result<WorkGraphReviewOutcomeV1, Status> {
+        self.journal_store
+            .review_work_item_handoff(request)
+            .map_err(|error| map_orchestrator_store_error("review work item handoff", error))
+    }
+
+    /// Records a provenance-bound owner review and host-applies its transition.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn review_work_item_handoff(
+        self: &Arc<Self>,
+        request: WorkGraphReviewRequest,
+    ) -> Result<WorkGraphReviewOutcomeV1, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.review_work_item_handoff_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph review worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_item_handoff_blocking(
+        &self,
+        owner_principal: &str,
+        graph_id: &str,
+        handoff_id: &str,
+    ) -> Result<Option<WorkItemHandoffEnvelopeV1>, Status> {
+        self.journal_store
+            .work_item_handoff(owner_principal, graph_id, handoff_id)
+            .map_err(|error| map_orchestrator_store_error("load work item handoff", error))
+    }
+
+    /// Retrieves one owner-scoped handoff without loading child transcripts.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_item_handoff(
+        self: &Arc<Self>,
+        owner_principal: String,
+        graph_id: String,
+        handoff_id: String,
+    ) -> Result<Option<WorkItemHandoffEnvelopeV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.work_item_handoff_blocking(
+                owner_principal.as_str(),
+                graph_id.as_str(),
+                handoff_id.as_str(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("work graph handoff load worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_work_graphs_for_owner_blocking(
+        &self,
+        owner_principal: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphListEntryV1>, Status> {
+        self.journal_store
+            .list_work_graphs_for_owner(owner_principal, session_id, limit)
+            .map_err(|error| map_orchestrator_store_error("list work graphs", error))
+    }
+
+    /// Lists bounded graph headers inside one owner/session scope.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn list_work_graphs_for_owner(
+        self: &Arc<Self>,
+        owner_principal: String,
+        session_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphListEntryV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_work_graphs_for_owner_blocking(
+                owner_principal.as_str(),
+                session_id.as_deref(),
+                limit,
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("work graph list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_graph_terminal_summary_blocking(
+        &self,
+        owner_principal: &str,
+        graph_id: &str,
+    ) -> Result<Option<WorkGraphTerminalSummaryV1>, Status> {
+        self.journal_store.work_graph_terminal_summary(owner_principal, graph_id).map_err(|error| {
+            map_orchestrator_store_error("load work graph terminal summary", error)
+        })
+    }
+
+    /// Loads a terminal parent-safe WorkGraph result for flow/objective projection.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_graph_terminal_summary(
+        self: &Arc<Self>,
+        owner_principal: String,
+        graph_id: String,
+    ) -> Result<Option<WorkGraphTerminalSummaryV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.work_graph_terminal_summary_blocking(owner_principal.as_str(), graph_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("work graph terminal summary worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_graph_claim_diagnostics_blocking(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<WorkGraphClaimDiagnosticsV1>, Status> {
+        self.journal_store
+            .work_graph_claim_diagnostics(graph_id)
+            .map_err(|error| map_orchestrator_store_error("load work graph diagnostics", error))
+    }
+
+    /// Loads bounded claim diagnostics for one graph.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_graph_claim_diagnostics(
+        self: &Arc<Self>,
+        graph_id: String,
+    ) -> Result<Option<WorkGraphClaimDiagnosticsV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.work_graph_claim_diagnostics_blocking(graph_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("work graph diagnostics worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_graph_events_blocking(
+        &self,
+        graph_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphEventRecordV1>, Status> {
+        self.journal_store
+            .work_graph_events(graph_id, limit)
+            .map_err(|error| map_orchestrator_store_error("load work graph events", error))
+    }
+
+    /// Loads bounded redacted WorkGraph lifecycle evidence.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_graph_events(
+        self: &Arc<Self>,
+        graph_id: String,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphEventRecordV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.work_graph_events_blocking(graph_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("work graph events worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_graph_comments_blocking(
+        &self,
+        owner_principal: &str,
+        graph_id: &str,
+        work_item_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphCommentRecordV1>, Status> {
+        self.journal_store
+            .work_graph_comments(owner_principal, graph_id, work_item_id, limit)
+            .map_err(|error| map_orchestrator_store_error("load work graph comments", error))
+    }
+
+    /// Loads bounded owner-scoped WorkGraph comments.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_graph_comments(
+        self: &Arc<Self>,
+        owner_principal: String,
+        graph_id: String,
+        work_item_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<WorkGraphCommentRecordV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.work_graph_comments_blocking(
+                owner_principal.as_str(),
+                graph_id.as_str(),
+                work_item_id.as_deref(),
+                limit,
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("work graph comments worker panicked"))?
+    }
+
+    /// Returns the shared local-resource projection used by WorkGraph admission.
+    ///
+    /// # Errors
+    /// Returns `failed_precondition` when the resource governor is unavailable.
+    pub(crate) fn work_graph_resource_snapshot(
+        &self,
+    ) -> Result<crate::application::local_resource_governor::LocalResourceSnapshotV1, Status> {
+        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
+            Status::failed_precondition("work graph resource governor is unavailable")
+        })?;
+        Ok(WorkGraphResourceCoordinator::new(services.resource_governor()).resource_snapshot())
     }
 
     #[allow(clippy::result_large_err)]

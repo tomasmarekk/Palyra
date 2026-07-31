@@ -240,6 +240,9 @@ pub(crate) const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 pub(crate) const ARTIFACT_READ_TOOL_NAME: &str = "palyra.artifact.read";
 pub(crate) const DELEGATION_QUERY_TOOL_NAME: &str = "palyra.delegation.query";
 pub(crate) const DELEGATION_CONTROL_TOOL_NAME: &str = "palyra.delegation.control";
+pub(crate) const WORK_GRAPH_QUERY_TOOL_NAME: &str = "palyra.work_graph.query";
+pub(crate) const WORK_GRAPH_CONTROL_TOOL_NAME: &str = "palyra.work_graph.control";
+pub(crate) const WORK_GRAPH_ARTIFACT_TOOL_NAME: &str = "palyra.work_graph.artifact";
 pub(crate) const SESSIONS_SPAWN_TOOL_NAME: &str = "sessions_spawn";
 pub(crate) const SESSIONS_YIELD_TOOL_NAME: &str = "sessions_yield";
 pub(crate) const SESSIONS_LIST_TOOL_NAME: &str = "sessions_list";
@@ -1067,6 +1070,18 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             proposal_id,
             input_json,
             controls.child_task_parent_context.as_ref(),
+        )
+        .await
+    } else if matches!(
+        tool_name,
+        WORK_GRAPH_QUERY_TOOL_NAME | WORK_GRAPH_CONTROL_TOOL_NAME | WORK_GRAPH_ARTIFACT_TOOL_NAME
+    ) {
+        crate::application::tool_runtime::work_graph::execute_work_graph_tool(
+            runtime_state,
+            context,
+            tool_name,
+            proposal_id,
+            input_json,
         )
         .await
     } else if matches!(

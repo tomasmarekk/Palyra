@@ -161,6 +161,8 @@ const SAFE_CHAT_PROFILE_TOOLS: &[&str] = &[
     "palyra.clarify.ask",
     "palyra.routines.query",
     "palyra.delegation.query",
+    "palyra.work_graph.query",
+    "palyra.work_graph.artifact",
     "sessions_list",
     "sessions_status",
     "sessions_history",
@@ -232,6 +234,9 @@ const AUTOMATION_PROFILE_TOOLS: &[&str] = &[
     "palyra.routines.control",
     "palyra.delegation.query",
     "palyra.delegation.control",
+    "palyra.work_graph.query",
+    "palyra.work_graph.control",
+    "palyra.work_graph.artifact",
     "sessions_spawn",
     "sessions_yield",
     "sessions_list",
@@ -493,6 +498,16 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.delegation.control" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "palyra.work_graph.query" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.work_graph.control" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.work_graph.artifact" => Some(ToolMetadata {
+            capabilities: ARTIFACT_READ_CAPABILITIES,
+            default_sensitive: false,
+        }),
         "sessions_list" | "sessions_status" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }

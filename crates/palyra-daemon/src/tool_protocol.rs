@@ -309,6 +309,7 @@ const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_WORK_GRAPH_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_TOOL_PROGRAM_RUN_TOOL_INPUT_BYTES: usize = 256 * 1024;
@@ -1246,6 +1247,9 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.routines.control"
                 | "palyra.delegation.query"
                 | "palyra.delegation.control"
+                | "palyra.work_graph.query"
+                | "palyra.work_graph.control"
+                | "palyra.work_graph.artifact"
                 | "sessions_spawn"
                 | "sessions_yield"
                 | "sessions_list"
@@ -1359,6 +1363,9 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         tool_name,
         "palyra.delegation.query"
             | "palyra.delegation.control"
+            | "palyra.work_graph.query"
+            | "palyra.work_graph.control"
+            | "palyra.work_graph.artifact"
             | "sessions_spawn"
             | "sessions_yield"
             | "sessions_list"
@@ -1427,6 +1434,9 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         | "sessions_steer"
         | "sessions_interrupt"
         | "sessions_switch_model" => MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES,
+        "palyra.work_graph.query" | "palyra.work_graph.control" | "palyra.work_graph.artifact" => {
+            MAX_WORK_GRAPH_TOOL_INPUT_BYTES
+        }
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
         tool_name if is_mcp_utility_tool(tool_name) => MAX_MCP_UTILITY_TOOL_INPUT_BYTES,

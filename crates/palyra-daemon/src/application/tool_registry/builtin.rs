@@ -1116,6 +1116,39 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
         ),
         entry(
+            "palyra.work_graph.query",
+            "List owner-scoped durable WorkGraphs or inspect bounded redacted claim diagnostics.",
+            work_graph_tool_schema(&["list", "diagnostics"]),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.work_graph.control",
+            "Request host-authoritative WorkGraph creation, claims, handoffs, review, heartbeats, state changes, or comments.",
+            work_graph_tool_schema(&[
+                "create",
+                "claim",
+                "complete",
+                "block",
+                "unblock",
+                "heartbeat",
+                "side_effect",
+                "reclaim",
+                "cancel",
+                "comment",
+                "review",
+            ]),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
+            "palyra.work_graph.artifact",
+            "Retrieve one bounded owner-scoped WorkGraph handoff and its source references without loading a child transcript.",
+            work_graph_tool_schema(&["retrieve"]),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
             "sessions_spawn",
             "Start a bounded Palyra child run for a delegated task and return child run identifiers immediately.",
             object_schema(
@@ -1926,6 +1959,135 @@ fn object_schema(required: &[&str], properties: Vec<(&str, Value)>, additional: 
         "required": required,
         "additionalProperties": additional,
     })
+}
+
+fn work_graph_tool_schema(operations: &[&str]) -> Value {
+    let budget_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "max_turns": {"type":["integer","null"],"minimum":1},
+            "max_provider_calls": {"type":["integer","null"],"minimum":1},
+            "max_tokens": {"type":["integer","null"],"minimum":1},
+            "max_cost_micros": {"type":["integer","null"],"minimum":1},
+            "max_wall_time_ms": {"type":["integer","null"],"minimum":1}
+        }
+    });
+    let item_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "work_item_id", "title", "description", "priority", "capability_profile",
+            "dependency_ids", "compensates_work_item_id", "serialization_key",
+            "resource_class", "provider_profile", "workspace_scope", "budget",
+            "max_runtime_ms", "requires_review"
+        ],
+        "properties": {
+            "work_item_id": {"type":"string","maxLength":128},
+            "title": {"type":"string","maxLength":512},
+            "description": {"type":"string","maxLength":16384},
+            "priority": {"type":"integer","minimum":-1000,"maximum":1000},
+            "capability_profile": {"type":"string","maxLength":128},
+            "dependency_ids": {
+                "type":"array",
+                "items":{"type":"string","maxLength":128},
+                "maxItems":128
+            },
+            "compensates_work_item_id": {"type":["string","null"],"maxLength":128},
+            "serialization_key": {"type":["string","null"],"maxLength":512},
+            "resource_class": {
+                "type":"string",
+                "enum":[
+                    "interactive", "cpu_heavy", "io_heavy", "provider_bound",
+                    "workspace_read", "workspace_mutation"
+                ]
+            },
+            "provider_profile": {"type":["string","null"],"maxLength":128},
+            "workspace_scope": {"type":["string","null"],"maxLength":2048},
+            "budget": budget_schema.clone(),
+            "max_runtime_ms": {"type":"integer","minimum":1000,"maximum":86400000},
+            "requires_review": {"type":"boolean"}
+        }
+    });
+    object_schema(
+        &["operation"],
+        vec![
+            ("operation", json!({"type":"string","enum":operations})),
+            ("graph_id", json!({"type":["string","null"],"maxLength":128})),
+            ("work_item_id", json!({"type":["string","null"],"maxLength":128})),
+            ("handoff_id", json!({"type":["string","null"],"maxLength":128})),
+            ("claim_token", json!({"type":["string","null"],"pattern":"^[0-9a-fA-F]{64}$"})),
+            ("claim_generation", json!({"type":["integer","null"],"minimum":1})),
+            ("expected_revision", json!({"type":["integer","null"],"minimum":1})),
+            ("summary", json!({"type":["string","null"],"maxLength":8192})),
+            ("structured_result", json!({})),
+            (
+                "evidence_refs",
+                json!({"type":"array","items":{"type":"string","maxLength":2048},"maxItems":64}),
+            ),
+            (
+                "artifact_refs",
+                json!({"type":"array","items":{"type":"string","maxLength":2048},"maxItems":64}),
+            ),
+            ("body", json!({"type":["string","null"],"maxLength":8192})),
+            ("reason_code", json!({"type":["string","null"],"maxLength":256})),
+            ("review_decision", json!({"type":["string","null"],"enum":["approve","reject",null]})),
+            ("objective_id", json!({"type":["string","null"],"maxLength":128})),
+            ("routine_id", json!({"type":["string","null"],"maxLength":128})),
+            ("flow_id", json!({"type":["string","null"],"maxLength":128})),
+            ("flow_step_id", json!({"type":["string","null"],"maxLength":128})),
+            ("budget", budget_schema),
+            (
+                "concurrency_policy",
+                json!({
+                    "type":["object","null"],
+                    "additionalProperties":false,
+                    "required":[
+                        "max_active_items", "max_active_per_profile",
+                        "max_active_per_provider", "max_workspace_readers_per_scope",
+                        "failure_limit", "retry_backoff_base_ms",
+                        "retry_backoff_max_ms", "cancel_settle_timeout_ms"
+                    ],
+                    "properties":{
+                        "max_active_items":{"type":"integer","minimum":1,"maximum":1024},
+                        "max_active_per_profile":{
+                            "type":"object",
+                            "additionalProperties":{"type":"integer","minimum":1,"maximum":1024}
+                        },
+                        "max_active_per_provider":{
+                            "type":"object",
+                            "additionalProperties":{"type":"integer","minimum":1,"maximum":1024}
+                        },
+                        "max_workspace_readers_per_scope":{
+                            "type":"integer","minimum":1,"maximum":1024
+                        },
+                        "failure_limit":{"type":"integer","minimum":1,"maximum":1024},
+                        "retry_backoff_base_ms":{"type":"integer","minimum":1},
+                        "retry_backoff_max_ms":{"type":"integer","minimum":1},
+                        "cancel_settle_timeout_ms":{
+                            "type":"integer","minimum":1,"maximum":60000
+                        }
+                    }
+                }),
+            ),
+            ("items", json!({"type":"array","items":item_schema,"maxItems":1024})),
+            (
+                "capability_profiles",
+                json!({"type":"array","items":{"type":"string","maxLength":128},"maxItems":128}),
+            ),
+            ("lease_ttl_ms", json!({"type":["integer","null"],"minimum":1000,"maximum":3600000})),
+            ("extend_by_ms", json!({"type":["integer","null"],"minimum":1000,"maximum":3600000})),
+            (
+                "side_effect_state",
+                json!({
+                    "type":["string","null"],
+                    "enum":["clear","in_flight","committed","unknown",null]
+                }),
+            ),
+            ("limit", json!({"type":["integer","null"],"minimum":1,"maximum":64})),
+        ],
+        false,
+    )
 }
 
 /// Every brokered browser tool registered alongside the core tools.

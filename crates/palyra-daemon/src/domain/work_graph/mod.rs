@@ -4,11 +4,13 @@
 mod claims;
 mod concurrency;
 mod contracts;
+mod handoff;
 mod validation;
 
 pub(crate) use claims::*;
 pub(crate) use concurrency::*;
 pub(crate) use contracts::*;
+pub(crate) use handoff::*;
 pub(crate) use validation::{
     validate_graph_create_request, validate_loaded_graph, validate_transition,
 };

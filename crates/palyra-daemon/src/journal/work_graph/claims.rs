@@ -198,7 +198,7 @@ impl JournalStore {
             })?;
         let claim =
             item.claim.clone().ok_or_else(|| invalid_claim_data("claim projection lost"))?;
-        Ok(ClaimReadyWorkItemOutcome::Granted(WorkItemClaimGrant { item, claim, token }))
+        Ok(ClaimReadyWorkItemOutcome::Granted(Box::new(WorkItemClaimGrant { item, claim, token })))
     }
 
     /// Renews a claim only when token, worker, and generation still match.
@@ -765,7 +765,10 @@ impl JournalStore {
             request.authority.graph_id.as_str(),
             request.authority.work_item_id.as_str(),
         )?;
-        Ok(WorkClaimSettlementOutcome::Applied { item, graph_revision: next_graph_revision })
+        Ok(WorkClaimSettlementOutcome::Applied {
+            item: Box::new(item),
+            graph_revision: next_graph_revision,
+        })
     }
 
     /// Projects bounded redacted claim metrics and the latest stable decision reason.

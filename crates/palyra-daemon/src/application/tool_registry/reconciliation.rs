@@ -310,6 +310,8 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         | "palyra.code.workspace_symbols"
         | "palyra.code.outline"
         | "palyra.delegation.query"
+        | "palyra.work_graph.query"
+        | "palyra.work_graph.artifact"
         | "sessions_yield"
         | "sessions_list"
         | "sessions_status"
@@ -344,6 +346,9 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         "palyra.clarify.ask" => BuiltinToolEffectResolution::mutation(ToolMutationClass::Delivery),
         "sessions_send" => BuiltinToolEffectResolution::mutation(ToolMutationClass::Delivery),
         "palyra.delegation.control" | "sessions_spawn" => {
+            BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
+        }
+        "palyra.work_graph.control" => {
             BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
         }
         "sessions_steer" | "sessions_interrupt" | "sessions_switch_model" => {

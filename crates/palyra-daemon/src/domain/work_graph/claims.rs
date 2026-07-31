@@ -29,6 +29,18 @@ impl WorkClaimToken {
     pub(crate) fn sha256_hex(&self) -> String {
         hex::encode(Sha256::digest(self.0))
     }
+
+    /// Encodes the one-time worker capability for transport to the winning worker.
+    pub(crate) fn expose_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Parses an exact 32-byte worker capability supplied back to the host.
+    pub(crate) fn from_hex(value: &str) -> Option<Self> {
+        let decoded = hex::decode(value).ok()?;
+        let bytes = <[u8; 32]>::try_from(decoded).ok()?;
+        Some(Self(bytes))
+    }
 }
 
 impl fmt::Debug for WorkClaimToken {
@@ -117,7 +129,7 @@ pub(crate) struct WorkItemClaimGrant {
 /// Outcome of atomic ready-queue admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaimReadyWorkItemOutcome {
-    Granted(WorkItemClaimGrant),
+    Granted(Box<WorkItemClaimGrant>),
     NoEligibleItem { reason_code: &'static str },
 }
 
@@ -210,7 +222,7 @@ pub(crate) struct WorkClaimSettlementRequest {
 /// Host disposition for a claim-scoped result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkClaimSettlementOutcome {
-    Applied { item: WorkItemRecordV1, graph_revision: u64 },
+    Applied { item: Box<WorkItemRecordV1>, graph_revision: u64 },
     Orphaned { reason_code: &'static str },
 }
 

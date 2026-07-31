@@ -7,13 +7,15 @@ use std::{
 };
 
 use crate::domain::work_graph::{
-    reason, ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, StaleReclaimDecision,
+    ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, StaleReclaimDecision,
     StaleReclaimRequest, WorkBudgetV1, WorkClaimAuthority, WorkClaimSettlementOutcome,
-    WorkClaimSettlementRequest, WorkGraphConcurrencyPolicy, WorkGraphCreateRequest,
-    WorkGraphOwnerScopeV1, WorkGraphState, WorkItemHeartbeatOutcome, WorkItemHeartbeatRequest,
-    WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest, WorkItemSpecV1, WorkItemState,
-    WorkItemTransitionRequest, WorkResourceClass, WorkRuntimeLiveness, WorkSideEffectFenceState,
-    WorkVerificationState,
+    WorkClaimSettlementRequest, WorkGraphCommentCreateRequest, WorkGraphConcurrencyPolicy,
+    WorkGraphCreateRequest, WorkGraphOwnerScopeV1, WorkGraphReviewDecision, WorkGraphReviewRequest,
+    WorkGraphState, WorkItemHandoffCreateRequest, WorkItemHeartbeatOutcome,
+    WorkItemHeartbeatRequest, WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest,
+    WorkItemSpecV1, WorkItemState, WorkItemTransitionRequest, WorkResourceClass,
+    WorkRuntimeLiveness, WorkSideEffectFenceState, WorkVerificationState,
+    MAX_WORK_HANDOFF_RESULT_BYTES,
 };
 
 use super::*;
@@ -79,7 +81,7 @@ fn claim(
     let ClaimReadyWorkItemOutcome::Granted(grant) = outcome else {
         panic!("ready item should be claimed");
     };
-    grant
+    *grant
 }
 
 fn claim_request(
@@ -126,6 +128,45 @@ fn expire_claim(store: &JournalStore, work_item_id: &str) {
             params![work_item_id],
         )
         .expect("claim should expire");
+}
+
+fn start_claim(
+    store: &JournalStore,
+    grant: &crate::domain::work_graph::WorkItemClaimGrant,
+) -> crate::domain::work_graph::WorkItemRecordV1 {
+    store
+        .transition_work_graph_item(&WorkItemTransitionRequest {
+            graph_id: grant.item.graph_id.clone(),
+            work_item_id: grant.item.work_item_id.clone(),
+            expected_revision: grant.item.revision,
+            target_state: WorkItemState::Running,
+            verification_state: None,
+            reason_code: "work_graph.test.running".to_owned(),
+            actor_principal: grant.claim.worker_principal.clone(),
+        })
+        .expect("claim should enter running")
+        .item
+}
+
+fn record_handoff(
+    store: &JournalStore,
+    grant: &crate::domain::work_graph::WorkItemClaimGrant,
+    expected_item_revision: u64,
+    verification_state: WorkVerificationState,
+    structured_result: Value,
+) -> crate::domain::work_graph::WorkItemHandoffCommitOutcome {
+    store
+        .record_work_item_handoff(&WorkItemHandoffCreateRequest {
+            authority: authority(grant),
+            expected_item_revision,
+            actor_principal: grant.claim.worker_principal.clone(),
+            summary: format!("bounded result for {}", grant.item.work_item_id),
+            structured_result,
+            evidence_refs: vec![format!("evidence:{}", grant.item.work_item_id)],
+            artifact_refs: vec![format!("artifact:{}", grant.item.work_item_id)],
+            verification_state,
+        })
+        .expect("handoff should commit")
 }
 
 #[test]
@@ -209,7 +250,7 @@ fn expected_revision_and_verification_gate_transitions() {
             expected_revision: 1,
             target_state: WorkItemState::Archived,
             verification_state: None,
-            reason_code: reason::STALE_REVISION.to_owned(),
+            reason_code: "work_graph.stale_revision".to_owned(),
             actor_principal: "host".to_owned(),
         })
         .expect_err("stale revision must fail");
@@ -750,4 +791,226 @@ fn memory_pressure_preserves_interactive_work_only() {
             reason_code: "work_graph.admission.memory_pressure"
         }
     ));
+}
+
+#[test]
+fn parallel_handoffs_commit_distinct_generation_bound_results() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = Arc::new(store(directory.path().join("journal.sqlite3")));
+    let mut create = request();
+    create.items = vec![item("a", &[]), item("c", &[])];
+    store.create_work_graph(&create).expect("graph should be created");
+    let a = claim(&store, "a", 1);
+    let c_outcome = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("second independent item should claim");
+    let ClaimReadyWorkItemOutcome::Granted(c) = c_outcome else {
+        panic!("second independent item should be granted");
+    };
+    let a_running = start_claim(&store, &a);
+    let c_running = start_claim(&store, &c);
+    let barrier = Arc::new(Barrier::new(3));
+    let first_store = Arc::clone(&store);
+    let first_barrier = Arc::clone(&barrier);
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        record_handoff(
+            &first_store,
+            &a,
+            a_running.revision,
+            WorkVerificationState::Waived,
+            json!({"worker": "a"}),
+        )
+    });
+    let second_store = Arc::clone(&store);
+    let second_barrier = Arc::clone(&barrier);
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        record_handoff(
+            &second_store,
+            &c,
+            c_running.revision,
+            WorkVerificationState::Waived,
+            json!({"worker": "c"}),
+        )
+    });
+    barrier.wait();
+    let first = first.join().expect("first handoff thread should finish");
+    let second = second.join().expect("second handoff thread should finish");
+
+    assert_ne!(first.handoff.handoff_id, second.handoff.handoff_id);
+    assert_ne!(first.handoff.provenance_sha256, second.handoff.provenance_sha256);
+    assert_eq!(
+        store
+            .work_item_handoff("principal-1", "graph-1", first.handoff.handoff_id.as_str())
+            .expect("first handoff should load")
+            .expect("first handoff should exist")
+            .structured_result["worker"],
+        "a"
+    );
+    assert_eq!(
+        store
+            .work_item_handoff("principal-1", "graph-1", second.handoff.handoff_id.as_str())
+            .expect("second handoff should load")
+            .expect("second handoff should exist")
+            .structured_result["worker"],
+        "c"
+    );
+}
+
+#[test]
+fn review_rejection_reopens_item_and_restart_restores_handoff_comments_and_evidence() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let path = directory.path().join("journal.sqlite3");
+    let first = store(path.clone());
+    let mut create = request();
+    create.items = vec![WorkItemSpecV1 { requires_review: true, ..item("a", &[]) }];
+    first.create_work_graph(&create).expect("graph should be created");
+    let grant = claim(&first, "a", 1);
+    let running = start_claim(&first, &grant);
+    first
+        .create_work_graph_comment(&WorkGraphCommentCreateRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            actor_principal: "principal-1".to_owned(),
+            body: "worker context note".to_owned(),
+        })
+        .expect("current worker comment should pass ACL");
+    let handoff = record_handoff(
+        &first,
+        &grant,
+        running.revision,
+        WorkVerificationState::Pending,
+        json!({"result": "candidate"}),
+    );
+    first
+        .settle_work_item_claim(&WorkClaimSettlementRequest {
+            authority: authority(&grant),
+            expected_item_revision: handoff.item_revision,
+            target_state: WorkItemState::Review,
+            verification_state: WorkVerificationState::Pending,
+            result_sha256: handoff.handoff.provenance_sha256.clone(),
+            reason_code: "work_graph.complete.review_requested".to_owned(),
+            actor_principal: "principal-1".to_owned(),
+        })
+        .expect("handoff should enter review");
+    drop(first);
+
+    let reopened = store(path);
+    let restored = reopened
+        .work_item_handoff("principal-1", "graph-1", handoff.handoff.handoff_id.as_str())
+        .expect("handoff replay should load")
+        .expect("handoff should survive restart");
+    assert_eq!(restored.evidence_refs, vec!["evidence:a"]);
+    assert_eq!(restored.artifact_refs, vec!["artifact:a"]);
+    assert_eq!(
+        reopened
+            .work_graph_comments("principal-1", "graph-1", Some("a"), 10)
+            .expect("comments should replay")
+            .len(),
+        1
+    );
+    let rejected = reopened
+        .review_work_item_handoff(&WorkGraphReviewRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            handoff_id: restored.handoff_id,
+            reviewer_principal: "principal-1".to_owned(),
+            decision: WorkGraphReviewDecision::Reject,
+            reason_code: "verification_failed".to_owned(),
+        })
+        .expect("owner review should reject for rework");
+    assert_eq!(rejected.item_state, WorkItemState::Ready);
+    assert_eq!(
+        reopened.work_graph_snapshot("graph-1").unwrap().unwrap().items[0].verification_state,
+        WorkVerificationState::Rejected
+    );
+}
+
+#[test]
+fn terminal_summary_bounds_parent_context_and_retrieval_enforces_owner_acl() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[])];
+    store.create_work_graph(&create).expect("graph should be created");
+    let grant = claim(&store, "a", 1);
+    let running = start_claim(&store, &grant);
+    let large_result = "x".repeat(MAX_WORK_HANDOFF_RESULT_BYTES - 2_048);
+    let handoff = record_handoff(
+        &store,
+        &grant,
+        running.revision,
+        WorkVerificationState::Waived,
+        json!({"large_child_output": large_result}),
+    );
+    store
+        .settle_work_item_claim(&WorkClaimSettlementRequest {
+            authority: authority(&grant),
+            expected_item_revision: handoff.item_revision,
+            target_state: WorkItemState::Succeeded,
+            verification_state: WorkVerificationState::Waived,
+            result_sha256: handoff.handoff.provenance_sha256.clone(),
+            reason_code: "work_graph.complete.host_verified".to_owned(),
+            actor_principal: "principal-1".to_owned(),
+        })
+        .expect("handoff should settle");
+    let terminal = store
+        .work_graph_terminal_summary("principal-1", "graph-1")
+        .expect("terminal summary should load")
+        .expect("graph should be terminal");
+    assert_eq!(terminal.state, WorkGraphState::Succeeded);
+    assert_eq!(terminal.handoffs.len(), 1);
+    assert_eq!(terminal.handoffs[0].summary, "bounded result for a");
+    assert!(serde_json::to_vec(&terminal).unwrap().len() < 16 * 1024);
+    assert!(
+        store
+            .work_item_handoff("principal-1", "graph-1", handoff.handoff.handoff_id.as_str(),)
+            .unwrap()
+            .unwrap()
+            .structured_result["large_child_output"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 32 * 1024
+    );
+    assert!(store
+        .work_item_handoff("principal-2", "graph-1", handoff.handoff.handoff_id.as_str(),)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn oversized_handoff_and_out_of_scope_comment_fail_closed() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[])];
+    store.create_work_graph(&create).expect("graph should be created");
+    let grant = claim(&store, "a", 1);
+    let running = start_claim(&store, &grant);
+    let error = store
+        .record_work_item_handoff(&WorkItemHandoffCreateRequest {
+            authority: authority(&grant),
+            expected_item_revision: running.revision,
+            actor_principal: "principal-1".to_owned(),
+            summary: "oversized".to_owned(),
+            structured_result: json!({
+                "payload": "x".repeat(MAX_WORK_HANDOFF_RESULT_BYTES)
+            }),
+            evidence_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            verification_state: WorkVerificationState::Waived,
+        })
+        .expect_err("oversized structured result must fail closed");
+    assert!(error.to_string().contains("structured result exceeds"));
+    let acl_error = store
+        .create_work_graph_comment(&WorkGraphCommentCreateRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            actor_principal: "principal-2".to_owned(),
+            body: "not allowed".to_owned(),
+        })
+        .expect_err("unrelated principal must not comment");
+    assert!(acl_error.to_string().contains("outside the graph ACL"));
 }

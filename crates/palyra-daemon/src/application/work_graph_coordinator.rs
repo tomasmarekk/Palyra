@@ -15,7 +15,7 @@ use crate::{
         WorkClaimSettlementOutcome, WorkClaimSettlementRequest, WorkGraphCancellationTargetV1,
         WorkResourceClass,
     },
-    journal::{JournalError, JournalStore},
+    journal::{JournalError, JournalStore, OrchestratorCancelRequest},
 };
 
 /// Production coordinator that charges WorkGraph execution to the shared local governor.
@@ -146,6 +146,23 @@ impl WorkGraphResourceCoordinator {
         })
     }
 
+    /// Cancels active workers through the durable orchestrator-run cancellation flag.
+    pub(crate) fn cancel_work_graph_workers(
+        &self,
+        journal: &JournalStore,
+        graph_id: &str,
+        expected_graph_revision: u64,
+        actor_principal: &str,
+    ) -> Result<WorkGraphCancellationReportV1, WorkGraphCoordinatorError> {
+        self.cancel_work_graph(
+            journal,
+            graph_id,
+            expected_graph_revision,
+            actor_principal,
+            &JournalWorkGraphCancellationPort { journal },
+        )
+    }
+
     /// Returns the shared governor snapshot used by WorkGraph diagnostics.
     pub(crate) fn resource_snapshot(
         &self,
@@ -167,6 +184,32 @@ pub(crate) trait WorkGraphWorkerCancellationPort: Send + Sync {
 /// Redaction-safe worker cancellation transport failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkGraphCancellationPortError;
+
+struct JournalWorkGraphCancellationPort<'a> {
+    journal: &'a JournalStore,
+}
+
+impl WorkGraphWorkerCancellationPort for JournalWorkGraphCancellationPort<'_> {
+    fn request_cancel(
+        &self,
+        target: &WorkGraphCancellationTargetV1,
+        deadline: Instant,
+    ) -> Result<(), WorkGraphCancellationPortError> {
+        if Instant::now() >= deadline {
+            return Err(WorkGraphCancellationPortError);
+        }
+        self.journal
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: target.worker_id.clone(),
+                reason: format!(
+                    "work graph cancellation for item {} generation {}",
+                    target.work_item_id, target.generation
+                ),
+            })
+            .map(|_| ())
+            .map_err(|_| WorkGraphCancellationPortError)
+    }
+}
 
 /// Bounded redacted cancellation fanout evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
