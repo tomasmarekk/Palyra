@@ -1,0 +1,67 @@
+schema_version: 1
+id: mcp.trusted_descriptor_registration
+title: MCP trusted external descriptor registration
+area: tools
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - approvals
+    - mcp
+  tools:
+    - mcp.trusted_descriptor.lookup
+  fixtures:
+    - qa/fixtures/mcp/trusted_descriptor_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Register the host-reviewed external descriptor and expose its lookup tool."
+  - id: approve
+    action: approval_decision
+    decision: approve_once
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp trusted descriptor registered"
+  events:
+    - event_type: approval.requested
+      min_count: 1
+    - event_type: approval.approved
+      min_count: 1
+    - event_type: mcp.runtime.catalog.changed
+      min_count: 1
+    - event_type: mcp.tool_import.snapshot
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: mcp.trusted_descriptor.lookup
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - mcp.trusted_descriptor.executable_payload
+  artifacts: []
+  claims:
+    - "unsigned executable activated"
+artifacts:
+  - path: qa/reports/mcp_trusted_descriptor_registration.json
+    kind: report
+    required: true
+  - path: qa/reports/mcp_trusted_descriptor_registration.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+    - security
+timeout:
+  run_ms: 45000
+  step_ms: 15000

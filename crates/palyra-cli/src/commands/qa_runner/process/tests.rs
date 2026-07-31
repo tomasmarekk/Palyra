@@ -28,6 +28,8 @@ const RUNTIME_KERNEL_V2_CANCEL_SCENARIO: &str = include_str!(
 );
 const RUNTIME_KERNEL_V2_COMPACTION_SCENARIO: &str =
     include_str!("../../../../../../qa/scenarios/runtime_kernel_v2/authoritative_compaction.yaml");
+const MCP_PERSISTENT_SCENARIO: &str =
+    include_str!("../../../../../../qa/scenarios/mcp_runtime/persistent_stdio.yaml");
 
 fn parse_scenario(source: &str) -> QaScenarioManifest {
     palyra_common::qa_scenarios::parse_qa_scenario_manifest_yaml(source)
@@ -54,7 +56,7 @@ fn parse_scenario_with_policy_profile(source: &str, profile: &str) -> QaScenario
 }
 
 #[test]
-fn isolated_daemon_config_enables_only_declared_process_runtime() {
+fn isolated_daemon_config_enables_only_declared_runtime() {
     let base_config = isolated_daemon_config(&parse_scenario(NO_TOOLS_SCENARIO));
     assert_eq!(base_config, QA_BASE_DAEMON_CONFIG);
     assert!(!base_config.contains("process_runner"));
@@ -67,6 +69,13 @@ fn isolated_daemon_config_enables_only_declared_process_runtime() {
     assert!(process_config.contains(r#"allowed_executables = ["echo"]"#));
     assert!(process_config.contains("allow_interpreters = false"));
     assert!(process_config.contains(r#"egress_enforcement_mode = "none""#));
+
+    let mcp_config = isolated_daemon_config(&parse_scenario(MCP_PERSISTENT_SCENARIO));
+    assert!(mcp_config.contains("[[mcp.servers]]"));
+    assert!(mcp_config.contains(r#"mode = "enabled""#));
+    assert!(mcp_config.contains(r#"command = "node""#));
+    assert!(mcp_config.contains(r#"approval_profile = "safe""#));
+    assert!(mcp_config.contains(r#"egress_policy = "deny_all""#));
 }
 
 fn command_env<'a>(command: &'a Command, key: &str) -> Option<&'a OsStr> {

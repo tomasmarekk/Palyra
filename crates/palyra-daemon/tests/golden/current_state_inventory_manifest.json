@@ -33,8 +33,8 @@
     },
     "product_area_status": {
       "preview": 3,
-      "production": 2,
-      "scaffold": 3
+      "production": 3,
+      "scaffold": 2
     }
   },
   "source_of_truth": [

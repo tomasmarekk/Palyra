@@ -259,6 +259,28 @@ fn approval_denied_profile_requires_exact_mutation_tool_and_deny_only_steps() {
 }
 
 #[test]
+fn persistent_mcp_profile_requires_the_exact_external_tool_and_allow_decisions() {
+    let mut manifest = parse_scenario(MCP_PERSISTENT_SCENARIO);
+    assert!(validate_policy_profile(&manifest).is_ok());
+
+    manifest.requires.tools.push("palyra.fs.read_file".to_owned());
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(MCP_PERSISTENT_SCENARIO);
+    manifest.steps.retain(|step| step.action != QaScenarioStepAction::ApprovalDecision);
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(MCP_PERSISTENT_SCENARIO);
+    let approval = manifest
+        .steps
+        .iter_mut()
+        .find(|step| step.action == QaScenarioStepAction::ApprovalDecision)
+        .expect("persistent MCP scenario should include an approval decision");
+    approval.decision = Some(QaScenarioApprovalDecision::Deny);
+    assert!(validate_policy_profile(&manifest).is_err());
+}
+
+#[test]
 fn fault_mutation_profile_requires_a_plan_and_allow_only_steps() {
     let mut manifest = parse_scenario(FAULT_MUTATION_SCENARIO);
     assert!(validate_policy_profile(&manifest).is_ok());

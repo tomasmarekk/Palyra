@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "transport": "stdio",
+  "server_name": "schema-bomb",
+  "catalog_generation": 1,
+  "failure": {
+    "reason_code": "mcp.invalid_schema",
+    "quarantine_reason": "tool schema exceeds bounded structural limits",
+    "catalog_available": false
+  },
+  "tools": [
+    {
+      "name": "mcp.schema_bomb.expand",
+      "input_schema_fixture": {
+        "shape": "recursively_nested_combinators",
+        "estimated_nodes": 1000000
+      }
+    }
+  ]
+}

@@ -18,7 +18,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 - Capability catalog entries: `32`
 - CLI families: `60`
-- Method registry entries: `523`
+- Method registry entries: `526`
 - Compat routes registered: `16/16`
 - Feature rollout flags: `35`
 - Runtime preview controls: `8` capabilities
@@ -28,10 +28,10 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 | Bucket | Count | Source |
 | --- | ---: | --- |
-| `production` | `2` | product area source map |
+| `production` | `3` | product area source map |
 | `preview` | `3` | product area source map |
 | `disabled` | `2` | runtime_controls effective_state |
-| `scaffold` | `3` | product area source map |
+| `scaffold` | `2` | product area source map |
 
 ## Source Of Truth
 
@@ -51,7 +51,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 | Area | Status | Evidence | Reason |
 | --- | --- | --- | --- |
 | `api` | `production` | `/console/v1/control-plane/capabilities`, `/v1/models`, `/v1/chat/completions`, `/v1/responses` | console and compat routes are registered in the live daemon harness |
-| `mcp` | `scaffold` | `cli family: mcp`, `runtime mode: scaffold` | MCP serve is discoverable, while external MCP import and supervision are unavailable |
+| `mcp` | `production` | `config: mcp.mode=enabled`, `qa/suites/mcp_persistent_runtime.yaml`, `/console/v1/mcp/servers/{server_id}/trusted-tools/register`, `/console/v1/mcp/servers/{server_id}/conformance` | durable supervised transports, catalog epochs, host-owned callback policy, and trusted registration are qualified through the real runtime gate |
 | `subagents` | `preview` | `runtime_controls.auxiliary_executor`, `cli: sessions subagents`, `session snapshot subagent_records` | delegated work and durable subagent record projections exist behind preview controls |
 | `execution_backends` | `preview` | `execution_backends`, `runtime_controls.networked_workers` | local sandbox is available, while remote backends and workers remain gated or disabled |
 | `qa_lab` | `scaffold` | `runtime QA fixtures`, `fixtures/golden/release_eval_inventory.json` | regression fixtures exist before the dedicated QA Lab manifest and runner |

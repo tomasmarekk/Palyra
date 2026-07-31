@@ -391,6 +391,15 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
         "qa_read_only" => anyhow::bail!(
             "qa.runner.policy_profile_mismatch: qa_read_only requires explicit workspace read tools"
         ),
+        "qa_mcp_persistent"
+            if has_exact_tools(&manifest.requires.tools, QA_MCP_PERSISTENT_TOOLS)
+                && approval_steps_allow_only(manifest) =>
+        {
+            Ok(())
+        }
+        "qa_mcp_persistent" => anyhow::bail!(
+            "qa.runner.policy_profile_mismatch: qa_mcp_persistent requires the exact persistent MCP conformance tool and explicit allow decisions"
+        ),
         "qa_approval_denied"
             if has_exact_tools(&manifest.requires.tools, QA_APPROVAL_MUTATION_TOOLS)
                 && approval_steps_deny_only(manifest) =>

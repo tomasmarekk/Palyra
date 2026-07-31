@@ -210,6 +210,7 @@ const QA_APPROVAL_MUTATION_TOOLS: &[&str] = &["palyra.fs.apply_patch"];
 const QA_FAULT_MUTATION_TOOLS: &[&str] =
     &["palyra.fs.apply_patch", "palyra.process.run", "palyra.http.fetch", "sessions_spawn"];
 const QA_FAULT_DELIVERY_TOOLS: &[&str] = &["palyra.clarify.ask"];
+const QA_MCP_PERSISTENT_TOOLS: &[&str] = &["mcp.conformance.inspect"];
 const QA_BASE_DAEMON_CONFIG: &str = "version = 1\n";
 const QA_PROCESS_DAEMON_CONFIG: &str = r#"version = 1
 
@@ -221,6 +222,24 @@ path_access_mode = "workspace_only"
 allowed_executables = ["echo"]
 allow_interpreters = false
 egress_enforcement_mode = "none"
+"#;
+const QA_MCP_PERSISTENT_DAEMON_CONFIG: &str = r#"version = 1
+
+[mcp]
+mode = "enabled"
+
+[[mcp.servers]]
+id = "conformance"
+enabled = true
+namespace = "conformance"
+transport = "stdio"
+command = "node"
+args = ["mcp-server.mjs"]
+trust_level = "workspace"
+approval_profile = "safe"
+egress_policy = "deny_all"
+oauth_required = false
+tool_allowlist = ["inspect"]
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1141,6 +1160,14 @@ impl QaDaemonSandbox {
 fn isolated_daemon_config(manifest: &QaScenarioManifest) -> &'static str {
     if manifest.requires.tools.iter().any(|tool| tool.starts_with("palyra.process.")) {
         QA_PROCESS_DAEMON_CONFIG
+    } else if manifest
+        .requires
+        .tools
+        .iter()
+        .map(String::as_str)
+        .eq(QA_MCP_PERSISTENT_TOOLS.iter().copied())
+    {
+        QA_MCP_PERSISTENT_DAEMON_CONFIG
     } else {
         QA_BASE_DAEMON_CONFIG
     }

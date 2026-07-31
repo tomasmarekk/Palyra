@@ -1,0 +1,33 @@
+# Credential-free provider turns for the real persistent MCP QA lane.
+schema_version: 1
+id: qa.mock.provider.mcp-persistent-runtime
+turns:
+  - id: after_second_persistent_call
+    match:
+      tool_result_call_id: qa-mcp-second
+      tool_result_success: true
+    behavior:
+      kind: text
+      text: "MCP persistent runtime conformance verified."
+      finish_reason: stop
+      prompt_tokens: 12
+      completion_tokens: 7
+      latency_ms: 2
+  - id: invoke_persistent_tool_twice
+    match:
+      prompt_contains:
+        - exercise the persistent mcp server twice
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-mcp-first
+          tool_name: mcp.conformance.inspect
+          input_json:
+            ordinal: 1
+        - proposal_id: qa-mcp-second
+          tool_name: mcp.conformance.inspect
+          input_json:
+            ordinal: 2
+      prompt_tokens: 13
+      completion_tokens: 11
+      latency_ms: 2

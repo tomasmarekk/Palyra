@@ -1,0 +1,60 @@
+schema_version: 1
+id: mcp.schema_bomb_quarantine
+title: MCP schema bomb quarantine
+area: security
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - mcp
+  tools:
+    - mcp.schema_bomb.expand
+  fixtures:
+    - qa/fixtures/mcp/schema_bomb_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Import the schema-bomb MCP fixture and keep its tool unavailable."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp schema bomb quarantined"
+  events:
+    - event_type: mcp.discovery.snapshot
+      min_count: 1
+    - event_type: mcp.invalid_schema
+      min_count: 1
+    - event_type: mcp.server_quarantined
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - mcp.schema_bomb.expand
+  events:
+    - mcp.tool_import.snapshot
+  artifacts: []
+  claims:
+    - "schema bomb accepted"
+artifacts:
+  - path: qa/reports/mcp_schema_bomb_quarantine.json
+    kind: report
+    required: true
+  - path: qa/reports/mcp_schema_bomb_quarantine.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+    - security
+timeout:
+  run_ms: 30000
+  step_ms: 10000

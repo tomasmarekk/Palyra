@@ -525,9 +525,14 @@ fn product_area_map() -> Vec<Value> {
         }),
         json!({
             "area": "mcp",
-            "status": "scaffold",
-            "evidence": ["cli family: mcp", "runtime mode: scaffold"],
-            "reason": "MCP serve is discoverable, while external MCP import and supervision are unavailable"
+            "status": "production",
+            "evidence": [
+                "config: mcp.mode=enabled",
+                "qa/suites/mcp_persistent_runtime.yaml",
+                "/console/v1/mcp/servers/{server_id}/trusted-tools/register",
+                "/console/v1/mcp/servers/{server_id}/conformance"
+            ],
+            "reason": "durable supervised transports, catalog epochs, host-owned callback policy, and trusted registration are qualified through the real runtime gate"
         }),
         json!({
             "area": "subagents",

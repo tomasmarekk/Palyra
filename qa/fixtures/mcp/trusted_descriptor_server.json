@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "transport": "http",
+  "server_name": "trusted-descriptor",
+  "catalog_generation": 2,
+  "registration": {
+    "descriptor_id": "external.docs.lookup",
+    "descriptor_sha256": "f6af2b67eb95ee2e7fbad82a4aa9fd8298124305e6fa99a8eb54b2ebf66d00a1",
+    "trust_source": "host-reviewed",
+    "executable_payload_present": false,
+    "breaking_change_requires_reapproval": true
+  },
+  "tools": [
+    {
+      "name": "mcp.trusted_descriptor.lookup",
+      "title": "Trusted descriptor lookup",
+      "input_schema_sha256": "8fd7e563397968c0669233982f90f9d950bc780ee2d64f7bc12ace047e7924dd"
+    }
+  ]
+}

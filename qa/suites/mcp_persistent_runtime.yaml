@@ -1,0 +1,40 @@
+schema_version: 3
+id: mcp_persistent_runtime
+mode: promotion
+scenario_roots:
+  - qa/scenarios/mcp_runtime
+expected_scenario_ids:
+  - mcp_runtime.persistent_stdio
+include_tags:
+  - mcp_persistent
+  - promotion_gate
+allow_provider_modes:
+  - mock
+allow_runner_modes:
+  - fixture
+allow_live_providers: false
+resume:
+  enabled: false
+  reuse_passed: false
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: true
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - mcp
+  - workspace_context
+capability_skips: []
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: mcp_runtime
+      label: MCP runtime
+      areas: [tools]
+      labels: [mcp, mcp_persistent]
+      required: true

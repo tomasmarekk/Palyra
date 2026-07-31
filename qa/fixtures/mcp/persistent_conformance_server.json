@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "transport": "stdio",
+  "server_name": "conformance",
+  "catalog_generation": 4,
+  "tools": [
+    {
+      "name": "mcp.conformance.inspect",
+      "title": "Inspect hostile fixture output",
+      "input_schema_sha256": "2fc8d45d9f01d19e32a655f203ed523ccefa9be3f472f4ad37da50e82b21d5e1",
+      "output_fixture": {
+        "success": true,
+        "untrusted_instruction": "fixture-prompt-injection-marker",
+        "credential_marker": "credential-placeholder",
+        "oversized_bytes": 1048576
+      }
+    }
+  ],
+  "catalog_updates": [
+    {
+      "catalog_generation": 5,
+      "breaking": true,
+      "requires_reapproval": true
+    }
+  ],
+  "callbacks": {
+    "elicitation": "wrong-session-denied",
+    "sampling": "budget-exhausted-denied",
+    "oauth": "single-flight-host-refresh"
+  },
+  "process_cleanup": {
+    "crash_before_shutdown": true,
+    "orphan_expected": false,
+    "cleanup_evidence_required": true
+  }
+}

@@ -10409,6 +10409,48 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/mcp/servers/{server_id}/conformance",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.mcp.servers.by_server_id.conformance",
+        "stability": "gated_production",
+        "required_scope": "admin.write",
+        "request_schema_id": "console.post.console.v1.mcp.servers.by_server_id.conformance.request.method-registry.v1",
+        "request_schema_hash": "e730b8e477d3cbb1e622dc95bd5e8b31e36695e297d128750705ef52d11f59ca",
+        "response_schema_id": "console.post.console.v1.mcp.servers.by_server_id.conformance.response.method-registry.v1",
+        "response_schema_hash": "55296e7cdb981ef67896ea9f3de7c99e74a7d424caaa13be0f1927a4ff73595f",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/mcp/servers/{server_id}/trusted-tools/decision",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.decision",
+        "stability": "gated_production",
+        "required_scope": "admin.write",
+        "request_schema_id": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.decision.request.method-registry.v1",
+        "request_schema_hash": "b673e853c7d8c47f1ae055f4e982cd8752fa71c8b4133668cdf96e586393f70d",
+        "response_schema_id": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.decision.response.method-registry.v1",
+        "response_schema_hash": "39391c56ae671087e2c4200df5ac951737b89223660735411e92c1bf22393df6",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/mcp/servers/{server_id}/trusted-tools/register",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.register",
+        "stability": "gated_production",
+        "required_scope": "admin.write",
+        "request_schema_id": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.register.request.method-registry.v1",
+        "request_schema_hash": "1a22b91e5641835b72c315677b89b4d2f334059e8a722f2988f8c1c4e2545883",
+        "response_schema_id": "console.post.console.v1.mcp.servers.by_server_id.trusted_tools.register.response.method-registry.v1",
+        "response_schema_hash": "d6ced38bee694102719f008650bee99a44e3a4410f26143b865f37ebd7a26023",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/memory/derived-artifacts",
         "http_method": "GET",
         "method_name": "console.get.console.v1.memory.derived_artifacts",
@@ -13277,12 +13319,14 @@
       },
       {
         "area": "mcp",
-        "status": "scaffold",
+        "status": "production",
         "evidence": [
-          "cli family: mcp",
-          "runtime mode: scaffold"
+          "config: mcp.mode=enabled",
+          "qa/suites/mcp_persistent_runtime.yaml",
+          "/console/v1/mcp/servers/{server_id}/trusted-tools/register",
+          "/console/v1/mcp/servers/{server_id}/conformance"
         ],
-        "reason": "MCP serve is discoverable, while external MCP import and supervision are unavailable"
+        "reason": "durable supervised transports, catalog epochs, host-owned callback policy, and trusted registration are qualified through the real runtime gate"
       },
       {
         "area": "subagents",
@@ -13350,14 +13394,14 @@
       "diagnostics_sections": 56,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
-      "method_registry_methods": 523,
+      "method_registry_methods": 526,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
     "product_area_status_counts": {
       "preview": 3,
-      "production": 2,
-      "scaffold": 3
+      "production": 3,
+      "scaffold": 2
     },
     "feature_rollout_counts": {
       "disabled": 35,
@@ -13382,7 +13426,7 @@
         "admin": 60,
         "canvas": 5,
         "compat": 16,
-        "console": 439,
+        "console": 442,
         "public": 2,
         "realtime": 1
       }

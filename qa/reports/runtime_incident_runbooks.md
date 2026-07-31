@@ -317,3 +317,51 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 - Revert ACP runtime maturity to preview.
 - Disable production registration until permission relay and lifecycle tests are
   green.
+
+## MCP Persistent Runtime
+
+### Symptoms
+
+- A configured server remains in `handshaking`, repeatedly enters
+  `reconnecting`, or becomes `quarantined`.
+- A catalog epoch changes during active work and subsequent calls report stale
+  schema or generation evidence.
+- Stdio cleanup reports `mcp.runtime.stdio.cleanup_incomplete`, or daemon drain
+  reports an MCP actor that did not stop within its bounded deadline.
+- OAuth refresh, elicitation, or sampling callbacks are denied with a stable
+  `mcp.runtime.*` reason code.
+
+### Diagnostics
+
+- Run `palyra mcp doctor <server-id> --json` and preserve the redacted lifecycle,
+  generation, catalog epoch, and reason codes.
+- Run `palyra mcp probe <server-id> --json` to distinguish a transport failure
+  from catalog or policy rejection.
+- Run `palyra mcp tools <server-id> --json` and verify that quarantined servers
+  are absent from the current catalog epoch.
+- Inspect `/admin/v1/status` and `/console/v1/diagnostics` for the bounded MCP
+  supervisor snapshot. Do not copy raw stderr, credentials, endpoint query
+  strings, or server payloads into an incident record.
+- For stdio incidents, confirm that cleanup evidence identifies a completed
+  process-tree close before restarting the daemon.
+
+### Safe Mitigation
+
+- Quarantine the affected server generation and allow healthy core tools to
+  continue. Do not bypass broker policy, approval, output, or redaction gates.
+- Correct the server config or credential reference, then run
+  `palyra mcp reload --path <config-path> --dry-run --json`.
+- Apply the reload only after the dry run identifies the intended server and no
+  unrelated config changes. A new connection must take sole ownership of a new
+  generation; never run a parallel per-call transport as a fallback.
+- If bounded drain cannot prove transport or process cleanup, leave the server
+  stopped and escalate with the redacted lifecycle evidence.
+
+### Rollback
+
+- Disable the affected server in configuration and reload through the normal
+  config path.
+- Preserve durable lifecycle, catalog, policy, conformance, and cleanup
+  evidence; rollback must not delete it or replay an uncertain side effect.
+- Re-enable only after `doctor`, `probe`, catalog inspection, restart recovery,
+  and bounded drain all succeed for one owner generation.

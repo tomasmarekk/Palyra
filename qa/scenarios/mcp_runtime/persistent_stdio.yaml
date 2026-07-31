@@ -1,0 +1,86 @@
+# Runs through an isolated palyrad and a real long-lived stdio MCP child.
+schema_version: 5
+id: mcp_runtime.persistent_stdio
+title: Persistent MCP stdio session through the real runtime
+area: tools
+mode:
+  runner: fixture
+  deterministic: true
+runner:
+  provider_fixture: qa/fixtures/mcp/persistent_runtime_provider.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/mcp_persistent
+  policy_profile: qa_mcp_persistent
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - mcp
+    - workspace_context
+  tools:
+    - mcp.conformance.inspect
+  fixtures:
+    - qa/fixtures/mcp/persistent_runtime_provider.yaml
+    - qa/fixtures/sandbox_workspaces/mcp_persistent
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exercise the persistent MCP server twice."
+  - id: approve_first_call
+    action: approval_decision
+    proposal_id: qa-mcp-first
+    decision: allow
+  - id: approve_second_call
+    action: approval_decision
+    proposal_id: qa-mcp-second
+    decision: allow
+expect:
+  terminal_state: completed
+  final_answer:
+    equals: "MCP persistent runtime conformance verified."
+  events:
+    - event_type: tool.call.started
+      min_count: 2
+    - event_type: approval.required
+      min_count: 2
+    - event_type: approval.resolved
+      min_count: 2
+    - event_type: tool.call.completed
+      min_count: 2
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: mcp.conformance.inspect
+      min_count: 2
+  runtime_path:
+    runtime_contract_version: runtime-contracts.v15
+    provider_lane: fixture
+    attempt_owner: embedded_run_stream
+    harness_id: embedded_run_stream
+    context_engine_id: legacy_provider_input
+    mcp_transport_mode: persistent
+    max_fallback_count: 0
+    allowed_fallback_reason_codes: []
+forbidden:
+  tool_calls: []
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts: []
+  claims:
+    - per-call MCP process launch
+artifacts:
+  - path: qa/reports/mcp_runtime/persistent_stdio.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - promotion_gate
+    - mcp
+    - mcp_persistent
+    - deterministic
+timeout:
+  run_ms: 60000
+  step_ms: 20000

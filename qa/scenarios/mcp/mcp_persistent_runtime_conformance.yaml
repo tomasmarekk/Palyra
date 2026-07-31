@@ -1,0 +1,68 @@
+schema_version: 1
+id: mcp.persistent_runtime_conformance
+title: MCP persistent runtime security and cleanup conformance
+area: security
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - approvals
+    - mcp
+    - redaction
+  tools:
+    - mcp.conformance.inspect
+  fixtures:
+    - qa/fixtures/mcp/persistent_conformance_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exercise the persistent MCP conformance fixture without trusting its output."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp persistent runtime conformance verified"
+  events:
+    - event_type: mcp.tool_import.snapshot
+      min_count: 1
+    - event_type: redaction.applied
+      min_count: 1
+    - event_type: mcp.runtime.catalog.changed
+      min_count: 1
+    - event_type: mcp.runtime.session.stopped
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: mcp.conformance.inspect
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - secret.exposed
+    - mcp.runtime.stdio.cleanup_incomplete
+  artifacts: []
+  claims:
+    - "fixture-prompt-injection-marker"
+    - "credential-placeholder"
+    - "breaking catalog reused without reapproval"
+artifacts:
+  - path: qa/reports/mcp_persistent_runtime_conformance.json
+    kind: report
+    required: true
+  - path: qa/reports/mcp_persistent_runtime_conformance.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+    - security
+timeout:
+  run_ms: 45000
+  step_ms: 15000

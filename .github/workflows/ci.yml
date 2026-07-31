@@ -383,6 +383,11 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      - name: Install Node.js for MCP fixture
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version-file: .node-version
+
       - name: Build QA daemon runtime
         run: cargo build -p palyra-daemon --bin palyrad --locked
 
@@ -419,6 +424,14 @@ jobs:
           test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
           mkdir -p artifacts/qa-lab/runtime-kernel-v2-authoritative
           cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/runtime_kernel_v2_authoritative.yaml --output-json artifacts/qa-lab/runtime-kernel-v2-authoritative/report.json --output-markdown artifacts/qa-lab/runtime-kernel-v2-authoritative/report.md --json
+
+      - name: Run persistent MCP runtime gate
+        env:
+          PALYRA_QA_PALYRAD_BIN: ${{ github.workspace }}/target/debug/palyrad
+        run: |
+          test -f "$PALYRA_QA_PALYRAD_BIN" && test ! -L "$PALYRA_QA_PALYRAD_BIN"
+          mkdir -p artifacts/qa-lab/mcp-persistent-runtime
+          cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/mcp_persistent_runtime.yaml --output-json artifacts/qa-lab/mcp-persistent-runtime/report.json --output-markdown artifacts/qa-lab/mcp-persistent-runtime/report.md --json
 
       - name: Upload QA Lab reports
         if: ${{ always() }}
