@@ -89,6 +89,7 @@ use super::vault::vault_get_requires_approval;
 // These bounds catch deadlocks without treating loaded cross-platform test scheduling as a
 // performance assertion.
 const ASYNC_RUNTIME_TEST_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_COMMON_TOOL_DISPATCH_FUTURE_BYTES: usize = 256 * 1024;
 
 #[test]
 fn provider_attempt_admission_exhaustion_maps_to_resource_exhausted() {
@@ -125,6 +126,35 @@ use super::{
     TOOL_APPROVAL_RESPONSE_TIMEOUT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
     VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
+
+#[test]
+fn common_tool_dispatch_future_stays_within_bounded_worker_stack_budget() {
+    let state = build_test_runtime_state(false);
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("qa"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FJ1",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FJ2",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    let future = super::execute_tool_with_runtime_dispatch_with_cancellation(
+        &state,
+        context,
+        "proposal-dispatch-size",
+        super::WORKSPACE_READ_FILE_TOOL_NAME,
+        br#"{"path":"README.md"}"#,
+        None,
+        None,
+    );
+    let future_bytes = std::mem::size_of_val(&future);
+
+    assert!(
+        future_bytes <= MAX_COMMON_TOOL_DISPATCH_FUTURE_BYTES,
+        "common tool dispatch future is {future_bytes} bytes; isolate large runtime branches behind pinned heap futures"
+    );
+}
 
 #[test]
 fn managed_coding_process_adapter_accepts_only_plain_foreground_requests() {

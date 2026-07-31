@@ -1555,119 +1555,138 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if tool_name == PROCESS_LIST_TOOL_NAME {
         execute_process_list_tool(runtime_state, context, proposal_id, input_json)
     } else if tool_name.starts_with("mcp.") {
-        let Some(mcp_runtime) = runtime_state.mcp_runtime().cloned() else {
-            record_mcp_metadata_trace_outcome(
-                runtime_state,
-                context.run_id,
-                proposal_id,
-                tool_name,
-                false,
-                "mcp.runtime.not_installed",
-            )
-            .await;
-            return build_tool_execution_outcome(
-                proposal_id,
-                tool_name,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                "persistent MCP runtime is not installed".to_owned(),
-                false,
-                "mcp_persistent_broker".to_owned(),
-                "broker_gated".to_owned(),
-            );
-        };
-        if mcp_runtime.mode() != palyra_common::runtime_preview::RuntimePreviewMode::Enabled {
-            record_mcp_metadata_trace_outcome(
-                runtime_state,
-                context.run_id,
-                proposal_id,
-                tool_name,
-                false,
-                "mcp.runtime.mode_not_enabled",
-            )
-            .await;
-            return build_tool_execution_outcome(
-                proposal_id,
-                tool_name,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                "MCP tool invocation requires mcp.mode=enabled".to_owned(),
-                false,
-                "mcp_persistent_broker".to_owned(),
-                "broker_gated".to_owned(),
-            );
-        }
-        match mcp_runtime
-            .invoke_tool(
-                Arc::clone(runtime_state),
-                tool_name.to_owned(),
-                input_json.to_vec(),
-                proposal_id.to_owned(),
-                crate::application::mcp_runtime::McpCallbackBinding {
-                    principal_id: context.principal.to_owned(),
-                    session_id: context.session_id.to_owned(),
-                    origin: context.channel.unwrap_or("direct").to_owned(),
-                },
-            )
-            .await
-        {
-            Ok(outcome) => {
-                record_mcp_metadata_trace_outcome(
-                    runtime_state,
-                    context.run_id,
-                    proposal_id,
-                    tool_name,
-                    outcome.success,
-                    if outcome.success {
-                        "mcp.runtime.tool_succeeded"
-                    } else {
-                        "mcp.runtime.tool_failed"
-                    },
-                )
-                .await;
-                let mcp_transport_invocation = outcome.transport_invocation_event();
-                let mut execution_outcome = build_tool_execution_outcome(
-                    proposal_id,
-                    tool_name,
-                    input_json,
-                    outcome.success,
-                    serde_json::to_vec(&outcome.output_json).unwrap_or_else(|_| b"{}".to_vec()),
-                    outcome.error.unwrap_or_default(),
-                    false,
-                    "mcp_persistent_broker".to_owned(),
-                    "broker_gated".to_owned(),
-                );
-                execution_outcome.attestation.mcp_transport_invocation =
-                    mcp_transport_invocation.map(Box::new);
-                execution_outcome
-            }
-            Err(error) => {
-                record_mcp_metadata_trace_outcome(
-                    runtime_state,
-                    context.run_id,
-                    proposal_id,
-                    tool_name,
-                    false,
-                    error.reason_code.as_str(),
-                )
-                .await;
-                build_tool_execution_outcome(
-                    proposal_id,
-                    tool_name,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    error.to_string(),
-                    false,
-                    "mcp_persistent_broker".to_owned(),
-                    "broker_gated".to_owned(),
-                )
-            }
-        }
+        // Keep the persistent transport state machine out of the common dispatch future. Tool
+        // turns poll this dispatcher through nested agent-loop futures on bounded Tokio stacks.
+        Box::pin(execute_persistent_mcp_tool(
+            runtime_state,
+            context,
+            proposal_id,
+            tool_name,
+            input_json,
+        ))
+        .await
     } else {
         execute_tool_call(&runtime_state.config.tool_call, proposal_id, tool_name, input_json).await
+    }
+}
+
+async fn execute_persistent_mcp_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let Some(mcp_runtime) = runtime_state.mcp_runtime().cloned() else {
+        record_mcp_metadata_trace_outcome(
+            runtime_state,
+            context.run_id,
+            proposal_id,
+            tool_name,
+            false,
+            "mcp.runtime.not_installed",
+        )
+        .await;
+        return build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "persistent MCP runtime is not installed".to_owned(),
+            false,
+            "mcp_persistent_broker".to_owned(),
+            "broker_gated".to_owned(),
+        );
+    };
+    if mcp_runtime.mode() != palyra_common::runtime_preview::RuntimePreviewMode::Enabled {
+        record_mcp_metadata_trace_outcome(
+            runtime_state,
+            context.run_id,
+            proposal_id,
+            tool_name,
+            false,
+            "mcp.runtime.mode_not_enabled",
+        )
+        .await;
+        return build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "MCP tool invocation requires mcp.mode=enabled".to_owned(),
+            false,
+            "mcp_persistent_broker".to_owned(),
+            "broker_gated".to_owned(),
+        );
+    }
+    match mcp_runtime
+        .invoke_tool(
+            Arc::clone(runtime_state),
+            tool_name.to_owned(),
+            input_json.to_vec(),
+            proposal_id.to_owned(),
+            crate::application::mcp_runtime::McpCallbackBinding {
+                principal_id: context.principal.to_owned(),
+                session_id: context.session_id.to_owned(),
+                origin: context.channel.unwrap_or("direct").to_owned(),
+            },
+        )
+        .await
+    {
+        Ok(outcome) => {
+            record_mcp_metadata_trace_outcome(
+                runtime_state,
+                context.run_id,
+                proposal_id,
+                tool_name,
+                outcome.success,
+                if outcome.success {
+                    "mcp.runtime.tool_succeeded"
+                } else {
+                    "mcp.runtime.tool_failed"
+                },
+            )
+            .await;
+            let mcp_transport_invocation = outcome.transport_invocation_event();
+            let mut execution_outcome = build_tool_execution_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                outcome.success,
+                serde_json::to_vec(&outcome.output_json).unwrap_or_else(|_| b"{}".to_vec()),
+                outcome.error.unwrap_or_default(),
+                false,
+                "mcp_persistent_broker".to_owned(),
+                "broker_gated".to_owned(),
+            );
+            execution_outcome.attestation.mcp_transport_invocation =
+                mcp_transport_invocation.map(Box::new);
+            execution_outcome
+        }
+        Err(error) => {
+            record_mcp_metadata_trace_outcome(
+                runtime_state,
+                context.run_id,
+                proposal_id,
+                tool_name,
+                false,
+                error.reason_code.as_str(),
+            )
+            .await;
+            build_tool_execution_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error.to_string(),
+                false,
+                "mcp_persistent_broker".to_owned(),
+                "broker_gated".to_owned(),
+            )
+        }
     }
 }
 
