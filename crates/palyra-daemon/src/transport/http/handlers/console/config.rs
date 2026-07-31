@@ -873,6 +873,7 @@ mod tests {
                 egress_allowlist: Vec::new(),
                 oauth_required: false,
                 oauth_grant: None,
+                elicitation_enabled: false,
                 sampling_policy: Default::default(),
                 tool_allowlist: Vec::new(),
                 tool_denylist: Vec::new(),

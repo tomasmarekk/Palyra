@@ -84,6 +84,7 @@ pub(crate) mod autonomy;
 pub mod child_completion;
 pub(crate) mod commitment_candidates;
 pub(crate) mod lifecycle;
+pub(crate) mod mcp_runtime;
 mod metadata_trace;
 pub(crate) mod objective_continuation;
 pub(crate) mod objective_guards;
@@ -7566,6 +7567,22 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 94, name: "work_graph_claim_leases", sql: work_graph::MIGRATION_94_SQL },
     Migration { version: 95, name: "work_graph_concurrency", sql: work_graph::MIGRATION_95_SQL },
     Migration { version: 96, name: "work_graph_handoffs", sql: work_graph::MIGRATION_96_SQL },
+    Migration { version: 97, name: "durable_mcp_runtime", sql: mcp_runtime::MIGRATION_97_SQL },
+    Migration {
+        version: 98,
+        name: "mcp_catalog_and_policy_evidence",
+        sql: mcp_runtime::MIGRATION_98_SQL,
+    },
+    Migration {
+        version: 99,
+        name: "mcp_trusted_tools_and_conformance",
+        sql: mcp_runtime::MIGRATION_99_SQL,
+    },
+    Migration {
+        version: 100,
+        name: "mcp_lifecycle_observations",
+        sql: lifecycle::MIGRATION_100_SQL,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(
@@ -33545,6 +33562,10 @@ mod tests {
 
     use palyra_common::{
         metadata_trace::{MetadataTraceEventDataV1, MetadataTraceRecoveryStrategyV1},
+        qa_runtime_path::{
+            McpTransportInvocationEvent, McpTransportInvocationMode,
+            MCP_TRANSPORT_INVOCATION_EVENT, MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
+        },
         runtime_contracts::{
             ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1,
             CancellationScopeKind, CleanupOutcome, CleanupReportV1, CleanupStepDisposition,
@@ -42982,7 +43003,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_effect_observation_commits_result_evidence_and_fence_atomically() {
+    fn tool_effect_observation_commits_mcp_transport_result_and_fence_atomically() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path.clone(), false))
             .expect("journal store should open");
@@ -43064,26 +43085,41 @@ mod tests {
                 OrchestratorTapeAppendRequest {
                     run_id: run_id.to_owned(),
                     seq: 0,
+                    event_type: MCP_TRANSPORT_INVOCATION_EVENT.to_owned(),
+                    payload_json: serde_json::to_string(&McpTransportInvocationEvent {
+                        schema_version: MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
+                        event_name: MCP_TRANSPORT_INVOCATION_EVENT.to_owned(),
+                        attestation_id: "mcpatt_tool_effect_commit".to_owned(),
+                        transport_id: "mcp.transport.stdio.fixture".to_owned(),
+                        namespaced_tool_id: "mcp.fixture.inspect".to_owned(),
+                        transport_mode: McpTransportInvocationMode::Persistent,
+                    })
+                    .expect("MCP transport evidence should serialize"),
+                },
+                OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 1,
                     event_type: "tool_result".to_owned(),
                     payload_json: json!({"proposal_id": proposal_id}).to_string(),
                 },
                 OrchestratorTapeAppendRequest {
                     run_id: run_id.to_owned(),
-                    seq: 1,
+                    seq: 2,
                     event_type: "tool_attestation".to_owned(),
                     payload_json: json!({"proposal_id": proposal_id}).to_string(),
                 },
                 OrchestratorTapeAppendRequest {
                     run_id: run_id.to_owned(),
-                    seq: 2,
+                    seq: 3,
                     event_type: "tool.executed".to_owned(),
                     payload_json: json!({"proposal_id": proposal_id}).to_string(),
                 },
             ],
         };
         let runtime_events = vec![
-            Some(runtime_event_for(0, RuntimeEventName::ToolResultObserved)),
-            Some(runtime_event_for(1, RuntimeEventName::ToolAttestationObserved)),
+            None,
+            Some(runtime_event_for(1, RuntimeEventName::ToolResultObserved)),
+            Some(runtime_event_for(2, RuntimeEventName::ToolAttestationObserved)),
             None,
         ];
         let observed = store
@@ -43103,7 +43139,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("tape events should count");
-        assert_eq!(tape_count, 3);
+        assert_eq!(tape_count, 4);
         drop(connection);
         let replay = store
             .commit_tool_effect_observation_with_runtime_projections(
@@ -43121,7 +43157,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("replayed tape events should count");
-        assert_eq!(replayed_tape_count, 3);
+        assert_eq!(replayed_tape_count, 4);
         let runtime_event_names = connection
             .prepare(
                 "SELECT event_name FROM runtime_events_v2 WHERE run_ulid = ?1 ORDER BY sequence ASC",

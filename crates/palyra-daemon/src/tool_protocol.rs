@@ -19,11 +19,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use palyra_common::tool_catalog::{
-    sensitive_allowlisted_tool_names, SENSITIVE_CAPABILITY_POLICY_NAMES,
-};
 pub use palyra_common::tool_catalog::{
     tool_metadata, tool_policy_capability_names, tool_requires_approval, ToolCapability,
+};
+use palyra_common::{
+    qa_runtime_path::McpTransportInvocationEvent,
+    tool_catalog::{sensitive_allowlisted_tool_names, SENSITIVE_CAPABILITY_POLICY_NAMES},
 };
 use palyra_policy::{
     evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
@@ -125,6 +126,10 @@ pub struct ToolAttestation {
     pub executor: String,
     pub sandbox_enforcement: String,
     pub execution_manifest: Option<Box<ExecutionAttestationManifest>>,
+    /// Canonical broker evidence when this execution crossed a persistent MCP transport.
+    ///
+    /// Boxed to keep the outcome small across deeply nested async execution frames.
+    pub mcp_transport_invocation: Option<Box<McpTransportInvocationEvent>>,
 }
 
 /// Final attested result of a tool call: success flag, JSON output bytes,
@@ -764,6 +769,7 @@ fn build_execution_outcome(
             executor: raw.executor,
             sandbox_enforcement: raw.sandbox_enforcement,
             execution_manifest: raw.execution_manifest.map(Box::new),
+            mcp_transport_invocation: None,
         },
     }
 }
@@ -1220,10 +1226,11 @@ async fn run_allowlisted_tool_with_cancellation(
 }
 
 // Closed set of tool names this executor can answer for (directly or with an
-// explicit delegation error). Keep in sync with the dispatch match above and
-// with `tool_input_limit_bytes`.
+// explicit delegation error), plus the host-routed MCP namespace. The MCP
+// broker remains the authority for the exact active tool, pinned catalog
+// epoch, schema, approval, and policy after this dispatch-family check.
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    if is_mcp_utility_tool(tool_name) {
+    if is_mcp_utility_tool(tool_name) || is_namespaced_mcp_tool(tool_name) {
         return true;
     }
     is_code_intel_tool(tool_name)
@@ -1309,6 +1316,14 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.browser.downloads.get"
                 | "palyra.plugin.run"
         )
+}
+
+fn is_namespaced_mcp_tool(tool_name: &str) -> bool {
+    tool_name.strip_prefix("mcp.").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(server_name, tool_name)| {
+            !server_name.is_empty() && !tool_name.is_empty()
+        })
+    })
 }
 
 // Executor labels recorded in attestations; pinned by tests and security
@@ -2486,6 +2501,14 @@ mod tests {
         assert_eq!(metadata.capabilities, &[ToolCapability::Network, ToolCapability::SecretsRead]);
         assert!(metadata.default_sensitive);
         assert!(tool_requires_approval("palyra.http.fetch"));
+    }
+
+    #[test]
+    fn namespaced_mcp_tools_are_host_routed_runtime_tools() {
+        assert!(is_runtime_supported_tool("mcp.docs.search"));
+        assert!(is_runtime_supported_tool("mcp.workspace.files.read"));
+        assert!(!is_runtime_supported_tool("mcp."));
+        assert!(!is_runtime_supported_tool("mcp.docs"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

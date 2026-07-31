@@ -1,9 +1,151 @@
 //! Runtime MCP transport implementation and JSON-RPC response parsing.
 
+use std::{sync::Arc, time::Duration};
+
 use super::host_types::default_resource_mime_type;
 use super::*;
 
 impl McpTransport for McpRuntimeTransport {
+    fn invocation_mode(&self, _manifest: &McpServerManifest) -> McpTransportInvocationMode {
+        McpTransportInvocationMode::Persistent
+    }
+
+    fn start(&self, manifest: &McpServerManifest) -> Result<(), McpBrokerError> {
+        let server_id = persistent_server_id(manifest)?;
+        let registry = Arc::clone(&self.registry);
+        let start_timeout = Duration::from_millis(manifest.start_timeout_ms);
+        run_transport_future(async move {
+            registry
+                .wait_until_ready(server_id.as_str(), start_timeout)
+                .await
+                .map(|_| ())
+                .map_err(registry_transport_error)
+        })
+        .map_err(Into::into)
+    }
+
+    fn list_tools(
+        &self,
+        manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredTool>, McpBrokerError> {
+        let result = self.request(manifest, "tools/list", json!({}))?;
+        tools_from_mcp_result(&result).map_err(Into::into)
+    }
+
+    fn list_resources(
+        &self,
+        manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredResource>, McpBrokerError> {
+        let result = self.request(manifest, "resources/list", json!({}))?;
+        resources_from_mcp_result(&result).map_err(Into::into)
+    }
+
+    fn read_resource(
+        &self,
+        manifest: &McpServerManifest,
+        request: &McpResourceReadRequest,
+    ) -> Result<McpResourceReadPayload, McpBrokerError> {
+        let params = json!({ "uri": request.uri.as_str() });
+        let result = self.request(manifest, "resources/read", params)?;
+        resource_payload_from_mcp_result(&result, request.uri.as_str()).map_err(Into::into)
+    }
+
+    fn list_prompts(
+        &self,
+        manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredPrompt>, McpBrokerError> {
+        let result = self.request(manifest, "prompts/list", json!({}))?;
+        prompts_from_mcp_result(&result).map_err(Into::into)
+    }
+
+    fn get_prompt(
+        &self,
+        manifest: &McpServerManifest,
+        request: &McpPromptGetRequest,
+    ) -> Result<McpPromptPayload, McpBrokerError> {
+        let params = json!({
+            "name": request.name.as_str(),
+            "arguments": request.arguments.clone(),
+        });
+        let result = self.request(manifest, "prompts/get", params)?;
+        prompt_payload_from_mcp_result(&result, request.name.as_str()).map_err(Into::into)
+    }
+
+    fn call_tool(
+        &self,
+        manifest: &McpServerManifest,
+        request: &McpToolCallRequest,
+    ) -> Result<McpToolResponse, McpBrokerError> {
+        let params = json!({
+            "name": request.tool_name,
+            "arguments": request.input,
+        });
+        let result = self.request_with_binding(
+            manifest,
+            "tools/call",
+            params,
+            Some(super::super::mcp_runtime::McpCallbackBinding {
+                principal_id: request.callback_principal_id.clone(),
+                session_id: request.callback_session_id.clone(),
+                origin: request.callback_origin.clone(),
+            }),
+        )?;
+        Ok(McpToolResponse {
+            output: result,
+            sampling_requested: false,
+            sampling_model_capability: None,
+            egress_host_requested: None,
+        })
+    }
+}
+
+impl McpRuntimeTransport {
+    fn request(
+        &self,
+        manifest: &McpServerManifest,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, McpBrokerError> {
+        self.request_with_binding(manifest, method, params, None)
+    }
+
+    fn request_with_binding(
+        &self,
+        manifest: &McpServerManifest,
+        method: &'static str,
+        params: Value,
+        callback_binding: Option<super::super::mcp_runtime::McpCallbackBinding>,
+    ) -> Result<Value, McpBrokerError> {
+        let server_id = persistent_server_id(manifest)?;
+        let registry = Arc::clone(&self.registry);
+        let request_timeout = Duration::from_millis(manifest.timeout_ms);
+        run_transport_future(async move {
+            let pin =
+                registry.catalog_pin(server_id.as_str()).await.map_err(registry_transport_error)?;
+            tokio::time::timeout(
+                request_timeout,
+                registry.request_pinned_with_callback_binding(
+                    &pin,
+                    method,
+                    params,
+                    callback_binding,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                McpTransportError::new(
+                    "mcp.runtime.request_timeout",
+                    format!("persistent MCP request for '{server_id}' exceeded its deadline"),
+                )
+            })?
+            .map_err(registry_transport_error)
+        })
+        .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+impl McpTransport for McpPerCallTestTransport {
     fn invocation_mode(&self, _manifest: &McpServerManifest) -> McpTransportInvocationMode {
         McpTransportInvocationMode::PerCall
     }
@@ -43,79 +185,6 @@ impl McpTransport for McpRuntimeTransport {
         tools_from_mcp_result(&result).map_err(Into::into)
     }
 
-    fn list_resources(
-        &self,
-        manifest: &McpServerManifest,
-    ) -> Result<Vec<McpDiscoveredResource>, McpBrokerError> {
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => execute_stdio_jsonrpc(
-                manifest,
-                Some(("resources/list", json!({}))),
-                manifest.timeout_ms,
-            ),
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "resources/list", json!({}), manifest.timeout_ms)
-            }
-        }?;
-        resources_from_mcp_result(&result).map_err(Into::into)
-    }
-
-    fn read_resource(
-        &self,
-        manifest: &McpServerManifest,
-        request: &McpResourceReadRequest,
-    ) -> Result<McpResourceReadPayload, McpBrokerError> {
-        let params = json!({ "uri": request.uri.as_str() });
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => execute_stdio_jsonrpc(
-                manifest,
-                Some(("resources/read", params)),
-                manifest.timeout_ms,
-            ),
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "resources/read", params, manifest.timeout_ms)
-            }
-        }?;
-        resource_payload_from_mcp_result(&result, request.uri.as_str()).map_err(Into::into)
-    }
-
-    fn list_prompts(
-        &self,
-        manifest: &McpServerManifest,
-    ) -> Result<Vec<McpDiscoveredPrompt>, McpBrokerError> {
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => execute_stdio_jsonrpc(
-                manifest,
-                Some(("prompts/list", json!({}))),
-                manifest.timeout_ms,
-            ),
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "prompts/list", json!({}), manifest.timeout_ms)
-            }
-        }?;
-        prompts_from_mcp_result(&result).map_err(Into::into)
-    }
-
-    fn get_prompt(
-        &self,
-        manifest: &McpServerManifest,
-        request: &McpPromptGetRequest,
-    ) -> Result<McpPromptPayload, McpBrokerError> {
-        let params = json!({
-            "name": request.name.as_str(),
-            "arguments": request.arguments.clone(),
-        });
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => {
-                execute_stdio_jsonrpc(manifest, Some(("prompts/get", params)), manifest.timeout_ms)
-            }
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "prompts/get", params, manifest.timeout_ms)
-            }
-        }?;
-        prompt_payload_from_mcp_result(&result, request.name.as_str()).map_err(Into::into)
-    }
-
     fn call_tool(
         &self,
         manifest: &McpServerManifest,
@@ -140,6 +209,16 @@ impl McpTransport for McpRuntimeTransport {
             egress_host_requested: None,
         })
     }
+}
+
+fn persistent_server_id(manifest: &McpServerManifest) -> Result<String, McpBrokerError> {
+    normalize_mcp_identifier(manifest.name.as_str(), "server_name")
+}
+
+fn registry_transport_error(
+    error: super::super::mcp_runtime::McpActorRegistryError,
+) -> McpTransportError {
+    McpTransportError::new("mcp.runtime.persistent_request_failed", error.to_string())
 }
 
 pub(super) fn resources_from_mcp_result(

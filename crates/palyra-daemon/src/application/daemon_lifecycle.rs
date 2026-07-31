@@ -121,6 +121,8 @@ pub(crate) enum LifecycleSubsystem {
     RuntimeHealth,
     /// Managed coding processes, terminals, language servers, and worktrees.
     ManagedCoding,
+    /// Persistent Model Context Protocol server sessions.
+    Mcp,
     /// Local process-lease reconciliation.
     ProcessLeases,
     /// Networked worker lease expiry.
@@ -131,7 +133,7 @@ pub(crate) enum LifecycleSubsystem {
 
 impl LifecycleSubsystem {
     /// Dependency-safe drain order. Producers stop before their consumers.
-    pub(crate) const DRAIN_ORDER: [Self; 10] = [
+    pub(crate) const DRAIN_ORDER: [Self; 11] = [
         Self::Scheduler,
         Self::Hooks,
         Self::BackgroundQueue,
@@ -139,6 +141,7 @@ impl LifecycleSubsystem {
         Self::SelfHealing,
         Self::RuntimeHealth,
         Self::ManagedCoding,
+        Self::Mcp,
         Self::ProcessLeases,
         Self::NetworkedWorkers,
         Self::Transports,
@@ -155,6 +158,7 @@ impl LifecycleSubsystem {
             Self::SelfHealing => "self_healing",
             Self::RuntimeHealth => "runtime_health",
             Self::ManagedCoding => "managed_coding",
+            Self::Mcp => "mcp",
             Self::ProcessLeases => "process_leases",
             Self::NetworkedWorkers => "networked_workers",
             Self::Transports => "transports",

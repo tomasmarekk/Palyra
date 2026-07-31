@@ -572,7 +572,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         };
         if let Some((section_name, file_mcp_servers)) = file_mcp_servers {
             if let Some(mode) = file_mcp_servers.mode {
-                mcp_servers.mode = parse_runtime_preview_mode(
+                mcp_servers.mode = parse_promoted_runtime_mode(
                     mode.as_str(),
                     format!("{section_name}.mode").as_str(),
                 )?;
@@ -1694,7 +1694,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         "PALYRA_API_FACADE_MODE",
         &mut source,
     )?;
-    mcp_servers.mode = apply_runtime_preview_mode_env_override(
+    mcp_servers.mode = apply_promoted_runtime_mode_env_override(
         mcp_servers.mode,
         "PALYRA_MCP_SERVERS_MODE",
         &mut source,
@@ -2949,6 +2949,19 @@ fn apply_runtime_preview_mode_env_override(
     Ok(mode)
 }
 
+fn apply_promoted_runtime_mode_env_override(
+    current: RuntimePreviewMode,
+    env_name: &'static str,
+    source: &mut String,
+) -> Result<RuntimePreviewMode> {
+    let Ok(raw) = env::var(env_name) else {
+        return Ok(current);
+    };
+    let mode = parse_promoted_runtime_mode(raw.as_str(), env_name)?;
+    source.push_str(&format!(" +env({env_name})"));
+    Ok(mode)
+}
+
 fn parse_runtime_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePreviewMode> {
     let mode = parse_preview_mode_value(raw, source_name)?;
     if matches!(mode, RuntimePreviewMode::Enabled) {
@@ -2957,6 +2970,10 @@ fn parse_runtime_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePre
         );
     }
     Ok(mode)
+}
+
+fn parse_promoted_runtime_mode(raw: &str, source_name: &str) -> Result<RuntimePreviewMode> {
+    Ok(parse_preview_mode_value(raw, source_name)?)
 }
 
 fn parse_mcp_server_config(
@@ -3072,6 +3089,7 @@ fn parse_mcp_server_config(
         egress_allowlist,
         oauth_required: entry.oauth_required.unwrap_or(false),
         oauth_grant,
+        elicitation_enabled: entry.elicitation_enabled.unwrap_or(false),
         sampling_policy,
         tool_allowlist,
         tool_denylist,
@@ -3636,6 +3654,14 @@ fn parse_mcp_oauth_grant(
             .ok_or_else(|| anyhow::anyhow!("{source_name}.grant_id is required"))?,
         format!("{source_name}.grant_id").as_str(),
     )?;
+    let auth_profile_id = raw
+        .auth_profile_id
+        .as_deref()
+        .map(|value| {
+            parse_optional_auth_profile_id(value, format!("{source_name}.auth_profile_id").as_str())
+        })
+        .transpose()?
+        .flatten();
     let access_token_vault_ref = parse_required_vault_ref(
         raw.access_token_vault_ref.as_deref(),
         format!("{source_name}.access_token_vault_ref").as_str(),
@@ -3687,6 +3713,7 @@ fn parse_mcp_oauth_grant(
     }
     Ok(Some(McpServerOAuthGrant {
         grant_id,
+        auth_profile_id,
         access_token_vault_ref,
         refresh_token_vault_ref,
         metadata_vault_ref,
@@ -3724,17 +3751,62 @@ fn parse_mcp_sampling_policy(
     .into_iter()
     .map(|value| normalize_mcp_model_capability(value.as_str(), source_name))
     .collect::<Result<Vec<_>>>()?;
-    if matches!(mode, McpServerSamplingMode::Allowlist) && allowed_model_capabilities.is_empty() {
-        anyhow::bail!(
-            "{source_name}.allowed_model_capabilities is required when sampling_policy.mode=allowlist"
-        );
+    let host_model_id = raw
+        .host_model_id
+        .as_deref()
+        .map(|value| normalize_mcp_model_capability(value, source_name))
+        .transpose()?;
+    let max_output_tokens_per_request = raw.max_output_tokens_per_request.unwrap_or(0);
+    let window_seconds = raw.window_seconds.unwrap_or(0);
+    let max_requests_per_window = raw.max_requests_per_window.unwrap_or(0);
+    let max_output_tokens_per_window = raw.max_output_tokens_per_window.unwrap_or(0);
+    let limits_enabled = max_output_tokens_per_request > 0
+        && window_seconds > 0
+        && max_requests_per_window > 0
+        && max_output_tokens_per_window >= max_output_tokens_per_request;
+    match mode {
+        McpServerSamplingMode::Allowlist => {
+            let host_model_id = host_model_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{source_name}.host_model_id is required when sampling_policy.mode=allowlist"
+                )
+            })?;
+            if allowed_model_capabilities.is_empty()
+                || !allowed_model_capabilities.iter().any(|model| model == host_model_id)
+            {
+                anyhow::bail!(
+                    "{source_name}.allowed_model_capabilities must include host_model_id when sampling_policy.mode=allowlist"
+                );
+            }
+            if !limits_enabled {
+                anyhow::bail!(
+                    "{source_name} requires positive per-request, window, and request limits with max_output_tokens_per_window >= max_output_tokens_per_request"
+                );
+            }
+        }
+        McpServerSamplingMode::Deny => {
+            if !allowed_model_capabilities.is_empty()
+                || host_model_id.is_some()
+                || max_output_tokens_per_request != 0
+                || window_seconds != 0
+                || max_requests_per_window != 0
+                || max_output_tokens_per_window != 0
+            {
+                anyhow::bail!(
+                    "{source_name} sampling fields must be empty or zero when sampling_policy.mode=deny"
+                );
+            }
+        }
     }
-    if matches!(mode, McpServerSamplingMode::Deny) && !allowed_model_capabilities.is_empty() {
-        anyhow::bail!(
-            "{source_name}.allowed_model_capabilities must be empty when sampling_policy.mode=deny"
-        );
-    }
-    Ok(McpServerSamplingPolicy { mode, allowed_model_capabilities })
+    Ok(McpServerSamplingPolicy {
+        mode,
+        allowed_model_capabilities,
+        host_model_id,
+        max_output_tokens_per_request,
+        window_seconds,
+        max_requests_per_window,
+        max_output_tokens_per_window,
+    })
 }
 
 fn parse_mcp_sampling_mode(raw: Option<&str>, source_name: &str) -> Result<McpServerSamplingMode> {
@@ -5847,8 +5919,8 @@ mod tests {
         parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
         parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
         parse_process_runner_path_access_mode, parse_process_runner_tier,
-        parse_provider_reasoning_effort, parse_provider_service_tier, parse_root_file_config,
-        parse_runtime_preview_mode, parse_storage_prefix_allowlist,
+        parse_promoted_runtime_mode, parse_provider_reasoning_effort, parse_provider_service_tier,
+        parse_root_file_config, parse_runtime_preview_mode, parse_storage_prefix_allowlist,
         parse_structured_secret_ref_field, parse_tool_allowlist, parse_vault_dir,
         parse_vault_ref_allowlist, validate_acp_runtime_registry, validate_runtime_preview_config,
         AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig,
@@ -6238,11 +6310,20 @@ mod tests {
 
     #[test]
     fn runtime_preview_modes_reject_enabled_until_maturity_gate() {
-        let error = parse_runtime_preview_mode("enabled", "mcp_servers.mode")
+        let error = parse_runtime_preview_mode("enabled", "qa_lab.mode")
             .expect_err("runtime preview sections should not be fully enabled yet");
         let rendered = error.to_string();
-        assert!(rendered.contains("mcp_servers.mode=enabled"));
+        assert!(rendered.contains("qa_lab.mode=enabled"));
         assert!(rendered.contains("maturity gate"));
+    }
+
+    #[test]
+    fn promoted_runtime_modes_accept_enabled() {
+        assert_eq!(
+            parse_promoted_runtime_mode("enabled", "mcp.mode")
+                .expect("promoted MCP mode should accept enabled"),
+            RuntimePreviewMode::Enabled
+        );
     }
 
     #[test]
@@ -6340,8 +6421,10 @@ mod tests {
                 transport: Some("stdio".to_owned()),
                 command: Some(FileMcpCommandValue::Command("mcp-docs".to_owned())),
                 oauth_required: Some(true),
+                elicitation_enabled: Some(true),
                 oauth_grant: Some(FileMcpOAuthGrantConfig {
                     grant_id: Some("grant.docs.oauth".to_owned()),
+                    auth_profile_id: None,
                     access_token_vault_ref: Some("global/mcp.docs.oauth_access".to_owned()),
                     refresh_token_vault_ref: Some("global/mcp.docs.oauth_refresh".to_owned()),
                     metadata_vault_ref: Some("global/mcp.docs.oauth_grant".to_owned()),
@@ -6354,7 +6437,12 @@ mod tests {
                 }),
                 sampling_policy: Some(FileMcpSamplingPolicyConfig {
                     mode: Some("allowlist".to_owned()),
-                    allowed_model_capabilities: Some(vec!["Model:GPT-5".to_owned()]),
+                    allowed_model_capabilities: Some(vec!["GPT-5".to_owned()]),
+                    host_model_id: Some("GPT-5".to_owned()),
+                    max_output_tokens_per_request: Some(256),
+                    window_seconds: Some(60),
+                    max_requests_per_window: Some(4),
+                    max_output_tokens_per_window: Some(1_024),
                 }),
                 ..Default::default()
             },
@@ -6370,10 +6458,65 @@ mod tests {
         assert_eq!(grant.scopes, vec!["docs.read".to_owned()]);
         assert_eq!(grant.expires_at_unix_ms, Some(1_730_000_000_000));
         assert_eq!(server.sampling_policy.mode, crate::config::McpServerSamplingMode::Allowlist);
-        assert_eq!(
-            server.sampling_policy.allowed_model_capabilities,
-            vec!["model:gpt-5".to_owned()]
-        );
+        assert_eq!(server.sampling_policy.allowed_model_capabilities, vec!["gpt-5".to_owned()]);
+        assert_eq!(server.sampling_policy.host_model_id.as_deref(), Some("gpt-5"));
+        assert_eq!(server.sampling_policy.max_output_tokens_per_request, 256);
+        assert_eq!(server.sampling_policy.window_seconds, 60);
+        assert_eq!(server.sampling_policy.max_requests_per_window, 4);
+        assert_eq!(server.sampling_policy.max_output_tokens_per_window, 1_024);
+        assert!(server.elicitation_enabled);
+    }
+
+    #[test]
+    fn mcp_sampling_allowlist_requires_complete_positive_host_bounds() {
+        let error = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("docs".to_owned()),
+                transport: Some("stdio".to_owned()),
+                command: Some(FileMcpCommandValue::Command("mcp-docs".to_owned())),
+                sampling_policy: Some(FileMcpSamplingPolicyConfig {
+                    mode: Some("allowlist".to_owned()),
+                    allowed_model_capabilities: Some(vec!["gpt-5".to_owned()]),
+                    host_model_id: Some("gpt-5".to_owned()),
+                    max_output_tokens_per_request: Some(256),
+                    window_seconds: Some(0),
+                    max_requests_per_window: Some(4),
+                    max_output_tokens_per_window: Some(1_024),
+                }),
+                ..Default::default()
+            },
+            0,
+            "mcp",
+        )
+        .expect_err("zero sampling window must fail closed");
+
+        assert!(error.to_string().contains("requires positive per-request, window"));
+    }
+
+    #[test]
+    fn mcp_sampling_deny_mode_rejects_latent_model_or_budget_configuration() {
+        let error = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("docs".to_owned()),
+                transport: Some("stdio".to_owned()),
+                command: Some(FileMcpCommandValue::Command("mcp-docs".to_owned())),
+                sampling_policy: Some(FileMcpSamplingPolicyConfig {
+                    mode: Some("deny".to_owned()),
+                    allowed_model_capabilities: Some(vec!["gpt-5".to_owned()]),
+                    host_model_id: None,
+                    max_output_tokens_per_request: None,
+                    window_seconds: None,
+                    max_requests_per_window: None,
+                    max_output_tokens_per_window: None,
+                }),
+                ..Default::default()
+            },
+            0,
+            "mcp",
+        )
+        .expect_err("deny mode must reject latent sampling capabilities");
+
+        assert!(error.to_string().contains("must be empty or zero"));
     }
 
     #[test]

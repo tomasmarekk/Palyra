@@ -51,6 +51,7 @@ pub mod managed_worktree_snapshots;
 pub(crate) mod managed_worktree_test_support;
 pub mod managed_worktrees;
 pub mod mcp_broker;
+pub mod mcp_runtime;
 pub mod memory;
 pub mod memory_provider;
 pub mod multimodal_context;

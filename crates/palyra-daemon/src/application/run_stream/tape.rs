@@ -14,6 +14,7 @@ use palyra_common::runtime_contracts::CancellationContextV1;
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
 use palyra_common::{
     qa_fault_injection::{QaFaultAction, QaFaultDirective},
+    qa_runtime_path::{McpTransportInvocationEvent, MCP_TRANSPORT_INVOCATION_EVENT},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_preview::{RuntimeDecisionPayload, RuntimePreviewCapability},
 };
@@ -1153,6 +1154,57 @@ pub(crate) async fn append_tool_result_tape_event(
     Ok(())
 }
 
+/// Builds the canonical tape row for one broker-attested MCP transport invocation.
+///
+/// The run owner validates and sequences broker evidence here so transport
+/// implementations cannot append directly to the run journal.
+///
+/// # Errors
+/// Returns an internal status when the broker payload is malformed or cannot
+/// be serialized.
+#[allow(clippy::result_large_err)]
+pub(crate) fn mcp_transport_invocation_tape_append_request(
+    run_id: &str,
+    seq: i64,
+    invocation: &McpTransportInvocationEvent,
+) -> Result<OrchestratorTapeAppendRequest, Status> {
+    invocation.validate_shape().map_err(|error| {
+        Status::internal(format!(
+            "invalid broker-issued MCP transport invocation evidence: {error}"
+        ))
+    })?;
+    let payload_json = serde_json::to_string(invocation).map_err(|error| {
+        Status::internal(format!("failed to serialize MCP transport invocation evidence: {error}"))
+    })?;
+    Ok(OrchestratorTapeAppendRequest {
+        run_id: run_id.to_owned(),
+        seq,
+        event_type: MCP_TRANSPORT_INVOCATION_EVENT.to_owned(),
+        payload_json,
+    })
+}
+
+/// Appends optional broker-attested MCP transport evidence before the tool result.
+///
+/// # Errors
+/// Returns an internal status for malformed evidence or the journal error when
+/// persistence fails.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn append_mcp_transport_invocation_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    invocation: Option<&McpTransportInvocationEvent>,
+) -> Result<(), Status> {
+    let Some(invocation) = invocation else {
+        return Ok(());
+    };
+    let request = mcp_transport_invocation_tape_append_request(run_id, *tape_seq, invocation)?;
+    runtime_state.append_orchestrator_tape_event(request).await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
 /// Sends a redacted tool-result event to the client and appends the tape row.
 ///
 /// The raw output and error are redacted once and the same redacted bytes
@@ -1574,12 +1626,16 @@ pub(crate) fn tool_attestation_tape_payload(input: ToolAttestationTapePayload<'_
 
 #[cfg(test)]
 mod tests {
+    use palyra_common::qa_runtime_path::{
+        McpTransportInvocationEvent, McpTransportInvocationMode, MCP_TRANSPORT_INVOCATION_EVENT,
+        MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
+    };
     use serde_json::Value;
 
     use super::{
-        redact_run_stream_text, redacted_run_stream_output_json,
-        should_attempt_tool_result_compaction, status_tape_payload, tool_result_tape_payload,
-        ToolResultCompactionOutcome,
+        mcp_transport_invocation_tape_append_request, redact_run_stream_text,
+        redacted_run_stream_output_json, should_attempt_tool_result_compaction,
+        status_tape_payload, tool_result_tape_payload, ToolResultCompactionOutcome,
     };
     use crate::{
         gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v1 as common_v1,
@@ -1590,6 +1646,29 @@ mod tests {
         assert!(!should_attempt_tool_result_compaction(0, false));
         assert!(should_attempt_tool_result_compaction(1, false));
         assert!(!should_attempt_tool_result_compaction(1, true));
+    }
+
+    #[test]
+    fn mcp_transport_invocation_request_preserves_canonical_identity() {
+        let invocation = McpTransportInvocationEvent {
+            schema_version: MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
+            event_name: MCP_TRANSPORT_INVOCATION_EVENT.to_owned(),
+            attestation_id: "mcpatt_fixture_1".to_owned(),
+            transport_id: "mcp.transport.stdio.fixture".to_owned(),
+            namespaced_tool_id: "mcp.fixture.inspect".to_owned(),
+            transport_mode: McpTransportInvocationMode::Persistent,
+        };
+
+        let request =
+            mcp_transport_invocation_tape_append_request("run_mcp_fixture", 7, &invocation)
+                .expect("canonical MCP evidence should produce a tape request");
+        let payload: McpTransportInvocationEvent = serde_json::from_str(&request.payload_json)
+            .expect("MCP tape payload should round-trip");
+
+        assert_eq!(request.run_id, "run_mcp_fixture");
+        assert_eq!(request.seq, 7);
+        assert_eq!(request.event_type, MCP_TRANSPORT_INVOCATION_EVENT);
+        assert_eq!(payload, invocation);
     }
 
     #[test]

@@ -630,6 +630,34 @@ pub(super) fn append_stale_suppression_metadata_trace_tx(
 }
 
 impl JournalStore {
+    /// Appends one bounded MCP tool outcome to an active run's public
+    /// metadata trace. Raw arguments, output, and diagnostics never enter the
+    /// trace; absent or already-closed traces are intentional no-ops.
+    pub(crate) fn append_mcp_metadata_trace_tool_outcome(
+        &self,
+        run_id: &str,
+        event_identity: &str,
+        tool_name: &str,
+        outcome: MetadataTraceToolOutcomeV1,
+        reason_code: &str,
+    ) -> Result<bool, JournalError> {
+        validate_reason_code(run_id, reason_code)?;
+        let now_unix_ms = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        append_runtime_metadata_trace_data_tx(
+            &guard,
+            run_id,
+            event_identity,
+            MetadataTraceEventDataV1::ToolOutcome(ToolOutcomeMetadataV1 {
+                tool_id_sha256: hash_identifier(run_id, MetadataTraceIdDomainV1::Tool, tool_name)?,
+                attempt: 1,
+                outcome,
+                reason_code: reason_code.to_owned(),
+            }),
+            now_unix_ms,
+        )
+    }
+
     #[cfg(test)]
     /// Appends one already-redacted, typed event to the active trace segment.
     ///

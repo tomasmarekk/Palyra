@@ -1551,6 +1551,24 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/plugins/{plugin_id}/delete",
             post(console::plugins::console_plugin_delete_handler),
         )
+        .route(
+            "/console/v1/mcp/servers/{server_id}/trusted-tools/register",
+            post(console::mcp::console_mcp_trusted_tool_register_handler).layer(
+                DefaultBodyLimit::max(console::mcp::MCP_TRUSTED_MUTATION_MAX_REQUEST_BODY_BYTES),
+            ),
+        )
+        .route(
+            "/console/v1/mcp/servers/{server_id}/conformance",
+            post(console::mcp::console_mcp_conformance_handler).layer(DefaultBodyLimit::max(
+                console::mcp::MCP_TRUSTED_MUTATION_MAX_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/console/v1/mcp/servers/{server_id}/trusted-tools/decision",
+            post(console::mcp::console_mcp_trusted_tool_decision_handler).layer(
+                DefaultBodyLimit::max(console::mcp::MCP_TRUSTED_MUTATION_MAX_REQUEST_BODY_BYTES),
+            ),
+        )
         .route("/console/v1/hooks", get(console::hooks::console_hooks_list_handler))
         .route("/console/v1/hooks/bind", post(console::hooks::console_hooks_bind_handler))
         .route("/console/v1/hooks/{hook_id}", get(console::hooks::console_hook_get_handler))

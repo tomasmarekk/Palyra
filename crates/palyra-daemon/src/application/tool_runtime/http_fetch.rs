@@ -1107,6 +1107,7 @@ fn http_fetch_tool_execution_outcome(
             executor: "gateway_http_fetch".to_owned(),
             sandbox_enforcement: "ssrf_guard".to_owned(),
             execution_manifest: None,
+            mcp_transport_invocation: None,
         },
     }
 }

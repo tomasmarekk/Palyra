@@ -17,6 +17,7 @@ use std::{
 
 use palyra_common::runtime_contracts::{
     RuntimeIdempotencyClass, SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision,
+    ToolResultVisibility,
 };
 use serde_json::json;
 use tonic::Status;
@@ -29,8 +30,9 @@ use crate::{
         run_stream::{
             flow_control::RunStreamFlowControl,
             tape::{
-                append_tool_attestation_tape_event, append_tool_decision_tape_event,
-                append_tool_proposal_tape_event, append_tool_result_tape_event,
+                append_mcp_transport_invocation_tape_event, append_tool_attestation_tape_event,
+                append_tool_decision_tape_event, append_tool_proposal_tape_event,
+                append_tool_result_tape_event, mcp_transport_invocation_tape_append_request,
                 redact_run_stream_text, redacted_run_stream_output_json,
                 tool_attestation_tape_payload, tool_result_tape_payload,
                 ToolAttestationTapePayload,
@@ -40,6 +42,7 @@ use crate::{
             reconcile_unknown_tool_side_effect, record_side_effect_reconciliation_receipt,
             SideEffectReconciliationBinding, SideEffectReconciliationOutcome,
         },
+        tool_governance::{apply_host_tool_result_middleware, ToolResultMiddlewareReport},
         tool_registry::{
             describe_catalog_tool, normalization_audit_tape_payload, rejection_tape_payload,
             resolve_catalog_invoke_target, resolve_tool_execution_semantics,
@@ -352,7 +355,7 @@ pub(crate) async fn process_route_tool_proposal_event(
     .await?;
 
     let mut post_execution_error = None;
-    let (execution_outcome, active_side_effect_fence) = if decision.allowed {
+    let (mut execution_outcome, active_side_effect_fence) = if decision.allowed {
         if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
             return Err(Status::cancelled(crate::gateway::CANCELLED_REASON));
         }
@@ -622,6 +625,22 @@ pub(crate) async fn process_route_tool_proposal_event(
         )
     };
 
+    if runtime_state.config.feature_rollouts.tool_result_middleware.enabled
+        || tool_name.starts_with("mcp.")
+    {
+        let report = apply_host_tool_result_middleware(
+            tool_name,
+            execution_outcome.output_json.as_slice(),
+            ToolResultVisibility::ModelInline,
+        )
+        .map_err(|error| {
+            Status::failed_precondition(format!("tool_result_middleware.invalid_output: {error}"))
+        })?;
+        execution_outcome.output_json.clone_from(&report.model_visible_output_json);
+        append_route_tool_result_middleware_tape_event(runtime_state, run_id, tape_seq, &report)
+            .await?;
+    }
+
     if active_side_effect_fence.is_some() && !execution_outcome.attestation.timed_out {
         commit_route_tool_execution_outcome(
             runtime_state,
@@ -671,6 +690,28 @@ pub(crate) async fn process_route_tool_proposal_event(
         "route_message_tool_result",
     )
     .await)
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_route_tool_result_middleware_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    report: &ToolResultMiddlewareReport,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(report).map_err(|error| {
+        Status::internal(format!("failed to serialize tool result middleware report: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool.result_middleware".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -918,10 +959,16 @@ async fn commit_route_tool_execution_outcome(
     };
     let safe_output_json = redacted_run_stream_output_json(outcome.output_json.as_slice());
     let safe_error = redact_run_stream_text(outcome.error.as_str());
-    let result_seq = *tape_seq;
+    let mut result_seq = *tape_seq;
+    let mut tape_events = Vec::with_capacity(4);
+    if let Some(invocation) = outcome.attestation.mcp_transport_invocation.as_deref() {
+        tape_events
+            .push(mcp_transport_invocation_tape_append_request(run_id, result_seq, invocation)?);
+        result_seq = result_seq.saturating_add(1);
+    }
     let attestation_seq = result_seq.saturating_add(1);
     let legacy_seq = attestation_seq.saturating_add(1);
-    let tape_events = vec![
+    tape_events.extend([
         OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
             seq: result_seq,
@@ -968,7 +1015,7 @@ async fn commit_route_tool_execution_outcome(
             })
             .to_string(),
         },
-    ];
+    ]);
     runtime_state
         .commit_tool_effect_observation(ToolEffectObservationCommitRequest {
             operation_id: fence.operation_id.clone(),
@@ -1291,6 +1338,13 @@ async fn append_route_tool_execution_tape_events(
     tool_name: &str,
     execution_outcome: &ToolExecutionOutcome,
 ) -> Result<(), Status> {
+    append_mcp_transport_invocation_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        execution_outcome.attestation.mcp_transport_invocation.as_deref(),
+    )
+    .await?;
     append_tool_result_tape_event(
         runtime_state,
         run_id,

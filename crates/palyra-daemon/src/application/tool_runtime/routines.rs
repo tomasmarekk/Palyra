@@ -3394,6 +3394,7 @@ fn routines_tool_execution_outcome(
             executor: "routines_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
             execution_manifest: None,
+            mcp_transport_invocation: None,
         },
     }
 }

@@ -1890,7 +1890,7 @@ async fn build_run_stream_tool_catalog_snapshot(
         .transpose()?;
     let catalog_policy =
         narrowed_policy.as_ref().unwrap_or(&runtime_state.config.tool_catalog_policy);
-    Ok(build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+    let request = ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
         catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
@@ -1908,7 +1908,12 @@ async fn build_run_stream_tool_catalog_snapshot(
         surface: ToolExposureSurface::RunStream,
         remaining_tool_budget: None,
         created_at_unix_ms,
-    }))
+    };
+    Ok(if let Some(runtime) = runtime_state.mcp_runtime() {
+        runtime.build_tool_catalog_snapshot(request)
+    } else {
+        build_model_visible_tool_catalog_snapshot(request)
+    })
 }
 
 async fn routine_tool_allowlist(

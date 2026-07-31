@@ -234,7 +234,7 @@ async fn build_and_record_route_tool_catalog_snapshot(
     _remaining_tool_budget: u32,
     tape_seq: &mut i64,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
-    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+    let request = ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
         catalog_policy: &runtime_state.config.tool_catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
@@ -252,7 +252,12 @@ async fn build_and_record_route_tool_catalog_snapshot(
         surface: ToolExposureSurface::RouteMessage,
         remaining_tool_budget: None,
         created_at_unix_ms: current_unix_ms(),
-    });
+    };
+    let snapshot = if let Some(runtime) = runtime_state.mcp_runtime() {
+        runtime.build_tool_catalog_snapshot(request)
+    } else {
+        build_model_visible_tool_catalog_snapshot(request)
+    };
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),

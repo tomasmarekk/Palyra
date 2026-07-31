@@ -790,6 +790,7 @@ pub struct McpServerConfig {
     pub egress_allowlist: Vec<String>,
     pub oauth_required: bool,
     pub oauth_grant: Option<McpServerOAuthGrant>,
+    pub elicitation_enabled: bool,
     pub sampling_policy: McpServerSamplingPolicy,
     pub tool_allowlist: Vec<String>,
     pub tool_denylist: Vec<String>,
@@ -806,6 +807,7 @@ pub struct McpServerEnvVaultRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerOAuthGrant {
     pub grant_id: String,
+    pub auth_profile_id: Option<String>,
     pub access_token_vault_ref: String,
     pub refresh_token_vault_ref: Option<String>,
     pub metadata_vault_ref: String,
@@ -822,11 +824,24 @@ pub struct McpServerOAuthGrant {
 pub struct McpServerSamplingPolicy {
     pub mode: McpServerSamplingMode,
     pub allowed_model_capabilities: Vec<String>,
+    pub host_model_id: Option<String>,
+    pub max_output_tokens_per_request: u64,
+    pub window_seconds: u64,
+    pub max_requests_per_window: u64,
+    pub max_output_tokens_per_window: u64,
 }
 
 impl Default for McpServerSamplingPolicy {
     fn default() -> Self {
-        Self { mode: McpServerSamplingMode::Deny, allowed_model_capabilities: Vec::new() }
+        Self {
+            mode: McpServerSamplingMode::Deny,
+            allowed_model_capabilities: Vec::new(),
+            host_model_id: None,
+            max_output_tokens_per_request: 0,
+            window_seconds: 0,
+            max_requests_per_window: 0,
+            max_output_tokens_per_window: 0,
+        }
     }
 }
 

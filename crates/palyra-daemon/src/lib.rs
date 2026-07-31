@@ -2315,6 +2315,41 @@ fn spawn_managed_coding_lifecycle(
     })
 }
 
+fn spawn_mcp_lifecycle(runtime: Arc<GatewayRuntimeState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(mcp_runtime) = runtime.mcp_runtime().cloned() else {
+            return;
+        };
+        let mut lifecycle = runtime.daemon_lifecycle.subscribe();
+        let snapshot = loop {
+            let snapshot = lifecycle.borrow().clone();
+            if matches!(
+                snapshot.phase,
+                application::daemon_lifecycle::DaemonLifecyclePhase::DrainingSubsystems
+                    | application::daemon_lifecycle::DaemonLifecyclePhase::ShutdownRequested
+            ) {
+                break snapshot;
+            }
+            if lifecycle.changed().await.is_err() {
+                return;
+            }
+        };
+        let remaining_ms = snapshot
+            .deadline_unix_ms
+            .unwrap_or_else(|| unix_ms_now().unwrap_or_default())
+            .saturating_sub(unix_ms_now().unwrap_or_default());
+        let timeout = Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(0).max(1));
+        let report = mcp_runtime.drain(timeout).await;
+        if !report.clean() {
+            warn!(
+                abandoned_requests = report.abandoned_requests(),
+                actor_count = report.actors.len(),
+                "persistent MCP runtime did not drain cleanly"
+            );
+        }
+    })
+}
+
 fn managed_coding_command_environment() -> BTreeMap<String, String> {
     [
         "PATH",
@@ -3052,6 +3087,16 @@ pub async fn run() -> Result<()> {
         },
     )
     .context("failed to initialize gateway runtime state")?;
+    let mcp_runtime = application::mcp_runtime::McpProductionRuntime::bootstrap(
+        &runtime,
+        &loaded.mcp_servers,
+        std::env::current_dir().context("failed to resolve MCP runtime working directory")?,
+    )
+    .await
+    .context("failed to initialize persistent MCP runtime")?;
+    runtime
+        .install_mcp_runtime(mcp_runtime)
+        .map_err(|_| anyhow::anyhow!("persistent MCP runtime was installed more than once"))?;
     runtime.configure_networked_worker_remote_dispatcher(Arc::new(
         application::tool_runtime::networked_worker::NodeRuntimeNetworkedWorkerDispatcher::new(
             Arc::clone(&node_runtime),
@@ -3565,6 +3610,11 @@ pub async fn run() -> Result<()> {
         &runtime,
         application::daemon_lifecycle::LifecycleSubsystem::ManagedCoding,
         spawn_managed_coding_lifecycle(runtime.clone()),
+    )?;
+    let _mcp_lifecycle_task = supervise_lifecycle_subsystem_task(
+        &runtime,
+        application::daemon_lifecycle::LifecycleSubsystem::Mcp,
+        spawn_mcp_lifecycle(runtime.clone()),
     )?;
     let _process_lease_reconciliation_task = supervise_lifecycle_subsystem_task(
         &runtime,

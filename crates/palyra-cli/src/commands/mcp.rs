@@ -472,12 +472,14 @@ struct McpOAuthLoginOptions<'a> {
     scopes: &'a [String],
     expires_at_unix_ms: Option<i64>,
     rotation_id: Option<&'a str>,
+    auth_profile_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct McpOAuthGrantLoginOutcome {
     server_id: String,
     grant_id: String,
+    auth_profile_id: Option<String>,
     access_token_vault_ref: String,
     refresh_token_vault_ref: Option<String>,
     metadata_vault_ref: String,
@@ -493,6 +495,8 @@ struct McpOAuthGrantVaultMetadata<'a> {
     schema_version: u32,
     server_id: &'a str,
     grant_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_profile_id: Option<&'a str>,
     access_token_vault_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token_vault_ref: Option<&'a str>,
@@ -517,6 +521,7 @@ fn run_mcp_login(args: McpLoginArgs) -> Result<()> {
         scopes: args.scopes.as_slice(),
         expires_at_unix_ms: args.expires_at_unix_ms,
         rotation_id: args.rotation_id.as_deref(),
+        auth_profile_id: args.auth_profile_id.as_deref(),
     };
     let vault = Vault::open_default().context("failed to open vault for MCP OAuth grant")?;
     let now_unix_ms = current_unix_ms()?;
@@ -533,6 +538,7 @@ fn run_mcp_login(args: McpLoginArgs) -> Result<()> {
         "source": path_ref.display().to_string(),
         "id": outcome.server_id,
         "grant_id": outcome.grant_id,
+        "auth_profile_id": outcome.auth_profile_id,
         "oauth_required": true,
         "access_token_vault_ref_configured": true,
         "refresh_token_vault_ref_configured": outcome.refresh_token_vault_ref.is_some(),
@@ -788,6 +794,9 @@ fn mcp_server_table(args: &McpRegistryMutateArgs) -> Result<toml::Value> {
     if args.oauth_required {
         table.insert("oauth_required".to_owned(), toml::Value::Boolean(true));
     }
+    if args.elicitation_enabled {
+        table.insert("elicitation_enabled".to_owned(), toml::Value::Boolean(true));
+    }
     if let Some(sampling_policy) = mcp_sampling_policy_table(args)? {
         table.insert("sampling_policy".to_owned(), sampling_policy);
     }
@@ -866,15 +875,44 @@ fn validate_mcp_transport_args(args: &McpRegistryMutateArgs) -> Result<()> {
     {
         anyhow::bail!("--egress-host is required when --egress-policy allowlist");
     }
-    if matches!(args.sampling_mode, McpSamplingModeArg::Allowlist)
-        && args.sampling_model_capabilities.is_empty()
-    {
-        anyhow::bail!("--sampling-model-capability is required when --sampling-mode allowlist");
-    }
-    if matches!(args.sampling_mode, McpSamplingModeArg::Deny)
-        && !args.sampling_model_capabilities.is_empty()
-    {
-        anyhow::bail!("--sampling-model-capability requires --sampling-mode allowlist");
+    match args.sampling_mode {
+        McpSamplingModeArg::Allowlist => {
+            let host_model_id = args.sampling_host_model_id.as_deref().ok_or_else(|| {
+                anyhow!("--sampling-host-model-id is required when --sampling-mode allowlist")
+            })?;
+            let normalized_host_model_id = normalize_mcp_model_capability(host_model_id)?;
+            let normalized_capabilities = args
+                .sampling_model_capabilities
+                .iter()
+                .map(|value| normalize_mcp_model_capability(value))
+                .collect::<Result<Vec<_>>>()?;
+            if !normalized_capabilities.iter().any(|value| value == &normalized_host_model_id) {
+                anyhow::bail!(
+                    "--sampling-model-capability must include --sampling-host-model-id when --sampling-mode allowlist"
+                );
+            }
+            if args.sampling_max_output_tokens_per_request == 0
+                || args.sampling_window_seconds == 0
+                || args.sampling_max_requests_per_window == 0
+                || args.sampling_max_output_tokens_per_window
+                    < args.sampling_max_output_tokens_per_request
+            {
+                anyhow::bail!(
+                    "--sampling-mode allowlist requires positive sampling limits and a window token limit at least as large as the per-request limit"
+                );
+            }
+        }
+        McpSamplingModeArg::Deny => {
+            if !args.sampling_model_capabilities.is_empty()
+                || args.sampling_host_model_id.is_some()
+                || args.sampling_max_output_tokens_per_request != 0
+                || args.sampling_window_seconds != 0
+                || args.sampling_max_requests_per_window != 0
+                || args.sampling_max_output_tokens_per_window != 0
+            {
+                anyhow::bail!("sampling callback options require --sampling-mode allowlist");
+            }
+        }
     }
     Ok(())
 }
@@ -974,6 +1012,11 @@ fn parse_env_vault_ref_tables(raw_refs: &[String]) -> Result<Vec<toml::Value>> {
 fn mcp_sampling_policy_table(args: &McpRegistryMutateArgs) -> Result<Option<toml::Value>> {
     if matches!(args.sampling_mode, McpSamplingModeArg::Deny)
         && args.sampling_model_capabilities.is_empty()
+        && args.sampling_host_model_id.is_none()
+        && args.sampling_max_output_tokens_per_request == 0
+        && args.sampling_window_seconds == 0
+        && args.sampling_max_requests_per_window == 0
+        && args.sampling_max_output_tokens_per_window == 0
     {
         return Ok(None);
     }
@@ -987,6 +1030,40 @@ fn mcp_sampling_policy_table(args: &McpRegistryMutateArgs) -> Result<Option<toml
             .collect::<Result<Vec<_>>>()?;
         table.insert("allowed_model_capabilities".to_owned(), string_array_toml(&capabilities));
     }
+    if let Some(host_model_id) = args.sampling_host_model_id.as_deref() {
+        table.insert(
+            "host_model_id".to_owned(),
+            toml::Value::String(normalize_mcp_model_capability(host_model_id)?),
+        );
+    }
+    table.insert(
+        "max_output_tokens_per_request".to_owned(),
+        toml::Value::Integer(
+            i64::try_from(args.sampling_max_output_tokens_per_request)
+                .context("--sampling-max-output-tokens-per-request is too large")?,
+        ),
+    );
+    table.insert(
+        "window_seconds".to_owned(),
+        toml::Value::Integer(
+            i64::try_from(args.sampling_window_seconds)
+                .context("--sampling-window-seconds is too large")?,
+        ),
+    );
+    table.insert(
+        "max_requests_per_window".to_owned(),
+        toml::Value::Integer(
+            i64::try_from(args.sampling_max_requests_per_window)
+                .context("--sampling-max-requests-per-window is too large")?,
+        ),
+    );
+    table.insert(
+        "max_output_tokens_per_window".to_owned(),
+        toml::Value::Integer(
+            i64::try_from(args.sampling_max_output_tokens_per_window)
+                .context("--sampling-max-output-tokens-per-window is too large")?,
+        ),
+    );
     Ok(Some(toml::Value::Table(table)))
 }
 
@@ -1103,6 +1180,10 @@ fn store_mcp_oauth_grant(
         .as_deref()
         .map(|value| normalize_mcp_config_identifier(value, "rotation_id"))
         .transpose()?;
+    let auth_profile_id = options
+        .auth_profile_id
+        .map(|value| normalize_mcp_config_identifier(value, "auth_profile_id"))
+        .transpose()?;
     let key_prefix = mcp_oauth_vault_key_prefix(server_id);
     let access_key = format!("{key_prefix}.access");
     let refresh_key = format!("{key_prefix}.refresh");
@@ -1127,6 +1208,7 @@ fn store_mcp_oauth_grant(
     let outcome = McpOAuthGrantLoginOutcome {
         server_id: server_id.to_owned(),
         grant_id,
+        auth_profile_id,
         access_token_vault_ref,
         refresh_token_vault_ref,
         metadata_vault_ref,
@@ -1140,6 +1222,7 @@ fn store_mcp_oauth_grant(
         schema_version: 1,
         server_id: outcome.server_id.as_str(),
         grant_id: outcome.grant_id.as_str(),
+        auth_profile_id: outcome.auth_profile_id.as_deref(),
         access_token_vault_ref: outcome.access_token_vault_ref.as_str(),
         refresh_token_vault_ref: outcome.refresh_token_vault_ref.as_deref(),
         metadata_vault_ref: outcome.metadata_vault_ref.as_str(),
@@ -1164,6 +1247,9 @@ fn store_mcp_oauth_grant(
 fn mcp_oauth_grant_toml(outcome: &McpOAuthGrantLoginOutcome) -> toml::Value {
     let mut table = toml::map::Map::new();
     table.insert("grant_id".to_owned(), toml::Value::String(outcome.grant_id.clone()));
+    if let Some(auth_profile_id) = outcome.auth_profile_id.as_ref() {
+        table.insert("auth_profile_id".to_owned(), toml::Value::String(auth_profile_id.clone()));
+    }
     table.insert(
         "access_token_vault_ref".to_owned(),
         toml::Value::String(outcome.access_token_vault_ref.clone()),
@@ -2754,8 +2840,14 @@ mod tests {
             egress_policy: McpEgressPolicyArg::DenyAll,
             egress_allowlist: Vec::new(),
             oauth_required: false,
+            elicitation_enabled: false,
             sampling_mode: McpSamplingModeArg::Deny,
             sampling_model_capabilities: Vec::new(),
+            sampling_host_model_id: None,
+            sampling_max_output_tokens_per_request: 0,
+            sampling_window_seconds: 0,
+            sampling_max_requests_per_window: 0,
+            sampling_max_output_tokens_per_window: 0,
             tool_allowlist: vec!["search".to_owned()],
             tool_denylist: Vec::new(),
             enabled: false,
@@ -2777,6 +2869,55 @@ mod tests {
         mcp_servers_array_mut(&mut document).expect("mcp section should be created").push(server);
         validate_daemon_compatible_document(&document)
             .expect("generated MCP registry document should match daemon schema");
+    }
+
+    #[test]
+    fn mcp_registry_table_encodes_host_owned_callback_policy() {
+        let mut args = stdio_registry_args();
+        args.elicitation_enabled = true;
+        args.sampling_mode = McpSamplingModeArg::Allowlist;
+        args.sampling_model_capabilities = vec!["GPT-5".to_owned()];
+        args.sampling_host_model_id = Some("GPT-5".to_owned());
+        args.sampling_max_output_tokens_per_request = 256;
+        args.sampling_window_seconds = 60;
+        args.sampling_max_requests_per_window = 4;
+        args.sampling_max_output_tokens_per_window = 1_024;
+
+        let server = mcp_server_table(&args).expect("bounded callback policy should encode");
+        assert_eq!(server.get("elicitation_enabled").and_then(toml::Value::as_bool), Some(true));
+        let sampling_policy = server
+            .get("sampling_policy")
+            .and_then(toml::Value::as_table)
+            .expect("sampling policy should be a TOML table");
+        assert_eq!(sampling_policy.get("mode").and_then(toml::Value::as_str), Some("allowlist"));
+        assert_eq!(
+            sampling_policy.get("host_model_id").and_then(toml::Value::as_str),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            sampling_policy.get("max_output_tokens_per_window").and_then(toml::Value::as_integer),
+            Some(1_024)
+        );
+
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        mcp_servers_array_mut(&mut document).expect("mcp section should be created").push(server);
+        validate_daemon_compatible_document(&document)
+            .expect("generated callback policy should match daemon schema");
+    }
+
+    #[test]
+    fn mcp_registry_rejects_incomplete_sampling_allowlist() {
+        let mut args = stdio_registry_args();
+        args.sampling_mode = McpSamplingModeArg::Allowlist;
+        args.sampling_model_capabilities = vec!["gpt-5".to_owned()];
+        args.sampling_host_model_id = Some("gpt-5".to_owned());
+        args.sampling_max_output_tokens_per_request = 256;
+        args.sampling_window_seconds = 60;
+        args.sampling_max_requests_per_window = 4;
+
+        let error =
+            mcp_server_table(&args).expect_err("incomplete callback budget must fail closed");
+        assert!(error.to_string().contains("positive sampling limits"));
     }
 
     #[test]
@@ -2845,8 +2986,12 @@ mod tests {
             expires_at_unix_ms: Some(1_730_000_000_000),
             rotation_id: Some("rotation-1".to_owned()),
         };
-        let options =
-            McpOAuthLoginOptions { scopes: &[], expires_at_unix_ms: None, rotation_id: None };
+        let options = McpOAuthLoginOptions {
+            scopes: &[],
+            expires_at_unix_ms: None,
+            rotation_id: None,
+            auth_profile_id: None,
+        };
 
         let outcome = login_mcp_server_in_document(
             &mut document,

@@ -5893,6 +5893,7 @@ fn browser_tool_execution_outcome(
             executor: "browser_broker".to_owned(),
             sandbox_enforcement: "browser_service".to_owned(),
             execution_manifest: None,
+            mcp_transport_invocation: None,
         },
     }
 }

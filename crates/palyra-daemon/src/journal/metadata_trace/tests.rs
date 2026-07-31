@@ -294,6 +294,43 @@ fn run_start_atomically_creates_root_segment_and_event() {
 }
 
 #[test]
+fn mcp_tool_outcome_projects_only_hashed_identity_and_typed_status() {
+    let store =
+        JournalStore::open(journal_config(temp_db_path())).expect("journal store should open");
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5MM1";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5MM2";
+    let tool_name = "mcp.docs.trusted.lookup";
+    create_session(&store, session_id);
+    start_run(&store, session_id, run_id);
+
+    assert!(store
+        .append_mcp_metadata_trace_tool_outcome(
+            run_id,
+            "mcp-tool-event-1",
+            tool_name,
+            MetadataTraceToolOutcomeV1::Succeeded,
+            "mcp.runtime.tool.succeeded",
+        )
+        .expect("MCP outcome should append"));
+
+    let trace =
+        store.load_metadata_trace(run_id).expect("trace should load").expect("trace should exist");
+    trace.validate_shape().expect("MCP projection should preserve trace invariants");
+    let event = trace.segments[0].events.last().expect("MCP outcome should be present");
+    assert!(matches!(
+        &event.event,
+        MetadataTraceEventDataV1::ToolOutcome(metadata)
+            if metadata.outcome == MetadataTraceToolOutcomeV1::Succeeded
+                && metadata.reason_code == "mcp.runtime.tool.succeeded"
+                && metadata.tool_id_sha256
+                    == metadata_trace_id_sha256(MetadataTraceIdDomainV1::Tool, tool_name)
+                        .expect("tool identity should hash")
+    ));
+    let serialized = serde_json::to_string(event).expect("trace event should serialize");
+    assert!(!serialized.contains(tool_name));
+}
+
+#[test]
 fn side_effect_runtime_event_projects_metadata_only_tool_outcome() {
     let store =
         JournalStore::open(journal_config(temp_db_path())).expect("journal store should open");

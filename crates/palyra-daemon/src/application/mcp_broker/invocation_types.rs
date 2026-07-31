@@ -49,6 +49,12 @@ pub struct McpToolCallRequest {
     pub input: Value,
     pub schema_hash: String,
     pub policy: McpInvocationPolicyDecision,
+    /// Host-owned principal to which nested callbacks remain bound.
+    pub callback_principal_id: String,
+    /// Host-owned session to which nested callbacks remain bound.
+    pub callback_session_id: String,
+    /// Host-owned invocation origin for nested callback ACLs.
+    pub callback_origin: String,
     #[serde(default)]
     pub approval_granted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

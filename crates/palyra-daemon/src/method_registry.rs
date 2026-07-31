@@ -239,6 +239,7 @@ fn required_scope_for_route(method: &str, path: &str) -> &'static str {
         _ if path.contains("/secrets") => "secrets.write",
         _ if path.contains("/config") && method == "GET" => "config.read",
         _ if path.contains("/config") => "config.write",
+        _ if path.starts_with("/console/v1/mcp/") => "admin.write",
         _ if path.starts_with("/console/") && method == "GET" => "console.read",
         _ if path.starts_with("/console/") => "console.write",
         _ => "public.read",
@@ -457,6 +458,28 @@ mod tests {
                     "deprecated descriptors should name a replacement or reason code"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn method_registry_exposes_admin_governed_mcp_trust_mutations() {
+        let snapshot = build_method_registry_snapshot();
+        let expected_routes = [
+            "/console/v1/mcp/servers/{server_id}/trusted-tools/register",
+            "/console/v1/mcp/servers/{server_id}/conformance",
+            "/console/v1/mcp/servers/{server_id}/trusted-tools/decision",
+        ];
+
+        for route in expected_routes {
+            let descriptor = snapshot
+                .methods
+                .iter()
+                .find(|descriptor| descriptor.http_method == "POST" && descriptor.route == route)
+                .unwrap_or_else(|| panic!("missing MCP mutation route contract for {route}"));
+            assert_eq!(descriptor.surface, "console");
+            assert_eq!(descriptor.required_scope, "admin.write");
+            assert_eq!(descriptor.stability, "gated_production");
+            assert!(!descriptor.streaming_supported);
         }
     }
 }

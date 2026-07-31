@@ -150,6 +150,8 @@ pub struct McpLoginArgs {
     pub expires_at_unix_ms: Option<i64>,
     #[arg(long, help = "Opaque provider rotation metadata")]
     pub rotation_id: Option<String>,
+    #[arg(long, help = "Existing OAuth auth profile used for automatic access-token refresh")]
+    pub auth_profile_id: Option<String>,
     #[arg(long, default_value_t = 5, help = "Number of backup files to retain")]
     pub backups: usize,
     #[arg(long, default_value_t = false)]
@@ -197,10 +199,26 @@ pub struct McpRegistryMutateArgs {
     pub egress_allowlist: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub oauth_required: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow host-owned MCP elicitation callbacks for this server"
+    )]
+    pub elicitation_enabled: bool,
     #[arg(long, value_enum, default_value_t = McpSamplingModeArg::Deny)]
     pub sampling_mode: McpSamplingModeArg,
     #[arg(long = "sampling-model-capability", help = "Repeatable sampling model capability")]
     pub sampling_model_capabilities: Vec<String>,
+    #[arg(long, help = "Host model used for MCP sampling callbacks")]
+    pub sampling_host_model_id: Option<String>,
+    #[arg(long, default_value_t = 0, help = "Maximum output tokens per sampling callback")]
+    pub sampling_max_output_tokens_per_request: u64,
+    #[arg(long, default_value_t = 0, help = "Sampling budget window in seconds")]
+    pub sampling_window_seconds: u64,
+    #[arg(long, default_value_t = 0, help = "Maximum sampling callbacks per budget window")]
+    pub sampling_max_requests_per_window: u64,
+    #[arg(long, default_value_t = 0, help = "Maximum sampling output tokens per budget window")]
+    pub sampling_max_output_tokens_per_window: u64,
     #[arg(long = "tool-allow", help = "Repeatable raw MCP tool allowlist entry")]
     pub tool_allowlist: Vec<String>,
     #[arg(long = "tool-deny", help = "Repeatable raw MCP tool denylist entry")]

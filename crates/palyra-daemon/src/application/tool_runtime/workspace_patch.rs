@@ -1592,6 +1592,7 @@ fn workspace_patch_tool_execution_outcome(
             executor: "workspace_patch".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
             execution_manifest: None,
+            mcp_transport_invocation: None,
         },
     }
 }

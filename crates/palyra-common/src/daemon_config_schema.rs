@@ -1035,6 +1035,7 @@ pub struct FileMcpServerConfig {
     pub egress_allowlist: Option<Vec<String>>,
     pub oauth_required: Option<bool>,
     pub oauth_grant: Option<FileMcpOAuthGrantConfig>,
+    pub elicitation_enabled: Option<bool>,
     pub sampling_policy: Option<FileMcpSamplingPolicyConfig>,
     pub tool_allowlist: Option<Vec<String>>,
     pub tool_denylist: Option<Vec<String>>,
@@ -1045,6 +1046,7 @@ pub struct FileMcpServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileMcpOAuthGrantConfig {
     pub grant_id: Option<String>,
+    pub auth_profile_id: Option<String>,
     pub access_token_vault_ref: Option<String>,
     pub refresh_token_vault_ref: Option<String>,
     pub metadata_vault_ref: Option<String>,
@@ -1062,6 +1064,11 @@ pub struct FileMcpOAuthGrantConfig {
 pub struct FileMcpSamplingPolicyConfig {
     pub mode: Option<String>,
     pub allowed_model_capabilities: Option<Vec<String>>,
+    pub host_model_id: Option<String>,
+    pub max_output_tokens_per_request: Option<u64>,
+    pub window_seconds: Option<u64>,
+    pub max_requests_per_window: Option<u64>,
+    pub max_output_tokens_per_window: Option<u64>,
 }
 
 /// Stdio command declaration, accepting both legacy argv arrays and canonical command strings.

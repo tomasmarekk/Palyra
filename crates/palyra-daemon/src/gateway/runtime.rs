@@ -27,6 +27,7 @@ mod managed_coding;
 
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use palyra_auth::{
     AuthCredential, AuthCredentialType, AuthProfileEligibility, AuthProfileRecord,
@@ -1526,6 +1527,14 @@ struct CredentialAvailabilityService {
     vault: Arc<Vault>,
 }
 
+/// Opaque, vault-backed OAuth availability result for the MCP host transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpAuthProfileCredentialLease {
+    pub(crate) access_token_vault_ref: String,
+    pub(crate) expires_at_unix_ms: i64,
+    pub(crate) evidence_sha256: String,
+}
+
 impl CredentialAvailabilityService {
     fn new(auth_runtime: Arc<AuthRuntimeState>, vault: Arc<Vault>) -> Self {
         Self { auth_runtime, vault }
@@ -1721,6 +1730,72 @@ impl CredentialAvailabilityService {
                 reason_code,
                 false,
             )
+        })
+    }
+
+    async fn ensure_mcp_oauth_profile(
+        &self,
+        profile_id: &str,
+        minimum_valid_until_unix_ms: i64,
+    ) -> Result<McpAuthProfileCredentialLease, Status> {
+        let read_profile = |registry: Arc<AuthProfileRegistry>, profile_id: String| async move {
+            tokio::task::spawn_blocking(move || registry.get_profile(profile_id.as_str()))
+                .await
+                .map_err(|_| Status::internal("MCP OAuth profile lookup worker panicked"))?
+                .map_err(map_auth_profile_error)?
+                .ok_or_else(|| Status::failed_precondition("MCP OAuth auth profile is missing"))
+        };
+        let mut profile =
+            read_profile(Arc::clone(&self.auth_runtime.registry), profile_id.to_owned()).await?;
+        let requires_refresh = match &profile.credential {
+            AuthCredential::Oauth { expires_at_unix_ms, .. } => {
+                expires_at_unix_ms.is_some_and(|expiry| expiry < minimum_valid_until_unix_ms)
+            }
+            AuthCredential::ApiKey { .. } => {
+                return Err(Status::failed_precondition(
+                    "MCP OAuth auth profile is not an OAuth credential",
+                ));
+            }
+        };
+        if requires_refresh {
+            let outcome = self
+                .auth_runtime
+                .refresh_oauth_profile(profile.profile_id.clone(), Arc::clone(&self.vault))
+                .await?;
+            if matches!(outcome.kind, OAuthRefreshOutcomeKind::Failed) {
+                return Err(Status::unavailable("MCP OAuth auth profile refresh failed"));
+            }
+            profile =
+                read_profile(Arc::clone(&self.auth_runtime.registry), profile.profile_id).await?;
+        }
+        let AuthCredential::Oauth { access_token_vault_ref, expires_at_unix_ms, .. } =
+            profile.credential
+        else {
+            return Err(Status::failed_precondition(
+                "MCP OAuth auth profile changed credential class",
+            ));
+        };
+        if expires_at_unix_ms.is_some_and(|expiry| expiry < minimum_valid_until_unix_ms) {
+            return Err(Status::unavailable(
+                "MCP OAuth auth profile remains below the minimum validity window",
+            ));
+        }
+        let expires_at_unix_ms = expires_at_unix_ms
+            .unwrap_or_else(|| minimum_valid_until_unix_ms.saturating_add(86_400_000));
+        let evidence_sha256 = crate::sha256_hex(
+            format!(
+                "{}\0{}\0{}\0{}",
+                profile.profile_id,
+                access_token_vault_ref,
+                profile.updated_at_unix_ms,
+                expires_at_unix_ms
+            )
+            .as_bytes(),
+        );
+        Ok(McpAuthProfileCredentialLease {
+            access_token_vault_ref,
+            expires_at_unix_ms,
+            evidence_sha256,
         })
     }
 }
@@ -2869,6 +2944,7 @@ pub struct GatewayRuntimeState {
         crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics,
     managed_coding_services:
         Option<Arc<crate::application::managed_coding_services::ManagedCodingRuntimeServices>>,
+    mcp_runtime: OnceLock<Arc<crate::application::mcp_runtime::McpProductionRuntime>>,
     pub(crate) journal_store: JournalStore,
     pub(crate) daemon_lifecycle: DaemonLifecycleController,
     daemon_lifecycle_transition_lock: Mutex<()>,
@@ -4251,6 +4327,38 @@ impl CapabilityDispatchAuthorizer for GatewayRuntimeState {
 }
 
 impl GatewayRuntimeState {
+    /// Installs the one process-wide persistent MCP runtime after the gateway
+    /// state has acquired its stable `Arc` identity.
+    ///
+    /// # Errors
+    /// Returns the supplied runtime when another owner was already installed.
+    pub(crate) fn install_mcp_runtime(
+        &self,
+        runtime: Arc<crate::application::mcp_runtime::McpProductionRuntime>,
+    ) -> Result<(), Arc<crate::application::mcp_runtime::McpProductionRuntime>> {
+        self.mcp_runtime.set(runtime)
+    }
+
+    /// Returns the installed persistent MCP runtime, if startup enabled it.
+    pub(crate) fn mcp_runtime(
+        &self,
+    ) -> Option<&Arc<crate::application::mcp_runtime::McpProductionRuntime>> {
+        self.mcp_runtime.get()
+    }
+
+    /// Ensures an MCP-bound OAuth profile has a live access token without
+    /// exposing the token value outside the vault boundary.
+    pub(crate) async fn ensure_mcp_oauth_profile(
+        &self,
+        profile_id: &str,
+        minimum_valid_until_unix_ms: i64,
+    ) -> Result<McpAuthProfileCredentialLease, Status> {
+        let service = self.credential_availability.as_ref().ok_or_else(|| {
+            Status::failed_precondition("MCP OAuth auth-profile runtime is unavailable")
+        })?;
+        service.ensure_mcp_oauth_profile(profile_id, minimum_valid_until_unix_ms).await
+    }
+
     fn record_networked_worker_stale_result_if_needed(
         &self,
         remote_request_id: &str,
@@ -4647,6 +4755,7 @@ impl GatewayRuntimeState {
             runtime_shadow_diagnostics:
                 crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics::default(),
             managed_coding_services,
+            mcp_runtime: OnceLock::new(),
             journal_store,
             daemon_lifecycle: DaemonLifecycleController::new(daemon_lifecycle_startup),
             daemon_lifecycle_transition_lock: Mutex::new(()),
@@ -20816,6 +20925,29 @@ pub(crate) mod tests {
         assert_eq!(lease.auth_class(), AuthCredentialType::Oauth);
         assert!(!format!("{lease:?}").contains("refreshed-access-token"));
         drop(lease);
+        let scope = "global".parse::<VaultScope>().expect("test vault scope should parse");
+        assert_eq!(
+            vault.get_secret(&scope, "oauth_access").expect("access token should load"),
+            b"refreshed-access-token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_oauth_profile_bridge_refreshes_expired_profile_without_exposing_token() {
+        let adapter = Arc::new(SingleFlightRefreshAdapter::default());
+        let (service, vault) = expired_oauth_credential_service(Arc::clone(&adapter));
+        let minimum_valid_until_unix_ms = current_unix_ms().saturating_add(30_000);
+
+        let lease = service
+            .ensure_mcp_oauth_profile("oauth-primary", minimum_valid_until_unix_ms)
+            .await
+            .expect("expired MCP OAuth profile should refresh");
+
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.access_token_vault_ref, "global/oauth_access");
+        assert!(lease.expires_at_unix_ms >= minimum_valid_until_unix_ms);
+        assert_eq!(lease.evidence_sha256.len(), 64);
+        assert!(!format!("{lease:?}").contains("refreshed-access-token"));
         let scope = "global".parse::<VaultScope>().expect("test vault scope should parse");
         assert_eq!(
             vault.get_secret(&scope, "oauth_access").expect("access token should load"),

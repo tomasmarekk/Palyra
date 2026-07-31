@@ -515,6 +515,7 @@ mod tests {
                 executor: "test".to_owned(),
                 sandbox_enforcement: "test".to_owned(),
                 execution_manifest: None,
+                mcp_transport_invocation: None,
             },
         }
     }

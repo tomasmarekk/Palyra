@@ -145,6 +145,72 @@ pub(super) const MIGRATION_92_SQL: &str = r#"
     END;
 "#;
 
+/// Migration 100: admit persistent MCP sessions to lifecycle drain evidence.
+///
+/// The table is rebuilt because SQLite cannot widen the subsystem `CHECK`
+/// constraint in place. Existing append-only observations retain their exact
+/// primary keys and lifecycle correlation.
+pub(super) const MIGRATION_100_SQL: &str = r#"
+    DROP TRIGGER IF EXISTS trg_daemon_subsystem_drain_prevent_update;
+    DROP TRIGGER IF EXISTS trg_daemon_subsystem_drain_prevent_delete;
+
+    ALTER TABLE daemon_subsystem_drain_observations
+        RENAME TO daemon_subsystem_drain_observations_legacy;
+
+    CREATE TABLE daemon_subsystem_drain_observations (
+        observation_index INTEGER PRIMARY KEY AUTOINCREMENT,
+        lifecycle_revision INTEGER NOT NULL,
+        lifecycle_epoch INTEGER NOT NULL,
+        subsystem TEXT NOT NULL CHECK (
+            subsystem IN (
+                'scheduler',
+                'hooks',
+                'background_queue',
+                'channels',
+                'self_healing',
+                'runtime_health',
+                'managed_coding',
+                'mcp',
+                'process_leases',
+                'networked_workers',
+                'transports'
+            )
+        ),
+        state TEXT NOT NULL CHECK (state IN ('running', 'draining', 'drained', 'aborted')),
+        observed_at_unix_ms INTEGER NOT NULL,
+        UNIQUE(lifecycle_revision, subsystem),
+        FOREIGN KEY(lifecycle_revision) REFERENCES daemon_lifecycle_transitions(revision)
+    );
+
+    INSERT INTO daemon_subsystem_drain_observations (
+        observation_index,
+        lifecycle_revision,
+        lifecycle_epoch,
+        subsystem,
+        state,
+        observed_at_unix_ms
+    )
+    SELECT
+        observation_index,
+        lifecycle_revision,
+        lifecycle_epoch,
+        subsystem,
+        state,
+        observed_at_unix_ms
+    FROM daemon_subsystem_drain_observations_legacy;
+
+    DROP TABLE daemon_subsystem_drain_observations_legacy;
+
+    CREATE TRIGGER trg_daemon_subsystem_drain_prevent_update
+    BEFORE UPDATE ON daemon_subsystem_drain_observations BEGIN
+        SELECT RAISE(ABORT, 'daemon_subsystem_drain_observations is append-only');
+    END;
+    CREATE TRIGGER trg_daemon_subsystem_drain_prevent_delete
+    BEFORE DELETE ON daemon_subsystem_drain_observations BEGIN
+        SELECT RAISE(ABORT, 'daemon_subsystem_drain_observations is append-only');
+    END;
+"#;
+
 impl JournalStore {
     /// Starts a new process epoch at the recovery barrier.
     ///
@@ -291,9 +357,28 @@ fn load_latest_snapshot(
             "daemon lifecycle snapshot digest mismatch".to_owned(),
         ));
     }
-    let snapshot: DaemonLifecycleSnapshot = serde_json::from_str(snapshot_json.as_str())?;
+    let mut snapshot: DaemonLifecycleSnapshot = serde_json::from_str(snapshot_json.as_str())?;
+    normalize_legacy_snapshot(&mut snapshot);
     validate_snapshot(&snapshot)?;
     Ok(Some(snapshot))
+}
+
+fn normalize_legacy_snapshot(snapshot: &mut DaemonLifecycleSnapshot) {
+    if snapshot.subsystems.len() == LifecycleSubsystem::DRAIN_ORDER.len().saturating_sub(1)
+        && snapshot.subsystems.iter().all(|entry| entry.subsystem != LifecycleSubsystem::Mcp)
+    {
+        let insertion_index = LifecycleSubsystem::DRAIN_ORDER
+            .iter()
+            .position(|subsystem| *subsystem == LifecycleSubsystem::Mcp)
+            .expect("MCP is part of the lifecycle drain order");
+        snapshot.subsystems.insert(
+            insertion_index,
+            crate::application::daemon_lifecycle::LifecycleSubsystemSnapshot {
+                subsystem: LifecycleSubsystem::Mcp,
+                state: crate::application::daemon_lifecycle::LifecycleSubsystemState::Drained,
+            },
+        );
+    }
 }
 
 fn validate_snapshot(snapshot: &DaemonLifecycleSnapshot) -> Result<(), JournalError> {
@@ -328,7 +413,10 @@ fn validate_snapshot(snapshot: &DaemonLifecycleSnapshot) -> Result<(), JournalEr
 mod tests {
     use rusqlite::Connection;
 
-    use super::{MIGRATION_79_SQL, MIGRATION_92_SQL};
+    use super::{normalize_legacy_snapshot, MIGRATION_100_SQL, MIGRATION_79_SQL, MIGRATION_92_SQL};
+    use crate::application::daemon_lifecycle::{
+        DaemonLifecycleSnapshot, LifecycleSubsystem, LifecycleSubsystemState,
+    };
 
     #[test]
     fn managed_coding_migration_preserves_lifecycle_observations() {
@@ -392,5 +480,89 @@ mod tests {
                 .is_err(),
             "migrated observations must remain append-only"
         );
+    }
+
+    #[test]
+    fn mcp_migration_preserves_observations_and_append_only_guards() {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        connection.execute_batch(MIGRATION_79_SQL).expect("lifecycle schema should initialize");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO daemon_lifecycle_transitions (
+                        revision, epoch, phase, reason_code, requested_by,
+                        requested_at_unix_ms, admission_policy, snapshot_json,
+                        snapshot_sha256, recorded_at_unix_ms
+                    ) VALUES (1, 1, 'running', 'daemon.lifecycle.ready', 'test',
+                        1, 'reject_new', '{}', 'digest', 1)
+                "#,
+                [],
+            )
+            .expect("legacy lifecycle transition should insert");
+        connection
+            .execute(
+                r#"
+                    INSERT INTO daemon_subsystem_drain_observations (
+                        observation_index, lifecycle_revision, lifecycle_epoch,
+                        subsystem, state, observed_at_unix_ms
+                    ) VALUES (7, 1, 1, 'scheduler', 'running', 1)
+                "#,
+                [],
+            )
+            .expect("legacy observation should insert");
+        connection
+            .execute_batch(MIGRATION_92_SQL)
+            .expect("managed coding lifecycle migration should apply");
+
+        connection.execute_batch(MIGRATION_100_SQL).expect("MCP lifecycle migration should apply");
+
+        let preserved: (i64, String) = connection
+            .query_row(
+                r#"
+                    SELECT observation_index, subsystem
+                    FROM daemon_subsystem_drain_observations
+                    WHERE lifecycle_revision = 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy observation should remain readable");
+        assert_eq!(preserved, (7, "scheduler".to_owned()));
+        connection
+            .execute(
+                r#"
+                    INSERT INTO daemon_subsystem_drain_observations (
+                        lifecycle_revision, lifecycle_epoch, subsystem, state,
+                        observed_at_unix_ms
+                    ) VALUES (1, 1, 'mcp', 'drained', 2)
+                "#,
+                [],
+            )
+            .expect("MCP observation should be admitted");
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM daemon_subsystem_drain_observations WHERE subsystem='mcp'",
+                    []
+                )
+                .is_err(),
+            "migrated observations must remain append-only"
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_normalization_inserts_drained_mcp_boundary() {
+        let mut snapshot = DaemonLifecycleSnapshot::recovery_barrier(1, 1, 1);
+        snapshot.subsystems.retain(|entry| entry.subsystem != LifecycleSubsystem::Mcp);
+
+        normalize_legacy_snapshot(&mut snapshot);
+
+        assert_eq!(snapshot.subsystems.len(), LifecycleSubsystem::DRAIN_ORDER.len());
+        let mcp = snapshot
+            .subsystems
+            .iter()
+            .find(|entry| entry.subsystem == LifecycleSubsystem::Mcp)
+            .expect("normalization should insert MCP");
+        assert_eq!(mcp.state, LifecycleSubsystemState::Drained);
     }
 }

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use palyra_common::runtime_contracts::{
     validate_tool_result_visibility_downgrade, ToolResultVisibility,
 };
+use palyra_safety::{transform_text_for_prompt, SafetyContentKind, SafetySourceKind, TrustLabel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -351,7 +352,11 @@ pub(crate) struct ToolResultMiddlewareReport {
     pub(crate) canonical_output_digest: String,
     pub(crate) model_visible_output_digest: String,
     pub(crate) visibility: ToolResultVisibility,
+    pub(crate) safety_action: String,
+    pub(crate) safety_findings: Vec<String>,
     pub(crate) steps: Vec<ToolResultMiddlewareStep>,
+    #[serde(skip)]
+    pub(crate) model_visible_output_json: Vec<u8>,
 }
 
 /// Validates and records the host-owned middleware chain.
@@ -363,10 +368,41 @@ pub(crate) fn apply_host_tool_result_middleware(
     let value = serde_json::from_slice::<Value>(output_json)
         .map_err(|error| format!("tool result middleware input must be JSON safe: {error}"))?;
     validate_middleware_shape(&value, 0)?;
-    let digest = stable_hash_bytes(canonical_json_bytes(&value).as_slice());
+    let canonical_digest = stable_hash_bytes(canonical_json_bytes(&value).as_slice());
+    let (model_visible_output_json, model_visible_digest, safety_action, safety_findings) =
+        if tool_name.starts_with("mcp.") {
+            let serialized = serde_json::to_string(&value)
+                .map_err(|error| format!("tool result middleware encode failed: {error}"))?;
+            let transform = transform_text_for_prompt(
+                serialized.as_str(),
+                SafetySourceKind::ToolOutput,
+                SafetyContentKind::PlainText,
+                TrustLabel::ExternalUntrusted,
+            );
+            let safety_findings = transform.scan.finding_codes();
+            let projected = json!({
+                "schema_version": TOOL_GOVERNANCE_SCHEMA_VERSION,
+                "source": "external_tool_output",
+                "trust_label": TrustLabel::ExternalUntrusted.as_str(),
+                "safety_action": transform.scan.recommended_action.as_str(),
+                "safety_findings": safety_findings,
+                "content": transform.transformed_text,
+            });
+            let encoded = serde_json::to_vec(&projected)
+                .map_err(|error| format!("tool result middleware projection failed: {error}"))?;
+            let digest = stable_hash_bytes(canonical_json_bytes(&projected).as_slice());
+            (
+                encoded,
+                digest,
+                transform.scan.recommended_action.as_str().to_owned(),
+                transform.scan.finding_codes(),
+            )
+        } else {
+            (output_json.to_vec(), canonical_digest.clone(), "allow".to_owned(), Vec::new())
+        };
     let mut current_visibility = visibility;
     let mut steps = Vec::new();
-    for middleware_class in host_tool_result_middleware_chain() {
+    for (index, middleware_class) in host_tool_result_middleware_chain().into_iter().enumerate() {
         let visibility_before = current_visibility;
         let requested_visibility = visibility_before;
         let visibility_after =
@@ -378,8 +414,12 @@ pub(crate) fn apply_host_tool_result_middleware(
         steps.push(ToolResultMiddlewareStep {
             class: middleware_class,
             plugin_id: format!("host.{}", middleware_class.as_str()),
-            input_digest: digest.clone(),
-            output_digest: digest.clone(),
+            input_digest: if index == 0 {
+                canonical_digest.clone()
+            } else {
+                model_visible_digest.clone()
+            },
+            output_digest: model_visible_digest.clone(),
             visibility_before,
             visibility_after,
             visibility: visibility_after,
@@ -392,10 +432,13 @@ pub(crate) fn apply_host_tool_result_middleware(
     }
     Ok(ToolResultMiddlewareReport {
         schema_version: TOOL_GOVERNANCE_SCHEMA_VERSION,
-        canonical_output_digest: digest.clone(),
-        model_visible_output_digest: digest.clone(),
+        canonical_output_digest: canonical_digest,
+        model_visible_output_digest: model_visible_digest,
         visibility: current_visibility,
+        safety_action,
+        safety_findings,
         steps,
+        model_visible_output_json,
     })
 }
 

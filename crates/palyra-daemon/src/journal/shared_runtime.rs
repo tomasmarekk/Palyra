@@ -3,21 +3,25 @@
 
 use std::collections::BTreeMap;
 
-use palyra_common::runtime_contracts::{
-    AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
-    CleanupOutcome, CleanupReportV1, GenerationCheckDisposition, GenerationCheckOutcome,
-    GenerationLeaseV1, HealthProbeDisposition, HealthProbeLeaseV1, HealthProbeResult,
-    HealthProbeSettlementV1, ProcessLeaseV1, QuarantineClearRequest, RuntimeAttemptId,
-    RuntimeAuthorityClass, RuntimeCausalLink, RuntimeCausalLinkKind, RuntimeComponentHealthV1,
-    RuntimeErrorPhase, RuntimeEventActorKind, RuntimeEventEnvelopeV2, RuntimeEventId,
-    RuntimeEventName, RuntimeEventPayloadRef, RuntimeEventRedactionClass, RuntimeGeneration,
-    RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1,
-    RuntimeHandleKind, RuntimeHandleState, RuntimeHealthState, RuntimeIdentityKind,
-    RuntimeIdentityRef, RuntimeIdentitySetV1, RuntimeInstanceId, RuntimeRetryability, RuntimeRunId,
-    RuntimeSessionId, RuntimeStateAdmissionPosture, RuntimeStateCompatibilityFinding,
-    RuntimeStateCompatibilityOutcome, RuntimeStateCompatibilityReport, RuntimeSubsystem,
-    RuntimeTraceId, SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision,
-    StaleEventDisposition, MAX_RUNTIME_COMPATIBILITY_FINDINGS,
+use palyra_common::{
+    qa_runtime_path::{McpTransportInvocationEvent, MCP_TRANSPORT_INVOCATION_EVENT},
+    runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
+        CleanupOutcome, CleanupReportV1, GenerationCheckDisposition, GenerationCheckOutcome,
+        GenerationLeaseV1, HealthProbeDisposition, HealthProbeLeaseV1, HealthProbeResult,
+        HealthProbeSettlementV1, ProcessLeaseV1, QuarantineClearRequest, RuntimeAttemptId,
+        RuntimeAuthorityClass, RuntimeCausalLink, RuntimeCausalLinkKind, RuntimeComponentHealthV1,
+        RuntimeErrorPhase, RuntimeEventActorKind, RuntimeEventEnvelopeV2, RuntimeEventId,
+        RuntimeEventName, RuntimeEventPayloadRef, RuntimeEventRedactionClass, RuntimeGeneration,
+        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeHandleDescriptorV1,
+        RuntimeHandleKind, RuntimeHandleState, RuntimeHealthState, RuntimeIdentityKind,
+        RuntimeIdentityRef, RuntimeIdentitySetV1, RuntimeInstanceId, RuntimeRetryability,
+        RuntimeRunId, RuntimeSessionId, RuntimeStateAdmissionPosture,
+        RuntimeStateCompatibilityFinding, RuntimeStateCompatibilityOutcome,
+        RuntimeStateCompatibilityReport, RuntimeSubsystem, RuntimeTraceId, SideEffectFenceState,
+        SideEffectFenceV1, SideEffectRetryDecision, StaleEventDisposition,
+        MAX_RUNTIME_COMPATIBILITY_FINDINGS,
+    },
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -2707,21 +2711,15 @@ impl JournalStore {
         request: &super::ToolEffectObservationCommitRequest,
         runtime_events: &[Option<RuntimeEventAppendRequest>],
     ) -> Result<ToolEffectObservationCommitOutcome, JournalError> {
-        if request.tape_events.is_empty()
-            || request.tape_events.len() != runtime_events.len()
+        if request.tape_events.len() != runtime_events.len()
             || !is_sha256_hex(request.evidence_sha256.as_str())
-            || !matches!(
-                request.tape_events.as_slice(),
-                [result, attestation, legacy]
-                    if result.event_type == "tool_result"
-                        && attestation.event_type == "tool_attestation"
-                        && legacy.event_type == "tool.executed"
-            )
         {
             return Err(JournalError::InvalidArgument(
                 "tool effect observation evidence batch is invalid".to_owned(),
             ));
         }
+        let canonical_offset =
+            validate_tool_effect_observation_evidence_batch(request.tape_events.as_slice())?;
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2742,9 +2740,13 @@ impl JournalStore {
                 reason: "tool effect observation generation no longer matches".to_owned(),
             });
         }
-        if runtime_events.first().and_then(Option::as_ref).is_none()
-            || runtime_events.get(1).and_then(Option::as_ref).is_none()
-            || runtime_events.get(2).is_none_or(Option::is_some)
+        if runtime_events.iter().take(canonical_offset).any(Option::is_some)
+            || runtime_events.get(canonical_offset).and_then(Option::as_ref).is_none()
+            || runtime_events
+                .get(canonical_offset.saturating_add(1))
+                .and_then(Option::as_ref)
+                .is_none()
+            || runtime_events.get(canonical_offset.saturating_add(2)).is_none_or(Option::is_some)
         {
             return Err(JournalError::ToolSideEffectFencePrecondition {
                 operation_id: request.operation_id.as_str().to_owned(),
@@ -9659,6 +9661,47 @@ fn persist_component_health_update_tx(
         ],
     )?;
     Ok(())
+}
+
+fn validate_tool_effect_observation_evidence_batch(
+    tape_events: &[OrchestratorTapeAppendRequest],
+) -> Result<usize, JournalError> {
+    let canonical_offset = match tape_events {
+        [result, attestation, legacy]
+            if result.event_type == "tool_result"
+                && attestation.event_type == "tool_attestation"
+                && legacy.event_type == "tool.executed" =>
+        {
+            0
+        }
+        [transport, result, attestation, legacy]
+            if transport.event_type == MCP_TRANSPORT_INVOCATION_EVENT
+                && result.event_type == "tool_result"
+                && attestation.event_type == "tool_attestation"
+                && legacy.event_type == "tool.executed" =>
+        {
+            let invocation = serde_json::from_str::<McpTransportInvocationEvent>(
+                transport.payload_json.as_str(),
+            )
+            .map_err(|error| {
+                JournalError::InvalidArgument(format!(
+                    "tool effect observation MCP transport evidence is invalid JSON: {error}"
+                ))
+            })?;
+            invocation.validate_shape().map_err(|error| {
+                JournalError::InvalidArgument(format!(
+                    "tool effect observation MCP transport evidence is invalid: {error}"
+                ))
+            })?;
+            1
+        }
+        _ => {
+            return Err(JournalError::InvalidArgument(
+                "tool effect observation evidence batch is invalid".to_owned(),
+            ));
+        }
+    };
+    Ok(canonical_offset)
 }
 
 fn validate_tool_effect_observation_evidence(

@@ -119,6 +119,7 @@ use super::{
     },
     orchestration::RunStreamHarnessLifecycle,
     tape::{
+        append_mcp_transport_invocation_tape_event, mcp_transport_invocation_tape_append_request,
         redact_run_stream_text, redacted_run_stream_output_json, send_status_with_tape,
         send_tool_approval_request_with_tape, send_tool_approval_response_with_tape,
         send_tool_attestation_with_tape, send_tool_decision_with_tape,
@@ -3340,10 +3341,16 @@ async fn commit_run_stream_tool_execution_outcome(
     };
     let safe_output_json = redacted_run_stream_output_json(outcome.output_json.as_slice());
     let safe_error = redact_run_stream_text(outcome.error.as_str());
-    let result_seq = *tape_seq;
+    let mut result_seq = *tape_seq;
+    let mut tape_events = Vec::with_capacity(4);
+    if let Some(invocation) = outcome.attestation.mcp_transport_invocation.as_deref() {
+        tape_events
+            .push(mcp_transport_invocation_tape_append_request(run_id, result_seq, invocation)?);
+        result_seq = result_seq.saturating_add(1);
+    }
     let attestation_seq = result_seq.saturating_add(1);
     let legacy_seq = attestation_seq.saturating_add(1);
-    let tape_events = vec![
+    tape_events.extend([
         OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
             seq: result_seq,
@@ -3390,7 +3397,7 @@ async fn commit_run_stream_tool_execution_outcome(
             })
             .to_string(),
         },
-    ];
+    ]);
     runtime_state
         .commit_tool_effect_observation(ToolEffectObservationCommitRequest {
             operation_id: fence.operation_id.clone(),
@@ -3613,6 +3620,14 @@ async fn commit_and_publish_projected_tool_execution_outcome(
         .await
         .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
     } else {
+        append_mcp_transport_invocation_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            execution_outcome.attestation.mcp_transport_invocation.as_deref(),
+        )
+        .await
+        .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
         send_tool_result_with_tape(
             sender,
             runtime_state,
@@ -4029,23 +4044,22 @@ async fn project_tool_result_for_model(
     context: ToolRuntimeExecutionContext<'_>,
     proposal_id: &str,
     tool_name: &str,
-    outcome: ToolExecutionOutcome,
+    mut outcome: ToolExecutionOutcome,
 ) -> Result<ProjectedToolExecutionOutcome, Status> {
     let budget = ToolTurnBudget::default();
     let middleware_report = if runtime_state.config.feature_rollouts.tool_result_middleware.enabled
+        || tool_name.starts_with("mcp.")
     {
-        Some(
-            apply_host_tool_result_middleware(
-                tool_name,
-                outcome.output_json.as_slice(),
-                ToolResultVisibility::ModelInline,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "tool_result_middleware.invalid_output: {error}"
-                ))
-            })?,
+        let report = apply_host_tool_result_middleware(
+            tool_name,
+            outcome.output_json.as_slice(),
+            ToolResultVisibility::ModelInline,
         )
+        .map_err(|error| {
+            Status::failed_precondition(format!("tool_result_middleware.invalid_output: {error}"))
+        })?;
+        outcome.output_json.clone_from(&report.model_visible_output_json);
+        Some(report)
     } else {
         None
     };
@@ -4856,6 +4870,7 @@ mod tests {
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
                 execution_manifest: None,
+                mcp_transport_invocation: None,
             },
         }
     }
@@ -6013,6 +6028,7 @@ mod tests {
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
                 execution_manifest: None,
+                mcp_transport_invocation: None,
             },
         };
 
@@ -6074,6 +6090,7 @@ mod tests {
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
                 execution_manifest: None,
+                mcp_transport_invocation: None,
             },
         };
 
@@ -6157,6 +6174,7 @@ mod tests {
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
                 execution_manifest: None,
+                mcp_transport_invocation: None,
             },
         };
 
@@ -6206,6 +6224,7 @@ mod tests {
                     executor: "test".to_owned(),
                     sandbox_enforcement: "n/a".to_owned(),
                     execution_manifest: None,
+                    mcp_transport_invocation: None,
                 },
             };
 
