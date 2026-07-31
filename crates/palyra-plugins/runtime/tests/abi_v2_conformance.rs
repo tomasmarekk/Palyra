@@ -4,7 +4,10 @@
 //! into guest memory, receives guest-produced bytes, and validates host-owned
 //! authority, lifecycle, deadline, capability, and cleanup invariants.
 
-use std::thread;
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use palyra_plugins_runtime::{
     PluginConformanceFixtureV2, PluginCoreWasmCancellationTokenV2, PluginRuntimeV2, RuntimeLimits,
@@ -344,11 +347,11 @@ fn streaming_call_cancels_after_an_emitted_event() {
         runtime.invoke(CANCELLATION_MODULE, &request, NOW_UNIX_MS, cancellation_for_guest)
     });
 
-    for _ in 0..1_000_000 {
-        if cancellation.observed_event_count() > 0 {
-            break;
-        }
-        thread::yield_now();
+    // A fixed yield count can expire before the worker is scheduled under full-suite load.
+    let event_deadline = Instant::now() + Duration::from_secs(30);
+    while cancellation.observed_event_count() == 0 {
+        assert!(Instant::now() < event_deadline, "guest did not emit its pre-cancellation event");
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(cancellation.observed_event_count(), 1);
     cancellation.cancel();
