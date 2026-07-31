@@ -98,6 +98,7 @@ pub(crate) mod startup_recovery;
 pub(crate) mod state_health;
 pub(crate) mod stuck_run_remediation;
 pub(crate) mod wait_coordinator;
+pub(crate) mod work_graph;
 
 pub(crate) use autonomous_wakes::{
     AutonomousWakeAdmissionRecord, AutonomousWakeAdmissionRequest, AutonomousWakeDecision,
@@ -4914,6 +4915,23 @@ pub enum JournalError {
     WorkItemNotFound { work_item_id: String },
     #[error("invalid work item transition for {work_item_id}: {from} -> {to}")]
     InvalidWorkItemTransition { work_item_id: String, from: String, to: String },
+    #[error("work graph already exists: {graph_id}")]
+    DuplicateWorkGraphId { graph_id: String },
+    #[error("work graph not found: {graph_id}")]
+    WorkGraphNotFound { graph_id: String },
+    #[error("work graph item not found: {graph_id}/{work_item_id}")]
+    WorkGraphItemNotFound { graph_id: String, work_item_id: String },
+    #[error(
+        "work graph revision conflict for {graph_id}/{work_item_id}: expected {expected_revision}, found {actual_revision}"
+    )]
+    WorkGraphRevisionConflict {
+        graph_id: String,
+        work_item_id: String,
+        expected_revision: u64,
+        actual_revision: u64,
+    },
+    #[error("invalid work graph: {reason_code}: {message}")]
+    InvalidWorkGraph { reason_code: String, message: String },
     #[error("commitment already exists: {commitment_id}")]
     DuplicateCommitmentId { commitment_id: String },
     #[error("commitment not found: {commitment_id}")]
@@ -7544,6 +7562,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "managed_coding_lifecycle_observations",
         sql: lifecycle::MIGRATION_92_SQL,
     },
+    Migration { version: 93, name: "durable_work_graph", sql: work_graph::MIGRATION_93_SQL },
 ];
 
 fn emit_background_task_wake_events_tx(

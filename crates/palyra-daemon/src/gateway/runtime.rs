@@ -81,6 +81,9 @@ use crate::application::{
         TurnControlApplyOutcome, TurnControlDecision, TurnControlOperation, TurnControlRequest,
     },
 };
+use crate::domain::work_graph::{
+    WorkGraphCreateRequest, WorkItemTransitionOutcome, WorkItemTransitionRequest,
+};
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsagePath, FeatureUsageRegistry, FeatureUsageSnapshot,
 };
@@ -89,6 +92,7 @@ use crate::journal::state_health::{
     JournalStateRepairReport, JournalStateRepairRequest, JournalWalCheckpointMode,
     JournalWalCheckpointReport, SidecarIndexDescriptor,
 };
+use crate::journal::work_graph::WorkGraphSnapshotV1;
 use crate::journal::{
     ChildCompletionReconcileReport, CommitmentCandidateV2Diagnostics, CommitmentCreateRequest,
     CommitmentDeliveryAttemptCreateRequest, CommitmentDeliveryAttemptRecord, CommitmentEventRecord,
@@ -14439,6 +14443,81 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.create_flow_blocking(&request))
             .await
             .map_err(|_| Status::internal("flow create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_work_graph_blocking(
+        &self,
+        request: &WorkGraphCreateRequest,
+    ) -> Result<WorkGraphSnapshotV1, Status> {
+        self.journal_store
+            .create_work_graph(request)
+            .map_err(|error| map_orchestrator_store_error("create work graph", error))
+    }
+
+    /// Creates one complete, host-validated work graph.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn create_work_graph(
+        self: &Arc<Self>,
+        request: WorkGraphCreateRequest,
+    ) -> Result<WorkGraphSnapshotV1, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_work_graph_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn work_graph_snapshot_blocking(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<WorkGraphSnapshotV1>, Status> {
+        self.journal_store
+            .work_graph_snapshot(graph_id)
+            .map_err(|error| map_orchestrator_store_error("load work graph", error))
+    }
+
+    /// Loads and revalidates one work graph projection.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn work_graph_snapshot(
+        self: &Arc<Self>,
+        graph_id: String,
+    ) -> Result<Option<WorkGraphSnapshotV1>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.work_graph_snapshot_blocking(graph_id.as_str()))
+            .await
+            .map_err(|_| Status::internal("work graph load worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn transition_work_graph_item_blocking(
+        &self,
+        request: &WorkItemTransitionRequest,
+    ) -> Result<WorkItemTransitionOutcome, Status> {
+        self.journal_store
+            .transition_work_graph_item(request)
+            .map_err(|error| map_orchestrator_store_error("transition work graph item", error))
+    }
+
+    /// Applies one host-authoritative expected-revision item transition.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn transition_work_graph_item(
+        self: &Arc<Self>,
+        request: WorkItemTransitionRequest,
+    ) -> Result<WorkItemTransitionOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.transition_work_graph_item_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph transition worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

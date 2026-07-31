@@ -30,6 +30,10 @@ use crate::{
         FlowDependencyNode, FlowDependencyReasonCode, FlowDependencyValidationReport,
         ValidatedFlowDependencyGraph,
     },
+    domain::work_graph::{
+        WorkBudgetV1, WorkGraphCreateRequest, WorkGraphOwnerScopeV1, WorkGraphState,
+        WorkItemSpecV1, WorkItemState,
+    },
     gateway::GatewayRuntimeState,
     journal::{
         ApprovalDecision, FlowBundleRecord, FlowCreateRequest, FlowDependenciesQuarantineRequest,
@@ -116,6 +120,19 @@ pub(crate) struct FlowLineage {
     pub approval_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_graph_id: Option<String>,
+}
+
+/// Host-owned input accepted by the managed work graph flow adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WorkGraphFlowInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph_id: Option<String>,
+    #[serde(default)]
+    budget: WorkBudgetV1,
+    items: Vec<WorkItemSpecV1>,
 }
 
 /// Human-readable contract description for one flow step adapter, used by console surfaces.
@@ -753,6 +770,87 @@ impl FlowCoordinator {
             }
         }
 
+        if let Some(graph_id) = lineage.work_graph_id.as_deref() {
+            let Some(snapshot) = runtime.work_graph_snapshot(graph_id.to_owned()).await? else {
+                return Ok(None);
+            };
+            if !same_flow_scope(
+                flow,
+                snapshot.graph.owner.principal.as_str(),
+                snapshot.graph.owner.device_id.as_str(),
+                snapshot.graph.owner.channel.as_deref(),
+            ) {
+                return Ok(None);
+            }
+            let mapped_state = match snapshot.graph.state {
+                WorkGraphState::Active => FlowStepState::Running,
+                WorkGraphState::Succeeded => FlowStepState::Succeeded,
+                WorkGraphState::Cancelled => FlowStepState::Cancelled,
+                WorkGraphState::Failed | WorkGraphState::Invalid | WorkGraphState::Archived => {
+                    FlowStepState::Failed
+                }
+            };
+            if Some(mapped_state) != state {
+                let terminal = mapped_state.is_terminal();
+                let output_json = terminal.then(|| {
+                    let succeeded = snapshot
+                        .items
+                        .iter()
+                        .filter(|item| item.state == WorkItemState::Succeeded)
+                        .count();
+                    json!({
+                        "schema_version": 1,
+                        "work_graph_id": graph_id,
+                        "state": snapshot.graph.state,
+                        "revision": snapshot.graph.revision,
+                        "item_count": snapshot.items.len(),
+                        "succeeded_item_count": succeeded,
+                        "reason_code": snapshot.graph.reason_code,
+                    })
+                    .to_string()
+                });
+                runtime
+                    .update_flow_step(FlowStepUpdateRequest {
+                        flow_id: flow.flow_id.clone(),
+                        step_id: step.step_id.clone(),
+                        state: Some(mapped_state.as_str().to_owned()),
+                        increment_attempt_count: false,
+                        output_json: Some(output_json),
+                        lineage_json: None,
+                        not_before_unix_ms: None,
+                        waiting_reason: if terminal {
+                            Some(None)
+                        } else {
+                            Some(Some("waiting for work graph terminal state".to_owned()))
+                        },
+                        last_error: matches!(
+                            snapshot.graph.state,
+                            WorkGraphState::Failed
+                                | WorkGraphState::Invalid
+                                | WorkGraphState::Archived
+                        )
+                        .then(|| Some(snapshot.graph.reason_code.clone())),
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: terminal
+                            .then(|| Some(crate::gateway::current_unix_ms())),
+                        actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+                        event_type: "flow.step.work_graph_sync".to_owned(),
+                        summary: format!(
+                            "work graph {graph_id} mapped to {}",
+                            mapped_state.as_str()
+                        ),
+                        payload_json: json!({
+                            "work_graph_id": graph_id,
+                            "work_graph_state": snapshot.graph.state,
+                            "work_graph_revision": snapshot.graph.revision,
+                        })
+                        .to_string(),
+                    })
+                    .await?;
+                return Ok(Some(mapped_state));
+            }
+        }
+
         Ok(state)
     }
 
@@ -809,6 +907,7 @@ impl FlowCoordinator {
         step: &FlowStepRecord,
     ) -> Result<(), Status> {
         match step.adapter.as_str() {
+            "work_graph" => Self::dispatch_work_graph_step(runtime, flow, step).await,
             "background_prompt" | "delegation" | "auxiliary_task" => {
                 Self::dispatch_background_step(runtime, flow, step).await
             }
@@ -852,6 +951,67 @@ impl FlowCoordinator {
             }
             _ => mark_step_blocked(runtime, step, "unsupported flow step adapter").await,
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn dispatch_work_graph_step(
+        runtime: &Arc<GatewayRuntimeState>,
+        flow: &FlowRecord,
+        step: &FlowStepRecord,
+    ) -> Result<(), Status> {
+        let mut lineage = parse_lineage(step)?;
+        if lineage.work_graph_id.is_some() {
+            return mark_step_waiting(runtime, step, "waiting for work graph terminal state").await;
+        }
+        let input = serde_json::from_value::<WorkGraphFlowInput>(parse_step_input(step)).map_err(
+            |error| Status::invalid_argument(format!("invalid work graph input: {error}")),
+        )?;
+        let graph_id = input.graph_id.unwrap_or_else(|| Ulid::new().to_string());
+        let snapshot = runtime
+            .create_work_graph(WorkGraphCreateRequest {
+                graph_id: graph_id.clone(),
+                owner: WorkGraphOwnerScopeV1 {
+                    principal: flow.owner_principal.clone(),
+                    device_id: flow.device_id.clone(),
+                    channel: flow.channel.clone(),
+                    session_id: flow.session_id.clone(),
+                    origin_run_id: flow.origin_run_id.clone(),
+                },
+                objective_id: lineage.objective_id.clone(),
+                routine_id: lineage.routine_id.clone(),
+                flow_id: Some(flow.flow_id.clone()),
+                flow_step_id: Some(step.step_id.clone()),
+                budget: input.budget,
+                items: input.items,
+                actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+            })
+            .await?;
+        lineage.work_graph_id = Some(graph_id.clone());
+        runtime
+            .update_flow_step(FlowStepUpdateRequest {
+                flow_id: flow.flow_id.clone(),
+                step_id: step.step_id.clone(),
+                state: Some(FlowStepState::Running.as_str().to_owned()),
+                increment_attempt_count: true,
+                output_json: None,
+                lineage_json: Some(serialize_lineage(&lineage)?),
+                not_before_unix_ms: None,
+                waiting_reason: Some(Some("waiting for work graph terminal state".to_owned())),
+                last_error: Some(None),
+                started_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                completed_at_unix_ms: Some(None),
+                actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+                event_type: "flow.step.work_graph_dispatched".to_owned(),
+                summary: format!("flow step created work graph {graph_id}"),
+                payload_json: json!({
+                    "work_graph_id": graph_id,
+                    "graph_revision": snapshot.graph.revision,
+                    "item_count": snapshot.items.len(),
+                })
+                .to_string(),
+            })
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -963,6 +1123,12 @@ impl FlowCoordinator {
 /// Returns the static adapter contract catalog surfaced to operators.
 pub(crate) fn flow_adapter_contracts() -> Vec<FlowAdapterContract> {
     vec![
+        FlowAdapterContract {
+            adapter: "work_graph",
+            input_contract: "bounded WorkGraphFlowInput with delegated budget and complete item DAG",
+            output_contract: "host-generated terminal summary without raw worker transcripts",
+            ownership: "managed",
+        },
         FlowAdapterContract {
             adapter: "routine",
             input_contract: "routine_id plus optional run lineage",
