@@ -44,6 +44,12 @@ pub(crate) fn validate_loaded_graph(
             format!("unsupported graph schema version {}", graph.schema_version),
         ));
     }
+    if items.is_empty() || items.len() > MAX_WORK_GRAPH_ITEMS {
+        return Err(WorkGraphValidationError::new(
+            INVALID_RESTORE,
+            "durable graph contains an invalid number of items",
+        ));
+    }
     if WorkGraphState::parse(graph.state.as_str()).is_none() {
         return Err(WorkGraphValidationError::new(INVALID_RESTORE, "unknown graph state"));
     }
@@ -61,6 +67,29 @@ pub(crate) fn validate_loaded_graph(
                     INVALID_RESTORE,
                     format!("item {} has unknown state", item.work_item_id),
                 ));
+            }
+            if item.state.is_claimed() != item.claim.is_some() {
+                return Err(WorkGraphValidationError::new(
+                    INVALID_RESTORE,
+                    format!("item {} claim authority does not match its state", item.work_item_id),
+                ));
+            }
+            if let Some(claim) = item.claim.as_ref() {
+                if claim.claim_token_sha256.len() != 64
+                    || !claim.claim_token_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || claim.generation == 0
+                    || claim.record_revision != item.revision
+                    || claim.attempt_id.trim().is_empty()
+                    || claim.runtime_instance_id.trim().is_empty()
+                    || claim.process_start_token.trim().is_empty()
+                    || claim.expires_at_unix_ms < claim.issued_at_unix_ms
+                    || claim.heartbeat_at_unix_ms < claim.issued_at_unix_ms
+                {
+                    return Err(WorkGraphValidationError::new(
+                        INVALID_RESTORE,
+                        format!("item {} has malformed claim authority", item.work_item_id),
+                    ));
+                }
             }
             Ok(WorkItemSpecV1 {
                 work_item_id: item.work_item_id.clone(),

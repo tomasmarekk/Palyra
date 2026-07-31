@@ -224,6 +224,22 @@ impl JournalStore {
                 actual_revision: current.revision,
             });
         }
+        if request.target_state == WorkItemState::Claimed {
+            return Err(JournalError::InvalidWorkGraph {
+                reason_code: "work_graph.claim.host_authority_required".to_owned(),
+                message: "claimed state is available only through atomic claim admission"
+                    .to_owned(),
+            });
+        }
+        if request.target_state.is_claimed() && current.claim.is_none() {
+            return Err(JournalError::InvalidWorkGraph {
+                reason_code: "work_graph.claim.authority_missing".to_owned(),
+                message: format!(
+                    "item {} cannot enter an execution-owned state without a claim",
+                    request.work_item_id
+                ),
+            });
+        }
         let verification = request.verification_state.unwrap_or(current.verification_state);
         validate_transition(current.state, request.target_state, verification)
             .map_err(validation_error)?;
@@ -264,6 +280,24 @@ impl JournalStore {
                 expected_revision: request.expected_revision,
                 actual_revision: current.revision,
             });
+        }
+        if !request.target_state.is_claimed() {
+            transaction.execute(
+                r#"
+                    UPDATE work_graph_items
+                    SET claim_token_sha256 = NULL,
+                        claim_worker_id = NULL,
+                        claim_worker_principal = NULL,
+                        claim_attempt_ulid = NULL,
+                        claim_runtime_instance_id = NULL,
+                        claim_process_start_token = NULL,
+                        claim_issued_at_unix_ms = NULL,
+                        claim_expires_at_unix_ms = NULL,
+                        claim_heartbeat_at_unix_ms = NULL
+                    WHERE graph_ulid = ?1 AND work_item_ulid = ?2
+                "#,
+                params![request.graph_id, request.work_item_id],
+            )?;
         }
         insert_event(
             &transaction,
@@ -372,7 +406,7 @@ impl JournalStore {
     }
 }
 
-fn validation_error(error: WorkGraphValidationError) -> JournalError {
+pub(super) fn validation_error(error: WorkGraphValidationError) -> JournalError {
     JournalError::InvalidWorkGraph {
         reason_code: error.reason_code.to_owned(),
         message: error.message,
@@ -420,7 +454,7 @@ fn dependency_failed(item: &WorkItemRecordV1, states: &BTreeMap<&str, WorkItemSt
     })
 }
 
-fn project_dependency_states(
+pub(super) fn project_dependency_states(
     transaction: &Transaction<'_>,
     graph_id: &str,
     graph_revision: u64,
@@ -493,7 +527,7 @@ fn project_dependency_states(
     Ok(changed_ids)
 }
 
-fn project_graph_state(
+pub(super) fn project_graph_state(
     connection: &Connection,
     graph_id: &str,
 ) -> Result<WorkGraphState, JournalError> {
@@ -529,7 +563,7 @@ fn project_graph_state(
     Ok(WorkGraphState::Active)
 }
 
-fn query_snapshot(
+pub(super) fn query_snapshot(
     connection: &Connection,
     graph_id: &str,
 ) -> Result<Option<WorkGraphSnapshotV1>, JournalError> {
@@ -580,7 +614,12 @@ fn query_snapshot(
                    provider_profile, workspace_scope, budget_json, max_runtime_ms,
                    requires_review, verification_state, revision, reason_code,
                    evidence_refs_json, artifact_refs_json, created_at_unix_ms,
-                   updated_at_unix_ms, completed_at_unix_ms
+                   updated_at_unix_ms, completed_at_unix_ms,
+                   claim_token_sha256, claim_worker_id, claim_worker_principal,
+                   claim_generation, claim_attempt_ulid, claim_runtime_instance_id,
+                   claim_process_start_token, claim_issued_at_unix_ms,
+                   claim_expires_at_unix_ms, claim_heartbeat_at_unix_ms,
+                   side_effect_fence_state, attempt_count
             FROM work_graph_items
             WHERE graph_ulid = ?1
             ORDER BY priority DESC, created_at_unix_ms ASC, work_item_ulid ASC
@@ -614,6 +653,18 @@ fn query_snapshot(
                 created_at_unix_ms: row.get(22)?,
                 updated_at_unix_ms: row.get(23)?,
                 completed_at_unix_ms: row.get(24)?,
+                claim_token_sha256: row.get(25)?,
+                claim_worker_id: row.get(26)?,
+                claim_worker_principal: row.get(27)?,
+                claim_generation: row.get(28)?,
+                claim_attempt_id: row.get(29)?,
+                claim_runtime_instance_id: row.get(30)?,
+                claim_process_start_token: row.get(31)?,
+                claim_issued_at_unix_ms: row.get(32)?,
+                claim_expires_at_unix_ms: row.get(33)?,
+                claim_heartbeat_at_unix_ms: row.get(34)?,
+                side_effect_fence_state: row.get(35)?,
+                attempt_count: row.get(36)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -697,10 +748,65 @@ struct RawItemRow {
     created_at_unix_ms: i64,
     updated_at_unix_ms: i64,
     completed_at_unix_ms: Option<i64>,
+    claim_token_sha256: Option<String>,
+    claim_worker_id: Option<String>,
+    claim_worker_principal: Option<String>,
+    claim_generation: i64,
+    claim_attempt_id: Option<String>,
+    claim_runtime_instance_id: Option<String>,
+    claim_process_start_token: Option<String>,
+    claim_issued_at_unix_ms: Option<i64>,
+    claim_expires_at_unix_ms: Option<i64>,
+    claim_heartbeat_at_unix_ms: Option<i64>,
+    side_effect_fence_state: String,
+    attempt_count: i64,
 }
 
 impl RawItemRow {
     fn into_record(self) -> Result<WorkItemRecordV1, JournalError> {
+        let claim = match (
+            self.claim_token_sha256,
+            self.claim_worker_id,
+            self.claim_worker_principal,
+            self.claim_attempt_id,
+            self.claim_runtime_instance_id,
+            self.claim_process_start_token,
+            self.claim_issued_at_unix_ms,
+            self.claim_expires_at_unix_ms,
+            self.claim_heartbeat_at_unix_ms,
+        ) {
+            (
+                Some(claim_token_sha256),
+                Some(worker_id),
+                Some(worker_principal),
+                Some(attempt_id),
+                Some(runtime_instance_id),
+                Some(process_start_token),
+                Some(issued_at_unix_ms),
+                Some(expires_at_unix_ms),
+                Some(heartbeat_at_unix_ms),
+            ) => Some(crate::domain::work_graph::WorkItemClaimV1 {
+                worker_id,
+                worker_principal,
+                claim_token_sha256,
+                generation: u64::try_from(self.claim_generation)
+                    .map_err(|_| corrupt("claim generation"))?,
+                attempt_id,
+                runtime_instance_id,
+                process_start_token,
+                issued_at_unix_ms,
+                expires_at_unix_ms,
+                heartbeat_at_unix_ms,
+                side_effect_fence: crate::domain::work_graph::WorkSideEffectFenceState::parse(
+                    self.side_effect_fence_state.as_str(),
+                )
+                .ok_or_else(|| corrupt("side effect fence"))?,
+                record_revision: u64::try_from(self.revision)
+                    .map_err(|_| corrupt("claim record revision"))?,
+            }),
+            (None, None, None, None, None, None, None, None, None) => None,
+            _ => return Err(corrupt("partial claim authority")),
+        };
         Ok(WorkItemRecordV1 {
             schema_version: u32::try_from(self.schema_version).map_err(|_| corrupt("schema"))?,
             graph_id: self.graph_id,
@@ -724,6 +830,9 @@ impl RawItemRow {
             requires_review: self.requires_review != 0,
             verification_state: WorkVerificationState::parse(self.verification_state.as_str())
                 .ok_or_else(|| corrupt("verification state"))?,
+            claim,
+            attempt_count: u64::try_from(self.attempt_count)
+                .map_err(|_| corrupt("attempt count"))?,
             revision: u64::try_from(self.revision).map_err(|_| corrupt("item revision"))?,
             reason_code: self.reason_code,
             evidence_refs: serde_json::from_str(self.evidence_refs_json.as_str())?,
@@ -742,21 +851,24 @@ fn corrupt(field: &str) -> JournalError {
     }
 }
 
-struct EventInsert<'a> {
-    graph_id: &'a str,
-    work_item_id: Option<&'a str>,
-    graph_revision: u64,
-    item_revision: Option<u64>,
-    event_type: &'a str,
-    actor_principal: &'a str,
-    from_state: Option<&'a str>,
-    to_state: Option<&'a str>,
-    reason_code: &'a str,
-    payload_json: &'a str,
-    created_at_unix_ms: i64,
+pub(super) struct EventInsert<'a> {
+    pub(super) graph_id: &'a str,
+    pub(super) work_item_id: Option<&'a str>,
+    pub(super) graph_revision: u64,
+    pub(super) item_revision: Option<u64>,
+    pub(super) event_type: &'a str,
+    pub(super) actor_principal: &'a str,
+    pub(super) from_state: Option<&'a str>,
+    pub(super) to_state: Option<&'a str>,
+    pub(super) reason_code: &'a str,
+    pub(super) payload_json: &'a str,
+    pub(super) created_at_unix_ms: i64,
 }
 
-fn insert_event(transaction: &Transaction<'_>, event: EventInsert<'_>) -> Result<(), JournalError> {
+pub(super) fn insert_event(
+    transaction: &Transaction<'_>,
+    event: EventInsert<'_>,
+) -> Result<(), JournalError> {
     ensure_json_field(event.payload_json, "work_graph_event.payload_json")?;
     transaction.execute(
         r#"

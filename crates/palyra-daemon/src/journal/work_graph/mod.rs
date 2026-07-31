@@ -3,12 +3,15 @@
 
 use super::*;
 
+mod claim_migration;
+mod claims;
 mod migration;
 mod storage;
 
 #[cfg(test)]
 mod tests;
 
+pub(super) const MIGRATION_94_SQL: &str = claim_migration::SQL;
 pub(super) const MIGRATION_93_SQL: &str = migration::SQL;
 
 pub(crate) use storage::WorkGraphSnapshotV1;

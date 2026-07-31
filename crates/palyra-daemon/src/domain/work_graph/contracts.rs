@@ -127,7 +127,7 @@ impl WorkItemState {
 
     /// Whether the item currently owns or may own execution authority.
     pub(crate) const fn is_claimed(self) -> bool {
-        matches!(self, Self::Claimed | Self::Running | Self::Waiting | Self::Review)
+        matches!(self, Self::Claimed | Self::Running | Self::Waiting)
     }
 }
 
@@ -309,6 +309,8 @@ pub(crate) struct WorkItemRecordV1 {
     pub(crate) max_runtime_ms: u64,
     pub(crate) requires_review: bool,
     pub(crate) verification_state: WorkVerificationState,
+    pub(crate) claim: Option<super::WorkItemClaimV1>,
+    pub(crate) attempt_count: u64,
     pub(crate) revision: u64,
     pub(crate) reason_code: String,
     pub(crate) evidence_refs: Vec<String>,

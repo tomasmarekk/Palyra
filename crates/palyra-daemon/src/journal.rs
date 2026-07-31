@@ -7563,6 +7563,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: lifecycle::MIGRATION_92_SQL,
     },
     Migration { version: 93, name: "durable_work_graph", sql: work_graph::MIGRATION_93_SQL },
+    Migration { version: 94, name: "work_graph_claim_leases", sql: work_graph::MIGRATION_94_SQL },
 ];
 
 fn emit_background_task_wake_events_tx(
