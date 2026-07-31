@@ -36,6 +36,7 @@ fn request(items: Vec<WorkItemSpecV1>) -> WorkGraphCreateRequest {
         flow_id: None,
         flow_step_id: None,
         budget: WorkBudgetV1 { max_turns: Some(10), ..WorkBudgetV1::default() },
+        concurrency_policy: WorkGraphConcurrencyPolicy::default(),
         items,
         actor_principal: "principal-1".to_owned(),
     }

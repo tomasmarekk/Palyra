@@ -1,7 +1,7 @@
 //! Durable work graph creation, replay, and transition tests.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Barrier},
     thread,
 };
@@ -9,10 +9,11 @@ use std::{
 use crate::domain::work_graph::{
     reason, ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, StaleReclaimDecision,
     StaleReclaimRequest, WorkBudgetV1, WorkClaimAuthority, WorkClaimSettlementOutcome,
-    WorkClaimSettlementRequest, WorkGraphCreateRequest, WorkGraphOwnerScopeV1, WorkGraphState,
-    WorkItemHeartbeatOutcome, WorkItemHeartbeatRequest, WorkItemSideEffectFenceOutcome,
-    WorkItemSideEffectFenceRequest, WorkItemSpecV1, WorkItemState, WorkItemTransitionRequest,
-    WorkResourceClass, WorkRuntimeLiveness, WorkSideEffectFenceState, WorkVerificationState,
+    WorkClaimSettlementRequest, WorkGraphConcurrencyPolicy, WorkGraphCreateRequest,
+    WorkGraphOwnerScopeV1, WorkGraphState, WorkItemHeartbeatOutcome, WorkItemHeartbeatRequest,
+    WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest, WorkItemSpecV1, WorkItemState,
+    WorkItemTransitionRequest, WorkResourceClass, WorkRuntimeLiveness, WorkSideEffectFenceState,
+    WorkVerificationState,
 };
 
 use super::*;
@@ -61,6 +62,7 @@ fn request() -> WorkGraphCreateRequest {
         flow_id: None,
         flow_step_id: None,
         budget: WorkBudgetV1 { max_turns: Some(10), ..WorkBudgetV1::default() },
+        concurrency_policy: WorkGraphConcurrencyPolicy::default(),
         items: vec![item("a", &[]), item("b", &["a"])],
         actor_principal: "principal-1".to_owned(),
     }
@@ -72,23 +74,34 @@ fn claim(
     expected_item_revision: u64,
 ) -> crate::domain::work_graph::WorkItemClaimGrant {
     let outcome = store
-        .claim_ready_work_item(&ClaimReadyWorkItemRequest {
-            graph_id: "graph-1".to_owned(),
-            work_item_id: Some(work_item_id.to_owned()),
-            expected_item_revision: Some(expected_item_revision),
-            worker_id: "worker-1".to_owned(),
-            worker_principal: "principal-1".to_owned(),
-            authorized_owner_principal: "principal-1".to_owned(),
-            capability_profiles: BTreeSet::from(["general".to_owned()]),
-            runtime_instance_id: "runtime-1".to_owned(),
-            process_start_token: "process-start-1".to_owned(),
-            lease_ttl_ms: 5_000,
-        })
+        .claim_ready_work_item(&claim_request(work_item_id, expected_item_revision, "worker-1"))
         .expect("claim should be evaluated");
     let ClaimReadyWorkItemOutcome::Granted(grant) = outcome else {
         panic!("ready item should be claimed");
     };
     grant
+}
+
+fn claim_request(
+    work_item_id: &str,
+    expected_item_revision: u64,
+    worker_id: &str,
+) -> ClaimReadyWorkItemRequest {
+    ClaimReadyWorkItemRequest {
+        graph_id: "graph-1".to_owned(),
+        work_item_id: Some(work_item_id.to_owned()),
+        expected_item_revision: Some(expected_item_revision),
+        worker_id: worker_id.to_owned(),
+        worker_principal: "principal-1".to_owned(),
+        authorized_owner_principal: "principal-1".to_owned(),
+        capability_profiles: BTreeSet::from(["general".to_owned()]),
+        provider_backpressure_profiles: BTreeSet::new(),
+        memory_pressure: false,
+        resource_lease_id: Some(format!("resource-{worker_id}")),
+        runtime_instance_id: format!("runtime-{worker_id}"),
+        process_start_token: format!("process-{worker_id}"),
+        lease_ttl_ms: 5_000,
+    }
 }
 
 fn authority(grant: &crate::domain::work_graph::WorkItemClaimGrant) -> WorkClaimAuthority {
@@ -275,6 +288,9 @@ fn concurrent_claimers_have_exactly_one_winner() {
                     worker_principal: "principal-1".to_owned(),
                     authorized_owner_principal: "principal-1".to_owned(),
                     capability_profiles: BTreeSet::from(["general".to_owned()]),
+                    provider_backpressure_profiles: BTreeSet::new(),
+                    memory_pressure: false,
+                    resource_lease_id: Some(format!("resource-{worker}")),
                     runtime_instance_id: format!("runtime-{worker}"),
                     process_start_token: format!("process-{worker}"),
                     lease_ttl_ms: 30_000,
@@ -526,4 +542,212 @@ fn side_effect_fence_and_claim_diagnostics_are_generation_fenced() {
         diagnostics.last_reason_code.as_deref(),
         Some("work_graph.side_effect_fence.updated")
     );
+}
+
+#[test]
+fn global_and_profile_caps_throttle_visible_claim_admission() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[]), item("c", &[])];
+    create.concurrency_policy.max_active_items = 1;
+    create.concurrency_policy.max_active_per_profile = BTreeMap::from([("general".to_owned(), 1)]);
+    store.create_work_graph(&create).expect("graph should be created");
+    claim(&store, "a", 1);
+    let denied = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("second claim should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.global_limit"
+        }
+    ));
+
+    let guard = store.connection.lock().expect("journal lock should be available");
+    guard
+        .execute(
+            "UPDATE work_graphs SET concurrency_policy_json = json_set(concurrency_policy_json, '$.max_active_items', 2) WHERE graph_ulid = 'graph-1'",
+            [],
+        )
+        .expect("test should widen only the global cap");
+    drop(guard);
+    let denied = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("profile cap should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.profile_limit"
+        }
+    ));
+}
+
+#[test]
+fn workspace_mutation_and_provider_pressure_are_serialized() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    let mut mutation = item("a", &[]);
+    mutation.resource_class = WorkResourceClass::WorkspaceMutation;
+    mutation.workspace_scope = Some("C:/workspace/project".to_owned());
+    mutation.provider_profile = Some("provider-a".to_owned());
+    let mut reader = item("c", &[]);
+    reader.resource_class = WorkResourceClass::WorkspaceRead;
+    reader.workspace_scope = Some("C:\\workspace\\project\\src".to_owned());
+    reader.provider_profile = Some("provider-a".to_owned());
+    create.items = vec![mutation, reader];
+    create.concurrency_policy.max_active_per_provider =
+        BTreeMap::from([("provider-a".to_owned(), 2)]);
+    store.create_work_graph(&create).expect("graph should be created");
+    claim(&store, "a", 1);
+    let denied = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("workspace collision should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.workspace_conflict"
+        }
+    ));
+
+    let guard = store.connection.lock().expect("journal lock should be available");
+    guard
+        .execute(
+            "UPDATE work_graphs SET concurrency_policy_json = json_set(concurrency_policy_json, '$.max_active_per_provider.\"provider-a\"', 1) WHERE graph_ulid = 'graph-1'",
+            [],
+        )
+        .expect("test should tighten the provider cap");
+    drop(guard);
+    let denied = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("provider cap should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.provider_limit"
+        }
+    ));
+
+    let mut pressured = claim_request("c", 1, "worker-2");
+    pressured.provider_backpressure_profiles.insert("provider-a".to_owned());
+    let denied =
+        store.claim_ready_work_item(&pressured).expect("provider pressure should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.provider_rate_limited"
+        }
+    ));
+}
+
+#[test]
+fn repeated_failures_back_off_then_open_the_circuit() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[])];
+    create.concurrency_policy.failure_limit = 2;
+    create.concurrency_policy.retry_backoff_base_ms = 1;
+    create.concurrency_policy.retry_backoff_max_ms = 1;
+    store.create_work_graph(&create).expect("graph should be created");
+    let first = claim(&store, "a", 1);
+    let running = store
+        .transition_work_graph_item(&WorkItemTransitionRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            expected_revision: first.item.revision,
+            target_state: WorkItemState::Running,
+            verification_state: None,
+            reason_code: "work_graph.running".to_owned(),
+            actor_principal: "host".to_owned(),
+        })
+        .expect("claim should start");
+    store
+        .settle_work_item_claim(&WorkClaimSettlementRequest {
+            authority: authority(&first),
+            expected_item_revision: running.item.revision,
+            target_state: WorkItemState::Failed,
+            verification_state: WorkVerificationState::Unverified,
+            result_sha256: "34".repeat(32),
+            reason_code: "work_graph.worker_failed".to_owned(),
+            actor_principal: "host".to_owned(),
+        })
+        .expect("first failure should schedule retry");
+    let retry = store.work_graph_snapshot("graph-1").unwrap().unwrap().items.remove(0);
+    assert_eq!(retry.state, WorkItemState::Ready);
+    assert_eq!(retry.failure_circuit.consecutive_failures, 1);
+    assert_eq!(retry.reason_code, "work_graph.failure.retry_backoff");
+    std::thread::sleep(std::time::Duration::from_millis(3));
+
+    let second = claim(&store, "a", retry.revision);
+    let running = store
+        .transition_work_graph_item(&WorkItemTransitionRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            expected_revision: second.item.revision,
+            target_state: WorkItemState::Running,
+            verification_state: None,
+            reason_code: "work_graph.running".to_owned(),
+            actor_principal: "host".to_owned(),
+        })
+        .expect("retry should start");
+    store
+        .settle_work_item_claim(&WorkClaimSettlementRequest {
+            authority: authority(&second),
+            expected_item_revision: running.item.revision,
+            target_state: WorkItemState::Failed,
+            verification_state: WorkVerificationState::Unverified,
+            result_sha256: "56".repeat(32),
+            reason_code: "work_graph.worker_failed_again".to_owned(),
+            actor_principal: "host".to_owned(),
+        })
+        .expect("second failure should open the circuit");
+    let failed = store.work_graph_snapshot("graph-1").unwrap().unwrap().items.remove(0);
+    assert_eq!(failed.state, WorkItemState::Failed);
+    assert_eq!(failed.failure_circuit.consecutive_failures, 2);
+    assert!(failed.failure_circuit.opened_at_unix_ms.is_some());
+    assert_eq!(failed.reason_code, "work_graph.failure.circuit_open");
+}
+
+#[test]
+fn cancel_fanout_returns_active_generations_and_cancels_every_branch() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[]), item("c", &[])];
+    store.create_work_graph(&create).expect("graph should be created");
+    claim(&store, "a", 1);
+    let c = store
+        .claim_ready_work_item(&claim_request("c", 1, "worker-2"))
+        .expect("second independent item should claim");
+    assert!(matches!(c, ClaimReadyWorkItemOutcome::Granted(_)));
+    let revision = store.work_graph_snapshot("graph-1").unwrap().unwrap().graph.revision;
+    let plan = store
+        .cancel_work_graph("graph-1", revision, "principal-1")
+        .expect("graph cancellation should commit");
+    assert_eq!(plan.targets.len(), 2);
+    let snapshot = store.work_graph_snapshot("graph-1").unwrap().unwrap();
+    assert_eq!(snapshot.graph.state, WorkGraphState::Cancelled);
+    assert!(snapshot.items.iter().all(|item| item.state == WorkItemState::Cancelled));
+    assert!(snapshot.items.iter().all(|item| item.claim.is_none()));
+}
+
+#[test]
+fn memory_pressure_preserves_interactive_work_only() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    let mut create = request();
+    create.items = vec![item("a", &[])];
+    store.create_work_graph(&create).expect("graph should be created");
+    let mut pressured = claim_request("a", 1, "worker-1");
+    pressured.memory_pressure = true;
+    let denied =
+        store.claim_ready_work_item(&pressured).expect("memory pressure should be evaluated");
+    assert!(matches!(
+        denied,
+        ClaimReadyWorkItemOutcome::NoEligibleItem {
+            reason_code: "work_graph.admission.memory_pressure"
+        }
+    ));
 }

@@ -80,9 +80,12 @@ use crate::application::{
         decide_turn_control_request, ControlActivePhase, TurnControlAction,
         TurnControlApplyOutcome, TurnControlDecision, TurnControlOperation, TurnControlRequest,
     },
+    work_graph_coordinator::WorkGraphResourceCoordinator,
 };
 use crate::domain::work_graph::{
-    WorkGraphCreateRequest, WorkItemTransitionOutcome, WorkItemTransitionRequest,
+    ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, WorkClaimSettlementOutcome,
+    WorkClaimSettlementRequest, WorkGraphCreateRequest, WorkItemTransitionOutcome,
+    WorkItemTransitionRequest,
 };
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsagePath, FeatureUsageRegistry, FeatureUsageSnapshot,
@@ -14493,6 +14496,64 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.work_graph_snapshot_blocking(graph_id.as_str()))
             .await
             .map_err(|_| Status::internal("work graph load worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn claim_ready_work_item_blocking(
+        &self,
+        request: ClaimReadyWorkItemRequest,
+    ) -> Result<ClaimReadyWorkItemOutcome, Status> {
+        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
+            Status::failed_precondition("work graph resource governor is unavailable")
+        })?;
+        WorkGraphResourceCoordinator::new(services.resource_governor())
+            .claim_ready_work_item(&self.journal_store, request)
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
+    /// Claims one ready item through shared resource and durable generation authority.
+    ///
+    /// # Errors
+    /// Returns `failed_precondition` without a daemon resource governor, or a mapped admission
+    /// failure if durable or resource state cannot be updated.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn claim_ready_work_item(
+        self: &Arc<Self>,
+        request: ClaimReadyWorkItemRequest,
+    ) -> Result<ClaimReadyWorkItemOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.claim_ready_work_item_blocking(request))
+            .await
+            .map_err(|_| Status::internal("work graph claim worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn settle_work_item_claim_blocking(
+        &self,
+        request: &WorkClaimSettlementRequest,
+    ) -> Result<WorkClaimSettlementOutcome, Status> {
+        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
+            Status::failed_precondition("work graph resource governor is unavailable")
+        })?;
+        WorkGraphResourceCoordinator::new(services.resource_governor())
+            .settle_work_item_claim(&self.journal_store, request)
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
+    /// Settles one exact claim generation and releases its shared resource lease.
+    ///
+    /// # Errors
+    /// Returns `failed_precondition` without a daemon resource governor, or a mapped durable
+    /// settlement failure.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn settle_work_item_claim(
+        self: &Arc<Self>,
+        request: WorkClaimSettlementRequest,
+    ) -> Result<WorkClaimSettlementOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.settle_work_item_claim_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work graph settlement worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

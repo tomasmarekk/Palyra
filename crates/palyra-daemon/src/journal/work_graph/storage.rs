@@ -45,15 +45,18 @@ impl JournalStore {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
         let budget_json = serde_json::to_string(&request.budget)?;
+        let concurrency_policy_json = serde_json::to_string(&request.concurrency_policy)?;
         match transaction.execute(
             r#"
                 INSERT INTO work_graphs (
                     graph_ulid, schema_version, owner_principal, device_id, channel,
                     session_ulid, origin_run_ulid, objective_id, routine_id, flow_ulid,
-                    flow_step_id, state, budget_json, revision, reason_code,
+                    flow_step_id, state, budget_json, concurrency_policy_json,
+                    revision, reason_code,
                     created_at_unix_ms, updated_at_unix_ms
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15, ?15
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    1, ?15, ?16, ?16
                 )
             "#,
             params![
@@ -70,6 +73,7 @@ impl JournalStore {
                 request.flow_step_id,
                 WorkGraphState::Active.as_str(),
                 budget_json,
+                concurrency_policy_json,
                 reason::CREATED,
                 now,
             ],
@@ -104,12 +108,12 @@ impl JournalStore {
                         priority, capability_profile, dependencies_json,
                         compensates_work_item_ulid, serialization_key, resource_class,
                         provider_profile, workspace_scope, budget_json, max_runtime_ms,
-                        requires_review, verification_state, revision, reason_code,
+                        requires_review, verification_state, revision, reason_code, failure_limit,
                         evidence_refs_json, artifact_refs_json, created_at_unix_ms,
                         updated_at_unix_ms
                     ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                        ?15, ?16, ?17, ?18, 1, ?19, '[]', '[]', ?20, ?20
+                        ?15, ?16, ?17, ?18, 1, ?19, ?20, '[]', '[]', ?21, ?21
                     )
                 "#,
                 params![
@@ -132,6 +136,7 @@ impl JournalStore {
                     bool_to_sqlite(item.requires_review),
                     WorkVerificationState::Unverified.as_str(),
                     initial_reason,
+                    i64::from(request.concurrency_policy.failure_limit),
                     now,
                 ],
             )?;
@@ -293,7 +298,8 @@ impl JournalStore {
                         claim_process_start_token = NULL,
                         claim_issued_at_unix_ms = NULL,
                         claim_expires_at_unix_ms = NULL,
-                        claim_heartbeat_at_unix_ms = NULL
+                        claim_heartbeat_at_unix_ms = NULL,
+                        resource_lease_id = NULL
                     WHERE graph_ulid = ?1 AND work_item_ulid = ?2
                 "#,
                 params![request.graph_id, request.work_item_id],
@@ -572,8 +578,9 @@ pub(super) fn query_snapshot(
             r#"
                 SELECT schema_version, graph_ulid, owner_principal, device_id, channel,
                        session_ulid, origin_run_ulid, objective_id, routine_id, flow_ulid,
-                       flow_step_id, state, budget_json, revision, reason_code,
-                       created_at_unix_ms, updated_at_unix_ms, completed_at_unix_ms
+                       flow_step_id, state, budget_json, concurrency_policy_json,
+                       revision, reason_code, created_at_unix_ms, updated_at_unix_ms,
+                       completed_at_unix_ms
                 FROM work_graphs
                 WHERE graph_ulid = ?1
             "#,
@@ -593,11 +600,12 @@ pub(super) fn query_snapshot(
                     flow_step_id: row.get(10)?,
                     state: row.get(11)?,
                     budget_json: row.get(12)?,
-                    revision: row.get(13)?,
-                    reason_code: row.get(14)?,
-                    created_at_unix_ms: row.get(15)?,
-                    updated_at_unix_ms: row.get(16)?,
-                    completed_at_unix_ms: row.get(17)?,
+                    concurrency_policy_json: row.get(13)?,
+                    revision: row.get(14)?,
+                    reason_code: row.get(15)?,
+                    created_at_unix_ms: row.get(16)?,
+                    updated_at_unix_ms: row.get(17)?,
+                    completed_at_unix_ms: row.get(18)?,
                 })
             },
         )
@@ -619,7 +627,9 @@ pub(super) fn query_snapshot(
                    claim_generation, claim_attempt_ulid, claim_runtime_instance_id,
                    claim_process_start_token, claim_issued_at_unix_ms,
                    claim_expires_at_unix_ms, claim_heartbeat_at_unix_ms,
-                   side_effect_fence_state, attempt_count
+                   side_effect_fence_state, attempt_count, consecutive_failure_count,
+                   failure_limit, retry_not_before_unix_ms, circuit_opened_at_unix_ms,
+                   failure_reason_code, resource_lease_id
             FROM work_graph_items
             WHERE graph_ulid = ?1
             ORDER BY priority DESC, created_at_unix_ms ASC, work_item_ulid ASC
@@ -665,6 +675,12 @@ pub(super) fn query_snapshot(
                 claim_heartbeat_at_unix_ms: row.get(34)?,
                 side_effect_fence_state: row.get(35)?,
                 attempt_count: row.get(36)?,
+                consecutive_failure_count: row.get(37)?,
+                failure_limit: row.get(38)?,
+                retry_not_before_unix_ms: row.get(39)?,
+                circuit_opened_at_unix_ms: row.get(40)?,
+                failure_reason_code: row.get(41)?,
+                resource_lease_id: row.get(42)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -687,6 +703,7 @@ struct RawGraphRow {
     flow_step_id: Option<String>,
     state: String,
     budget_json: String,
+    concurrency_policy_json: String,
     revision: i64,
     reason_code: String,
     created_at_unix_ms: i64,
@@ -713,6 +730,7 @@ impl RawGraphRow {
             state: WorkGraphState::parse(self.state.as_str())
                 .ok_or_else(|| corrupt("graph state"))?,
             budget: serde_json::from_str(self.budget_json.as_str())?,
+            concurrency_policy: serde_json::from_str(self.concurrency_policy_json.as_str())?,
             revision: u64::try_from(self.revision).map_err(|_| corrupt("graph revision"))?,
             reason_code: self.reason_code,
             created_at_unix_ms: self.created_at_unix_ms,
@@ -760,10 +778,17 @@ struct RawItemRow {
     claim_heartbeat_at_unix_ms: Option<i64>,
     side_effect_fence_state: String,
     attempt_count: i64,
+    consecutive_failure_count: i64,
+    failure_limit: i64,
+    retry_not_before_unix_ms: Option<i64>,
+    circuit_opened_at_unix_ms: Option<i64>,
+    failure_reason_code: Option<String>,
+    resource_lease_id: Option<String>,
 }
 
 impl RawItemRow {
     fn into_record(self) -> Result<WorkItemRecordV1, JournalError> {
+        let resource_lease_id = self.resource_lease_id.clone();
         let claim = match (
             self.claim_token_sha256,
             self.claim_worker_id,
@@ -801,12 +826,16 @@ impl RawItemRow {
                     self.side_effect_fence_state.as_str(),
                 )
                 .ok_or_else(|| corrupt("side effect fence"))?,
+                resource_lease_id: resource_lease_id.clone(),
                 record_revision: u64::try_from(self.revision)
                     .map_err(|_| corrupt("claim record revision"))?,
             }),
             (None, None, None, None, None, None, None, None, None) => None,
             _ => return Err(corrupt("partial claim authority")),
         };
+        if claim.is_none() && resource_lease_id.is_some() {
+            return Err(corrupt("resource lease without claim authority"));
+        }
         Ok(WorkItemRecordV1 {
             schema_version: u32::try_from(self.schema_version).map_err(|_| corrupt("schema"))?,
             graph_id: self.graph_id,
@@ -833,6 +862,15 @@ impl RawItemRow {
             claim,
             attempt_count: u64::try_from(self.attempt_count)
                 .map_err(|_| corrupt("attempt count"))?,
+            failure_circuit: crate::domain::work_graph::WorkItemFailureCircuitState {
+                consecutive_failures: u32::try_from(self.consecutive_failure_count)
+                    .map_err(|_| corrupt("consecutive failure count"))?,
+                failure_limit: u32::try_from(self.failure_limit)
+                    .map_err(|_| corrupt("failure limit"))?,
+                retry_not_before_unix_ms: self.retry_not_before_unix_ms,
+                opened_at_unix_ms: self.circuit_opened_at_unix_ms,
+                reason_code: self.failure_reason_code,
+            },
             revision: u64::try_from(self.revision).map_err(|_| corrupt("item revision"))?,
             reason_code: self.reason_code,
             evidence_refs: serde_json::from_str(self.evidence_refs_json.as_str())?,

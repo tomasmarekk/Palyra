@@ -31,8 +31,8 @@ use crate::{
         ValidatedFlowDependencyGraph,
     },
     domain::work_graph::{
-        WorkBudgetV1, WorkGraphCreateRequest, WorkGraphOwnerScopeV1, WorkGraphState,
-        WorkItemSpecV1, WorkItemState,
+        WorkBudgetV1, WorkGraphConcurrencyPolicy, WorkGraphCreateRequest, WorkGraphOwnerScopeV1,
+        WorkGraphState, WorkItemSpecV1, WorkItemState,
     },
     gateway::GatewayRuntimeState,
     journal::{
@@ -132,6 +132,8 @@ struct WorkGraphFlowInput {
     graph_id: Option<String>,
     #[serde(default)]
     budget: WorkBudgetV1,
+    #[serde(default)]
+    concurrency_policy: WorkGraphConcurrencyPolicy,
     items: Vec<WorkItemSpecV1>,
 }
 
@@ -982,6 +984,7 @@ impl FlowCoordinator {
                 flow_id: Some(flow.flow_id.clone()),
                 flow_step_id: Some(step.step_id.clone()),
                 budget: input.budget,
+                concurrency_policy: input.concurrency_policy,
                 items: input.items,
                 actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
             })

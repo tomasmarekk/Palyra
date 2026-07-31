@@ -95,6 +95,8 @@ pub enum ResourceServiceKind {
     ExternalRuntime,
     /// Git worktree mutation or snapshot operation.
     Worktree,
+    /// Host-authoritative WorkGraph worker execution.
+    WorkGraph,
 }
 
 /// Retention priority used only for pressure planning.

@@ -25,11 +25,6 @@ impl WorkClaimToken {
         Ok(Self(bytes))
     }
 
-    /// Reconstructs a token supplied by a worker without logging its bytes.
-    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     /// Computes the lowercase digest persisted by the journal.
     pub(crate) fn sha256_hex(&self) -> String {
         hex::encode(Sha256::digest(self.0))
@@ -89,6 +84,7 @@ pub(crate) struct WorkItemClaimV1 {
     pub(crate) expires_at_unix_ms: i64,
     pub(crate) heartbeat_at_unix_ms: i64,
     pub(crate) side_effect_fence: WorkSideEffectFenceState,
+    pub(crate) resource_lease_id: Option<String>,
     pub(crate) record_revision: u64,
 }
 
@@ -102,6 +98,9 @@ pub(crate) struct ClaimReadyWorkItemRequest {
     pub(crate) worker_principal: String,
     pub(crate) authorized_owner_principal: String,
     pub(crate) capability_profiles: BTreeSet<String>,
+    pub(crate) provider_backpressure_profiles: BTreeSet<String>,
+    pub(crate) memory_pressure: bool,
+    pub(crate) resource_lease_id: Option<String>,
     pub(crate) runtime_instance_id: String,
     pub(crate) process_start_token: String,
     pub(crate) lease_ttl_ms: u64,
@@ -247,5 +246,4 @@ pub(crate) mod claim_reason {
         "work_graph.reclaim.side_effect_confirmation_required";
     pub(crate) const RECLAIM_NOT_EXPIRED: &str = "work_graph.reclaim.not_expired";
     pub(crate) const LATE_RESULT_ORPHANED: &str = "work_graph.result.stale_generation";
-    pub(crate) const SETTLED: &str = "work_graph.result.settled";
 }

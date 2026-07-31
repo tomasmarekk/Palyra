@@ -175,6 +175,11 @@ pub(crate) fn executable_fingerprint(path: &Path) -> std::io::Result<String> {
 }
 
 impl ManagedCodingRuntimeServices {
+    /// Shares the single daemon resource authority with bounded WorkGraph admission.
+    pub(crate) fn resource_governor(&self) -> LocalResourceGovernor {
+        self.governor.clone()
+    }
+
     /// Opens every service under one bounded resource and lifecycle authority.
     ///
     /// # Errors

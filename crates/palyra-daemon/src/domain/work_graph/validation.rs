@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{
-    reason, WorkGraphCreateRequest, WorkGraphRecordV1, WorkGraphState, WorkGraphValidationError,
-    WorkItemRecordV1, WorkItemSpecV1, WorkItemState, WorkVerificationState, MAX_WORK_GRAPH_ITEMS,
+    reason, WorkGraphConcurrencyPolicy, WorkGraphCreateRequest, WorkGraphRecordV1, WorkGraphState,
+    WorkGraphValidationError, WorkItemRecordV1, WorkItemSpecV1, WorkItemState,
+    WorkVerificationState, MAX_WORK_GRAPH_CONCURRENCY, MAX_WORK_GRAPH_ITEMS,
     MAX_WORK_ITEM_DEPENDENCIES, MAX_WORK_ITEM_DESCRIPTION_BYTES, MAX_WORK_ITEM_TITLE_BYTES,
     WORK_GRAPH_SCHEMA_VERSION,
 };
@@ -30,6 +31,7 @@ pub(crate) fn validate_graph_create_request(
             format!("items must contain 1..={MAX_WORK_GRAPH_ITEMS} entries"),
         ));
     }
+    validate_concurrency_policy(&request.concurrency_policy)?;
     validate_specs(request.items.as_slice(), request.budget)
 }
 
@@ -53,6 +55,7 @@ pub(crate) fn validate_loaded_graph(
     if WorkGraphState::parse(graph.state.as_str()).is_none() {
         return Err(WorkGraphValidationError::new(INVALID_RESTORE, "unknown graph state"));
     }
+    validate_concurrency_policy(&graph.concurrency_policy)?;
     let specs = items
         .iter()
         .map(|item| {
@@ -91,6 +94,18 @@ pub(crate) fn validate_loaded_graph(
                     ));
                 }
             }
+            if item.failure_circuit.failure_limit == 0
+                || item.failure_circuit.failure_limit > MAX_WORK_GRAPH_CONCURRENCY
+                || item.failure_circuit.consecutive_failures > item.failure_circuit.failure_limit
+                || item.failure_circuit.opened_at_unix_ms.is_some()
+                    != (item.failure_circuit.consecutive_failures
+                        >= item.failure_circuit.failure_limit)
+            {
+                return Err(WorkGraphValidationError::new(
+                    INVALID_RESTORE,
+                    format!("item {} has malformed failure circuit", item.work_item_id),
+                ));
+            }
             Ok(WorkItemSpecV1 {
                 work_item_id: item.work_item_id.clone(),
                 title: item.title.clone(),
@@ -110,6 +125,41 @@ pub(crate) fn validate_loaded_graph(
         })
         .collect::<Result<Vec<_>, _>>()?;
     validate_specs(specs.as_slice(), graph.budget)
+}
+
+/// Validates bounded graph concurrency and retry policy.
+pub(crate) fn validate_concurrency_policy(
+    policy: &WorkGraphConcurrencyPolicy,
+) -> Result<(), WorkGraphValidationError> {
+    if policy.max_active_items == 0
+        || policy.max_active_items > MAX_WORK_GRAPH_CONCURRENCY
+        || policy.max_workspace_readers_per_scope == 0
+        || policy.max_workspace_readers_per_scope > MAX_WORK_GRAPH_CONCURRENCY
+        || policy.failure_limit == 0
+        || policy.failure_limit > MAX_WORK_GRAPH_CONCURRENCY
+        || policy.retry_backoff_base_ms == 0
+        || policy.retry_backoff_base_ms > policy.retry_backoff_max_ms
+        || policy.cancel_settle_timeout_ms == 0
+        || policy.cancel_settle_timeout_ms > 60_000
+    {
+        return Err(WorkGraphValidationError::new(
+            INVALID_PAYLOAD,
+            "work graph concurrency policy is outside host bounds",
+        ));
+    }
+    for (dimension, limits) in
+        [("profile", &policy.max_active_per_profile), ("provider", &policy.max_active_per_provider)]
+    {
+        if limits.iter().any(|(key, limit)| {
+            key.trim().is_empty() || *limit == 0 || *limit > MAX_WORK_GRAPH_CONCURRENCY
+        }) {
+            return Err(WorkGraphValidationError::new(
+                INVALID_PAYLOAD,
+                format!("work graph {dimension} concurrency policy is invalid"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_specs(

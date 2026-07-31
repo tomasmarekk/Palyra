@@ -92,6 +92,7 @@ pub mod tool_security;
 pub mod turn_control;
 pub mod verification;
 pub(crate) mod wake_coordinator;
+pub(crate) mod work_graph_coordinator;
 pub mod workspace_observability;
 
 pub mod route_message;

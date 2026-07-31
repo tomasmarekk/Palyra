@@ -262,6 +262,7 @@ pub(crate) struct WorkGraphRecordV1 {
     pub(crate) flow_step_id: Option<String>,
     pub(crate) state: WorkGraphState,
     pub(crate) budget: WorkBudgetV1,
+    pub(crate) concurrency_policy: super::WorkGraphConcurrencyPolicy,
     pub(crate) revision: u64,
     pub(crate) reason_code: String,
     pub(crate) created_at_unix_ms: i64,
@@ -311,6 +312,7 @@ pub(crate) struct WorkItemRecordV1 {
     pub(crate) verification_state: WorkVerificationState,
     pub(crate) claim: Option<super::WorkItemClaimV1>,
     pub(crate) attempt_count: u64,
+    pub(crate) failure_circuit: super::WorkItemFailureCircuitState,
     pub(crate) revision: u64,
     pub(crate) reason_code: String,
     pub(crate) evidence_refs: Vec<String>,
@@ -330,6 +332,7 @@ pub(crate) struct WorkGraphCreateRequest {
     pub(crate) flow_id: Option<String>,
     pub(crate) flow_step_id: Option<String>,
     pub(crate) budget: WorkBudgetV1,
+    pub(crate) concurrency_policy: super::WorkGraphConcurrencyPolicy,
     pub(crate) items: Vec<WorkItemSpecV1>,
     pub(crate) actor_principal: String,
 }
@@ -363,8 +366,6 @@ pub(crate) mod reason {
     pub(crate) const INVALID_GRAPH: &str = "work_graph.invalid";
     pub(crate) const INVALID_TRANSITION: &str = "work_graph.invalid_transition";
     pub(crate) const STALE_REVISION: &str = "work_graph.stale_revision";
-    pub(crate) const CANCELLED: &str = "work_graph.cancelled";
-    pub(crate) const COMPENSATION_REQUIRED: &str = "work_graph.compensation_required";
 }
 
 /// Fail-closed validation error with a stable reason code.

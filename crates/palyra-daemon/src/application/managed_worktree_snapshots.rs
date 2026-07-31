@@ -537,6 +537,7 @@ impl WorktreeSnapshotStore {
                             | ResourceServiceKind::Pty
                             | ResourceServiceKind::Lsp
                             | ResourceServiceKind::Mcp
+                            | ResourceServiceKind::WorkGraph
                             | ResourceServiceKind::ExternalRuntime
                     )
             });

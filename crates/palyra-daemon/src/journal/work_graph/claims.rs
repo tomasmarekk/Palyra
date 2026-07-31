@@ -1,12 +1,13 @@
 //! Atomic work-item claims, generation-fenced heartbeats, reclaim, and settlement.
 
 use crate::domain::work_graph::{
-    claim_reason, validate_loaded_graph, validate_transition, ClaimReadyWorkItemOutcome,
-    ClaimReadyWorkItemRequest, StaleReclaimDecision, StaleReclaimRequest, WorkClaimAuthority,
-    WorkClaimSettlementOutcome, WorkClaimSettlementRequest, WorkClaimToken,
-    WorkGraphClaimDiagnosticsV1, WorkItemClaimGrant, WorkItemClaimV1, WorkItemHeartbeatOutcome,
-    WorkItemHeartbeatRequest, WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest,
-    WorkItemState, WorkRuntimeLiveness, WorkSideEffectFenceState, MAX_WORK_CLAIM_TTL_MS,
+    claim_reason, concurrency_reason, validate_loaded_graph, validate_transition,
+    ClaimReadyWorkItemOutcome, ClaimReadyWorkItemRequest, StaleReclaimDecision,
+    StaleReclaimRequest, WorkClaimAuthority, WorkClaimSettlementOutcome,
+    WorkClaimSettlementRequest, WorkClaimToken, WorkGraphClaimDiagnosticsV1, WorkItemClaimGrant,
+    WorkItemClaimV1, WorkItemHeartbeatOutcome, WorkItemHeartbeatRequest, WorkItemRecordV1,
+    WorkItemSideEffectFenceOutcome, WorkItemSideEffectFenceRequest, WorkItemState,
+    WorkResourceClass, WorkRuntimeLiveness, WorkSideEffectFenceState, MAX_WORK_CLAIM_TTL_MS,
     MIN_WORK_CLAIM_TTL_MS,
 };
 
@@ -42,8 +43,9 @@ impl JournalStore {
             });
         }
 
-        let mut capability_mismatch = false;
-        let candidate = snapshot.items.iter().find(|item| {
+        let mut denial_reason = claim_reason::NO_READY_ITEM;
+        let mut candidate = None;
+        for item in &snapshot.items {
             if item.state != WorkItemState::Ready
                 || request
                     .work_item_id
@@ -51,22 +53,27 @@ impl JournalStore {
                     .is_some_and(|requested| requested != &item.work_item_id)
                 || request.expected_item_revision.is_some_and(|revision| revision != item.revision)
             {
-                return false;
+                continue;
             }
             if !request.capability_profiles.contains(item.capability_profile.as_str()) {
-                capability_mismatch = true;
-                return false;
+                denial_reason = claim_reason::CAPABILITY_MISMATCH;
+                continue;
             }
-            true
-        });
+            if let Some(reason_code) = concurrency_denial_reason(
+                item,
+                snapshot.items.as_slice(),
+                &snapshot.graph.concurrency_policy,
+                request,
+                now,
+            ) {
+                denial_reason = reason_code;
+                continue;
+            }
+            candidate = Some(item);
+            break;
+        }
         let Some(candidate) = candidate else {
-            return Ok(ClaimReadyWorkItemOutcome::NoEligibleItem {
-                reason_code: if capability_mismatch {
-                    claim_reason::CAPABILITY_MISMATCH
-                } else {
-                    claim_reason::NO_READY_ITEM
-                },
-            });
+            return Ok(ClaimReadyWorkItemOutcome::NoEligibleItem { reason_code: denial_reason });
         };
 
         let (previous_generation, previous_attempt_count) = transaction.query_row(
@@ -110,13 +117,14 @@ impl JournalStore {
                     claim_heartbeat_at_unix_ms = ?11,
                     side_effect_fence_state = ?13,
                     attempt_count = ?14,
-                    revision = ?15,
-                    reason_code = ?16,
+                    resource_lease_id = ?15,
+                    revision = ?16,
+                    reason_code = ?17,
                     updated_at_unix_ms = ?11
                 WHERE graph_ulid = ?1
                   AND work_item_ulid = ?2
                   AND state = 'ready'
-                  AND revision = ?17
+                  AND revision = ?18
             "#,
             params![
                 request.graph_id,
@@ -133,6 +141,7 @@ impl JournalStore {
                 expires_at,
                 WorkSideEffectFenceState::Clear.as_str(),
                 u64_to_sqlite(attempt_count, "attempt_count")?,
+                request.resource_lease_id,
                 u64_to_sqlite(next_item_revision, "work_item_revision")?,
                 claim_reason::CLAIMED,
                 u64_to_sqlite(candidate.revision, "expected_item_revision")?,
@@ -511,6 +520,7 @@ impl JournalStore {
                     claim_issued_at_unix_ms = NULL,
                     claim_expires_at_unix_ms = NULL,
                     claim_heartbeat_at_unix_ms = NULL,
+                    resource_lease_id = NULL,
                     side_effect_fence_state = ?4,
                     revision = ?5,
                     reason_code = ?6,
@@ -614,9 +624,32 @@ impl JournalStore {
         }
         validate_transition(item.state, request.target_state, request.verification_state)
             .map_err(validation_error)?;
+        let failure_count = if request.target_state == WorkItemState::Failed {
+            item.failure_circuit.consecutive_failures.saturating_add(1)
+        } else {
+            0
+        };
+        let circuit_open = request.target_state == WorkItemState::Failed
+            && failure_count >= item.failure_circuit.failure_limit;
+        let retry_scheduled = request.target_state == WorkItemState::Failed && !circuit_open;
+        let effective_state =
+            if retry_scheduled { WorkItemState::Ready } else { request.target_state };
+        let effective_reason = if retry_scheduled {
+            concurrency_reason::RETRY_BACKOFF
+        } else if circuit_open {
+            concurrency_reason::CIRCUIT_OPEN
+        } else {
+            request.reason_code.as_str()
+        };
+        let retry_not_before = retry_scheduled.then(|| {
+            now.saturating_add(retry_backoff_ms(&snapshot.graph.concurrency_policy, failure_count))
+        });
+        let circuit_opened_at = circuit_open.then_some(now);
+        let failure_reason =
+            (request.target_state == WorkItemState::Failed).then(|| request.reason_code.clone());
         let next_item_revision = item.revision.saturating_add(1);
         let next_graph_revision = snapshot.graph.revision.saturating_add(1);
-        let completed_at = request.target_state.is_terminal().then_some(now);
+        let completed_at = effective_state.is_terminal().then_some(now);
         let updated = transaction.execute(
             r#"
                 UPDATE work_graph_items
@@ -631,25 +664,34 @@ impl JournalStore {
                     claim_issued_at_unix_ms = NULL,
                     claim_expires_at_unix_ms = NULL,
                     claim_heartbeat_at_unix_ms = NULL,
+                    resource_lease_id = NULL,
                     side_effect_fence_state = ?5,
-                    revision = ?6,
-                    reason_code = ?7,
-                    updated_at_unix_ms = ?8,
-                    completed_at_unix_ms = ?9
+                    consecutive_failure_count = ?6,
+                    retry_not_before_unix_ms = ?7,
+                    circuit_opened_at_unix_ms = ?8,
+                    failure_reason_code = ?9,
+                    revision = ?10,
+                    reason_code = ?11,
+                    updated_at_unix_ms = ?12,
+                    completed_at_unix_ms = ?13
                 WHERE graph_ulid = ?1
                   AND work_item_ulid = ?2
-                  AND revision = ?10
-                  AND claim_token_sha256 = ?11
-                  AND claim_generation = ?12
+                  AND revision = ?14
+                  AND claim_token_sha256 = ?15
+                  AND claim_generation = ?16
             "#,
             params![
                 request.authority.graph_id,
                 request.authority.work_item_id,
-                request.target_state.as_str(),
+                effective_state.as_str(),
                 request.verification_state.as_str(),
                 WorkSideEffectFenceState::Committed.as_str(),
+                i64::from(failure_count),
+                retry_not_before,
+                circuit_opened_at,
+                failure_reason,
                 u64_to_sqlite(next_item_revision, "work_item_revision")?,
-                request.reason_code,
+                effective_reason,
                 now,
                 completed_at,
                 u64_to_sqlite(request.expected_item_revision, "expected_item_revision")?,
@@ -668,6 +710,9 @@ impl JournalStore {
             "generation": request.authority.generation,
             "result_sha256": request.result_sha256,
             "verification_state": request.verification_state,
+            "failure_count": failure_count,
+            "retry_scheduled": retry_scheduled,
+            "circuit_open": circuit_open,
         })
         .to_string();
         insert_event(
@@ -680,8 +725,8 @@ impl JournalStore {
                 event_type: "work_graph.item.claim_settled",
                 actor_principal: request.actor_principal.as_str(),
                 from_state: Some(item.state.as_str()),
-                to_state: Some(request.target_state.as_str()),
-                reason_code: request.reason_code.as_str(),
+                to_state: Some(effective_state.as_str()),
+                reason_code: effective_reason,
                 payload_json: event_payload.as_str(),
                 created_at_unix_ms: now,
             },
@@ -708,7 +753,7 @@ impl JournalStore {
                 request.authority.graph_id,
                 graph_state.as_str(),
                 u64_to_sqlite(next_graph_revision, "graph_revision")?,
-                request.reason_code,
+                effective_reason,
                 now,
                 bool_to_sqlite(graph_state.is_terminal()),
             ],
@@ -818,7 +863,122 @@ fn validate_claim_request(request: &ClaimReadyWorkItemRequest) -> Result<(), Jou
     {
         return Err(invalid_claim_data("capability profile set cannot be empty"));
     }
+    if request.provider_backpressure_profiles.iter().any(|profile| profile.trim().is_empty()) {
+        return Err(invalid_claim_data("provider backpressure profiles cannot be empty"));
+    }
+    if request.resource_lease_id.as_ref().is_some_and(|lease_id| lease_id.trim().is_empty()) {
+        return Err(invalid_claim_data("resource lease id cannot be empty"));
+    }
     validate_ttl(request.lease_ttl_ms)
+}
+
+fn concurrency_denial_reason(
+    candidate: &WorkItemRecordV1,
+    items: &[WorkItemRecordV1],
+    policy: &crate::domain::work_graph::WorkGraphConcurrencyPolicy,
+    request: &ClaimReadyWorkItemRequest,
+    now: i64,
+) -> Option<&'static str> {
+    if candidate.failure_circuit.retry_not_before_unix_ms.is_some_and(|not_before| not_before > now)
+    {
+        return Some(concurrency_reason::RETRY_BACKOFF);
+    }
+    if candidate.failure_circuit.opened_at_unix_ms.is_some() {
+        return Some(concurrency_reason::CIRCUIT_OPEN);
+    }
+    if request.memory_pressure && candidate.resource_class != WorkResourceClass::Interactive {
+        return Some(concurrency_reason::MEMORY_PRESSURE);
+    }
+    if candidate
+        .provider_profile
+        .as_ref()
+        .is_some_and(|profile| request.provider_backpressure_profiles.contains(profile))
+    {
+        return Some(concurrency_reason::PROVIDER_RATE_LIMITED);
+    }
+
+    let active = items.iter().filter(|item| item.claim.is_some()).collect::<Vec<_>>();
+    if active.len() >= policy.max_active_items as usize {
+        return Some(concurrency_reason::GLOBAL_LIMIT);
+    }
+    let profile_limit = policy
+        .max_active_per_profile
+        .get(candidate.capability_profile.as_str())
+        .copied()
+        .unwrap_or(policy.max_active_items);
+    if active.iter().filter(|item| item.capability_profile == candidate.capability_profile).count()
+        >= profile_limit as usize
+    {
+        return Some(concurrency_reason::PROFILE_LIMIT);
+    }
+    if let Some(provider) = candidate.provider_profile.as_deref() {
+        let provider_limit = policy
+            .max_active_per_provider
+            .get(provider)
+            .copied()
+            .unwrap_or(policy.max_active_items);
+        if active.iter().filter(|item| item.provider_profile.as_deref() == Some(provider)).count()
+            >= provider_limit as usize
+        {
+            return Some(concurrency_reason::PROVIDER_LIMIT);
+        }
+    }
+    if candidate
+        .serialization_key
+        .as_ref()
+        .is_some_and(|key| active.iter().any(|item| item.serialization_key.as_ref() == Some(key)))
+    {
+        return Some(concurrency_reason::SERIALIZATION_CONFLICT);
+    }
+    if let Some(scope) = candidate.workspace_scope.as_deref() {
+        let conflicting = active.iter().any(|item| {
+            item.workspace_scope.as_deref().is_some_and(|active_scope| {
+                workspace_scopes_overlap(scope, active_scope)
+                    && (candidate.resource_class == WorkResourceClass::WorkspaceMutation
+                        || item.resource_class == WorkResourceClass::WorkspaceMutation)
+            })
+        });
+        if conflicting {
+            return Some(concurrency_reason::WORKSPACE_CONFLICT);
+        }
+        if candidate.resource_class == WorkResourceClass::WorkspaceRead
+            && active
+                .iter()
+                .filter(|item| {
+                    item.resource_class == WorkResourceClass::WorkspaceRead
+                        && item.workspace_scope.as_deref().is_some_and(|active_scope| {
+                            workspace_scopes_overlap(scope, active_scope)
+                        })
+                })
+                .count()
+                >= policy.max_workspace_readers_per_scope as usize
+        {
+            return Some(concurrency_reason::WORKSPACE_READER_LIMIT);
+        }
+    }
+    None
+}
+
+fn workspace_scopes_overlap(left: &str, right: &str) -> bool {
+    let normalize =
+        |value: &str| value.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let left = normalize(left);
+    let right = normalize(right);
+    left == right
+        || left.strip_prefix(right.as_str()).is_some_and(|remainder| remainder.starts_with('/'))
+        || right.strip_prefix(left.as_str()).is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn retry_backoff_ms(
+    policy: &crate::domain::work_graph::WorkGraphConcurrencyPolicy,
+    failure_count: u32,
+) -> i64 {
+    let exponent = failure_count.saturating_sub(1).min(20);
+    let delay = policy
+        .retry_backoff_base_ms
+        .saturating_mul(1_u64 << exponent)
+        .min(policy.retry_backoff_max_ms);
+    i64::try_from(delay).unwrap_or(i64::MAX)
 }
 
 fn validate_ttl(ttl_ms: u64) -> Result<(), JournalError> {
