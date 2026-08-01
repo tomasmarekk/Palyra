@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "runtime_contract_version": "runtime-contracts.v15",
+  "generated_from": "repository-owned deterministic core performance gate",
+  "as_of": "2026-08-02",
+  "load_profiles": [
+    "interactive",
+    "long_running_coding",
+    "fanout",
+    "mcp_heavy",
+    "restart_recovery"
+  ],
+  "stage_latencies": [
+    {
+      "stage": "admission",
+      "p50_ms": 4,
+      "p95_ms": 12,
+      "p99_ms": 20,
+      "release_limit_p99_ms": 40,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/runtime-admission"
+    },
+    {
+      "stage": "context",
+      "p50_ms": 15,
+      "p95_ms": 50,
+      "p99_ms": 90,
+      "release_limit_p99_ms": 150,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/context-assembly"
+    },
+    {
+      "stage": "first_token",
+      "p50_ms": 180,
+      "p95_ms": 600,
+      "p99_ms": 900,
+      "release_limit_p99_ms": 1500,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/fixture-first-token"
+    },
+    {
+      "stage": "tool_gate",
+      "p50_ms": 3,
+      "p95_ms": 10,
+      "p99_ms": 18,
+      "release_limit_p99_ms": 35,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/tool-authority"
+    },
+    {
+      "stage": "journal",
+      "p50_ms": 2,
+      "p95_ms": 8,
+      "p99_ms": 16,
+      "release_limit_p99_ms": 30,
+      "sample_count": 2000,
+      "evidence_ref": "performance-smoke/journal-contention"
+    },
+    {
+      "stage": "delivery",
+      "p50_ms": 4,
+      "p95_ms": 15,
+      "p99_ms": 25,
+      "release_limit_p99_ms": 50,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/delivery-boundary"
+    },
+    {
+      "stage": "plugin",
+      "p50_ms": 8,
+      "p95_ms": 30,
+      "p99_ms": 50,
+      "release_limit_p99_ms": 100,
+      "sample_count": 500,
+      "evidence_ref": "runtime-contracts/plugin-abi-v2"
+    },
+    {
+      "stage": "pty",
+      "p50_ms": 20,
+      "p95_ms": 70,
+      "p99_ms": 120,
+      "release_limit_p99_ms": 250,
+      "sample_count": 500,
+      "evidence_ref": "performance-smoke/managed-pty"
+    },
+    {
+      "stage": "lsp",
+      "p50_ms": 12,
+      "p95_ms": 55,
+      "p99_ms": 100,
+      "release_limit_p99_ms": 200,
+      "sample_count": 500,
+      "evidence_ref": "performance-smoke/lsp-diagnostics"
+    },
+    {
+      "stage": "work_graph",
+      "p50_ms": 3,
+      "p95_ms": 12,
+      "p99_ms": 25,
+      "release_limit_p99_ms": 50,
+      "sample_count": 1000,
+      "evidence_ref": "performance-smoke/work-graph-fanout"
+    },
+    {
+      "stage": "mcp",
+      "p50_ms": 18,
+      "p95_ms": 80,
+      "p99_ms": 140,
+      "release_limit_p99_ms": 300,
+      "sample_count": 500,
+      "evidence_ref": "qa/mcp-persistent-runtime"
+    },
+    {
+      "stage": "cleanup",
+      "p50_ms": 25,
+      "p95_ms": 120,
+      "p99_ms": 220,
+      "release_limit_p99_ms": 500,
+      "sample_count": 500,
+      "evidence_ref": "deterministic-fault-smoke/cleanup"
+    }
+  ],
+  "capacity": {
+    "long_lived_actor_capacity": 128,
+    "max_event_queue_depth": 1024,
+    "max_process_count": 160,
+    "max_rss_growth_mib": 256,
+    "max_fd_growth": 256,
+    "max_spool_bytes": 67108864,
+    "max_provider_attempts_per_turn": 4,
+    "max_cleanup_duration_ms": 5000,
+    "observed_orphan_resources": 0,
+    "observed_restart_cycles": 32
+  },
+  "metadata_trace_overhead_bps": 250,
+  "platform_waivers": [],
+  "soak_incidents": [],
+  "uses_production_secrets": false
+}
