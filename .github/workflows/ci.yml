@@ -396,6 +396,49 @@ jobs:
           sudo install --mode=0755 "$(command -v node)" /usr/local/bin/node
           bwrap --version
           /usr/local/bin/node --version
+          mcp_sandbox_probe() {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' |
+              bwrap \
+                --die-with-parent \
+                --unshare-pid \
+                --unshare-net \
+                --proc /proc \
+                --dev /dev \
+                --tmpfs /tmp \
+                --tmpfs /var/tmp \
+                --dir /etc \
+                --ro-bind /usr /usr \
+                --ro-bind /bin /bin \
+                --ro-bind /sbin /sbin \
+                --ro-bind /lib /lib \
+                --ro-bind /lib64 /lib64 \
+                --ro-bind /etc/hosts /etc/hosts \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+                --ro-bind /etc/passwd /etc/passwd \
+                --ro-bind /etc/group /etc/group \
+                --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+                --dir /workspace \
+                --bind "$GITHUB_WORKSPACE/qa/fixtures/sandbox_workspaces/mcp_persistent" /workspace \
+                --chdir /workspace \
+                --clearenv \
+                --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                --setenv LANG C \
+                --setenv LC_ALL C \
+                -- \
+                node mcp-server.mjs
+          }
+          if ! probe_output="$(mcp_sandbox_probe 2>&1)"; then
+            printf '%s\n' "$probe_output"
+            # Ubuntu 24.04 can gate otherwise-supported user namespaces behind AppArmor.
+            if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" == "1" ]]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe_output="$(mcp_sandbox_probe)"
+            else
+              exit 1
+            fi
+          fi
+          grep -F '"protocolVersion":"2025-06-18"' <<<"$probe_output"
 
       - name: Build QA daemon runtime
         run: cargo build -p palyra-daemon --bin palyrad --locked
