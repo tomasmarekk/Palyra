@@ -774,6 +774,57 @@ mod tests {
         assert!(registry.drain(Duration::from_secs(1)).await.already_drained);
     }
 
+    async fn run_actor_capacity_cycle(actor_count: usize) -> usize {
+        let records = (0..actor_count)
+            .map(|index| configured_record(format!("server-{index}").as_str()))
+            .collect();
+        let store = Arc::new(MemoryStore { records: Mutex::new(records) });
+        let factory = Arc::new(Factory { prepared: Mutex::new(0) });
+        let registry =
+            McpActorRegistry::restore_and_start(store, factory.clone(), Duration::from_secs(1))
+                .await
+                .expect("capacity cycle should restore every actor");
+
+        assert_eq!(registry.len(), actor_count);
+        assert_eq!(*factory.prepared.lock().expect("factory lock should be healthy"), actor_count);
+        for server_id in registry.server_ids() {
+            let snapshot = registry
+                .handle(server_id.as_str())
+                .expect("capacity actor should remain registered")
+                .snapshot()
+                .await
+                .expect("capacity actor should answer a bounded snapshot request");
+            assert_eq!(snapshot.record.server_id, server_id);
+            assert!(!snapshot.draining);
+        }
+
+        let report = registry.drain(Duration::from_secs(1)).await;
+        assert!(report.clean(), "actor drain report: {report:?}");
+        assert_eq!(report.actors.len(), actor_count);
+        assert!(registry.is_empty());
+        report
+            .actors
+            .iter()
+            .filter(|actor| {
+                actor.forced || !actor.transport_closed || actor.failure_reason_code.is_some()
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn capacity_soak_drains_actor_fleet_without_orphans_across_restarts() {
+        const LONG_LIVED_ACTOR_CAPACITY: usize = 128;
+        const RESTART_CYCLES: usize = 32;
+        const ACTORS_PER_RESTART: usize = 4;
+
+        let mut orphaned_actors = run_actor_capacity_cycle(LONG_LIVED_ACTOR_CAPACITY).await;
+        for _ in 0..RESTART_CYCLES {
+            orphaned_actors += run_actor_capacity_cycle(ACTORS_PER_RESTART).await;
+        }
+
+        assert_eq!(orphaned_actors, 0);
+    }
+
     #[tokio::test]
     async fn disabled_records_restore_without_starting_actor_owners() {
         let store =
