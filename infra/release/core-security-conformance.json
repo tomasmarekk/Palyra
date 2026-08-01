@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "runtime_contract_version": "runtime-contracts.v15",
+  "as_of": "2026-08-02",
+  "attack_corpus_ref": "fixtures/security/critical_attack_scenarios.json",
+  "suites": [
+    {
+      "suite_id": "safety",
+      "scenario_count": 6,
+      "runner": "cargo test -p palyra-safety --test critical_attack_scenarios --locked",
+      "evidence_ref": "crates/palyra-safety/tests/critical_attack_scenarios.rs",
+      "passed": true
+    },
+    {
+      "suite_id": "egress",
+      "scenario_count": 4,
+      "runner": "cargo test -p palyra-egress-proxy --test critical_attack_scenarios --locked",
+      "evidence_ref": "crates/palyra-egress-proxy/tests/critical_attack_scenarios.rs",
+      "passed": true
+    },
+    {
+      "suite_id": "worker_attestation",
+      "scenario_count": 5,
+      "runner": "cargo test -p palyra-workerd --test critical_attack_scenarios --locked",
+      "evidence_ref": "crates/palyra-workerd/tests/critical_attack_scenarios.rs",
+      "passed": true
+    }
+  ],
+  "fuzz_targets": [
+    {
+      "target_id": "plugin_contract_parser",
+      "input_cap_bytes": 65536,
+      "evidence_ref": "fuzz/fuzz_targets/plugin_contract_parser.rs",
+      "bounded": true
+    },
+    {
+      "target_id": "provider_transcript_parser",
+      "input_cap_bytes": 65536,
+      "evidence_ref": "fuzz/fuzz_targets/provider_transcript_parser.rs",
+      "bounded": true
+    },
+    {
+      "target_id": "transcript_projection",
+      "input_cap_bytes": 65536,
+      "evidence_ref": "fuzz/fuzz_targets/transcript_projection.rs",
+      "bounded": true
+    },
+    {
+      "target_id": "pty_process_input_parser",
+      "input_cap_bytes": 32768,
+      "evidence_ref": "fuzz/fuzz_targets/pty_process_input_parser.rs",
+      "bounded": true
+    }
+  ],
+  "negative_boundaries": [
+    {
+      "boundary_id": "sandbox_escape",
+      "test_ref": "crates/palyra-daemon/src/sandbox_runner.rs",
+      "expected_reason_code": "process.failure.sandbox_denied",
+      "passed": true
+    },
+    {
+      "boundary_id": "approval_bypass",
+      "test_ref": "crates/palyra-daemon/tests/gateway_grpc.rs",
+      "expected_reason_code": "approval.required",
+      "passed": true
+    },
+    {
+      "boundary_id": "cross_session_access",
+      "test_ref": "crates/palyra-daemon/src/application/session_queue.rs",
+      "expected_reason_code": "permission_denied",
+      "passed": true
+    },
+    {
+      "boundary_id": "stale_generation",
+      "test_ref": "crates/palyra-daemon/src/application/mcp_runtime/actor.rs",
+      "expected_reason_code": "stale_generation",
+      "passed": true
+    },
+    {
+      "boundary_id": "vault_reference",
+      "test_ref": "crates/palyra-vault/src/lib.rs",
+      "expected_reason_code": "invalid_secret_key",
+      "passed": true
+    },
+    {
+      "boundary_id": "egress_proxy",
+      "test_ref": "crates/palyra-egress-proxy/tests/critical_attack_scenarios.rs",
+      "expected_reason_code": "private_target_blocked",
+      "passed": true
+    }
+  ],
+  "unresolved_blockers": [],
+  "uses_production_secrets": false
+}

@@ -278,6 +278,7 @@ pub(crate) async fn console_diagnostics_handler(
     let metrics_catalog = crate::runtime_diagnostics::build_metrics_catalog_snapshot();
     let core_performance_qualification =
         crate::runtime_diagnostics::build_core_performance_qualification_snapshot();
+    let security_conformance = crate::runtime_diagnostics::build_security_conformance_snapshot();
     let trace_export = crate::runtime_diagnostics::build_trace_exporter_contract();
     let diagnostics_timeline =
         crate::runtime_diagnostics::build_diagnostics_timeline_contract(generated_at_unix_ms);
@@ -316,6 +317,7 @@ pub(crate) async fn console_diagnostics_handler(
             "shutdown_forensics": shutdown_forensics.clone(),
             "metrics_catalog": metrics_catalog.clone(),
             "core_performance_qualification": core_performance_qualification.clone(),
+            "security_conformance": security_conformance.clone(),
             "timeline": diagnostics_timeline.clone(),
             "trace_export": trace_export.clone(),
             "run_runtime_path": run_runtime_path.clone(),
@@ -346,6 +348,7 @@ pub(crate) async fn console_diagnostics_handler(
         "agent_runtime_metrics": runtime_metrics,
         "metrics_catalog": metrics_catalog,
         "core_performance_qualification": core_performance_qualification,
+        "security_conformance": security_conformance,
         "opentelemetry": otel_spans,
         "trace_export": trace_export.clone(),
         "runtime_diagnostics": build_console_runtime_diagnostics_payload(

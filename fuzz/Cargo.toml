@@ -13,6 +13,8 @@ palyra-a2ui = { path = "../crates/palyra-a2ui" }
 palyra-auth = { path = "../crates/palyra-auth" }
 palyra-common = { path = "../crates/palyra-common" }
 palyra-connectors = { path = "../crates/palyra-connectors" }
+palyra-model-providers = { path = "../crates/palyra-model-providers" }
+palyra-plugins-sdk = { path = "../crates/palyra-plugins/sdk" }
 palyra-safety = { path = "../crates/palyra-safety" }
 serde_json = "1"
 
@@ -82,6 +84,34 @@ bench = false
 [[bin]]
 name = "safety_boundary_transform"
 path = "fuzz_targets/safety_boundary_transform.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_contract_parser"
+path = "fuzz_targets/plugin_contract_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_transcript_parser"
+path = "fuzz_targets/provider_transcript_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcript_projection"
+path = "fuzz_targets/transcript_projection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pty_process_input_parser"
+path = "fuzz_targets/pty_process_input_parser.rs"
 test = false
 doc = false
 bench = false

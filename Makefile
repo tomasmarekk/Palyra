@@ -168,7 +168,11 @@ fuzz-build:
 		cargo fuzz build auth_profile_registry_parser && \
 		cargo fuzz build redaction_routines && \
 		cargo fuzz build channel_payload_validation && \
-		cargo fuzz build webhook_replay_verifier; \
+		cargo fuzz build webhook_replay_verifier && \
+		cargo fuzz build plugin_contract_parser && \
+		cargo fuzz build provider_transcript_parser && \
+		cargo fuzz build transcript_projection && \
+		cargo fuzz build pty_process_input_parser; \
 	else \
 		echo "cargo-fuzz is not installed. Install it to compile fuzz targets."; \
 		exit 1; \

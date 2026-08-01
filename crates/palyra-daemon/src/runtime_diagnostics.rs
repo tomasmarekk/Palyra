@@ -1062,6 +1062,12 @@ pub(crate) fn build_core_performance_qualification_snapshot() -> Value {
     crate::application::core_stability::performance::build_core_performance_qualification_snapshot()
 }
 
+/// Returns the bounded core security decision included in operator
+/// diagnostics and support bundles.
+pub(crate) fn build_security_conformance_snapshot() -> Value {
+    crate::application::core_stability::security::build_security_conformance_snapshot()
+}
+
 /// Validates that Prometheus labels stay low-cardinality and secret-free.
 pub(crate) fn validate_metric_labels(labels: &[(&str, &str)]) -> Result<(), String> {
     for (key, value) in labels {

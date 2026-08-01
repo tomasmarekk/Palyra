@@ -1233,6 +1233,8 @@ dependencies = [
  "palyra-auth",
  "palyra-common",
  "palyra-connectors",
+ "palyra-model-providers",
+ "palyra-plugins-sdk",
  "palyra-safety",
  "serde_json",
 ]
@@ -1259,6 +1261,29 @@ dependencies = [
  "tokio-rustls",
  "ulid",
  "x25519-dalek",
+]
+
+[[package]]
+name = "palyra-model-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "palyra-common",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "ulid",
+ "yaml_serde",
+]
+
+[[package]]
+name = "palyra-plugins-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

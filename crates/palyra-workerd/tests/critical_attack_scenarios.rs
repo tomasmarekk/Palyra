@@ -21,6 +21,9 @@ struct AttackCorpus {
 enum ExpectedWorkerError {
     MissingEgressProxyBinding,
     DigestMismatchImage,
+    DigestMismatchBuild,
+    Expired,
+    NotYetValid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +38,11 @@ struct WorkerAttestationScenario {
     artifact_digest_sha256: String,
     egress_proxy_attested: bool,
     expected_image_digest_sha256: Option<String>,
+    expected_build_digest_sha256: Option<String>,
+    expected_artifact_digest_sha256: Option<String>,
+    issued_at_unix_ms: Option<i64>,
+    expires_at_unix_ms: Option<i64>,
+    now_unix_ms: Option<i64>,
 }
 
 fn load_corpus() -> AttackCorpus {
@@ -69,6 +77,9 @@ fn critical_worker_attestation_attack_corpus_stays_fail_closed() {
         let mut manager = WorkerFleetManager::default();
         let mut policy = WorkerFleetPolicy::default();
         policy.attestation.image_digest_sha256 = scenario.expected_image_digest_sha256.clone();
+        policy.attestation.build_digest_sha256 = scenario.expected_build_digest_sha256.clone();
+        policy.attestation.artifact_digest_sha256 =
+            scenario.expected_artifact_digest_sha256.clone();
 
         let error = manager
             .register_worker(
@@ -83,11 +94,11 @@ fn critical_worker_attestation_attack_corpus_stays_fail_closed() {
                     sdk_protocol_version: 1,
                     wit_abi_version: "palyra-worker-abi/v1".to_owned(),
                     heartbeat_unix_ms: 2_000,
-                    issued_at_unix_ms: 1_000,
-                    expires_at_unix_ms: 10_000,
+                    issued_at_unix_ms: scenario.issued_at_unix_ms.unwrap_or(1_000),
+                    expires_at_unix_ms: scenario.expires_at_unix_ms.unwrap_or(10_000),
                 },
                 &policy,
-                2_000,
+                scenario.now_unix_ms.unwrap_or(2_000),
             )
             .expect_err("critical worker attestation scenario should fail closed");
 
@@ -102,6 +113,22 @@ fn critical_worker_attestation_attack_corpus_stays_fail_closed() {
                 error,
                 WorkerLifecycleError::Attestation(
                     palyra_workerd::WorkerAttestationError::DigestMismatch { field: "image" }
+                )
+            )),
+            ExpectedWorkerError::DigestMismatchBuild => assert!(matches!(
+                error,
+                WorkerLifecycleError::Attestation(
+                    palyra_workerd::WorkerAttestationError::DigestMismatch { field: "build" }
+                )
+            )),
+            ExpectedWorkerError::Expired => assert!(matches!(
+                error,
+                WorkerLifecycleError::Attestation(palyra_workerd::WorkerAttestationError::Expired)
+            )),
+            ExpectedWorkerError::NotYetValid => assert!(matches!(
+                error,
+                WorkerLifecycleError::Attestation(
+                    palyra_workerd::WorkerAttestationError::NotYetValid
                 )
             )),
         }
