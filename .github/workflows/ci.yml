@@ -388,6 +388,15 @@ jobs:
         with:
           node-version-file: .node-version
 
+      - name: Install Linux sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          # The Tier-C root exposes /usr, while setup-node installs the pinned binary under /opt.
+          sudo install --mode=0755 "$(command -v node)" /usr/local/bin/node
+          bwrap --version
+          /usr/local/bin/node --version
+
       - name: Build QA daemon runtime
         run: cargo build -p palyra-daemon --bin palyrad --locked
 
