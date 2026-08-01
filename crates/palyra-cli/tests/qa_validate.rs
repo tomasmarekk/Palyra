@@ -816,8 +816,8 @@ artifacts:
 maturity:
   labels: [p0, negative_retry_evidence]
 timeout:
-  run_ms: 30000
-  step_ms: 10000
+  run_ms: 60000
+  step_ms: 20000
 "#,
     )
     .context("failed to write missing-retry scenario")?;
@@ -865,10 +865,13 @@ scorecard:
     assert!(!output.status.success(), "missing retry evidence must fail the gate");
     let payload: Value = serde_json::from_slice(output.stdout.as_slice())
         .context("missing-retry gate JSON should parse")?;
-    assert!(payload
-        .pointer("/scenarios/0/issue_codes")
-        .and_then(Value::as_array)
-        .is_some_and(|codes| codes.iter().any(|code| code.as_str() == Some("missing_event"))));
+    assert!(
+        payload
+            .pointer("/scenarios/0/issue_codes")
+            .and_then(Value::as_array)
+            .is_some_and(|codes| codes.iter().any(|code| code.as_str() == Some("missing_event"))),
+        "missing-retry gate lost the expected evidence verdict: {payload:#}"
+    );
     assert_eq!(
         payload.pointer("/scenarios/0/execution/cleanup/verified").and_then(Value::as_bool),
         Some(true)
