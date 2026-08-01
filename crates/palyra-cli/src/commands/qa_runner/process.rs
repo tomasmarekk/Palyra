@@ -225,6 +225,15 @@ egress_enforcement_mode = "none"
 "#;
 const QA_MCP_PERSISTENT_DAEMON_CONFIG: &str = r#"version = 1
 
+[tool_call.process_runner]
+enabled = true
+tier = "c"
+workspace_root = "."
+path_access_mode = "workspace_only"
+allowed_executables = ["node"]
+allow_interpreters = true
+egress_enforcement_mode = "strict"
+
 [mcp]
 mode = "enabled"
 

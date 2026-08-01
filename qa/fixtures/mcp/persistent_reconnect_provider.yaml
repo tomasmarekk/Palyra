@@ -1,0 +1,43 @@
+# Credential-free provider turns that require one real MCP process restart.
+schema_version: 1
+id: qa.mock.provider.mcp-persistent-reconnect
+turns:
+  - id: finish_after_reconnected_call
+    match:
+      tool_result_call_id: qa-mcp-reconnect-second
+      tool_result_success: true
+    behavior:
+      kind: text
+      text: "MCP crash reconnect verified."
+      finish_reason: stop
+      prompt_tokens: 12
+      completion_tokens: 6
+      latency_ms: 2
+  - id: retry_after_server_crash
+    match:
+      tool_result_call_id: qa-mcp-reconnect-first
+      tool_result_success: false
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-mcp-reconnect-second
+          tool_name: mcp.conformance.inspect
+          input_json:
+            mode: crash_once
+      prompt_tokens: 14
+      completion_tokens: 9
+      latency_ms: 2
+  - id: crash_persistent_server
+    match:
+      prompt_contains:
+        - crash and reconnect the persistent mcp server
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-mcp-reconnect-first
+          tool_name: mcp.conformance.inspect
+          input_json:
+            mode: crash_once
+      prompt_tokens: 13
+      completion_tokens: 9
+      latency_ms: 2

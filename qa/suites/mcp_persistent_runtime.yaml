@@ -5,6 +5,7 @@ scenario_roots:
   - qa/scenarios/mcp_runtime
 expected_scenario_ids:
   - mcp_runtime.persistent_stdio
+  - mcp_runtime.crash_reconnect
 include_tags:
   - mcp_persistent
   - promotion_gate

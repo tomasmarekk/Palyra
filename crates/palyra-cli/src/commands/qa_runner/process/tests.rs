@@ -71,6 +71,11 @@ fn isolated_daemon_config_enables_only_declared_runtime() {
     assert!(process_config.contains(r#"egress_enforcement_mode = "none""#));
 
     let mcp_config = isolated_daemon_config(&parse_scenario(MCP_PERSISTENT_SCENARIO));
+    assert!(mcp_config.contains("[tool_call.process_runner]"));
+    assert!(mcp_config.contains(r#"tier = "c""#));
+    assert!(mcp_config.contains(r#"allowed_executables = ["node"]"#));
+    assert!(mcp_config.contains("allow_interpreters = true"));
+    assert!(mcp_config.contains(r#"egress_enforcement_mode = "strict""#));
     assert!(mcp_config.contains("[[mcp.servers]]"));
     assert!(mcp_config.contains(r#"mode = "enabled""#));
     assert!(mcp_config.contains(r#"command = "node""#));

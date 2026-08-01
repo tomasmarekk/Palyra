@@ -1,6 +1,9 @@
 import readline from "node:readline";
+import { existsSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const protocolVersion = "2025-06-18";
+const crashMarker = fileURLToPath(new URL(".mcp-crash-once", import.meta.url));
 let toolCallCount = 0;
 
 function send(payload) {
@@ -42,8 +45,8 @@ function handle(message) {
             type: "object",
             properties: {
               ordinal: { type: "integer", minimum: 1, maximum: 2 },
+              mode: { type: "string", enum: ["crash_once"] },
             },
-            required: ["ordinal"],
             additionalProperties: false,
           },
         },
@@ -64,6 +67,17 @@ function handle(message) {
     return;
   }
   if (method === "tools/call") {
+    if (params.name === "inspect" && params.arguments?.mode === "crash_once") {
+      if (!existsSync(crashMarker)) {
+        writeFileSync(crashMarker, "crashed\n", { encoding: "utf8", mode: 0o600 });
+        process.exit(42);
+      }
+      result(id, {
+        content: [{ type: "text", text: "reconnect-recovered" }],
+        structuredContent: { reconnectRecovered: true },
+      });
+      return;
+    }
     toolCallCount += 1;
     const ordinal = params.arguments?.ordinal;
     if (params.name !== "inspect" || ordinal !== toolCallCount) {
