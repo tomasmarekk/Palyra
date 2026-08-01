@@ -125,12 +125,18 @@ change_requires_workspace_rust_tests() {
   return 1
 }
 
+build_cli_integration_daemon() {
+  echo "Building palyrad required by CLI integration tests..."
+  "$CARGO_BIN" build -p palyra-daemon --bin palyrad --locked
+}
+
 run_changed_rust_package_tests() {
   local package_names
   local package_name
 
   if change_requires_workspace_rust_tests; then
     echo "Running Rust workspace tests because workspace-level Rust inputs changed..."
+    build_cli_integration_daemon
     "$CARGO_BIN" test --workspace --locked
     return
   fi
@@ -144,6 +150,9 @@ run_changed_rust_package_tests() {
   echo "Running Rust delta tests for changed workspace packages..."
   while IFS= read -r package_name; do
     [[ -n "$package_name" ]] || continue
+    if [[ "$package_name" == "palyra-cli" ]]; then
+      build_cli_integration_daemon
+    fi
     echo "Running cargo test -p $package_name --locked..."
     "$CARGO_BIN" test -p "$package_name" --locked
   done <<<"$package_names"
@@ -205,6 +214,7 @@ run_full_profile() {
   "$CARGO_BIN" clippy --workspace --all-targets -- -D warnings
 
   echo "Running unit and integration tests..."
+  build_cli_integration_daemon
   "$CARGO_BIN" test --workspace --locked
 
   echo "Running workflow regression matrix..."
