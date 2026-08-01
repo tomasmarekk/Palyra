@@ -146,6 +146,8 @@ const MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS: usize = 4_096;
 #[cfg(target_os = "macos")]
 const MAX_MACOS_PROCESS_GROUP_SNAPSHOT_ATTEMPTS: usize = 3;
 #[cfg(target_os = "macos")]
+const MAX_MACOS_ZOMBIE_ANCHOR_SNAPSHOT_ATTEMPTS: usize = 64;
+#[cfg(target_os = "macos")]
 const MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES: u64 = 1;
 const PROCESS_STDIN_INPUT_MAX_BYTES: usize = 8 * 1024;
 const PROCESS_STDIN_TOTAL_MAX_BYTES: usize = 64 * 1024;
@@ -2042,37 +2044,48 @@ fn verify_live_ownership_anchor(pid: u32) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 fn verify_macos_zombie_ownership_anchor(pid: u32) -> io::Result<()> {
     let process_id = unix_pid_from_u32(pid)?;
-    let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(|_| io::Error::other("macOS process information buffer is invalid"))?;
     // Darwin removes an unreaped child from getpgid/getsid visibility after exit, while libproc
     // retains its exact zombie record. Successful spawn already proves the pre-exec setsid call;
-    // require that same reserved PID to remain its process-group leader before accepting it.
-    // SAFETY: `information` is the fixed writable PROC_PIDTBSDINFO ABI buffer.
-    let read = unsafe {
-        macos_proc_pidinfo(
-            process_id,
-            libc::PROC_PIDTBSDINFO,
-            MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
-            information.as_mut_ptr().cast(),
-            information_size,
-        )
-    };
-    if read <= 0 {
-        return Err(io::Error::last_os_error());
+    // require that same reserved PID to remain its process-group leader before accepting it. The
+    // live-to-zombie libproc projection can briefly expose an intermediate record, so retry only
+    // complete mismatching snapshots and never relax the exact identity checks.
+    for attempt in 0..MAX_MACOS_ZOMBIE_ANCHOR_SNAPSHOT_ATTEMPTS {
+        let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: `information` is the fixed writable PROC_PIDTBSDINFO ABI buffer.
+        let read = unsafe {
+            macos_proc_pidinfo(
+                process_id,
+                libc::PROC_PIDTBSDINFO,
+                MACOS_PROC_PIDINFO_INCLUDE_ZOMBIES,
+                information.as_mut_ptr().cast(),
+                information_size,
+            )
+        };
+        if read <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if read != information_size {
+            return Err(io::Error::other("macOS process information response was incomplete"));
+        }
+        // SAFETY: proc_pidinfo reported a complete fixed-size structure.
+        let information = unsafe { information.assume_init() };
+        if information.pbi_status == libc::SZOMB
+            && information.pbi_pid == pid
+            && information.pbi_pgid == pid
+        {
+            return Ok(());
+        }
+        if attempt + 1 == MAX_MACOS_ZOMBIE_ANCHOR_SNAPSHOT_ATTEMPTS {
+            return Err(io::Error::other(format!(
+                "macOS pid {pid} is not the exact exited ownership anchor: status={}, observed_pid={}, process_group_id={}",
+                information.pbi_status, information.pbi_pid, information.pbi_pgid
+            )));
+        }
+        thread::sleep(Duration::from_millis(1));
     }
-    if read != information_size {
-        return Err(io::Error::other("macOS process information response was incomplete"));
-    }
-    // SAFETY: proc_pidinfo reported a complete fixed-size structure.
-    let information = unsafe { information.assume_init() };
-    if information.pbi_status == libc::SZOMB
-        && information.pbi_pid == pid
-        && information.pbi_pgid == pid
-    {
-        return Ok(());
-    }
-    Err(io::Error::other(format!("macOS pid {pid} is not the exact exited ownership anchor")))
+    Err(io::Error::other("macOS zombie ownership snapshot attempts are disabled"))
 }
 
 #[cfg(windows)]
