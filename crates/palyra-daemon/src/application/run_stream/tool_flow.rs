@@ -2626,6 +2626,33 @@ async fn execute_prepared_run_stream_tool_proposal(
 async fn execute_prepared_tool_runtime(
     execution: PreparedToolRuntimeExecution<'_>,
 ) -> Result<Option<PreparedToolRuntimeOutcome>, Status> {
+    let _interrupt_phase = execution.flow_control.enter_interrupt_phase(RunInterruptPhase::Tool);
+    if !execution.cancellation.permits_new_work(crate::gateway::current_unix_ms()) {
+        record_run_interrupt_observation(execution.runtime_state, &execution.flow_control);
+        return Ok(None);
+    }
+    if !execution.prepared.decision.allowed {
+        return Ok(Some(PreparedToolRuntimeOutcome {
+            outcome: denied_execution_outcome(
+                execution.prepared.proposal_id.as_str(),
+                execution.prepared.tool_name.as_str(),
+                execution.prepared.input_json.as_slice(),
+                execution.prepared.decision.reason.as_str(),
+            ),
+            side_effect_fence: None,
+            post_execution_error: None,
+        }));
+    }
+
+    // Keep the allowed path heap-pinned so the run-stream state machine does
+    // not inline the full dispatch and cancellation state into its poll stack.
+    Box::pin(execute_allowed_prepared_tool_runtime(execution)).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn execute_allowed_prepared_tool_runtime(
+    execution: PreparedToolRuntimeExecution<'_>,
+) -> Result<Option<PreparedToolRuntimeOutcome>, Status> {
     let PreparedToolRuntimeExecution {
         progress_sender,
         runtime_state,
@@ -2638,24 +2665,6 @@ async fn execute_prepared_tool_runtime(
         flow_control,
         mut cancellation,
     } = execution;
-    let _interrupt_phase = flow_control.enter_interrupt_phase(RunInterruptPhase::Tool);
-    if !cancellation.permits_new_work(crate::gateway::current_unix_ms()) {
-        record_run_interrupt_observation(runtime_state, &flow_control);
-        return Ok(None);
-    }
-    if !prepared.decision.allowed {
-        return Ok(Some(PreparedToolRuntimeOutcome {
-            outcome: denied_execution_outcome(
-                prepared.proposal_id.as_str(),
-                prepared.tool_name.as_str(),
-                prepared.input_json.as_slice(),
-                prepared.decision.reason.as_str(),
-            ),
-            side_effect_fence: None,
-            post_execution_error: None,
-        }));
-    }
-
     if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
         request_persisted_run_interrupt(runtime_state, run_id, &flow_control).await?;
         record_run_interrupt_observation(runtime_state, &flow_control);
@@ -2764,7 +2773,11 @@ async fn execute_prepared_tool_runtime(
         process_cancellation.clone().unwrap_or_else(|| cancellation.context().clone());
     let execution_cancellation_requested = Arc::clone(&cancellation_requested);
     let child_task_parent_context = flow_control.root_context().clone();
-    let mut execution_future = Box::pin(
+    // Dispatch runs from a Tokio scheduling root. This bounds the synchronous
+    // poll chain; JoinSet drop also prevents detached execution if its owner
+    // disappears outside the normal cancellation protocol.
+    let mut execution_tasks = JoinSet::new();
+    execution_tasks.spawn(
         async move {
             execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
                 &execution_runtime_state,
@@ -2793,9 +2806,8 @@ async fn execute_prepared_tool_runtime(
         .instrument(tool_span),
     );
     let mut post_start_error = None;
-    // The execution future is created once and pinned outside the select
-    // loop, so losing a select race to the cancel poll never drops execution
-    // progress (cancel-safe polling of `&mut future`).
+    // The task handle is polled in place, so losing a select race to the
+    // cancel poll never loses execution progress.
     let outcome = loop {
         tokio::select! {
             biased;
@@ -2809,14 +2821,14 @@ async fn execute_prepared_tool_runtime(
                     ));
                     match timeout(
                         Duration::from_millis(cancellation.context().hard_abort_after_ms.max(1)),
-                        &mut execution_future,
+                        execution_tasks.join_next(),
                     )
                     .await
                     {
                         Ok(outcome) => break outcome,
                         Err(_) => {
                             supervise_serial_tool_cleanup(
-                                execution_future,
+                                execution_tasks,
                                 SerialToolCleanupSupervisor {
                                     runtime_state: Arc::clone(runtime_state),
                                     fence: active_side_effect_fence.clone(),
@@ -2831,17 +2843,19 @@ async fn execute_prepared_tool_runtime(
                         }
                     }
                 }
-                // Read-only and deterministic-idempotent tools may be
-                // abandoned safely; mutating tools are always drained.
+                // Read-only and deterministic-idempotent tools may be aborted
+                // safely; mutating tools are always drained.
+                execution_tasks.abort_all();
                 return Ok(None);
             }
-            result = &mut execution_future => {
+            result = execution_tasks.join_next() => {
                 break result;
             }
             _ = &mut execution_deadline_sleep => {
                 runtime_state.record_run_stream_tool_deadline_exceeded();
                 cancellation_requested.store(true, Ordering::Relaxed);
                 if !must_drain_execution_after_cancel {
+                    execution_tasks.abort_all();
                     return Err(Status::deadline_exceeded(format!(
                         "tool execution deadline exceeded for {}",
                         prepared.tool_name
@@ -2853,14 +2867,14 @@ async fn execute_prepared_tool_runtime(
                 )));
                 match timeout(
                     Duration::from_millis(cancellation.context().hard_abort_after_ms.max(1)),
-                    &mut execution_future,
+                    execution_tasks.join_next(),
                 )
                 .await
                 {
                     Ok(outcome) => break outcome,
                     Err(_) => {
                         supervise_serial_tool_cleanup(
-                            execution_future,
+                            execution_tasks,
                             SerialToolCleanupSupervisor {
                                 runtime_state: Arc::clone(runtime_state),
                                 fence: active_side_effect_fence.clone(),
@@ -2905,14 +2919,14 @@ async fn execute_prepared_tool_runtime(
                                     Duration::from_millis(
                                         cancellation.context().hard_abort_after_ms.max(1),
                                     ),
-                                    &mut execution_future,
+                                    execution_tasks.join_next(),
                                 )
                                 .await
                                 {
                                     Ok(outcome) => break outcome,
                                     Err(_) => {
                                         supervise_serial_tool_cleanup(
-                                            execution_future,
+                                            execution_tasks,
                                             SerialToolCleanupSupervisor {
                                                 runtime_state: Arc::clone(runtime_state),
                                                 fence: active_side_effect_fence.clone(),
@@ -2929,6 +2943,7 @@ async fn execute_prepared_tool_runtime(
                                     }
                                 }
                             }
+                            execution_tasks.abort_all();
                             return Err(error);
                         }
                         if let Err(error) = send_process_progress_status_with_tape(
@@ -2948,14 +2963,14 @@ async fn execute_prepared_tool_runtime(
                                     Duration::from_millis(
                                         cancellation.context().hard_abort_after_ms.max(1),
                                     ),
-                                    &mut execution_future,
+                                    execution_tasks.join_next(),
                                 )
                                 .await
                                 {
                                     Ok(outcome) => break outcome,
                                     Err(_) => {
                                         supervise_serial_tool_cleanup(
-                                            execution_future,
+                                            execution_tasks,
                                             SerialToolCleanupSupervisor {
                                                 runtime_state: Arc::clone(runtime_state),
                                                 fence: active_side_effect_fence.clone(),
@@ -2972,6 +2987,7 @@ async fn execute_prepared_tool_runtime(
                                     }
                                 }
                             }
+                            execution_tasks.abort_all();
                             return Err(error);
                         }
                     }
@@ -2995,14 +3011,14 @@ async fn execute_prepared_tool_runtime(
                                 Duration::from_millis(
                                     cancellation.context().hard_abort_after_ms.max(1),
                                 ),
-                                &mut execution_future,
+                                execution_tasks.join_next(),
                             )
                             .await
                             {
                                 Ok(outcome) => break outcome,
                                 Err(_) => {
                                     supervise_serial_tool_cleanup(
-                                        execution_future,
+                                        execution_tasks,
                                         SerialToolCleanupSupervisor {
                                             runtime_state: Arc::clone(runtime_state),
                                             fence: active_side_effect_fence.clone(),
@@ -3018,7 +3034,8 @@ async fn execute_prepared_tool_runtime(
                             }
                         }
                         // Read-only and deterministic-idempotent tools may be
-                        // abandoned safely; mutating tools are always drained.
+                        // aborted safely; mutating tools are always drained.
+                        execution_tasks.abort_all();
                         return Ok(None);
                     }
                     Ok(false) => {}
@@ -3030,14 +3047,14 @@ async fn execute_prepared_tool_runtime(
                                 Duration::from_millis(
                                     cancellation.context().hard_abort_after_ms.max(1),
                                 ),
-                                &mut execution_future,
+                                execution_tasks.join_next(),
                             )
                             .await
                             {
                                 Ok(outcome) => break outcome,
                                 Err(_) => {
                                     supervise_serial_tool_cleanup(
-                                        execution_future,
+                                        execution_tasks,
                                         SerialToolCleanupSupervisor {
                                             runtime_state: Arc::clone(runtime_state),
                                             fence: active_side_effect_fence.clone(),
@@ -3048,16 +3065,60 @@ async fn execute_prepared_tool_runtime(
                                             started_at,
                                         },
                                     );
-                                    return Err(post_start_error
-                                        .take()
-                                        .expect("cancellation polling error should remain available"));
+                                    return Err(post_start_error.take().expect(
+                                        "cancellation polling error should remain available",
+                                    ));
                                 }
                             }
                         }
+                        execution_tasks.abort_all();
                         return Err(error);
                     }
                 }
             }
+        }
+    };
+    let outcome = match outcome {
+        Some(Ok(outcome)) => outcome,
+        Some(Err(error)) => {
+            if let Err(settlement_error) =
+                mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref())
+                    .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    proposal_id = %prepared.proposal_id,
+                    tool_name = %prepared.tool_name,
+                    error = %settlement_error,
+                    "failed to mark tool effect unknown after dispatch task termination"
+                );
+            }
+            warn!(
+                run_id = %run_id,
+                proposal_id = %prepared.proposal_id,
+                tool_name = %prepared.tool_name,
+                task_cancelled = error.is_cancelled(),
+                task_panicked = error.is_panic(),
+                "tool dispatch task terminated before reporting an outcome"
+            );
+            return Err(Status::internal(
+                "tool dispatch task terminated before reporting an outcome",
+            ));
+        }
+        None => {
+            if let Err(settlement_error) =
+                mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref())
+                    .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    proposal_id = %prepared.proposal_id,
+                    tool_name = %prepared.tool_name,
+                    error = %settlement_error,
+                    "failed to mark tool effect unknown after missing dispatch outcome"
+                );
+            }
+            return Err(Status::internal("tool dispatch task ended without reporting an outcome"));
         }
     };
     if let (Some(fence), Some(tape_seq)) = (active_side_effect_fence.as_ref(), progress_tape_seq) {
@@ -3140,12 +3201,10 @@ struct SerialToolCleanupSupervisor {
     started_at: Instant,
 }
 
-fn supervise_serial_tool_cleanup<F>(
-    execution_future: Pin<Box<F>>,
+fn supervise_serial_tool_cleanup(
+    mut execution_tasks: JoinSet<ToolExecutionOutcome>,
     supervisor: SerialToolCleanupSupervisor,
-) where
-    F: Future<Output = ToolExecutionOutcome> + Send + 'static,
-{
+) {
     tokio::spawn(async move {
         if let Err(error) =
             mark_tool_side_effect_unknown(&supervisor.runtime_state, supervisor.fence.as_ref())
@@ -3160,7 +3219,29 @@ fn supervise_serial_tool_cleanup<F>(
             );
             return;
         }
-        let outcome = execution_future.await;
+        let outcome = match execution_tasks.join_next().await {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(error)) => {
+                warn!(
+                    run_id = %supervisor.run_id,
+                    proposal_id = %supervisor.proposal_id,
+                    tool_name = %supervisor.tool_name,
+                    task_cancelled = error.is_cancelled(),
+                    task_panicked = error.is_panic(),
+                    "serial tool cleanup dispatch task terminated without an outcome"
+                );
+                return;
+            }
+            None => {
+                warn!(
+                    run_id = %supervisor.run_id,
+                    proposal_id = %supervisor.proposal_id,
+                    tool_name = %supervisor.tool_name,
+                    "serial tool cleanup ended without a dispatch outcome"
+                );
+                return;
+            }
+        };
         if let Err(error) = record_tool_side_effect_cleanup_outcome(
             &supervisor.runtime_state,
             supervisor.fence.as_ref(),
@@ -4829,12 +4910,12 @@ mod tests {
     use crate::tool_protocol::{ToolAttestation, ToolDecision, ToolExecutionOutcome};
     use crate::transport::grpc::auth::RequestContext;
     use palyra_common::runtime_contracts::{
-        project_legacy_runtime_error, ArtifactRetentionPolicy, CancellationSettlementOutcome,
-        ReconciliationStrategy, RuntimeErrorClass, RuntimeErrorObservation, RuntimeEventEnvelopeV2,
-        RuntimeEventName, RuntimeEventPayloadRef, RuntimeGeneration, RuntimeIdempotencyClass,
-        RuntimeOperationId, RuntimeRetryability, SideEffectFenceState, SideEffectFenceV1,
-        SideEffectRestartPolicy, ToolResultArtifactRef, ToolResultProjectionPolicyKind,
-        ToolResultSensitivity, ToolTurnBudget,
+        project_legacy_runtime_error, ArtifactRetentionPolicy, CancellationScopeKind,
+        CancellationSettlementOutcome, ReconciliationStrategy, RuntimeErrorClass,
+        RuntimeErrorObservation, RuntimeEventEnvelopeV2, RuntimeEventName, RuntimeEventPayloadRef,
+        RuntimeGeneration, RuntimeIdempotencyClass, RuntimeOperationId, RuntimeRetryability,
+        SideEffectFenceState, SideEffectFenceV1, SideEffectRestartPolicy, ToolResultArtifactRef,
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
     };
     use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
@@ -4847,6 +4928,8 @@ mod tests {
         time::{sleep, Duration},
     };
     use tonic::{Code, Status};
+
+    const MAX_PREPARED_TOOL_RUNTIME_WRAPPER_BYTES: usize = 1024;
 
     fn start_backpressure_test_run(state: &GatewayRuntimeState, session_id: &str, run_id: &str) {
         start_test_orchestrator_run(state, session_id, run_id);
@@ -4999,6 +5082,46 @@ mod tests {
             )
             .expect("unresolved fence count should load");
         assert_eq!(unresolved, 0, "mutating tool fence must not remain unresolved");
+    }
+
+    #[test]
+    fn prepared_tool_runtime_wrapper_stays_heap_bounded() {
+        let state = test_runtime_state();
+        let request_context = RequestContext {
+            principal: "test-principal".to_owned(),
+            device_id: "test-device".to_owned(),
+            channel: Some("qa".to_owned()),
+        };
+        let mut prepared =
+            mutating_prepared_tool("session_denied_runtime_size", "proposal_denied_runtime_size");
+        prepared.decision.allowed = false;
+        prepared.decision.reason = "test policy denial".to_owned();
+        let flow_control = super::RunStreamFlowControl::new(
+            RuntimeGeneration::new(1).expect("test generation should validate"),
+            Duration::from_secs(30),
+        )
+        .expect("test flow control should initialize");
+        let cancellation = flow_control
+            .live_child(CancellationScopeKind::ToolExecution, Duration::from_secs(10))
+            .expect("test cancellation child should initialize");
+        let future = super::execute_prepared_tool_runtime(super::PreparedToolRuntimeExecution {
+            progress_sender: None,
+            runtime_state: &state,
+            request_context: &request_context,
+            run_id: "run_denied_runtime_size",
+            progress_tape_seq: None,
+            effect_started_tape_seq: Some(0),
+            prepared: &prepared,
+            remaining_tool_budget: None,
+            flow_control,
+            cancellation,
+        });
+        let future_bytes = std::mem::size_of_val(&future);
+
+        assert!(
+            future_bytes <= MAX_PREPARED_TOOL_RUNTIME_WRAPPER_BYTES,
+            "prepared tool runtime wrapper is {future_bytes} bytes; keep the allowed execution state behind a pinned heap future"
+        );
     }
 
     #[test]
