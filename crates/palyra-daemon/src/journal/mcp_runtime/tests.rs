@@ -36,33 +36,91 @@ async fn configured_record_and_adjacent_event_survive_restart() {
     let first = store(path.clone());
     let configured = configured_record();
     first.insert_configured(&configured).await.expect("configured record should persist");
-    let handshaking =
-        configured.begin_handshake(1_001).expect("handshake transition should validate");
-    let event = McpRuntimeEventV2::from_transition(
-        &configured,
-        &handshaking,
-        "mcp.runtime.handshake.started",
-    )
-    .expect("event should match transition");
+    let starting = configured.begin_start(1_001).expect("starting transition should validate");
+    let event =
+        McpRuntimeEventV2::from_transition(&configured, &starting, "mcp.runtime.session.starting")
+            .expect("event should match transition");
     first
-        .persist_transition(configured.revision, &handshaking, &event)
+        .persist_transition(configured.revision, &starting, &event)
         .await
         .expect("transition should commit");
     drop(first);
 
     let reopened = store(path);
-    assert_eq!(reopened.load_all().await.expect("records should restore"), vec![handshaking]);
+    assert_eq!(reopened.load_all().await.expect("records should restore"), vec![starting]);
     let guard = reopened.connection.lock().expect("journal lock should be available");
     let migration_count: i64 = guard
         .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 97", [], |row| {
             row.get(0)
         })
         .expect("migration marker should load");
+    let lifecycle_migration_count: i64 = guard
+        .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 101", [], |row| {
+            row.get(0)
+        })
+        .expect("lifecycle migration marker should load");
     let event_count: i64 = guard
         .query_row("SELECT COUNT(*) FROM mcp_connection_lifecycle_events_v2", [], |row| row.get(0))
         .expect("event count should load");
     assert_eq!(migration_count, 1);
+    assert_eq!(lifecycle_migration_count, 1);
     assert_eq!(event_count, 1);
+}
+
+#[tokio::test]
+async fn degraded_record_survives_restart() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let path = directory.path().join("journal.sqlite3");
+    let journal = store(path.clone());
+    let configured = configured_record();
+    journal.insert_configured(&configured).await.expect("configured record should persist");
+
+    let starting = configured.begin_start(1_001).expect("starting transition should validate");
+    let starting_event =
+        McpRuntimeEventV2::from_transition(&configured, &starting, "mcp.runtime.session.starting")
+            .expect("starting event should validate");
+    journal
+        .persist_transition(configured.revision, &starting, &starting_event)
+        .await
+        .expect("starting state should persist");
+
+    let handshaking =
+        starting.begin_handshake(1_002).expect("handshake transition should validate");
+    let handshake_event = McpRuntimeEventV2::from_transition(
+        &starting,
+        &handshaking,
+        "mcp.runtime.handshake.started",
+    )
+    .expect("handshake event should validate");
+    journal
+        .persist_transition(starting.revision, &handshaking, &handshake_event)
+        .await
+        .expect("handshake should persist");
+
+    let ready =
+        handshaking.mark_ready("a".repeat(64), 1_003).expect("ready transition should validate");
+    let ready_event =
+        McpRuntimeEventV2::from_transition(&handshaking, &ready, "mcp.runtime.session.ready")
+            .expect("ready event should validate");
+    journal
+        .persist_transition(handshaking.revision, &ready, &ready_event)
+        .await
+        .expect("ready state should persist");
+
+    let degraded = ready
+        .mark_degraded("mcp.runtime.transport.closed", 1_004)
+        .expect("degraded transition should validate");
+    let degraded_event =
+        McpRuntimeEventV2::from_transition(&ready, &degraded, "mcp.runtime.transport.closed")
+            .expect("degraded event should validate");
+    journal
+        .persist_transition(ready.revision, &degraded, &degraded_event)
+        .await
+        .expect("degraded state should persist");
+    drop(journal);
+
+    let reopened = store(path);
+    assert_eq!(reopened.load_all().await.expect("degraded head should restore"), vec![degraded]);
 }
 
 #[tokio::test]
@@ -71,25 +129,21 @@ async fn stale_transition_cannot_mutate_head_or_append_evidence() {
     let store = store(directory.path().join("journal.sqlite3"));
     let configured = configured_record();
     store.insert_configured(&configured).await.expect("configured record should persist");
-    let handshaking =
-        configured.begin_handshake(1_001).expect("handshake transition should validate");
-    let event = McpRuntimeEventV2::from_transition(
-        &configured,
-        &handshaking,
-        "mcp.runtime.handshake.started",
-    )
-    .expect("event should match transition");
+    let starting = configured.begin_start(1_001).expect("starting transition should validate");
+    let event =
+        McpRuntimeEventV2::from_transition(&configured, &starting, "mcp.runtime.session.starting")
+            .expect("event should match transition");
     store
-        .persist_transition(configured.revision, &handshaking, &event)
+        .persist_transition(configured.revision, &starting, &event)
         .await
         .expect("first transition should commit");
 
-    let stale = store.persist_transition(configured.revision, &handshaking, &event).await;
+    let stale = store.persist_transition(configured.revision, &starting, &event).await;
     assert_eq!(
         stale,
         Err(McpRuntimeStoreError::RevisionConflict {
             expected: configured.revision,
-            actual: Some(handshaking.revision),
+            actual: Some(starting.revision),
         })
     );
     let guard = store.connection.lock().expect("journal lock should be available");
@@ -126,20 +180,28 @@ async fn catalog_epoch_evidence_commits_atomically_with_ready_head() {
     let journal = store(path.clone());
     let configured = configured_record();
     journal.insert_configured(&configured).await.expect("configured record should persist");
+    let starting = configured.begin_start(1_001).expect("starting transition should validate");
+    let starting_event =
+        McpRuntimeEventV2::from_transition(&configured, &starting, "mcp.runtime.session.starting")
+            .expect("starting event should validate");
+    journal
+        .persist_transition(configured.revision, &starting, &starting_event)
+        .await
+        .expect("starting state should persist");
     let handshaking =
-        configured.begin_handshake(1_001).expect("handshake transition should validate");
+        starting.begin_handshake(1_002).expect("handshake transition should validate");
     let handshake_event = McpRuntimeEventV2::from_transition(
-        &configured,
+        &starting,
         &handshaking,
         "mcp.runtime.handshake.started",
     )
     .expect("handshake event should validate");
     journal
-        .persist_transition(configured.revision, &handshaking, &handshake_event)
+        .persist_transition(starting.revision, &handshaking, &handshake_event)
         .await
         .expect("handshake should persist");
     let ready =
-        handshaking.mark_ready("a".repeat(64), 1_002).expect("ready transition should validate");
+        handshaking.mark_ready("a".repeat(64), 1_003).expect("ready transition should validate");
     let ready_event =
         McpRuntimeEventV2::from_transition(&handshaking, &ready, "mcp.runtime.session.ready")
             .expect("ready event should validate");

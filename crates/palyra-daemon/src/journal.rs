@@ -7583,6 +7583,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "mcp_lifecycle_observations",
         sql: lifecycle::MIGRATION_100_SQL,
     },
+    Migration {
+        version: 101,
+        name: "mcp_exact_runtime_lifecycle",
+        sql: mcp_runtime::MIGRATION_101_SQL,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(

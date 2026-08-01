@@ -3087,16 +3087,6 @@ pub async fn run() -> Result<()> {
         },
     )
     .context("failed to initialize gateway runtime state")?;
-    let mcp_runtime = application::mcp_runtime::McpProductionRuntime::bootstrap(
-        &runtime,
-        &loaded.mcp_servers,
-        std::env::current_dir().context("failed to resolve MCP runtime working directory")?,
-    )
-    .await
-    .context("failed to initialize persistent MCP runtime")?;
-    runtime
-        .install_mcp_runtime(mcp_runtime)
-        .map_err(|_| anyhow::anyhow!("persistent MCP runtime was installed more than once"))?;
     runtime.configure_networked_worker_remote_dispatcher(Arc::new(
         application::tool_runtime::networked_worker::NodeRuntimeNetworkedWorkerDispatcher::new(
             Arc::clone(&node_runtime),
@@ -3154,6 +3144,16 @@ pub async fn run() -> Result<()> {
         .reconcile_persisted_process_leases_async()
         .await
         .context("failed to reconcile persisted process leases during startup")?;
+    let mcp_runtime = application::mcp_runtime::McpProductionRuntime::bootstrap(
+        &runtime,
+        &loaded.mcp_servers,
+        std::env::current_dir().context("failed to resolve MCP runtime working directory")?,
+    )
+    .await
+    .context("failed to initialize persistent MCP runtime")?;
+    runtime
+        .install_mcp_runtime(mcp_runtime)
+        .map_err(|_| anyhow::anyhow!("persistent MCP runtime was installed more than once"))?;
     let mut startup_cleanup_traces_finalized = 0usize;
     for run_id in &startup_run_recovery.deferred_metadata_trace_run_ids {
         if runtime.journal_store.finalize_startup_recovery_metadata_trace(run_id).with_context(

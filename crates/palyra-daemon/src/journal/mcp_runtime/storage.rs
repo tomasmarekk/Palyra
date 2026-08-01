@@ -11,7 +11,7 @@ use crate::application::mcp_runtime::{
 use super::super::JournalStore;
 
 const RECORD_COLUMNS: &str = "
-    schema_version, server_id, transport, lifecycle, runtime_generation,
+    schema_version, server_id, transport, runtime_lifecycle, runtime_generation,
     catalog_epoch, catalog_digest, credential_scope_id, trust_profile_id,
     consecutive_failures, next_retry_at_unix_ms, quarantine_reason_code,
     revision, created_at_unix_ms, updated_at_unix_ms
@@ -43,20 +43,21 @@ impl McpRuntimeRecordStore for JournalStore {
         let result = guard.execute(
             r#"
                 INSERT INTO mcp_server_records_v2 (
-                    schema_version, server_id, transport, lifecycle,
+                    schema_version, server_id, transport, lifecycle, runtime_lifecycle,
                     runtime_generation, catalog_epoch, catalog_digest,
                     credential_scope_id, trust_profile_id, consecutive_failures,
                     next_retry_at_unix_ms, quarantine_reason_code, revision,
                     created_at_unix_ms, updated_at_unix_ms
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15
+                    ?13, ?14, ?15, ?16
                 )
             "#,
             (
                 record.schema_version,
                 record.server_id.as_str(),
                 transport_str(record.transport),
+                legacy_lifecycle_str(record.lifecycle),
                 lifecycle_str(record.lifecycle),
                 to_sqlite(record.runtime_generation, "runtime_generation")?,
                 to_sqlite(record.catalog_epoch, "catalog_epoch")?,
@@ -124,23 +125,25 @@ impl McpRuntimeRecordStore for JournalStore {
                     SET schema_version = ?1,
                         transport = ?3,
                         lifecycle = ?4,
-                        runtime_generation = ?5,
-                        catalog_epoch = ?6,
-                        catalog_digest = ?7,
-                        credential_scope_id = ?8,
-                        trust_profile_id = ?9,
-                        consecutive_failures = ?10,
-                        next_retry_at_unix_ms = ?11,
-                        quarantine_reason_code = ?12,
-                        revision = ?13,
-                        created_at_unix_ms = ?14,
-                        updated_at_unix_ms = ?15
-                    WHERE server_id = ?2 AND revision = ?16
+                        runtime_lifecycle = ?5,
+                        runtime_generation = ?6,
+                        catalog_epoch = ?7,
+                        catalog_digest = ?8,
+                        credential_scope_id = ?9,
+                        trust_profile_id = ?10,
+                        consecutive_failures = ?11,
+                        next_retry_at_unix_ms = ?12,
+                        quarantine_reason_code = ?13,
+                        revision = ?14,
+                        created_at_unix_ms = ?15,
+                        updated_at_unix_ms = ?16
+                    WHERE server_id = ?2 AND revision = ?17
                 "#,
-                (
+                params![
                     record.schema_version,
                     record.server_id.as_str(),
                     transport_str(record.transport),
+                    legacy_lifecycle_str(record.lifecycle),
                     lifecycle_str(record.lifecycle),
                     to_sqlite(record.runtime_generation, "runtime_generation")?,
                     to_sqlite(record.catalog_epoch, "catalog_epoch")?,
@@ -154,7 +157,7 @@ impl McpRuntimeRecordStore for JournalStore {
                     record.created_at_unix_ms,
                     record.updated_at_unix_ms,
                     to_sqlite(expected_revision, "expected_revision")?,
-                ),
+                ],
             )
             .map_err(|_| unavailable("record_update_failed"))?;
         if changed != 1 {
@@ -348,8 +351,10 @@ fn parse_transport(value: &str) -> Result<McpSessionTransportKind, McpRuntimeSto
 fn lifecycle_str(lifecycle: McpRuntimeLifecycleState) -> &'static str {
     match lifecycle {
         McpRuntimeLifecycleState::Configured => "configured",
+        McpRuntimeLifecycleState::Starting => "starting",
         McpRuntimeLifecycleState::Handshaking => "handshaking",
         McpRuntimeLifecycleState::Ready => "ready",
+        McpRuntimeLifecycleState::Degraded => "degraded",
         McpRuntimeLifecycleState::Reconnecting => "reconnecting",
         McpRuntimeLifecycleState::Stopping => "stopping",
         McpRuntimeLifecycleState::Stopped => "stopped",
@@ -358,11 +363,21 @@ fn lifecycle_str(lifecycle: McpRuntimeLifecycleState) -> &'static str {
     }
 }
 
+fn legacy_lifecycle_str(lifecycle: McpRuntimeLifecycleState) -> &'static str {
+    match lifecycle {
+        McpRuntimeLifecycleState::Starting => "configured",
+        McpRuntimeLifecycleState::Degraded => "reconnecting",
+        state => lifecycle_str(state),
+    }
+}
+
 fn parse_lifecycle(value: &str) -> Result<McpRuntimeLifecycleState, McpRuntimeStoreError> {
     match value {
         "configured" => Ok(McpRuntimeLifecycleState::Configured),
+        "starting" => Ok(McpRuntimeLifecycleState::Starting),
         "handshaking" => Ok(McpRuntimeLifecycleState::Handshaking),
         "ready" => Ok(McpRuntimeLifecycleState::Ready),
+        "degraded" => Ok(McpRuntimeLifecycleState::Degraded),
         "reconnecting" => Ok(McpRuntimeLifecycleState::Reconnecting),
         "stopping" => Ok(McpRuntimeLifecycleState::Stopping),
         "stopped" => Ok(McpRuntimeLifecycleState::Stopped),

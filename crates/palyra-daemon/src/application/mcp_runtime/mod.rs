@@ -57,7 +57,7 @@ pub use supervisor::{
     McpDescriptorTrustVerifier, McpExternalToolDescriptor, McpReconnectPolicy, McpRuntimeEventV2,
     McpRuntimeLifecycleState, McpRuntimeRecordStore, McpRuntimeStoreError, McpRuntimeSupervisor,
     McpRuntimeSupervisorError, McpServerRecordV2, McpToolEffectClassification,
-    McpVerifiedDescriptorIdentity, TrustedExternalToolRegistrationRequest,
+    McpVerifiedDescriptorIdentity, ReconnectOutcome, TrustedExternalToolRegistrationRequest,
     MCP_SERVER_RECORD_SCHEMA_VERSION,
 };
 pub use transport::{
@@ -66,5 +66,5 @@ pub use transport::{
     McpResponsePayload, McpSamplingRequest, McpServerCallbackRequest, McpServerCallbackResponse,
     McpServerCallbackType, McpServerNotification, McpSessionConnector, McpSessionReader,
     McpSessionRequest, McpSessionTransportKind, McpSessionWriter, McpTransportError,
-    McpTransportEvent,
+    McpTransportEvent, McpTransportHealth, McpTransportHealthState, McpTransportSession,
 };

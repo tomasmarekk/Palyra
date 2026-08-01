@@ -661,7 +661,7 @@ mod tests {
         async fn connect(
             &self,
             _request: &McpConnectRequest,
-        ) -> Result<super::super::McpConnectedSession, McpTransportError> {
+        ) -> Result<Box<dyn super::super::McpTransportSession>, McpTransportError> {
             Err(McpTransportError::Unavailable {
                 reason_code: "mcp.runtime.test.connector_unused".to_owned(),
             })
@@ -740,6 +740,8 @@ mod tests {
             handshake_timeout: Duration::from_secs(1),
             callback_timeout: Duration::from_secs(1),
             transport_operation_timeout: Duration::from_secs(1),
+            keepalive_interval: Duration::from_secs(60),
+            keepalive_timeout: Duration::from_secs(1),
             default_drain_timeout: Duration::from_secs(1),
             reconnect_policy: McpReconnectPolicy::default(),
         }

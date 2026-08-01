@@ -451,6 +451,40 @@ pub trait McpSessionReader: Send {
     async fn next_event(&mut self) -> Result<McpTransportEvent, McpTransportError>;
 }
 
+/// Observable state of one actor-owned persistent transport generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportHealthState {
+    /// The transport is connected and has no outstanding keepalive probe.
+    Connected,
+    /// A bounded host ping is awaiting its response.
+    KeepalivePending,
+    /// Transport health failed and reconnect is required.
+    Degraded,
+    /// The transport was closed by an orderly drain.
+    Closed,
+}
+
+/// Bounded transport liveness evidence published through actor diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpTransportHealth {
+    /// Generation that exclusively owns this transport.
+    pub runtime_generation: u64,
+    /// Current health state.
+    pub state: McpTransportHealthState,
+    /// Time at which initialization completed.
+    pub connected_at_unix_ms: i64,
+    /// Most recent validated frame or successful write time.
+    pub last_activity_at_unix_ms: i64,
+    /// Most recent keepalive request time.
+    pub last_keepalive_at_unix_ms: Option<i64>,
+    /// Successfully acknowledged keepalive count.
+    pub successful_keepalives: u64,
+    /// Keepalive failures observed before reconnect.
+    pub failed_keepalives: u64,
+}
+
 /// Connected session returned after transport setup and MCP initialization.
 pub struct McpConnectedSession {
     initialize_result: McpInitializeResult,
@@ -480,6 +514,25 @@ impl McpConnectedSession {
     }
 }
 
+/// Actor-owned initialized transport session.
+///
+/// Implementations transfer both I/O halves exactly once so no second owner can
+/// issue requests for the same runtime generation.
+pub trait McpTransportSession: Send {
+    /// Consumes the session into negotiated metadata and exclusive I/O halves.
+    fn into_parts(
+        self: Box<Self>,
+    ) -> (McpInitializeResult, Box<dyn McpSessionWriter>, Box<dyn McpSessionReader>);
+}
+
+impl McpTransportSession for McpConnectedSession {
+    fn into_parts(
+        self: Box<Self>,
+    ) -> (McpInitializeResult, Box<dyn McpSessionWriter>, Box<dyn McpSessionReader>) {
+        (*self).into_parts()
+    }
+}
+
 /// Factory for persistent stdio, Streamable HTTP, or SSE sessions.
 #[async_trait]
 pub trait McpSessionConnector: Send + Sync {
@@ -490,7 +543,7 @@ pub trait McpSessionConnector: Send + Sync {
     async fn connect(
         &self,
         request: &McpConnectRequest,
-    ) -> Result<McpConnectedSession, McpTransportError>;
+    ) -> Result<Box<dyn McpTransportSession>, McpTransportError>;
 }
 
 /// Persistent transport failure.

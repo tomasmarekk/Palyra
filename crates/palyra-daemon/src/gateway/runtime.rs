@@ -2944,6 +2944,7 @@ pub struct GatewayRuntimeState {
         crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics,
     managed_coding_services:
         Option<Arc<crate::application::managed_coding_services::ManagedCodingRuntimeServices>>,
+    local_resource_governor: crate::application::local_resource_governor::LocalResourceGovernor,
     mcp_runtime: OnceLock<Arc<crate::application::mcp_runtime::McpProductionRuntime>>,
     pub(crate) journal_store: JournalStore,
     pub(crate) daemon_lifecycle: DaemonLifecycleController,
@@ -4346,6 +4347,13 @@ impl GatewayRuntimeState {
         self.mcp_runtime.get()
     }
 
+    /// Shares the daemon-wide durable resource authority with MCP actors.
+    pub(crate) fn mcp_resource_governor(
+        &self,
+    ) -> crate::application::local_resource_governor::LocalResourceGovernor {
+        self.local_resource_governor.clone()
+    }
+
     /// Ensures an MCP-bound OAuth profile has a live access token without
     /// exposing the token value outside the vault boundary.
     pub(crate) async fn ensure_mcp_oauth_profile(
@@ -4537,6 +4545,25 @@ impl GatewayRuntimeState {
         let credential_availability = auth_runtime.map(|auth_runtime| {
             CredentialAvailabilityService::new(auth_runtime, Arc::clone(&vault))
         });
+        let local_resource_governor = match managed_coding_services.as_ref() {
+            Some(services) => services.resource_governor(),
+            None => {
+                let state_parent =
+                    journal_config.db_path.parent().unwrap_or_else(|| Path::new("."));
+                let state_root = if state_parent.is_absolute() {
+                    state_parent.join("managed-coding-runtime")
+                } else {
+                    std::env::current_dir()
+                        .map_err(|error| JournalError::InvalidArgument(error.to_string()))?
+                        .join(state_parent)
+                        .join("managed-coding-runtime")
+                };
+                crate::application::managed_coding_services::ManagedCodingRuntimeServices::open_resource_governor(
+                    state_root.as_path(),
+                )
+                .map_err(|error| JournalError::InvalidArgument(error.to_string()))?
+            }
+        };
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
@@ -4755,6 +4782,7 @@ impl GatewayRuntimeState {
             runtime_shadow_diagnostics:
                 crate::runtime_diagnostics::shadow_differential::ShadowDifferentialDiagnostics::default(),
             managed_coding_services,
+            local_resource_governor,
             mcp_runtime: OnceLock::new(),
             journal_store,
             daemon_lifecycle: DaemonLifecycleController::new(daemon_lifecycle_startup),
@@ -14617,10 +14645,7 @@ impl GatewayRuntimeState {
         &self,
         request: ClaimReadyWorkItemRequest,
     ) -> Result<ClaimReadyWorkItemOutcome, Status> {
-        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
-            Status::failed_precondition("work graph resource governor is unavailable")
-        })?;
-        WorkGraphResourceCoordinator::new(services.resource_governor())
+        WorkGraphResourceCoordinator::new(self.local_resource_governor.clone())
             .claim_ready_work_item(&self.journal_store, request)
             .map_err(|error| Status::internal(error.to_string()))
     }
@@ -14628,8 +14653,7 @@ impl GatewayRuntimeState {
     /// Claims one ready item through shared resource and durable generation authority.
     ///
     /// # Errors
-    /// Returns `failed_precondition` without a daemon resource governor, or a mapped admission
-    /// failure if durable or resource state cannot be updated.
+    /// Returns a mapped admission failure if durable or resource state cannot be updated.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn claim_ready_work_item(
         self: &Arc<Self>,
@@ -14646,10 +14670,7 @@ impl GatewayRuntimeState {
         &self,
         request: &WorkClaimSettlementRequest,
     ) -> Result<WorkClaimSettlementOutcome, Status> {
-        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
-            Status::failed_precondition("work graph resource governor is unavailable")
-        })?;
-        WorkGraphResourceCoordinator::new(services.resource_governor())
+        WorkGraphResourceCoordinator::new(self.local_resource_governor.clone())
             .settle_work_item_claim(&self.journal_store, request)
             .map_err(|error| Status::internal(error.to_string()))
     }
@@ -14800,11 +14821,7 @@ impl GatewayRuntimeState {
             StaleReclaimDecision::Reclaimed { .. } | StaleReclaimDecision::RequiresReview { .. }
         ) {
             if let Some((lease_id, generation)) = resource_lease {
-                let services = self.managed_coding_services.as_ref().ok_or_else(|| {
-                    Status::failed_precondition("work graph resource governor is unavailable")
-                })?;
-                services
-                    .resource_governor()
+                self.local_resource_governor
                     .release(lease_id.as_str(), generation)
                     .map_err(|error| Status::internal(error.to_string()))?;
             }
@@ -14842,10 +14859,7 @@ impl GatewayRuntimeState {
         expected_graph_revision: u64,
         actor_principal: &str,
     ) -> Result<WorkGraphCancellationReportV1, Status> {
-        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
-            Status::failed_precondition("work graph resource governor is unavailable")
-        })?;
-        WorkGraphResourceCoordinator::new(services.resource_governor())
+        WorkGraphResourceCoordinator::new(self.local_resource_governor.clone())
             .cancel_work_graph_workers(
                 &self.journal_store,
                 graph_id,
@@ -15147,16 +15161,11 @@ impl GatewayRuntimeState {
     }
 
     /// Returns the shared local-resource projection used by WorkGraph admission.
-    ///
-    /// # Errors
-    /// Returns `failed_precondition` when the resource governor is unavailable.
     pub(crate) fn work_graph_resource_snapshot(
         &self,
     ) -> Result<crate::application::local_resource_governor::LocalResourceSnapshotV1, Status> {
-        let services = self.managed_coding_services.as_ref().ok_or_else(|| {
-            Status::failed_precondition("work graph resource governor is unavailable")
-        })?;
-        Ok(WorkGraphResourceCoordinator::new(services.resource_governor()).resource_snapshot())
+        Ok(WorkGraphResourceCoordinator::new(self.local_resource_governor.clone())
+            .resource_snapshot())
     }
 
     #[allow(clippy::result_large_err)]

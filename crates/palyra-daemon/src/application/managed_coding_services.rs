@@ -180,6 +180,24 @@ impl ManagedCodingRuntimeServices {
         self.governor.clone()
     }
 
+    /// Opens the daemon-wide durable resource authority independently of Git
+    /// and the optional managed-coding services that also consume it.
+    pub(crate) fn open_resource_governor(
+        state_root: &Path,
+    ) -> Result<LocalResourceGovernor, ManagedCodingServicesError> {
+        if !state_root.is_absolute() {
+            return Err(ManagedCodingServicesError::InvalidConfiguration);
+        }
+        let limits = service_resource_limit();
+        LocalResourceGovernor::open(LocalResourceGovernorConfig {
+            registry_path: state_root.join("resource-leases.json"),
+            global_limit: limits,
+            per_owner_limit: limits,
+            max_records: 4_096,
+        })
+        .map_err(|error| ManagedCodingServicesError::ResourceGovernor(error.to_string()))
+    }
+
     /// Opens every service under one bounded resource and lifecycle authority.
     ///
     /// # Errors
@@ -194,14 +212,7 @@ impl ManagedCodingRuntimeServices {
         {
             return Err(ManagedCodingServicesError::InvalidConfiguration);
         }
-        let limits = service_resource_limit();
-        let governor = LocalResourceGovernor::open(LocalResourceGovernorConfig {
-            registry_path: config.state_root.join("resource-leases.json"),
-            global_limit: limits,
-            per_owner_limit: limits,
-            max_records: 4_096,
-        })
-        .map_err(|error| ManagedCodingServicesError::ResourceGovernor(error.to_string()))?;
+        let governor = Self::open_resource_governor(config.state_root.as_path())?;
         let process = Arc::new(
             ProcessSupervisor::start(ProcessSupervisorConfig {
                 state_root: config.state_root.clone(),

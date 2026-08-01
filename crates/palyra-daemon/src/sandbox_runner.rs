@@ -1102,6 +1102,198 @@ impl ManagedStdioProcess {
 pub(crate) fn spawn_managed_stdio_process(
     config: &ManagedStdioProcessConfig,
 ) -> Result<ManagedStdioProcess, SandboxProcessRunError> {
+    validate_managed_stdio_process_config(config)?;
+    let mut command = Command::new(config.executable.as_path());
+    command
+        .args(config.args.iter())
+        .current_dir(config.cwd.as_path())
+        .env_clear()
+        .envs(config.env.iter());
+    spawn_prepared_managed_stdio_process(config, command, config.executable.as_path())
+}
+
+/// Validates and launches a persistent stdio service through the same sandbox
+/// policy, path, interpreter, egress, and quota gates as `palyra.process.run`.
+///
+/// Durable runtime-handle registration remains the caller's responsibility and
+/// must complete before the returned process is acknowledged to an actor.
+///
+/// # Errors
+/// Returns [`SandboxProcessRunError`] before spawn when any configured sandbox
+/// invariant cannot be enforced, with no direct-host fallback.
+pub(crate) fn spawn_sandboxed_managed_stdio_process(
+    policy: &SandboxProcessRunnerPolicy,
+    configured_command: &str,
+    config: &ManagedStdioProcessConfig,
+) -> Result<ManagedStdioProcess, SandboxProcessRunError> {
+    validate_managed_stdio_process_config(config)?;
+    if !policy.enabled {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::Disabled,
+            message: "sandbox process runner is disabled by runtime policy".to_owned(),
+        });
+    }
+    if normalize_process_executable_token(configured_command)
+        != normalize_process_executable_token(config.executable.to_string_lossy().as_ref())
+    {
+        return Err(managed_stdio_error(
+            "configured command does not match its trusted executable",
+        ));
+    }
+    let mut input = ProcessRunnerToolInput {
+        command: configured_command.to_owned(),
+        args: config.args.clone(),
+        cwd: Some(config.cwd.to_string_lossy().into_owned()),
+        env: config.env.clone(),
+        prepend_path: Vec::new(),
+        requested_egress_hosts: Vec::new(),
+        timeout_ms: None,
+        background: true,
+        notify_on_complete: false,
+        watch_patterns: Vec::new(),
+        interactive: false,
+        stdin: true,
+        pty: false,
+        port_hints: Vec::new(),
+        lifetime_mode: BackgroundLifetimeMode::RunOwned,
+        keep_running_after_run: false,
+        env_profile_id: None,
+        elevated_intent: false,
+        facade_mapping: None,
+    };
+    validate_input_shape(&input)?;
+    validate_background_lifetime_mode(&input)?;
+    validate_allowed_executable(policy, input.command.as_str())?;
+    validate_no_embedded_command_line_arg(&input)?;
+    validate_cmd_invocation_shape(input.command.as_str(), input.args.as_slice())?;
+    validate_process_termination_scope(input.command.as_str(), input.args.as_slice())?;
+
+    let path_access_mode = process_runner_effective_path_access_mode(policy);
+    let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
+    let host_access_roots = process_runner_accepts_host_path_fields(policy).then(host_access_roots);
+    let host_access_path_env = process_runner_accepts_host_path_fields(policy)
+        .then(|| host_access_path_env_for_input(&input));
+    let working_directory = match path_access_mode {
+        PathAccessMode::UnrestrictedOs => resolve_unrestricted_working_directory(
+            workspace_root.as_path(),
+            input.cwd.as_deref(),
+            host_access_path_env.as_ref().expect("host path env should be initialized"),
+        )?,
+        PathAccessMode::ApprovedRoots => resolve_host_working_directory_with_roots(
+            workspace_root.as_path(),
+            input.cwd.as_deref(),
+            host_access_roots.as_ref().expect("host roots should be initialized").as_slice(),
+            host_access_path_env.as_ref().expect("host path env should be initialized"),
+        )?,
+        PathAccessMode::WorkspaceOnly => {
+            resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
+        }
+    };
+    let process_risk = classify_process_run(
+        &input,
+        ProcessRiskContext {
+            workspace_root: Some(workspace_root.as_path()),
+            resolved_cwd: Some(working_directory.as_path()),
+        },
+    );
+    validate_supported_target_runtime(&process_risk)?;
+    match path_access_mode {
+        PathAccessMode::UnrestrictedOs => {}
+        PathAccessMode::ApprovedRoots => {
+            let roots = host_access_roots.as_ref().expect("host roots should be initialized");
+            let path_env =
+                host_access_path_env.as_ref().expect("host path env should be initialized");
+            input.args = rewrite_host_access_process_args(
+                input.args.as_slice(),
+                workspace_root.as_path(),
+                path_env,
+            )?;
+            validate_host_command_path_scope_with_roots(
+                workspace_root.as_path(),
+                working_directory.as_path(),
+                input.command.as_str(),
+                roots.as_slice(),
+            )?;
+            validate_host_interpreter_argument_guardrails_with_roots(
+                workspace_root.as_path(),
+                working_directory.as_path(),
+                input.command.as_str(),
+                input.args.as_slice(),
+                roots.as_slice(),
+            )?;
+            validate_host_argument_scope_with_roots(
+                workspace_root.as_path(),
+                working_directory.as_path(),
+                input.command.as_str(),
+                input.args.as_slice(),
+                roots.as_slice(),
+            )?;
+        }
+        PathAccessMode::WorkspaceOnly => {
+            validate_interpreter_argument_guardrails(
+                workspace_root.as_path(),
+                working_directory.as_path(),
+                input.command.as_str(),
+                input.args.as_slice(),
+            )?;
+            validate_argument_workspace_scope(
+                workspace_root.as_path(),
+                working_directory.as_path(),
+                input.command.as_str(),
+                input.args.as_slice(),
+            )?;
+        }
+    }
+    let requested_hosts = if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
+        validate_requested_egress_hosts_require_enforcement(&input)?;
+        Vec::new()
+    } else {
+        collect_requested_egress_hosts(&input)?
+    };
+    if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
+        validate_tier_c_strict_offline_egress_requests(policy, requested_hosts.as_slice())?;
+    }
+    if !matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
+        validate_egress_hosts(policy, requested_hosts.as_slice())?;
+    }
+    if matches!(path_access_mode, PathAccessMode::WorkspaceOnly) {
+        validate_platform_resource_quota_support(policy)?;
+    }
+    if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
+        validate_runtime_egress_enforcement(policy)?;
+    }
+
+    let command = build_process_command(
+        policy,
+        &input,
+        workspace_root.as_path(),
+        working_directory.as_path(),
+    )?;
+    let provenance_executable =
+        resolve_prepared_managed_stdio_program(&command, working_directory.as_path())?;
+    spawn_prepared_managed_stdio_process(config, command, provenance_executable.as_path())
+}
+
+fn resolve_prepared_managed_stdio_program(
+    command: &Command,
+    cwd: &Path,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    let configured = PathBuf::from(command.get_program());
+    if configured.is_absolute() {
+        return configured.canonicalize().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: format!("failed to resolve sandbox runtime executable: {error}"),
+        });
+    }
+    let raw = configured
+        .to_str()
+        .ok_or_else(|| managed_stdio_error("sandbox runtime executable is not valid UTF-8"))?;
+    resolve_tier_b_process_program(raw, cwd, OsStr::new(sandbox_process_path()), true, false)
+}
+
+fn validate_managed_stdio_process_config(
+    config: &ManagedStdioProcessConfig,
+) -> Result<(), SandboxProcessRunError> {
     if !config.executable.is_absolute()
         || !config.executable.is_file()
         || !config.cwd.is_absolute()
@@ -1114,22 +1306,24 @@ pub(crate) fn spawn_managed_stdio_process(
     {
         return Err(managed_stdio_error("launch plan violates bounded process policy"));
     }
+    Ok(())
+}
+
+fn spawn_prepared_managed_stdio_process(
+    config: &ManagedStdioProcessConfig,
+    mut command: Command,
+    provenance_executable: &Path,
+) -> Result<ManagedStdioProcess, SandboxProcessRunError> {
+    validate_managed_stdio_process_config(config)?;
+    #[cfg(windows)]
+    let _ = provenance_executable;
     #[cfg(unix)]
-    let executable_sha256 = sha256_file_bounded(config.executable.as_path()).map_err(|error| {
-        SandboxProcessRunError {
+    let executable_sha256 =
+        sha256_file_bounded(provenance_executable).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::SpawnFailed,
             message: format!("failed to hash managed stdio runtime executable: {error}"),
-        }
-    })?;
-    let mut command = Command::new(config.executable.as_path());
-    command
-        .args(config.args.iter())
-        .current_dir(config.cwd.as_path())
-        .env_clear()
-        .envs(config.env.iter())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        })?;
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_managed_stdio_process_ownership(&mut command);
     configure_background_child_suspended(&mut command);
     let child = command.spawn().map_err(|error| SandboxProcessRunError {

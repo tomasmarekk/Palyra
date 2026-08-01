@@ -24,7 +24,7 @@ use super::{
 use crate::application::mcp_runtime::{
     McpConnectRequest, McpConnectedSession, McpServerCallbackResponse, McpServerNotification,
     McpSessionConnector, McpSessionReader, McpSessionRequest, McpSessionTransportKind,
-    McpSessionWriter, McpTransportError, McpTransportEvent,
+    McpSessionWriter, McpTransportError, McpTransportEvent, McpTransportSession,
 };
 
 /// Request to establish and initialize a host-governed remote MCP session.
@@ -173,13 +173,13 @@ impl McpSessionConnector for McpHttpConnector {
     async fn connect(
         &self,
         request: &McpConnectRequest,
-    ) -> Result<McpConnectedSession, McpTransportError> {
+    ) -> Result<Box<dyn McpTransportSession>, McpTransportError> {
         if request.transport != McpSessionTransportKind::StreamableHttp {
             return Err(McpTransportError::InvalidRequest {
                 reason_code: "mcp.runtime.http.transport_mismatch",
             });
         }
-        self.inner.connect(request).await
+        Ok(Box::new(self.inner.connect(request).await?))
     }
 }
 

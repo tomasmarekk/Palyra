@@ -18,7 +18,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use palyra_common::{runtime_contracts::CleanupOutcome, runtime_preview::RuntimePreviewMode};
+use palyra_common::{
+    runtime_contracts::{
+        CleanupOutcome, RuntimeHandleDescriptorV1, RuntimeHandleKind, RuntimeHandleState,
+    },
+    runtime_preview::RuntimePreviewMode,
+};
 use palyra_egress_proxy::{EgressPolicyVerdict, EgressProxyPolicyService, EgressProxyRequest};
 use palyra_vault::{Vault, VaultRef};
 use reqwest::{
@@ -33,9 +38,13 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use ulid::Ulid;
 
 use crate::{
+    application::local_resource_governor::{
+        LocalResourceGovernor, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePriority,
+        ResourceServiceKind, ResourceUnitsV1,
+    },
     application::mcp_broker::{
         build_mcp_tool_catalog_snapshot, mcp_manifest_from_config, McpBroker, McpBrokerPolicy,
-        McpRuntimeSupervisor, McpRuntimeTransport, McpToolDiscoveryReport,
+        McpRuntimeSupervisor, McpRuntimeTransport, McpServerLifecycleState, McpToolDiscoveryReport,
         McpToolInvocationOutcome,
     },
     application::tool_registry::{
@@ -54,7 +63,9 @@ use crate::{
     },
     model_provider::{ProviderOutputContentPart, ProviderRequest},
     provider_leases::{LeasePriority, ProviderLeaseExecutionContext},
-    sandbox_runner::{spawn_managed_stdio_process, ManagedStdioProcess, ManagedStdioProcessConfig},
+    sandbox_runner::{
+        spawn_sandboxed_managed_stdio_process, ManagedStdioProcess, ManagedStdioProcessConfig,
+    },
     usage_governance::resolve_provider_binding_for_model,
 };
 
@@ -62,25 +73,27 @@ use super::{
     McpActorFactoryError, McpActorLaunchPlan, McpActorRegistry, McpActorRegistryDrainReport,
     McpActorRegistryError, McpActorRuntimeFactory, McpAuthorizedElicitationRequest,
     McpAuthorizedSamplingRequest, McpByteReader, McpByteWriter, McpCallbackBinding,
-    McpCatalogAuthority, McpCatalogEpochPin, McpConformanceReportV1, McpConnectorCatalogState,
-    McpConnectorLimits, McpConnectorPortError, McpDescriptorAdmissionError,
-    McpDescriptorAdmissionPolicy, McpDescriptorAttestation, McpDescriptorTrustVerifier,
-    McpElicitationExecutionPort, McpExternalToolDescriptor, McpHostCallbackPolicy,
-    McpHostExecutionError, McpHostPolicyCallbackService, McpHttpConnector, McpHttpConnectorConfig,
-    McpHttpSessionCloseRequest, McpHttpSessionEventRequest, McpHttpSessionExchangeRequest,
-    McpHttpSessionOpenRequest, McpHttpSessionPort, McpHttpSessionResponse, McpInitializeRequest,
-    McpLaunchedProcessSession, McpOAuthCredentialError, McpOAuthCredentialLease,
-    McpOAuthCredentialPort, McpOAuthRefreshCoordinator, McpOAuthRefreshRequest,
-    McpPolicyAuditAppendOutcome, McpPolicyAuditEventV1, McpPolicyAuditStore,
-    McpPolicyAuditStoreError, McpProcessCloseEvidence, McpProcessControl, McpProcessLaunchRequest,
-    McpProcessLauncher, McpProtocolCapabilities, McpReconnectPolicy, McpRuntimeEventV2,
-    McpRuntimeLifecycleState, McpRuntimeRecordStore, McpRuntimeStoreError,
-    McpSamplingExecutionPort, McpSamplingUsage, McpSecurityEvidenceStore,
-    McpSecurityEvidenceStoreError, McpServerRecordV2, McpSessionActorConfig, McpSessionConnector,
-    McpSessionTransportKind, McpSseConnector, McpSseConnectorConfig, McpStdioConnector,
-    McpStdioConnectorConfig, McpTrustedToolActivationState, McpTrustedToolApproval,
-    McpTrustedToolRecordV1, McpTrustedToolRegistry, McpTrustedToolRegistryError,
-    McpVerifiedDescriptorIdentity, TrustedExternalToolRegistrationRequest,
+    McpCatalogAuthority, McpCatalogEpochPin, McpConformanceReportV1, McpConnectRequest,
+    McpConnectorCatalogState, McpConnectorLimits, McpConnectorPortError,
+    McpDescriptorAdmissionError, McpDescriptorAdmissionPolicy, McpDescriptorAttestation,
+    McpDescriptorTrustVerifier, McpElicitationExecutionPort, McpExternalToolDescriptor,
+    McpHostCallbackPolicy, McpHostExecutionError, McpHostPolicyCallbackService, McpHttpConnector,
+    McpHttpConnectorConfig, McpHttpSessionCloseRequest, McpHttpSessionEventRequest,
+    McpHttpSessionExchangeRequest, McpHttpSessionOpenRequest, McpHttpSessionPort,
+    McpHttpSessionResponse, McpInitializeRequest, McpLaunchedProcessSession,
+    McpOAuthCredentialError, McpOAuthCredentialLease, McpOAuthCredentialPort,
+    McpOAuthRefreshCoordinator, McpOAuthRefreshRequest, McpPolicyAuditAppendOutcome,
+    McpPolicyAuditEventV1, McpPolicyAuditStore, McpPolicyAuditStoreError, McpProcessCloseEvidence,
+    McpProcessControl, McpProcessLaunchRequest, McpProcessLauncher, McpProtocolCapabilities,
+    McpReconnectPolicy, McpRuntimeEventV2, McpRuntimeLifecycleState, McpRuntimeRecordStore,
+    McpRuntimeStoreError, McpSamplingExecutionPort, McpSamplingUsage, McpSecurityEvidenceStore,
+    McpSecurityEvidenceStoreError, McpServerCallbackResponse, McpServerRecordV2,
+    McpSessionActorConfig, McpSessionConnector, McpSessionReader, McpSessionRequest,
+    McpSessionTransportKind, McpSessionWriter, McpSseConnector, McpSseConnectorConfig,
+    McpStdioConnector, McpStdioConnectorConfig, McpTransportError, McpTransportSession,
+    McpTrustedToolActivationState, McpTrustedToolApproval, McpTrustedToolRecordV1,
+    McpTrustedToolRegistry, McpTrustedToolRegistryError, McpVerifiedDescriptorIdentity,
+    TrustedExternalToolRegistrationRequest,
 };
 
 const IO_CHANNEL_CAPACITY: usize = 32;
@@ -89,8 +102,12 @@ const DEFAULT_PROCESS_LEASE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_RESOURCE_LEASE: Duration = Duration::from_secs(60);
 const DEFAULT_ELICITATION_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const MCP_SAMPLING_LEASE_WAIT_MS: u64 = 5_000;
+const MCP_BROKER_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const REMOTE_CONTENT_TYPE_JSON: &str = "application/json";
 const REMOTE_CONTENT_TYPE_SSE: &str = "text/event-stream";
@@ -147,6 +164,7 @@ impl McpProductionRuntime {
             configs: Arc::new(active_configs.clone()),
             startup_cwd,
             vault: Arc::clone(&runtime.vault),
+            runtime: Arc::downgrade(runtime),
         });
         let authorities = Arc::new(RwLock::new(BTreeMap::new()));
         let factory = Arc::new(ProductionActorFactory {
@@ -155,6 +173,7 @@ impl McpProductionRuntime {
             audit: store.clone(),
             vault: Arc::clone(&runtime.vault),
             runtime: Arc::downgrade(runtime),
+            resource_governor: runtime.mcp_resource_governor(),
             authorities: Arc::clone(&authorities),
         });
         let registry = Arc::new(
@@ -246,34 +265,124 @@ impl McpProductionRuntime {
         approval_id: String,
         callback_binding: McpCallbackBinding,
     ) -> Result<McpToolInvocationOutcome, crate::application::mcp_broker::McpBrokerError> {
-        let input = serde_json::from_slice(&input_json).map_err(|error| {
+        let input: Value = serde_json::from_slice(&input_json).map_err(|error| {
             crate::application::mcp_broker::McpBrokerError::new(
                 "mcp.tool_input_invalid",
                 format!("MCP tool input is not valid JSON: {error}"),
             )
         })?;
-        let production = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let mut broker = production.broker.lock().map_err(|_| {
+        let refresh_server_id = self.discovery_reports().into_iter().find_map(|report| {
+            report
+                .registry_entries
+                .iter()
+                .any(|entry| entry.name == tool_name)
+                .then_some(report.server_name)
+        });
+        let server_id = refresh_server_id.clone().ok_or_else(|| {
+            crate::application::mcp_broker::McpBrokerError::new(
+                "mcp.tool_unknown",
+                format!("MCP tool '{tool_name}' is not in the active catalog"),
+            )
+        })?;
+        self.registry
+            .wait_until_ready(server_id.as_str(), DEFAULT_HANDSHAKE_TIMEOUT)
+            .await
+            .map_err(|error| {
                 crate::application::mcp_broker::McpBrokerError::new(
-                    "mcp.broker_unavailable",
-                    "MCP broker lock is unavailable",
+                    "mcp.runtime.actor_not_ready",
+                    format!("persistent MCP actor did not become ready: {error}"),
                 )
             })?;
-            broker.invoke_namespaced_tool_with_managed_health(
-                runtime.as_ref(),
-                tool_name.as_str(),
-                input,
-                approval_id.as_str(),
-                callback_binding,
-                &production.transport,
-            )
-        })
-        .await
-        .map_err(|error| {
+        let production = Arc::clone(self);
+        let (result_sender, result_receiver) = oneshot::channel();
+        // The synchronous broker composes catalog, policy, projection, and
+        // transport frames. Keep that stack off Tokio's smaller shared
+        // blocking workers while preserving the same non-cancellable drain.
+        thread::Builder::new()
+            .name("palyra-mcp-broker".to_owned())
+            .stack_size(MCP_BROKER_WORKER_STACK_BYTES)
+            .spawn(move || {
+                let result = production
+                    .broker
+                    .lock()
+                    .map_err(|_| {
+                        crate::application::mcp_broker::McpBrokerError::new(
+                            "mcp.broker_unavailable",
+                            "MCP broker lock is unavailable",
+                        )
+                    })
+                    .and_then(|mut broker| {
+                        if broker.state(server_id.as_str())? != McpServerLifecycleState::Healthy {
+                            broker.start_server_with_managed_health(
+                                runtime.as_ref(),
+                                server_id.as_str(),
+                                &production.transport,
+                            )?;
+                            let report = broker.discover_tools_with_managed_health(
+                                runtime.as_ref(),
+                                server_id.as_str(),
+                                &production.transport,
+                            )?;
+                            production.replace_discovery_report(report).map_err(|error| {
+                                crate::application::mcp_broker::McpBrokerError::new(
+                                    "mcp.catalog_state_unavailable",
+                                    format!("MCP catalog repair could not be committed: {error}"),
+                                )
+                            })?;
+                        }
+                        let initial = broker.invoke_namespaced_tool_with_managed_health(
+                            runtime.as_ref(),
+                            tool_name.as_str(),
+                            input.clone(),
+                            approval_id.as_str(),
+                            callback_binding.clone(),
+                            &production.transport,
+                        );
+                        if initial
+                            .as_ref()
+                            .is_err_and(|error| error.reason_code == "mcp.tool_unknown")
+                        {
+                            if let Some(server_id) = refresh_server_id {
+                                // A model-visible discovery report proves this tool was admitted.
+                                // Repair one missing broker projection before any effect crossed
+                                // the transport boundary, then retry exactly once.
+                                let report = broker.discover_tools_with_managed_health(
+                                    runtime.as_ref(),
+                                    server_id.as_str(),
+                                    &production.transport,
+                                )?;
+                                production.replace_discovery_report(report).map_err(|error| {
+                                    crate::application::mcp_broker::McpBrokerError::new(
+                                        "mcp.catalog_state_unavailable",
+                                        format!(
+                                            "MCP catalog refresh could not be committed: {error}"
+                                        ),
+                                    )
+                                })?;
+                                return broker.invoke_namespaced_tool_with_managed_health(
+                                    runtime.as_ref(),
+                                    tool_name.as_str(),
+                                    input,
+                                    approval_id.as_str(),
+                                    callback_binding,
+                                    &production.transport,
+                                );
+                            }
+                        }
+                        initial
+                    });
+                let _ = result_sender.send(result);
+            })
+            .map_err(|error| {
+                crate::application::mcp_broker::McpBrokerError::new(
+                    "mcp.broker_worker_spawn_failed",
+                    format!("MCP broker worker could not start: {error}"),
+                )
+            })?;
+        result_receiver.await.map_err(|error| {
             crate::application::mcp_broker::McpBrokerError::new(
                 "mcp.broker_worker_failed",
-                format!("MCP broker worker failed: {error}"),
+                format!("MCP broker worker failed before reporting an outcome: {error}"),
             )
         })?
     }
@@ -458,18 +567,40 @@ impl McpProductionRuntime {
             let start_attempt = self.supervisor.lock().ok().and_then(|mut supervisor| {
                 supervisor.start_server(server.id.as_str(), now_unix_ms()).ok()
             });
-            let result = self.broker.lock().map_err(|_| ()).and_then(|mut broker| {
-                broker
-                    .start_server_with_managed_health(runtime, server.id.as_str(), &self.transport)
-                    .map_err(|_| ())?;
-                broker
-                    .discover_tools_with_managed_health(
-                        runtime,
-                        server.id.as_str(),
-                        &self.transport,
+            let readiness = self
+                .registry
+                .wait_until_ready(server.id.as_str(), DEFAULT_HANDSHAKE_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    crate::application::mcp_broker::McpBrokerError::new(
+                        "mcp.runtime.actor_not_ready",
+                        format!("persistent MCP actor did not become ready: {error}"),
                     )
-                    .map_err(|_| ())
-            });
+                });
+            let result = match readiness {
+                Ok(_) => self
+                    .broker
+                    .lock()
+                    .map_err(|_| {
+                        crate::application::mcp_broker::McpBrokerError::new(
+                            "mcp.broker_unavailable",
+                            "MCP broker lock is unavailable during catalog startup",
+                        )
+                    })
+                    .and_then(|mut broker| {
+                        broker.start_server_with_managed_health(
+                            runtime,
+                            server.id.as_str(),
+                            &self.transport,
+                        )?;
+                        broker.discover_tools_with_managed_health(
+                            runtime,
+                            server.id.as_str(),
+                            &self.transport,
+                        )
+                    }),
+                Err(error) => Err(error),
+            };
             if let Some(attempt) = start_attempt {
                 if let Ok(mut supervisor) = self.supervisor.lock() {
                     match &result {
@@ -480,14 +611,20 @@ impl McpProductionRuntime {
                                 now_unix_ms(),
                             );
                         }
-                        Err(()) => {
+                        Err(error) => {
                             let _ = supervisor.record_failure(
                                 server.id.as_str(),
                                 attempt.expected_generation,
-                                "mcp.runtime.start_failed",
-                                "persistent MCP actor did not become ready",
+                                error.reason_code.as_str(),
+                                error.message.as_str(),
                                 None,
                                 now_unix_ms(),
+                            );
+                            tracing::warn!(
+                                server_id = %server.id,
+                                reason_code = %error.reason_code,
+                                error = %error.message,
+                                "persistent MCP catalog startup failed"
                             );
                         }
                     }
@@ -800,8 +937,10 @@ async fn stop_for_reconfigure(
 ) -> Result<McpServerRecordV2, McpProductionRuntimeError> {
     if matches!(
         record.lifecycle,
-        McpRuntimeLifecycleState::Handshaking
+        McpRuntimeLifecycleState::Starting
+            | McpRuntimeLifecycleState::Handshaking
             | McpRuntimeLifecycleState::Ready
+            | McpRuntimeLifecycleState::Degraded
             | McpRuntimeLifecycleState::Reconnecting
     ) {
         let next = record.transition(
@@ -871,12 +1010,191 @@ fn trust_profile(trust: McpServerTrustLevel) -> &'static str {
     }
 }
 
+struct GovernedMcpConnector {
+    inner: Arc<dyn McpSessionConnector>,
+    governor: LocalResourceGovernor,
+    owner_id: String,
+    transport: McpSessionTransportKind,
+}
+
+#[async_trait]
+impl McpSessionConnector for GovernedMcpConnector {
+    async fn connect(
+        &self,
+        request: &McpConnectRequest,
+    ) -> Result<Box<dyn McpTransportSession>, McpTransportError> {
+        let governor = self.governor.clone();
+        let lease_request = ResourceLeaseRequestV1 {
+            owner_id: self.owner_id.clone(),
+            generation: request.runtime_generation,
+            service: ResourceServiceKind::Mcp,
+            priority: ResourcePriority::IdleService,
+            requested: mcp_transport_resources(self.transport),
+            duration: DEFAULT_RESOURCE_LEASE,
+        };
+        let lease = tokio::task::spawn_blocking(move || governor.acquire(lease_request))
+            .await
+            .map_err(|_| resource_transport_error("mcp.runtime.resource.acquire_worker_failed"))?
+            .map_err(|_| resource_transport_error("mcp.runtime.resource.capacity_denied"))?;
+
+        match self.inner.connect(request).await {
+            Ok(session) => Ok(Box::new(GovernedMcpTransportSession {
+                inner: Some(session),
+                governor: self.governor.clone(),
+                lease: Some(lease),
+            })),
+            Err(error) => {
+                release_resource_lease(self.governor.clone(), lease).await;
+                Err(error)
+            }
+        }
+    }
+}
+
+struct GovernedMcpTransportSession {
+    inner: Option<Box<dyn McpTransportSession>>,
+    governor: LocalResourceGovernor,
+    lease: Option<ResourceLeaseV1>,
+}
+
+impl McpTransportSession for GovernedMcpTransportSession {
+    fn into_parts(
+        mut self: Box<Self>,
+    ) -> (super::McpInitializeResult, Box<dyn McpSessionWriter>, Box<dyn McpSessionReader>) {
+        let inner = self.inner.take().expect("governed MCP session must own its transport");
+        let lease = self.lease.take().expect("governed MCP session must own its resource lease");
+        let (initialize, writer, reader) = inner.into_parts();
+        (
+            initialize,
+            Box::new(GovernedMcpSessionWriter {
+                inner: writer,
+                governor: self.governor.clone(),
+                lease: Some(lease),
+            }),
+            reader,
+        )
+    }
+}
+
+impl Drop for GovernedMcpTransportSession {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.governor.release(lease.lease_id.as_str(), lease.generation);
+        }
+    }
+}
+
+struct GovernedMcpSessionWriter {
+    inner: Box<dyn McpSessionWriter>,
+    governor: LocalResourceGovernor,
+    lease: Option<ResourceLeaseV1>,
+}
+
+impl GovernedMcpSessionWriter {
+    async fn renew(&mut self) -> Result<(), McpTransportError> {
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| resource_transport_error("mcp.runtime.resource.lease_released"))?;
+        let governor = self.governor.clone();
+        let lease_id = lease.lease_id.clone();
+        let generation = lease.generation;
+        let renewed = tokio::task::spawn_blocking(move || {
+            governor.renew(lease_id.as_str(), generation, DEFAULT_RESOURCE_LEASE)
+        })
+        .await
+        .map_err(|_| resource_transport_error("mcp.runtime.resource.renew_worker_failed"))?
+        .map_err(|_| resource_transport_error("mcp.runtime.resource.renew_denied"))?;
+        self.lease = Some(renewed);
+        Ok(())
+    }
+
+    async fn release(&mut self) -> Result<(), McpTransportError> {
+        let Some(lease) = self.lease.take() else {
+            return Ok(());
+        };
+        let governor = self.governor.clone();
+        tokio::task::spawn_blocking(move || {
+            governor.release(lease.lease_id.as_str(), lease.generation)
+        })
+        .await
+        .map_err(|_| resource_transport_error("mcp.runtime.resource.release_worker_failed"))?
+        .map(|_| ())
+        .map_err(|_| resource_transport_error("mcp.runtime.resource.release_failed"))
+    }
+}
+
+#[async_trait]
+impl McpSessionWriter for GovernedMcpSessionWriter {
+    async fn send_request(&mut self, request: McpSessionRequest) -> Result<(), McpTransportError> {
+        self.renew().await?;
+        self.inner.send_request(request).await
+    }
+
+    async fn send_callback_response(
+        &mut self,
+        response: McpServerCallbackResponse,
+    ) -> Result<(), McpTransportError> {
+        self.renew().await?;
+        self.inner.send_callback_response(response).await
+    }
+
+    async fn close(&mut self) -> Result<(), McpTransportError> {
+        let close = self.inner.close().await;
+        let release = self.release().await;
+        close.and(release)
+    }
+}
+
+impl Drop for GovernedMcpSessionWriter {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.governor.release(lease.lease_id.as_str(), lease.generation);
+        }
+    }
+}
+
+async fn release_resource_lease(governor: LocalResourceGovernor, lease: ResourceLeaseV1) {
+    let _ = tokio::task::spawn_blocking(move || {
+        governor.release(lease.lease_id.as_str(), lease.generation)
+    })
+    .await;
+}
+
+const fn mcp_transport_resources(transport: McpSessionTransportKind) -> ResourceUnitsV1 {
+    match transport {
+        McpSessionTransportKind::Stdio => ResourceUnitsV1 {
+            processes: 1,
+            memory_bytes: 256 * 1024 * 1024,
+            file_descriptors: 32,
+            sockets: 0,
+            spool_bytes: 2 * 1024 * 1024,
+            concurrency: 1,
+        },
+        McpSessionTransportKind::StreamableHttp | McpSessionTransportKind::ServerSentEvents => {
+            ResourceUnitsV1 {
+                processes: 0,
+                memory_bytes: 32 * 1024 * 1024,
+                file_descriptors: 8,
+                sockets: 2,
+                spool_bytes: 2 * 1024 * 1024,
+                concurrency: 1,
+            }
+        }
+    }
+}
+
+fn resource_transport_error(reason_code: &str) -> McpTransportError {
+    McpTransportError::Unavailable { reason_code: reason_code.to_owned() }
+}
+
 struct ProductionActorFactory {
     configs: BTreeMap<String, McpServerConfig>,
     launcher: Arc<McpStdioProcessLauncher>,
     audit: Arc<GatewayMcpStore>,
     vault: Arc<Vault>,
     runtime: Weak<GatewayRuntimeState>,
+    resource_governor: LocalResourceGovernor,
     authorities: Arc<RwLock<BTreeMap<String, Arc<McpCatalogAuthority>>>>,
 }
 
@@ -976,6 +1294,12 @@ impl McpActorRuntimeFactory for ProductionActorFactory {
                 )
             }
         };
+        let connector: Arc<dyn McpSessionConnector> = Arc::new(GovernedMcpConnector {
+            inner: connector,
+            governor: self.resource_governor.clone(),
+            owner_id: format!("mcp:{}", record.server_id),
+            transport: record.transport,
+        });
         let elicitation: Option<Arc<dyn McpElicitationExecutionPort>> =
             config.elicitation_enabled.then(|| {
                 Arc::new(McpProductionElicitationPort {
@@ -1038,6 +1362,8 @@ fn actor_config(record: McpServerRecordV2, config: &McpServerConfig) -> McpSessi
         handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         callback_timeout: Duration::from_secs(15),
         transport_operation_timeout: Duration::from_secs(10),
+        keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+        keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
         default_drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         reconnect_policy: McpReconnectPolicy::default(),
     }
@@ -2275,6 +2601,7 @@ struct McpStdioProcessLauncher {
     configs: Arc<BTreeMap<String, McpServerConfig>>,
     startup_cwd: PathBuf,
     vault: Arc<Vault>,
+    runtime: Weak<GatewayRuntimeState>,
 }
 
 #[async_trait]
@@ -2295,6 +2622,8 @@ impl McpProcessLauncher for McpStdioProcessLauncher {
         let executable = resolve_executable(command[0].as_str(), &self.startup_cwd)
             .ok_or_else(|| port_error("mcp.runtime.stdio.executable_unresolved"))?;
         let env = resolve_stdio_environment(config, &self.vault)?;
+        let runtime =
+            self.runtime.upgrade().ok_or_else(|| port_error("mcp.runtime.gateway_dropped"))?;
         let process_config = ManagedStdioProcessConfig {
             executable,
             args: command.iter().skip(1).cloned().collect(),
@@ -2303,23 +2632,80 @@ impl McpProcessLauncher for McpStdioProcessLauncher {
             generation: request.runtime_generation,
             lease_duration: DEFAULT_PROCESS_LEASE,
         };
-        let process =
-            tokio::task::spawn_blocking(move || spawn_managed_stdio_process(&process_config))
-                .await
-                .map_err(|_| port_error("mcp.runtime.stdio.launch_worker_failed"))?
-                .map_err(|_| port_error("mcp.runtime.stdio.launch_failed"))?;
-        launched_stdio_session(process, request.max_chunk_bytes)
+        let process_runner = runtime.config.tool_call.process_runner.clone();
+        let configured_command = command[0].clone();
+        let process = tokio::task::spawn_blocking(move || {
+            spawn_sandboxed_managed_stdio_process(
+                &process_runner,
+                configured_command.as_str(),
+                &process_config,
+            )
+        })
+        .await
+        .map_err(|_| port_error("mcp.runtime.stdio.launch_worker_failed"))?
+        .map_err(|_| port_error("mcp.runtime.stdio.launch_failed"))?;
+        let descriptor = mcp_process_descriptor(
+            process.lease(),
+            request.launch_profile_id.as_str(),
+            now_unix_ms(),
+        )?;
+        if runtime
+            .journal_store
+            .register_process_handle_and_lease(&descriptor, process.lease())
+            .is_err()
+        {
+            let _ = tokio::task::spawn_blocking(move || process.cleanup(true)).await;
+            return Err(port_error("mcp.runtime.stdio.process_registration_failed"));
+        }
+        launched_stdio_session(
+            process,
+            request.max_chunk_bytes,
+            Arc::downgrade(&runtime),
+            descriptor,
+        )
     }
+}
+
+fn mcp_process_descriptor(
+    lease: &palyra_common::runtime_contracts::ProcessLeaseV1,
+    server_id: &str,
+    now: i64,
+) -> Result<RuntimeHandleDescriptorV1, McpConnectorPortError> {
+    let descriptor = RuntimeHandleDescriptorV1 {
+        schema_version: lease.schema_version,
+        instance_id: lease.instance_id.clone(),
+        kind: RuntimeHandleKind::Process,
+        session_id: None,
+        run_id: None,
+        generation: lease.generation,
+        owner: format!("mcp:{server_id}"),
+        state: RuntimeHandleState::Running,
+        resume_metadata_json: Some(
+            json!({
+                "schema_version": 1,
+                "pid": lease.pid,
+                "server_id_sha256": hex::encode(Sha256::digest(server_id.as_bytes())),
+                "transport": "stdio",
+            })
+            .to_string(),
+        ),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    descriptor
+        .validate()
+        .map_err(|_| port_error("mcp.runtime.stdio.process_descriptor_invalid"))?;
+    Ok(descriptor)
 }
 
 fn resolve_stdio_environment(
     config: &McpServerConfig,
     vault: &Vault,
 ) -> Result<BTreeMap<String, String>, McpConnectorPortError> {
-    let mut env = ["PATH", "Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "TMP", "TEMP"]
-        .into_iter()
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_owned(), value)))
-        .collect::<BTreeMap<_, _>>();
+    // The sandbox runner supplies its own minimal PATH, locale, and temporary-directory
+    // environment. Inheriting host process variables here would either be rejected by its
+    // reserved-key guard or let a configured server influence the trusted launch baseline.
+    let mut env = BTreeMap::new();
     for binding in &config.env_vault_refs {
         let reference = VaultRef::parse(binding.vault_ref.trim_start_matches("vault://"))
             .map_err(|_| port_error("mcp.runtime.stdio.vault_ref_invalid"))?;
@@ -2348,22 +2734,36 @@ fn resolve_executable(command: &str, startup_cwd: &Path) -> Option<PathBuf> {
 fn launched_stdio_session(
     mut process: ManagedStdioProcess,
     max_chunk_bytes: usize,
+    runtime: Weak<GatewayRuntimeState>,
+    descriptor: RuntimeHandleDescriptorV1,
 ) -> Result<McpLaunchedProcessSession, McpConnectorPortError> {
-    let stdin =
-        process.take_stdin().map_err(|_| port_error("mcp.runtime.stdio.stdin_unavailable"))?;
-    let stdout =
-        process.take_stdout().map_err(|_| port_error("mcp.runtime.stdio.stdout_unavailable"))?;
-    let stderr =
-        process.take_stderr().map_err(|_| port_error("mcp.runtime.stdio.stderr_unavailable"))?;
+    let io = (|| {
+        let stdin =
+            process.take_stdin().map_err(|_| port_error("mcp.runtime.stdio.stdin_unavailable"))?;
+        let stdout = process
+            .take_stdout()
+            .map_err(|_| port_error("mcp.runtime.stdio.stdout_unavailable"))?;
+        let stderr = process
+            .take_stderr()
+            .map_err(|_| port_error("mcp.runtime.stdio.stderr_unavailable"))?;
+        let writer = spawn_byte_writer(stdin)?;
+        let stdout = spawn_byte_reader(stdout, max_chunk_bytes, "stdout")?;
+        let stderr = spawn_byte_reader(stderr, max_chunk_bytes, "stderr")?;
+        Ok::<_, McpConnectorPortError>((writer, stdout, stderr))
+    })();
+    let (writer, stdout, stderr) = match io {
+        Ok(io) => io,
+        Err(error) => {
+            let _ = cleanup_registered_mcp_process(process, &runtime, &descriptor);
+            return Err(error);
+        }
+    };
     let process = Arc::new(Mutex::new(Some(process)));
-    let writer = spawn_byte_writer(stdin)?;
-    let stdout = spawn_byte_reader(stdout, max_chunk_bytes, "stdout")?;
-    let stderr = spawn_byte_reader(stderr, max_chunk_bytes, "stderr")?;
     Ok(McpLaunchedProcessSession::new(
         Box::new(writer),
         Box::new(stdout),
         Some(Box::new(stderr)),
-        Box::new(OwnedProcessControl { process }),
+        Box::new(OwnedProcessControl { process, runtime, descriptor }),
     ))
 }
 
@@ -2504,6 +2904,8 @@ impl McpByteReader for ThreadByteReader {
 
 struct OwnedProcessControl {
     process: Arc<Mutex<Option<ManagedStdioProcess>>>,
+    runtime: Weak<GatewayRuntimeState>,
+    descriptor: RuntimeHandleDescriptorV1,
 }
 
 #[async_trait]
@@ -2521,16 +2923,46 @@ impl McpProcessControl for OwnedProcessControl {
                 reason_code: "mcp.runtime.stdio.already_closed".to_owned(),
             });
         };
-        let report = tokio::task::spawn_blocking(move || process.cleanup(true))
-            .await
-            .map_err(|_| port_error("mcp.runtime.stdio.cleanup_worker_failed"))?;
-        let process_exited = report.outcome == CleanupOutcome::Completed;
-        Ok(McpProcessCloseEvidence {
-            process_exited,
-            descendants_remaining: u32::from(!process_exited),
-            reason_code: report.reason_code,
+        let runtime = self.runtime.clone();
+        let descriptor = self.descriptor.clone();
+        tokio::task::spawn_blocking(move || {
+            cleanup_registered_mcp_process(process, &runtime, &descriptor)
         })
+        .await
+        .map_err(|_| port_error("mcp.runtime.stdio.cleanup_worker_failed"))?
     }
+}
+
+impl Drop for OwnedProcessControl {
+    fn drop(&mut self) {
+        let process = self.process.lock().ok().and_then(|mut process| process.take());
+        if let Some(process) = process {
+            let _ = cleanup_registered_mcp_process(process, &self.runtime, &self.descriptor);
+        }
+    }
+}
+
+fn cleanup_registered_mcp_process(
+    process: ManagedStdioProcess,
+    runtime: &Weak<GatewayRuntimeState>,
+    descriptor: &RuntimeHandleDescriptorV1,
+) -> Result<McpProcessCloseEvidence, McpConnectorPortError> {
+    let report = process.cleanup(true);
+    let process_exited = report.outcome == CleanupOutcome::Completed;
+    let mut terminal = descriptor.clone();
+    terminal.state =
+        if process_exited { RuntimeHandleState::Closed } else { RuntimeHandleState::Orphaned };
+    terminal.updated_at_unix_ms = report.completed_at_unix_ms.max(terminal.created_at_unix_ms);
+    let runtime = runtime.upgrade().ok_or_else(|| port_error("mcp.runtime.gateway_dropped"))?;
+    runtime
+        .journal_store
+        .finalize_process_cleanup(&terminal, &report)
+        .map_err(|_| port_error("mcp.runtime.stdio.cleanup_persistence_failed"))?;
+    Ok(McpProcessCloseEvidence {
+        process_exited,
+        descendants_remaining: u32::from(!process_exited),
+        reason_code: report.reason_code,
+    })
 }
 
 fn port_error(reason_code: &str) -> McpConnectorPortError {
@@ -2555,6 +2987,19 @@ mod tests {
     };
 
     use super::*;
+    use crate::application::local_resource_governor::LocalResourceGovernorConfig;
+
+    struct UnavailableConnector;
+
+    #[async_trait]
+    impl McpSessionConnector for UnavailableConnector {
+        async fn connect(
+            &self,
+            _request: &McpConnectRequest,
+        ) -> Result<Box<dyn McpTransportSession>, McpTransportError> {
+            Err(resource_transport_error("mcp.runtime.test.connector_unavailable"))
+        }
+    }
 
     fn remote_config(transport: McpServerTransport, url: String) -> McpServerConfig {
         McpServerConfig {
@@ -2596,6 +3041,32 @@ mod tests {
             oauth_request_sequence: AtomicU64::new(0),
             sessions: AsyncMutex::new(BTreeMap::new()),
         }
+    }
+
+    #[test]
+    fn stdio_environment_contains_only_vault_bindings() {
+        let vault = crate::gateway::build_test_vault();
+        let secret_ref = VaultRef::parse("global/mcp_stdio_token").expect("vault ref parses");
+        vault
+            .put_secret(&secret_ref.scope, secret_ref.key.as_str(), b"test-stdio-token")
+            .expect("test token is stored");
+        let mut config =
+            remote_config(McpServerTransport::Stdio, "http://127.0.0.1/unused".to_owned());
+        config.command = Some(vec!["node".to_owned(), "mcp-server.mjs".to_owned()]);
+        config.env_vault_refs = vec![crate::config::McpServerEnvVaultRef {
+            name: "MCP_STDIO_TOKEN".to_owned(),
+            vault_ref: "global/mcp_stdio_token".to_owned(),
+        }];
+
+        let environment =
+            resolve_stdio_environment(&config, vault.as_ref()).expect("vault binding resolves");
+
+        assert_eq!(environment.len(), 1);
+        assert_eq!(
+            environment.get("MCP_STDIO_TOKEN").map(String::as_str),
+            Some("test-stdio-token")
+        );
+        assert!(!environment.contains_key("PATH"));
     }
 
     fn open_request() -> McpHttpSessionOpenRequest {
@@ -2812,5 +3283,54 @@ mod tests {
             None,
             "approval must not synthesize caller-requested structured data"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_connection_releases_exact_resource_lease() {
+        let registry_path =
+            std::env::temp_dir().join(format!("palyra-mcp-resource-{}.json", Ulid::new()));
+        let limit = ResourceUnitsV1 {
+            processes: 2,
+            memory_bytes: 512 * 1024 * 1024,
+            file_descriptors: 64,
+            sockets: 4,
+            spool_bytes: 8 * 1024 * 1024,
+            concurrency: 2,
+        };
+        let governor = LocalResourceGovernor::open(LocalResourceGovernorConfig {
+            registry_path: registry_path.clone(),
+            global_limit: limit,
+            per_owner_limit: limit,
+            max_records: 16,
+        })
+        .expect("resource governor opens");
+        let connector = GovernedMcpConnector {
+            inner: Arc::new(UnavailableConnector),
+            governor: governor.clone(),
+            owner_id: "mcp:test-server".to_owned(),
+            transport: McpSessionTransportKind::Stdio,
+        };
+        let request = McpConnectRequest {
+            server_id: "test-server".to_owned(),
+            transport: McpSessionTransportKind::Stdio,
+            runtime_generation: 1,
+            handshake_timeout_ms: 1_000,
+            initialize: McpInitializeRequest {
+                client_name: "palyra".to_owned(),
+                client_version: "0.1.0".to_owned(),
+                supported_protocol_versions: vec![MCP_PROTOCOL_VERSION.to_owned()],
+                capabilities: McpProtocolCapabilities::default(),
+            },
+        };
+
+        let error = match connector.connect(&request).await {
+            Ok(_) => panic!("connection should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason_code(), "mcp.runtime.test.connector_unavailable");
+        let snapshot = governor.snapshot();
+        assert_eq!(snapshot.active_leases, 0);
+        assert_eq!(snapshot.used, ResourceUnitsV1::default());
+        let _ = std::fs::remove_file(registry_path);
     }
 }

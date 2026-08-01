@@ -10,8 +10,8 @@ use super::{
     McpConnectorCatalogState, McpConnectorEvidenceHandle, McpConnectorLimits,
 };
 use crate::application::mcp_runtime::{
-    McpConnectRequest, McpConnectedSession, McpSessionConnector, McpSessionTransportKind,
-    McpTransportError,
+    McpConnectRequest, McpSessionConnector, McpSessionTransportKind, McpTransportError,
+    McpTransportSession,
 };
 
 /// Configuration for an SSE MCP session with a paired request endpoint.
@@ -65,13 +65,13 @@ impl McpSessionConnector for McpSseConnector {
     async fn connect(
         &self,
         request: &McpConnectRequest,
-    ) -> Result<McpConnectedSession, McpTransportError> {
+    ) -> Result<Box<dyn McpTransportSession>, McpTransportError> {
         if request.transport != McpSessionTransportKind::ServerSentEvents {
             return Err(McpTransportError::InvalidRequest {
                 reason_code: "mcp.runtime.sse.transport_mismatch",
             });
         }
-        self.inner.connect(request).await
+        Ok(Box::new(self.inner.connect(request).await?))
     }
 }
 

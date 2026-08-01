@@ -29,10 +29,14 @@ const DEFAULT_MAX_SCHEMA_DEPTH: usize = 64;
 pub enum McpRuntimeLifecycleState {
     /// Configuration is valid but no runtime generation is active.
     Configured,
+    /// The actor owns startup admission but has not opened the transport yet.
+    Starting,
     /// A new generation is connecting and negotiating MCP initialization.
     Handshaking,
     /// A persistent session is ready to accept requests.
     Ready,
+    /// The active transport failed and its generation is unavailable.
+    Degraded,
     /// The active generation failed and is waiting for bounded reconnect.
     Reconnecting,
     /// The actor is draining accepted requests.
@@ -51,21 +55,41 @@ impl McpRuntimeLifecycleState {
             return true;
         }
         match self {
-            Self::Configured => matches!(next, Self::Handshaking | Self::Disabled),
+            Self::Configured => matches!(next, Self::Starting | Self::Disabled),
+            Self::Starting => {
+                matches!(
+                    next,
+                    Self::Handshaking
+                        | Self::Degraded
+                        | Self::Reconnecting
+                        | Self::Stopping
+                        | Self::Quarantined
+                )
+            }
             Self::Handshaking => {
                 matches!(
                     next,
-                    Self::Ready | Self::Reconnecting | Self::Stopping | Self::Quarantined
+                    Self::Ready
+                        | Self::Degraded
+                        | Self::Reconnecting
+                        | Self::Stopping
+                        | Self::Quarantined
                 )
             }
             Self::Ready => {
+                matches!(
+                    next,
+                    Self::Degraded | Self::Reconnecting | Self::Stopping | Self::Quarantined
+                )
+            }
+            Self::Degraded => {
                 matches!(next, Self::Reconnecting | Self::Stopping | Self::Quarantined)
             }
             Self::Reconnecting => {
-                matches!(next, Self::Handshaking | Self::Stopping | Self::Quarantined)
+                matches!(next, Self::Starting | Self::Stopping | Self::Quarantined)
             }
             Self::Stopping => matches!(next, Self::Stopped | Self::Quarantined),
-            Self::Stopped => matches!(next, Self::Handshaking | Self::Disabled),
+            Self::Stopped => matches!(next, Self::Starting | Self::Disabled),
             Self::Quarantined => {
                 matches!(next, Self::Configured | Self::Stopping | Self::Disabled)
             }
@@ -174,6 +198,18 @@ impl McpServerRecordV2 {
         Ok(())
     }
 
+    /// Plans actor-owned startup admission before opening the transport.
+    ///
+    /// # Errors
+    /// Returns an error when the lifecycle transition is illegal.
+    pub fn begin_start(&self, now_unix_ms: i64) -> Result<Self, McpRuntimeSupervisorError> {
+        self.transition(
+            McpRuntimeLifecycleState::Starting,
+            now_unix_ms,
+            "mcp.runtime.session.starting",
+        )
+    }
+
     /// Plans a new handshaking generation.
     ///
     /// # Errors
@@ -193,6 +229,18 @@ impl McpServerRecordV2 {
         next.next_retry_at_unix_ms = None;
         next.validate()?;
         Ok(next)
+    }
+
+    /// Records an unavailable transport generation before reconnect planning.
+    ///
+    /// # Errors
+    /// Returns an error when the lifecycle transition is illegal.
+    pub fn mark_degraded(
+        &self,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> Result<Self, McpRuntimeSupervisorError> {
+        self.transition(McpRuntimeLifecycleState::Degraded, now_unix_ms, reason_code)
     }
 
     /// Plans a ready projection after successful initialization.
@@ -329,6 +377,20 @@ impl McpServerRecordV2 {
         reason_code: &str,
         now_unix_ms: i64,
     ) -> Result<Self, McpRuntimeSupervisorError> {
+        Ok(self.plan_reconnect(policy, reason_code, now_unix_ms)?.record)
+    }
+
+    /// Plans the bounded reconnect or terminal quarantine outcome after a
+    /// degraded transition has been committed.
+    ///
+    /// # Errors
+    /// Returns an error for invalid policy, reason, state, time, or counters.
+    pub fn plan_reconnect(
+        &self,
+        policy: &McpReconnectPolicy,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> Result<ReconnectOutcome, McpRuntimeSupervisorError> {
         policy.validate()?;
         if !valid_reason_code(reason_code) {
             return Err(McpRuntimeSupervisorError::InvalidReasonCode);
@@ -360,7 +422,13 @@ impl McpServerRecordV2 {
             next.quarantine_reason_code = None;
         }
         next.validate()?;
-        Ok(next)
+        Ok(ReconnectOutcome {
+            retry_at_unix_ms: next.next_retry_at_unix_ms,
+            consecutive_failures: failures,
+            quarantined,
+            reason_code: reason_code.to_owned(),
+            record: next,
+        })
     }
 
     /// Plans an immediate reconnect after daemon restart without counting it as a failure.
@@ -423,6 +491,22 @@ impl McpServerRecordV2 {
         next.updated_at_unix_ms = now_unix_ms;
         Ok(next)
     }
+}
+
+/// Explicit result of reconnect planning after one degraded generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconnectOutcome {
+    /// Durable record that must be committed atomically.
+    pub record: McpServerRecordV2,
+    /// Stable sanitized transport or policy reason.
+    pub reason_code: String,
+    /// Number of consecutive failures represented by this outcome.
+    pub consecutive_failures: u32,
+    /// Earliest retry time, absent when the server was quarantined.
+    pub retry_at_unix_ms: Option<i64>,
+    /// Whether the reconnect budget was exhausted.
+    pub quarantined: bool,
 }
 
 /// One durable lifecycle or catalog transition.
@@ -1197,7 +1281,11 @@ mod tests {
 
     #[test]
     fn catalog_epoch_advances_only_for_changed_catalog() {
-        let handshaking = configured_record().begin_handshake(2).expect("handshake starts");
+        let handshaking = configured_record()
+            .begin_start(2)
+            .expect("startup begins")
+            .begin_handshake(2)
+            .expect("handshake starts");
         let ready = handshaking.mark_ready(DIGEST_A.to_owned(), 3).expect("session is ready");
         assert_eq!(ready.catalog_epoch, 1);
 
@@ -1216,14 +1304,22 @@ mod tests {
     fn repeated_failures_quarantine_without_another_retry() {
         let policy =
             McpReconnectPolicy { quarantine_after_failures: 2, ..McpReconnectPolicy::default() };
-        let handshaking = configured_record().begin_handshake(2).expect("handshake starts");
+        let handshaking = configured_record()
+            .begin_start(2)
+            .expect("startup begins")
+            .begin_handshake(2)
+            .expect("handshake starts");
         let retry = handshaking
             .mark_failure(&policy, "mcp.runtime.transport.closed", 3)
             .expect("first failure retries");
         assert_eq!(retry.lifecycle, McpRuntimeLifecycleState::Reconnecting);
         assert!(retry.next_retry_at_unix_ms.is_some());
 
-        let retrying = retry.begin_handshake(4_000).expect("retry starts");
+        let retrying = retry
+            .begin_start(4_000)
+            .expect("retry startup begins")
+            .begin_handshake(4_000)
+            .expect("retry starts");
         let quarantined = retrying
             .mark_failure(&policy, "mcp.runtime.transport.closed", 4_001)
             .expect("second failure quarantines");
@@ -1237,7 +1333,11 @@ mod tests {
 
     #[test]
     fn restart_reconnect_does_not_consume_failure_budget() {
-        let handshaking = configured_record().begin_handshake(2).expect("handshake starts");
+        let handshaking = configured_record()
+            .begin_start(2)
+            .expect("startup begins")
+            .begin_handshake(2)
+            .expect("handshake starts");
         let ready = handshaking.mark_ready(DIGEST_A.to_owned(), 3).expect("session is ready");
         let recovered = ready.recover_after_restart(4).expect("restart reconnect is planned");
 

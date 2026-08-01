@@ -549,6 +549,8 @@ mod tests {
             1_000,
         )
         .expect("configured record should validate")
+        .begin_start(1_001)
+        .expect("startup should validate")
         .begin_handshake(1_001)
         .expect("handshake should validate")
         .mark_ready("a".repeat(64), 1_002)

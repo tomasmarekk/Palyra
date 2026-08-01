@@ -362,6 +362,8 @@ mod tests {
             1_000,
         )
         .expect("configured record should validate")
+        .begin_start(1_001)
+        .expect("startup should validate")
         .begin_handshake(1_001)
         .expect("handshake should validate");
         authority.apply_committed(&record).expect("authority should apply");

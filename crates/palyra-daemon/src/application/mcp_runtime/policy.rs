@@ -919,6 +919,8 @@ mod tests {
         )
         .expect("configured record should validate");
         let ready = configured
+            .begin_start(1_001)
+            .expect("startup should validate")
             .begin_handshake(1_001)
             .expect("handshake should validate")
             .mark_ready("a".repeat(64), 1_002)

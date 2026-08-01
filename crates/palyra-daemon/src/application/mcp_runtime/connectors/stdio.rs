@@ -21,7 +21,7 @@ use super::{
 use crate::application::mcp_runtime::{
     McpConnectRequest, McpConnectedSession, McpServerCallbackResponse, McpServerNotification,
     McpSessionConnector, McpSessionReader, McpSessionRequest, McpSessionTransportKind,
-    McpSessionWriter, McpTransportError, McpTransportEvent,
+    McpSessionWriter, McpTransportError, McpTransportEvent, McpTransportSession,
 };
 
 const MAX_HANDSHAKE_SIDE_FRAMES: usize = 64;
@@ -167,7 +167,7 @@ impl McpSessionConnector for McpStdioConnector {
     async fn connect(
         &self,
         request: &McpConnectRequest,
-    ) -> Result<McpConnectedSession, McpTransportError> {
+    ) -> Result<Box<dyn McpTransportSession>, McpTransportError> {
         request.validate()?;
         if request.transport != McpSessionTransportKind::Stdio {
             return Err(McpTransportError::InvalidRequest {
@@ -265,7 +265,11 @@ impl McpSessionConnector for McpStdioConnector {
             catalog: Arc::clone(&self.catalog),
             evidence: self.evidence.clone(),
         };
-        McpConnectedSession::new(initialize_result, Box::new(writer), Box::new(reader))
+        Ok(Box::new(McpConnectedSession::new(
+            initialize_result,
+            Box::new(writer),
+            Box::new(reader),
+        )?))
     }
 }
 
