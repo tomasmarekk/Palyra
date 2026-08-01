@@ -155,7 +155,7 @@ use startup::{
 #[cfg(test)]
 use workspace_diagnostics::load_failure_workspace_projection_with_hook;
 
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 // Unix cleanup can require several full process-table and marker scans before proving inactivity.
