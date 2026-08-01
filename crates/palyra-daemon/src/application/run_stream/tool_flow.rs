@@ -88,7 +88,7 @@ use crate::{
     },
     gateway::{
         await_tool_approval_response, best_effort_mark_approval_error,
-        build_and_ingest_tool_result_memory_summary,
+        build_and_ingest_tool_result_memory_summary, execute_persistent_mcp_tool,
         execute_tool_with_runtime_dispatch_with_cancellation_and_progress,
         record_tool_execution_outcome_metrics, shared_tool_budget, shared_tool_budget_remaining,
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
@@ -335,6 +335,8 @@ struct PreparedToolRuntimeOutcome {
     side_effect_fence: Option<ActiveToolSideEffectFence>,
     post_execution_error: Option<Status>,
 }
+
+type BoxedToolDispatchTask = Pin<Box<dyn Future<Output = ToolExecutionOutcome> + Send + 'static>>;
 
 #[derive(Debug)]
 enum ToolOutcomeFinalizationError {
@@ -2773,12 +2775,30 @@ async fn execute_allowed_prepared_tool_runtime(
         process_cancellation.clone().unwrap_or_else(|| cancellation.context().clone());
     let execution_cancellation_requested = Arc::clone(&cancellation_requested);
     let child_task_parent_context = flow_control.root_context().clone();
-    // Dispatch runs from a Tokio scheduling root. This bounds the synchronous
-    // poll chain; JoinSet drop also prevents detached execution if its owner
-    // disappears outside the normal cancellation protocol.
+    // Keep MCP outside the monolithic common dispatcher future, then erase
+    // either concrete task before it crosses Tokio's generic spawn boundary.
     let mut execution_tasks = JoinSet::new();
-    execution_tasks.spawn(
-        async move {
+    let execution_future: BoxedToolDispatchTask = if execution_tool_name.starts_with("mcp.") {
+        Box::pin(async move {
+            execute_persistent_mcp_tool(
+                &execution_runtime_state,
+                ToolRuntimeExecutionContext {
+                    principal: execution_principal.as_str(),
+                    device_id: execution_device_id.as_str(),
+                    channel: execution_channel.as_deref(),
+                    session_id: execution_session_id.as_str(),
+                    run_id: execution_run_id.as_str(),
+                    execution_backend,
+                    backend_reason_code: execution_backend_reason.as_str(),
+                },
+                execution_proposal_id.as_str(),
+                execution_tool_name.as_str(),
+                execution_input_json.as_slice(),
+            )
+            .await
+        })
+    } else {
+        Box::pin(async move {
             execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
                 &execution_runtime_state,
                 ToolRuntimeExecutionContext {
@@ -2802,9 +2822,9 @@ async fn execute_allowed_prepared_tool_runtime(
                 },
             )
             .await
-        }
-        .instrument(tool_span),
-    );
+        })
+    };
+    execution_tasks.spawn(execution_future.instrument(tool_span));
     let mut post_start_error = None;
     // The task handle is polled in place, so losing a select race to the
     // cancel poll never loses execution progress.
@@ -4930,6 +4950,7 @@ mod tests {
     use tonic::{Code, Status};
 
     const MAX_PREPARED_TOOL_RUNTIME_WRAPPER_BYTES: usize = 1024;
+    const MAX_BOXED_TOOL_DISPATCH_TASK_BYTES: usize = 128;
 
     fn start_backpressure_test_run(state: &GatewayRuntimeState, session_id: &str, run_id: &str) {
         start_test_orchestrator_run(state, session_id, run_id);
@@ -5121,6 +5142,18 @@ mod tests {
         assert!(
             future_bytes <= MAX_PREPARED_TOOL_RUNTIME_WRAPPER_BYTES,
             "prepared tool runtime wrapper is {future_bytes} bytes; keep the allowed execution state behind a pinned heap future"
+        );
+    }
+
+    #[test]
+    fn spawned_tool_dispatch_task_stays_pointer_bounded() {
+        let future: super::BoxedToolDispatchTask =
+            Box::pin(async { tool_outcome_for_replay_test(true, json!({"ok": true}), "", false) });
+        let future_bytes = std::mem::size_of_val(&future);
+
+        assert!(
+            future_bytes <= MAX_BOXED_TOOL_DISPATCH_TASK_BYTES,
+            "spawned tool dispatch task is {future_bytes} bytes; erase the concrete task before instrumenting and spawning it"
         );
     }
 

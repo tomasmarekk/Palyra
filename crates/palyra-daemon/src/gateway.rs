@@ -1570,7 +1570,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     }
 }
 
-async fn execute_persistent_mcp_tool(
+pub(crate) async fn execute_persistent_mcp_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     proposal_id: &str,
