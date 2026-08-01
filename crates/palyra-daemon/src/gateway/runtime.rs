@@ -14722,6 +14722,32 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("work graph side-effect worker panicked"))?
     }
 
+    fn classify_work_runtime_liveness(
+        worker_id: &str,
+        runtime_instance_id: &str,
+        process_start_token: &str,
+        run: Option<(&str, &str)>,
+    ) -> WorkRuntimeLiveness {
+        let expected_runtime_instance_id = format!("model-tool:{worker_id}");
+        let claim_identity_matches =
+            runtime_instance_id == expected_runtime_instance_id && process_start_token == worker_id;
+        let run_identity_matches = run.is_none_or(|(run_id, _)| run_id == worker_id);
+        if !claim_identity_matches || !run_identity_matches {
+            return WorkRuntimeLiveness::ProcessIdentityReused;
+        }
+
+        match run {
+            Some((_, state))
+                if crate::orchestrator::RunLifecycleState::from_str(state)
+                    .is_some_and(crate::orchestrator::RunLifecycleState::is_terminal) =>
+            {
+                WorkRuntimeLiveness::Dead
+            }
+            Some(_) => WorkRuntimeLiveness::Alive,
+            None => WorkRuntimeLiveness::Dead,
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn reconcile_stale_work_item_blocking(
         &self,
@@ -14747,16 +14773,12 @@ impl GatewayRuntimeState {
             self.journal_store.orchestrator_run_status_snapshot(claim.worker_id.as_str()).map_err(
                 |error| map_orchestrator_store_error("load work item worker liveness", error),
             )?;
-        let liveness = match run {
-            Some(run)
-                if crate::orchestrator::RunLifecycleState::from_str(run.state.as_str())
-                    .is_some_and(crate::orchestrator::RunLifecycleState::is_terminal) =>
-            {
-                WorkRuntimeLiveness::Dead
-            }
-            Some(_) => WorkRuntimeLiveness::Alive,
-            None => WorkRuntimeLiveness::Dead,
-        };
+        let liveness = Self::classify_work_runtime_liveness(
+            claim.worker_id.as_str(),
+            claim.runtime_instance_id.as_str(),
+            claim.process_start_token.as_str(),
+            run.as_ref().map(|run| (run.run_id.as_str(), run.state.as_str())),
+        );
         let resource_lease =
             claim.resource_lease_id.as_ref().map(|lease_id| (lease_id.clone(), claim.generation));
         let decision = self
@@ -20776,6 +20798,7 @@ pub(crate) mod tests {
     use crate::application::run_stream::flow_control::{
         RunInterruptLatencyObservation, RunInterruptPhase, RUN_INTERRUPT_LATENCY_MAX_MS,
     };
+    use crate::domain::work_graph::WorkRuntimeLiveness;
     use crate::gateway::RUN_PARAMETER_DELTA_CACHE_CAPACITY;
     use crate::journal::{
         CanvasStatePatchRecord, JournalConfig, JournalStore, OrchestratorRunStartRequest,
@@ -20829,6 +20852,63 @@ pub(crate) mod tests {
     };
     use tokio::sync::{mpsc, Notify};
     use tonic::Code;
+
+    #[test]
+    fn work_runtime_liveness_keeps_exact_active_identity_alive() {
+        let liveness = GatewayRuntimeState::classify_work_runtime_liveness(
+            "run-1",
+            "model-tool:run-1",
+            "run-1",
+            Some(("run-1", "in_progress")),
+        );
+
+        assert_eq!(liveness, WorkRuntimeLiveness::Alive);
+    }
+
+    #[test]
+    fn work_runtime_liveness_marks_exact_terminal_identity_dead() {
+        let liveness = GatewayRuntimeState::classify_work_runtime_liveness(
+            "run-1",
+            "model-tool:run-1",
+            "run-1",
+            Some(("run-1", "done")),
+        );
+
+        assert_eq!(liveness, WorkRuntimeLiveness::Dead);
+    }
+
+    #[test]
+    fn work_runtime_liveness_marks_missing_exact_identity_dead() {
+        let liveness = GatewayRuntimeState::classify_work_runtime_liveness(
+            "run-1",
+            "model-tool:run-1",
+            "run-1",
+            None,
+        );
+
+        assert_eq!(liveness, WorkRuntimeLiveness::Dead);
+    }
+
+    #[test]
+    fn work_runtime_liveness_detects_reused_identity_components() {
+        let cases = [
+            ("model-tool:run-2", "run-1", Some(("run-1", "in_progress"))),
+            ("model-tool:run-1", "run-2", Some(("run-1", "in_progress"))),
+            ("model-tool:run-1", "run-1", Some(("run-2", "in_progress"))),
+        ];
+
+        for (runtime_instance_id, process_start_token, run) in cases {
+            assert_eq!(
+                GatewayRuntimeState::classify_work_runtime_liveness(
+                    "run-1",
+                    runtime_instance_id,
+                    process_start_token,
+                    run,
+                ),
+                WorkRuntimeLiveness::ProcessIdentityReused
+            );
+        }
+    }
 
     #[derive(Default)]
     struct SingleFlightRefreshAdapter {
