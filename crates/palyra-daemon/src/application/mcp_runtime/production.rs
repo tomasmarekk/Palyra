@@ -3287,8 +3287,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_connection_releases_exact_resource_lease() {
-        let registry_path =
-            std::env::temp_dir().join(format!("palyra-mcp-resource-{}.json", Ulid::new()));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let registry_path = temp.path().join("resource-leases.json");
         let limit = ResourceUnitsV1 {
             processes: 2,
             memory_bytes: 512 * 1024 * 1024,
@@ -3331,6 +3331,5 @@ mod tests {
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.active_leases, 0);
         assert_eq!(snapshot.used, ResourceUnitsV1::default());
-        let _ = std::fs::remove_file(registry_path);
     }
 }
