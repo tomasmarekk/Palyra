@@ -7,7 +7,7 @@
 //! I/O, which keeps every budget rule unit-testable.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -110,8 +110,12 @@ pub(crate) type RunProgressOutcomeClass = ToolResultClass;
 pub(crate) struct RunProgressAttempt {
     pub(crate) tool_name: String,
     pub(crate) normalized_input_json: Vec<u8>,
+    pub(crate) normalized_output_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) volatile_output_fields: Vec<String>,
     pub(crate) workspace_key: Option<String>,
     pub(crate) query_hash: Option<String>,
+    pub(crate) progress_percent: Option<u8>,
     pub(crate) sensitivity: String,
     pub(crate) outcome_class: RunProgressOutcomeClass,
 }
@@ -148,12 +152,44 @@ pub(crate) struct RunProgressIntervention {
     pub(crate) guidance: String,
     pub(crate) terminate_run: bool,
     pub(crate) learning_observation: String,
+    pub(crate) detection: LoopDetectionEvidence,
+}
+
+/// Redacted, replay-visible evidence explaining why a run loop intervened.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LoopDetectionEvidence {
+    pub(crate) schema_version: u32,
+    pub(crate) detector_type: LoopDetectorType,
+    pub(crate) normalized_outcome_hash: Option<String>,
+    pub(crate) cycle_length: Option<u8>,
+    pub(crate) monotonic_progress: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) volatile_fields_stripped: Vec<String>,
+}
+
+/// Host-defined detector classification used by diagnostics and no-progress metrics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LoopDetectorType {
+    RepeatedSignature,
+    AlternatingCycle,
+    VolatileFieldPoll,
 }
 
 /// Pure no-progress detector for repeated tool failure, denial, or read loops.
 #[derive(Debug, Clone)]
 pub(crate) struct RunProgressController {
     guardrail_state: ToolLoopGuardrailState,
+    recent_observations: VecDeque<RunProgressObservation>,
+    poll_counts: BTreeMap<String, u32>,
+    last_progress_percent: BTreeMap<String, u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunProgressObservation {
+    series_key: String,
+    fingerprint_key: String,
+    outcome_hash: String,
 }
 
 /// Per-run repeated tool-call counters, keyed by sanitized call signature.
@@ -182,7 +218,12 @@ impl RunProgressController {
     /// Creates a controller that intervenes after `max_repeated_attempts`.
     #[must_use]
     pub(crate) fn new(max_repeated_attempts: u32) -> Self {
-        Self { guardrail_state: ToolLoopGuardrailState::new(max_repeated_attempts) }
+        Self {
+            guardrail_state: ToolLoopGuardrailState::new(max_repeated_attempts),
+            recent_observations: VecDeque::with_capacity(6),
+            poll_counts: BTreeMap::new(),
+            last_progress_percent: BTreeMap::new(),
+        }
     }
 
     /// Records an attempt and returns guidance once the same failure repeats.
@@ -191,8 +232,13 @@ impl RunProgressController {
         attempt: RunProgressAttempt,
     ) -> Option<RunProgressIntervention> {
         if attempt.outcome_class == RunProgressOutcomeClass::Success {
-            self.guardrail_state.clear();
+            self.clear();
             return None;
+        }
+        if attempt.outcome_class == RunProgressOutcomeClass::ReadNoProgress
+            && attempt.normalized_output_hash.is_some()
+        {
+            return self.observe_read_progress(attempt);
         }
         let decision = self.guardrail_state.observe(&attempt)?;
         let fingerprint = attempt.fingerprint();
@@ -206,9 +252,147 @@ impl RunProgressController {
                 "repeated_no_progress tool={} outcome={:?} attempts={}",
                 fingerprint.tool_name, fingerprint.outcome_class, decision.attempts
             ),
+            detection: LoopDetectionEvidence {
+                schema_version: 1,
+                detector_type: LoopDetectorType::RepeatedSignature,
+                normalized_outcome_hash: attempt.normalized_output_hash,
+                cycle_length: None,
+                monotonic_progress: false,
+                volatile_fields_stripped: attempt.volatile_output_fields,
+            },
             fingerprint,
             attempts: decision.attempts,
         })
+    }
+
+    fn observe_read_progress(
+        &mut self,
+        attempt: RunProgressAttempt,
+    ) -> Option<RunProgressIntervention> {
+        let series_key = attempt.series_key();
+        if let Some(progress_percent) = attempt.progress_percent {
+            let previous = self.last_progress_percent.get(series_key.as_str()).copied();
+            self.last_progress_percent.insert(series_key.clone(), progress_percent);
+            if previous.is_none_or(|value| progress_percent > value) {
+                self.poll_counts.retain(|key, _| !key.starts_with(series_key.as_str()));
+                self.recent_observations.retain(|observation| observation.series_key != series_key);
+                return None;
+            }
+        }
+
+        let fingerprint = attempt.fingerprint();
+        let outcome_hash = attempt.normalized_output_hash.clone().unwrap_or_default();
+        let observation = RunProgressObservation {
+            series_key: series_key.clone(),
+            fingerprint_key: format!("{}:{outcome_hash}", fingerprint.input_hash),
+            outcome_hash: outcome_hash.clone(),
+        };
+        self.recent_observations.push_back(observation);
+        while self.recent_observations.len() > 6 {
+            self.recent_observations.pop_front();
+        }
+
+        if let Some(cycle_attempts) = self.alternating_cycle_attempts(series_key.as_str()) {
+            return Some(self.loop_intervention(
+                attempt,
+                fingerprint,
+                cycle_attempts,
+                LoopDetectorType::AlternatingCycle,
+                Some(2),
+                outcome_hash,
+            ));
+        }
+
+        let poll_key = format!("{series_key}:{}:{outcome_hash}", fingerprint.input_hash);
+        let attempts = {
+            let attempts = self.poll_counts.entry(poll_key).or_default();
+            *attempts = attempts.saturating_add(1);
+            *attempts
+        };
+        if attempts < self.guardrail_state.guidance_threshold {
+            return None;
+        }
+        Some(self.loop_intervention(
+            attempt,
+            fingerprint,
+            attempts,
+            LoopDetectorType::VolatileFieldPoll,
+            None,
+            outcome_hash,
+        ))
+    }
+
+    fn alternating_cycle_attempts(&self, series_key: &str) -> Option<u32> {
+        let observations = self
+            .recent_observations
+            .iter()
+            .filter(|observation| observation.series_key == series_key)
+            .collect::<Vec<_>>();
+        if observations.len() < 4 {
+            return None;
+        }
+        let tail = &observations[observations.len().saturating_sub(6)..];
+        let alternating = tail.len() >= 4
+            && tail.iter().enumerate().all(|(index, observation)| {
+                observation.fingerprint_key == tail[index % 2].fingerprint_key
+            })
+            && tail[0].fingerprint_key != tail[1].fingerprint_key
+            && tail[0].outcome_hash == tail[2].outcome_hash
+            && tail[1].outcome_hash == tail[3].outcome_hash;
+        alternating.then(|| u32::try_from(tail.len()).unwrap_or(u32::MAX))
+    }
+
+    fn loop_intervention(
+        &self,
+        attempt: RunProgressAttempt,
+        fingerprint: RunProgressAttemptFingerprint,
+        attempts: u32,
+        detector_type: LoopDetectorType,
+        cycle_length: Option<u8>,
+        outcome_hash: String,
+    ) -> RunProgressIntervention {
+        let terminate_run = match detector_type {
+            LoopDetectorType::AlternatingCycle => attempts >= 6,
+            LoopDetectorType::VolatileFieldPoll => {
+                attempts > self.guardrail_state.guidance_threshold
+            }
+            LoopDetectorType::RepeatedSignature => false,
+        };
+        let event_type =
+            if terminate_run { TOOL_LOOP_BLOCKED_EVENT } else { TOOL_LOOP_WARNING_EVENT };
+        let detector_label = match detector_type {
+            LoopDetectorType::AlternatingCycle => "alternating_cycle",
+            LoopDetectorType::VolatileFieldPoll => "volatile_field_poll",
+            LoopDetectorType::RepeatedSignature => "repeated_signature",
+        };
+        RunProgressIntervention {
+            event_type: event_type.to_owned(),
+            reason_code: format!("tool.loop.{detector_label}"),
+            signature: attempt.signature(),
+            fingerprint: fingerprint.clone(),
+            attempts,
+            guidance: guidance_for_repeated_attempt(&fingerprint, attempts),
+            terminate_run,
+            learning_observation: format!(
+                "repeated_no_progress detector={detector_label} tool={} attempts={attempts}",
+                fingerprint.tool_name
+            ),
+            detection: LoopDetectionEvidence {
+                schema_version: 1,
+                detector_type,
+                normalized_outcome_hash: Some(outcome_hash),
+                cycle_length,
+                monotonic_progress: false,
+                volatile_fields_stripped: attempt.volatile_output_fields,
+            },
+        }
+    }
+
+    fn clear(&mut self) {
+        self.guardrail_state.clear();
+        self.recent_observations.clear();
+        self.poll_counts.clear();
+        self.last_progress_percent.clear();
     }
 }
 
@@ -289,6 +473,15 @@ impl RunProgressAttempt {
             sensitivity: self.sensitivity.clone(),
             outcome_class: self.outcome_class.clone(),
         }
+    }
+
+    fn series_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.tool_name,
+            self.workspace_key.as_deref().unwrap_or(""),
+            self.query_hash.as_deref().unwrap_or("")
+        )
     }
 }
 
@@ -2485,8 +2678,11 @@ mod tests {
         RunProgressAttempt {
             tool_name: tool_name.to_owned(),
             normalized_input_json: input.to_vec(),
+            normalized_output_hash: None,
+            volatile_output_fields: Vec::new(),
             workspace_key: Some("workspace-a".to_owned()),
             query_hash: None,
+            progress_percent: None,
             sensitivity: "normal".to_owned(),
             outcome_class: RunProgressOutcomeClass::Failure,
         }
@@ -2753,6 +2949,77 @@ mod tests {
         assert!(controller.observe(failure.clone()).is_none());
         assert!(controller.observe(success).is_none());
         assert!(controller.observe(failure).is_none());
+    }
+
+    #[test]
+    fn run_progress_controller_detects_alternating_read_cycle() {
+        let mut controller = RunProgressController::new(3);
+        let mut first = failed_attempt("palyra.process.status", br#"{"process_id":"a"}"#);
+        first.outcome_class = RunProgressOutcomeClass::ReadNoProgress;
+        first.normalized_output_hash = Some("a".repeat(64));
+        let mut second = first.clone();
+        second.normalized_input_json = br#"{"process_id":"b"}"#.to_vec();
+        second.normalized_output_hash = Some("b".repeat(64));
+
+        assert!(controller.observe(first.clone()).is_none());
+        assert!(controller.observe(second.clone()).is_none());
+        assert!(controller.observe(first.clone()).is_none());
+        let warning = controller.observe(second.clone()).expect("A/B/A/B should warn");
+        assert_eq!(warning.reason_code, "tool.loop.alternating_cycle");
+        assert_eq!(warning.detection.detector_type, LoopDetectorType::AlternatingCycle);
+        assert!(!warning.terminate_run);
+
+        assert!(controller.observe(first).is_some());
+        let blocked = controller.observe(second).expect("A/B/A/B/A/B should block");
+        assert!(blocked.terminate_run);
+        assert_eq!(blocked.detection.cycle_length, Some(2));
+    }
+
+    #[test]
+    fn run_progress_controller_detects_volatile_field_poll() {
+        let mut controller = RunProgressController::new(3);
+        let mut attempt = failed_attempt("palyra.process.status", br#"{"process_id":"a"}"#);
+        attempt.outcome_class = RunProgressOutcomeClass::ReadNoProgress;
+        attempt.normalized_output_hash = Some("c".repeat(64));
+        attempt.volatile_output_fields = vec!["timestamp".to_owned(), "request_id".to_owned()];
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        assert!(controller.observe(attempt.clone()).is_none());
+        let warning = controller.observe(attempt).expect("third identical poll should warn");
+
+        assert_eq!(warning.reason_code, "tool.loop.volatile_field_poll");
+        assert_eq!(warning.detection.detector_type, LoopDetectorType::VolatileFieldPoll);
+        assert_eq!(
+            warning.detection.volatile_fields_stripped,
+            vec!["timestamp".to_owned(), "request_id".to_owned()]
+        );
+    }
+
+    #[test]
+    fn run_progress_controller_allows_monotonic_progress() {
+        let mut controller = RunProgressController::new(2);
+        let mut attempt = failed_attempt("palyra.process.status", br#"{"process_id":"a"}"#);
+        attempt.outcome_class = RunProgressOutcomeClass::ReadNoProgress;
+        attempt.normalized_output_hash = Some("d".repeat(64));
+
+        for percent in [10, 20, 40, 100] {
+            attempt.progress_percent = Some(percent);
+            assert!(controller.observe(attempt.clone()).is_none());
+        }
+    }
+
+    #[test]
+    fn run_progress_controller_allows_legitimate_two_step_iteration() {
+        let mut controller = RunProgressController::new(3);
+        let mut first = failed_attempt("palyra.process.status", br#"{"process_id":"a"}"#);
+        first.outcome_class = RunProgressOutcomeClass::ReadNoProgress;
+        first.normalized_output_hash = Some("e".repeat(64));
+        let mut second = first.clone();
+        second.normalized_input_json = br#"{"process_id":"b"}"#.to_vec();
+        second.normalized_output_hash = Some("f".repeat(64));
+
+        assert!(controller.observe(first).is_none());
+        assert!(controller.observe(second).is_none());
     }
 
     #[test]

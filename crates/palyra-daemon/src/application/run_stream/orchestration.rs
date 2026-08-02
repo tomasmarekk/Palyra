@@ -6662,6 +6662,7 @@ fn tool_loop_intervention_payload(intervention: &RunProgressIntervention) -> Str
         "redaction_level": "hash_only_tool_arguments",
         "signature": intervention.signature,
         "fingerprint": intervention.fingerprint,
+        "detection": intervention.detection,
         "guidance": intervention.guidance,
         "learning_observation": intervention.learning_observation,
     }))
@@ -6705,17 +6706,123 @@ fn verification_finalizer_payload(
 fn run_progress_attempt_from_tool_result(
     result: &RunStreamToolResultForModel,
 ) -> RunProgressAttempt {
+    let output_evidence = normalized_tool_output_evidence(result.outcome.output_json.as_slice());
     RunProgressAttempt {
         tool_name: result.tool_name.clone(),
         normalized_input_json: canonical_tool_input_json(result.input_json.as_slice()),
+        normalized_output_hash: Some(output_evidence.hash),
+        volatile_output_fields: output_evidence.volatile_fields,
         workspace_key: normalized_tool_path_scope(
             result.tool_name.as_str(),
             result.input_json.as_slice(),
         ),
         query_hash: tool_query_hash(result.tool_name.as_str(), result.input_json.as_slice()),
+        progress_percent: output_evidence.progress_percent,
         sensitivity: "runtime_result".to_owned(),
         outcome_class: run_progress_outcome_class(result),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedToolOutputEvidence {
+    hash: String,
+    volatile_fields: Vec<String>,
+    progress_percent: Option<u8>,
+}
+
+fn normalized_tool_output_evidence(output_json: &[u8]) -> NormalizedToolOutputEvidence {
+    let Ok(mut value) = serde_json::from_slice::<Value>(output_json) else {
+        return NormalizedToolOutputEvidence {
+            hash: crate::sha256_hex(output_json),
+            volatile_fields: Vec::new(),
+            progress_percent: None,
+        };
+    };
+    let progress_percent = extract_progress_percent(&value);
+    let mut volatile_fields = Vec::new();
+    strip_volatile_result_fields(&mut value, &mut volatile_fields);
+    volatile_fields.sort();
+    volatile_fields.dedup();
+    NormalizedToolOutputEvidence {
+        hash: crate::sha256_hex(canonical_json_bytes(&value).as_slice()),
+        volatile_fields,
+        progress_percent,
+    }
+}
+
+fn strip_volatile_result_fields(value: &mut Value, stripped: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, nested| {
+                if is_host_defined_volatile_result_field(key) {
+                    stripped.push(key.to_ascii_lowercase());
+                    return false;
+                }
+                strip_volatile_result_fields(nested, stripped);
+                true
+            });
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_volatile_result_fields(item, stripped);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_host_defined_volatile_result_field(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "timestamp"
+            | "timestamp_ms"
+            | "request_id"
+            | "trace_id"
+            | "event_id"
+            | "poll_id"
+            | "nonce"
+            | "current_time"
+            | "sampled_at"
+            | "created_at"
+            | "updated_at"
+            | "last_heartbeat_at"
+    ) || normalized.ends_with("_timestamp")
+        || normalized.ends_with("_timestamp_ms")
+        || normalized.ends_with("_request_id")
+}
+
+fn extract_progress_percent(value: &Value) -> Option<u8> {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .filter_map(|(key, nested)| {
+                if is_progress_percent_field(key) {
+                    parse_progress_percent(nested)
+                } else {
+                    extract_progress_percent(nested)
+                }
+            })
+            .max(),
+        Value::Array(items) => items.iter().filter_map(extract_progress_percent).max(),
+        _ => None,
+    }
+}
+
+fn is_progress_percent_field(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "progress" | "progress_percent" | "percent_complete" | "percentage"
+    )
+}
+
+fn parse_progress_percent(value: &Value) -> Option<u8> {
+    let numeric = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().trim_end_matches('%').parse::<f64>().ok(),
+        _ => None,
+    }?;
+    (numeric.is_finite() && (0.0..=100.0).contains(&numeric)).then(|| numeric.round() as u8)
 }
 
 fn canonical_tool_input_json(input_json: &[u8]) -> Vec<u8> {
@@ -8075,7 +8182,7 @@ mod tests {
         incomplete_terminal_outcome_message, is_browser_tool_name,
         is_run_stream_response_channel_closed, length_recovery_prompt,
         narrow_routine_tool_catalog_policy, normalized_provider_stream_from_output_v2,
-        phase_heartbeat_interval, provider_error_partial_summary,
+        normalized_tool_output_evidence, phase_heartbeat_interval, provider_error_partial_summary,
         provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
         provider_request_deadline_timeout, provider_request_timeout_message,
         provider_request_timeout_status, provider_status_recovery_decision_payload,
@@ -10317,6 +10424,31 @@ mod tests {
             std::str::from_utf8(first_attempt.normalized_input_json.as_slice()).unwrap(),
             r#"{"options":{"a":1,"b":2},"path":"src/lib.rs"}"#
         );
+    }
+
+    #[test]
+    fn run_progress_output_normalization_strips_volatile_fields() {
+        let first = normalized_tool_output_evidence(
+            br#"{"request_id":"req-1","status":"running","timestamp":100}"#,
+        );
+        let second = normalized_tool_output_evidence(
+            br#"{"timestamp":200,"status":"running","request_id":"req-2"}"#,
+        );
+
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(first.volatile_fields, vec!["request_id", "timestamp"]);
+        assert_eq!(second.volatile_fields, vec!["request_id", "timestamp"]);
+    }
+
+    #[test]
+    fn run_progress_output_normalization_preserves_progress_signal() {
+        let evidence = normalized_tool_output_evidence(
+            br#"{"status":{"progress_percent":"42%","updated_at":"now"}}"#,
+        );
+
+        assert_eq!(evidence.progress_percent, Some(42));
+        assert_eq!(evidence.volatile_fields, vec!["updated_at"]);
+        assert_eq!(evidence.hash.len(), 64);
     }
 
     #[test]

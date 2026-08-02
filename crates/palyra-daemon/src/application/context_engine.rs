@@ -257,6 +257,52 @@ pub(crate) struct ContextEngineDroppedSegmentExplain {
     pub(crate) reason: String,
 }
 
+/// Bounded diagnostics-only report for one deterministic prompt composition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PromptCompositionReportV1 {
+    pub(crate) schema_version: u32,
+    pub(crate) report_hash: String,
+    pub(crate) redaction_level: String,
+    pub(crate) segments: Vec<PromptCompositionSegmentReport>,
+}
+
+/// Hash-only prompt segment decision; raw instructions and source identifiers are excluded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PromptCompositionSegmentReport {
+    pub(crate) kind: ContextSegmentKind,
+    pub(crate) authority: PromptSegmentAuthority,
+    pub(crate) estimated_tokens: u64,
+    pub(crate) selected_state: PromptSegmentSelectedState,
+    pub(crate) reason: String,
+    pub(crate) source_hash: String,
+    pub(crate) cache_segment: PromptCacheSegment,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptSegmentAuthority {
+    HostInstruction,
+    HostRuntimeState,
+    UserInput,
+    UntrustedEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptSegmentSelectedState {
+    Selected,
+    Truncated,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptCacheSegment {
+    StablePrefix,
+    Dynamic,
+    Excluded,
+}
+
 /// Flattened included/excluded view of the assembly pipeline, one entry per
 /// segment, grouped by the pipeline step that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,6 +433,7 @@ pub(crate) struct ContextEngineExplain {
     pub(crate) tool_result_pruning: Option<ToolResultPruningExplain>,
     pub(crate) reason_codes: Vec<String>,
     pub(crate) assembly_steps: Vec<PromptAssemblyStepExplain>,
+    pub(crate) prompt_composition: PromptCompositionReportV1,
     pub(crate) selected_segments: Vec<ContextEngineSegmentExplain>,
     pub(crate) dropped_segments: Vec<ContextEngineDroppedSegmentExplain>,
 }
@@ -1707,6 +1754,8 @@ fn assemble_segments(
     }
     reason_codes.sort();
     reason_codes.dedup();
+    let prompt_composition =
+        build_prompt_composition_report(selected_segment_explain.as_slice(), dropped.as_slice());
 
     AssembledPrompt {
         prompt_text,
@@ -1752,9 +1801,117 @@ fn assemble_segments(
             tool_result_pruning,
             reason_codes,
             assembly_steps,
+            prompt_composition,
             selected_segments: selected_segment_explain,
             dropped_segments: dropped,
         },
+    }
+}
+
+fn build_prompt_composition_report(
+    selected: &[ContextEngineSegmentExplain],
+    dropped: &[ContextEngineDroppedSegmentExplain],
+) -> PromptCompositionReportV1 {
+    let mut segments = selected
+        .iter()
+        .map(|segment| PromptCompositionSegmentReport {
+            kind: segment.kind,
+            authority: prompt_segment_authority(segment.kind),
+            estimated_tokens: segment.estimated_tokens,
+            selected_state: PromptSegmentSelectedState::Selected,
+            reason: segment.include_reason.clone(),
+            source_hash: prompt_segment_source_hash(
+                segment.kind,
+                segment.source_refs.as_slice(),
+                segment.estimated_tokens,
+            ),
+            cache_segment: if segment.stable {
+                PromptCacheSegment::StablePrefix
+            } else {
+                PromptCacheSegment::Dynamic
+            },
+        })
+        .chain(dropped.iter().map(|segment| PromptCompositionSegmentReport {
+            kind: segment.kind,
+            authority: prompt_segment_authority(segment.kind),
+            estimated_tokens: segment.estimated_tokens,
+            selected_state: if segment.reason.contains("truncat") {
+                PromptSegmentSelectedState::Truncated
+            } else {
+                PromptSegmentSelectedState::Rejected
+            },
+            reason: segment.reason.clone(),
+            source_hash: prompt_segment_source_hash(segment.kind, &[], segment.estimated_tokens),
+            cache_segment: PromptCacheSegment::Excluded,
+        }))
+        .collect::<Vec<_>>();
+    segments.sort_by(|left, right| {
+        left.kind
+            .as_str()
+            .cmp(right.kind.as_str())
+            .then_with(|| left.selected_state.sort_key().cmp(&right.selected_state.sort_key()))
+            .then_with(|| left.source_hash.cmp(&right.source_hash))
+    });
+    let report_hash =
+        crate::sha256_hex(serde_json::to_vec(&segments).unwrap_or_default().as_slice());
+    PromptCompositionReportV1 {
+        schema_version: 1,
+        report_hash,
+        redaction_level: "hash_only_sources_no_raw_content".to_owned(),
+        segments,
+    }
+}
+
+fn prompt_segment_authority(kind: ContextSegmentKind) -> PromptSegmentAuthority {
+    match kind {
+        ContextSegmentKind::SystemInstructions | ContextSegmentKind::DeveloperInstructions => {
+            PromptSegmentAuthority::HostInstruction
+        }
+        ContextSegmentKind::RuntimeResourceManifest | ContextSegmentKind::AgentPlanState => {
+            PromptSegmentAuthority::HostRuntimeState
+        }
+        ContextSegmentKind::UserInput => PromptSegmentAuthority::UserInput,
+        ContextSegmentKind::PreferenceContext
+        | ContextSegmentKind::ProjectContext
+        | ContextSegmentKind::SessionCompactionSummary
+        | ContextSegmentKind::CheckpointSummary
+        | ContextSegmentKind::ContextReferences
+        | ContextSegmentKind::AttachmentRecall
+        | ContextSegmentKind::ExplicitRecall
+        | ContextSegmentKind::MemoryRecall
+        | ContextSegmentKind::ChannelAmbientContext
+        | ContextSegmentKind::SessionTail
+        | ContextSegmentKind::ToolExchange => PromptSegmentAuthority::UntrustedEvidence,
+    }
+}
+
+fn prompt_segment_source_hash(
+    kind: ContextSegmentKind,
+    source_refs: &[String],
+    estimated_tokens: u64,
+) -> String {
+    let mut hashed_refs =
+        source_refs.iter().map(|value| crate::sha256_hex(value.as_bytes())).collect::<Vec<_>>();
+    hashed_refs.sort();
+    hashed_refs.dedup();
+    crate::sha256_hex(
+        serde_json::to_vec(&json!({
+            "kind": kind.as_str(),
+            "estimated_tokens": estimated_tokens,
+            "source_ref_hashes": hashed_refs,
+        }))
+        .unwrap_or_default()
+        .as_slice(),
+    )
+}
+
+impl PromptSegmentSelectedState {
+    const fn sort_key(self) -> u8 {
+        match self {
+            Self::Selected => 0,
+            Self::Truncated => 1,
+            Self::Rejected => 2,
+        }
     }
 }
 
@@ -3616,7 +3773,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        apply_prompt_cache_session_metadata, assemble_segments,
+        apply_prompt_cache_session_metadata, assemble_segments, build_prompt_composition_report,
         context_assembly_diagnostics_payload, context_inspector_snapshot,
         context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
         render_agent_plan_context_block, resolve_provider_context_budget,
@@ -3624,13 +3781,15 @@ mod tests {
         ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
         ContextEngineAfterTurnOutcome, ContextEngineBootstrapInput, ContextEngineCompactFuture,
         ContextEngineCompactionDisposition, ContextEngineCompactionOutcome,
-        ContextEngineCompactionRequest, ContextEngineDescriptor, ContextEngineIngestEvent,
+        ContextEngineCompactionRequest, ContextEngineDescriptor,
+        ContextEngineDroppedSegmentExplain, ContextEngineIngestEvent,
         ContextEngineLifecycleOutcome, ContextEnginePrepareFuture, ContextEngineRegistry,
-        ContextEngineStrategy, ContextEngineToolCall, ContextEngineToolCallOutcome,
-        ContextEngineToolSchemaPlan, ContextInspectorBreakdownItem, ContextInspectorSnapshot,
-        ContextSegment, ContextSegmentKind, ContextSourceKind, ProviderBudgetProfile,
-        ProviderContextBudget, SummaryQualityGateExplain, DEFAULT_CONTEXT_ENGINE_ID,
-        DEFAULT_CONTEXT_ENGINE_VERSION,
+        ContextEngineSegmentExplain, ContextEngineStrategy, ContextEngineToolCall,
+        ContextEngineToolCallOutcome, ContextEngineToolSchemaPlan, ContextInspectorBreakdownItem,
+        ContextInspectorSnapshot, ContextSegment, ContextSegmentKind, ContextSourceKind,
+        PromptCacheSegment, PromptSegmentAuthority, PromptSegmentSelectedState,
+        ProviderBudgetProfile, ProviderContextBudget, SummaryQualityGateExplain,
+        DEFAULT_CONTEXT_ENGINE_ID, DEFAULT_CONTEXT_ENGINE_VERSION,
     };
     use crate::application::plan_state::{
         AgentPlanItem, AgentPlanStatus, AGENT_PLAN_SCHEMA_VERSION,
@@ -4141,6 +4300,71 @@ mod tests {
             .assembly_steps
             .iter()
             .any(|step| step.step == "runtime_state" && step.included));
+    }
+
+    #[test]
+    fn prompt_composition_report_excludes_secret_segment_content() {
+        let selected = ContextEngineSegmentExplain {
+            kind: ContextSegmentKind::SystemInstructions,
+            source_kind: ContextSourceKind::System,
+            label: "protected bootstrap".to_owned(),
+            estimated_tokens: 32,
+            include_reason: "protected_instruction".to_owned(),
+            redaction_status: "redacted".to_owned(),
+            stable: true,
+            protected: true,
+            trust_label: TrustLabel::TrustedLocal,
+            safety_action: SafetyAction::Allow,
+            safety_findings: Vec::new(),
+            group_id: None,
+            source_refs: vec!["vault://system/instruction-secret".to_owned()],
+            preview: "api_key=raw-secret-value".to_owned(),
+        };
+
+        let first = build_prompt_composition_report(std::slice::from_ref(&selected), &[]);
+        let second = build_prompt_composition_report(std::slice::from_ref(&selected), &[]);
+        let serialized = serde_json::to_string(&first).expect("report should serialize");
+
+        assert_eq!(first, second);
+        assert_eq!(first.report_hash.len(), 64);
+        assert_eq!(first.segments[0].authority, PromptSegmentAuthority::HostInstruction);
+        assert_eq!(first.segments[0].cache_segment, PromptCacheSegment::StablePrefix);
+        assert!(!serialized.contains("raw-secret-value"));
+        assert!(!serialized.contains("vault://system/instruction-secret"));
+    }
+
+    #[test]
+    fn prompt_composition_report_records_rejected_and_truncated_segments() {
+        let report = build_prompt_composition_report(
+            &[],
+            &[
+                ContextEngineDroppedSegmentExplain {
+                    kind: ContextSegmentKind::ProjectContext,
+                    label: "large bootstrap".to_owned(),
+                    estimated_tokens: 4_000,
+                    reason: "bootstrap_truncated".to_owned(),
+                },
+                ContextEngineDroppedSegmentExplain {
+                    kind: ContextSegmentKind::MemoryRecall,
+                    label: "memory".to_owned(),
+                    estimated_tokens: 2_000,
+                    reason: "budget_evicted".to_owned(),
+                },
+            ],
+        );
+
+        assert!(report
+            .segments
+            .iter()
+            .any(|segment| segment.selected_state == PromptSegmentSelectedState::Truncated));
+        assert!(report
+            .segments
+            .iter()
+            .any(|segment| segment.selected_state == PromptSegmentSelectedState::Rejected));
+        assert!(report
+            .segments
+            .iter()
+            .all(|segment| segment.cache_segment == PromptCacheSegment::Excluded));
     }
 
     #[test]
