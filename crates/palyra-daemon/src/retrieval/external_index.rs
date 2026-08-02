@@ -10,7 +10,10 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::journal::{JournalError, JournalStore};
+use crate::journal::{
+    JournalError, JournalStore, MemoryEmbeddingsMode, MemoryIndexInventory, RebuildCheckpoint,
+    RebuildCheckpointAdvanceRequest,
+};
 
 use super::{ExternalRetrievalIndex, ExternalRetrievalIndexSnapshot, RetrievalBackendState};
 
@@ -21,6 +24,51 @@ const DEFAULT_EXTERNAL_QUERY_LATENCY_SLO_MS: u64 = 250;
 const DEFAULT_EXTERNAL_DEGRADED_FALLBACK_RATE_BPS: u32 = 500;
 const DEFAULT_EXTERNAL_RECONCILIATION_SUCCESS_RATE_BPS: u32 = 9_500;
 const MAX_EXTERNAL_QUERY_LATENCY_SAMPLES: usize = 512;
+const MEMORY_INDEX_REBUILD_CHECKPOINT_KEY: &str = "memory_external_projection.v1";
+const MEMORY_INDEX_HEALTH_SCHEMA_VERSION: u64 = 1;
+
+/// Provenance-bearing retrieval usefulness counters for maintenance decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RetrievalUsefulnessMetrics {
+    pub(crate) search_attempt_count: u64,
+    pub(crate) useful_primary_result_count: u64,
+    pub(crate) degraded_fallback_count: u64,
+    pub(crate) usefulness_rate_bps: u32,
+    pub(crate) provenance: Vec<String>,
+}
+
+/// Operator-safe drift inventory across journal-backed lexical/vector projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MemoryIndexHealthReport {
+    pub(crate) schema_version: u64,
+    pub(crate) checked_at_unix_ms: i64,
+    pub(crate) state: String,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) source_of_truth: String,
+    pub(crate) missing_entry_count: u64,
+    pub(crate) stale_entry_count: u64,
+    pub(crate) duplicate_entry_count: u64,
+    pub(crate) orphan_entry_count: u64,
+    pub(crate) duplicate_fact_count: u64,
+    pub(crate) lexical_missing_count: u64,
+    pub(crate) lexical_stale_count: u64,
+    pub(crate) lexical_duplicate_count: u64,
+    pub(crate) lexical_orphan_count: u64,
+    pub(crate) vector_missing_count: u64,
+    pub(crate) vector_stale_count: u64,
+    pub(crate) vector_orphan_count: u64,
+    pub(crate) workspace_missing_count: u64,
+    pub(crate) workspace_stale_count: u64,
+    pub(crate) workspace_duplicate_count: u64,
+    pub(crate) workspace_orphan_count: u64,
+    pub(crate) vector_available: bool,
+    pub(crate) vector_reason_code: String,
+    pub(crate) rebuild_required: bool,
+    pub(crate) rebuild_checkpoint: Option<RebuildCheckpoint>,
+    pub(crate) retrieval_usefulness: RetrievalUsefulnessMetrics,
+    pub(crate) interactive_run_posture: String,
+    pub(crate) redaction_level: String,
+}
 
 /// Measured-vs-target SLO posture for the external index, plus the preview gate verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,9 +139,13 @@ pub(crate) struct ExternalRetrievalDriftReport {
     pub(crate) freshness_lag_ms: Option<u64>,
     pub(crate) drift_count: u64,
     pub(crate) reconciliation_required: bool,
+    pub(crate) health: MemoryIndexHealthReport,
 }
 
-/// Drift before/after a reconciliation backfill, plus the indexer run that repaired it.
+/// Drift before/after one reconciliation batch, plus its indexer outcome.
+///
+/// `success` means terminal catch-up. The SLO separately counts each committed
+/// bounded batch as successful progress, including batches with remaining drift.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalReconciliationOutcome {
     pub(crate) checked_at_unix_ms: i64,
@@ -107,6 +159,7 @@ pub(crate) struct ExternalRetrievalReconciliationOutcome {
 struct ExternalRetrievalRuntimeState {
     snapshot: ExternalRetrievalIndexSnapshot,
     search_attempts: u64,
+    useful_primary_results: u64,
     degraded_fallbacks: u64,
     query_latency_samples_ms: Vec<u64>,
     reconciliation_attempts: u64,
@@ -143,6 +196,7 @@ impl Default for ExternalRetrievalRuntime {
                     last_error: None,
                 },
                 search_attempts: 0,
+                useful_primary_results: 0,
                 degraded_fallbacks: 0,
                 query_latency_samples_ms: Vec::new(),
                 reconciliation_attempts: 0,
@@ -166,6 +220,8 @@ impl ExternalRetrievalRuntime {
         guard.search_attempts = guard.search_attempts.saturating_add(1);
         if degraded_fallback {
             guard.degraded_fallbacks = guard.degraded_fallbacks.saturating_add(1);
+        } else {
+            guard.useful_primary_results = guard.useful_primary_results.saturating_add(1);
         }
         guard.query_latency_samples_ms.push(latency_ms);
         if guard.query_latency_samples_ms.len() > MAX_EXTERNAL_QUERY_LATENCY_SAMPLES {
@@ -190,21 +246,21 @@ impl ExternalRetrievalRuntime {
         attempt_count: u32,
         ran_at_unix_ms: i64,
     ) -> Result<ExternalRetrievalIndexerOutcome, JournalError> {
+        store.repair_memory_index_projections(batch_size)?;
         let memory = store.memory_embeddings_status()?;
         let workspace: crate::journal::WorkspaceRetrievalIndexStatus =
             store.workspace_retrieval_index_status()?;
+        let checkpoint =
+            store.advance_memory_index_rebuild_checkpoint(&RebuildCheckpointAdvanceRequest {
+                checkpoint_key: MEMORY_INDEX_REBUILD_CHECKPOINT_KEY.to_owned(),
+                source_memory_count: memory.total_count,
+                source_workspace_count: workspace.chunk_count,
+                batch_size,
+                now_unix_ms: ran_at_unix_ms,
+            })?;
         let mut guard = self.state.write().unwrap_or_else(|error| error.into_inner());
-        let effective_batch = batch_size.max(1) as u64;
-        let next_memory = next_indexed_count(
-            guard.snapshot.indexed_memory_items,
-            memory.total_count,
-            effective_batch,
-        );
-        let next_workspace = next_indexed_count(
-            guard.snapshot.indexed_workspace_chunks,
-            workspace.chunk_count,
-            effective_batch,
-        );
+        let next_memory = checkpoint.indexed_memory_count;
+        let next_workspace = checkpoint.indexed_workspace_count;
         let pending_memory_items = memory.total_count.saturating_sub(next_memory);
         let pending_workspace_chunks = workspace.chunk_count.saturating_sub(next_workspace);
         let pending_total = pending_memory_items.saturating_add(pending_workspace_chunks);
@@ -264,10 +320,12 @@ impl ExternalRetrievalRuntime {
         let memory = store.memory_embeddings_status()?;
         let workspace: crate::journal::WorkspaceRetrievalIndexStatus =
             store.workspace_retrieval_index_status()?;
+        let health = self.health_report(store, checked_at_unix_ms)?;
         Ok(self.detect_drift_from_counts(
             memory.total_count,
             workspace.chunk_count,
             checked_at_unix_ms,
+            health,
         ))
     }
 
@@ -284,12 +342,19 @@ impl ExternalRetrievalRuntime {
         let memory = store.memory_embeddings_status()?;
         let workspace: crate::journal::WorkspaceRetrievalIndexStatus =
             store.workspace_retrieval_index_status()?;
-        let guard = self.state.read().unwrap_or_else(|error| error.into_inner());
+        let health = self.health_report(store, checked_at_unix_ms)?;
+        let mut snapshot = self.snapshot_from_durable_checkpoint(store)?;
+        snapshot.drift_count = health
+            .missing_entry_count
+            .saturating_add(health.stale_entry_count)
+            .saturating_add(health.duplicate_entry_count)
+            .saturating_add(health.orphan_entry_count);
         Ok(external_drift_report(
-            &guard.snapshot,
+            &snapshot,
             memory.total_count,
             workspace.chunk_count,
             checked_at_unix_ms,
+            health,
         ))
     }
 
@@ -300,13 +365,21 @@ impl ExternalRetrievalRuntime {
         journal_memory_items: u64,
         journal_workspace_chunks: u64,
         checked_at_unix_ms: i64,
+        health: MemoryIndexHealthReport,
     ) -> ExternalRetrievalDriftReport {
         let mut guard = self.state.write().unwrap_or_else(|error| error.into_inner());
+        if let Some(checkpoint) = health.rebuild_checkpoint.as_ref() {
+            guard.snapshot.indexed_memory_items = checkpoint.indexed_memory_count;
+            guard.snapshot.indexed_workspace_chunks = checkpoint.indexed_workspace_count;
+            guard.snapshot.last_indexed_at_unix_ms = Some(checkpoint.updated_at_unix_ms);
+            guard.snapshot.journal_watermark_unix_ms = Some(checkpoint.updated_at_unix_ms);
+        }
         let report = external_drift_report(
             &guard.snapshot,
             journal_memory_items,
             journal_workspace_chunks,
             checked_at_unix_ms,
+            health,
         );
         guard.snapshot.indexed_memory_items = report.indexed_memory_items;
         guard.snapshot.indexed_workspace_chunks = report.indexed_workspace_chunks;
@@ -329,8 +402,12 @@ impl ExternalRetrievalRuntime {
         report
     }
 
-    /// Runs drift detection, a repair backfill sized to clear the full backlog, and a
-    /// post-repair drift check; success means no reconciliation remains required.
+    /// Runs drift detection, one bounded repair batch, and a post-repair drift
+    /// check; callers repeat the operation until terminal catch-up succeeds.
+    ///
+    /// A committed checkpoint counts as a successful SLO attempt even when
+    /// `ExternalRetrievalReconciliationOutcome::success` remains false because
+    /// more bounded batches are required.
     ///
     /// # Errors
     /// Returns [`JournalError`] when any underlying journal status query fails.
@@ -346,20 +423,21 @@ impl ExternalRetrievalRuntime {
             guard.reconciliation_attempts = guard.reconciliation_attempts.saturating_add(1);
             recompute_external_slos(&mut guard);
         }
-        // Repair in one pass: widen the batch to at least the observed drift so a
-        // single indexer run can catch the checkpoint up completely.
-        let repair_batch_size =
-            batch_size.max(1).max(usize::try_from(drift_before.drift_count).unwrap_or(usize::MAX));
-        let indexer = self.run_indexer(store, repair_batch_size, 1, checked_at_unix_ms)?;
-        let drift_after = self.detect_drift(store, checked_at_unix_ms)?;
-        let success = !drift_after.reconciliation_required;
+        // One request advances one bounded batch. Operators can repeat it, and
+        // a crash resumes from the journal cursor without blocking interactive runs.
+        let indexer =
+            self.run_indexer(store, batch_size.clamp(1, 10_000), 1, checked_at_unix_ms)?;
         {
             let mut guard = self.state.write().unwrap_or_else(|error| error.into_inner());
-            if success {
+            // The SLO measures successful bounded checkpoint batches, while
+            // outcome `success` below means the entire rebuild is caught up.
+            if indexer.checkpoint_committed {
                 guard.reconciliation_successes = guard.reconciliation_successes.saturating_add(1);
             }
             recompute_external_slos(&mut guard);
         }
+        let drift_after = self.detect_drift(store, checked_at_unix_ms)?;
+        let success = !drift_after.reconciliation_required;
         Ok(ExternalRetrievalReconciliationOutcome {
             checked_at_unix_ms,
             drift_before,
@@ -367,6 +445,49 @@ impl ExternalRetrievalRuntime {
             drift_after,
             success,
         })
+    }
+
+    /// Builds an operator-safe health report from journal-owned rows.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when inventory, embedding, or checkpoint reads fail.
+    pub(crate) fn health_report(
+        &self,
+        store: &JournalStore,
+        checked_at_unix_ms: i64,
+    ) -> Result<MemoryIndexHealthReport, JournalError> {
+        let inventory = store.memory_index_inventory()?;
+        let embeddings = store.memory_embeddings_status()?;
+        let checkpoint =
+            store.memory_index_rebuild_checkpoint(MEMORY_INDEX_REBUILD_CHECKPOINT_KEY)?;
+        let guard = self.state.read().unwrap_or_else(|error| error.into_inner());
+        Ok(memory_index_health_report(
+            &inventory,
+            embeddings.mode,
+            embeddings.production_default_active,
+            embeddings.degraded_reason_code.as_deref(),
+            checkpoint,
+            guard.search_attempts,
+            guard.useful_primary_results,
+            guard.degraded_fallbacks,
+            checked_at_unix_ms,
+        ))
+    }
+
+    fn snapshot_from_durable_checkpoint(
+        &self,
+        store: &JournalStore,
+    ) -> Result<ExternalRetrievalIndexSnapshot, JournalError> {
+        let mut snapshot = self.snapshot();
+        if let Some(checkpoint) =
+            store.memory_index_rebuild_checkpoint(MEMORY_INDEX_REBUILD_CHECKPOINT_KEY)?
+        {
+            snapshot.indexed_memory_items = checkpoint.indexed_memory_count;
+            snapshot.indexed_workspace_chunks = checkpoint.indexed_workspace_count;
+            snapshot.last_indexed_at_unix_ms = Some(checkpoint.updated_at_unix_ms);
+            snapshot.journal_watermark_unix_ms = Some(checkpoint.updated_at_unix_ms);
+        }
+        Ok(snapshot)
     }
 }
 
@@ -382,25 +503,26 @@ impl ExternalRetrievalIndex for ExternalRetrievalRuntime {
     }
 }
 
-// Advances the checkpoint by one batch, clamped to the journal total in both
-// directions so deletions in the journal can never leave the count ahead of it.
-fn next_indexed_count(current: u64, journal_total: u64, batch_size: u64) -> u64 {
-    current.min(journal_total).saturating_add(batch_size).min(journal_total)
-}
-
 fn external_drift_report(
     snapshot: &ExternalRetrievalIndexSnapshot,
     journal_memory_items: u64,
     journal_workspace_chunks: u64,
     checked_at_unix_ms: i64,
+    health: MemoryIndexHealthReport,
 ) -> ExternalRetrievalDriftReport {
     let indexed_memory_items = snapshot.indexed_memory_items.min(journal_memory_items);
     let indexed_workspace_chunks = snapshot.indexed_workspace_chunks.min(journal_workspace_chunks);
     let memory_drift = signed_drift(journal_memory_items, indexed_memory_items);
     let workspace_chunk_drift = signed_drift(journal_workspace_chunks, indexed_workspace_chunks);
-    let drift_count = journal_memory_items
+    let source_drift_count = journal_memory_items
         .saturating_sub(indexed_memory_items)
         .saturating_add(journal_workspace_chunks.saturating_sub(indexed_workspace_chunks));
+    let health_drift_count = health
+        .missing_entry_count
+        .saturating_add(health.stale_entry_count)
+        .saturating_add(health.duplicate_entry_count)
+        .saturating_add(health.orphan_entry_count);
+    let drift_count = source_drift_count.saturating_add(health_drift_count);
     let freshness_lag_ms = snapshot
         .journal_watermark_unix_ms
         // max(0) guards against a watermark ahead of the probe clock; the cast to u64
@@ -417,6 +539,120 @@ fn external_drift_report(
         freshness_lag_ms,
         drift_count,
         reconciliation_required: drift_count > 0,
+        health,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_index_health_report(
+    inventory: &MemoryIndexInventory,
+    embeddings_mode: MemoryEmbeddingsMode,
+    production_vector_available: bool,
+    embedding_degraded_reason: Option<&str>,
+    checkpoint: Option<RebuildCheckpoint>,
+    search_attempts: u64,
+    useful_primary_results: u64,
+    degraded_fallbacks: u64,
+    checked_at_unix_ms: i64,
+) -> MemoryIndexHealthReport {
+    let missing_entry_count = inventory
+        .lexical_missing_count
+        .saturating_add(inventory.vector_missing_count)
+        .saturating_add(inventory.workspace_missing_count);
+    let stale_entry_count = inventory
+        .lexical_stale_count
+        .saturating_add(inventory.vector_stale_count)
+        .saturating_add(inventory.workspace_stale_count);
+    let duplicate_entry_count = inventory
+        .lexical_duplicate_count
+        .saturating_add(inventory.workspace_duplicate_count)
+        .saturating_add(inventory.duplicate_fact_count);
+    let orphan_entry_count = inventory
+        .lexical_orphan_count
+        .saturating_add(inventory.vector_orphan_count)
+        .saturating_add(inventory.workspace_orphan_count);
+    let vector_available =
+        production_vector_available && embeddings_mode == MemoryEmbeddingsMode::ModelProvider;
+    let mut reason_codes = Vec::new();
+    if missing_entry_count > 0 {
+        reason_codes.push("memory_index.missing_entries".to_owned());
+    }
+    if stale_entry_count > 0 {
+        reason_codes.push("memory_index.stale_entries".to_owned());
+    }
+    if duplicate_entry_count > 0 {
+        reason_codes.push("memory_index.duplicate_entries".to_owned());
+    }
+    if orphan_entry_count > 0 {
+        reason_codes.push("memory_index.orphan_entries".to_owned());
+    }
+    if !vector_available {
+        reason_codes.push("memory_index.vector_unavailable".to_owned());
+    }
+    if checkpoint.as_ref().is_some_and(|value| value.state == "running") {
+        reason_codes.push("memory_index.rebuild_in_progress".to_owned());
+    }
+    if reason_codes.is_empty() {
+        reason_codes.push("memory_index.healthy".to_owned());
+    }
+    let rebuild_required = missing_entry_count
+        .saturating_add(stale_entry_count)
+        .saturating_add(duplicate_entry_count)
+        .saturating_add(orphan_entry_count)
+        > 0;
+    let state = if rebuild_required {
+        "rebuild_required"
+    } else if !vector_available {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    let usefulness_rate_bps = u32::try_from(
+        useful_primary_results.saturating_mul(10_000).checked_div(search_attempts).unwrap_or(0),
+    )
+    .unwrap_or(10_000)
+    .min(10_000);
+    MemoryIndexHealthReport {
+        schema_version: MEMORY_INDEX_HEALTH_SCHEMA_VERSION,
+        checked_at_unix_ms,
+        state: state.to_owned(),
+        reason_codes,
+        source_of_truth: "journal".to_owned(),
+        missing_entry_count,
+        stale_entry_count,
+        duplicate_entry_count,
+        orphan_entry_count,
+        duplicate_fact_count: inventory.duplicate_fact_count,
+        lexical_missing_count: inventory.lexical_missing_count,
+        lexical_stale_count: inventory.lexical_stale_count,
+        lexical_duplicate_count: inventory.lexical_duplicate_count,
+        lexical_orphan_count: inventory.lexical_orphan_count,
+        vector_missing_count: inventory.vector_missing_count,
+        vector_stale_count: inventory.vector_stale_count,
+        vector_orphan_count: inventory.vector_orphan_count,
+        workspace_missing_count: inventory.workspace_missing_count,
+        workspace_stale_count: inventory.workspace_stale_count,
+        workspace_duplicate_count: inventory.workspace_duplicate_count,
+        workspace_orphan_count: inventory.workspace_orphan_count,
+        vector_available,
+        vector_reason_code: if vector_available {
+            "memory_index.vector_available".to_owned()
+        } else {
+            embedding_degraded_reason
+                .map(|reason| format!("memory_index.vector_unavailable.{reason}"))
+                .unwrap_or_else(|| "memory_index.vector_unavailable".to_owned())
+        },
+        rebuild_required,
+        rebuild_checkpoint: checkpoint,
+        retrieval_usefulness: RetrievalUsefulnessMetrics {
+            search_attempt_count: search_attempts,
+            useful_primary_result_count: useful_primary_results,
+            degraded_fallback_count: degraded_fallbacks,
+            usefulness_rate_bps,
+            provenance: vec!["retrieval.external.search_attempt".to_owned()],
+        },
+        interactive_run_posture: "non_blocking_bounded_batch".to_owned(),
+        redaction_level: "counts_and_stable_reason_codes_only".to_owned(),
     }
 }
 
@@ -627,14 +863,42 @@ mod tests {
         assert_eq!(drift.memory_drift, 1);
         assert!(drift.reconciliation_required);
 
-        let reconciliation = external_index
+        let first_reconciliation = external_index
             .reconcile(&store, 1, 4_000)
-            .expect("reconciliation should run journal-derived backfill");
-        assert!(reconciliation.success);
-        assert!(reconciliation.drift_before.reconciliation_required);
-        assert!(!reconciliation.drift_after.reconciliation_required);
-        assert_eq!(reconciliation.indexer.indexed_memory_items, 2);
-        assert_eq!(external_index.snapshot().scale_slos.preview_gate_state, "preview_ready");
+            .expect("first reconciliation should run one bounded journal-derived batch");
+        assert!(!first_reconciliation.success);
+        assert!(first_reconciliation.drift_before.reconciliation_required);
+        assert!(first_reconciliation.drift_after.reconciliation_required);
+        assert_eq!(first_reconciliation.indexer.indexed_memory_items, 1);
+        let running_checkpoint = first_reconciliation
+            .drift_after
+            .health
+            .rebuild_checkpoint
+            .as_ref()
+            .expect("first bounded batch should publish its durable cursor");
+        assert_eq!(running_checkpoint.generation, 2);
+        assert_eq!(running_checkpoint.state, "running");
+        assert_eq!(running_checkpoint.indexed_memory_count, 1);
+
+        let completed_reconciliation = external_index
+            .reconcile(&store, 1, 5_000)
+            .expect("second reconciliation should resume the durable checkpoint");
+        assert!(completed_reconciliation.success);
+        assert!(completed_reconciliation.drift_before.reconciliation_required);
+        assert!(!completed_reconciliation.drift_after.reconciliation_required);
+        assert_eq!(completed_reconciliation.indexer.indexed_memory_items, 2);
+        let completed_checkpoint = completed_reconciliation
+            .drift_after
+            .health
+            .rebuild_checkpoint
+            .as_ref()
+            .expect("completed reconciliation should retain its durable cursor");
+        assert_eq!(completed_checkpoint.generation, 2);
+        assert_eq!(completed_checkpoint.state, "completed");
+        assert_eq!(completed_checkpoint.indexed_memory_count, 2);
+        let scale_slos = external_index.snapshot().scale_slos;
+        assert_eq!(scale_slos.reconciliation_success_rate_bps, 10_000);
+        assert_eq!(scale_slos.preview_gate_state, "preview_ready");
     }
 
     #[test]
@@ -715,5 +979,101 @@ mod tests {
         assert_eq!(scale_slos.query_latency_p95_ms, 120);
         assert_eq!(scale_slos.degraded_fallback_rate_bps, 5_000);
         assert!(!scale_slos.degraded_fallback_ok);
+    }
+
+    #[test]
+    fn external_runtime_rebuild_resumes_from_durable_checkpoint_after_restart() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let store = JournalStore::open(JournalConfig {
+            db_path: temp.path().join("journal.sqlite3"),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("journal store should open");
+        for (memory_id, content_text) in [
+            ("01ARZ3NDEKTSV4RRFFQ69G5M61", "first durable memory index checkpoint item"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5M62", "second durable memory index checkpoint item"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5M63", "third durable memory index checkpoint item"),
+        ] {
+            store
+                .create_memory_item(&MemoryItemCreateRequest {
+                    memory_id: memory_id.to_owned(),
+                    principal: "user:ops".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    session_id: None,
+                    source: MemorySource::Manual,
+                    content_text: content_text.to_owned(),
+                    tags: Vec::new(),
+                    confidence: Some(0.9),
+                    ttl_unix_ms: None,
+                })
+                .expect("memory item should be indexed in journal");
+        }
+
+        let first_runtime = ExternalRetrievalRuntime::default();
+        let first_batch = first_runtime
+            .run_indexer(&store, 1, 1, 1_000)
+            .expect("first rebuild batch should commit");
+        assert!(!first_batch.complete);
+        assert_eq!(first_batch.indexed_memory_items, 1);
+        drop(first_runtime);
+
+        let restarted_runtime = ExternalRetrievalRuntime::default();
+        let second_batch = restarted_runtime
+            .run_indexer(&store, 1, 1, 2_000)
+            .expect("restarted runtime should resume the durable cursor");
+        assert!(!second_batch.complete);
+        assert_eq!(second_batch.indexed_memory_items, 2);
+        let running_health = restarted_runtime
+            .health_report(&store, 2_000)
+            .expect("running rebuild health should load");
+        let running_checkpoint =
+            running_health.rebuild_checkpoint.expect("durable rebuild checkpoint should exist");
+        assert_eq!(running_checkpoint.generation, 1);
+        assert_eq!(running_checkpoint.state, "running");
+
+        let completed = restarted_runtime
+            .run_indexer(&store, 1, 1, 3_000)
+            .expect("resumed rebuild should complete");
+        assert!(completed.complete);
+        assert_eq!(completed.indexed_memory_items, 3);
+        let completed_health = restarted_runtime
+            .health_report(&store, 3_000)
+            .expect("completed rebuild health should load");
+        assert_eq!(
+            completed_health
+                .rebuild_checkpoint
+                .expect("completed checkpoint should remain durable")
+                .state,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn memory_index_health_reports_vector_unavailability_explicitly() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let store = JournalStore::open(JournalConfig {
+            db_path: temp.path().join("journal.sqlite3"),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("journal store should open");
+        let external_index = ExternalRetrievalRuntime::default();
+
+        let health =
+            external_index.health_report(&store, 1_000).expect("memory index health should load");
+
+        assert_eq!(health.state, "degraded");
+        assert!(!health.vector_available);
+        assert!(
+            health.vector_reason_code.starts_with("memory_index.vector_unavailable"),
+            "vector degradation should expose a stable operator reason"
+        );
+        assert!(health.reason_codes.contains(&"memory_index.vector_unavailable".to_owned()));
+        assert_eq!(health.source_of_truth, "journal");
+        assert_eq!(health.interactive_run_posture, "non_blocking_bounded_batch");
+        assert_eq!(health.redaction_level, "counts_and_stable_reason_codes_only");
     }
 }

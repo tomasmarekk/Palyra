@@ -26,14 +26,12 @@ pub(crate) async fn console_memory_index_drift_handler(
         state.runtime.preview_external_retrieval_drift().await.map_err(runtime_status_response)?;
     let retrieval_backend =
         state.runtime.retrieval_backend_snapshot().map_err(runtime_status_response)?;
-    let diagnostics = build_memory_retrieval_diagnostics(
-        &retrieval_backend,
-        Some(drift.drift_count),
-        Some(drift.reconciliation_required),
-    );
+    let diagnostics = build_memory_index_diagnostics(&retrieval_backend, &drift);
+    let health = drift.health.clone();
     Ok(Json(json!({
         "drift": drift,
         "diagnostics": diagnostics,
+        "health": health,
         "external_index": retrieval_backend.external_index.clone(),
         "retrieval": {
             "backend": retrieval_backend,
@@ -65,14 +63,14 @@ pub(crate) async fn console_memory_index_reconcile_handler(
         .map_err(runtime_status_response)?;
     let retrieval_backend =
         state.runtime.retrieval_backend_snapshot().map_err(runtime_status_response)?;
-    let diagnostics = build_memory_retrieval_diagnostics(
-        &retrieval_backend,
-        Some(reconciliation.drift_after.drift_count),
-        Some(reconciliation.drift_after.reconciliation_required),
-    );
+    let diagnostics =
+        build_memory_index_diagnostics(&retrieval_backend, &reconciliation.drift_after);
+    let health = reconciliation.drift_after.health.clone();
     let event_details = json!({
         "batch_size": batch_size,
         "reconciliation": reconciliation.clone(),
+        "reason_codes": health.reason_codes.clone(),
+        "redaction_level": health.redaction_level.clone(),
     });
     if let Err(error) = state
         .runtime
@@ -84,12 +82,33 @@ pub(crate) async fn console_memory_index_reconcile_handler(
     Ok(Json(json!({
         "reconciliation": reconciliation,
         "diagnostics": diagnostics,
+        "health": health,
         "external_index": retrieval_backend.external_index.clone(),
         "retrieval": {
             "backend": retrieval_backend,
         },
         "contract": contract_descriptor(),
     })))
+}
+
+fn build_memory_index_diagnostics(
+    retrieval_backend: &crate::retrieval::RetrievalBackendSnapshot,
+    drift: &crate::retrieval::ExternalRetrievalDriftReport,
+) -> Value {
+    let mut diagnostics = build_memory_retrieval_diagnostics(
+        retrieval_backend,
+        Some(drift.drift_count),
+        Some(drift.reconciliation_required),
+    );
+    if let Some(object) = diagnostics.as_object_mut() {
+        object.insert("health_state".to_owned(), json!(drift.health.state));
+        object.insert("reason_codes".to_owned(), json!(drift.health.reason_codes));
+        object.insert("vector_available".to_owned(), json!(drift.health.vector_available));
+        object.insert("vector_reason_code".to_owned(), json!(drift.health.vector_reason_code));
+        object.insert("rebuild_checkpoint".to_owned(), json!(drift.health.rebuild_checkpoint));
+        object.insert("redaction_level".to_owned(), json!(drift.health.redaction_level));
+    }
+    diagnostics
 }
 
 /// Builds the operator-facing retrieval diagnostics block (mode, fallback

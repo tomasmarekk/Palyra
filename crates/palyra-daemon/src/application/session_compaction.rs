@@ -17,6 +17,8 @@
 //! `context_engine`, `recall`, `run_stream::tape`, and the console handlers.
 
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -96,6 +98,13 @@ const SESSION_COMPACTION_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const SESSION_COMPACTION_TOOL_RESULT_FIELD_MAX_CHARS: usize = 1_200;
 const SESSION_COMPACTION_TOOL_RESULT_MAX_DEPTH: usize = 6;
 const SESSION_COMPACTION_DEFAULT_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
+const MEMORY_FLUSH_SCHEMA_VERSION: u64 = 1;
+const MEMORY_FLUSH_MAX_CANDIDATES: usize = 12;
+const MEMORY_FLUSH_MAX_CITATIONS: usize = 4;
+const MEMORY_FLUSH_FACT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+const MEMORY_FLUSH_PREFERENCE_TTL_MS: u64 = 180 * 24 * 60 * 60 * 1_000;
+const MEMORY_FLUSH_PROCEDURE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+const MEMORY_FLUSH_SENSITIVE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 // Continuity candidates below this confidence need operator review before a
 // durable workspace write; seeds are scored against it in finalize_candidate.
 const AUTO_WRITE_CONFIDENCE_THRESHOLD: f64 = 0.82;
@@ -139,6 +148,10 @@ const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
 static TEST_WRITE_FAILURE_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SAFEGUARD_FAILURE_REASON: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static TEST_MEMORY_FLUSH_REVIEWER_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Complete compaction proposal for one session: summary, counts, candidates.
 ///
@@ -169,6 +182,7 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) active_task_summary: SessionActiveTaskSummary,
     pub(crate) checkpoint_metadata: SessionCompactionCheckpointMetadata,
     pub(crate) candidates: Vec<SessionCompactionCandidate>,
+    pub(crate) memory_flush: MemoryFlushProjectionV1,
     pub(crate) checkpoint_preview: SessionCompactionCheckpointPreview,
     pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
     pub(crate) safeguard: CompactionSafeguardProjection,
@@ -205,6 +219,7 @@ impl SessionCompactionPlan {
                 .iter()
                 .filter(|candidate| candidate.disposition == "review_required")
                 .count(),
+            "memory_flush": self.memory_flush,
             "summary_text": self.summary_text,
             "summary_preview": self.summary_preview,
             "active_task_summary": self.active_task_summary,
@@ -293,6 +308,87 @@ pub(crate) struct SessionCompactionCandidate {
     pub disposition: String,
     pub rationale: String,
     pub provenance: Vec<SessionCompactionCandidateProvenance>,
+}
+
+/// Candidate category extracted before destructive transcript compaction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryFlushCandidateKind {
+    Fact,
+    Preference,
+    Procedure,
+}
+
+/// Whether the candidate repeats a user assertion or is model-derived.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryFlushAssertionKind {
+    UserFact,
+    Inference,
+}
+
+/// Safety classification applied before a candidate can reach review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryFlushSensitivity {
+    Normal,
+    Sensitive,
+    Poisoned,
+}
+
+/// Evidence pointer linking a candidate to one journal tape record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MemoryFlushCitationV1 {
+    pub(crate) evidence_ref: String,
+    pub(crate) run_id: String,
+    pub(crate) tape_seq: i64,
+    pub(crate) event_type: String,
+    pub(crate) created_at_unix_ms: i64,
+}
+
+/// Review-only memory proposal created before compaction loses transcript detail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct MemoryFlushCandidateV1 {
+    pub(crate) schema_version: u64,
+    pub(crate) candidate_id: String,
+    pub(crate) kind: MemoryFlushCandidateKind,
+    pub(crate) assertion_kind: MemoryFlushAssertionKind,
+    pub(crate) content: String,
+    pub(crate) confidence: f64,
+    pub(crate) sensitivity: MemoryFlushSensitivity,
+    pub(crate) retention_ttl_ms: u64,
+    pub(crate) review_state: String,
+    pub(crate) permanent_write_allowed: bool,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) citations: Vec<MemoryFlushCitationV1>,
+    pub(crate) provenance_kind: String,
+}
+
+/// Maintenance counters derived from the reviewed pre-compaction candidate set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MemoryFlushMaintenanceMetricsV1 {
+    pub(crate) candidate_count: u64,
+    pub(crate) useful_candidate_count: u64,
+    pub(crate) duplicate_fact_count: u64,
+    pub(crate) contradiction_count: u64,
+    pub(crate) user_correction_count: u64,
+    pub(crate) citation_count: u64,
+    pub(crate) usefulness_rate_bps: u32,
+    pub(crate) provenance: Vec<String>,
+}
+
+/// Candidate-only flush result embedded in compaction diagnostics and artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct MemoryFlushProjectionV1 {
+    pub(crate) schema_version: u64,
+    pub(crate) event_type: String,
+    pub(crate) reviewer_status: String,
+    pub(crate) candidate_only: bool,
+    pub(crate) compaction_continues: bool,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) candidates: Vec<MemoryFlushCandidateV1>,
+    pub(crate) maintenance_metrics: MemoryFlushMaintenanceMetricsV1,
+    pub(crate) redaction_level: String,
 }
 
 /// Planned or applied workspace write for one curated document path.
@@ -726,6 +822,7 @@ struct CompactionSummaryJsonInput<'a> {
     active_task_summary: &'a SessionActiveTaskSummary,
     checkpoint_metadata: &'a SessionCompactionCheckpointMetadata,
     candidates: &'a [SessionCompactionCandidate],
+    memory_flush: &'a MemoryFlushProjectionV1,
     writes: &'a [SessionCompactionWritePreview],
     checkpoint_preview: &'a SessionCompactionCheckpointPreview,
     checkpoint_pair: &'a PreAPostCompactionCheckpoints,
@@ -990,6 +1087,9 @@ pub(crate) async fn apply_session_compaction(
                 "mode": request.mode,
                 "source_event_count": plan.source_event_count,
                 "summary_sha256": crate::sha256_hex(plan.summary_text.as_bytes()),
+                "memory_flush_candidate_count": plan.memory_flush.candidates.len(),
+                "memory_flush_reviewer_status": plan.memory_flush.reviewer_status.as_str(),
+                "memory_flush_reason_codes": plan.memory_flush.reason_codes.as_slice(),
                 "redaction_level": "metadata_and_hash_only",
             }),
         )
@@ -1236,6 +1336,7 @@ pub(crate) async fn apply_session_compaction(
                 active_task_summary: &plan.active_task_summary,
                 checkpoint_metadata: &plan.checkpoint_metadata,
                 candidates: plan.candidates.as_slice(),
+                memory_flush: &plan.memory_flush,
                 writes: applied_writes.as_slice(),
                 checkpoint_preview: &plan.checkpoint_preview,
                 checkpoint_pair: &applied_checkpoint_pair,
@@ -1292,6 +1393,9 @@ pub(crate) async fn apply_session_compaction(
                 "mode": request.mode,
                 "artifact_id_sha256": crate::sha256_hex(artifact.artifact_id.as_bytes()),
                 "summary_sha256": crate::sha256_hex(plan.summary_text.as_bytes()),
+                "memory_flush_candidate_count": plan.memory_flush.candidates.len(),
+                "memory_flush_reviewer_status": plan.memory_flush.reviewer_status.as_str(),
+                "memory_flush_reason_codes": plan.memory_flush.reason_codes.as_slice(),
                 "redaction_level": "metadata_and_hash_only",
             }),
         )
@@ -1422,6 +1526,7 @@ fn build_session_compaction_plan_with_metadata(
     });
     let mut candidates =
         build_continuity_candidates(condensed_records.as_slice(), workspace_documents);
+    let memory_flush = build_memory_flush_projection(condensed_records.as_slice());
     if compaction_mode_requires_review_for_durable_writes(input.mode) {
         require_review_for_unreviewed_durable_write_candidates(candidates.as_mut_slice());
     }
@@ -1571,6 +1676,7 @@ fn build_session_compaction_plan_with_metadata(
         active_task_summary: &active_task_summary,
         checkpoint_metadata: &checkpoint_metadata,
         candidates: candidates.as_slice(),
+        memory_flush: &memory_flush,
         writes: write_previews.as_slice(),
         checkpoint_preview: &checkpoint_preview,
         checkpoint_pair: &checkpoint_pair,
@@ -1599,6 +1705,7 @@ fn build_session_compaction_plan_with_metadata(
         "estimated_output_tokens": estimated_output_tokens,
         "candidate_count": candidate_count,
         "review_candidate_count": review_candidate_count,
+        "memory_flush": memory_flush,
         "blocked_reason": blocked_reason,
         "checkpoint_metadata": checkpoint_metadata,
         "checkpoint_pair": checkpoint_pair,
@@ -1633,6 +1740,7 @@ fn build_session_compaction_plan_with_metadata(
         active_task_summary,
         checkpoint_metadata,
         candidates,
+        memory_flush,
         checkpoint_preview,
         checkpoint_pair,
         safeguard,
@@ -2119,6 +2227,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("successor_transcript".to_owned(), json!(&plan.successor_transcript));
             object.insert("identifier_evidence".to_owned(), json!(&plan.identifier_evidence));
             object.insert("operator_instruction".to_owned(), json!(&plan.operator_instruction));
+            object.insert("memory_flush".to_owned(), json!(&plan.memory_flush));
         }
         plan.summary_json = summary.to_string();
     }
@@ -2132,6 +2241,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("successor_transcript".to_owned(), json!(&plan.successor_transcript));
             object.insert("identifier_evidence".to_owned(), json!(&plan.identifier_evidence));
             object.insert("operator_instruction".to_owned(), json!(&plan.operator_instruction));
+            object.insert("memory_flush".to_owned(), json!(&plan.memory_flush));
         }
         plan.trigger_inputs_json = trigger_inputs.to_string();
     }
@@ -3252,6 +3362,369 @@ fn build_continuity_candidates(
     candidates
 }
 
+fn build_memory_flush_projection(
+    condensed_records: &[SessionCompactionRecordSnapshot],
+) -> MemoryFlushProjectionV1 {
+    let (mut candidates, mut metrics) = extract_memory_flush_candidates(condensed_records);
+    let reviewer_result = review_memory_flush_candidates(candidates.as_mut_slice());
+    let (reviewer_status, reason_codes) = match reviewer_result {
+        Ok(()) => (
+            "candidate_only_reviewed",
+            vec![
+                "memory_flush.candidates_reviewed".to_owned(),
+                "memory_flush.permanent_write_requires_operator_review".to_owned(),
+            ],
+        ),
+        Err(reason_code) => {
+            for candidate in candidates
+                .iter_mut()
+                .filter(|candidate| candidate.sensitivity == MemoryFlushSensitivity::Normal)
+            {
+                candidate.review_state = "reviewer_failed".to_owned();
+                insert_unique_reason_code(
+                    &mut candidate.reason_codes,
+                    "memory_flush.reviewer_failed",
+                );
+            }
+            (
+                "reviewer_failed",
+                vec![
+                    reason_code.to_owned(),
+                    "memory_flush.reviewer_failure_non_blocking".to_owned(),
+                ],
+            )
+        }
+    };
+    metrics.candidate_count = candidates.len() as u64;
+    metrics.useful_candidate_count = candidates
+        .iter()
+        .filter(|candidate| candidate.sensitivity == MemoryFlushSensitivity::Normal)
+        .count() as u64;
+    metrics.citation_count =
+        candidates.iter().map(|candidate| candidate.citations.len() as u64).sum();
+    metrics.usefulness_rate_bps = u32::try_from(
+        metrics
+            .useful_candidate_count
+            .saturating_mul(10_000)
+            .checked_div(metrics.candidate_count)
+            .unwrap_or(0),
+    )
+    .unwrap_or(10_000)
+    .min(10_000);
+    metrics.provenance = candidates
+        .iter()
+        .flat_map(|candidate| candidate.citations.iter())
+        .map(|citation| {
+            format!(
+                "memory_flush.citation_sha256:{}",
+                &crate::sha256_hex(citation.evidence_ref.as_bytes())[..16]
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    MemoryFlushProjectionV1 {
+        schema_version: MEMORY_FLUSH_SCHEMA_VERSION,
+        event_type: "memory.flush.candidates.reviewed".to_owned(),
+        reviewer_status: reviewer_status.to_owned(),
+        candidate_only: true,
+        compaction_continues: true,
+        reason_codes,
+        candidates,
+        maintenance_metrics: metrics,
+        redaction_level: "sensitive_content_redacted_and_citations_bounded".to_owned(),
+    }
+}
+
+fn extract_memory_flush_candidates(
+    records: &[SessionCompactionRecordSnapshot],
+) -> (Vec<MemoryFlushCandidateV1>, MemoryFlushMaintenanceMetricsV1) {
+    let mut candidates = Vec::<MemoryFlushCandidateV1>::new();
+    let mut signatures = HashMap::<String, usize>::new();
+    let mut duplicate_fact_count = 0_u64;
+    let mut contradiction_count = 0_u64;
+    let mut user_correction_count = 0_u64;
+    for record in records.iter().rev() {
+        if candidates.len() >= MEMORY_FLUSH_MAX_CANDIDATES {
+            break;
+        }
+        if !record_can_seed_continuity_candidate(record) {
+            continue;
+        }
+        let normalized = record.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.len() < 24 || looks_like_noise(normalized.as_str()) {
+            continue;
+        }
+        let lower = normalized.to_ascii_lowercase();
+        let kind = classify_memory_flush_kind(lower.as_str());
+        let assertion_kind = if matches!(
+            record.event_type.as_str(),
+            "message.received" | "queued.input" | "tape:user_message"
+        ) {
+            MemoryFlushAssertionKind::UserFact
+        } else {
+            MemoryFlushAssertionKind::Inference
+        };
+        let user_correction = assertion_kind == MemoryFlushAssertionKind::UserFact
+            && is_user_correction(lower.as_str());
+        if user_correction {
+            user_correction_count = user_correction_count.saturating_add(1);
+        }
+        let signature = format!(
+            "{}:{}",
+            memory_flush_kind_key(kind),
+            normalize_memory_flush_signature(normalized.as_str())
+        );
+        let citation = memory_flush_citation(record);
+        if let Some(existing_index) = signatures.get(signature.as_str()).copied() {
+            if kind == MemoryFlushCandidateKind::Fact {
+                duplicate_fact_count = duplicate_fact_count.saturating_add(1);
+            }
+            let existing = &mut candidates[existing_index];
+            if existing.citations.len() < MEMORY_FLUSH_MAX_CITATIONS {
+                existing.citations.push(citation);
+            }
+            insert_unique_reason_code(
+                &mut existing.reason_codes,
+                "memory_flush.duplicate_suppressed",
+            );
+            continue;
+        }
+
+        let scan = scan_workspace_content_for_prompt_injection(normalized.as_str());
+        let sensitivity = if is_sensitive_candidate(normalized.as_str()) {
+            MemoryFlushSensitivity::Sensitive
+        } else if scan.state.as_str() != "clean" {
+            MemoryFlushSensitivity::Poisoned
+        } else {
+            MemoryFlushSensitivity::Normal
+        };
+        let mut reason_codes = match sensitivity {
+            MemoryFlushSensitivity::Normal => vec!["memory_flush.review_required".to_owned()],
+            MemoryFlushSensitivity::Sensitive => {
+                vec!["memory_flush.blocked_sensitive".to_owned()]
+            }
+            MemoryFlushSensitivity::Poisoned => vec!["memory_flush.blocked_tainted".to_owned()],
+        };
+        if user_correction {
+            reason_codes.push("memory_flush.user_correction".to_owned());
+        }
+        let content = if sensitivity == MemoryFlushSensitivity::Normal {
+            redact_memory_flush_text(normalized.as_str())
+        } else {
+            "<redacted-memory-flush-candidate>".to_owned()
+        };
+        let confidence = memory_flush_confidence(kind, assertion_kind, user_correction);
+        let mut candidate = MemoryFlushCandidateV1 {
+            schema_version: MEMORY_FLUSH_SCHEMA_VERSION,
+            candidate_id: format!(
+                "memory-cand-{}",
+                &crate::sha256_hex(
+                    format!(
+                        "{}:{}:{}",
+                        memory_flush_kind_key(kind),
+                        memory_flush_assertion_key(assertion_kind),
+                        normalized
+                    )
+                    .as_bytes()
+                )[..16]
+            ),
+            kind,
+            assertion_kind,
+            content,
+            confidence,
+            sensitivity,
+            retention_ttl_ms: memory_flush_retention_ttl(kind, assertion_kind, sensitivity),
+            review_state: match sensitivity {
+                MemoryFlushSensitivity::Normal => "pending_review",
+                MemoryFlushSensitivity::Sensitive => "blocked_sensitive",
+                MemoryFlushSensitivity::Poisoned => "blocked_tainted",
+            }
+            .to_owned(),
+            permanent_write_allowed: false,
+            reason_codes,
+            citations: vec![citation],
+            provenance_kind: if user_correction {
+                "user_correction"
+            } else if assertion_kind == MemoryFlushAssertionKind::UserFact {
+                "user_assertion"
+            } else {
+                "model_inference"
+            }
+            .to_owned(),
+        };
+        if sensitivity == MemoryFlushSensitivity::Normal {
+            for existing in candidates.iter_mut().filter(|existing| {
+                existing.kind == kind && existing.sensitivity == MemoryFlushSensitivity::Normal
+            }) {
+                if lines_look_contradictory(existing.content.as_str(), candidate.content.as_str()) {
+                    contradiction_count = contradiction_count.saturating_add(1);
+                    existing.review_state = "review_required".to_owned();
+                    insert_unique_reason_code(
+                        &mut existing.reason_codes,
+                        "memory_flush.contradiction_detected",
+                    );
+                    candidate.review_state = "review_required".to_owned();
+                    insert_unique_reason_code(
+                        &mut candidate.reason_codes,
+                        "memory_flush.contradiction_detected",
+                    );
+                }
+            }
+        }
+        signatures.insert(signature, candidates.len());
+        candidates.push(candidate);
+    }
+    candidates.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    (
+        candidates,
+        MemoryFlushMaintenanceMetricsV1 {
+            candidate_count: 0,
+            useful_candidate_count: 0,
+            duplicate_fact_count,
+            contradiction_count,
+            user_correction_count,
+            citation_count: 0,
+            usefulness_rate_bps: 0,
+            provenance: Vec::new(),
+        },
+    )
+}
+
+fn review_memory_flush_candidates(
+    candidates: &mut [MemoryFlushCandidateV1],
+) -> Result<(), &'static str> {
+    #[cfg(test)]
+    if TEST_MEMORY_FLUSH_REVIEWER_FAILURE.with(Cell::get) {
+        return Err("memory_flush.reviewer_failed");
+    }
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.sensitivity == MemoryFlushSensitivity::Normal)
+    {
+        candidate.review_state = "review_required".to_owned();
+        insert_unique_reason_code(
+            &mut candidate.reason_codes,
+            "memory_flush.candidate_only_reviewed",
+        );
+    }
+    Ok(())
+}
+
+fn classify_memory_flush_kind(lower: &str) -> MemoryFlushCandidateKind {
+    if contains_any(
+        lower,
+        &["prefer", "preference", "i like", "always use", "never use", "default to"],
+    ) {
+        MemoryFlushCandidateKind::Preference
+    } else if contains_any(
+        lower,
+        &["procedure", "workflow", "steps:", "step 1", "run cargo", "run npm", "when ", "then "],
+    ) {
+        MemoryFlushCandidateKind::Procedure
+    } else {
+        MemoryFlushCandidateKind::Fact
+    }
+}
+
+fn memory_flush_confidence(
+    kind: MemoryFlushCandidateKind,
+    assertion_kind: MemoryFlushAssertionKind,
+    user_correction: bool,
+) -> f64 {
+    if user_correction {
+        return 0.97;
+    }
+    match (kind, assertion_kind) {
+        (MemoryFlushCandidateKind::Preference, MemoryFlushAssertionKind::UserFact) => 0.94,
+        (MemoryFlushCandidateKind::Procedure, MemoryFlushAssertionKind::UserFact) => 0.90,
+        (MemoryFlushCandidateKind::Fact, MemoryFlushAssertionKind::UserFact) => 0.88,
+        (_, MemoryFlushAssertionKind::Inference) => 0.72,
+    }
+}
+
+fn memory_flush_retention_ttl(
+    kind: MemoryFlushCandidateKind,
+    assertion_kind: MemoryFlushAssertionKind,
+    sensitivity: MemoryFlushSensitivity,
+) -> u64 {
+    if sensitivity != MemoryFlushSensitivity::Normal {
+        return MEMORY_FLUSH_SENSITIVE_TTL_MS;
+    }
+    let base = match kind {
+        MemoryFlushCandidateKind::Fact => MEMORY_FLUSH_FACT_TTL_MS,
+        MemoryFlushCandidateKind::Preference => MEMORY_FLUSH_PREFERENCE_TTL_MS,
+        MemoryFlushCandidateKind::Procedure => MEMORY_FLUSH_PROCEDURE_TTL_MS,
+    };
+    if assertion_kind == MemoryFlushAssertionKind::Inference {
+        base / 2
+    } else {
+        base
+    }
+}
+
+fn memory_flush_citation(record: &SessionCompactionRecordSnapshot) -> MemoryFlushCitationV1 {
+    MemoryFlushCitationV1 {
+        evidence_ref: format!("tape:{}:{}", record.run_id, record.seq),
+        run_id: record.run_id.clone(),
+        tape_seq: record.seq,
+        event_type: record.event_type.clone(),
+        created_at_unix_ms: record.created_at_unix_ms,
+    }
+}
+
+fn normalize_memory_flush_signature(content: &str) -> String {
+    content
+        .chars()
+        .map(
+            |character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            },
+        )
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_memory_flush_text(content: &str) -> String {
+    let auth_redacted = redact_auth_error(content);
+    let url_redacted = redact_url_segments_in_text(auth_redacted.as_str());
+    truncate_console_text(url_redacted.as_str(), 320)
+}
+
+fn is_user_correction(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &["correction:", "actually,", "i meant", "not that", "to clarify", "instead of"],
+    )
+}
+
+fn memory_flush_kind_key(kind: MemoryFlushCandidateKind) -> &'static str {
+    match kind {
+        MemoryFlushCandidateKind::Fact => "fact",
+        MemoryFlushCandidateKind::Preference => "preference",
+        MemoryFlushCandidateKind::Procedure => "procedure",
+    }
+}
+
+fn memory_flush_assertion_key(assertion_kind: MemoryFlushAssertionKind) -> &'static str {
+    match assertion_kind {
+        MemoryFlushAssertionKind::UserFact => "user_fact",
+        MemoryFlushAssertionKind::Inference => "inference",
+    }
+}
+
+fn insert_unique_reason_code(reason_codes: &mut Vec<String>, reason_code: &str) {
+    if !reason_codes.iter().any(|existing| existing == reason_code) {
+        reason_codes.push(reason_code.to_owned());
+    }
+}
+
 // Tool output is externally influenced text; only user/assistant messages
 // may seed durable workspace writes (tool text still feeds action-item
 // extraction, which has its own injection scan).
@@ -3379,6 +3852,7 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
             "review_candidate_count": input.review_candidate_count,
             "candidates": input.candidates,
         },
+        "memory_flush": input.memory_flush,
         "writes": input.writes,
         "checkpoint_preview": input.checkpoint_preview,
         "checkpoint_pair": input.checkpoint_pair,
@@ -4268,17 +4742,20 @@ pub(crate) fn truncate_console_text(raw: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_session_compaction_plan, render_compaction_prompt_block,
-        session_compaction_summary_hash, CompactionSafeguardDecision,
-        CompactionSafeguardProjection, CompactionSafeguardReasonCode, ContextCompressor,
-        HybridSessionContextCompressor, PreAPostCompactionCheckpoints, PreAPostCompactionDecision,
-        PreAPostCompactionReasonCode, ProviderBackedEvidenceDecision,
+        build_memory_flush_projection, build_session_compaction_plan,
+        render_compaction_prompt_block, session_compaction_summary_hash,
+        CompactionSafeguardDecision, CompactionSafeguardProjection, CompactionSafeguardReasonCode,
+        ContextCompressor, HybridSessionContextCompressor, MemoryFlushAssertionKind,
+        MemoryFlushCandidateKind, MemoryFlushSensitivity, PreAPostCompactionCheckpoints,
+        PreAPostCompactionDecision, PreAPostCompactionReasonCode, ProviderBackedEvidenceDecision,
         ProviderBackedEvidenceProjection, ProviderBackedEvidenceReasonCode,
-        ProviderBackedEvidenceSessionContextCompressor, SessionContextCompressionInput,
-        COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED, COMPACTION_SAFEGUARD_EVENT_PASSED,
-        COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
+        ProviderBackedEvidenceSessionContextCompressor, SessionCompactionRecordSnapshot,
+        SessionContextCompressionInput, COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED,
+        COMPACTION_SAFEGUARD_EVENT_PASSED, COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK,
+        MEMORY_FLUSH_SENSITIVE_TTL_MS, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
         PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED,
         PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED, PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED,
+        TEST_MEMORY_FLUSH_REVIEWER_FAILURE,
     };
     use crate::journal::{
         OrchestratorSessionPinRecord, OrchestratorSessionRecord,
@@ -6120,5 +6597,134 @@ Open action items:
         assert!(block.contains("trust_label=\"historical_reference\""));
         assert!(block.contains("instruction_authority=\"none\""));
         assert!(block.ends_with("</session_compaction_summary>"));
+    }
+
+    fn memory_flush_record(
+        seq: i64,
+        event_type: &str,
+        text: &str,
+    ) -> SessionCompactionRecordSnapshot {
+        SessionCompactionRecordSnapshot {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5MF1".to_owned(),
+            seq,
+            event_type: event_type.to_owned(),
+            created_at_unix_ms: 1_000_i64.saturating_add(seq),
+            text: text.to_owned(),
+            bucket: "condensed",
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn memory_flush_merges_duplicate_fact_citations() {
+        let records = vec![
+            memory_flush_record(
+                1,
+                "message.received",
+                "The deployment daemon listens on the configured local gateway port.",
+            ),
+            memory_flush_record(
+                2,
+                "message.received",
+                "The deployment daemon listens on the configured local gateway port.",
+            ),
+        ];
+
+        let projection = build_memory_flush_projection(records.as_slice());
+
+        assert_eq!(projection.candidates.len(), 1);
+        assert_eq!(projection.candidates[0].kind, MemoryFlushCandidateKind::Fact);
+        assert_eq!(projection.candidates[0].citations.len(), 2);
+        assert!(!projection.candidates[0].permanent_write_allowed);
+        assert_eq!(projection.maintenance_metrics.duplicate_fact_count, 1);
+    }
+
+    #[test]
+    fn memory_flush_routes_contradiction_to_review() {
+        let records = vec![
+            memory_flush_record(
+                1,
+                "message.received",
+                "The operator setting must enable local deployment mode by default.",
+            ),
+            memory_flush_record(
+                2,
+                "message.received",
+                "The operator setting must disable local deployment mode by default.",
+            ),
+        ];
+
+        let projection = build_memory_flush_projection(records.as_slice());
+
+        assert_eq!(projection.maintenance_metrics.contradiction_count, 1);
+        assert!(
+            projection.candidates.iter().all(|candidate| {
+                candidate.review_state == "review_required"
+                    && candidate
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == "memory_flush.contradiction_detected")
+            }),
+            "contradictory candidates should remain review-only: {:?}",
+            projection.candidates
+        );
+    }
+
+    #[test]
+    fn memory_flush_redacts_secret_shaped_content() {
+        let records = vec![memory_flush_record(
+            1,
+            "message.received",
+            "The production API key is sk-prod-1234567890abcdef and should be remembered.",
+        )];
+
+        let projection = build_memory_flush_projection(records.as_slice());
+        let candidate = projection.candidates.first().expect("secret candidate should be reported");
+
+        assert_eq!(candidate.sensitivity, MemoryFlushSensitivity::Sensitive);
+        assert_eq!(candidate.review_state, "blocked_sensitive");
+        assert_eq!(candidate.content, "<redacted-memory-flush-candidate>");
+        assert_eq!(candidate.retention_ttl_ms, MEMORY_FLUSH_SENSITIVE_TTL_MS);
+        assert!(!serde_json::to_string(&projection)
+            .expect("projection should serialize")
+            .contains("sk-prod"));
+    }
+
+    #[test]
+    fn memory_flush_tracks_user_correction_provenance() {
+        let records = vec![memory_flush_record(
+            1,
+            "message.received",
+            "Correction: I meant the local gateway must remain private by default.",
+        )];
+
+        let projection = build_memory_flush_projection(records.as_slice());
+        let candidate =
+            projection.candidates.first().expect("correction candidate should be retained");
+
+        assert_eq!(candidate.assertion_kind, MemoryFlushAssertionKind::UserFact);
+        assert_eq!(candidate.provenance_kind, "user_correction");
+        assert_eq!(candidate.confidence, 0.97);
+        assert_eq!(projection.maintenance_metrics.user_correction_count, 1);
+        assert_eq!(candidate.citations.len(), 1);
+    }
+
+    #[test]
+    fn memory_flush_reviewer_failure_does_not_block_compaction() {
+        TEST_MEMORY_FLUSH_REVIEWER_FAILURE.with(|failure| failure.set(true));
+        let projection = build_memory_flush_projection(&[memory_flush_record(
+            1,
+            "message.received",
+            "The daemon runtime uses a journal-backed local state database.",
+        )]);
+        TEST_MEMORY_FLUSH_REVIEWER_FAILURE.with(|failure| failure.set(false));
+
+        assert_eq!(projection.reviewer_status, "reviewer_failed");
+        assert!(projection.compaction_continues);
+        assert!(projection
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "memory_flush.reviewer_failure_non_blocking"));
+        assert!(projection.candidates.iter().all(|candidate| !candidate.permanent_write_allowed));
     }
 }

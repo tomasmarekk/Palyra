@@ -1088,6 +1088,56 @@ pub struct MemoryEmbeddingsStatus {
     pub queue: MemoryEmbeddingQueueStatus,
 }
 
+/// Count-only inventory used by the memory index doctor.
+///
+/// The report deliberately excludes memory text and identifiers. Every count
+/// is derived from journal-owned rows and rebuildable lexical/vector
+/// projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryIndexInventory {
+    pub lexical_missing_count: u64,
+    pub lexical_stale_count: u64,
+    pub lexical_duplicate_count: u64,
+    pub lexical_orphan_count: u64,
+    pub vector_missing_count: u64,
+    pub vector_stale_count: u64,
+    pub vector_orphan_count: u64,
+    pub workspace_missing_count: u64,
+    pub workspace_stale_count: u64,
+    pub workspace_duplicate_count: u64,
+    pub workspace_orphan_count: u64,
+    pub duplicate_fact_count: u64,
+}
+
+/// Durable cursor for a bounded, journal-derived memory index rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebuildCheckpoint {
+    pub schema_version: u64,
+    pub checkpoint_key: String,
+    pub generation: u64,
+    pub state: String,
+    pub source_memory_count: u64,
+    pub source_workspace_count: u64,
+    pub indexed_memory_count: u64,
+    pub indexed_workspace_count: u64,
+    pub batch_size: usize,
+    pub started_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    pub reason_code: String,
+}
+
+/// Inputs for advancing one bounded rebuild batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildCheckpointAdvanceRequest {
+    pub checkpoint_key: String,
+    pub source_memory_count: u64,
+    pub source_workspace_count: u64,
+    pub batch_size: usize,
+    pub now_unix_ms: i64,
+}
+
 fn memory_embeddings_status_quality(
     mode: MemoryEmbeddingsMode,
     production_default_active: bool,
@@ -5513,6 +5563,26 @@ const MIGRATION_102_SQL: &str = r#"
     END;
 "#;
 
+const MIGRATION_103_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS memory_index_rebuild_checkpoints (
+        checkpoint_key TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        source_memory_count INTEGER NOT NULL,
+        source_workspace_count INTEGER NOT NULL,
+        indexed_memory_count INTEGER NOT NULL,
+        indexed_workspace_count INTEGER NOT NULL,
+        batch_size INTEGER NOT NULL,
+        started_at_unix_ms INTEGER NOT NULL,
+        updated_at_unix_ms INTEGER NOT NULL,
+        completed_at_unix_ms INTEGER,
+        reason_code TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_index_rebuild_state
+        ON memory_index_rebuild_checkpoints(state, updated_at_unix_ms);
+"#;
+
 // INTENTIONAL: this list is append-only history. Versions already shipped have
 // been applied to live databases and are skipped on startup, so never edit or
 // reorder an existing entry -- add a new `Migration` with the next version.
@@ -7919,6 +7989,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: mcp_runtime::MIGRATION_101_SQL,
     },
     Migration { version: 102, name: "session_search_fts_projection", sql: MIGRATION_102_SQL },
+    Migration { version: 103, name: "memory_index_rebuild_checkpoints", sql: MIGRATION_103_SQL },
 ];
 
 fn emit_background_task_wake_events_tx(
@@ -25061,6 +25132,492 @@ impl JournalStore {
         })
     }
 
+    /// Inspects journal-owned memory/workspace rows against their rebuildable
+    /// lexical and vector projections.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if an inventory query fails.
+    pub fn memory_index_inventory(&self) -> Result<MemoryIndexInventory, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let lexical_missing_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_items AS memory
+                LEFT JOIN memory_items_fts AS lexical
+                    ON lexical.memory_ulid = memory.memory_ulid
+                WHERE lexical.rowid IS NULL
+            "#,
+            [],
+        )?;
+        let lexical_stale_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_items AS memory
+                INNER JOIN memory_items_fts AS lexical
+                    ON lexical.memory_ulid = memory.memory_ulid
+                WHERE lexical.content_text != memory.content_text
+            "#,
+            [],
+        )?;
+        let lexical_duplicate_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COALESCE(SUM(entry_count - 1), 0)
+                FROM (
+                    SELECT COUNT(*) AS entry_count
+                    FROM memory_items_fts
+                    GROUP BY memory_ulid
+                    HAVING COUNT(*) > 1
+                )
+            "#,
+            [],
+        )?;
+        let lexical_orphan_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_items_fts AS lexical
+                LEFT JOIN memory_items AS memory
+                    ON memory.memory_ulid = lexical.memory_ulid
+                WHERE memory.memory_ulid IS NULL
+            "#,
+            [],
+        )?;
+        let vector_missing_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_items AS memory
+                LEFT JOIN memory_vectors AS vectors
+                    ON vectors.memory_ulid = memory.memory_ulid
+                WHERE vectors.memory_ulid IS NULL
+            "#,
+            [],
+        )?;
+        let vector_stale_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_items AS memory
+                INNER JOIN memory_vectors AS vectors
+                    ON vectors.memory_ulid = memory.memory_ulid
+                WHERE
+                    COALESCE(vectors.embedding_model_id, vectors.embedding_model, '') != ?1 OR
+                    COALESCE(vectors.embedding_dims, vectors.dims, 0) != ?2 OR
+                    COALESCE(vectors.embedding_version, 0) != ?3
+            "#,
+            params![
+                self.memory_embedding_runtime.active_model_id.as_str(),
+                i64::try_from(self.memory_embedding_runtime.active_dims).map_err(|_| {
+                    JournalError::InvalidArgument(
+                        "memory embedding dimensions exceed sqlite integer range".to_owned(),
+                    )
+                })?,
+                CURRENT_MEMORY_EMBEDDING_VERSION,
+            ],
+        )?;
+        let vector_orphan_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM memory_vectors AS vectors
+                LEFT JOIN memory_items AS memory
+                    ON memory.memory_ulid = vectors.memory_ulid
+                WHERE memory.memory_ulid IS NULL
+            "#,
+            [],
+        )?;
+        let workspace_missing_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM workspace_documents AS document
+                WHERE document.deleted_at_unix_ms IS NULL
+                  AND TRIM(document.content_text) != ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_document_chunks AS chunk
+                      WHERE chunk.document_ulid = document.document_ulid
+                        AND chunk.version = document.latest_version
+                        AND chunk.is_latest = 1
+                  )
+            "#,
+            [],
+        )?;
+        let workspace_stale_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM workspace_document_chunks AS chunk
+                INNER JOIN workspace_documents AS document
+                    ON document.document_ulid = chunk.document_ulid
+                WHERE chunk.is_latest = 1
+                  AND (
+                      document.deleted_at_unix_ms IS NOT NULL OR
+                      chunk.version != document.latest_version OR
+                      chunk.path != document.path
+                  )
+            "#,
+            [],
+        )?;
+        let workspace_duplicate_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COALESCE(SUM(entry_count - 1), 0)
+                FROM (
+                    SELECT COUNT(*) AS entry_count
+                    FROM workspace_document_chunks
+                    WHERE is_latest = 1
+                    GROUP BY document_ulid, version, chunk_index
+                    HAVING COUNT(*) > 1
+                )
+            "#,
+            [],
+        )?;
+        let workspace_orphan_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COUNT(*)
+                FROM workspace_document_chunks AS chunk
+                LEFT JOIN workspace_documents AS document
+                    ON document.document_ulid = chunk.document_ulid
+                WHERE document.document_ulid IS NULL
+            "#,
+            [],
+        )?;
+        let duplicate_fact_count = query_nonnegative_count(
+            &guard,
+            r#"
+                SELECT COALESCE(SUM(entry_count - 1), 0)
+                FROM (
+                    SELECT COUNT(*) AS entry_count
+                    FROM memory_items
+                    GROUP BY
+                        principal,
+                        COALESCE(channel, ''),
+                        COALESCE(session_ulid, ''),
+                        content_hash
+                    HAVING COUNT(*) > 1
+                )
+            "#,
+            [],
+        )?;
+        Ok(MemoryIndexInventory {
+            lexical_missing_count,
+            lexical_stale_count,
+            lexical_duplicate_count,
+            lexical_orphan_count,
+            vector_missing_count,
+            vector_stale_count,
+            vector_orphan_count,
+            workspace_missing_count,
+            workspace_stale_count,
+            workspace_duplicate_count,
+            workspace_orphan_count,
+            duplicate_fact_count,
+        })
+    }
+
+    /// Returns the latest durable rebuild cursor for `checkpoint_key`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the checkpoint query fails.
+    pub fn memory_index_rebuild_checkpoint(
+        &self,
+        checkpoint_key: &str,
+    ) -> Result<Option<RebuildCheckpoint>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_memory_index_rebuild_checkpoint(&guard, checkpoint_key)
+    }
+
+    /// Advances one bounded, idempotent rebuild batch and commits its cursor
+    /// atomically with the resulting state.
+    ///
+    /// A completed checkpoint is returned unchanged while source counts remain
+    /// identical. When journal counts change, a new generation starts from
+    /// zero because the index is a disposable projection, never authority.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] for invalid inputs, conversion overflow, or a
+    /// failed SQLite transaction.
+    pub fn advance_memory_index_rebuild_checkpoint(
+        &self,
+        request: &RebuildCheckpointAdvanceRequest,
+    ) -> Result<RebuildCheckpoint, JournalError> {
+        let checkpoint_key = request.checkpoint_key.trim();
+        if checkpoint_key.is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "memory index rebuild checkpoint key cannot be empty".to_owned(),
+            ));
+        }
+        let effective_batch = request.batch_size.clamp(1, 10_000);
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = load_memory_index_rebuild_checkpoint(&transaction, checkpoint_key)?;
+        if let Some(checkpoint) = existing.as_ref() {
+            if checkpoint.state == "completed"
+                && checkpoint.source_memory_count == request.source_memory_count
+                && checkpoint.source_workspace_count == request.source_workspace_count
+            {
+                transaction.commit()?;
+                return Ok(checkpoint.clone());
+            }
+        }
+
+        let sources_match = existing.as_ref().is_some_and(|checkpoint| {
+            checkpoint.state == "running"
+                && checkpoint.source_memory_count == request.source_memory_count
+                && checkpoint.source_workspace_count == request.source_workspace_count
+        });
+        let generation = if sources_match {
+            existing.as_ref().map(|checkpoint| checkpoint.generation).unwrap_or(1)
+        } else {
+            existing.as_ref().map(|checkpoint| checkpoint.generation.saturating_add(1)).unwrap_or(1)
+        };
+        let started_at_unix_ms = if sources_match {
+            existing
+                .as_ref()
+                .map(|checkpoint| checkpoint.started_at_unix_ms)
+                .unwrap_or(request.now_unix_ms)
+        } else {
+            request.now_unix_ms
+        };
+        let previous_memory = if sources_match {
+            existing.as_ref().map(|checkpoint| checkpoint.indexed_memory_count).unwrap_or(0)
+        } else {
+            0
+        };
+        let previous_workspace = if sources_match {
+            existing.as_ref().map(|checkpoint| checkpoint.indexed_workspace_count).unwrap_or(0)
+        } else {
+            0
+        };
+        let batch_u64 = u64::try_from(effective_batch).map_err(|_| {
+            JournalError::InvalidArgument(
+                "memory index rebuild batch size exceeds supported range".to_owned(),
+            )
+        })?;
+        let indexed_memory_count =
+            previous_memory.saturating_add(batch_u64).min(request.source_memory_count);
+        let indexed_workspace_count =
+            previous_workspace.saturating_add(batch_u64).min(request.source_workspace_count);
+        let complete = indexed_memory_count == request.source_memory_count
+            && indexed_workspace_count == request.source_workspace_count;
+        let checkpoint = RebuildCheckpoint {
+            schema_version: 1,
+            checkpoint_key: checkpoint_key.to_owned(),
+            generation,
+            state: if complete { "completed" } else { "running" }.to_owned(),
+            source_memory_count: request.source_memory_count,
+            source_workspace_count: request.source_workspace_count,
+            indexed_memory_count,
+            indexed_workspace_count,
+            batch_size: effective_batch,
+            started_at_unix_ms,
+            updated_at_unix_ms: request.now_unix_ms,
+            completed_at_unix_ms: complete.then_some(request.now_unix_ms),
+            reason_code: if complete {
+                "memory_index.rebuild.completed"
+            } else {
+                "memory_index.rebuild.batch_committed"
+            }
+            .to_owned(),
+        };
+        upsert_memory_index_rebuild_checkpoint(&transaction, &checkpoint)?;
+        transaction.commit()?;
+        Ok(checkpoint)
+    }
+
+    /// Repairs one bounded batch of rebuildable lexical/vector projections.
+    ///
+    /// Duplicate source facts remain untouched because journal rows are
+    /// authoritative and require operator review; only derived rows are
+    /// deleted or regenerated.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when projection discovery, embedding backfill,
+    /// or the repair transaction fails.
+    pub fn repair_memory_index_projections(&self, batch_size: usize) -> Result<(), JournalError> {
+        let effective_batch = batch_size.clamp(1, 10_000);
+        let _embedding_outcome = self.run_memory_embeddings_backfill(effective_batch)?;
+        let now_unix_ms = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+
+        let lexical_targets = {
+            let mut statement = guard.prepare(
+                r#"
+                    SELECT memory.memory_ulid
+                    FROM memory_items AS memory
+                    LEFT JOIN memory_items_fts AS lexical
+                        ON lexical.memory_ulid = memory.memory_ulid
+                    GROUP BY memory.memory_ulid, memory.content_text
+                    HAVING
+                        COUNT(lexical.rowid) != 1 OR
+                        MAX(CASE WHEN lexical.content_text = memory.content_text THEN 1 ELSE 0 END) != 1
+                    ORDER BY memory.created_at_unix_ms ASC, memory.memory_ulid ASC
+                    LIMIT ?1
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![i64::try_from(effective_batch).map_err(|_| {
+                    JournalError::InvalidArgument(
+                        "memory index repair batch exceeds sqlite integer range".to_owned(),
+                    )
+                })?],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let workspace_targets = {
+            let mut statement = guard.prepare(
+                r#"
+                    SELECT
+                        document.document_ulid,
+                        document.principal,
+                        document.channel,
+                        document.agent_id,
+                        document.path,
+                        document.latest_version,
+                        document.content_text,
+                        document.risk_state,
+                        document.prompt_binding,
+                        document.updated_at_unix_ms
+                    FROM workspace_documents AS document
+                    WHERE document.deleted_at_unix_ms IS NULL
+                      AND TRIM(document.content_text) != ''
+                      AND (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_document_chunks AS chunk
+                              WHERE chunk.document_ulid = document.document_ulid
+                                AND chunk.version = document.latest_version
+                                AND chunk.is_latest = 1
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM workspace_document_chunks AS chunk
+                              WHERE chunk.document_ulid = document.document_ulid
+                                AND chunk.is_latest = 1
+                                AND (
+                                    chunk.version != document.latest_version OR
+                                    chunk.path != document.path
+                                )
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM workspace_document_chunks AS chunk
+                              WHERE chunk.document_ulid = document.document_ulid
+                                AND chunk.is_latest = 1
+                              GROUP BY chunk.version, chunk.chunk_index
+                              HAVING COUNT(*) > 1
+                          )
+                      )
+                    ORDER BY document.updated_at_unix_ms ASC, document.document_ulid ASC
+                    LIMIT ?1
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![i64::try_from(effective_batch).map_err(|_| {
+                    JournalError::InvalidArgument(
+                        "workspace index repair batch exceeds sqlite integer range".to_owned(),
+                    )
+                })?],
+                |row| {
+                    Ok(MemoryIndexWorkspaceRepairTarget {
+                        document_id: row.get(0)?,
+                        principal: row.get(1)?,
+                        channel: row.get(2)?,
+                        agent_id: row.get(3)?,
+                        path: row.get(4)?,
+                        version: row.get(5)?,
+                        content_text: row.get(6)?,
+                        risk_state: row.get(7)?,
+                        prompt_binding: row.get(8)?,
+                        updated_at_unix_ms: row.get(9)?,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for memory_id in lexical_targets {
+            transaction.execute(
+                "DELETE FROM memory_items_fts WHERE memory_ulid = ?1",
+                params![memory_id.as_str()],
+            )?;
+            transaction.execute(
+                r#"
+                    INSERT INTO memory_items_fts (memory_ulid, content_text)
+                    SELECT memory_ulid, content_text
+                    FROM memory_items
+                    WHERE memory_ulid = ?1
+                "#,
+                params![memory_id.as_str()],
+            )?;
+        }
+        transaction.execute(
+            r#"
+                DELETE FROM memory_items_fts
+                WHERE rowid IN (
+                    SELECT lexical.rowid
+                    FROM memory_items_fts AS lexical
+                    LEFT JOIN memory_items AS memory
+                        ON memory.memory_ulid = lexical.memory_ulid
+                    WHERE memory.memory_ulid IS NULL
+                    LIMIT ?1
+                )
+            "#,
+            params![i64::try_from(effective_batch).map_err(|_| {
+                JournalError::InvalidArgument(
+                    "memory orphan repair batch exceeds sqlite integer range".to_owned(),
+                )
+            })?],
+        )?;
+        for target in &workspace_targets {
+            reindex_workspace_document_chunks_tx(
+                &transaction,
+                self.memory_embedding_provider.as_ref(),
+                WorkspaceChunkReindexArgs {
+                    document_id: target.document_id.as_str(),
+                    principal: target.principal.as_str(),
+                    channel: target.channel.as_deref(),
+                    agent_id: target.agent_id.as_deref(),
+                    path: target.path.as_str(),
+                    version: target.version,
+                    content_text: target.content_text.as_str(),
+                    risk_state: target.risk_state.as_str(),
+                    prompt_binding: target.prompt_binding.as_str(),
+                    created_at_unix_ms: target.updated_at_unix_ms.max(now_unix_ms),
+                    embedding_dims: self.memory_embedding_provider.dimensions(),
+                },
+            )?;
+        }
+        transaction.execute(
+            r#"
+                DELETE FROM workspace_document_chunks
+                WHERE chunk_ulid IN (
+                    SELECT chunk.chunk_ulid
+                    FROM workspace_document_chunks AS chunk
+                    LEFT JOIN workspace_documents AS document
+                        ON document.document_ulid = chunk.document_ulid
+                    WHERE document.document_ulid IS NULL
+                    LIMIT ?1
+                )
+            "#,
+            params![i64::try_from(effective_batch).map_err(|_| {
+                JournalError::InvalidArgument(
+                    "workspace orphan repair batch exceeds sqlite integer range".to_owned(),
+                )
+            })?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Applies retention (TTL, entry, and byte caps) to memory items and recall
     /// artifacts, optionally VACUUMs, and persists the maintenance bookkeeping.
     ///
@@ -27113,6 +27670,20 @@ struct WorkspaceChunkReindexArgs<'a> {
     embedding_dims: usize,
 }
 
+#[derive(Debug, Clone)]
+struct MemoryIndexWorkspaceRepairTarget {
+    document_id: String,
+    principal: String,
+    channel: Option<String>,
+    agent_id: Option<String>,
+    path: String,
+    version: i64,
+    content_text: String,
+    risk_state: String,
+    prompt_binding: String,
+    updated_at_unix_ms: i64,
+}
+
 /// Restricts `path` to owner-only access on Unix; the non-Unix twin is a no-op.
 #[cfg(unix)]
 fn enforce_owner_only_permissions(path: &Path, mode: u32) -> Result<(), JournalError> {
@@ -28779,9 +29350,7 @@ fn load_session_search_candidates(
             .session_label
             .as_deref()
             .filter(|title| !title.trim().is_empty())
-            .or_else(|| {
-                session.auto_title.as_deref().filter(|title| !title.trim().is_empty())
-            })
+            .or_else(|| session.auto_title.as_deref().filter(|title| !title.trim().is_empty()))
             .unwrap_or_default();
         if !session_search_text_matches(text.as_str(), normalized_query, query_terms)
             && !session_search_text_matches(effective_title, normalized_query, query_terms)
@@ -32788,6 +33357,136 @@ fn query_memory_usage_snapshot(
         entries: entries_raw.max(0) as u64,
         approx_bytes: bytes_raw.max(0) as u64,
     })
+}
+
+fn query_nonnegative_count<P>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<u64, JournalError>
+where
+    P: rusqlite::Params,
+{
+    let raw = connection.query_row(sql, params, |row| row.get::<_, i64>(0))?;
+    Ok(raw.max(0) as u64)
+}
+
+fn load_memory_index_rebuild_checkpoint(
+    connection: &Connection,
+    checkpoint_key: &str,
+) -> Result<Option<RebuildCheckpoint>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    schema_version,
+                    checkpoint_key,
+                    generation,
+                    state,
+                    source_memory_count,
+                    source_workspace_count,
+                    indexed_memory_count,
+                    indexed_workspace_count,
+                    batch_size,
+                    started_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms,
+                    reason_code
+                FROM memory_index_rebuild_checkpoints
+                WHERE checkpoint_key = ?1
+            "#,
+            params![checkpoint_key],
+            |row| {
+                Ok(RebuildCheckpoint {
+                    schema_version: clamp_nonnegative_i64_to_u64(row.get(0)?),
+                    checkpoint_key: row.get(1)?,
+                    generation: clamp_nonnegative_i64_to_u64(row.get(2)?),
+                    state: row.get(3)?,
+                    source_memory_count: clamp_nonnegative_i64_to_u64(row.get(4)?),
+                    source_workspace_count: clamp_nonnegative_i64_to_u64(row.get(5)?),
+                    indexed_memory_count: clamp_nonnegative_i64_to_u64(row.get(6)?),
+                    indexed_workspace_count: clamp_nonnegative_i64_to_u64(row.get(7)?),
+                    batch_size: nonnegative_i64_to_usize(row.get(8)?),
+                    started_at_unix_ms: row.get(9)?,
+                    updated_at_unix_ms: row.get(10)?,
+                    completed_at_unix_ms: row.get(11)?,
+                    reason_code: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn upsert_memory_index_rebuild_checkpoint(
+    transaction: &Transaction<'_>,
+    checkpoint: &RebuildCheckpoint,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        r#"
+            INSERT INTO memory_index_rebuild_checkpoints (
+                checkpoint_key,
+                schema_version,
+                generation,
+                state,
+                source_memory_count,
+                source_workspace_count,
+                indexed_memory_count,
+                indexed_workspace_count,
+                batch_size,
+                started_at_unix_ms,
+                updated_at_unix_ms,
+                completed_at_unix_ms,
+                reason_code
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(checkpoint_key) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                generation = excluded.generation,
+                state = excluded.state,
+                source_memory_count = excluded.source_memory_count,
+                source_workspace_count = excluded.source_workspace_count,
+                indexed_memory_count = excluded.indexed_memory_count,
+                indexed_workspace_count = excluded.indexed_workspace_count,
+                batch_size = excluded.batch_size,
+                started_at_unix_ms = excluded.started_at_unix_ms,
+                updated_at_unix_ms = excluded.updated_at_unix_ms,
+                completed_at_unix_ms = excluded.completed_at_unix_ms,
+                reason_code = excluded.reason_code
+        "#,
+        params![
+            checkpoint.checkpoint_key.as_str(),
+            sqlite_i64(checkpoint.schema_version, "rebuild checkpoint schema version")?,
+            sqlite_i64(checkpoint.generation, "rebuild checkpoint generation")?,
+            checkpoint.state.as_str(),
+            sqlite_i64(checkpoint.source_memory_count, "source memory count")?,
+            sqlite_i64(checkpoint.source_workspace_count, "source workspace count")?,
+            sqlite_i64(checkpoint.indexed_memory_count, "indexed memory count")?,
+            sqlite_i64(checkpoint.indexed_workspace_count, "indexed workspace count")?,
+            i64::try_from(checkpoint.batch_size).map_err(|_| {
+                JournalError::InvalidArgument(
+                    "memory index rebuild batch size exceeds sqlite integer range".to_owned(),
+                )
+            })?,
+            checkpoint.started_at_unix_ms,
+            checkpoint.updated_at_unix_ms,
+            checkpoint.completed_at_unix_ms,
+            checkpoint.reason_code.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64, JournalError> {
+    i64::try_from(value)
+        .map_err(|_| JournalError::InvalidArgument(format!("{field} exceeds sqlite integer range")))
+}
+
+fn clamp_nonnegative_i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn nonnegative_i64_to_usize(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
 }
 
 fn query_pending_memory_embeddings_count(
@@ -55988,5 +56687,118 @@ mod tests {
             .expect("workspace restore report should exist");
         assert_eq!(report.device_id, "device-alpha");
         assert_eq!(report.result_state, "succeeded");
+    }
+
+    #[test]
+    fn memory_index_inventory_reports_projection_drift_and_duplicate_facts() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let first_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5MI1";
+        let second_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5MI2";
+        for memory_id in [first_memory_id, second_memory_id] {
+            store
+                .create_memory_item(&sample_memory_request(
+                    memory_id,
+                    "user:ops",
+                    Some("cli"),
+                    Some("01ARZ3NDEKTSV4RRFFQ69G5FAR"),
+                    MemorySource::TapeUserMessage,
+                    "operator prefers deterministic releases",
+                ))
+                .expect("memory item should be created");
+        }
+
+        {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            guard
+                .execute(
+                    "DELETE FROM memory_items_fts WHERE memory_ulid = ?1",
+                    params![first_memory_id],
+                )
+                .expect("lexical projection should be removable");
+            guard
+                .execute(
+                    "UPDATE memory_items_fts SET content_text = ?2 WHERE memory_ulid = ?1",
+                    params![second_memory_id, "stale lexical content"],
+                )
+                .expect("lexical projection should be mutable for drift simulation");
+            guard
+                .execute(
+                    "INSERT INTO memory_items_fts(memory_ulid, content_text) VALUES (?1, ?2)",
+                    params![second_memory_id, "operator prefers deterministic releases"],
+                )
+                .expect("duplicate lexical projection should be insertable");
+            guard
+                .execute(
+                    "INSERT INTO memory_items_fts(memory_ulid, content_text) VALUES (?1, ?2)",
+                    params!["01ARZ3NDEKTSV4RRFFQ69G5MIO", "orphan lexical content"],
+                )
+                .expect("orphan lexical projection should be insertable");
+            guard
+                .execute(
+                    "DELETE FROM memory_vectors WHERE memory_ulid = ?1",
+                    params![first_memory_id],
+                )
+                .expect("vector projection should be removable");
+        }
+
+        let inventory = store.memory_index_inventory().expect("memory index inventory should load");
+        assert_eq!(inventory.lexical_missing_count, 1);
+        assert_eq!(inventory.lexical_stale_count, 1);
+        assert_eq!(inventory.lexical_duplicate_count, 1);
+        assert_eq!(inventory.lexical_orphan_count, 1);
+        assert_eq!(inventory.vector_missing_count, 1);
+        assert_eq!(inventory.duplicate_fact_count, 1);
+    }
+
+    #[test]
+    fn memory_index_rebuild_checkpoint_is_idempotent_and_resumable() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let request = |source_memory_count, now_unix_ms| super::RebuildCheckpointAdvanceRequest {
+            checkpoint_key: "external_retrieval".to_owned(),
+            source_memory_count,
+            source_workspace_count: 2,
+            batch_size: 1,
+            now_unix_ms,
+        };
+
+        let first = store
+            .advance_memory_index_rebuild_checkpoint(&request(3, 100))
+            .expect("first rebuild batch should commit");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.state, "running");
+        assert_eq!(first.indexed_memory_count, 1);
+        assert_eq!(first.indexed_workspace_count, 1);
+
+        let second = store
+            .advance_memory_index_rebuild_checkpoint(&request(3, 200))
+            .expect("second rebuild batch should resume");
+        assert_eq!(second.generation, 1);
+        assert_eq!(second.state, "running");
+        assert_eq!(second.indexed_memory_count, 2);
+        assert_eq!(second.indexed_workspace_count, 2);
+
+        let completed = store
+            .advance_memory_index_rebuild_checkpoint(&request(3, 300))
+            .expect("final rebuild batch should complete");
+        assert_eq!(completed.state, "completed");
+        assert_eq!(completed.indexed_memory_count, 3);
+        assert_eq!(completed.indexed_workspace_count, 2);
+
+        let idempotent = store
+            .advance_memory_index_rebuild_checkpoint(&request(3, 400))
+            .expect("completed rebuild should be idempotent");
+        assert_eq!(idempotent, completed);
+
+        let next_generation = store
+            .advance_memory_index_rebuild_checkpoint(&request(4, 500))
+            .expect("changed journal counts should start a new generation");
+        assert_eq!(next_generation.generation, 2);
+        assert_eq!(next_generation.state, "running");
+        assert_eq!(next_generation.indexed_memory_count, 1);
+        assert_eq!(next_generation.indexed_workspace_count, 1);
     }
 }
