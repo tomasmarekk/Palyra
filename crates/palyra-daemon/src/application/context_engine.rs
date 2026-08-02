@@ -4759,6 +4759,40 @@ mod tests {
                         "source_refs": ["segment:user_input:ship it"]
                     }
                 ],
+                "prompt_composition": {
+                    "schema_version": 1,
+                    "report_hash": "8ae873bb1a8bc02f8a64c9c06b3cce42392e3bfab4b898493b47b9bc4d06d7a7",
+                    "redaction_level": "hash_only_sources_no_raw_content",
+                    "segments": [
+                        {
+                            "kind": "context_references",
+                            "authority": "untrusted_evidence",
+                            "estimated_tokens": 48,
+                            "selected_state": "selected",
+                            "reason": "protected_active_context",
+                            "source_hash": "e69314bd4d571902d70301f561b7af7d261093df86a4acb17835a684f602f44d",
+                            "cache_segment": "dynamic"
+                        },
+                        {
+                            "kind": "preference_context",
+                            "authority": "untrusted_evidence",
+                            "estimated_tokens": 64,
+                            "selected_state": "selected",
+                            "reason": "protected_active_context",
+                            "source_hash": "71bbefe09528f4b22bce95a35dccf632b33143b5b9b8385948719c9e3464fe51",
+                            "cache_segment": "stable_prefix"
+                        },
+                        {
+                            "kind": "user_input",
+                            "authority": "user_input",
+                            "estimated_tokens": 24,
+                            "selected_state": "selected",
+                            "reason": "protected_active_context",
+                            "source_hash": "53322cf40408da4154a39388c05c6cb85dd572ab42b44ec27dd4b83147f9ba7f",
+                            "cache_segment": "dynamic"
+                        }
+                    ]
+                },
                 "selected_segments": [
                     {
                         "kind": "preference_context",

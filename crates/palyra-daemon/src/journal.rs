@@ -28603,12 +28603,12 @@ fn search_orchestrator_session_windows(
         lexical_candidate_count: total_windows,
         vector_candidate_count: 0,
     });
-    diagnostics.degraded_reason = Some("session_semantic_rerank_disabled".to_owned());
+    diagnostics.degraded_reason = Some("transcript_vector_index_unavailable".to_owned());
     diagnostics.fused_hit_count = total_windows;
     diagnostics.coverage_gap = if total_windows == 0 {
         Some("no_session_windows".to_owned())
     } else {
-        Some("semantic_rerank_not_requested".to_owned())
+        Some("vector_branch_empty".to_owned())
     };
 
     Ok(SessionSearchOutcome { query: normalized_query.to_owned(), groups, diagnostics })

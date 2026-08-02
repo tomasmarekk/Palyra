@@ -1628,8 +1628,23 @@ fn memory_session_search_schema_targets_prior_transcripts() {
 
     assert!(entry.description.contains("prior session transcripts"));
     assert!(alias.description.contains("Compatibility alias"));
-    assert_eq!(alias.input_schema["required"][0], "query");
-    assert_eq!(entry.input_schema["required"][0], "query");
+    assert!(
+        alias.input_schema["required"].as_array().is_some_and(Vec::is_empty),
+        "recent browse must not require a query"
+    );
+    assert!(
+        entry.input_schema["required"].as_array().is_some_and(Vec::is_empty),
+        "recent browse must not require a query"
+    );
+    assert!(entry.input_schema["properties"].get("query").is_some());
+    assert!(alias.input_schema["properties"].get("query").is_some());
+    assert!(entry.input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .is_some_and(|operations| operations.iter().any(|operation| operation == "recent")));
+    assert!(entry.input_schema["properties"]["operation"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Search requires query"));
     assert!(entry.input_schema["properties"]["query"]["description"]
         .as_str()
         .unwrap_or_default()
