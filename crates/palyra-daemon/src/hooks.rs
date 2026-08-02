@@ -927,6 +927,7 @@ pub(crate) async fn dispatch_named_event_with_report(
                         "output_sha256": crate::sha256_hex(
                             serde_json::to_vec(&output_json).unwrap_or_default().as_slice()
                         ),
+                        "output": hook_dispatch_output_metadata(&output_json),
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -1428,6 +1429,15 @@ fn attach_lifecycle_decision(mut output_json: Value, decision: &RunLifecycleHook
     })
 }
 
+/// Retains the stable status code without persisting arbitrary plugin output in the journal.
+fn hook_dispatch_output_metadata(output: &Value) -> Value {
+    let mut metadata = Map::new();
+    if let Some(exit_code) = output.get("exit_code").and_then(Value::as_i64) {
+        metadata.insert("exit_code".to_owned(), json!(exit_code));
+    }
+    Value::Object(metadata)
+}
+
 async fn record_hook_event(
     runtime: Arc<GatewayRuntimeState>,
     event: &str,
@@ -1496,9 +1506,9 @@ mod tests {
 
     use super::{
         attach_lifecycle_decision, build_redacted_hook_event_envelope,
-        enforce_run_lifecycle_resolution, hook_bindings_index_path, hook_run_failure_outcome,
-        lifecycle_decision_kind_from_exit_code, load_hook_bindings_index, normalize_hook_event,
-        validate_hook_output_authority, HOOK_BINDINGS_LAYOUT_VERSION,
+        enforce_run_lifecycle_resolution, hook_bindings_index_path, hook_dispatch_output_metadata,
+        hook_run_failure_outcome, lifecycle_decision_kind_from_exit_code, load_hook_bindings_index,
+        normalize_hook_event, validate_hook_output_authority, HOOK_BINDINGS_LAYOUT_VERSION,
     };
 
     #[test]
@@ -1552,6 +1562,19 @@ mod tests {
             load_hook_bindings_index(tempdir.path()).expect("hook bindings index should load");
         let hook_ids = index.entries.iter().map(|entry| entry.hook_id.as_str()).collect::<Vec<_>>();
         assert_eq!(hook_ids, vec!["a-first", "z-last"]);
+    }
+
+    #[test]
+    fn hook_dispatch_metadata_keeps_exit_code_and_redacts_raw_output() {
+        let metadata = hook_dispatch_output_metadata(&json!({
+            "exit_code": 7,
+            "secret": "must-not-reach-the-journal",
+            "nested": {
+                "payload": "untrusted"
+            }
+        }));
+
+        assert_eq!(metadata, json!({ "exit_code": 7 }));
     }
 
     #[test]
