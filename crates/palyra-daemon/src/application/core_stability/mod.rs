@@ -4,4 +4,5 @@
 //! evidence stays repository-owned and contains only bounded synthetic data.
 
 pub(crate) mod performance;
+pub(crate) mod retirement;
 pub(crate) mod security;

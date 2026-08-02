@@ -114,6 +114,10 @@ pub(crate) async fn admin_status_handler(
     let core_performance_qualification =
         crate::runtime_diagnostics::build_core_performance_qualification_snapshot();
     let security_conformance = crate::runtime_diagnostics::build_security_conformance_snapshot();
+    let legacy_retirement = crate::runtime_diagnostics::build_legacy_retirement_snapshot(
+        state.runtime.runtime_kernel_dispatcher().diagnostics(),
+        &state.runtime.config.feature_rollouts,
+    );
     let v2_rollout = crate::runtime_diagnostics::build_v2_rollout_snapshot(
         state.runtime.runtime_kernel_dispatcher().diagnostics(),
         &core_performance_qualification,
@@ -153,6 +157,7 @@ pub(crate) async fn admin_status_handler(
             "metrics_catalog": metrics_catalog.clone(),
             "core_performance_qualification": core_performance_qualification.clone(),
             "security_conformance": security_conformance.clone(),
+            "legacy_retirement": legacy_retirement.clone(),
             "v2_rollout": v2_rollout.clone(),
             "timeline": diagnostics_timeline.clone(),
             "trace_export": trace_export.clone(),
@@ -268,6 +273,7 @@ pub(crate) async fn admin_status_handler(
         map.insert("metrics_catalog".to_owned(), metrics_catalog);
         map.insert("core_performance_qualification".to_owned(), core_performance_qualification);
         map.insert("security_conformance".to_owned(), security_conformance);
+        map.insert("legacy_retirement".to_owned(), legacy_retirement);
         map.insert("v2_rollout".to_owned(), v2_rollout);
         map.insert("trace_export".to_owned(), trace_export.clone());
         map.insert("runtime_error_contract".to_owned(), runtime_error_contract.clone());

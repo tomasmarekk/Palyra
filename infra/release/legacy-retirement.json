@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "runtime_contract_version": "runtime-contracts.v15",
+  "replacement_profile": "v2",
+  "generated_from": "core-runtime-qualification",
+  "as_of": "2026-08-02",
+  "removal_deadline": "2027-02-01",
+  "legacy_routes": [
+    {
+      "route_id": "run_stream_legacy_authority",
+      "disposition": "compatibility_only",
+      "replacement": "runtime_kernel_v2",
+      "new_run_admission": false,
+      "preserves_durable_data": true,
+      "removal_condition": "all persisted legacy session authority pins are migrated or expired",
+      "owner": "runtime-kernel",
+      "evidence_refs": [
+        "profile_resolver::tests::legacy_profile_rejects_new_sessions_but_preserves_existing_session_reads",
+        "scripts/check-architecture-boundaries.sh"
+      ]
+    },
+    {
+      "route_id": "legacy_orchestrator_tape_reader",
+      "disposition": "durable_reader",
+      "replacement": "metadata_trace_v1",
+      "new_run_admission": false,
+      "preserves_durable_data": true,
+      "removal_condition": "the public replay compatibility commitment no longer requires pre-V2 tapes",
+      "owner": "journal",
+      "evidence_refs": [
+        "scripts/test/run-replay-gate.sh",
+        "scripts/test/check-runtime-contract-snapshots.sh"
+      ]
+    },
+    {
+      "route_id": "pre_v2_journal_migration",
+      "disposition": "durable_reader",
+      "replacement": "runtime_contracts_v15",
+      "new_run_admission": false,
+      "preserves_durable_data": true,
+      "removal_condition": "the immutable pre-V2 migration fixture reaches its documented retention boundary",
+      "owner": "journal",
+      "evidence_refs": [
+        "scripts/test/check-journal-migration-fixture.sh",
+        "scripts/test/check-runtime-contract-snapshots.sh"
+      ]
+    }
+  ],
+  "config_deprecations": [
+    {
+      "key": "runtime_kernel.profile=legacy",
+      "scope": "new_session_runtime_selection",
+      "replacement": "runtime_kernel.profile=v2",
+      "accepted_for_read": true,
+      "removal_condition": "all persisted legacy session authority pins are migrated or expired",
+      "reason_code": "runtime.legacy.new_session_retired"
+    },
+    {
+      "key": "feature_rollouts.context_engine",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    },
+    {
+      "key": "feature_rollouts.provider_stream_normalizer",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    },
+    {
+      "key": "feature_rollouts.provider_recovery",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    },
+    {
+      "key": "feature_rollouts.session_queue_policy",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    },
+    {
+      "key": "feature_rollouts.replay_capture",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    },
+    {
+      "key": "feature_rollouts.delivery_arbitration",
+      "scope": "runtime_kernel_generation_selection",
+      "replacement": "runtime_kernel.profile",
+      "accepted_for_read": true,
+      "removal_condition": "the runtime-generation compatibility window closes",
+      "reason_code": "runtime.config.generation_flag_deprecated"
+    }
+  ],
+  "independent_high_risk_flags": [
+    "feature_rollouts.inline_runtime_hooks",
+    "feature_rollouts.tool_result_middleware"
+  ],
+  "removed_modules": [
+    {
+      "path": "application/release_hardening.rs",
+      "replacement": "application/core_stability"
+    },
+    {
+      "path": "application/runtime_boundary_metrics.rs",
+      "replacement": "runtime_diagnostics"
+    }
+  ],
+  "orchestration_budget": {
+    "path": "crates/palyra-daemon/src/application/run_stream/orchestration.rs",
+    "max_lines": 11000,
+    "allowed_legacy_start_sites": 1
+  },
+  "release_rollback_only": true
+}

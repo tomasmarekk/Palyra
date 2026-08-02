@@ -246,7 +246,7 @@ impl RuntimeProfileResolver {
         binding: ExistingSessionBinding<'_>,
     ) -> Result<RuntimeKernelProfileConfigV1, RuntimeProfileResolverError> {
         match binding {
-            ExistingSessionBinding::New => Ok(self.configured_profile.clone()),
+            ExistingSessionBinding::New => self.new_session_profile(),
             ExistingSessionBinding::Existing { pinned_profile: Some(profile), .. } => {
                 profile.validate()?;
                 Ok(profile.clone())
@@ -321,8 +321,9 @@ impl RuntimeProfileResolver {
             {
                 return Ok(SessionAuthorityResolution::Use(persisted));
             }
+            let target_profile = self.new_session_profile()?;
             let target = resolve_runtime_authority_intent_for_principal(
-                &self.configured_profile,
+                &target_profile,
                 session_id,
                 principal,
                 availability,
@@ -338,7 +339,7 @@ impl RuntimeProfileResolver {
             return Ok(SessionAuthorityResolution::Use(persisted));
         }
         let profile = match binding {
-            ExistingSessionAuthorityBinding::New => self.configured_profile.clone(),
+            ExistingSessionAuthorityBinding::New => self.new_session_profile()?,
             ExistingSessionAuthorityBinding::Existing { pinned: None, at_safe_boundary } => {
                 match self.existing_session_policy {
                     ExistingSessionMigrationPolicy::KeepPinned => legacy_profile()?,
@@ -360,6 +361,15 @@ impl RuntimeProfileResolver {
             progress,
             self.selector.as_ref(),
         )?))
+    }
+
+    fn new_session_profile(
+        &self,
+    ) -> Result<RuntimeKernelProfileConfigV1, RuntimeProfileResolverError> {
+        if self.configured_profile.profile() == RuntimeKernelVersion::Legacy {
+            return Err(RuntimeProfileResolverError::LegacyNewSessionRetired);
+        }
+        Ok(self.configured_profile.clone())
     }
 
     /// Returns the all-legacy or all-V2 component bundle for selected authority.
@@ -559,6 +569,12 @@ pub(crate) enum RuntimeProfileResolverError {
     /// Persisted session authority pin failed the application contract.
     #[error("persisted session authority pin is invalid")]
     InvalidPersistedPin,
+    /// The retired legacy profile may read existing session state, but cannot
+    /// acquire authority for a newly admitted session.
+    #[error(
+        "runtime_kernel.profile=legacy is compatibility-only and cannot admit new sessions; use runtime_kernel.profile=v2 or roll back the release"
+    )]
+    LegacyNewSessionRetired,
 }
 
 #[cfg(test)]

@@ -1068,6 +1068,17 @@ pub(crate) fn build_security_conformance_snapshot() -> Value {
     crate::application::core_stability::security::build_security_conformance_snapshot()
 }
 
+/// Returns the fail-closed legacy retirement and config migration posture.
+pub(crate) fn build_legacy_retirement_snapshot(
+    profile: &crate::application::runtime_kernel_v2::profile_resolver::ResolvedRuntimeProfileV1,
+    feature_rollouts: &crate::config::FeatureRolloutsConfig,
+) -> Value {
+    crate::application::core_stability::retirement::build_legacy_retirement_snapshot(
+        profile,
+        feature_rollouts,
+    )
+}
+
 /// Returns the configured V2 rollout stage and release-gate decision.
 pub(crate) fn build_v2_rollout_snapshot(
     profile: &crate::application::runtime_kernel_v2::profile_resolver::ResolvedRuntimeProfileV1,

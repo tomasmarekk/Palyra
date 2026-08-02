@@ -23,8 +23,6 @@ fn set_bundle(rollouts: &mut FeatureRolloutsConfig, enabled: bool) {
     rollouts.provider_stream_normalizer = setting;
     rollouts.provider_recovery = setting;
     rollouts.session_queue_policy = setting;
-    rollouts.inline_runtime_hooks = setting;
-    rollouts.tool_result_middleware = setting;
     rollouts.replay_capture = setting;
     rollouts.delivery_arbitration = setting;
 }
@@ -51,33 +49,27 @@ fn inline_key_with_byte(byte: &str) -> RuntimeKernelSamplingKeySource {
 
 #[test]
 fn config_matrix_resolves_only_atomic_profile_bundles() {
-    for (profile, expected) in [
-        (RuntimeKernelProfile::Legacy, RuntimeComponentGeneration::Legacy),
-        (RuntimeKernelProfile::V2, RuntimeComponentGeneration::V2),
-    ] {
-        let config = RuntimeKernelConfig { profile, ..RuntimeKernelConfig::default() };
-        let mut rollouts = FeatureRolloutsConfig::default();
-        set_bundle(&mut rollouts, profile == RuntimeKernelProfile::V2);
-        let resolver =
-            RuntimeProfileResolver::resolve(&config, &rollouts, None).expect("matrix is valid");
-        let decision = resolver
-            .resolve_authority(
-                &identities("session_matrix"),
-                None,
-                ExistingSessionBinding::New,
-                None,
-                V2RuntimeAvailability::Ready,
-                RuntimeAuthorityProgressEvidence::pristine(),
-            )
-            .expect("authority should resolve");
-        let bundle = resolver.component_bundle(&decision).expect("bundle should resolve");
-        assert_eq!(bundle.generation(), expected);
-        let serialized = serde_json::to_value(bundle).expect("bundle should serialize");
-        assert!(serialized.as_object().is_some_and(|fields| {
-            let expected = if expected == RuntimeComponentGeneration::V2 { "v2" } else { "legacy" };
-            fields.values().all(|value| value.as_str() == Some(expected))
-        }));
-    }
+    let config = RuntimeKernelConfig::default();
+    let mut rollouts = FeatureRolloutsConfig::default();
+    set_bundle(&mut rollouts, true);
+    let resolver =
+        RuntimeProfileResolver::resolve(&config, &rollouts, None).expect("matrix is valid");
+    let decision = resolver
+        .resolve_authority(
+            &identities("session_matrix"),
+            None,
+            ExistingSessionBinding::New,
+            None,
+            V2RuntimeAvailability::Ready,
+            RuntimeAuthorityProgressEvidence::pristine(),
+        )
+        .expect("authority should resolve");
+    let bundle = resolver.component_bundle(&decision).expect("bundle should resolve");
+    assert_eq!(bundle.generation(), RuntimeComponentGeneration::V2);
+    let serialized = serde_json::to_value(bundle).expect("bundle should serialize");
+    assert!(serialized
+        .as_object()
+        .is_some_and(|fields| fields.values().all(|value| value.as_str() == Some("v2"))));
 
     let partial = FeatureRolloutsConfig {
         context_engine: FeatureRolloutSetting::from_config(true),
@@ -86,6 +78,37 @@ fn config_matrix_resolves_only_atomic_profile_bundles() {
     assert!(
         RuntimeProfileResolver::resolve(&RuntimeKernelConfig::default(), &partial, None).is_err()
     );
+}
+
+#[test]
+fn legacy_profile_rejects_new_sessions_but_preserves_existing_session_reads() {
+    let config = RuntimeKernelConfig {
+        profile: RuntimeKernelProfile::Legacy,
+        ..RuntimeKernelConfig::default()
+    };
+    let resolver =
+        RuntimeProfileResolver::resolve(&config, &FeatureRolloutsConfig::default(), None)
+            .expect("legacy compatibility profile should remain readable");
+    let error = match resolver.resolve_authority_intent(
+        &RuntimeSessionId::parse("session_new_retired").unwrap(),
+        None,
+        ExistingSessionAuthorityBinding::New,
+        V2RuntimeAvailability::Ready,
+        RuntimeAuthorityProgressEvidence::pristine(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("legacy profile must not acquire new-session authority"),
+    };
+    assert!(matches!(error, RuntimeProfileResolverError::LegacyNewSessionRetired));
+    assert!(error.to_string().contains("use runtime_kernel.profile=v2"));
+
+    let existing = resolver
+        .profile_for_session(ExistingSessionBinding::Existing {
+            pinned_profile: None,
+            at_safe_boundary: false,
+        })
+        .expect("existing unpinned compatibility state should remain readable");
+    assert_eq!(existing.profile(), RuntimeKernelVersion::Legacy);
 }
 
 #[test]
@@ -227,7 +250,7 @@ fn persisted_session_pin_survives_restart_config_change_and_key_rotation() {
 }
 
 #[test]
-fn safe_boundary_reports_legacy_to_v2_and_v2_to_legacy_cas_targets() {
+fn safe_boundary_reports_legacy_to_v2_and_rejects_runtime_rollback_to_legacy() {
     let session_id = RuntimeSessionId::parse("session_migration").unwrap();
     let legacy_pin = JournalSessionAuthorityPin {
         schema_version: 1,
@@ -290,23 +313,17 @@ fn safe_boundary_reports_legacy_to_v2_and_v2_to_legacy_cas_targets() {
     assert_eq!(expected_revision, 4);
     assert_eq!(target.selected_runtime(), Some(RuntimeAuthority::V2));
 
-    let SessionAuthorityResolution::Migrate { expected_revision, target } = to_legacy
-        .resolve_authority_intent(
-            &session_id,
-            None,
-            ExistingSessionAuthorityBinding::Existing {
-                pinned: Some(&v2_pin),
-                at_safe_boundary: true,
-            },
-            V2RuntimeAvailability::Ready,
-            RuntimeAuthorityProgressEvidence::pristine(),
-        )
-        .unwrap()
-    else {
-        panic!("V2 pin should request a legacy migration");
+    let error = match to_legacy.resolve_authority_intent(
+        &session_id,
+        None,
+        ExistingSessionAuthorityBinding::Existing { pinned: Some(&v2_pin), at_safe_boundary: true },
+        V2RuntimeAvailability::Ready,
+        RuntimeAuthorityProgressEvidence::pristine(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("runtime rollback to retired legacy authority must fail"),
     };
-    assert_eq!(expected_revision, 7);
-    assert_eq!(target.selected_runtime(), Some(RuntimeAuthority::Legacy));
+    assert!(matches!(error, RuntimeProfileResolverError::LegacyNewSessionRetired));
 
     assert!(matches!(
         to_v2

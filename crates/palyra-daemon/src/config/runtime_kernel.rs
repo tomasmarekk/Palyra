@@ -220,8 +220,6 @@ pub(crate) fn compatibility_bundle_resolution(
         ("provider_stream_normalizer", feature_rollouts.provider_stream_normalizer),
         ("provider_recovery", feature_rollouts.provider_recovery),
         ("session_queue_policy", feature_rollouts.session_queue_policy),
-        ("inline_runtime_hooks", feature_rollouts.inline_runtime_hooks),
-        ("tool_result_middleware", feature_rollouts.tool_result_middleware),
         ("replay_capture", feature_rollouts.replay_capture),
         ("delivery_arbitration", feature_rollouts.delivery_arbitration),
     ];
@@ -235,7 +233,7 @@ pub(crate) fn compatibility_bundle_resolution(
     if explicit.len() != settings.len() {
         let names = explicit.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
         anyhow::bail!(
-            "runtime_kernel compatibility flags must be all explicit or all absent; explicit: {names}"
+            "deprecated runtime-generation compatibility flags must be all explicit or all absent; configure runtime_kernel.profile instead; explicit: {names}"
         );
     }
     let enabled = explicit
@@ -243,7 +241,9 @@ pub(crate) fn compatibility_bundle_resolution(
         .map(|(_, setting)| setting.enabled)
         .ok_or_else(|| anyhow::anyhow!("runtime_kernel compatibility bundle is empty"))?;
     if explicit.iter().any(|(_, setting)| setting.enabled != enabled) {
-        anyhow::bail!("runtime_kernel compatibility flags cannot mix legacy and v2 behavior");
+        anyhow::bail!(
+            "deprecated runtime-generation compatibility flags cannot mix legacy and v2 behavior; configure runtime_kernel.profile instead"
+        );
     }
     let generation = if enabled {
         CompatibilityBundleGeneration::V2
@@ -294,8 +294,6 @@ mod tests {
         config.provider_stream_normalizer = setting;
         config.provider_recovery = setting;
         config.session_queue_policy = setting;
-        config.inline_runtime_hooks = setting;
-        config.tool_result_middleware = setting;
         config.replay_capture = setting;
         config.delivery_arbitration = setting;
     }
@@ -305,11 +303,26 @@ mod tests {
         let defaults = FeatureRolloutsConfig::default();
         assert_eq!(compatibility_bundle_generation(&defaults).expect("defaults are valid"), None);
 
+        let independent_high_risk = FeatureRolloutsConfig {
+            inline_runtime_hooks: FeatureRolloutSetting::from_config(true),
+            tool_result_middleware: FeatureRolloutSetting::from_env(true),
+            ..FeatureRolloutsConfig::default()
+        };
+        assert_eq!(
+            compatibility_bundle_generation(&independent_high_risk)
+                .expect("high-risk capability flags are not generation selectors"),
+            None
+        );
+
         let partial = FeatureRolloutsConfig {
             context_engine: FeatureRolloutSetting::from_config(true),
             ..FeatureRolloutsConfig::default()
         };
-        assert!(compatibility_bundle_generation(&partial).is_err());
+        let error = compatibility_bundle_generation(&partial)
+            .expect_err("partial generation bundle should fail closed");
+        let message = error.to_string();
+        assert!(message.contains("deprecated runtime-generation compatibility flags"));
+        assert!(message.contains("configure runtime_kernel.profile instead"));
 
         let mut mixed = FeatureRolloutsConfig::default();
         set_bundle(&mut mixed, FeatureRolloutSetting::from_env(true));

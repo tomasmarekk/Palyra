@@ -117,6 +117,8 @@ check_legacy_run_stream_freeze() {
   local admission_ingress="$root/admission_ingress.rs"
   local v2_attempt_adapter="$root/embedded_attempt.rs"
   local v2_driver="$root/orchestration/v2_driver.rs"
+  local shadow_planning="$root/orchestration/shadow_planning.rs"
+  local token_estimation="$root/orchestration/token_estimation.rs"
   local tool_owner_adapter="$root/tool_flow/owner.rs"
   local tool_contract_adapter="$root/tool_flow/stages.rs"
   local allowed_seams
@@ -134,7 +136,7 @@ check_legacy_run_stream_freeze() {
 
   # INTENTIONAL: every new run-stream file begins frozen. Crossing into V2
   # requires adding one narrowly named adapter seam here during review.
-  allowed_seams="^(${dispatcher_boundary}|${admission_ingress}|${v2_attempt_adapter}|${v2_driver}|${tool_owner_adapter}|${tool_contract_adapter}):[0-9]+:"
+  allowed_seams="^(${dispatcher_boundary}|${admission_ingress}|${v2_attempt_adapter}|${v2_driver}|${shadow_planning}|${token_estimation}|${tool_owner_adapter}|${tool_contract_adapter}):[0-9]+:"
   runtime_matches="$(
     source_matches \
       'runtime_kernel_v2|RuntimeKernel(Profile|Version|Dispatcher|V2)|RuntimeDispatchDecision|RunStreamRuntimeDispatch|RuntimeAuthority::(Legacy|V2)' \
@@ -231,6 +233,59 @@ check_legacy_run_stream_freeze() {
     || "$start_line" -ge "$v2_line" ]]; then
     echo "architecture boundary violation: v2-selection-cannot-fall-back-to-legacy-start" >&2
     echo "  expected one legacy branch/start followed by one V2 branch in $dispatcher_boundary" >&2
+    return 1
+  fi
+}
+
+check_legacy_retirement_contract() {
+  local orchestration="crates/palyra-daemon/src/application/run_stream/orchestration.rs"
+  local resolver="crates/palyra-daemon/src/application/runtime_kernel_v2/profile_resolver.rs"
+  local resolver_tests="crates/palyra-daemon/src/application/runtime_kernel_v2/profile_resolver/tests.rs"
+  local manifest="infra/release/legacy-retirement.json"
+  local retirement_module="crates/palyra-daemon/src/application/core_stability/retirement.rs"
+  local orchestration_lines
+  local guard_count
+  local compatibility_test_count
+
+  orchestration_lines="$(wc -l < "$orchestration")"
+  if [[ "$orchestration_lines" -gt 11000 ]]; then
+    echo "architecture boundary violation: run-stream-orchestration-is-compatibility-adapter" >&2
+    echo "  $orchestration has $orchestration_lines lines; retirement budget is 11000" >&2
+    return 1
+  fi
+
+  for retired in \
+    "crates/palyra-daemon/src/application/release_hardening.rs" \
+    "crates/palyra-daemon/src/application/runtime_boundary_metrics.rs"; do
+    if [[ -e "$retired" ]]; then
+      echo "architecture boundary violation: retired-runtime-scaffold-removed" >&2
+      echo "  retired module still exists: $retired" >&2
+      return 1
+    fi
+  done
+
+  if [[ ! -f "$manifest" || ! -f "$retirement_module" ]] \
+    || ! grep -q '"new_run_admission": false' "$manifest" \
+    || ! grep -q '"release_rollback_only": true' "$manifest" \
+    || ! grep -q 'struct LegacyRetirementManifest' "$retirement_module" \
+    || ! grep -q 'struct ConfigDeprecationNotice' "$retirement_module"; then
+    echo "architecture boundary violation: legacy-retirement-contract-is-complete" >&2
+    return 1
+  fi
+
+  guard_count="$(
+    grep -Ec 'ExistingSessionAuthorityBinding::New[[:space:]]*=>[[:space:]]*self\.new_session_profile\(\)\?' \
+      "$resolver" \
+      || true
+  )"
+  compatibility_test_count="$(
+    grep -Ec '^fn legacy_profile_rejects_new_sessions_but_preserves_existing_session_reads\(\)' \
+      "$resolver_tests" \
+      || true
+  )"
+  if [[ "$guard_count" -ne 1 || "$compatibility_test_count" -ne 1 ]]; then
+    echo "architecture boundary violation: legacy-new-session-admission-is-retired" >&2
+    echo "  expected one production guard and one compatibility regression test" >&2
     return 1
   fi
 }
@@ -404,6 +459,7 @@ check_rule \
 
 check_run_stream_tool_dispatch_boundary || failed=true
 check_legacy_run_stream_freeze || failed=true
+check_legacy_retirement_contract || failed=true
 check_v2_tool_authority_boundary || failed=true
 check_shadow_planner_boundary || failed=true
 
