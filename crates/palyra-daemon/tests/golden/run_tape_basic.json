@@ -2,7 +2,7 @@
   {
     "seq": 0,
     "event_type": "runtime.authority.selected",
-    "payload_json": "{\"schema_version\":1,\"route\":\"legacy\",\"authority\":{\"schema_version\":1,\"profile\":\"legacy\",\"generation\":1,\"disposition\":\"selected\",\"selected_runtime\":\"legacy\",\"shadow_evaluation_enabled\":false,\"reason\":\"legacy_profile_selected\",\"reason_code\":\"runtime.selection.legacy_profile_selected\"}}"
+    "payload_json": "{\"schema_version\":1,\"route\":\"legacy_with_shadow\",\"authority\":{\"schema_version\":1,\"profile\":\"v2_shadow\",\"generation\":1,\"disposition\":\"selected\",\"selected_runtime\":\"legacy\",\"shadow_evaluation_enabled\":true,\"reason\":\"v2_shadow_legacy_authority\",\"reason_code\":\"runtime.selection.v2_shadow_legacy_authority\"}}"
   },
   {
     "seq": 1,

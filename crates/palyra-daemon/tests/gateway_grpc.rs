@@ -36,6 +36,13 @@ const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const ENVELOPE_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 const OPENAI_TEST_MODEL: &str = "openai-test-model";
+// Legacy-authoritative integration tests assert retained compatibility behavior.
+// Pin them to the explicit shadow profile so production's V2 default remains
+// covered independently and cannot silently change their test subject.
+const COMPATIBILITY_RUNTIME_PROFILE: &str = "v2_shadow";
+const COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS: &str = "10000";
+const COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX: &str =
+    "abababababababababababababababababababababababababababababababab";
 const SAMPLE_PNG_1X1: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
@@ -11386,7 +11393,8 @@ async fn grpc_append_event_rejects_mismatched_embedded_event_version() -> Result
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape() -> Result<()> {
-    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_for_compatibility_runtime()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -11476,6 +11484,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
     let runtime_evidence_event_types = [
         "run.runtime_path_summary",
         "metadata.runtime_selected",
+        "runtime.shadow.differential",
         "context.assembled",
         "provider.attempt.completed",
         "provider.transcript.projected",
@@ -11801,7 +11810,8 @@ async fn grpc_run_stream_session_context_includes_previous_user_turn() -> Result
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_honors_cancel_command_and_marks_run_cancelled() -> Result<()> {
-    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_for_compatibility_runtime()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -11921,7 +11931,8 @@ async fn grpc_run_stream_rejects_session_identity_mismatch_as_failed_preconditio
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_protocol_error_after_accept_marks_run_failed() -> Result<()> {
-    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_for_compatibility_runtime()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -11972,7 +11983,8 @@ async fn grpc_run_stream_protocol_error_after_accept_marks_run_failed() -> Resul
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_mid_stream_run_id_switch_marks_original_run_failed() -> Result<()> {
-    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_for_compatibility_runtime()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -12588,6 +12600,23 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16, PathBuf)> {
     spawn_palyrad_with_dynamic_ports_options(false, None, false)
 }
 
+fn spawn_palyrad_with_dynamic_ports_for_compatibility_runtime() -> Result<(Child, u16, u16, PathBuf)>
+{
+    spawn_palyrad_with_dynamic_ports_options_and_env(
+        false,
+        None,
+        false,
+        &[
+            ("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE),
+            (
+                "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+                COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+            ),
+            ("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX),
+        ],
+    )
+}
+
 fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
     hash_chain_enabled: bool,
 ) -> Result<(Child, u16, u16, PathBuf)> {
@@ -12608,6 +12637,20 @@ fn spawn_palyrad_with_dynamic_ports_options(
     hash_chain_enabled: bool,
     max_journal_payload_bytes: Option<usize>,
     canvas_host_enabled: bool,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_dynamic_ports_options_and_env(
+        hash_chain_enabled,
+        max_journal_payload_bytes,
+        canvas_host_enabled,
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_dynamic_ports_options_and_env(
+    hash_chain_enabled: bool,
+    max_journal_payload_bytes: Option<usize>,
+    canvas_host_enabled: bool,
+    extra_env: &[(&str, &str)],
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_base_daemon_config()?;
     let journal_db_path = unique_temp_journal_db_path();
@@ -12644,6 +12687,9 @@ fn spawn_palyrad_with_dynamic_ports_options(
         command
             .env("PALYRA_CANVAS_HOST_ENABLED", "true")
             .env("PALYRA_CANVAS_HOST_PUBLIC_BASE_URL", "http://127.0.0.1:7142");
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
@@ -12900,6 +12946,12 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -12960,6 +13012,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_v2_compatibility_b
         openai_api_key,
         &[
             ("PALYRA_RUNTIME_KERNEL_PROFILE", "v2"),
+            ("PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS", "0"),
             ("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true"),
             ("PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER", "true"),
             ("PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY", "true"),
@@ -13029,6 +13082,12 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_config(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13082,6 +13141,12 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_inbound_coalescing
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13193,6 +13258,12 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13254,6 +13325,12 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_memory_auto_inject
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13308,6 +13385,12 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13380,6 +13463,12 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
@@ -13470,6 +13559,12 @@ fn spawn_palyrad_with_openai_provider_tool_policy_config(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_RUNTIME_KERNEL_PROFILE", COMPATIBILITY_RUNTIME_PROFILE)
+        .env(
+            "PALYRA_RUNTIME_KERNEL_SHADOW_SAMPLE_BASIS_POINTS",
+            COMPATIBILITY_RUNTIME_SHADOW_SAMPLE_BASIS_POINTS,
+        )
+        .env("PALYRA_RUNTIME_KERNEL_SAMPLING_KEY_HEX", COMPATIBILITY_RUNTIME_SAMPLING_KEY_HEX)
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
