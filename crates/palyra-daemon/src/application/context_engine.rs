@@ -25,10 +25,10 @@ use std::{
 };
 
 use palyra_safety::{
-    transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
+    SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel, transform_text_for_prompt,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tonic::Status;
 use tracing::warn;
 
@@ -36,39 +36,38 @@ use crate::{
     application::{
         channel_turn::{ChannelHistoryAmbientContext, ChannelTurnEnvelope},
         context_compaction::{
-            gate_context_tool_call, ContextToolDescriptor, CONTEXT_INSPECT_TOOL_NAME,
+            CONTEXT_INSPECT_TOOL_NAME, ContextToolDescriptor, gate_context_tool_call,
         },
-        context_compression::{shrink_json_value, JsonShrinkConfig},
-        context_references::{render_context_reference_block, ContextReferencePreviewEnvelope},
+        context_compression::{JsonShrinkConfig, shrink_json_value},
+        context_references::{ContextReferencePreviewEnvelope, render_context_reference_block},
         instruction_compiler::{
             CompiledInstructions, InstructionCompiler, InstructionCompilerInput,
             InstructionTrustSummary,
         },
         learning::render_preference_prompt_context,
         provider_input::{
-            build_attachment_recall_prompt, build_explicit_recall_prompt,
-            build_memory_augmented_prompt, build_previous_run_context_prompt,
-            build_previous_run_provider_projection, build_project_context_prompt,
-            build_provider_image_inputs, parse_provider_reasoning_effort_override,
-            parse_provider_service_tier_override, record_provider_pruning_decision,
-            resolve_latest_session_compaction_artifact, MemoryPromptFailureMode,
-            PrepareModelProviderInputRequest, PreparedModelProviderInput,
-            PromptCacheSessionMetadata,
+            MemoryPromptFailureMode, PrepareModelProviderInputRequest, PreparedModelProviderInput,
+            PromptCacheSessionMetadata, build_attachment_recall_prompt,
+            build_explicit_recall_prompt, build_memory_augmented_prompt,
+            build_previous_run_context_prompt, build_previous_run_provider_projection,
+            build_project_context_prompt, build_provider_image_inputs,
+            parse_provider_reasoning_effort_override, parse_provider_service_tier_override,
+            record_provider_pruning_decision, resolve_latest_session_compaction_artifact,
         },
         runtime_resource_manifest::RuntimeResourceManifest,
         session_pruning::{
+            ToolResultPruningExplain, ToolResultPruningInput, ToolResultPruningPolicy,
             apply_tool_result_pruning, classify_pruning_task, context_engine_pruning_outcome,
-            detect_pruning_risk, pruning_decision_from_config, ToolResultPruningExplain,
-            ToolResultPruningInput, ToolResultPruningPolicy,
+            detect_pruning_risk, pruning_decision_from_config,
         },
         tool_registry::{ModelVisibleToolCatalogSnapshot, ToolExposureSurface},
     },
-    gateway::{ingest_memory_best_effort, GatewayRuntimeState},
+    gateway::{GatewayRuntimeState, ingest_memory_best_effort},
     journal::{
         OrchestratorCheckpointRecord, OrchestratorCompactionArtifactRecord,
         OrchestratorTapeAppendRequest,
     },
-    model_provider::ProviderMessageRole,
+    model_provider::{ProviderMessageRole, ProviderPromptSegment},
     transport::grpc::auth::RequestContext,
 };
 
@@ -88,6 +87,9 @@ const SEGMENT_PREVIEW_CHARS: usize = 180;
 const AMBIENT_OBSERVE_ONLY_CONTEXT_MAX_TURNS: usize = 4;
 const AGENT_PLAN_CONTEXT_ITEM_LIMIT: usize = 12;
 const AGENT_PLAN_CONTEXT_FIELD_PREVIEW_CHARS: usize = 240;
+const ADVISOR_EVIDENCE_INPUT_MAX_CHARS: usize = 2_400;
+const ADVISOR_EVIDENCE_SEGMENT_LIMIT: usize = 24;
+const ADVISOR_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 /// Orchestrator tape event type under which the assembly trace is journaled.
 pub(crate) const CONTEXT_ENGINE_PLAN_EVENT: &str = "context.engine.plan";
 /// Schema version stamped into [`ContextEngineExplain`] and its trace hash.
@@ -121,6 +123,110 @@ const CONTEXT_ENGINE_LIFECYCLE_HOOKS: &[&str] = &[
     "estimate_breakdown",
     "end_session:unsupported_persistent_session",
 ];
+
+/// Purpose-limited context projection supplied to one read-only advisor.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AdvisorContextEvidencePack {
+    pub schema_version: u32,
+    pub purpose: String,
+    pub prompt_text: String,
+    pub evidence_refs: Vec<String>,
+    pub input_token_estimate: u64,
+    pub context_trace_sha256: Option<String>,
+    pub redaction_level: String,
+    pub instruction_authority: String,
+    pub objective_authority: bool,
+    pub tool_access: bool,
+}
+
+/// Builds a redacted, bounded evidence pack without copying instruction text.
+///
+/// Prompt-segment content remains hash-only; the only text projection is the
+/// current user input after the journal's secret redaction.
+///
+/// # Errors
+/// Returns `Status::internal` if the bounded JSON projection cannot serialize.
+#[allow(clippy::result_large_err)]
+pub(crate) fn build_advisor_context_evidence_pack(
+    purpose: &str,
+    user_input: &str,
+    prompt_segments: &[ProviderPromptSegment],
+    context_trace_id: Option<&str>,
+) -> Result<AdvisorContextEvidencePack, Status> {
+    let purpose = purpose
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(48)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let purpose = if purpose.is_empty() { "general_review".to_owned() } else { purpose };
+    let redacted_input = redact_advisor_evidence_text(user_input);
+    let context_segments = prompt_segments
+        .iter()
+        .take(ADVISOR_EVIDENCE_SEGMENT_LIMIT)
+        .map(|segment| {
+            let content_hash = if segment.content_hash.len() == 64
+                && segment.content_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                segment.content_hash.clone()
+            } else {
+                crate::sha256_hex(segment.content_hash.as_bytes())
+            };
+            json!({
+                "evidence_ref": format!("context:{}", &content_hash[..16]),
+                "kind": segment.kind,
+                "content_sha256": content_hash,
+                "byte_len": segment.byte_len,
+                "trust_label": segment.trust_label,
+                "cache_hint": segment.cache_hint,
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence_refs = context_segments
+        .iter()
+        .filter_map(|segment| {
+            segment.get("evidence_ref").and_then(Value::as_str).map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let envelope = json!({
+        "schema_version": ADVISOR_EVIDENCE_SCHEMA_VERSION,
+        "purpose": purpose,
+        "instruction_authority": "none",
+        "objective_authority": false,
+        "tool_access": false,
+        "redaction_level": "secret_redacted_hash_only_context",
+        "user_request_evidence": redacted_input,
+        "context_segments": context_segments,
+    });
+    let prompt_text = serde_json::to_string(&envelope).map_err(|error| {
+        Status::internal(format!("advisor context evidence pack serialization failed: {error}"))
+    })?;
+    let input_token_estimate =
+        crate::orchestrator::estimate_token_count(prompt_text.as_str()).max(1);
+    Ok(AdvisorContextEvidencePack {
+        schema_version: ADVISOR_EVIDENCE_SCHEMA_VERSION,
+        purpose,
+        prompt_text,
+        evidence_refs,
+        input_token_estimate,
+        context_trace_sha256: context_trace_id.map(|value| crate::sha256_hex(value.as_bytes())),
+        redaction_level: "secret_redacted_hash_only_context".to_owned(),
+        instruction_authority: "none".to_owned(),
+        objective_authority: false,
+        tool_access: false,
+    })
+}
+
+fn redact_advisor_evidence_text(value: &str) -> String {
+    let bounded = value.chars().take(ADVISOR_EVIDENCE_INPUT_MAX_CHARS).collect::<String>();
+    let payload = json!({ "value": bounded }).to_string();
+    crate::journal::redact_payload_json(payload.as_bytes())
+        .ok()
+        .and_then(|redacted| serde_json::from_str::<Value>(redacted.as_str()).ok())
+        .and_then(|redacted| redacted.get("value").and_then(Value::as_str).map(ToOwned::to_owned))
+        .unwrap_or_else(|| "<redacted>".to_owned())
+}
 type ContextEnginePrepareFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PreparedModelProviderInput, Status>> + Send + 'a>>;
 // Registry variants implement the full lifecycle contract; the production
@@ -3773,12 +3879,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        apply_prompt_cache_session_metadata, assemble_segments, build_prompt_composition_report,
-        context_assembly_diagnostics_payload, context_inspector_snapshot,
-        context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
-        render_agent_plan_context_block, resolve_provider_context_budget,
-        runtime_resource_manifest_segment, select_strategy, ContextEngine,
-        ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
+        ContextEngine, ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
         ContextEngineAfterTurnOutcome, ContextEngineBootstrapInput, ContextEngineCompactFuture,
         ContextEngineCompactionDisposition, ContextEngineCompactionOutcome,
         ContextEngineCompactionRequest, ContextEngineDescriptor,
@@ -3787,30 +3888,36 @@ mod tests {
         ContextEngineSegmentExplain, ContextEngineStrategy, ContextEngineToolCall,
         ContextEngineToolCallOutcome, ContextEngineToolSchemaPlan, ContextInspectorBreakdownItem,
         ContextInspectorSnapshot, ContextSegment, ContextSegmentKind, ContextSourceKind,
-        PromptCacheSegment, PromptSegmentAuthority, PromptSegmentSelectedState,
-        ProviderBudgetProfile, ProviderContextBudget, SummaryQualityGateExplain,
-        DEFAULT_CONTEXT_ENGINE_ID, DEFAULT_CONTEXT_ENGINE_VERSION,
+        DEFAULT_CONTEXT_ENGINE_ID, DEFAULT_CONTEXT_ENGINE_VERSION, PromptCacheSegment,
+        PromptSegmentAuthority, PromptSegmentSelectedState, ProviderBudgetProfile,
+        ProviderContextBudget, SummaryQualityGateExplain, apply_prompt_cache_session_metadata,
+        assemble_segments, build_advisor_context_evidence_pack, build_prompt_composition_report,
+        context_assembly_diagnostics_payload, context_inspector_snapshot,
+        context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
+        render_agent_plan_context_block, resolve_provider_context_budget,
+        runtime_resource_manifest_segment, select_strategy,
     };
     use crate::application::plan_state::{
-        AgentPlanItem, AgentPlanStatus, AGENT_PLAN_SCHEMA_VERSION,
+        AGENT_PLAN_SCHEMA_VERSION, AgentPlanItem, AgentPlanStatus,
     };
     use crate::application::runtime_resource_manifest::{
-        build_runtime_resource_manifest, RuntimeResourceCollisionBehavior, RuntimeResourceKind,
-        RuntimeResourceManifestItem, RuntimeResourceScope,
+        RuntimeResourceCollisionBehavior, RuntimeResourceKind, RuntimeResourceManifestItem,
+        RuntimeResourceScope, build_runtime_resource_manifest,
     };
     use crate::application::session_compaction::render_compaction_prompt_block;
     use crate::application::tool_registry::ModelVisibleToolCatalogSnapshot;
     use crate::gateway::GatewayRuntimeState;
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
-        ProviderHealthProbeSnapshot, ProviderMessageRole, ProviderRegistryModelSnapshot,
+        ProviderHealthProbeSnapshot, ProviderMessageRole, ProviderPromptCacheHint,
+        ProviderPromptSegment, ProviderPromptSegmentKind, ProviderRegistryModelSnapshot,
         ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
         ProviderRetryPolicySnapshot, ProviderRouteSelectionTrace, ProviderRuntimeMetricsSnapshot,
         ProviderStatusSnapshot,
     };
     use crate::transport::grpc::auth::RequestContext;
     use palyra_safety::{SafetyAction, TrustLabel};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tonic::Status;
 
     fn segment(
@@ -3833,6 +3940,37 @@ mod tests {
         );
         segment.estimated_tokens = estimated_tokens;
         segment
+    }
+
+    #[test]
+    fn advisor_evidence_pack_is_bounded_redacted_and_non_authoritative() {
+        let segment = ProviderPromptSegment {
+            kind: ProviderPromptSegmentKind::System,
+            content_hash: "raw-system-instruction".to_owned(),
+            byte_len: 4_096,
+            trust_label: "trusted_system".to_owned(),
+            cache_hint: ProviderPromptCacheHint::LongLived,
+            invalidation_reason: None,
+        };
+        let pack = build_advisor_context_evidence_pack(
+            "Code Review",
+            "Review this. Authorization: Bearer topsecret123 sk-test-secret-token",
+            &[segment],
+            Some("raw-context-trace-id"),
+        )
+        .expect("advisor evidence pack should serialize");
+
+        assert_eq!(pack.purpose, "codereview");
+        assert_eq!(pack.instruction_authority, "none");
+        assert!(!pack.objective_authority);
+        assert!(!pack.tool_access);
+        assert_eq!(pack.evidence_refs.len(), 1);
+        assert!(pack.evidence_refs[0].starts_with("context:"));
+        assert!(!pack.prompt_text.contains("topsecret123"));
+        assert!(!pack.prompt_text.contains("sk-test-secret-token"));
+        assert!(!pack.prompt_text.contains("raw-system-instruction"));
+        assert!(!pack.prompt_text.contains("raw-context-trace-id"));
+        assert_eq!(pack.context_trace_sha256, Some(crate::sha256_hex(b"raw-context-trace-id")));
     }
     #[allow(clippy::too_many_arguments)]
     fn segment_with_safety(
@@ -4238,11 +4376,13 @@ mod tests {
             None,
         );
 
-        assert!(assembled
-            .explain
-            .reason_codes
-            .iter()
-            .any(|reason| reason == "agent_plan_context_injected"));
+        assert!(
+            assembled
+                .explain
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "agent_plan_context_injected")
+        );
         let segment = assembled
             .explain
             .selected_segments
@@ -4291,15 +4431,19 @@ mod tests {
             .expect("runtime manifest segment should be selected");
         assert_eq!(segment.source_kind, ContextSourceKind::RuntimeState);
         assert_eq!(segment.include_reason, "stable_context_prefix");
-        assert!(segment
-            .source_refs
-            .iter()
-            .any(|source_ref| source_ref.starts_with("runtime_resource_manifest_hash:")));
-        assert!(assembled
-            .explain
-            .assembly_steps
-            .iter()
-            .any(|step| step.step == "runtime_state" && step.included));
+        assert!(
+            segment
+                .source_refs
+                .iter()
+                .any(|source_ref| source_ref.starts_with("runtime_resource_manifest_hash:"))
+        );
+        assert!(
+            assembled
+                .explain
+                .assembly_steps
+                .iter()
+                .any(|step| step.step == "runtime_state" && step.included)
+        );
     }
 
     #[test]
@@ -4353,18 +4497,24 @@ mod tests {
             ],
         );
 
-        assert!(report
-            .segments
-            .iter()
-            .any(|segment| segment.selected_state == PromptSegmentSelectedState::Truncated));
-        assert!(report
-            .segments
-            .iter()
-            .any(|segment| segment.selected_state == PromptSegmentSelectedState::Rejected));
-        assert!(report
-            .segments
-            .iter()
-            .all(|segment| segment.cache_segment == PromptCacheSegment::Excluded));
+        assert!(
+            report
+                .segments
+                .iter()
+                .any(|segment| segment.selected_state == PromptSegmentSelectedState::Truncated)
+        );
+        assert!(
+            report
+                .segments
+                .iter()
+                .any(|segment| segment.selected_state == PromptSegmentSelectedState::Rejected)
+        );
+        assert!(
+            report
+                .segments
+                .iter()
+                .all(|segment| segment.cache_segment == PromptCacheSegment::Excluded)
+        );
     }
 
     #[test]
@@ -4766,11 +4916,13 @@ mod tests {
         assert_eq!(snapshot.prompt_cache.memory_snapshot_hash, metadata.memory_snapshot_hash);
         assert_eq!(snapshot.prompt_cache.provider_cache_strategy, "openai_prompt_cache_key");
         assert!(snapshot.prompt_cache.cache_hit_eligible);
-        assert!(snapshot
-            .prompt_cache
-            .invalidation_reasons
-            .iter()
-            .any(|reason| reason == "memory_recall_volatile"));
+        assert!(
+            snapshot
+                .prompt_cache
+                .invalidation_reasons
+                .iter()
+                .any(|reason| reason == "memory_recall_volatile")
+        );
     }
 
     #[test]
@@ -4954,11 +5106,9 @@ mod tests {
         assert_eq!(breakdown(&snapshot, "current_turn").selected_segments, 1);
         assert_eq!(snapshot.compaction.summary_verdict.as_deref(), Some("allow"));
         assert_eq!(snapshot.compaction.selected_summary_segments, 1);
-        assert!(snapshot
-            .compaction
-            .reason_codes
-            .iter()
-            .any(|reason| reason == "summary_quality_clean"));
+        assert!(
+            snapshot.compaction.reason_codes.iter().any(|reason| reason == "summary_quality_clean")
+        );
     }
 
     #[test]
@@ -4988,10 +5138,9 @@ mod tests {
             payload.pointer("/engine_registry/selected_engine_id").and_then(Value::as_str),
             Some(DEFAULT_CONTEXT_ENGINE_ID)
         );
-        assert!(payload
-            .pointer("/engine_registry/registry_hash")
-            .and_then(Value::as_str)
-            .is_some());
+        assert!(
+            payload.pointer("/engine_registry/registry_hash").and_then(Value::as_str).is_some()
+        );
     }
 
     #[test]
@@ -5292,11 +5441,13 @@ mod tests {
         assert!(assembled.prompt_text.contains("tool_result_pruning.v1"));
         assert!(!assembled.prompt_text.contains("ALWAYS_DROP_MARKER"));
         assert!(assembled.prompt_text.contains(recent_output));
-        assert!(assembled
-            .explain
-            .reason_codes
-            .iter()
-            .any(|reason| reason == "tool_result_pruning_applied"));
+        assert!(
+            assembled
+                .explain
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "tool_result_pruning_applied")
+        );
         let pruning = assembled
             .explain
             .tool_result_pruning

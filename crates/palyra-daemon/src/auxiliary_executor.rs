@@ -16,13 +16,14 @@ use palyra_common::runtime_preview::{
     RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tonic::Status;
 
 use crate::{
-    gateway::{is_provider_reconfigured_status, GatewayRuntimeState, RequestContext},
+    gateway::{GatewayRuntimeState, RequestContext, is_provider_reconfigured_status},
     model_provider::{
-        ProviderImageInput, ProviderRequest, ProviderResponse, ProviderStatusSnapshot,
+        PromptCacheReport, ProviderImageInput, ProviderRequest, ProviderResponse,
+        ProviderStatusSnapshot,
     },
     objective_judge::{
         OBJECTIVE_JUDGE_COMPLETED_EVENT, OBJECTIVE_JUDGE_FAILED_EVENT,
@@ -30,8 +31,8 @@ use crate::{
     },
     provider_leases::ProviderLeaseExecutionContext,
     usage_governance::{
-        plan_usage_routing, resolve_provider_binding_for_model, RoutingDecision, RoutingTaskClass,
-        UsageRoutingPlanRequest,
+        RoutingDecision, RoutingTaskClass, UsageRoutingPlanRequest, plan_usage_routing,
+        resolve_provider_binding_for_model,
     },
 };
 
@@ -41,6 +42,7 @@ const CLASSIFICATION_DEFAULT_BUDGET_TOKENS: u64 = 600;
 const EXTRACTION_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
 const OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS: u64 = 900;
 const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
+const ADVISOR_DEFAULT_BUDGET_TOKENS: u64 = 1_600;
 const AUXILIARY_OUTPUT_TEXT_LIMIT: usize = 4_000;
 const MAX_AUXILIARY_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
 const PROVIDER_RECONFIGURED_REASON_CODE: &str = "runtime.generation.provider_reconfigured";
@@ -59,6 +61,7 @@ pub(crate) enum AuxiliaryTaskType {
     Extraction,
     ObjectiveJudge,
     Vision,
+    Advisor,
 }
 
 /// Authority envelope enforced for an auxiliary task family.
@@ -114,6 +117,7 @@ impl AuxiliaryTaskType {
             Self::Extraction => "extraction",
             Self::ObjectiveJudge => "objective_judge",
             Self::Vision => "vision",
+            Self::Advisor => "advisor",
         }
     }
 
@@ -194,6 +198,18 @@ impl AuxiliaryTaskType {
                 json_mode: true,
                 accepts_vision: true,
             },
+            Self::Advisor => AuxiliaryTaskContract {
+                task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::ReadOnlyEvidence,
+                input_contract: "purpose_limited_advisor_evidence_json",
+                output_contract: "bounded_non_authoritative_finding_json",
+                default_budget_tokens: ADVISOR_DEFAULT_BUDGET_TOKENS,
+                model_preference: AuxiliaryModelPreference::LowCost,
+                fallback_policy: AuxiliaryFallbackPolicy::FailClosed,
+                routing_task_class: RoutingTaskClass::AuxiliaryExtraction,
+                json_mode: true,
+                accepts_vision: false,
+            },
         }
     }
 }
@@ -270,6 +286,16 @@ pub(crate) struct AuxiliaryExecutionRequest {
     pub vision_inputs: Vec<ProviderImageInput>,
 }
 
+/// Host-owned execution overrides for a bounded auxiliary request.
+///
+/// Model selection and cache metadata are accepted only from runtime code,
+/// never from the model-generated task payload.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuxiliaryExecutionPolicy {
+    pub model_override: Option<String>,
+    pub prompt_cache_report: Option<PromptCacheReport>,
+}
+
 /// Successful task outcome: provider output plus usage, provenance, and the
 /// contract/routing decision that produced it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -284,6 +310,9 @@ pub(crate) struct AuxiliaryExecutionResult {
     pub provider_id: String,
     pub model_id: String,
     pub served_from_cache: bool,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub estimated_cost_microusd: Option<u64>,
     pub retry_count: u32,
     pub failover_count: u32,
     pub contract: AuxiliaryTaskContract,
@@ -311,6 +340,9 @@ impl AuxiliaryExecutionResult {
                 "provider_id": self.provider_id,
                 "model_id": self.model_id,
                 "served_from_cache": self.served_from_cache,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+                "estimated_cost_microusd": self.estimated_cost_microusd,
                 "retry_count": self.retry_count,
                 "failover_count": self.failover_count,
             },
@@ -337,6 +369,21 @@ impl AuxiliaryExecutionResult {
 pub(crate) async fn execute_auxiliary_task(
     runtime_state: &Arc<GatewayRuntimeState>,
     request: AuxiliaryExecutionRequest,
+) -> Result<AuxiliaryExecutionResult, Status> {
+    execute_auxiliary_task_with_policy(runtime_state, request, AuxiliaryExecutionPolicy::default())
+        .await
+}
+
+/// Executes an auxiliary task with host-selected model/cache policy.
+///
+/// # Errors
+/// Returns the same validation, routing, lifecycle, and provider errors as
+/// [`execute_auxiliary_task`].
+#[allow(clippy::result_large_err)]
+pub(crate) async fn execute_auxiliary_task_with_policy(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request: AuxiliaryExecutionRequest,
+    execution_policy: AuxiliaryExecutionPolicy,
 ) -> Result<AuxiliaryExecutionResult, Status> {
     let contract = request.task_type.contract();
     if !contract.accepts_vision && !request.vision_inputs.is_empty() {
@@ -370,12 +417,13 @@ pub(crate) async fn execute_auxiliary_task(
         scope_id: request.task_id.as_str(),
         task_class: contract.routing_task_class,
         provider_snapshot: &provider_snapshot,
-        model_profile_override: None,
+        model_profile_override: execution_policy.model_override.as_deref(),
     })
     .await?;
     let started_reason = match request.task_type {
         AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_STARTED_EVENT,
         AuxiliaryTaskType::Vision => VISION_STARTED_REASON_CODE,
+        AuxiliaryTaskType::Advisor => "advisor_fanout.provider_started",
         _ => "auxiliary executor acquired usage routing plan",
     };
     record_auxiliary_lifecycle_event(
@@ -413,8 +461,10 @@ pub(crate) async fn execute_auxiliary_task(
     // Only an "enforced" routing decision pins the model; advisory modes let
     // the provider runtime pick, so the lease binding falls back to the
     // routing plan's provider/credential pair below.
-    let mut provider_model_override =
-        (routing.mode == "enforced").then(|| routing.actual_model_id.clone());
+    let mut provider_model_override = execution_policy
+        .model_override
+        .clone()
+        .or_else(|| (routing.mode == "enforced").then(|| routing.actual_model_id.clone()));
     let (mut lease_provider_id, mut lease_credential_id) = auxiliary_provider_binding(
         &provider_snapshot,
         &routing,
@@ -423,12 +473,19 @@ pub(crate) async fn execute_auxiliary_task(
     let mut supersession_retries = 0_u8;
 
     let response = loop {
-        let provider_request = ProviderRequest::from_input_text(
+        let mut provider_request = ProviderRequest::from_input_text(
             input_text.to_owned(),
             contract.json_mode,
             request.vision_inputs.clone(),
             provider_model_override.clone(),
         );
+        provider_request.max_output_tokens = Some(effective_budget);
+        if let Some(cache_report) = execution_policy.prompt_cache_report.as_ref() {
+            provider_request.prompt_cache_policy.strategy = cache_report.requested_strategy;
+            provider_request.prompt_cache_policy.provider_compatibility =
+                cache_report.provider_cache_strategy.clone();
+        }
+        provider_request.prompt_cache_report = execution_policy.prompt_cache_report.clone();
         match runtime_state
             .execute_model_provider_with_lease(
                 provider_request,
@@ -489,6 +546,7 @@ pub(crate) async fn execute_auxiliary_task(
                 let failed_reason = match request.task_type {
                     AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_FAILED_EVENT,
                     AuxiliaryTaskType::Vision => VISION_FAILED_REASON_CODE,
+                    AuxiliaryTaskType::Advisor => "advisor_fanout.provider_failed",
                     _ => "auxiliary executor provider request failed",
                 };
                 let _ = record_auxiliary_lifecycle_event(
@@ -528,6 +586,7 @@ pub(crate) async fn execute_auxiliary_task(
     let completed_reason = match result.task_type {
         AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_COMPLETED_EVENT,
         AuxiliaryTaskType::Vision => VISION_COMPLETED_REASON_CODE,
+        AuxiliaryTaskType::Advisor => "advisor_fanout.provider_completed",
         _ => "auxiliary executor completed provider request",
     };
     record_auxiliary_lifecycle_event(
@@ -601,6 +660,17 @@ fn build_execution_result(
         task_type,
         contract.authority_profile,
     );
+    let cache_read_tokens = response
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt.state.as_ref())
+        .map(|state| state.cache_tokens)
+        .fold(0_u64, u64::saturating_add);
+    let estimated_cost_microusd = response
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt.state.as_ref()?.estimated_cost_microusd)
+        .try_fold(0_u64, u64::checked_add);
     AuxiliaryExecutionResult {
         task_id,
         task_type,
@@ -612,6 +682,9 @@ fn build_execution_result(
         provider_id: response.provider_id,
         model_id: response.model_id,
         served_from_cache: response.served_from_cache,
+        cache_read_tokens,
+        cache_write_tokens: 0,
+        estimated_cost_microusd,
         retry_count: response.retry_count,
         failover_count: response.failover_count,
         contract,
@@ -752,19 +825,19 @@ pub(crate) fn auxiliary_stop_condition(
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{mpsc, Notify};
+    use tokio::sync::{Notify, mpsc};
     use ulid::Ulid;
 
     use super::{
-        auxiliary_stop_condition, execute_auxiliary_task, AuxiliaryAuthorityProfile,
-        AuxiliaryExecutionRequest, AuxiliaryFallbackPolicy, AuxiliaryModelPreference,
-        AuxiliaryStopConditionInput, AuxiliaryTaskType,
+        AuxiliaryAuthorityProfile, AuxiliaryExecutionRequest, AuxiliaryFallbackPolicy,
+        AuxiliaryModelPreference, AuxiliaryStopConditionInput, AuxiliaryTaskType,
+        auxiliary_stop_condition, execute_auxiliary_task,
     };
     use crate::{
         gateway::{
-            runtime::tests::{provider_status_snapshot, SuccessfulModelProvider},
-            tests::build_test_runtime_state,
             RequestContext,
+            runtime::tests::{SuccessfulModelProvider, provider_status_snapshot},
+            tests::build_test_runtime_state,
         },
         journal::OrchestratorSessionUpsertRequest,
         model_provider::{
