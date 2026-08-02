@@ -195,6 +195,46 @@ pub(crate) struct HookDispatchReport {
     pub(crate) invocation_traces: Vec<HookInvocationTrace>,
 }
 
+/// Capability to dispatch one event through the configured inline hook runtime.
+pub(crate) struct ConfiguredHookDispatcher {
+    runtime: Arc<GatewayRuntimeState>,
+    policy: crate::wasm_plugin_runner::WasmPluginRunnerPolicy,
+    execution_timeout: Duration,
+}
+
+impl ConfiguredHookDispatcher {
+    /// Dispatches the event and returns typed middleware and trace metadata.
+    pub(crate) async fn dispatch_with_report(
+        self,
+        event: &str,
+        event_payload: Value,
+    ) -> Result<HookDispatchReport> {
+        dispatch_named_event_with_report(
+            self.runtime,
+            &self.policy,
+            self.execution_timeout,
+            event,
+            event_payload,
+        )
+        .await
+    }
+}
+
+/// Acquires inline hook dispatch authority when its rollout is enabled.
+///
+/// The capability boundary lets feature-off callers return before payload
+/// parsing or hashing without growing direct rollout branches in run-stream.
+pub(crate) fn configured_event_dispatcher(
+    runtime: Arc<GatewayRuntimeState>,
+) -> Option<ConfiguredHookDispatcher> {
+    if !runtime.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return None;
+    }
+    let policy = runtime.config.tool_call.wasm_runtime.clone();
+    let execution_timeout = Duration::from_millis(runtime.config.tool_call.execution_timeout_ms);
+    Some(ConfiguredHookDispatcher { runtime, policy, execution_timeout })
+}
+
 /// Redacted event envelope passed to constrained plugin hooks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

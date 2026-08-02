@@ -730,33 +730,32 @@ pub(crate) async fn dispatch_tool_argument_patch_if_enabled(
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     tape_seq: &mut i64,
 ) -> Result<Vec<u8>, Status> {
-    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+    let Some(dispatcher) = crate::hooks::configured_event_dispatcher(Arc::clone(runtime_state))
+    else {
         return Ok(input_json.to_vec());
-    }
+    };
     let arguments = serde_json::from_slice::<Value>(input_json).map_err(|error| {
         Status::invalid_argument(format!("invalid normalized tool input: {error}"))
     })?;
     let base_arguments_sha256 = crate::sha256_hex(input_json);
     let allowlisted_fields = existing_tool_argument_fields(&arguments);
-    let report = crate::hooks::dispatch_named_event_with_report(
-        Arc::clone(runtime_state),
-        &runtime_state.config.tool_call.wasm_runtime,
-        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
-        AgentHookKind::BeforeToolCall.as_str(),
-        json!({
-            "schema_version": 1,
-            "run_id": run_id,
-            "proposal_id": proposal_id,
-            "tool_name": tool_name,
-            "base_arguments_sha256": base_arguments_sha256.as_str(),
-            "allowlisted_fields": allowlisted_fields.iter().collect::<Vec<_>>(),
-            "redaction_level": "field_names_and_hash_only",
-        }),
-    )
-    .await
-    .map_err(|error| {
-        Status::failed_precondition(format!("typed tool middleware dispatch failed: {error}"))
-    })?;
+    let report = dispatcher
+        .dispatch_with_report(
+            AgentHookKind::BeforeToolCall.as_str(),
+            json!({
+                "schema_version": 1,
+                "run_id": run_id,
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "base_arguments_sha256": base_arguments_sha256.as_str(),
+                "allowlisted_fields": allowlisted_fields.iter().collect::<Vec<_>>(),
+                "redaction_level": "field_names_and_hash_only",
+            }),
+        )
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!("typed tool middleware dispatch failed: {error}"))
+        })?;
     let Some(patch) = report.tool_argument_patch else {
         return Ok(input_json.to_vec());
     };
@@ -4366,34 +4365,33 @@ async fn dispatch_tool_result_hook_if_enabled(
     prepared: &RunStreamPreparedToolExecution,
     outcome: &ToolExecutionOutcome,
 ) -> Result<(), Status> {
-    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+    let Some(dispatcher) = crate::hooks::configured_event_dispatcher(Arc::clone(runtime_state))
+    else {
         return Ok(());
-    }
-    crate::hooks::dispatch_named_event_with_report(
-        Arc::clone(runtime_state),
-        &runtime_state.config.tool_call.wasm_runtime,
-        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
-        hook_kind.as_str(),
-        json!({
-            "schema_version": 1,
-            "run_id": run_id,
-            "proposal_id": prepared.proposal_id.as_str(),
-            "tool_name": prepared.tool_name.as_str(),
-            "success": outcome.success,
-            "output_bytes": outcome.output_json.len(),
-            "output_sha256": crate::sha256_hex(outcome.output_json.as_slice()),
-            "error_sha256": crate::sha256_hex(outcome.error.as_bytes()),
-            "redaction_level": "hash_only_tool_result",
-        }),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        Status::failed_precondition(format!(
-            "inline {} hook dispatch failed: {error}",
-            hook_kind.as_str()
-        ))
-    })
+    };
+    dispatcher
+        .dispatch_with_report(
+            hook_kind.as_str(),
+            json!({
+                "schema_version": 1,
+                "run_id": run_id,
+                "proposal_id": prepared.proposal_id.as_str(),
+                "tool_name": prepared.tool_name.as_str(),
+                "success": outcome.success,
+                "output_bytes": outcome.output_json.len(),
+                "output_sha256": crate::sha256_hex(outcome.output_json.as_slice()),
+                "error_sha256": crate::sha256_hex(outcome.error.as_bytes()),
+                "redaction_level": "hash_only_tool_result",
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "inline {} hook dispatch failed: {error}",
+                hook_kind.as_str()
+            ))
+        })
 }
 
 async fn project_tool_result_for_model(
@@ -4808,18 +4806,14 @@ async fn append_sessions_spawn_tape_event_if_needed(
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
-    if runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
-        if let Err(error) = crate::hooks::dispatch_named_event_with_report(
-            Arc::clone(runtime_state),
-            &runtime_state.config.tool_call.wasm_runtime,
-            Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
-            AgentHookKind::SubagentSpawned.as_str(),
-            payload,
-        )
-        .await
-        {
-            warn!(error = %error, "fail-open subagent-spawned observer hook dispatch failed");
-        }
+    let Some(dispatcher) = crate::hooks::configured_event_dispatcher(Arc::clone(runtime_state))
+    else {
+        return Ok(());
+    };
+    if let Err(error) =
+        dispatcher.dispatch_with_report(AgentHookKind::SubagentSpawned.as_str(), payload).await
+    {
+        warn!(error = %error, "fail-open subagent-spawned observer hook dispatch failed");
     }
     Ok(())
 }

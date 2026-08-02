@@ -156,6 +156,15 @@ pub(crate) struct AdvisorRuntimeSelectionInput<'a> {
     pub recursion_depth: u8,
 }
 
+/// Host trigger inputs for the configured advisor runtime.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConfiguredAdvisorRuntimeSelectionInput<'a> {
+    pub parameter_delta_json: Option<&'a str>,
+    pub security_policy_triggered: bool,
+    pub objective_checkpoint: bool,
+    pub recursion_depth: u8,
+}
+
 /// Validated runtime selection with bounded budgets and stable trigger reason.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AdvisorRuntimeSelection {
@@ -251,6 +260,24 @@ pub(crate) fn select_advisor_runtime(
         recursion_depth: input.recursion_depth,
         security_quorum_required,
     }))
+}
+
+/// Selects advisors through the subsystem-owned rollout boundary.
+///
+/// Run-stream callers provide trigger evidence, while this module remains the
+/// single owner of whether the optional advisor runtime is active.
+#[allow(clippy::result_large_err)]
+pub(crate) fn select_configured_advisor_runtime(
+    runtime_state: &GatewayRuntimeState,
+    input: ConfiguredAdvisorRuntimeSelectionInput<'_>,
+) -> Result<Option<AdvisorRuntimeSelection>, Status> {
+    select_advisor_runtime(AdvisorRuntimeSelectionInput {
+        feature_enabled: runtime_state.config.feature_rollouts.advisor_fanout.enabled,
+        parameter_delta_json: input.parameter_delta_json,
+        security_policy_triggered: input.security_policy_triggered,
+        objective_checkpoint: input.objective_checkpoint,
+        recursion_depth: input.recursion_depth,
+    })
 }
 
 #[derive(Debug, Clone, Default)]
