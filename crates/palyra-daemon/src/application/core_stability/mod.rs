@@ -6,3 +6,4 @@
 pub(crate) mod performance;
 pub(crate) mod retirement;
 pub(crate) mod security;
+pub(crate) mod stable;

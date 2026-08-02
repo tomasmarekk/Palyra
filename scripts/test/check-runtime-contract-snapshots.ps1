@@ -133,3 +133,13 @@ Invoke-ExactContractCheck `
     -Label "feature rollout no-hidden-fallback proof" `
     -ExpectedTest "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" `
     -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled", "--locked", "--", "--exact")
+Invoke-ExactContractCheck `
+    -Label "stable core evidence contract" `
+    -ExpectedTest "application::core_stability::stable::tests::builtin_evidence_pack_qualifies" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "--lib", "application::core_stability::stable::tests::builtin_evidence_pack_qualifies", "--locked", "--", "--exact")
+Invoke-ContractCheck `
+    -Label "stable core maturity, fixture, and redaction conformance" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "--lib", "application::core_stability::stable::tests", "--locked")
+
+Write-Output "==> release dashboard, runbook drill, and support redaction"
+& (Join-Path $rootDir "scripts\ci\check-release-dashboard.ps1")

@@ -1,0 +1,359 @@
+{
+  "schema_version": 1,
+  "contract_id": "palyra.stable-core-evidence.v1",
+  "runtime_contract_version": "runtime-contracts.v15",
+  "as_of": "2026-08-02",
+  "release_support_posture": "production",
+  "capabilities": [
+    {
+      "capability_id": "runtime_kernel_v2",
+      "maturity": "stable",
+      "minimum_maturity": "stable",
+      "owner_component": "runtime-kernel",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "qa/suites/runtime_kernel_v2_authoritative.yaml",
+        "scripts/test/check-runtime-contract-snapshots.sh",
+        "scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "compatibility_commitment": "Existing generation pins and durable pre-V2 evidence remain readable while all newly admitted sessions use RuntimeKernelV2.",
+      "rollback_control": "release rollback to the prior qualified build",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "core_release_rollback",
+        "continuity_recovery_blocked"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "provider_recovery",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "model-provider-recovery",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "provider_turn_recovery::tests",
+        "provider_attempt_state_machine::tests",
+        "qa/suites/runtime_kernel_v2_authoritative.yaml"
+      ],
+      "compatibility_commitment": "Provider error envelopes and terminal outcome reason codes remain backward compatible; recovery never retries an uncertain side effect.",
+      "rollback_control": "release rollback with provider recovery evidence retained",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "continuity_recovery_blocked",
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "continuity_safe_resume",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "continuity-recovery",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "scripts/test/run-continuity-campaign-gate.sh",
+        "qa/suites/fault_smoke.yaml",
+        "application::continuity_recovery::tests"
+      ],
+      "compatibility_commitment": "Unknown effects remain reconciliation-owned and historical recovery records are never deleted by rollback.",
+      "rollback_control": "observe-only recovery posture in the prior qualified release",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "continuity_recovery_blocked",
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "objective_loop",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "objective-runtime",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "application::objective_loop::tests",
+        "application::autonomy::tests",
+        "scripts/test/run-workflow-regression.sh"
+      ],
+      "compatibility_commitment": "Objective continuation remains bounded, operator-interruptible, and additive to the durable session contract.",
+      "rollback_control": "disable autonomous continuation in the prior qualified release",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "managed_coding_runtime",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "managed-coding",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "runtime_diagnostics::tests::managed_coding_contract_snapshot_matches_golden",
+        "application::code_intel_runtime::tests",
+        "application::tool_runtime::process_registry::tests"
+      ],
+      "compatibility_commitment": "PTY, process lease, worktree, and LSP records retain their versioned cleanup and redaction semantics across rollback.",
+      "rollback_control": "release rollback with process cleanup before serving admission",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "lsp_crash",
+        "pty_orphan",
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "work_graph",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "work-graph",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "application::work_graph::tests",
+        "application::flow_runtime::tests",
+        "scripts/test/run-workflow-regression.sh"
+      ],
+      "compatibility_commitment": "Claim generations, stale-result suppression, and durable work records remain readable and fail closed after rollback.",
+      "rollback_control": "stop new claims and roll back the release after active leases drain",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "work_graph_stale_claim",
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    },
+    {
+      "capability_id": "mcp_persistent_runtime",
+      "maturity": "gated_production",
+      "minimum_maturity": "gated_production",
+      "owner_component": "mcp-runtime",
+      "owner_signoff": "@tomasmarekk",
+      "evidence_status": "passed",
+      "direct_hot_path": true,
+      "no_hidden_fallback": true,
+      "default_for_new_runs": true,
+      "required_gate_refs": [
+        "qa/suites/mcp_persistent_runtime.yaml",
+        "mcp_runtime::tests",
+        "scripts/test/check-runtime-contract-snapshots.sh"
+      ],
+      "compatibility_commitment": "Server generation, catalog epoch, policy, and cleanup evidence remain durable; rollback never creates a parallel per-call transport.",
+      "rollback_control": "disable the affected server and roll back after bounded actor drain",
+      "rollback_preserves_durable_data": true,
+      "rollback_repeats_confirmed_side_effects": false,
+      "runbook_ids": [
+        "mcp_outage",
+        "core_release_rollback"
+      ],
+      "promotion_blockers": []
+    }
+  ],
+  "sli_definitions": [
+    {
+      "metric_id": "core_run_completion_success_rate_bps",
+      "direction": "at_least",
+      "target": 9900,
+      "warning": 9850,
+      "critical": 9700,
+      "window": "rolling_24h_min_100_runs",
+      "allowed_labels": [
+        "runtime_profile",
+        "terminal_outcome",
+        "platform"
+      ],
+      "reason_code": "core.sli.completion_breached"
+    },
+    {
+      "metric_id": "core_recovery_success_rate_bps",
+      "direction": "at_least",
+      "target": 9500,
+      "warning": 9250,
+      "critical": 9000,
+      "window": "rolling_24h_min_20_recoveries",
+      "allowed_labels": [
+        "recovery_class",
+        "outcome",
+        "platform"
+      ],
+      "reason_code": "core.sli.recovery_breached"
+    },
+    {
+      "metric_id": "core_interrupt_latency_p99_ms",
+      "direction": "at_most",
+      "target": 2000,
+      "warning": 2500,
+      "critical": 5000,
+      "window": "rolling_24h_min_20_interrupts",
+      "allowed_labels": [
+        "runtime_phase",
+        "platform"
+      ],
+      "reason_code": "core.sli.interrupt_breached"
+    },
+    {
+      "metric_id": "core_duplicate_confirmed_effect_total",
+      "direction": "at_most",
+      "target": 0,
+      "warning": 0,
+      "critical": 1,
+      "window": "per_release",
+      "allowed_labels": [
+        "effect_class",
+        "platform"
+      ],
+      "reason_code": "core.sli.duplicate_effect_breached"
+    },
+    {
+      "metric_id": "core_cleanup_success_rate_bps",
+      "direction": "at_least",
+      "target": 9990,
+      "warning": 9950,
+      "critical": 9900,
+      "window": "rolling_24h_min_100_leases",
+      "allowed_labels": [
+        "resource_class",
+        "cleanup_outcome",
+        "platform"
+      ],
+      "reason_code": "core.sli.cleanup_breached"
+    },
+    {
+      "metric_id": "mcp_reconnect_latency_p99_ms",
+      "direction": "at_most",
+      "target": 30000,
+      "warning": 45000,
+      "critical": 60000,
+      "window": "rolling_24h_min_10_reconnects",
+      "allowed_labels": [
+        "transport_kind",
+        "outcome",
+        "platform"
+      ],
+      "reason_code": "core.sli.mcp_reconnect_breached"
+    },
+    {
+      "metric_id": "core_resource_pressure_rejection_rate_bps",
+      "direction": "at_most",
+      "target": 100,
+      "warning": 250,
+      "critical": 500,
+      "window": "rolling_24h_min_100_admissions",
+      "allowed_labels": [
+        "resource_class",
+        "admission_outcome",
+        "platform"
+      ],
+      "reason_code": "core.sli.resource_pressure_breached"
+    }
+  ],
+  "runbooks": [
+    {
+      "runbook_id": "continuity_recovery_blocked",
+      "section": "Continuity Recovery Blocked or Unknown",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.recovery_blocked"
+    },
+    {
+      "runbook_id": "plugin_quarantine",
+      "section": "Plugin Quarantine",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.plugin_quarantine"
+    },
+    {
+      "runbook_id": "mcp_outage",
+      "section": "MCP Persistent Runtime Outage",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.mcp_outage"
+    },
+    {
+      "runbook_id": "lsp_crash",
+      "section": "LSP Crash",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.lsp_crash"
+    },
+    {
+      "runbook_id": "pty_orphan",
+      "section": "PTY Orphan",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.pty_orphan"
+    },
+    {
+      "runbook_id": "work_graph_stale_claim",
+      "section": "WorkGraph Stale Claim",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.work_graph_stale_claim"
+    },
+    {
+      "runbook_id": "core_release_rollback",
+      "section": "Core Release Rollback",
+      "synthetic_drill": "passed",
+      "reason_code": "core.runbook.release_rollback"
+    }
+  ],
+  "support_bundle_checklist": [
+    {
+      "check_id": "metadata_only_runtime_evidence",
+      "required": true,
+      "validation_ref": "application::core_stability::stable::tests::stable_support_bundle_fixture_rejects_raw_sensitive_data"
+    },
+    {
+      "check_id": "secret_and_credential_redaction",
+      "required": true,
+      "validation_ref": "application::core_stability::stable::tests::stable_support_bundle_fixture_rejects_raw_sensitive_data"
+    },
+    {
+      "check_id": "prompt_and_tool_payload_redaction",
+      "required": true,
+      "validation_ref": "application::core_stability::stable::tests::stable_support_bundle_fixture_rejects_raw_sensitive_data"
+    },
+    {
+      "check_id": "absolute_path_redaction",
+      "required": true,
+      "validation_ref": "application::core_stability::stable::tests::stable_support_bundle_fixture_rejects_raw_sensitive_data"
+    },
+    {
+      "check_id": "bounded_low_cardinality_labels",
+      "required": true,
+      "validation_ref": "core_stability::stable::tests::builtin_evidence_pack_qualifies"
+    }
+  ],
+  "legacy_retirement_evidence": {
+    "manifest_ref": "infra/release/legacy-retirement.json",
+    "status": "passed",
+    "new_legacy_run_admission": false,
+    "durable_compatibility_reads_preserved": true
+  }
+}

@@ -239,7 +239,7 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 - Return advisor fanout to preview-only posture.
 - Re-run host authority boundary checks before re-enabling.
 
-## LSP Service
+## LSP Crash
 
 ### Symptoms
 
@@ -262,6 +262,129 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 
 - Restore preview-only LSP posture.
 - Require unavailable-server fallback coverage before promotion.
+
+## Plugin Quarantine
+
+### Symptoms
+
+- A plugin generation reports a contract violation, fuel or memory exhaustion,
+  forbidden capability access, or an invalid ABI result.
+- Diagnostics show repeated quarantine attempts or a quarantined generation
+  still present in the model-visible catalog.
+
+### Diagnostics
+
+- Preserve the stable reason code, plugin generation, contract kind, and
+  bounded cleanup outcome from `/console/v1/diagnostics`.
+- Run the plugin ABI v2 conformance suite and the critical attack scenarios.
+- Verify the support bundle contains no plugin payload, secret value, local
+  path, or raw Wasm bytes.
+
+### Safe Mitigation
+
+- Quarantine the affected plugin generation and remove it from catalog
+  projection without granting fallback authority.
+- Keep healthy built-in tools available through their normal policy and
+  approval boundaries.
+
+### Rollback
+
+- Disable the affected plugin artifact or roll back to its last qualified,
+  signed version.
+- Preserve quarantine and invocation evidence; never replay an uncertain
+  mutating call during rollback.
+
+## PTY Orphan
+
+### Symptoms
+
+- A terminal command is terminal but its process lease remains active.
+- Cleanup reports a surviving child or an unclosed PTY handle after the bounded
+  drain deadline.
+
+### Diagnostics
+
+- Preserve the runtime handle, process lease generation, cleanup reason code,
+  and bounded child-count evidence.
+- Inspect managed-coding diagnostics without copying command input, terminal
+  output, environment values, or workspace paths.
+- Run the managed process cleanup and PTY lifecycle tests.
+
+### Safe Mitigation
+
+- Stop new commands for the affected lease owner and request host-owned
+  process-tree cleanup.
+- If cleanup cannot be proven, quarantine the execution environment and require
+  operator review before reuse.
+
+### Rollback
+
+- Drain managed coding admission before release rollback.
+- Preserve cleanup reports and worktree metadata; never treat a missing process
+  as proof that its side effect did not occur.
+
+## WorkGraph Stale Claim
+
+### Symptoms
+
+- A claim lease expires without terminal work evidence.
+- A late result arrives for an older claim generation.
+- The same ready node appears owned by more than one worker.
+
+### Diagnostics
+
+- Inspect the work item, claim generation, lease state, reclaim reason code, and
+  late-result suppression counter.
+- Run WorkGraph claim, stale-reclaim, and cancellation regression tests.
+- Do not include task payloads, worker credentials, or raw error messages in the
+  incident record.
+
+### Safe Mitigation
+
+- Reclaim only after the durable lease proves expiry and assign a new claim
+  generation.
+- Reject late results from stale generations and reconcile uncertain effects
+  before any retry.
+
+### Rollback
+
+- Stop new claims, drain active leases, and retain the graph and claim ledger
+  through release rollback.
+- Never delete a stale claim or accept its late result to make the graph appear
+  healthy.
+
+## Core Release Rollback
+
+### Symptoms
+
+- A stable-core SLI reaches its critical threshold.
+- A required gate, owner sign-off, support-bundle check, or legacy retirement
+  invariant no longer qualifies.
+- Diagnostics report `core.stable.release_blocked`.
+
+### Diagnostics
+
+- Export the redacted support bundle and preserve the stable evidence pack,
+  alert state, runtime generation, cleanup status, and release version.
+- Identify the breached capability and stable reason code without copying raw
+  prompts, tool payloads, secrets, local paths, or high-cardinality identifiers.
+- Run the release dashboard checker and the smallest affected runtime gate.
+
+### Safe Mitigation
+
+- Stop widening admission, drain affected actors, and quarantine only the
+  failing generation or capability where its contract permits isolation.
+- Suspend retries for uncertain effects and keep durable reconciliation records
+  available to the prior release.
+
+### Rollback
+
+- Roll back to the prior qualified release; do not activate a hidden legacy
+  branch inside the current process.
+- Preserve journals, metadata traces, claims, catalog epochs, quarantine
+  records, and cleanup evidence.
+- Confirm the prior release can read the preserved data before restoring
+  admission, and never repeat a confirmed side effect.
 
 ## Routine Scheduler
 
@@ -318,7 +441,7 @@ without exposing prompts, credentials, raw provider payloads, or local paths.
 - Disable production registration until permission relay and lifecycle tests are
   green.
 
-## MCP Persistent Runtime
+## MCP Persistent Runtime Outage
 
 ### Symptoms
 

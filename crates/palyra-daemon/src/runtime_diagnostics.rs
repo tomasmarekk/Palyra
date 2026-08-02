@@ -1068,6 +1068,11 @@ pub(crate) fn build_security_conformance_snapshot() -> Value {
     crate::application::core_stability::security::build_security_conformance_snapshot()
 }
 
+/// Returns the bounded stable-core support and SLI decision.
+pub(crate) fn build_stable_core_evidence_snapshot() -> Value {
+    crate::application::core_stability::stable::build_stable_core_evidence_snapshot()
+}
+
 /// Returns the fail-closed legacy retirement and config migration posture.
 pub(crate) fn build_legacy_retirement_snapshot(
     profile: &crate::application::runtime_kernel_v2::profile_resolver::ResolvedRuntimeProfileV1,

@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "metric_id": "core_run_completion_success_rate_bps",
+      "observed": 9900,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_run_completion_success_rate_bps",
+      "observed": 9699,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "core_recovery_success_rate_bps",
+      "observed": 9500,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_recovery_success_rate_bps",
+      "observed": 8999,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "core_interrupt_latency_p99_ms",
+      "observed": 2000,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_interrupt_latency_p99_ms",
+      "observed": 5001,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "core_duplicate_confirmed_effect_total",
+      "observed": 0,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_duplicate_confirmed_effect_total",
+      "observed": 1,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "core_cleanup_success_rate_bps",
+      "observed": 9990,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_cleanup_success_rate_bps",
+      "observed": 9899,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "mcp_reconnect_latency_p99_ms",
+      "observed": 30000,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "mcp_reconnect_latency_p99_ms",
+      "observed": 60001,
+      "expected": "critical"
+    },
+    {
+      "metric_id": "core_resource_pressure_rejection_rate_bps",
+      "observed": 100,
+      "expected": "healthy"
+    },
+    {
+      "metric_id": "core_resource_pressure_rejection_rate_bps",
+      "observed": 501,
+      "expected": "critical"
+    }
+  ]
+}

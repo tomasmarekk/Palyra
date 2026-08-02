@@ -108,3 +108,13 @@ run_exact_contract_check \
   "feature rollout no-hidden-fallback proof" \
   "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" \
   "$CARGO_BIN" test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact
+run_exact_contract_check \
+  "stable core evidence contract" \
+  "application::core_stability::stable::tests::builtin_evidence_pack_qualifies" \
+  "$CARGO_BIN" test -p palyra-daemon --lib application::core_stability::stable::tests::builtin_evidence_pack_qualifies --locked -- --exact
+run_contract_check \
+  "stable core maturity, fixture, and redaction conformance" \
+  "$CARGO_BIN" test -p palyra-daemon --lib application::core_stability::stable::tests --locked
+run_contract_check \
+  "release dashboard, runbook drill, and support redaction" \
+  pwsh -NoLogo -NoProfile -File scripts/ci/check-release-dashboard.ps1

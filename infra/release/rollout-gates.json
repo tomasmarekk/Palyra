@@ -1,7 +1,49 @@
 {
-  "updated_at": "2026-07-22",
-  "release_scope": "mobile_companion_localization_hardening",
+  "updated_at": "2026-08-02",
+  "release_scope": "core_runtime_stabilization_and_existing_surface_gates",
   "success_metrics": [
+    {
+      "metric_id": "core_run_completion_success_rate_bps",
+      "source": "stable core runtime diagnostics",
+      "target": ">= 9900 over rolling_24h_min_100_runs",
+      "operator_action_on_breach": "stop promotion and follow the core release rollback runbook"
+    },
+    {
+      "metric_id": "core_recovery_success_rate_bps",
+      "source": "continuity and provider recovery diagnostics",
+      "target": ">= 9500 over rolling_24h_min_20_recoveries",
+      "operator_action_on_breach": "suspend automatic recovery for the affected class and preserve reconciliation evidence"
+    },
+    {
+      "metric_id": "core_interrupt_latency_p99_ms",
+      "source": "runtime phase interrupt diagnostics",
+      "target": "<= 2000 over rolling_24h_min_20_interrupts",
+      "operator_action_on_breach": "stop widening admission and inspect cancellation ownership"
+    },
+    {
+      "metric_id": "core_duplicate_confirmed_effect_total",
+      "source": "side-effect and delivery arbitration evidence",
+      "target": "= 0 per release",
+      "operator_action_on_breach": "block release and reconcile the confirmed effect before any retry"
+    },
+    {
+      "metric_id": "core_cleanup_success_rate_bps",
+      "source": "process lease and actor cleanup reports",
+      "target": ">= 9990 over rolling_24h_min_100_leases",
+      "operator_action_on_breach": "quarantine the affected resource generation and run its cleanup runbook"
+    },
+    {
+      "metric_id": "mcp_reconnect_latency_p99_ms",
+      "source": "persistent MCP supervisor diagnostics",
+      "target": "<= 30000 over rolling_24h_min_10_reconnects",
+      "operator_action_on_breach": "disable the affected server generation and follow the MCP outage runbook"
+    },
+    {
+      "metric_id": "core_resource_pressure_rejection_rate_bps",
+      "source": "runtime admission and resource governor diagnostics",
+      "target": "<= 100 over rolling_24h_min_100_admissions",
+      "operator_action_on_breach": "hold rollout and inspect bounded capacity evidence"
+    },
     {
       "metric_id": "time_to_first_value_minutes",
       "source": "activation telemetry",
@@ -76,6 +118,36 @@
     }
   ],
   "gates": [
+    {
+      "feature_id": "stable_core_runtime",
+      "release_stage": "stable",
+      "runtime_controls": [
+        "runtime_kernel.profile=v2",
+        "infra/release/stable-core-evidence.json",
+        "zero hidden legacy fallback",
+        "release rollback only"
+      ],
+      "required_qa_suite": "qa/suites/runtime_kernel_v2_authoritative.yaml",
+      "entry_criteria": [
+        "stable core evidence pack qualifies with zero P0 blockers",
+        "performance and security conformance evidence qualify",
+        "legacy retirement forbids new legacy admission while preserving durable readers",
+        "release dashboard, alert fixtures, runbook drills, and support-bundle redaction checks pass"
+      ],
+      "exit_criteria": [
+        "all seven core SLI definitions remain within target or a bounded warning posture",
+        "runtime_kernel_v2 remains stable and every other core capability remains at least gated_production",
+        "owner sign-off and compatibility commitments remain present",
+        "rollback preserves durable evidence and never repeats a confirmed side effect"
+      ],
+      "promotion_blockers": [
+        "stable_core_evidence_not_qualified",
+        "core_sli_critical",
+        "p0_blocker_present",
+        "support_bundle_redaction_failed",
+        "legacy_retirement_reopened"
+      ]
+    },
     {
       "feature_id": "mobile_companion",
       "release_stage": "operator_preview",
@@ -193,7 +265,7 @@
     },
     {
       "feature_id": "runtime_kernel_v2_authoritative",
-      "release_stage": "main_qualification",
+      "release_stage": "stable",
       "runtime_controls": [
         "runtime_kernel.profile=v2",
         "generation-pinned V2 authority",

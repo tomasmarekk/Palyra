@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "incidents": [
+    {
+      "incident_id": "synthetic-recovery-blocked",
+      "runbook_id": "continuity_recovery_blocked",
+      "evidence_fields": [
+        "reason_code",
+        "generation",
+        "cleanup_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-plugin-quarantine",
+      "runbook_id": "plugin_quarantine",
+      "evidence_fields": [
+        "reason_code",
+        "plugin_generation",
+        "quarantine_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-mcp-outage",
+      "runbook_id": "mcp_outage",
+      "evidence_fields": [
+        "reason_code",
+        "server_generation",
+        "catalog_epoch",
+        "cleanup_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-lsp-crash",
+      "runbook_id": "lsp_crash",
+      "evidence_fields": [
+        "reason_code",
+        "server_generation",
+        "cleanup_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-pty-orphan",
+      "runbook_id": "pty_orphan",
+      "evidence_fields": [
+        "reason_code",
+        "process_lease",
+        "cleanup_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-work-graph-stale-claim",
+      "runbook_id": "work_graph_stale_claim",
+      "evidence_fields": [
+        "reason_code",
+        "claim_generation",
+        "reclaim_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    },
+    {
+      "incident_id": "synthetic-core-release-rollback",
+      "runbook_id": "core_release_rollback",
+      "evidence_fields": [
+        "reason_code",
+        "release_version",
+        "drain_status"
+      ],
+      "contains_raw_secret": false,
+      "rollback_preserves_durable_data": true,
+      "result": "passed"
+    }
+  ],
+  "support_bundle_sample": {
+    "reason_code": "core.runbook.synthetic_incident",
+    "runtime_profile": "v2",
+    "generation": 2,
+    "credential": "<redacted>",
+    "prompt": "<redacted>",
+    "tool_payload": "<redacted>",
+    "workspace_path": "<redacted>",
+    "cleanup_status": "complete"
+  }
+}

@@ -95,6 +95,21 @@ fn admin_status_requires_token_and_context() -> Result<()> {
         "admin status should expose the stable contract readiness reason"
     );
     assert_eq!(
+        success_payload.pointer("/stable_core_evidence/qualified").and_then(Value::as_bool),
+        Some(true),
+        "admin status should expose the evidence-derived stable core decision"
+    );
+    assert_eq!(
+        success_payload.pointer("/stable_core_evidence/reason_code").and_then(Value::as_str),
+        Some("core.stable.release_qualified"),
+        "admin status should expose the stable core reason code"
+    );
+    assert_eq!(
+        success_payload.pointer("/stable_core_evidence/p0_blocker_count").and_then(Value::as_u64),
+        Some(0),
+        "admin status should fail closed when a P0 blocker reappears"
+    );
+    assert_eq!(
         success_payload
             .pointer("/runtime_diagnostics/runtime_error_contract/metadata_trace/event_name")
             .and_then(Value::as_str),

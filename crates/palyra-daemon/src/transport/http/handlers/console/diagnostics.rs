@@ -279,6 +279,7 @@ pub(crate) async fn console_diagnostics_handler(
     let core_performance_qualification =
         crate::runtime_diagnostics::build_core_performance_qualification_snapshot();
     let security_conformance = crate::runtime_diagnostics::build_security_conformance_snapshot();
+    let stable_core_evidence = crate::runtime_diagnostics::build_stable_core_evidence_snapshot();
     let legacy_retirement = crate::runtime_diagnostics::build_legacy_retirement_snapshot(
         state.runtime.runtime_kernel_dispatcher().diagnostics(),
         &state.runtime.config.feature_rollouts,
@@ -327,6 +328,7 @@ pub(crate) async fn console_diagnostics_handler(
             "metrics_catalog": metrics_catalog.clone(),
             "core_performance_qualification": core_performance_qualification.clone(),
             "security_conformance": security_conformance.clone(),
+            "stable_core_evidence": stable_core_evidence.clone(),
             "legacy_retirement": legacy_retirement.clone(),
             "v2_rollout": v2_rollout.clone(),
             "timeline": diagnostics_timeline.clone(),
@@ -360,6 +362,7 @@ pub(crate) async fn console_diagnostics_handler(
         "metrics_catalog": metrics_catalog,
         "core_performance_qualification": core_performance_qualification,
         "security_conformance": security_conformance,
+        "stable_core_evidence": stable_core_evidence,
         "legacy_retirement": legacy_retirement,
         "v2_rollout": v2_rollout,
         "opentelemetry": otel_spans,
