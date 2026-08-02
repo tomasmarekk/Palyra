@@ -300,9 +300,11 @@ pub async fn extract_document_content_bounded(
     {
         let timeout = Duration::from_millis(request.limits.timeout_ms.max(1));
         let worker_request = request.clone();
-        let worker = tokio::task::spawn_blocking(move || extract_owned_document(worker_request));
-        return match tokio::time::timeout(timeout, worker).await {
-            Ok(Ok(result)) => result,
+        let worker = tokio::task::spawn_blocking(move || {
+            extract_owned_document(worker_request).map_err(Box::new)
+        });
+        match tokio::time::timeout(timeout, worker).await {
+            Ok(Ok(result)) => result.map_err(|error| *error),
             Ok(Err(_)) => Err(extraction_error(
                 &request,
                 source_sha256,
@@ -319,7 +321,7 @@ pub async fn extract_document_content_bounded(
                 "document extraction exceeded the configured host timeout",
                 true,
             )),
-        };
+        }
     }
 
     #[cfg(not(test))]
