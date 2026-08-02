@@ -6002,7 +6002,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_kernel_env_profile_overrides_file_and_defaults_remain_legacy() {
+    fn runtime_kernel_env_profile_overrides_file_and_explicit_legacy_remains_supported() {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let tempdir = tempfile::tempdir().expect("temporary directory should be created");
         let config_path = tempdir.path().join("palyra.toml");

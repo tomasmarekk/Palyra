@@ -472,7 +472,7 @@ pub struct RuntimeKernelConfig {
 impl Default for RuntimeKernelConfig {
     fn default() -> Self {
         Self {
-            profile: RuntimeKernelProfile::Legacy,
+            profile: RuntimeKernelProfile::V2,
             canary_basis_points: 0,
             shadow_sample_basis_points: 0,
             sampling_identity: RuntimeKernelSamplingIdentity::Session,

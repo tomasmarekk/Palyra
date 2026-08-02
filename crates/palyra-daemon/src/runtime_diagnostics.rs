@@ -1068,6 +1068,19 @@ pub(crate) fn build_security_conformance_snapshot() -> Value {
     crate::application::core_stability::security::build_security_conformance_snapshot()
 }
 
+/// Returns the configured V2 rollout stage and release-gate decision.
+pub(crate) fn build_v2_rollout_snapshot(
+    profile: &crate::application::runtime_kernel_v2::profile_resolver::ResolvedRuntimeProfileV1,
+    performance: &Value,
+    security: &Value,
+) -> Value {
+    crate::application::runtime_kernel_v2::rollout::build_v2_rollout_snapshot(
+        profile,
+        performance,
+        security,
+    )
+}
+
 /// Validates that Prometheus labels stay low-cardinality and secret-free.
 pub(crate) fn validate_metric_labels(labels: &[(&str, &str)]) -> Result<(), String> {
     for (key, value) in labels {

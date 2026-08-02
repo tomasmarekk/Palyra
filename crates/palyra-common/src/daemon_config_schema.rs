@@ -515,7 +515,7 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
     ConfigSchemaEntry {
         path: "runtime_kernel.profile",
         value_type: "enum(legacy|v2_shadow|v2_canary|v2)",
-        default_value: Some("legacy"),
+        default_value: Some("v2"),
         env_vars: &["PALYRA_RUNTIME_KERNEL_PROFILE"],
         secret: false,
         deprecated: false,

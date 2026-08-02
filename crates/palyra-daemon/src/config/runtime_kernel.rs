@@ -330,11 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn default_runtime_profile_is_legacy_and_rejects_a_v2_bundle() {
+    fn default_runtime_profile_is_v2_and_rejects_a_legacy_bundle() {
         let config = RuntimeKernelConfig::default();
-        assert_eq!(config.profile, RuntimeKernelProfile::Legacy);
+        assert_eq!(config.profile, RuntimeKernelProfile::V2);
         let mut rollouts = FeatureRolloutsConfig::default();
-        set_bundle(&mut rollouts, FeatureRolloutSetting::from_config(true));
+        set_bundle(&mut rollouts, FeatureRolloutSetting::from_config(false));
         assert!(validate(&config, &rollouts).is_err());
     }
 

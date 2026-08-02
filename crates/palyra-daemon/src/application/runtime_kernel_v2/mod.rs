@@ -51,6 +51,7 @@ pub(crate) mod production_services;
 pub(crate) mod profile;
 pub(crate) mod profile_resolver;
 pub(crate) mod rollback;
+pub(crate) mod rollout;
 pub(crate) mod runtime_selection;
 pub(crate) mod selection;
 pub(crate) mod selection_host;

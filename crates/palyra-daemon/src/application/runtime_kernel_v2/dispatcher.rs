@@ -160,8 +160,12 @@ impl RuntimeKernelDispatcher {
     /// no longer form a valid closed profile.
     #[cfg(test)]
     pub(crate) fn legacy_default() -> Result<Self, RuntimeDispatcherError> {
+        let config = RuntimeKernelConfig {
+            profile: RuntimeKernelProfile::Legacy,
+            ..RuntimeKernelConfig::default()
+        };
         Self::resolve(
-            &RuntimeKernelConfig::default(),
+            &config,
             &FeatureRolloutsConfig::default(),
             None,
             false,
