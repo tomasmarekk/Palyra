@@ -6,7 +6,13 @@ use super::*;
 use crate::{
     application::channel_turn::ChannelTurnEnvelopeInput,
     gateway::tests::{build_test_runtime_state, build_test_runtime_state_with_runtime_overrides},
-    journal::OrchestratorCancelRequest,
+    journal::{
+        run_admission::{
+            JournalInitialSessionAuthorityPinRequest, JournalRuntimeAuthority,
+            JournalRuntimeAuthorityReason, JournalRuntimeProfile, JournalSessionAuthorityIntent,
+        },
+        OrchestratorCancelRequest, OrchestratorSessionUpsertRequest,
+    },
     model_provider::{
         capability_defaults_for_kind, AudioTranscriptionRequest, AudioTranscriptionResponse,
         ModelProvider, ModelProviderKind, ProviderAttemptSummary, ProviderError,
@@ -270,6 +276,39 @@ fn route_context() -> RequestContext {
     }
 }
 
+fn pin_existing_legacy_route_session(
+    state: &GatewayRuntimeState,
+    plan: &ChannelRoutePlan,
+    context: &RequestContext,
+) {
+    let session_id = Ulid::new().to_string();
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.clone(),
+            session_key: plan.session_key.clone(),
+            session_label: plan.session_label.clone(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .expect("existing legacy route session should persist");
+    state
+        .journal_store
+        .pin_initial_session_runtime_authority(&JournalInitialSessionAuthorityPinRequest {
+            session_id,
+            expected_revision: 0,
+            intent: JournalSessionAuthorityIntent {
+                configured_profile: JournalRuntimeProfile::Legacy,
+                selected_runtime: JournalRuntimeAuthority::Legacy,
+                reason: JournalRuntimeAuthorityReason::LegacyProfileSelected,
+                shadow_evaluation_enabled: false,
+            },
+            migration_reason_code: "runtime.session_authority.route_provider_test".to_owned(),
+        })
+        .expect("existing legacy route session authority should pin");
+}
+
 #[tokio::test]
 async fn route_provider_supersession_retries_with_replacement_and_settles_done() {
     let mut feature_rollouts = crate::config::FeatureRolloutsConfig::default();
@@ -279,6 +318,8 @@ async fn route_provider_supersession_retries_with_replacement_and_settles_done()
     let input = route_input();
     let plan = route_plan(&input);
     let context = route_context();
+    // Provider replacement belongs to the retained compatibility path, not new-session admission.
+    pin_existing_legacy_route_session(&state, &plan, &context);
     let envelope = route_envelope(&input, &context);
     let content = common_v1::MessageContent { text: input.text.clone(), attachments: Vec::new() };
 
@@ -433,6 +474,7 @@ async fn route_provider_cancellation_during_call_suppresses_retry_and_output() {
     let input = route_input();
     let plan = route_plan(&input);
     let context = route_context();
+    pin_existing_legacy_route_session(&state, &plan, &context);
     let envelope = route_envelope(&input, &context);
     let content = common_v1::MessageContent { text: input.text.clone(), attachments: Vec::new() };
 
@@ -527,6 +569,7 @@ async fn route_provider_supersession_exhaustion_settles_failed_without_orphan() 
     let input = route_input();
     let plan = route_plan(&input);
     let context = route_context();
+    pin_existing_legacy_route_session(&state, &plan, &context);
     let envelope = route_envelope(&input, &context);
     let content = common_v1::MessageContent { text: input.text.clone(), attachments: Vec::new() };
 
