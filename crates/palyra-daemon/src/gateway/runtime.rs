@@ -6292,10 +6292,6 @@ impl GatewayRuntimeState {
         self.counters.learning_candidates_created.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_learning_candidate_auto_applied(&self) {
-        self.counters.learning_candidates_auto_applied.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Counts an allow/deny tool decision. Denials also count as denied
     /// requests, and process-runner denials additionally count as sandbox
     /// policy denies.

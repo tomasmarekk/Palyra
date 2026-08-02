@@ -14,7 +14,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use palyra_common::{
     runtime_contracts::{
@@ -97,6 +97,10 @@ const CHILD_PROGRESS_HISTORY_LIMIT: usize = 64;
 // polls briefly so target_run_id never references a missing run.
 const CHILD_RUN_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_RUN_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const POST_RUN_REFLECTION_HARD_TIMEOUT: Duration = Duration::from_secs(120);
+const POST_RUN_REFLECTION_TIMEOUT_REASON: &str = "post_run_reflection.hard_timeout";
+const POST_RUN_REFLECTION_TIMEOUT_MESSAGE: &str =
+    "post-run reflection exceeded its hard execution timeout";
 
 /// Spawns the background queue polling loop on the Tokio runtime.
 ///
@@ -702,6 +706,75 @@ fn replace_background_task_snapshot(
     }
 }
 
+#[derive(Debug)]
+enum PostRunReflectionSettlement {
+    Succeeded(Value),
+    Failed { status_code: Code, message: String },
+    TimedOut,
+}
+
+async fn settle_post_run_reflection<F>(
+    reflection: F,
+    hard_timeout: Duration,
+) -> PostRunReflectionSettlement
+where
+    F: Future<Output = Result<Value, Status>>,
+{
+    match tokio::time::timeout(hard_timeout, reflection).await {
+        Ok(Ok(result)) => PostRunReflectionSettlement::Succeeded(result),
+        Ok(Err(error)) => PostRunReflectionSettlement::Failed {
+            status_code: error.code(),
+            message: error.message().to_owned(),
+        },
+        Err(_) => PostRunReflectionSettlement::TimedOut,
+    }
+}
+
+fn post_run_reflection_terminal_update(
+    task: &OrchestratorBackgroundTaskRecord,
+    settlement: PostRunReflectionSettlement,
+    completed_at_unix_ms: i64,
+) -> OrchestratorBackgroundTaskWorkerUpdateRequest {
+    let (state, last_error, result_json) = match settlement {
+        PostRunReflectionSettlement::Succeeded(result) => {
+            (AuxiliaryTaskState::Succeeded.as_str().to_owned(), None, result.to_string())
+        }
+        PostRunReflectionSettlement::Failed { message, .. } => (
+            AuxiliaryTaskState::Failed.as_str().to_owned(),
+            Some(message.clone()),
+            json!({
+                "status": "failed",
+                "task_id": task.task_id.as_str(),
+                "reason": "post_run_reflection.failed",
+                "error": message,
+            })
+            .to_string(),
+        ),
+        PostRunReflectionSettlement::TimedOut => (
+            AuxiliaryTaskState::Failed.as_str().to_owned(),
+            Some(POST_RUN_REFLECTION_TIMEOUT_MESSAGE.to_owned()),
+            json!({
+                "status": "failed",
+                "task_id": task.task_id.as_str(),
+                "reason": POST_RUN_REFLECTION_TIMEOUT_REASON,
+                "timeout_ms": u64::try_from(POST_RUN_REFLECTION_HARD_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX),
+            })
+            .to_string(),
+        ),
+    };
+    OrchestratorBackgroundTaskWorkerUpdateRequest {
+        task_id: task.task_id.clone(),
+        execution_generation: task.execution_generation,
+        state: Some(state),
+        target_run_id: Some(None),
+        last_error: Some(last_error),
+        result_json: Some(Some(result_json)),
+        started_at_unix_ms: None,
+        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+    }
+}
+
 /// Marks the task running and routes it to the matching executor: reflection
 /// tasks and auxiliary task kinds run in-process; everything else becomes a
 /// child gateway run supervised by `run_background_task_stream`.
@@ -716,55 +789,33 @@ async fn dispatch_background_task(
         let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
         let runtime = Arc::clone(runtime);
         tokio::spawn(async move {
-            match process_post_run_reflection_task(&runtime, &task).await {
-                Ok(result) => {
-                    persist_auxiliary_task_terminal_update(
-                        &runtime,
-                        task.task_id.as_str(),
-                        OrchestratorBackgroundTaskWorkerUpdateRequest {
-                            task_id: task.task_id.clone(),
-                            execution_generation: task.execution_generation,
-                            state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
-                            target_run_id: Some(None),
-                            last_error: Some(None),
-                            result_json: Some(Some(result.to_string())),
-                            started_at_unix_ms: None,
-                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => {
+            let settlement = settle_post_run_reflection(
+                process_post_run_reflection_task(&runtime, &task),
+                POST_RUN_REFLECTION_HARD_TIMEOUT,
+            )
+            .await;
+            match &settlement {
+                PostRunReflectionSettlement::Succeeded(_) => {}
+                PostRunReflectionSettlement::Failed { status_code, message } => {
                     warn!(
                         task_id = %task.task_id,
-                        status_code = ?error.code(),
-                        status_message = %error.message(),
+                        status_code = ?status_code,
+                        status_message = %message,
                         "post-run reflection task failed"
                     );
-                    persist_auxiliary_task_terminal_update(
-                        &runtime,
-                        task.task_id.as_str(),
-                        OrchestratorBackgroundTaskWorkerUpdateRequest {
-                            task_id: task.task_id.clone(),
-                            execution_generation: task.execution_generation,
-                            state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
-                            target_run_id: Some(None),
-                            last_error: Some(Some(error.message().to_owned())),
-                            result_json: Some(Some(
-                                json!({
-                                    "status": "failed",
-                                    "task_id": task.task_id,
-                                    "error": error.message(),
-                                })
-                                .to_string(),
-                            )),
-                            started_at_unix_ms: None,
-                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                        },
-                    )
-                    .await;
                 }
+                PostRunReflectionSettlement::TimedOut => warn!(
+                    task_id = %task.task_id,
+                    reason = POST_RUN_REFLECTION_TIMEOUT_REASON,
+                    "post-run reflection task timed out"
+                ),
             }
+            let update = post_run_reflection_terminal_update(
+                &task,
+                settlement,
+                crate::gateway::current_unix_ms(),
+            );
+            persist_auxiliary_task_terminal_update(&runtime, task.task_id.as_str(), update).await;
         });
         return Ok(());
     }
@@ -3956,14 +4007,15 @@ mod tests {
         evaluate_delegation_scheduler_limits, expire_child_task_cancellation_context,
         finalize_task_from_run, finalize_task_from_run_if_parent_generation_current,
         inject_background_metadata, parent_tape_accepts_background_event,
-        pending_child_cancel_reason, process_background_task,
+        pending_child_cancel_reason, post_run_reflection_terminal_update, process_background_task,
         reconcile_attached_child_with_invalid_contract, replace_background_task_snapshot,
         request_attached_child_expiry_cancel, run_background_task_stream,
         running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
-        should_emit_child_stream_progress, task_has_attached_child,
+        settle_post_run_reflection, should_emit_child_stream_progress, task_has_attached_child,
         task_has_in_flight_work_without_target, validate_child_task_cancellation_contract,
         ChildLifecycleTapeBudget, ChildLifecycleTapeDecision, ChildStreamProgress,
-        DelegationSchedulerDecision, MergeDeliveryPayloadContext,
+        DelegationSchedulerDecision, MergeDeliveryPayloadContext, PostRunReflectionSettlement,
+        POST_RUN_REFLECTION_TIMEOUT_MESSAGE, POST_RUN_REFLECTION_TIMEOUT_REASON,
     };
     use crate::{
         application::delivery_arbitration::{DeliveryDecision, DeliveryDecisionAction},
@@ -4194,6 +4246,47 @@ mod tests {
                 .expect("background auxiliary stale diagnostic count should load"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn post_run_reflection_timeout_settles_with_generation_guard_and_stable_reason() {
+        let settlement = settle_post_run_reflection(
+            std::future::pending::<Result<Value, tonic::Status>>(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(settlement, PostRunReflectionSettlement::TimedOut));
+
+        let mut task = sample_task(
+            "reflection-timeout",
+            AuxiliaryTaskState::Running.as_str(),
+            1,
+            "group-a",
+            DelegationRuntimeLimits::default(),
+        );
+        task.task_kind = AuxiliaryTaskKind::PostRunReflection.as_str().to_owned();
+        task.execution_generation = 9;
+        let update = post_run_reflection_terminal_update(&task, settlement, 1_700_000_000_000);
+        let result: Value = serde_json::from_str(
+            update
+                .result_json
+                .as_ref()
+                .and_then(Option::as_ref)
+                .expect("timeout result should be present"),
+        )
+        .expect("timeout result should be JSON");
+
+        assert_eq!(update.execution_generation, 9);
+        assert_eq!(update.state.as_deref(), Some(AuxiliaryTaskState::Failed.as_str()));
+        assert_eq!(
+            update.last_error.as_ref().and_then(Option::as_deref),
+            Some(POST_RUN_REFLECTION_TIMEOUT_MESSAGE)
+        );
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some(POST_RUN_REFLECTION_TIMEOUT_REASON)
+        );
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("failed"));
     }
 
     fn unauthenticated_gateway_auth() -> GatewayAuthConfig {
