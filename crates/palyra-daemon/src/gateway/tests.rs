@@ -51,6 +51,10 @@ use crate::agents::AgentCreateRequest;
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsageCapabilitySnapshot, FeatureUsagePath, FeatureUsageReason,
 };
+use crate::journal::run_admission::{
+    JournalInitialSessionAuthorityPinRequest, JournalRuntimeAuthority,
+    JournalRuntimeAuthorityReason, JournalRuntimeProfile, JournalSessionAuthorityIntent,
+};
 use crate::journal::{
     ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
     ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
@@ -2261,6 +2265,35 @@ async fn grpc_run_stream_provider_supersession_suppresses_stale_output_and_settl
     let session_id = Ulid::new().to_string();
     let run_id = Ulid::new().to_string();
     let envelope_id = Ulid::new().to_string();
+
+    // This regression exercises provider replacement on the compatibility runtime, so model an
+    // existing legacy session explicitly instead of admitting a forbidden new legacy session.
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.clone(),
+            session_key: session_id.clone(),
+            session_label: None,
+            principal: "user:test".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+            channel: Some("test".to_owned()),
+        })
+        .expect("existing legacy test session should persist");
+    state
+        .journal_store
+        .pin_initial_session_runtime_authority(&JournalInitialSessionAuthorityPinRequest {
+            session_id: session_id.clone(),
+            expected_revision: 0,
+            intent: JournalSessionAuthorityIntent {
+                configured_profile: JournalRuntimeProfile::Legacy,
+                selected_runtime: JournalRuntimeAuthority::Legacy,
+                reason: JournalRuntimeAuthorityReason::LegacyProfileSelected,
+                shadow_evaluation_enabled: false,
+            },
+            migration_reason_code: "runtime.session_authority.provider_supersession_test"
+                .to_owned(),
+        })
+        .expect("existing legacy test session authority should pin");
 
     let (stale_started_tx, mut stale_started_rx) = tokio::sync::mpsc::channel(1);
     let stale_release = Arc::new(Notify::new());
