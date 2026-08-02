@@ -1243,62 +1243,63 @@ fn build_post_run_reviewer_evidence_pack(
     let mut admitted_bytes = 0_usize;
     let mut observed_taint = false;
 
-    let mut admit = |record: PostRunReviewerEvidenceRecord| {
-        total_source_count = total_source_count.saturating_add(1);
-        observed_taint |= !record.taint_reason_codes.is_empty();
-        let record_bytes =
-            serde_json::to_vec(&record).map(|encoded| encoded.len()).unwrap_or(usize::MAX);
-        let evidence_budget = POST_RUN_REVIEWER_EVIDENCE_MAX_BYTES
-            .saturating_sub(POST_RUN_REVIEWER_EVIDENCE_METADATA_RESERVE_BYTES);
-        if records.len() >= POST_RUN_REVIEWER_EVIDENCE_MAX_RECORDS
-            || admitted_bytes.saturating_add(record_bytes) > evidence_budget
-        {
-            skipped_source_count = skipped_source_count.saturating_add(1);
-            return;
-        }
-        admitted_bytes = admitted_bytes.saturating_add(record_bytes);
-        if record.redaction_applied {
-            redacted_source_count = redacted_source_count.saturating_add(1);
-        }
-        if record.excerpt_truncated {
-            truncated_source_count = truncated_source_count.saturating_add(1);
-        }
-        records.push(record);
-    };
+    {
+        let mut admit = |record: PostRunReviewerEvidenceRecord| {
+            total_source_count = total_source_count.saturating_add(1);
+            observed_taint |= !record.taint_reason_codes.is_empty();
+            let record_bytes =
+                serde_json::to_vec(&record).map(|encoded| encoded.len()).unwrap_or(usize::MAX);
+            let evidence_budget = POST_RUN_REVIEWER_EVIDENCE_MAX_BYTES
+                .saturating_sub(POST_RUN_REVIEWER_EVIDENCE_METADATA_RESERVE_BYTES);
+            if records.len() >= POST_RUN_REVIEWER_EVIDENCE_MAX_RECORDS
+                || admitted_bytes.saturating_add(record_bytes) > evidence_budget
+            {
+                skipped_source_count = skipped_source_count.saturating_add(1);
+                return;
+            }
+            admitted_bytes = admitted_bytes.saturating_add(record_bytes);
+            if record.redaction_applied {
+                redacted_source_count = redacted_source_count.saturating_add(1);
+            }
+            if record.excerpt_truncated {
+                truncated_source_count = truncated_source_count.saturating_add(1);
+            }
+            records.push(record);
+        };
 
-    for candidate in compaction_candidates {
-        let mut taint_reason_codes = Vec::new();
-        if matches!(candidate.sensitivity.as_str(), "poisoned" | "sensitive") {
-            taint_reason_codes
-                .push(format!("post_run_reviewer.compaction_{}", candidate.sensitivity));
+        for candidate in compaction_candidates {
+            let mut taint_reason_codes = Vec::new();
+            if matches!(candidate.sensitivity.as_str(), "poisoned" | "sensitive") {
+                taint_reason_codes
+                    .push(format!("post_run_reviewer.compaction_{}", candidate.sensitivity));
+            }
+            if matches!(candidate.disposition.as_str(), "blocked_poisoned" | "blocked_sensitive") {
+                taint_reason_codes.push("post_run_reviewer.compaction_blocked".to_owned());
+            }
+            admit(build_post_run_reviewer_evidence_record(
+                "compaction_candidate",
+                format!("compaction:{}", candidate.candidate_id),
+                candidate.category.as_str(),
+                format!("{}\n{}", candidate.content, candidate.rationale).as_str(),
+                taint_reason_codes,
+            ));
         }
-        if matches!(candidate.disposition.as_str(), "blocked_poisoned" | "blocked_sensitive") {
-            taint_reason_codes.push("post_run_reviewer.compaction_blocked".to_owned());
-        }
-        admit(build_post_run_reviewer_evidence_record(
-            "compaction_candidate",
-            format!("compaction:{}", candidate.candidate_id),
-            candidate.category.as_str(),
-            format!("{}\n{}", candidate.content, candidate.rationale).as_str(),
-            taint_reason_codes,
-        ));
-    }
 
-    for record in transcript.iter().filter(|record| record.run_id == run_id) {
-        let taint_reason_codes = serde_json::from_str::<Value>(record.payload_json.as_str())
-            .ok()
-            .and_then(|payload| patch_taint_reason(&payload))
-            .map(|_| vec!["post_run_reviewer.tool_output_tainted".to_owned()])
-            .unwrap_or_default();
-        admit(build_post_run_reviewer_evidence_record(
-            "transcript_event",
-            format!("transcript:{}:{}", record.run_id, record.seq),
-            record.event_type.as_str(),
-            record.payload_json.as_str(),
-            taint_reason_codes,
-        ));
+        for record in transcript.iter().filter(|record| record.run_id == run_id) {
+            let taint_reason_codes = serde_json::from_str::<Value>(record.payload_json.as_str())
+                .ok()
+                .and_then(|payload| patch_taint_reason(&payload))
+                .map(|_| vec!["post_run_reviewer.tool_output_tainted".to_owned()])
+                .unwrap_or_default();
+            admit(build_post_run_reviewer_evidence_record(
+                "transcript_event",
+                format!("transcript:{}:{}", record.run_id, record.seq),
+                record.event_type.as_str(),
+                record.payload_json.as_str(),
+                taint_reason_codes,
+            ));
+        }
     }
-    drop(admit);
 
     let mut reason_codes = vec![
         "post_run_reviewer.candidate_only".to_owned(),
