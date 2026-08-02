@@ -27,7 +27,18 @@ pub(crate) async fn console_skills_list_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let skills_root = resolve_skills_root()?;
-    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    let mut index = {
+        let _guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "installed skills index lock is poisoned",
+            ))
+        })?;
+        let mut index = load_installed_skills_index(skills_root.as_path())?;
+        if refresh_installed_skill_staleness(&mut index, unix_ms_now().unwrap_or_default()) {
+            save_installed_skills_index(skills_root.as_path(), &index)?;
+        }
+        index
+    };
     if let Some(skill_id) =
         query.skill_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
@@ -342,39 +353,90 @@ pub(crate) async fn console_skills_install_handler(
             )))
         })?;
     }
-    fs::write(managed_artifact_path.as_path(), artifact_bytes.as_slice()).map_err(|error| {
-        runtime_status_response(tonic::Status::internal(format!(
-            "failed to persist managed artifact {}: {error}",
-            managed_artifact_path.display()
-        )))
+    let _index_guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+        runtime_status_response(tonic::Status::internal("installed skills index lock is poisoned"))
     })?;
+    let artifact_sha256 = sha256_hex(artifact_bytes.as_slice());
+    if managed_artifact_path.exists() {
+        let existing_bytes = fs::read(managed_artifact_path.as_path()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to read existing immutable artifact {}: {error}",
+                managed_artifact_path.display()
+            )))
+        })?;
+        if sha256_hex(existing_bytes.as_slice()) != artifact_sha256 {
+            return Err(runtime_status_response(tonic::Status::already_exists(format!(
+                "immutable skill version {}@{} already has a different artifact",
+                skill_id, version
+            ))));
+        }
+    } else {
+        write_new_skill_artifact_atomically(
+            managed_artifact_path.as_path(),
+            artifact_bytes.as_slice(),
+        )
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to persist managed artifact {}: {error}",
+                managed_artifact_path.display()
+            )))
+        })?;
+    }
 
     let mut index = load_installed_skills_index(skills_root.as_path())?;
+    if index.entries.iter().any(|entry| entry.skill_id == skill_id && entry.version == version) {
+        return Err(runtime_status_response(tonic::Status::already_exists(format!(
+            "immutable skill version already installed: {}@{}",
+            skill_id, version
+        ))));
+    }
     let previous_current = index
         .entries
         .iter()
         .find(|entry| entry.skill_id == skill_id && entry.current && entry.version != version)
         .cloned();
-    index.entries.retain(|entry| !(entry.skill_id == skill_id && entry.version == version));
-    for entry in &mut index.entries {
-        if entry.skill_id == skill_id {
-            entry.current = false;
-        }
-    }
     let installed_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
         )))
     })?;
+    for entry in &mut index.entries {
+        if entry.skill_id == skill_id && entry.current {
+            entry.current = false;
+            palyra_skills::mark_skill_version_stale(&mut entry.lifecycle, installed_at_unix_ms);
+        }
+    }
     let payload_sha256 = audit_report.payload_sha256.clone();
     let trust_decision = trust_decision_label(audit_report.trust_decision);
+    let eval_pack_sha256 = sha256_hex(
+        serde_json::to_vec(&audit_report)
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to encode skill evaluation evidence: {error}"
+                )))
+            })?
+            .as_slice(),
+    );
+    let lifecycle = palyra_skills::activate_signed_skill_version(
+        artifact_sha256.clone(),
+        eval_pack_sha256,
+        audit_report.should_quarantine || !audit_report.passed,
+        palyra_skills::SkillActivationGate { operator_approved: true, policy_approved: false },
+        installed_at_unix_ms,
+    )
+    .map_err(|decision| {
+        runtime_status_response(tonic::Status::failed_precondition(format!(
+            "skill activation gate denied: {}",
+            decision.reason_codes.join(",")
+        )))
+    })?;
     let record = InstalledSkillRecord {
         skill_id: skill_id.clone(),
         version: version.clone(),
         publisher: inspection.manifest.publisher.clone(),
         current: true,
         installed_at_unix_ms,
-        artifact_sha256: sha256_hex(artifact_bytes.as_slice()),
+        artifact_sha256,
         payload_sha256: payload_sha256.clone(),
         signature_key_id: inspection.signature.key_id.clone(),
         trust_decision: trust_decision.clone(),
@@ -414,6 +476,8 @@ pub(crate) async fn console_skills_install_handler(
             previous_payload_sha256: entry.payload_sha256.clone(),
             captured_at_unix_ms: installed_at_unix_ms,
         }),
+        lifecycle,
+        usage: SkillUsageTelemetry::default(),
     };
     index.entries.push(record.clone());
     save_installed_skills_index(skills_root.as_path(), &index)?;
@@ -439,8 +503,17 @@ pub(crate) async fn console_skills_verify_handler(
     let _session = authorize_console_session(&state, &headers, true)?;
     let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
     let skills_root = resolve_skills_root()?;
+    let _index_guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+        runtime_status_response(tonic::Status::internal("installed skills index lock is poisoned"))
+    })?;
     let mut index = load_installed_skills_index(skills_root.as_path())?;
-    let version = resolve_skill_version(&index, skill_id.as_str(), payload.version.as_deref())?;
+    let version = resolve_installed_skill_version_any_state(
+        &index,
+        skill_id.as_str(),
+        payload.version.as_deref(),
+    )?
+    .version
+    .clone();
     let artifact_path =
         managed_skill_artifact_path(skills_root.as_path(), skill_id.as_str(), version.as_str());
     let artifact_bytes = fs::read(artifact_path.as_path()).map_err(|error| {
@@ -449,6 +522,18 @@ pub(crate) async fn console_skills_verify_handler(
             artifact_path.display()
         )))
     })?;
+    let artifact_sha256 = sha256_hex(artifact_bytes.as_slice());
+    let expected_artifact_sha256 = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.version == version)
+        .map(|entry| entry.artifact_sha256.as_str())
+        .unwrap_or_default();
+    if artifact_sha256 != expected_artifact_sha256 {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "skill.lifecycle.immutable_artifact_mismatch",
+        )));
+    }
 
     let trust_store_path = resolve_skills_trust_store_path(skills_root.as_path());
     let mut trust_store = load_trust_store(trust_store_path.as_path())?;
@@ -471,6 +556,8 @@ pub(crate) async fn console_skills_verify_handler(
         entry.payload_sha256 = report.payload_sha256.clone();
         entry.publisher = report.manifest.publisher.clone();
         entry.trust_decision = trust_decision_label(report.trust_decision);
+        entry.lifecycle.artifact_signed = true;
+        entry.lifecycle.artifact_sha256 = artifact_sha256;
     }
     save_installed_skills_index(skills_root.as_path(), &index)?;
     Ok(Json(json!({ "report": report })))
@@ -491,8 +578,20 @@ pub(crate) async fn console_skills_audit_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
     let skills_root = resolve_skills_root()?;
-    let index = load_installed_skills_index(skills_root.as_path())?;
-    let version = resolve_skill_version(&index, skill_id.as_str(), payload.version.as_deref())?;
+    let (version, expected_artifact_sha256) = {
+        let _index_guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "installed skills index lock is poisoned",
+            ))
+        })?;
+        let index = load_installed_skills_index(skills_root.as_path())?;
+        let record = resolve_installed_skill_version_any_state(
+            &index,
+            skill_id.as_str(),
+            payload.version.as_deref(),
+        )?;
+        (record.version.clone(), record.artifact_sha256.clone())
+    };
     let artifact_path =
         managed_skill_artifact_path(skills_root.as_path(), skill_id.as_str(), version.as_str());
     let artifact_bytes = fs::read(artifact_path.as_path()).map_err(|error| {
@@ -501,6 +600,11 @@ pub(crate) async fn console_skills_audit_handler(
             artifact_path.display()
         )))
     })?;
+    if sha256_hex(artifact_bytes.as_slice()) != expected_artifact_sha256 {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "skill.lifecycle.immutable_artifact_mismatch",
+        )));
+    }
 
     let trust_store_path = resolve_skills_trust_store_path(skills_root.as_path());
     let mut trust_store = load_trust_store(trust_store_path.as_path())?;
@@ -516,6 +620,44 @@ pub(crate) async fn console_skills_audit_handler(
         )))
     })?;
     save_trust_store(trust_store_path.as_path(), &trust_store)?;
+    let eval_pack_sha256 = sha256_hex(
+        serde_json::to_vec(&report)
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to encode skill evaluation evidence: {error}"
+                )))
+            })?
+            .as_slice(),
+    );
+    {
+        let _index_guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "installed skills index lock is poisoned",
+            ))
+        })?;
+        let mut index = load_installed_skills_index(skills_root.as_path())?;
+        let entry = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.skill_id == skill_id && entry.version == version)
+            .ok_or_else(|| {
+                runtime_status_response(tonic::Status::not_found(format!(
+                    "installed skill not found: {skill_id}@{version}"
+                )))
+            })?;
+        entry.security_scan = installed_skill_security_snapshot(&report);
+        palyra_skills::record_skill_evaluation(
+            &mut entry.lifecycle,
+            report.passed && report.accepted,
+            Some(eval_pack_sha256),
+            report.should_quarantine || !report.passed,
+            report.generated_at_unix_ms,
+        );
+        if !entry.lifecycle.state.is_executable() {
+            entry.current = false;
+        }
+        save_installed_skills_index(skills_root.as_path(), &index)?;
+    }
 
     let quarantined = if report.should_quarantine && payload.quarantine_on_fail.unwrap_or(true) {
         let record = state
@@ -547,6 +689,35 @@ pub(crate) async fn console_skills_audit_handler(
         "report": report,
         "quarantined": quarantined,
     })))
+}
+
+fn installed_skill_security_snapshot(
+    report: &palyra_skills::SkillSecurityAuditReport,
+) -> InstalledSkillSecuritySnapshot {
+    InstalledSkillSecuritySnapshot {
+        schema_version: 1,
+        accepted: report.accepted,
+        passed: report.passed,
+        should_quarantine: report.should_quarantine,
+        generated_at_unix_ms: report.generated_at_unix_ms,
+        payload_sha256: report.payload_sha256.clone(),
+        trust_decision: trust_decision_label(report.trust_decision),
+        check_count: report.checks.len(),
+        failed_checks: report
+            .checks
+            .iter()
+            .filter(|check| check.status == SkillAuditCheckStatus::Fail)
+            .map(|check| check.check_id.clone())
+            .collect(),
+        warning_checks: report
+            .checks
+            .iter()
+            .filter(|check| check.status == SkillAuditCheckStatus::Warn)
+            .map(|check| check.check_id.clone())
+            .collect(),
+        quarantine_reasons: report.quarantine_reasons.clone(),
+        policy: report.policy.clone(),
+    }
 }
 
 /// Marks a skill version as quarantined.
@@ -628,6 +799,264 @@ pub(crate) async fn console_skill_enable_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(skill_status_response(record)))
+}
+
+/// Applies an operator-reviewed lifecycle action to one immutable skill version.
+///
+/// # Errors
+/// Returns an error response when authorization, lifecycle invariants, active
+/// pointer validation, rollback evidence, or atomic index persistence fails.
+pub(crate) async fn console_skill_lifecycle_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<ConsoleSkillLifecycleRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let version = normalize_non_empty_field(payload.version, "version")?;
+    let action = normalize_non_empty_field(payload.action, "action")?.to_ascii_lowercase();
+    let reason = payload.reason.and_then(trim_to_option);
+    let now_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let skills_root = resolve_skills_root()?;
+    let record = {
+        let _guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "installed skills index lock is poisoned",
+            ))
+        })?;
+        let mut index = load_installed_skills_index(skills_root.as_path())?;
+        let record = apply_installed_skill_lifecycle_action(
+            &mut index,
+            skill_id.as_str(),
+            version.as_str(),
+            action.as_str(),
+            payload.operator_approved.unwrap_or(false),
+            now_unix_ms,
+        )?;
+        save_installed_skills_index(skills_root.as_path(), &index)?;
+        record
+    };
+    let lifecycle_reason_code = format!("skill.lifecycle.{action}_completed");
+    let trace_recorded = match state
+        .runtime
+        .record_console_event(
+            &session.context,
+            "skill.lifecycle.transition",
+            json!({
+                "skill_id": record.skill_id,
+                "version": record.version,
+                "action": action,
+                "state": record.lifecycle.state.as_str(),
+                "reason_code": lifecycle_reason_code,
+                "operator_reason_present": reason.is_some(),
+                "operator_reason_sha256": reason
+                    .as_deref()
+                    .map(|value| sha256_hex(value.as_bytes())),
+                "artifact_sha256": record.artifact_sha256,
+                "payload_sha256": record.payload_sha256,
+                "rollback_count": record.lifecycle.rollback_count,
+            }),
+        )
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                skill_id = %skill_id,
+                version = %version,
+                action = %action,
+                "failed to record skill lifecycle console event"
+            );
+            false
+        }
+    };
+
+    Ok(Json(json!({
+        "record": record,
+        "action": action,
+        "reason": reason,
+        "operator_principal_hash": sha256_hex(session.context.principal.as_bytes()),
+        "diagnostics": {
+            "reason_code": lifecycle_reason_code,
+            "artifact_immutable": true,
+            "activation_authority": "operator_or_host_policy_only",
+            "model_activation_allowed": false,
+            "trace_recorded": trace_recorded,
+        }
+    })))
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_installed_skill_lifecycle_action(
+    index: &mut InstalledSkillsIndex,
+    skill_id: &str,
+    version: &str,
+    action: &str,
+    operator_approved: bool,
+    now_unix_ms: i64,
+) -> Result<InstalledSkillRecord, Response> {
+    let target_index = index
+        .entries
+        .iter()
+        .position(|entry| entry.skill_id == skill_id && entry.version == version)
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "installed skill not found: {skill_id}@{version}"
+            )))
+        })?;
+    match action {
+        "pin" => palyra_skills::set_skill_version_pinned(
+            &mut index.entries[target_index].lifecycle,
+            true,
+            now_unix_ms,
+        ),
+        "unpin" => palyra_skills::set_skill_version_pinned(
+            &mut index.entries[target_index].lifecycle,
+            false,
+            now_unix_ms,
+        ),
+        "mark_stale" => {
+            let entry = &mut index.entries[target_index];
+            if !matches!(
+                entry.lifecycle.state,
+                SkillLifecycleState::Active | SkillLifecycleState::Stale
+            ) {
+                return Err(lifecycle_conflict("skill.lifecycle.stale_transition_denied"));
+            }
+            if entry.lifecycle.pinned {
+                return Err(lifecycle_conflict("skill.lifecycle.pinned_stale_denied"));
+            }
+            if !entry.usage.dependent_routine_refs.is_empty() {
+                return Err(lifecycle_conflict("skill.lifecycle.referenced_stale_denied"));
+            }
+            palyra_skills::mark_skill_version_stale(&mut entry.lifecycle, now_unix_ms);
+        }
+        "archive" => {
+            let entry = &mut index.entries[target_index];
+            palyra_skills::archive_skill_version(
+                &mut entry.lifecycle,
+                entry.current,
+                entry.usage.dependent_routine_refs.len(),
+                now_unix_ms,
+            )
+            .map_err(lifecycle_conflict)?;
+            entry.current = false;
+        }
+        "restore" => {
+            palyra_skills::restore_skill_version(
+                &mut index.entries[target_index].lifecycle,
+                now_unix_ms,
+            )
+            .map_err(lifecycle_conflict)?;
+            index.entries[target_index].current = false;
+        }
+        "activate" => {
+            if !operator_approved {
+                return Err(lifecycle_conflict("skill.lifecycle.operator_ack_required"));
+            }
+            if index.entries[target_index].current {
+                return Err(lifecycle_conflict("skill.lifecycle.already_active"));
+            }
+            let previous_index =
+                index.entries.iter().position(|entry| entry.skill_id == skill_id && entry.current);
+            let rollback_snapshot =
+                previous_index.map(|previous_entry_index| InstalledSkillRollbackSnapshot {
+                    schema_version: 1,
+                    previous_version: index.entries[previous_entry_index].version.clone(),
+                    previous_artifact_sha256: index.entries[previous_entry_index]
+                        .artifact_sha256
+                        .clone(),
+                    previous_payload_sha256: index.entries[previous_entry_index]
+                        .payload_sha256
+                        .clone(),
+                    captured_at_unix_ms: now_unix_ms,
+                });
+            palyra_skills::activate_existing_skill_version(
+                &mut index.entries[target_index].lifecycle,
+                palyra_skills::SkillActivationGate {
+                    operator_approved: true,
+                    policy_approved: false,
+                },
+                now_unix_ms,
+            )
+            .map_err(|decision| lifecycle_conflict(decision.reason_codes.join(",").as_str()))?;
+            if let Some(previous_index) = previous_index {
+                index.entries[previous_index].current = false;
+                palyra_skills::mark_skill_version_stale(
+                    &mut index.entries[previous_index].lifecycle,
+                    now_unix_ms,
+                );
+            }
+            index.entries[target_index].current = true;
+            index.entries[target_index].rollback_snapshot = rollback_snapshot;
+        }
+        "rollback" => {
+            if !operator_approved {
+                return Err(lifecycle_conflict("skill.lifecycle.operator_ack_required"));
+            }
+            if !index.entries[target_index].current {
+                return Err(lifecycle_conflict("skill.lifecycle.rollback_requires_current"));
+            }
+            let snapshot = index.entries[target_index]
+                .rollback_snapshot
+                .clone()
+                .ok_or_else(|| lifecycle_conflict("skill.lifecycle.rollback_snapshot_missing"))?;
+            let previous_index = index
+                .entries
+                .iter()
+                .position(|entry| {
+                    entry.skill_id == skill_id && entry.version == snapshot.previous_version
+                })
+                .ok_or_else(|| {
+                    lifecycle_conflict("skill.lifecycle.rollback_previous_version_missing")
+                })?;
+            let previous = &index.entries[previous_index];
+            if previous.artifact_sha256 != snapshot.previous_artifact_sha256
+                || previous.payload_sha256 != snapshot.previous_payload_sha256
+            {
+                return Err(lifecycle_conflict("skill.lifecycle.rollback_evidence_mismatch"));
+            }
+            palyra_skills::activate_existing_skill_version(
+                &mut index.entries[previous_index].lifecycle,
+                palyra_skills::SkillActivationGate {
+                    operator_approved: true,
+                    policy_approved: false,
+                },
+                now_unix_ms,
+            )
+            .map_err(|decision| lifecycle_conflict(decision.reason_codes.join(",").as_str()))?;
+            index.entries[previous_index].current = true;
+            index.entries[previous_index].rollback_snapshot = None;
+            index.entries[target_index].current = false;
+            index.entries[target_index].rollback_snapshot = None;
+            palyra_skills::mark_skill_version_rolled_back(
+                &mut index.entries[target_index].lifecycle,
+                now_unix_ms,
+            );
+        }
+        _ => {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "action must be pin, unpin, mark_stale, archive, restore, activate, or rollback",
+            )));
+        }
+    }
+    normalize_installed_skills_index(index);
+    index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.version == version)
+        .cloned()
+        .ok_or_else(|| lifecycle_conflict("skill.lifecycle.target_lost_after_normalization"))
+}
+
+fn lifecycle_conflict(reason_code: &str) -> Response {
+    runtime_status_response(tonic::Status::failed_precondition(reason_code.to_owned()))
 }
 
 /// Promotes a reviewed procedure learning candidate to a skill scaffold.
@@ -1366,13 +1795,68 @@ fn builder_source_summary(source: &BuilderSource) -> String {
 mod tests {
     use std::fs;
 
+    use palyra_skills::{
+        activate_signed_skill_version, mark_skill_version_stale, SkillActivationGate,
+        SkillLifecycleState, SkillUsageTelemetry,
+    };
     use tempfile::tempdir;
 
     use super::{
-        load_skill_builder_candidate_index, procedure_candidate_status_is_promotable,
-        skill_builder_candidates_index_path,
+        apply_installed_skill_lifecycle_action, load_skill_builder_candidate_index,
+        procedure_candidate_status_is_promotable, skill_builder_candidates_index_path,
     };
-    use crate::SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION;
+    use crate::{
+        InstalledSkillRecord, InstalledSkillRollbackSnapshot, InstalledSkillSecuritySnapshot,
+        InstalledSkillSource, InstalledSkillsIndex, SkillSecurityAuditPolicy,
+        SKILLS_LAYOUT_VERSION, SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION,
+    };
+
+    fn lifecycle_record(version: &str, current: bool) -> InstalledSkillRecord {
+        let mut lifecycle = activate_signed_skill_version(
+            format!("artifact-{version}"),
+            format!("eval-{version}"),
+            false,
+            SkillActivationGate { operator_approved: true, policy_approved: false },
+            10,
+        )
+        .expect("fixture lifecycle should activate");
+        if !current {
+            mark_skill_version_stale(&mut lifecycle, 20);
+        }
+        InstalledSkillRecord {
+            skill_id: "acme.lifecycle".to_owned(),
+            version: version.to_owned(),
+            publisher: "acme".to_owned(),
+            current,
+            installed_at_unix_ms: 10,
+            artifact_sha256: format!("artifact-{version}"),
+            payload_sha256: format!("payload-{version}"),
+            signature_key_id: "key-1".to_owned(),
+            trust_decision: "allowlisted".to_owned(),
+            source: InstalledSkillSource {
+                kind: "managed_artifact".to_owned(),
+                reference: format!("{version}.palyra-skill"),
+            },
+            missing_secrets: Vec::new(),
+            security_scan: InstalledSkillSecuritySnapshot {
+                schema_version: 1,
+                accepted: true,
+                passed: true,
+                should_quarantine: false,
+                generated_at_unix_ms: 10,
+                payload_sha256: format!("payload-{version}"),
+                trust_decision: "allowlisted".to_owned(),
+                check_count: 1,
+                failed_checks: Vec::new(),
+                warning_checks: Vec::new(),
+                quarantine_reasons: Vec::new(),
+                policy: SkillSecurityAuditPolicy::default(),
+            },
+            rollback_snapshot: None,
+            lifecycle,
+            usage: SkillUsageTelemetry::default(),
+        }
+    }
 
     #[test]
     fn load_skill_builder_candidate_index_migrates_legacy_metadata() {
@@ -1396,5 +1880,81 @@ mod tests {
         assert!(!procedure_candidate_status_is_promotable("suppressed"));
         assert!(procedure_candidate_status_is_promotable("proposed"));
         assert!(procedure_candidate_status_is_promotable("accepted"));
+    }
+
+    #[test]
+    fn lifecycle_action_archives_and_restores_without_activation() {
+        let mut index = InstalledSkillsIndex {
+            schema_version: SKILLS_LAYOUT_VERSION,
+            updated_at_unix_ms: 0,
+            entries: vec![lifecycle_record("1.0.0", false)],
+        };
+
+        let archived = apply_installed_skill_lifecycle_action(
+            &mut index,
+            "acme.lifecycle",
+            "1.0.0",
+            "archive",
+            false,
+            30,
+        )
+        .expect("inactive version should archive");
+        assert_eq!(archived.lifecycle.state, SkillLifecycleState::Archived);
+        assert!(!archived.current);
+
+        let restored = apply_installed_skill_lifecycle_action(
+            &mut index,
+            "acme.lifecycle",
+            "1.0.0",
+            "restore",
+            false,
+            40,
+        )
+        .expect("archived version should restore");
+        assert_eq!(restored.lifecycle.state, SkillLifecycleState::Evaluated);
+        assert!(!restored.current, "restore must not silently reactivate code");
+    }
+
+    #[test]
+    fn lifecycle_rollback_consumes_exact_previous_pointer_once() {
+        let previous = lifecycle_record("1.0.0", false);
+        let mut current = lifecycle_record("2.0.0", true);
+        current.rollback_snapshot = Some(InstalledSkillRollbackSnapshot {
+            schema_version: 1,
+            previous_version: previous.version.clone(),
+            previous_artifact_sha256: previous.artifact_sha256.clone(),
+            previous_payload_sha256: previous.payload_sha256.clone(),
+            captured_at_unix_ms: 20,
+        });
+        let mut index = InstalledSkillsIndex {
+            schema_version: SKILLS_LAYOUT_VERSION,
+            updated_at_unix_ms: 0,
+            entries: vec![previous, current],
+        };
+
+        let rolled_back = apply_installed_skill_lifecycle_action(
+            &mut index,
+            "acme.lifecycle",
+            "2.0.0",
+            "rollback",
+            true,
+            30,
+        )
+        .expect("matching immutable rollback evidence should restore the previous pointer");
+        assert_eq!(rolled_back.lifecycle.state, SkillLifecycleState::RolledBack);
+        assert!(!rolled_back.current);
+        assert!(rolled_back.rollback_snapshot.is_none());
+        assert!(index.entries.iter().any(|entry| entry.version == "1.0.0" && entry.current));
+
+        let error = apply_installed_skill_lifecycle_action(
+            &mut index,
+            "acme.lifecycle",
+            "2.0.0",
+            "rollback",
+            true,
+            40,
+        )
+        .expect_err("consumed rollback pointer must not be reusable");
+        assert_eq!(error.status(), axum::http::StatusCode::PRECONDITION_FAILED);
     }
 }

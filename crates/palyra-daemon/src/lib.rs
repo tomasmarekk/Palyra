@@ -119,6 +119,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
     fs,
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -235,7 +236,8 @@ use palyra_common::{
 use palyra_common::{
     default_identity_store_root, default_state_root,
     versioned_json::{
-        migrate_updated_at_metadata_v0_to_v1, parse_versioned_json, VersionedJsonFormat,
+        migrate_updated_at_metadata_v0_to_v1, parse_versioned_json, JsonMigrationFn,
+        VersionedJsonFormat,
     },
 };
 use palyra_connectors::providers::discord::{
@@ -263,9 +265,9 @@ use palyra_policy::{
 use palyra_skills::{
     audit_skill_artifact_security, inspect_skill_artifact, verify_skill_artifact,
     SkillAuditCheckStatus, SkillCapabilities, SkillCompat, SkillEntrypoints,
-    SkillFilesystemCapabilities, SkillIntegrity, SkillManifest, SkillQuotaConfig,
-    SkillSecurityAuditPolicy, SkillToolEntrypoint, SkillToolRisk, SkillTrustStore,
-    SKILL_MANIFEST_VERSION,
+    SkillFilesystemCapabilities, SkillIntegrity, SkillLifecycleRecord, SkillLifecycleState,
+    SkillManifest, SkillQuotaConfig, SkillSecurityAuditPolicy, SkillToolEntrypoint, SkillToolRisk,
+    SkillTrustStore, SkillUsageTelemetry, SkillUsageUpdate, SKILL_MANIFEST_VERSION,
 };
 use palyra_vault::{
     SecretResolutionStatus, SecretResolveErrorKind, SecretResolver, Vault,
@@ -417,11 +419,13 @@ const CONSOLE_RELAY_TOKEN_MAX_TTL_MS: u64 = 30 * 60 * 1_000;
 const CONSOLE_MAX_RELAY_TOKENS: usize = 4_096;
 const CONSOLE_MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 const CONSOLE_MAX_RELAY_ACTION_PAYLOAD_BYTES: u64 = 32 * 1_024;
-const SKILLS_LAYOUT_VERSION: u32 = 1;
+const SKILLS_LAYOUT_VERSION: u32 = 2;
 const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
 const SKILL_ARTIFACT_FILE_NAME: &str = "artifact.palyra-skill";
+const SKILL_STALE_AFTER_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const INSTALLED_SKILLS_INDEX_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("installed skills index", SKILLS_LAYOUT_VERSION);
+static INSTALLED_SKILLS_INDEX_LOCK: Mutex<()> = Mutex::new(());
 
 // Serde DTOs for the console/admin HTTP surface follow. They are crate-root
 // private on purpose: every `transport::http` handler module can reach them
@@ -1290,6 +1294,16 @@ struct ConsoleSkillActionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleSkillLifecycleRequest {
+    version: String,
+    action: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    operator_approved: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleAuditEventsQuery {
     limit: Option<usize>,
     kind: Option<i32>,
@@ -2022,6 +2036,10 @@ struct InstalledSkillRecord {
     security_scan: InstalledSkillSecuritySnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rollback_snapshot: Option<InstalledSkillRollbackSnapshot>,
+    #[serde(default)]
+    lifecycle: SkillLifecycleRecord,
+    #[serde(default)]
+    usage: SkillUsageTelemetry,
 }
 
 /// Where a skill artifact came from (for example a local path or registry ref).
@@ -3856,7 +3874,10 @@ fn load_installed_skills_index(skills_root: &FsPath) -> Result<InstalledSkillsIn
     let mut index: InstalledSkillsIndex = parse_versioned_json(
         payload.as_slice(),
         INSTALLED_SKILLS_INDEX_FORMAT,
-        &[(0, migrate_updated_at_metadata_v0_to_v1)],
+        &[
+            (0, migrate_updated_at_metadata_v0_to_v1 as JsonMigrationFn),
+            (1, migrate_installed_skills_v1_to_v2 as JsonMigrationFn),
+        ],
     )
     .map_err(|error| {
         runtime_status_response(tonic::Status::invalid_argument(format!(
@@ -3866,6 +3887,79 @@ fn load_installed_skills_index(skills_root: &FsPath) -> Result<InstalledSkillsIn
     })?;
     normalize_installed_skills_index(&mut index);
     Ok(index)
+}
+
+fn migrate_installed_skills_v1_to_v2(object: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let entries = object
+        .entry("entries".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("installed skills index entries must be an array")?;
+    for entry in entries {
+        let entry =
+            entry.as_object_mut().context("installed skills index entry must be an object")?;
+        let current = entry.get("current").and_then(Value::as_bool).unwrap_or(false);
+        let installed_at_unix_ms =
+            entry.get("installed_at_unix_ms").and_then(Value::as_i64).unwrap_or_default();
+        let artifact_sha256 =
+            entry.get("artifact_sha256").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let payload_sha256 =
+            entry.get("payload_sha256").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let signature_present = entry
+            .get("signature_key_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        let security_scan = entry.get("security_scan").and_then(Value::as_object);
+        let audit_passed = security_scan
+            .and_then(|scan| scan.get("passed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let quarantined = security_scan
+            .and_then(|scan| scan.get("should_quarantine"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let activation_evidence_valid =
+            signature_present && audit_passed && !quarantined && !artifact_sha256.is_empty();
+        let state = if current && activation_evidence_valid {
+            SkillLifecycleState::Active
+        } else if activation_evidence_valid {
+            SkillLifecycleState::Stale
+        } else {
+            SkillLifecycleState::Observed
+        };
+        entry.entry("lifecycle".to_owned()).or_insert_with(|| {
+            json!({
+                "schema_version": palyra_skills::SKILL_LIFECYCLE_SCHEMA_VERSION,
+                "state": state,
+                "pinned": false,
+                "artifact_signed": signature_present,
+                "artifact_sha256": artifact_sha256,
+                "eval_status": if activation_evidence_valid { "passed" } else { "failed" },
+                "eval_pack_sha256": activation_evidence_valid.then_some(payload_sha256),
+                "tainted": quarantined,
+                "reviewed_by_operator": false,
+                "reviewed_by_policy": activation_evidence_valid,
+                "activated_at_unix_ms": (state == SkillLifecycleState::Active)
+                    .then_some(installed_at_unix_ms),
+                "stale_detected_at_unix_ms": (state == SkillLifecycleState::Stale)
+                    .then_some(installed_at_unix_ms),
+                "archived_at_unix_ms": Value::Null,
+                "restored_at_unix_ms": Value::Null,
+                "rollback_count": 0,
+                "transitions": [{
+                    "from": Value::Null,
+                    "to": state,
+                    "at_unix_ms": installed_at_unix_ms,
+                    "reason_code": "skill.lifecycle.legacy_imported"
+                }]
+            })
+        });
+        entry.entry("usage".to_owned()).or_insert_with(|| {
+            serde_json::to_value(SkillUsageTelemetry::default())
+                .expect("default skill usage telemetry must serialize")
+        });
+    }
+    Ok(())
 }
 
 /// Writes the installed-skills index after re-normalizing and stamping the
@@ -3894,7 +3988,11 @@ fn save_installed_skills_index(
             "failed to serialize installed skills index: {error}"
         )))
     })?;
-    fs::write(skills_root.join(SKILLS_INDEX_FILE_NAME), payload).map_err(|error| {
+    write_installed_skills_index_atomically(
+        skills_root.join(SKILLS_INDEX_FILE_NAME).as_path(),
+        payload.as_slice(),
+    )
+    .map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to write installed skills index {}: {error}",
             skills_root.join(SKILLS_INDEX_FILE_NAME).display()
@@ -3902,9 +4000,88 @@ fn save_installed_skills_index(
     })
 }
 
-/// Restores the index invariants: deterministic ordering and exactly one
-/// `current` entry per skill (the first marked one wins; if none is marked,
-/// the first entry in sort order is promoted).
+fn write_installed_skills_index_atomically(path: &FsPath, payload: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "installed skills index path must have a parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let temporary_path = parent.join(format!(".installed-index.{suffix}.tmp"));
+    let write_result = (|| {
+        let mut temporary =
+            fs::OpenOptions::new().create_new(true).write(true).open(temporary_path.as_path())?;
+        temporary.write_all(payload)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        replace_installed_skills_index(temporary_path.as_path(), path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(temporary_path.as_path());
+    }
+    write_result
+}
+
+fn write_new_skill_artifact_atomically(path: &FsPath, payload: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed skill artifact path must have a parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let temporary_path = parent.join(format!(".skill-artifact.{suffix}.tmp"));
+    let write_result = (|| {
+        let mut temporary =
+            fs::OpenOptions::new().create_new(true).write(true).open(temporary_path.as_path())?;
+        temporary.write_all(payload)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        fs::hard_link(temporary_path.as_path(), path)?;
+        let _ = fs::remove_file(temporary_path.as_path());
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(temporary_path.as_path());
+    }
+    write_result
+}
+
+#[cfg(not(windows))]
+fn replace_installed_skills_index(source: &FsPath, destination: &FsPath) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_installed_skills_index(source: &FsPath, destination: &FsPath) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let destination =
+        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let moved = unsafe {
+        // SAFETY: The owned vectors are valid, nul-terminated UTF-16 paths for
+        // the duration of this call. Win32 performs the replacement atomically.
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Restores deterministic ordering and at most one executable `current`
+/// pointer per skill without manufacturing a replacement pointer.
 fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
     index.entries.sort_by(|left, right| {
         left.skill_id
@@ -3914,45 +4091,112 @@ fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
     });
     let mut current_by_skill = HashMap::<String, bool>::new();
     for entry in &mut index.entries {
+        if !entry.lifecycle.state.is_executable() {
+            entry.current = false;
+        }
         if current_by_skill.get(entry.skill_id.as_str()).copied().unwrap_or(false) {
             entry.current = false;
         } else if entry.current {
             current_by_skill.insert(entry.skill_id.clone(), true);
         }
     }
-    // Second pass: skills whose entries were all unmarked get their first
-    // entry promoted. The or_insert_with closure deliberately mutates `entry`
-    // as a side effect; it only runs for a skill_id not seen above.
-    for entry in &mut index.entries {
-        current_by_skill.entry(entry.skill_id.clone()).or_insert_with(|| {
-            entry.current = true;
-            true
-        });
-    }
 }
 
-/// Picks the effective version for a skill action: an explicit non-blank
-/// `version` wins, otherwise the current (or first known) installed version.
+fn refresh_installed_skill_staleness(index: &mut InstalledSkillsIndex, now_unix_ms: i64) -> bool {
+    let mut changed = false;
+    for entry in &mut index.entries {
+        let last_activity = entry.usage.last_used_at_unix_ms.unwrap_or(entry.installed_at_unix_ms);
+        let is_stale = now_unix_ms.saturating_sub(last_activity) >= SKILL_STALE_AFTER_MS;
+        if is_stale
+            && !entry.lifecycle.pinned
+            && entry.usage.dependent_routine_refs.is_empty()
+            && entry.lifecycle.state == SkillLifecycleState::Active
+        {
+            palyra_skills::mark_skill_version_stale(&mut entry.lifecycle, now_unix_ms);
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_installed_skill_version_any_state<'a>(
+    index: &'a InstalledSkillsIndex,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<&'a InstalledSkillRecord, Response> {
+    let selected = if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
+        index.entries.iter().find(|entry| entry.skill_id == skill_id && entry.version == version)
+    } else {
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.skill_id == skill_id && entry.current)
+            .or_else(|| index.entries.iter().find(|entry| entry.skill_id == skill_id))
+    };
+    selected.ok_or_else(|| {
+        runtime_status_response(tonic::Status::not_found(format!(
+            "installed skill not found: {skill_id}"
+        )))
+    })
+}
+
+/// Picks the effective executable version: an explicit non-blank version wins;
+/// otherwise a reviewed current pointer is required.
 #[allow(clippy::result_large_err)]
 fn resolve_skill_version(
     index: &InstalledSkillsIndex,
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<String, Response> {
-    if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(version.to_owned());
+    let selected = if version.is_some_and(|value| !value.trim().is_empty()) {
+        resolve_installed_skill_version_any_state(index, skill_id, version)?
+    } else {
+        index.entries.iter().find(|entry| entry.skill_id == skill_id && entry.current).ok_or_else(
+            || {
+                runtime_status_response(tonic::Status::failed_precondition(format!(
+                    "installed skill has no active version: {skill_id}"
+                )))
+            },
+        )?
+    };
+    if !selected.lifecycle.state.is_executable() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(format!(
+            "installed skill {}@{} is not active (lifecycle={})",
+            selected.skill_id,
+            selected.version,
+            selected.lifecycle.state.as_str()
+        ))));
     }
-    let current = index
+    Ok(selected.version.clone())
+}
+
+fn record_installed_skill_usage(
+    skill_id: &str,
+    version: &str,
+    update: SkillUsageUpdate,
+) -> Result<(), String> {
+    let _guard = INSTALLED_SKILLS_INDEX_LOCK
+        .lock()
+        .map_err(|_| "installed skills index lock is poisoned".to_owned())?;
+    let skills_root = resolve_skills_root().map_err(|response| {
+        format!("failed to resolve skills root for usage update (http {})", response.status())
+    })?;
+    let mut index = load_installed_skills_index(skills_root.as_path()).map_err(|response| {
+        format!(
+            "failed to load installed skills index for usage update (http {})",
+            response.status()
+        )
+    })?;
+    let entry = index
         .entries
-        .iter()
-        .find(|entry| entry.skill_id == skill_id && entry.current)
-        .or_else(|| index.entries.iter().find(|entry| entry.skill_id == skill_id))
-        .ok_or_else(|| {
-            runtime_status_response(tonic::Status::not_found(format!(
-                "installed skill not found: {skill_id}"
-            )))
-        })?;
-    Ok(current.version.clone())
+        .iter_mut()
+        .find(|entry| entry.skill_id == skill_id && entry.version == version)
+        .ok_or_else(|| format!("installed skill usage target not found: {skill_id}@{version}"))?;
+    palyra_skills::apply_skill_usage_update(&mut entry.usage, update);
+    save_installed_skills_index(skills_root.as_path(), &index).map_err(|response| {
+        format!("failed to persist installed skill usage (http {})", response.status())
+    })
 }
 
 /// Canonical on-disk location of a managed skill artifact:
@@ -5302,15 +5546,16 @@ mod tests {
         production_runtime_kernel_v2_availability, prune_console_relay_tokens,
         redact_console_diagnostics_value, resolve_discord_intents_from_flags,
         resolve_model_provider_secret, resolve_runtime_state_root_with_override,
-        runtime_status_response, sanitize_http_error_message, sha256_hex,
-        spawn_networked_worker_expiry_loop_with_interval,
+        runtime_status_response, sanitize_http_error_message, save_installed_skills_index,
+        sha256_hex, spawn_networked_worker_expiry_loop_with_interval,
         spawn_process_lease_reconciliation_loop_with_interval,
         spawn_runtime_health_reconciliation_loop_with_interval, summarize_discord_inbound_monitor,
         validate_admin_auth_config, validate_canvas_http_canvas_id,
         validate_canvas_http_token_query, validate_process_runner_backend_policy,
-        ConsoleRelayToken, DiscordBotIdentitySummary, DiscordOnboardingRequest,
-        DiscordOnboardingScope, DiscordPrivilegedIntentStatus, RemoteBindEndpoints,
-        RemoteBindGuardConfig, ADMIN_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        write_new_skill_artifact_atomically, ConsoleRelayToken, DiscordBotIdentitySummary,
+        DiscordOnboardingRequest, DiscordOnboardingScope, DiscordPrivilegedIntentStatus,
+        InstalledSkillSecuritySnapshot, RemoteBindEndpoints, RemoteBindGuardConfig,
+        SkillLifecycleState, ADMIN_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
         ADMIN_RATE_LIMIT_LOOPBACK_MAX_REQUESTS_PER_WINDOW, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
         ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW, CANVAS_HTTP_MAX_TOKEN_BYTES,
         CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
@@ -5804,16 +6049,144 @@ mod tests {
         let _ = handle.await;
     }
 
+    fn write_legacy_installed_skill_index(root: &std::path::Path) {
+        let security_scan = InstalledSkillSecuritySnapshot {
+            schema_version: 1,
+            accepted: true,
+            passed: true,
+            should_quarantine: false,
+            generated_at_unix_ms: 10,
+            payload_sha256: "payload-sha".to_owned(),
+            trust_decision: "allowlisted".to_owned(),
+            check_count: 1,
+            failed_checks: Vec::new(),
+            warning_checks: Vec::new(),
+            quarantine_reasons: Vec::new(),
+            policy: palyra_skills::SkillSecurityAuditPolicy::default(),
+        };
+        let payload = json!({
+            "schema_version": 1,
+            "updated_at_unix_ms": 10,
+            "entries": [{
+                "skill_id": "acme.legacy",
+                "version": "1.0.0",
+                "publisher": "acme",
+                "current": true,
+                "installed_at_unix_ms": 10,
+                "artifact_sha256": "artifact-sha",
+                "payload_sha256": "payload-sha",
+                "signature_key_id": "key-1",
+                "trust_decision": "allowlisted",
+                "source": {
+                    "kind": "managed_artifact",
+                    "reference": "artifact.palyra-skill"
+                },
+                "security_scan": security_scan
+            }]
+        });
+        fs::write(
+            root.join(SKILLS_INDEX_FILE_NAME),
+            serde_json::to_vec_pretty(&payload).expect("legacy fixture should serialize"),
+        )
+        .expect("legacy installed skills index should be written");
+    }
+
     #[test]
-    fn load_installed_skills_index_migrates_legacy_metadata() {
+    fn load_installed_skills_index_migrates_legacy_lifecycle() {
         let tempdir = tempfile::tempdir().expect("temporary directory should be created");
-        fs::write(tempdir.path().join(SKILLS_INDEX_FILE_NAME), br#"{"entries":[]}"#)
-            .expect("legacy installed skills index should be written");
+        write_legacy_installed_skill_index(tempdir.path());
         let index = load_installed_skills_index(tempdir.path())
             .expect("legacy installed skills index should load");
         assert_eq!(index.schema_version, SKILLS_LAYOUT_VERSION);
-        assert_eq!(index.updated_at_unix_ms, 0);
-        assert!(index.entries.is_empty());
+        let record = index.entries.first().expect("legacy record should survive migration");
+        assert!(record.current);
+        assert_eq!(record.lifecycle.state, SkillLifecycleState::Active);
+        assert!(record.lifecycle.artifact_signed);
+        assert_eq!(record.lifecycle.eval_pack_sha256.as_deref(), Some("payload-sha"));
+        assert_eq!(record.usage.invocation_count, 0);
+        assert_eq!(
+            record.lifecycle.transitions.last().map(|transition| transition.reason_code.as_str()),
+            Some("skill.lifecycle.legacy_imported")
+        );
+    }
+
+    #[test]
+    fn installed_skill_usage_update_survives_interrupted_publish() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        write_legacy_installed_skill_index(tempdir.path());
+        let mut index = load_installed_skills_index(tempdir.path())
+            .expect("legacy installed skills index should load");
+        palyra_skills::apply_skill_usage_update(
+            &mut index.entries[0].usage,
+            palyra_skills::SkillUsageUpdate {
+                succeeded: true,
+                verification_passed: true,
+                corrected: false,
+                cost_delta_microusd: 7,
+                used_at_unix_ms: 20,
+                dependent_routine_ref: Some("routine:alpha".to_owned()),
+            },
+        );
+        save_installed_skills_index(tempdir.path(), &index)
+            .expect("first usage update should publish atomically");
+
+        fs::write(tempdir.path().join(".installed-index.interrupted.tmp"), b"{")
+            .expect("interrupted temporary payload should be simulated");
+        let mut recovered = load_installed_skills_index(tempdir.path())
+            .expect("orphaned temporary payload must not corrupt the primary index");
+        assert_eq!(recovered.entries[0].usage.invocation_count, 1);
+        palyra_skills::apply_skill_usage_update(
+            &mut recovered.entries[0].usage,
+            palyra_skills::SkillUsageUpdate {
+                succeeded: false,
+                verification_passed: false,
+                corrected: true,
+                cost_delta_microusd: -2,
+                used_at_unix_ms: 30,
+                dependent_routine_ref: None,
+            },
+        );
+        save_installed_skills_index(tempdir.path(), &recovered)
+            .expect("a later usage update should replace the primary index");
+
+        let final_index = load_installed_skills_index(tempdir.path())
+            .expect("published usage index should remain readable");
+        assert_eq!(final_index.entries[0].usage.invocation_count, 2);
+        assert_eq!(final_index.entries[0].usage.success_count, 1);
+        assert_eq!(final_index.entries[0].usage.failure_count, 1);
+        assert_eq!(final_index.entries[0].usage.correction_count, 1);
+        assert_eq!(final_index.entries[0].usage.cost_delta_microusd, 5);
+    }
+
+    #[test]
+    fn installed_skill_normalization_does_not_manufacture_current_pointer() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        write_legacy_installed_skill_index(tempdir.path());
+        let mut index = load_installed_skills_index(tempdir.path())
+            .expect("legacy installed skills index should load");
+        index.entries[0].current = false;
+        save_installed_skills_index(tempdir.path(), &index)
+            .expect("index without a current pointer should persist");
+
+        let reloaded = load_installed_skills_index(tempdir.path())
+            .expect("index without a current pointer should reload");
+        assert!(reloaded.entries.iter().all(|entry| !entry.current));
+    }
+
+    #[test]
+    fn immutable_skill_artifact_publish_never_replaces_existing_bytes() {
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let artifact_path = tempdir.path().join("artifact.palyra-skill");
+        write_new_skill_artifact_atomically(artifact_path.as_path(), b"version-one")
+            .expect("first immutable artifact publish should succeed");
+
+        let error = write_new_skill_artifact_atomically(artifact_path.as_path(), b"version-two")
+            .expect_err("an existing immutable version must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(artifact_path).expect("published artifact should remain readable"),
+            b"version-one"
+        );
     }
 
     fn openai_model_provider_config() -> ModelProviderConfig {

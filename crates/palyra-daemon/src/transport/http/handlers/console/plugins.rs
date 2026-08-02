@@ -1280,28 +1280,78 @@ fn install_skill_artifact_for_plugin_binding(
             )))
         })?;
     }
-    fs::write(managed_artifact_path.as_path(), artifact_bytes.as_slice()).map_err(|error| {
-        runtime_status_response(tonic::Status::internal(format!(
-            "failed to persist managed artifact {}: {error}",
-            managed_artifact_path.display()
-        )))
+    let _index_guard = INSTALLED_SKILLS_INDEX_LOCK.lock().map_err(|_| {
+        runtime_status_response(tonic::Status::internal("installed skills index lock is poisoned"))
     })?;
+    let artifact_sha256 = sha256_hex(artifact_bytes.as_slice());
+    if managed_artifact_path.exists() {
+        let existing_bytes = fs::read(managed_artifact_path.as_path()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to read existing immutable artifact {}: {error}",
+                managed_artifact_path.display()
+            )))
+        })?;
+        if sha256_hex(existing_bytes.as_slice()) != artifact_sha256 {
+            return Err(runtime_status_response(tonic::Status::already_exists(format!(
+                "immutable skill version {}@{} already has a different artifact",
+                skill_id, version
+            ))));
+        }
+    } else {
+        write_new_skill_artifact_atomically(
+            managed_artifact_path.as_path(),
+            artifact_bytes.as_slice(),
+        )
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to persist managed artifact {}: {error}",
+                managed_artifact_path.display()
+            )))
+        })?;
+    }
 
     let mut index = load_installed_skills_index(skills_root.as_path())?;
+    if index.entries.iter().any(|entry| entry.skill_id == skill_id && entry.version == version) {
+        return Err(runtime_status_response(tonic::Status::already_exists(format!(
+            "immutable skill version already installed: {}@{}",
+            skill_id, version
+        ))));
+    }
     let previous_current = index
         .entries
         .iter()
         .find(|entry| entry.skill_id == skill_id && entry.current && entry.version != version)
         .cloned();
-    index.entries.retain(|entry| !(entry.skill_id == skill_id && entry.version == version));
-    for entry in &mut index.entries {
-        if entry.skill_id == skill_id {
-            entry.current = false;
-        }
-    }
     let installed_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
+        )))
+    })?;
+    for entry in &mut index.entries {
+        if entry.skill_id == skill_id && entry.current {
+            entry.current = false;
+            palyra_skills::mark_skill_version_stale(&mut entry.lifecycle, installed_at_unix_ms);
+        }
+    }
+    let lifecycle = palyra_skills::activate_signed_skill_version(
+        artifact_sha256.clone(),
+        sha256_hex(
+            serde_json::to_vec(&audit_report)
+                .map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to encode skill evaluation evidence: {error}"
+                    )))
+                })?
+                .as_slice(),
+        ),
+        audit_report.should_quarantine || !audit_report.passed,
+        palyra_skills::SkillActivationGate { operator_approved: true, policy_approved: false },
+        installed_at_unix_ms,
+    )
+    .map_err(|decision| {
+        runtime_status_response(tonic::Status::failed_precondition(format!(
+            "skill activation gate denied: {}",
+            decision.reason_codes.join(",")
         )))
     })?;
     let record = InstalledSkillRecord {
@@ -1310,7 +1360,7 @@ fn install_skill_artifact_for_plugin_binding(
         publisher: inspection.manifest.publisher.clone(),
         current: true,
         installed_at_unix_ms,
-        artifact_sha256: sha256_hex(artifact_bytes.as_slice()),
+        artifact_sha256,
         payload_sha256: audit_report.payload_sha256.clone(),
         signature_key_id: inspection.signature.key_id.clone(),
         trust_decision: trust_decision_label(audit_report.trust_decision),
@@ -1323,6 +1373,8 @@ fn install_skill_artifact_for_plugin_binding(
         rollback_snapshot: previous_current
             .as_ref()
             .map(|entry| installed_skill_rollback_snapshot(entry, installed_at_unix_ms)),
+        lifecycle,
+        usage: SkillUsageTelemetry::default(),
     };
     index.entries.push(record.clone());
     save_installed_skills_index(skills_root.as_path(), &index)?;

@@ -15,6 +15,7 @@ mod contract;
 mod error;
 mod extension;
 mod install_policy;
+mod lifecycle;
 mod manifest;
 mod models;
 mod plugin_testkit;
@@ -36,6 +37,7 @@ pub use contract::{
 pub use error::SkillPackagingError;
 pub use extension::*;
 pub use install_policy::*;
+pub use lifecycle::*;
 pub use manifest::{
     parse_ed25519_signing_key, parse_manifest_toml, plugin_manifest_validation_report,
 };

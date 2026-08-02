@@ -1525,6 +1525,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::skills::console_skill_enable_handler),
         )
         .route(
+            "/console/v1/skills/{skill_id}/lifecycle",
+            post(console::skills::console_skill_lifecycle_handler),
+        )
+        .route(
             "/console/v1/skills/candidates/{candidate_id}/promote",
             post(console::skills::console_procedure_skill_promote_handler),
         )

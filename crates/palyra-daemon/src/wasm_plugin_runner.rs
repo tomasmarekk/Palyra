@@ -214,7 +214,7 @@ pub fn run_wasm_plugin(
     validate_optional_metadata(input.module_path.as_deref(), "module_path")?;
     validate_optional_metadata(input.tool_id.as_deref(), "tool_id")?;
     let resolved = resolve_module_source(policy, &input)?;
-    execute_module(
+    execute_and_record_installed_skill_usage(
         policy,
         resolved.installed_skill.as_ref(),
         resolved.module_bytes.as_slice(),
@@ -248,7 +248,7 @@ pub(crate) fn run_resolved_wasm_plugin(
             message: "wasm plugin runtime is disabled by runtime policy".to_owned(),
         });
     }
-    execute_module(
+    execute_and_record_installed_skill_usage(
         policy,
         Some(resolved),
         resolved.module_bytes.as_slice(),
@@ -256,6 +256,44 @@ pub(crate) fn run_resolved_wasm_plugin(
         capabilities,
         timeout,
     )
+}
+
+fn execute_and_record_installed_skill_usage(
+    policy: &WasmPluginRunnerPolicy,
+    installed_skill: Option<&ResolvedInstalledSkillModule>,
+    module_bytes: &[u8],
+    entrypoint: &str,
+    capabilities: WasmPluginRequestedCapabilities,
+    timeout: Duration,
+) -> Result<WasmPluginRunSuccess, WasmPluginRunError> {
+    let result =
+        execute_module(policy, installed_skill, module_bytes, entrypoint, capabilities, timeout);
+    if let Some(skill) = installed_skill {
+        let update = palyra_skills::SkillUsageUpdate {
+            succeeded: result.is_ok(),
+            verification_passed: false,
+            corrected: false,
+            cost_delta_microusd: 0,
+            used_at_unix_ms: crate::unix_ms_now().unwrap_or_default(),
+            dependent_routine_ref: None,
+        };
+        if let Err(error) = crate::record_installed_skill_usage(
+            skill.skill_id.as_str(),
+            skill.skill_version.as_str(),
+            update,
+        ) {
+            // Execution outcome is authoritative; telemetry persistence cannot
+            // retroactively turn a completed guest call into a retryable call.
+            tracing::warn!(
+                skill_id = %skill.skill_id,
+                skill_version = %skill.skill_version,
+                reason_code = "skill.lifecycle.usage_persist_failed",
+                error = %error,
+                "installed skill usage telemetry could not be persisted"
+            );
+        }
+    }
+    result
 }
 
 fn parse_input(input_json: &[u8]) -> Result<WasmPluginRunInput, WasmPluginRunError> {
