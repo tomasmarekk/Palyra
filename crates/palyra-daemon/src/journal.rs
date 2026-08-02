@@ -786,7 +786,7 @@ pub struct WorkspaceSearchCandidateRecord {
 }
 
 /// Latency and candidate-count diagnostics for one retrieval branch.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetrievalBranchDiagnostics {
     pub source_kind: String,
     pub query_embedding_cache_hit: bool,
@@ -4206,6 +4206,105 @@ pub struct SessionSearchRequest {
     pub include_archived: bool,
 }
 
+/// Schema version for the typed Session Search 2.0 contracts.
+pub const SESSION_SEARCH_V2_SCHEMA_VERSION: u64 = 2;
+
+/// Navigation operation supported by [`SessionSearchRequestV2`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchOperationV2 {
+    Search,
+    Recent,
+    Read,
+    ScrollBefore,
+    ScrollAfter,
+    Lineage,
+    Artifacts,
+}
+
+/// Opaque, ACL-revalidated cursor for continuing from a transcript event.
+///
+/// The cursor is a one-way digest over journal identities. It is resolved
+/// only after applying the caller's session scope, so it neither exposes raw
+/// ids nor grants access by possession.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchAnchor {
+    pub schema_version: u64,
+    pub cursor_sha256: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Bounded transcript context around one search anchor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BookendProjection {
+    pub anchor: SearchAnchor,
+    pub before: Vec<SessionSearchEvent>,
+    pub matched: SessionSearchEvent,
+    pub after: Vec<SessionSearchEvent>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+}
+
+/// Scoped reference to an artifact associated with a matching session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSearchArtifactRefV2 {
+    pub artifact_ref: String,
+    pub artifact_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub created_at_unix_ms: i64,
+}
+
+/// Durable request contract for search, recent browse, and anchored navigation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSearchRequestV2 {
+    pub schema_version: u64,
+    pub operation: SessionSearchOperationV2,
+    pub principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<String>,
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<SearchAnchor>,
+    pub top_k: usize,
+    pub min_score: f64,
+    pub page_size: usize,
+    pub max_bookends_per_root: usize,
+    pub include_archived: bool,
+    pub include_current_session: bool,
+    pub semantic_rerank: bool,
+}
+
+/// One root-grouped Session Search 2.0 result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSearchHitV2 {
+    pub root_session_id: String,
+    pub matched_session_ids: Vec<String>,
+    pub title: String,
+    pub updated_at_unix_ms: i64,
+    pub archived: bool,
+    pub score: f64,
+    pub lineage: SessionSearchLineage,
+    pub bookends: Vec<BookendProjection>,
+    pub source_refs: Vec<String>,
+    pub artifacts: Vec<SessionSearchArtifactRefV2>,
+    pub helper_policy: String,
+    pub semantic_rerank_state: String,
+}
+
+/// Typed Session Search 2.0 result and compatibility projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSearchOutcomeV2 {
+    pub schema_version: u64,
+    pub operation: SessionSearchOperationV2,
+    pub query: String,
+    pub hits: Vec<SessionSearchHitV2>,
+    pub diagnostics: RetrievalBranchDiagnostics,
+}
+
 /// Artifact kind for persisted recall previews.
 pub const RECALL_ARTIFACT_KIND_PREVIEW: &str = "recall_preview";
 /// Artifact kind for persisted session-search results.
@@ -4286,18 +4385,23 @@ pub struct SessionSearchGroup {
 }
 
 /// Branch lineage of a session as shown in search results.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSearchLineage {
+    pub root_session_id: String,
     pub branch_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_origin_run_id: Option<String>,
+    pub helper_policy: String,
+    pub helper_session_count: u64,
+    pub hidden_helper_session_count: u64,
+    pub member_session_ids: Vec<String>,
     pub runs: Vec<SessionSearchRunRef>,
 }
 
 /// Run reference inside session-search lineage.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSearchRunRef {
     pub run_id: String,
     pub origin_kind: String,
@@ -4326,7 +4430,7 @@ pub struct SessionSearchWindow {
 }
 
 /// Transcript event inside a session-search window.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSearchEvent {
     pub session_id: String,
     pub run_id: String,
@@ -5182,6 +5286,232 @@ struct Migration {
     name: &'static str,
     sql: &'static str,
 }
+
+#[allow(dead_code, reason = "the operator memory-index doctor consumes this rebuild contract")]
+const SESSION_SEARCH_FTS_REBUILD_SQL: &str = r#"
+    DELETE FROM orchestrator_session_search_fts;
+    INSERT INTO orchestrator_session_search_fts (
+        rowid,
+        session_ulid,
+        run_ulid,
+        tape_seq,
+        created_at_unix_ms,
+        event_type,
+        title,
+        body,
+        artifact_labels,
+        tags
+    )
+    SELECT
+        tape.rowid,
+        sessions.session_ulid,
+        tape.run_ulid,
+        tape.seq,
+        tape.created_at_unix_ms,
+        tape.event_type,
+        COALESCE(
+            NULLIF(TRIM(sessions.session_label), ''),
+            NULLIF(TRIM(sessions.auto_title), ''),
+            ''
+        ),
+        CASE
+            WHEN tape.event_type IN ('message.received', 'queued.input')
+                AND json_type(tape.payload_json, '$.text') = 'text'
+                THEN json_extract(tape.payload_json, '$.text')
+            WHEN tape.event_type = 'message.replied'
+                AND json_type(tape.payload_json, '$.reply_text') = 'text'
+                THEN json_extract(tape.payload_json, '$.reply_text')
+            WHEN tape.event_type = 'rollback.marker'
+                AND json_type(tape.payload_json, '$.event') = 'text'
+                THEN json_extract(tape.payload_json, '$.event')
+            WHEN tape.event_type IN ('assistant.summary', 'session.summary')
+                AND json_type(tape.payload_json, '$.summary') = 'text'
+                THEN json_extract(tape.payload_json, '$.summary')
+            ELSE ''
+        END,
+        CASE
+            WHEN json_type(tape.payload_json, '$.artifact_labels') IN ('text', 'array')
+                THEN json_extract(tape.payload_json, '$.artifact_labels')
+            ELSE ''
+        END,
+        CASE
+            WHEN json_type(tape.payload_json, '$.tags') IN ('text', 'array')
+                THEN json_extract(tape.payload_json, '$.tags')
+            ELSE ''
+        END
+    FROM orchestrator_tape AS tape
+    INNER JOIN orchestrator_runs AS runs
+        ON runs.run_ulid = tape.run_ulid
+    INNER JOIN orchestrator_sessions AS sessions
+        ON sessions.session_ulid = runs.session_ulid
+    WHERE tape.event_type IN (
+        'message.received',
+        'queued.input',
+        'message.replied',
+        'rollback.marker',
+        'assistant.summary',
+        'session.summary'
+    )
+      AND json_valid(tape.payload_json);
+"#;
+
+const MIGRATION_102_SQL: &str = r#"
+    CREATE VIRTUAL TABLE IF NOT EXISTS orchestrator_session_search_fts USING fts5(
+        session_ulid UNINDEXED,
+        run_ulid UNINDEXED,
+        tape_seq UNINDEXED,
+        created_at_unix_ms UNINDEXED,
+        event_type UNINDEXED,
+        title,
+        body,
+        artifact_labels,
+        tags,
+        tokenize = 'unicode61'
+    );
+
+    INSERT INTO orchestrator_session_search_fts (
+        rowid,
+        session_ulid,
+        run_ulid,
+        tape_seq,
+        created_at_unix_ms,
+        event_type,
+        title,
+        body,
+        artifact_labels,
+        tags
+    )
+    SELECT
+        tape.rowid,
+        sessions.session_ulid,
+        tape.run_ulid,
+        tape.seq,
+        tape.created_at_unix_ms,
+        tape.event_type,
+        COALESCE(
+            NULLIF(TRIM(sessions.session_label), ''),
+            NULLIF(TRIM(sessions.auto_title), ''),
+            ''
+        ),
+        CASE
+            WHEN tape.event_type IN ('message.received', 'queued.input')
+                AND json_type(tape.payload_json, '$.text') = 'text'
+                THEN json_extract(tape.payload_json, '$.text')
+            WHEN tape.event_type = 'message.replied'
+                AND json_type(tape.payload_json, '$.reply_text') = 'text'
+                THEN json_extract(tape.payload_json, '$.reply_text')
+            WHEN tape.event_type = 'rollback.marker'
+                AND json_type(tape.payload_json, '$.event') = 'text'
+                THEN json_extract(tape.payload_json, '$.event')
+            WHEN tape.event_type IN ('assistant.summary', 'session.summary')
+                AND json_type(tape.payload_json, '$.summary') = 'text'
+                THEN json_extract(tape.payload_json, '$.summary')
+            ELSE ''
+        END,
+        CASE
+            WHEN json_type(tape.payload_json, '$.artifact_labels') IN ('text', 'array')
+                THEN json_extract(tape.payload_json, '$.artifact_labels')
+            ELSE ''
+        END,
+        CASE
+            WHEN json_type(tape.payload_json, '$.tags') IN ('text', 'array')
+                THEN json_extract(tape.payload_json, '$.tags')
+            ELSE ''
+        END
+    FROM orchestrator_tape AS tape
+    INNER JOIN orchestrator_runs AS runs
+        ON runs.run_ulid = tape.run_ulid
+    INNER JOIN orchestrator_sessions AS sessions
+        ON sessions.session_ulid = runs.session_ulid
+    WHERE tape.event_type IN (
+        'message.received',
+        'queued.input',
+        'message.replied',
+        'rollback.marker',
+        'assistant.summary',
+        'session.summary'
+    )
+      AND json_valid(tape.payload_json);
+
+    CREATE TRIGGER IF NOT EXISTS trg_orchestrator_session_search_tape_ai
+    AFTER INSERT ON orchestrator_tape
+    WHEN new.event_type IN (
+        'message.received',
+        'queued.input',
+        'message.replied',
+        'rollback.marker',
+        'assistant.summary',
+        'session.summary'
+    )
+      AND json_valid(new.payload_json)
+    BEGIN
+        INSERT INTO orchestrator_session_search_fts (
+            rowid,
+            session_ulid,
+            run_ulid,
+            tape_seq,
+            created_at_unix_ms,
+            event_type,
+            title,
+            body,
+            artifact_labels,
+            tags
+        )
+        SELECT
+            new.rowid,
+            sessions.session_ulid,
+            new.run_ulid,
+            new.seq,
+            new.created_at_unix_ms,
+            new.event_type,
+            COALESCE(
+                NULLIF(TRIM(sessions.session_label), ''),
+                NULLIF(TRIM(sessions.auto_title), ''),
+                ''
+            ),
+            CASE
+                WHEN new.event_type IN ('message.received', 'queued.input')
+                    AND json_type(new.payload_json, '$.text') = 'text'
+                    THEN json_extract(new.payload_json, '$.text')
+                WHEN new.event_type = 'message.replied'
+                    AND json_type(new.payload_json, '$.reply_text') = 'text'
+                    THEN json_extract(new.payload_json, '$.reply_text')
+                WHEN new.event_type = 'rollback.marker'
+                    AND json_type(new.payload_json, '$.event') = 'text'
+                    THEN json_extract(new.payload_json, '$.event')
+                WHEN new.event_type IN ('assistant.summary', 'session.summary')
+                    AND json_type(new.payload_json, '$.summary') = 'text'
+                    THEN json_extract(new.payload_json, '$.summary')
+                ELSE ''
+            END,
+            CASE
+                WHEN json_type(new.payload_json, '$.artifact_labels') IN ('text', 'array')
+                    THEN json_extract(new.payload_json, '$.artifact_labels')
+                ELSE ''
+            END,
+            CASE
+                WHEN json_type(new.payload_json, '$.tags') IN ('text', 'array')
+                    THEN json_extract(new.payload_json, '$.tags')
+                ELSE ''
+            END
+        FROM orchestrator_runs AS runs
+        INNER JOIN orchestrator_sessions AS sessions
+            ON sessions.session_ulid = runs.session_ulid
+        WHERE runs.run_ulid = new.run_ulid;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_orchestrator_session_search_title_au
+    AFTER UPDATE OF session_label, auto_title ON orchestrator_sessions
+    BEGIN
+        UPDATE orchestrator_session_search_fts
+        SET title = COALESCE(
+            NULLIF(TRIM(new.session_label), ''),
+            NULLIF(TRIM(new.auto_title), ''),
+            ''
+        )
+        WHERE session_ulid = new.session_ulid;
+    END;
+"#;
 
 // INTENTIONAL: this list is append-only history. Versions already shipped have
 // been applied to live databases and are skipped on startup, so never edit or
@@ -7588,6 +7918,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "mcp_exact_runtime_lifecycle",
         sql: mcp_runtime::MIGRATION_101_SQL,
     },
+    Migration { version: 102, name: "session_search_fts_projection", sql: MIGRATION_102_SQL },
 ];
 
 fn emit_background_task_wake_events_tx(
@@ -16090,6 +16421,47 @@ impl JournalStore {
         let started_at = Instant::now();
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         search_orchestrator_session_windows(&guard, request, started_at)
+    }
+
+    /// Executes the typed Session Search 2.0 contract.
+    ///
+    /// ACL scope is applied before lexical ranking or anchor resolution.
+    /// Semantic reranking is currently explicit degraded metadata over the
+    /// ACL-filtered FTS result rather than a hidden provider call.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the request is invalid or journal access
+    /// fails.
+    pub fn search_orchestrator_sessions_v2(
+        &self,
+        request: &SessionSearchRequestV2,
+    ) -> Result<SessionSearchOutcomeV2, JournalError> {
+        validate_session_search_v2_request(request)?;
+        let started_at = Instant::now();
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        search_orchestrator_sessions_v2(&guard, request, started_at)
+    }
+
+    /// Rebuilds the Session Search 2.0 FTS projection from journal source rows.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the rebuild transaction or verification
+    /// query fails.
+    #[allow(
+        dead_code,
+        reason = "the operator memory-index doctor calls this explicit repair surface"
+    )]
+    pub fn rebuild_orchestrator_session_search_index(&self) -> Result<u64, JournalError> {
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SESSION_SEARCH_FTS_REBUILD_SQL)?;
+        let indexed_rows = transaction.query_row(
+            "SELECT COUNT(*) FROM orchestrator_session_search_fts",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        transaction.commit()?;
+        Ok(u64::try_from(indexed_rows.max(0)).unwrap_or(u64::MAX))
     }
 
     /// Persists a recall artifact with sanitized payload, diagnostics, and
@@ -27484,6 +27856,7 @@ struct SessionSearchGroupBuilder {
     session: OrchestratorSessionRecord,
     best_score: f64,
     match_count: u64,
+    member_session_ids: BTreeSet<String>,
     runs: Vec<SessionSearchRunRef>,
     windows: Vec<SessionSearchWindow>,
 }
@@ -27525,20 +27898,22 @@ fn search_orchestrator_session_windows(
 
     let mut groups = BTreeMap::<String, SessionSearchGroupBuilder>::new();
     for candidate in candidates {
-        if groups.len() >= top_k && !groups.contains_key(candidate.event.session_id.as_str()) {
+        let root_session = resolve_session_search_root(connection, &candidate.session, request, 8)?;
+        let root_session_id = root_session.session_id.clone();
+        if groups.len() >= top_k && !groups.contains_key(root_session_id.as_str()) {
             continue;
         }
-        let builder = groups.entry(candidate.event.session_id.clone()).or_insert_with(|| {
-            SessionSearchGroupBuilder {
-                session: candidate.session.clone(),
-                best_score: candidate.score,
-                match_count: 0,
-                runs: Vec::new(),
-                windows: Vec::new(),
-            }
+        let builder = groups.entry(root_session_id).or_insert_with(|| SessionSearchGroupBuilder {
+            session: root_session,
+            best_score: candidate.score,
+            match_count: 0,
+            member_session_ids: BTreeSet::new(),
+            runs: Vec::new(),
+            windows: Vec::new(),
         });
         builder.best_score = builder.best_score.max(candidate.score);
         builder.match_count = builder.match_count.saturating_add(1);
+        builder.member_session_ids.insert(candidate.event.session_id.clone());
         push_session_search_run_ref(
             &mut builder.runs,
             candidate.event.run_id.as_str(),
@@ -27606,11 +27981,28 @@ fn search_orchestrator_session_windows(
         .map(|builder| {
             let session =
                 hydrate_orchestrator_session(connection, builder.session, Some(normalized_query))?;
+            let mut member_session_ids = load_session_search_lineage_members(
+                connection,
+                session.session_id.as_str(),
+                request,
+            )?;
+            member_session_ids.extend(builder.member_session_ids);
+            member_session_ids.sort();
+            member_session_ids.dedup();
+            let helper_session_count = member_session_ids
+                .iter()
+                .filter(|session_id| session_id.as_str() != session.session_id)
+                .count() as u64;
             Ok(SessionSearchGroup {
                 lineage: SessionSearchLineage {
+                    root_session_id: session.session_id.clone(),
                     branch_state: session.branch_state.clone(),
                     parent_session_id: session.parent_session_id.clone(),
                     branch_origin_run_id: session.branch_origin_run_id.clone(),
+                    helper_policy: "group_under_root".to_owned(),
+                    helper_session_count,
+                    hidden_helper_session_count: helper_session_count,
+                    member_session_ids,
                     runs: builder.runs,
                 },
                 session,
@@ -27640,35 +28032,361 @@ fn search_orchestrator_session_windows(
         lexical_candidate_count: total_windows,
         vector_candidate_count: 0,
     });
-    diagnostics.degraded_reason = Some("transcript_vector_index_unavailable".to_owned());
+    diagnostics.degraded_reason = Some("session_semantic_rerank_disabled".to_owned());
     diagnostics.fused_hit_count = total_windows;
     diagnostics.coverage_gap = if total_windows == 0 {
         Some("no_session_windows".to_owned())
     } else {
-        Some("vector_branch_empty".to_owned())
+        Some("semantic_rerank_not_requested".to_owned())
     };
 
     Ok(SessionSearchOutcome { query: normalized_query.to_owned(), groups, diagnostics })
 }
 
-fn load_session_search_candidates(
+fn resolve_session_search_root(
     connection: &Connection,
+    session: &OrchestratorSessionRecord,
     request: &SessionSearchRequest,
-    normalized_query: &str,
-    query_terms: &[String],
-    scan_limit: usize,
-) -> Result<Vec<SessionSearchCandidate>, JournalError> {
-    let like_needles = session_search_like_needles(normalized_query, query_terms);
-    let like_clause = if like_needles.is_empty() {
-        "1 = 1".to_owned()
-    } else {
-        (0..like_needles.len())
-            .map(|index| format!("LOWER(tape.payload_json) LIKE ?{} ESCAPE '\\'", index + 7))
-            .collect::<Vec<_>>()
-            .join(" OR ")
+    max_depth: usize,
+) -> Result<OrchestratorSessionRecord, JournalError> {
+    let mut current = session.clone();
+    let mut seen = BTreeSet::from([current.session_id.clone()]);
+    for _ in 0..max_depth {
+        let Some(parent_session_id) = current.parent_session_id.as_deref() else {
+            break;
+        };
+        if !seen.insert(parent_session_id.to_owned()) {
+            break;
+        }
+        let Some(parent) = load_orchestrator_session_by_id(connection, parent_session_id)? else {
+            break;
+        };
+        if parent.principal != request.principal
+            || parent.device_id != request.device_id
+            || parent.channel != request.channel
+            || (!request.include_archived && parent.archived_at_unix_ms.is_some())
+        {
+            break;
+        }
+        current = parent;
+    }
+    Ok(current)
+}
+
+fn load_session_search_lineage_members(
+    connection: &Connection,
+    root_session_id: &str,
+    request: &SessionSearchRequest,
+) -> Result<Vec<String>, JournalError> {
+    let include_archived = i64::from(request.include_archived);
+    let mut statement = connection.prepare(
+        r#"
+            WITH RECURSIVE lineage(session_ulid, depth) AS (
+                SELECT ?1, 0
+                UNION ALL
+                SELECT child.session_ulid, lineage.depth + 1
+                FROM orchestrator_sessions AS child
+                INNER JOIN lineage
+                    ON child.parent_session_ulid = lineage.session_ulid
+                WHERE lineage.depth < 8
+            )
+            SELECT sessions.session_ulid
+            FROM lineage
+            INNER JOIN orchestrator_sessions AS sessions
+                ON sessions.session_ulid = lineage.session_ulid
+            WHERE sessions.principal = ?2
+              AND sessions.device_id = ?3
+              AND ((sessions.channel = ?4) OR (sessions.channel IS NULL AND ?4 IS NULL))
+              AND (?5 = 1 OR sessions.archived_at_unix_ms IS NULL)
+              AND (?6 IS NULL OR sessions.session_ulid != ?6)
+            ORDER BY lineage.depth ASC, sessions.created_at_unix_ms ASC, sessions.session_ulid ASC
+            LIMIT 64
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        root_session_id,
+        request.principal,
+        request.device_id,
+        request.channel,
+        include_archived,
+        request.exclude_session_id,
+    ])?;
+    let mut members = Vec::new();
+    while let Some(row) = rows.next()? {
+        members.push(row.get(0)?);
+    }
+    Ok(members)
+}
+
+fn validate_session_search_v2_request(
+    request: &SessionSearchRequestV2,
+) -> Result<(), JournalError> {
+    if request.schema_version != SESSION_SEARCH_V2_SCHEMA_VERSION {
+        return Err(JournalError::InvalidArgument(format!(
+            "session search schema version {} is unsupported",
+            request.schema_version
+        )));
+    }
+    if request.principal.trim().is_empty() || request.device_id.trim().is_empty() {
+        return Err(JournalError::InvalidArgument(
+            "session search principal and device_id must be non-empty".to_owned(),
+        ));
+    }
+    if !request.min_score.is_finite() || !(0.0..=1.0).contains(&request.min_score) {
+        return Err(JournalError::InvalidArgument(
+            "session search min_score must be in range 0.0..=1.0".to_owned(),
+        ));
+    }
+    if request.operation == SessionSearchOperationV2::Search && request.query.trim().is_empty() {
+        return Err(JournalError::InvalidArgument(
+            "session search query must be non-empty for search".to_owned(),
+        ));
+    }
+    let requires_anchor = matches!(
+        request.operation,
+        SessionSearchOperationV2::Read
+            | SessionSearchOperationV2::ScrollBefore
+            | SessionSearchOperationV2::ScrollAfter
+            | SessionSearchOperationV2::Lineage
+            | SessionSearchOperationV2::Artifacts
+    );
+    if requires_anchor && request.anchor.is_none() {
+        return Err(JournalError::InvalidArgument(
+            "session search anchor is required for navigation".to_owned(),
+        ));
+    }
+    if let Some(anchor) = &request.anchor {
+        if anchor.schema_version != SESSION_SEARCH_V2_SCHEMA_VERSION
+            || anchor.cursor_sha256.len() != 64
+            || !anchor.cursor_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(JournalError::InvalidArgument(
+                "session search anchor is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn search_orchestrator_sessions_v2(
+    connection: &Connection,
+    request: &SessionSearchRequestV2,
+    started_at: Instant,
+) -> Result<SessionSearchOutcomeV2, JournalError> {
+    let legacy_request = session_search_v2_legacy_request(request);
+    let semantic_rerank_state =
+        if request.semantic_rerank { "degraded_to_lexical_not_configured" } else { "disabled" };
+    let (mut groups, mut diagnostics) = match request.operation {
+        SessionSearchOperationV2::Search | SessionSearchOperationV2::Recent => {
+            let outcome =
+                search_orchestrator_session_windows(connection, &legacy_request, started_at)?;
+            (outcome.groups, outcome.diagnostics)
+        }
+        SessionSearchOperationV2::Read
+        | SessionSearchOperationV2::ScrollBefore
+        | SessionSearchOperationV2::ScrollAfter
+        | SessionSearchOperationV2::Lineage
+        | SessionSearchOperationV2::Artifacts => {
+            let anchor = request.anchor.as_ref().ok_or_else(|| {
+                JournalError::InvalidArgument("session search anchor missing".to_owned())
+            })?;
+            let candidate = resolve_session_search_anchor(connection, request, anchor)?;
+            let (before, after) = match request.operation {
+                SessionSearchOperationV2::ScrollBefore => (request.page_size.min(16), 0),
+                SessionSearchOperationV2::ScrollAfter => (0, request.page_size.min(16)),
+                SessionSearchOperationV2::Lineage | SessionSearchOperationV2::Artifacts => (0, 0),
+                SessionSearchOperationV2::Read => {
+                    let page_size = request.page_size.min(16);
+                    (page_size, page_size)
+                }
+                SessionSearchOperationV2::Search | SessionSearchOperationV2::Recent => (0, 0),
+            };
+            let group = build_session_search_anchor_group(
+                connection,
+                &legacy_request,
+                candidate,
+                before,
+                after,
+            )?;
+            let diagnostics = retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+                source_kind: "transcript_anchor",
+                query_embedding_cache_hit: false,
+                lexical_latency_ms: 0,
+                vector_latency_ms: 0,
+                total_latency_ms: elapsed_millis(started_at),
+                candidate_count: 1,
+                lexical_candidate_count: 1,
+                vector_candidate_count: 0,
+            });
+            (vec![group], diagnostics)
+        }
     };
-    let limit_parameter_index = like_needles.len() + 7;
-    let sql = format!(
+    groups.truncate(request.top_k.clamp(1, 24));
+    diagnostics.degraded_reason = Some(if request.semantic_rerank {
+        "session_semantic_rerank_unavailable".to_owned()
+    } else {
+        "session_semantic_rerank_disabled".to_owned()
+    });
+    diagnostics.coverage_gap = if groups.is_empty() {
+        Some("no_session_windows".to_owned())
+    } else if request.semantic_rerank {
+        Some("semantic_rerank_degraded_to_lexical".to_owned())
+    } else {
+        Some("semantic_rerank_not_requested".to_owned())
+    };
+    diagnostics.total_latency_ms = elapsed_millis(started_at);
+
+    let include_artifacts = request.operation == SessionSearchOperationV2::Artifacts;
+    let mut hits = Vec::with_capacity(groups.len());
+    for group in groups {
+        hits.push(session_search_group_to_v2_hit(
+            connection,
+            group,
+            request,
+            semantic_rerank_state,
+            include_artifacts,
+        )?);
+    }
+    Ok(SessionSearchOutcomeV2 {
+        schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+        operation: request.operation,
+        query: request.query.trim().to_owned(),
+        hits,
+        diagnostics,
+    })
+}
+
+fn session_search_v2_legacy_request(request: &SessionSearchRequestV2) -> SessionSearchRequest {
+    SessionSearchRequest {
+        principal: request.principal.clone(),
+        device_id: request.device_id.clone(),
+        channel: request.channel.clone(),
+        session_id: None,
+        exclude_session_id: if request.include_current_session {
+            None
+        } else {
+            request.current_session_id.clone()
+        },
+        query: if request.operation == SessionSearchOperationV2::Recent {
+            String::new()
+        } else {
+            request.query.trim().to_owned()
+        },
+        top_k: request.top_k.clamp(1, 24),
+        min_score: request.min_score,
+        window_before: request.page_size.min(8),
+        window_after: request.page_size.min(8),
+        max_windows_per_session: request.max_bookends_per_root.clamp(1, 8),
+        include_archived: request.include_archived,
+    }
+}
+
+fn build_session_search_anchor_group(
+    connection: &Connection,
+    legacy_request: &SessionSearchRequest,
+    candidate: SessionSearchCandidate,
+    before_limit: usize,
+    after_limit: usize,
+) -> Result<SessionSearchGroup, JournalError> {
+    let root_session =
+        resolve_session_search_root(connection, &candidate.session, legacy_request, 8)?;
+    let events = load_session_search_window_events(
+        connection,
+        candidate.event.session_id.as_str(),
+        candidate.event.run_id.as_str(),
+        candidate.event.seq,
+        before_limit,
+        after_limit,
+    )?;
+    let match_index = events
+        .iter()
+        .position(|event| {
+            event.run_id == candidate.event.run_id && event.seq == candidate.event.seq
+        })
+        .ok_or_else(|| {
+            JournalError::InvalidArgument("session search anchor no longer resolves".to_owned())
+        })?;
+    let before = events[..match_index].to_vec();
+    let mut matched = events[match_index].clone();
+    matched.is_match = true;
+    let after = events[match_index.saturating_add(1)..].to_vec();
+    let source_ref = session_search_window_source_ref(
+        candidate.event.session_id.as_str(),
+        candidate.event.run_id.as_str(),
+        candidate.event.seq,
+        candidate.event.event_type.as_str(),
+    );
+    let window = SessionSearchWindow {
+        window_id: format!(
+            "session:{}:run:{}:seq:{}",
+            candidate.event.session_id, candidate.event.run_id, candidate.event.seq
+        ),
+        source_ref,
+        session_id: candidate.event.session_id.clone(),
+        run_id: candidate.event.run_id.clone(),
+        match_seq: candidate.event.seq,
+        match_event_type: candidate.event.event_type.clone(),
+        match_created_at_unix_ms: candidate.event.created_at_unix_ms,
+        score: candidate.score,
+        snippet: candidate.snippet,
+        before,
+        matched,
+        after,
+        provenance: SessionSearchProvenanceRef {
+            source_type: "orchestrator_tape".to_owned(),
+            session_id: candidate.event.session_id.clone(),
+            run_id: candidate.event.run_id.clone(),
+            tape_seq: candidate.event.seq,
+            event_type: candidate.event.event_type.clone(),
+            created_at_unix_ms: candidate.event.created_at_unix_ms,
+        },
+    };
+    let members = load_session_search_lineage_members(
+        connection,
+        root_session.session_id.as_str(),
+        legacy_request,
+    )?;
+    let root_session_id = root_session.session_id.clone();
+    let root_branch_state = root_session.branch_state.clone();
+    let root_parent_session_id = root_session.parent_session_id.clone();
+    let root_branch_origin_run_id = root_session.branch_origin_run_id.clone();
+    let helper_session_count =
+        members.iter().filter(|session_id| session_id.as_str() != root_session.session_id).count()
+            as u64;
+    Ok(SessionSearchGroup {
+        session: hydrate_orchestrator_session(connection, root_session, None)?,
+        best_score: candidate.score,
+        match_count: 1,
+        lineage: SessionSearchLineage {
+            root_session_id,
+            branch_state: root_branch_state,
+            parent_session_id: root_parent_session_id,
+            branch_origin_run_id: root_branch_origin_run_id,
+            helper_policy: "group_under_root".to_owned(),
+            helper_session_count,
+            hidden_helper_session_count: helper_session_count,
+            member_session_ids: members,
+            runs: vec![SessionSearchRunRef {
+                run_id: candidate.event.run_id,
+                origin_kind: candidate.event.origin_kind,
+                origin_run_id: candidate.event.origin_run_id,
+                parent_run_id: candidate.event.parent_run_id,
+            }],
+        },
+        windows: vec![window],
+    })
+}
+
+fn resolve_session_search_anchor(
+    connection: &Connection,
+    request: &SessionSearchRequestV2,
+    anchor: &SearchAnchor,
+) -> Result<SessionSearchCandidate, JournalError> {
+    let include_archived = i64::from(request.include_archived);
+    let exclude_session_id = (!request.include_current_session)
+        .then_some(request.current_session_id.as_deref())
+        .flatten();
+    let mut statement = connection.prepare(
         r#"
             SELECT
                 sessions.session_ulid,
@@ -27703,7 +28421,252 @@ fn load_session_search_candidates(
                 COALESCE(runs.origin_kind, 'manual'),
                 runs.origin_run_ulid,
                 runs.parent_run_ulid
-            FROM orchestrator_tape AS tape
+            FROM orchestrator_session_search_fts AS search
+            INNER JOIN orchestrator_tape AS tape
+                ON tape.rowid = search.rowid
+            INNER JOIN orchestrator_runs AS runs
+                ON runs.run_ulid = tape.run_ulid
+            INNER JOIN orchestrator_sessions AS sessions
+                ON sessions.session_ulid = runs.session_ulid
+            WHERE sessions.principal = ?1
+              AND sessions.device_id = ?2
+              AND ((sessions.channel = ?3) OR (sessions.channel IS NULL AND ?3 IS NULL))
+              AND (?4 = 1 OR sessions.archived_at_unix_ms IS NULL)
+              AND (?5 IS NULL OR sessions.session_ulid != ?5)
+            ORDER BY sessions.updated_at_unix_ms DESC, tape.created_at_unix_ms DESC
+            LIMIT 4096
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        request.principal,
+        request.device_id,
+        request.channel,
+        include_archived,
+        exclude_session_id,
+    ])?;
+    while let Some(row) = rows.next()? {
+        let session = map_orchestrator_session_row(row)?;
+        let run_id: String = row.get(24)?;
+        let seq: i64 = row.get(25)?;
+        let event_type: String = row.get(26)?;
+        let payload_json: String = row.get(27)?;
+        let created_at_unix_ms: i64 = row.get(28)?;
+        if session_search_anchor_digest(
+            session.session_id.as_str(),
+            run_id.as_str(),
+            seq,
+            event_type.as_str(),
+        ) != anchor.cursor_sha256
+        {
+            continue;
+        }
+        let text = extract_session_search_text(event_type.as_str(), payload_json.as_str())
+            .ok_or_else(|| {
+                JournalError::InvalidArgument(
+                    "session search anchor references an unsupported event".to_owned(),
+                )
+            })?;
+        return Ok(SessionSearchCandidate {
+            session,
+            event: SessionSearchEvent {
+                session_id: row.get(0)?,
+                run_id,
+                seq,
+                event_type,
+                created_at_unix_ms,
+                origin_kind: row.get(29)?,
+                origin_run_id: row.get(30)?,
+                parent_run_id: row.get(31)?,
+                text: text.clone(),
+                is_match: true,
+            },
+            score: 1.0,
+            snippet: session_search_snippet(text.as_str(), ""),
+        });
+    }
+    Err(JournalError::SessionNotFound { selector: "opaque_search_anchor".to_owned() })
+}
+
+fn session_search_anchor_digest(
+    session_id: &str,
+    run_id: &str,
+    tape_seq: i64,
+    event_type: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "palyra.session-search.anchor.v2\0{session_id}\0{run_id}\0{tape_seq}\0{event_type}"
+        )
+        .as_bytes(),
+    )
+}
+
+fn session_search_group_to_v2_hit(
+    connection: &Connection,
+    group: SessionSearchGroup,
+    request: &SessionSearchRequestV2,
+    semantic_rerank_state: &str,
+    include_artifacts: bool,
+) -> Result<SessionSearchHitV2, JournalError> {
+    let mut matched_session_ids =
+        group.windows.iter().map(|window| window.session_id.clone()).collect::<Vec<_>>();
+    matched_session_ids.sort();
+    matched_session_ids.dedup();
+    let mut bookends = Vec::with_capacity(group.windows.len());
+    let mut source_refs = Vec::with_capacity(group.windows.len());
+    for window in &group.windows {
+        let anchor = SearchAnchor {
+            schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+            cursor_sha256: session_search_anchor_digest(
+                window.session_id.as_str(),
+                window.run_id.as_str(),
+                window.match_seq,
+                window.match_event_type.as_str(),
+            ),
+            created_at_unix_ms: window.match_created_at_unix_ms,
+        };
+        bookends.push(BookendProjection {
+            anchor,
+            before: window.before.clone(),
+            matched: window.matched.clone(),
+            after: window.after.clone(),
+            has_more_before: window.before.len() >= request.page_size.min(16),
+            has_more_after: window.after.len() >= request.page_size.min(16),
+        });
+        source_refs.push(window.source_ref.clone());
+    }
+    let artifacts = if include_artifacts {
+        load_session_search_artifact_refs(connection, &group.lineage.member_session_ids, 32)?
+    } else {
+        Vec::new()
+    };
+    Ok(SessionSearchHitV2 {
+        root_session_id: group.session.session_id,
+        matched_session_ids,
+        title: group.session.title,
+        updated_at_unix_ms: group.session.updated_at_unix_ms,
+        archived: group.session.archived_at_unix_ms.is_some(),
+        score: group.best_score,
+        lineage: group.lineage,
+        bookends,
+        source_refs,
+        artifacts,
+        helper_policy: "group_under_root".to_owned(),
+        semantic_rerank_state: semantic_rerank_state.to_owned(),
+    })
+}
+
+fn load_session_search_artifact_refs(
+    connection: &Connection,
+    session_ids: &[String],
+    limit: usize,
+) -> Result<Vec<SessionSearchArtifactRefV2>, JournalError> {
+    let mut artifacts = Vec::new();
+    let per_session_limit = i64::try_from(limit.clamp(1, 32)).unwrap_or(32);
+    let mut tool_statement = connection.prepare(
+        r#"
+            SELECT artifact_ulid, tool_name, mime_type, created_at_unix_ms
+            FROM tool_result_artifacts
+            WHERE session_ulid = ?1
+              AND purge_requested = 0
+            ORDER BY created_at_unix_ms DESC, artifact_ulid ASC
+            LIMIT ?2
+        "#,
+    )?;
+    let mut recall_statement = connection.prepare(
+        r#"
+            SELECT artifact_ulid, artifact_kind, created_at_unix_ms
+            FROM recall_artifacts
+            WHERE session_ulid = ?1
+            ORDER BY created_at_unix_ms DESC, artifact_ulid ASC
+            LIMIT ?2
+        "#,
+    )?;
+    for session_id in session_ids.iter().take(64) {
+        let mut rows = tool_statement.query(params![session_id, per_session_limit])?;
+        while let Some(row) = rows.next()? {
+            let artifact_id: String = row.get(0)?;
+            let tool_name: String = row.get(1)?;
+            artifacts.push(SessionSearchArtifactRefV2 {
+                artifact_ref: format!("tool_result_artifact:{artifact_id}"),
+                artifact_kind: tool_name,
+                mime_type: row.get(2)?,
+                created_at_unix_ms: row.get(3)?,
+            });
+            if artifacts.len() >= limit {
+                return Ok(artifacts);
+            }
+        }
+        let mut rows = recall_statement.query(params![session_id, per_session_limit])?;
+        while let Some(row) = rows.next()? {
+            let artifact_id: String = row.get(0)?;
+            artifacts.push(SessionSearchArtifactRefV2 {
+                artifact_ref: format!("recall_artifact:{artifact_id}"),
+                artifact_kind: row.get(1)?,
+                mime_type: None,
+                created_at_unix_ms: row.get(2)?,
+            });
+            if artifacts.len() >= limit {
+                return Ok(artifacts);
+            }
+        }
+    }
+    artifacts.sort_by(|left, right| {
+        right
+            .created_at_unix_ms
+            .cmp(&left.created_at_unix_ms)
+            .then_with(|| left.artifact_ref.cmp(&right.artifact_ref))
+    });
+    artifacts.truncate(limit);
+    Ok(artifacts)
+}
+
+fn load_session_search_candidates(
+    connection: &Connection,
+    request: &SessionSearchRequest,
+    normalized_query: &str,
+    query_terms: &[String],
+    scan_limit: usize,
+) -> Result<Vec<SessionSearchCandidate>, JournalError> {
+    let fts_query = session_search_fts_query(normalized_query, query_terms);
+    let sql = if fts_query.is_some() {
+        r#"
+            SELECT
+                sessions.session_ulid,
+                sessions.session_key,
+                sessions.session_label,
+                sessions.principal,
+                sessions.device_id,
+                sessions.channel,
+                sessions.created_at_unix_ms,
+                sessions.updated_at_unix_ms,
+                sessions.last_run_ulid,
+                sessions.archived_at_unix_ms,
+                sessions.auto_title,
+                sessions.auto_title_source,
+                sessions.auto_title_generator_version,
+                sessions.auto_title_updated_at_unix_ms,
+                sessions.title_generation_state,
+                sessions.manual_title_locked,
+                sessions.manual_title_updated_at_unix_ms,
+                sessions.model_profile_override,
+                sessions.thinking_override,
+                sessions.trace_override,
+                sessions.verbose_override,
+                sessions.branch_state,
+                sessions.parent_session_ulid,
+                sessions.branch_origin_run_ulid,
+                tape.run_ulid,
+                tape.seq,
+                tape.event_type,
+                tape.payload_json,
+                tape.created_at_unix_ms,
+                COALESCE(runs.origin_kind, 'manual'),
+                runs.origin_run_ulid,
+                runs.parent_run_ulid
+            FROM orchestrator_session_search_fts AS search
+            INNER JOIN orchestrator_tape AS tape
+                ON tape.rowid = search.rowid
             INNER JOIN orchestrator_runs AS runs
                 ON runs.run_ulid = tape.run_ulid
             INNER JOIN orchestrator_sessions AS sessions
@@ -27714,32 +28677,86 @@ fn load_session_search_candidates(
               AND (?4 = 1 OR sessions.archived_at_unix_ms IS NULL)
               AND (?5 IS NULL OR sessions.session_ulid = ?5)
               AND (?6 IS NULL OR sessions.session_ulid != ?6)
-              AND tape.event_type IN ('message.received', 'queued.input', 'message.replied', 'rollback.marker')
-              AND ({like_clause})
-            ORDER BY tape.created_at_unix_ms DESC, tape.run_ulid DESC, tape.seq DESC
-            LIMIT ?{limit_parameter_index}
-        "#,
-    );
-    let mut statement = connection.prepare(sql.as_str())?;
+              AND orchestrator_session_search_fts MATCH ?7
+            ORDER BY
+                bm25(orchestrator_session_search_fts, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 4.0, 2.0, 1.0),
+                tape.created_at_unix_ms DESC,
+                tape.run_ulid DESC,
+                tape.seq DESC
+            LIMIT ?8
+        "#
+    } else {
+        r#"
+            SELECT
+                sessions.session_ulid,
+                sessions.session_key,
+                sessions.session_label,
+                sessions.principal,
+                sessions.device_id,
+                sessions.channel,
+                sessions.created_at_unix_ms,
+                sessions.updated_at_unix_ms,
+                sessions.last_run_ulid,
+                sessions.archived_at_unix_ms,
+                sessions.auto_title,
+                sessions.auto_title_source,
+                sessions.auto_title_generator_version,
+                sessions.auto_title_updated_at_unix_ms,
+                sessions.title_generation_state,
+                sessions.manual_title_locked,
+                sessions.manual_title_updated_at_unix_ms,
+                sessions.model_profile_override,
+                sessions.thinking_override,
+                sessions.trace_override,
+                sessions.verbose_override,
+                sessions.branch_state,
+                sessions.parent_session_ulid,
+                sessions.branch_origin_run_ulid,
+                tape.run_ulid,
+                tape.seq,
+                tape.event_type,
+                tape.payload_json,
+                tape.created_at_unix_ms,
+                COALESCE(runs.origin_kind, 'manual'),
+                runs.origin_run_ulid,
+                runs.parent_run_ulid
+            FROM orchestrator_session_search_fts AS search
+            INNER JOIN orchestrator_tape AS tape
+                ON tape.rowid = search.rowid
+            INNER JOIN orchestrator_runs AS runs
+                ON runs.run_ulid = tape.run_ulid
+            INNER JOIN orchestrator_sessions AS sessions
+                ON sessions.session_ulid = runs.session_ulid
+            WHERE sessions.principal = ?1
+              AND sessions.device_id = ?2
+              AND ((sessions.channel = ?3) OR (sessions.channel IS NULL AND ?3 IS NULL))
+              AND (?4 = 1 OR sessions.archived_at_unix_ms IS NULL)
+              AND (?5 IS NULL OR sessions.session_ulid = ?5)
+              AND (?6 IS NULL OR sessions.session_ulid != ?6)
+            ORDER BY
+                sessions.updated_at_unix_ms DESC,
+                tape.created_at_unix_ms DESC,
+                tape.run_ulid DESC,
+                tape.seq DESC
+            LIMIT ?7
+        "#
+    };
+    let mut statement = connection.prepare(sql)?;
     let now_unix_ms = current_unix_ms()?;
     let channel = request.channel.as_deref();
     let include_archived = if request.include_archived { 1_i64 } else { 0_i64 };
     let session_id = request.session_id.as_deref();
     let exclude_session_id = request.exclude_session_id.as_deref();
-    let scan_limit = scan_limit as i64;
-    let like_patterns = like_needles
-        .iter()
-        .map(|needle| format!("%{}%", escape_sql_like(needle.as_str())))
-        .collect::<Vec<_>>();
-    let mut parameters: Vec<&dyn ToSql> = Vec::with_capacity(7 + like_patterns.len());
+    let scan_limit = i64::try_from(scan_limit).unwrap_or(i64::MAX);
+    let mut parameters: Vec<&dyn ToSql> = Vec::with_capacity(8);
     parameters.push(&request.principal);
     parameters.push(&request.device_id);
     parameters.push(&channel);
     parameters.push(&include_archived);
     parameters.push(&session_id);
     parameters.push(&exclude_session_id);
-    for pattern in &like_patterns {
-        parameters.push(pattern);
+    if let Some(fts_query) = &fts_query {
+        parameters.push(fts_query);
     }
     parameters.push(&scan_limit);
     let mut rows = statement.query(params_from_iter(parameters))?;
@@ -27758,11 +28775,22 @@ fn load_session_search_candidates(
         else {
             continue;
         };
-        if !session_search_text_matches(text.as_str(), normalized_query, query_terms) {
+        let effective_title = session
+            .session_label
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                session.auto_title.as_deref().filter(|title| !title.trim().is_empty())
+            })
+            .unwrap_or_default();
+        if !session_search_text_matches(text.as_str(), normalized_query, query_terms)
+            && !session_search_text_matches(effective_title, normalized_query, query_terms)
+        {
             continue;
         }
         let score = score_session_search_match(
             text.as_str(),
+            effective_title,
             event_type.as_str(),
             created_at_unix_ms,
             now_unix_ms,
@@ -27788,6 +28816,36 @@ fn load_session_search_candidates(
         });
     }
     Ok(candidates)
+}
+
+fn session_search_fts_query(normalized_query: &str, query_terms: &[String]) -> Option<String> {
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let phrase = normalized_query.replace('"', "\"\"");
+    let mut terms = query_terms.to_vec();
+    if terms.is_empty() {
+        terms.extend(
+            normalized_query
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .map(str::trim)
+                .filter(|term| !term.is_empty())
+                .map(str::to_lowercase),
+        );
+    }
+    terms.sort();
+    terms.dedup();
+    let prefix_query = terms
+        .iter()
+        .take(24)
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    if prefix_query.is_empty() {
+        Some(format!("\"{phrase}\""))
+    } else {
+        Some(format!("\"{phrase}\" OR ({prefix_query})"))
+    }
 }
 
 fn load_session_search_window_events(
@@ -27951,30 +29009,6 @@ fn session_search_is_stop_term(term: &str) -> bool {
     )
 }
 
-fn session_search_like_needles(query: &str, terms: &[String]) -> Vec<String> {
-    let mut needles = Vec::new();
-    push_session_search_like_needle(&mut needles, query.to_lowercase());
-    for term in terms {
-        push_session_search_like_needle(&mut needles, term.clone());
-        if let Some(prefix) = session_search_term_prefix(term) {
-            push_session_search_like_needle(&mut needles, prefix);
-        }
-        for alias in session_search_term_aliases(term.as_str()) {
-            push_session_search_like_needle(&mut needles, (*alias).to_owned());
-        }
-    }
-    needles.truncate(12);
-    needles
-}
-
-fn push_session_search_like_needle(needles: &mut Vec<String>, needle: String) {
-    let needle = needle.trim().to_owned();
-    if needle.len() < 2 || needles.iter().any(|existing| existing == &needle) {
-        return;
-    }
-    needles.push(needle);
-}
-
 fn session_search_term_prefix(term: &str) -> Option<String> {
     let chars = term.chars().collect::<Vec<_>>();
     if chars.len() < 5 {
@@ -27986,6 +29020,9 @@ fn session_search_term_prefix(term: &str) -> Option<String> {
 }
 
 fn session_search_text_matches(text: &str, query: &str, terms: &[String]) -> bool {
+    if query.is_empty() {
+        return true;
+    }
     let normalized_text = text.to_lowercase();
     let normalized_query = query.to_lowercase();
     if !normalized_query.is_empty() && normalized_text.contains(normalized_query.as_str()) {
@@ -28031,6 +29068,7 @@ fn session_search_term_aliases(term: &str) -> &'static [&'static str] {
 
 fn score_session_search_match(
     text: &str,
+    title: &str,
     event_type: &str,
     created_at_unix_ms: i64,
     now_unix_ms: i64,
@@ -28038,17 +29076,25 @@ fn score_session_search_match(
     terms: &[String],
 ) -> f64 {
     let normalized_text = text.to_lowercase();
+    let normalized_title = title.to_lowercase();
     let normalized_query = query.to_lowercase();
     let phrase_score =
         if !normalized_query.is_empty() && normalized_text.contains(normalized_query.as_str()) {
-            0.58
+            0.48
+        } else {
+            0.0
+        };
+    let title_score =
+        if !normalized_query.is_empty() && normalized_title.contains(normalized_query.as_str()) {
+            0.38
         } else {
             0.0
         };
     let term_score = if terms.is_empty() {
         0.0
     } else {
-        let matched_terms = session_search_matched_term_count(normalized_text.as_str(), terms);
+        let matched_terms = session_search_matched_term_count(normalized_text.as_str(), terms)
+            .max(session_search_matched_term_count(normalized_title.as_str(), terms));
         0.32 * (matched_terms as f64 / terms.len() as f64)
     };
     let event_quality = match event_type {
@@ -28061,7 +29107,7 @@ fn score_session_search_match(
     let age_ms = now_unix_ms.saturating_sub(created_at_unix_ms).max(0) as f64;
     let age_days = age_ms / 86_400_000.0;
     let recency_score = 0.10 / (1.0 + age_days / 30.0);
-    (phrase_score + term_score + event_quality + recency_score).clamp(0.0, 1.0)
+    (phrase_score + title_score + term_score + event_quality + recency_score).clamp(0.0, 1.0)
 }
 
 fn extract_session_search_text(event_type: &str, payload_json: &str) -> Option<String> {
@@ -28070,6 +29116,7 @@ fn extract_session_search_text(event_type: &str, payload_json: &str) -> Option<S
         "message.received" | "queued.input" => payload.get("text").and_then(Value::as_str),
         "message.replied" => payload.get("reply_text").and_then(Value::as_str),
         "rollback.marker" => payload.get("event").and_then(Value::as_str),
+        "assistant.summary" | "session.summary" => payload.get("summary").and_then(Value::as_str),
         _ => None,
     }?;
     normalize_orchestrator_session_text(raw, 1_200)
@@ -33637,7 +34684,8 @@ mod tests {
         OrchestratorCancelRequest, OrchestratorParentGenerationGuard,
         OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputUpdateRequest,
         OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
-        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionPinCreateRequest,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionCleanupRequest,
+        OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
         OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
         OrchestratorStartupBackgroundTaskRecoveryReport, OrchestratorTapeAppendRequest,
         OrchestratorUsageDelta, PersistedProcessLeaseRecord, ProgressDraftListFilter,
@@ -33653,9 +34701,9 @@ mod tests {
         RuntimeHealthProbeBeginRequest, RuntimeHealthProbeReconciliationMode,
         RuntimeHealthProbeSettlementOutcome, RuntimeHealthProbeSettlementRequest,
         RuntimeHealthQuarantineClearRequest, SessionProjectContextStateUpsertRequest,
-        SessionSearchRequest, SessionSearchUxSourceRefsProjection,
-        SessionSearchUxSourceRefsReasonCode, SessionWriteLeaseAcquireRequest,
-        SessionWriteLeaseRecord, SessionWriteLeaseReleaseRequest,
+        SessionSearchOperationV2, SessionSearchRequest, SessionSearchRequestV2,
+        SessionSearchUxSourceRefsProjection, SessionSearchUxSourceRefsReasonCode,
+        SessionWriteLeaseAcquireRequest, SessionWriteLeaseRecord, SessionWriteLeaseReleaseRequest,
         SideEffectFenceCleanupOutcomeRequest, SideEffectFenceOperatorResolutionRequest,
         SkillExecutionStatus, SkillStatusUpsertRequest, ToolEffectObservationCommitRequest,
         ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRetentionPolicy, ToolJobRetryPolicy,
@@ -33671,7 +34719,7 @@ mod tests {
         NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
         NETWORKED_WORKER_EXPIRY_MAX_ENTRIES, NETWORKED_WORKER_FLEET_MAX_ENTRIES,
         RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
-        SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED,
+        SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED, SESSION_SEARCH_V2_SCHEMA_VERSION,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -49580,6 +50628,339 @@ mod tests {
                 "session recall should surface the prior feature flag for query {query}"
             );
         }
+    }
+
+    fn session_search_v2_test_request(
+        operation: SessionSearchOperationV2,
+        query: &str,
+    ) -> SessionSearchRequestV2 {
+        SessionSearchRequestV2 {
+            schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+            operation,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            current_session_id: None,
+            query: query.to_owned(),
+            anchor: None,
+            top_k: 8,
+            min_score: 0.0,
+            page_size: 1,
+            max_bookends_per_root: 4,
+            include_archived: false,
+            include_current_session: false,
+            semantic_rerank: false,
+        }
+    }
+
+    #[test]
+    fn session_search_v2_ranks_exact_title_phrase_first() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        for (session_id, run_id, title) in [
+            ("01ARZ3NDEKTSV4RRFFQ69G5ST1", "01ARZ3NDEKTSV4RRFFQ69G5RT1", "Blue Harbor deployment"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5ST2", "01ARZ3NDEKTSV4RRFFQ69G5RT2", "Blue deployment Harbor"),
+        ] {
+            store
+                .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                    session_id: session_id.to_owned(),
+                    session_key: format!("session:{session_id}"),
+                    session_label: Some(title.to_owned()),
+                    principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                })
+                .expect("session should persist");
+            start_orchestrator_run(&store, session_id, run_id);
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "message.received".to_owned(),
+                    payload_json: r#"{"text":"Routine deployment status."}"#.to_owned(),
+                })
+                .expect("tape event should persist");
+        }
+
+        let mut request =
+            session_search_v2_test_request(SessionSearchOperationV2::Search, "blue harbor");
+        request.top_k = 1;
+        let outcome =
+            store.search_orchestrator_sessions_v2(&request).expect("title search should succeed");
+
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].title, "Blue Harbor deployment");
+        assert_eq!(
+            outcome.hits[0].semantic_rerank_state, "disabled",
+            "lexical title ranking must be explicit when semantic reranking is disabled"
+        );
+    }
+
+    #[test]
+    fn session_search_v2_deduplicates_helper_lineage_under_root() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let root_session_id = "01ARZ3NDEKTSV4RRFFQ69G5SL1";
+        let child_session_id = "01ARZ3NDEKTSV4RRFFQ69G5SL2";
+        for (session_id, run_id) in [
+            (root_session_id, "01ARZ3NDEKTSV4RRFFQ69G5RL1"),
+            (child_session_id, "01ARZ3NDEKTSV4RRFFQ69G5RL2"),
+        ] {
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, run_id);
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "message.received".to_owned(),
+                    payload_json: r#"{"text":"Shared heliotrope investigation evidence."}"#
+                        .to_owned(),
+                })
+                .expect("tape event should persist");
+        }
+        store
+            .update_orchestrator_session_lineage(&OrchestratorSessionLineageUpdateRequest {
+                session_id: child_session_id.to_owned(),
+                branch_state: "branch".to_owned(),
+                parent_session_id: Some(root_session_id.to_owned()),
+                branch_origin_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5RL1".to_owned()),
+                suggested_auto_title: None,
+            })
+            .expect("child lineage should persist");
+
+        let request =
+            session_search_v2_test_request(SessionSearchOperationV2::Search, "heliotrope");
+        let outcome =
+            store.search_orchestrator_sessions_v2(&request).expect("lineage search should succeed");
+
+        assert_eq!(outcome.hits.len(), 1);
+        let hit = &outcome.hits[0];
+        assert_eq!(hit.root_session_id, root_session_id);
+        assert_eq!(hit.lineage.helper_policy, "group_under_root");
+        assert_eq!(hit.lineage.helper_session_count, 1);
+        assert_eq!(hit.lineage.hidden_helper_session_count, 1);
+        assert_eq!(hit.lineage.member_session_ids.len(), 2);
+        assert_eq!(hit.matched_session_ids.len(), 2);
+    }
+
+    #[test]
+    fn session_search_v2_recent_browses_without_query() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        for (session_id, run_id, text) in [
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5SN1",
+                "01ARZ3NDEKTSV4RRFFQ69G5RN1",
+                "Older session transcript.",
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5SN2",
+                "01ARZ3NDEKTSV4RRFFQ69G5RN2",
+                "Newer session transcript.",
+            ),
+        ] {
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, run_id);
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq: 0,
+                    event_type: "message.received".to_owned(),
+                    payload_json: json!({"text": text}).to_string(),
+                })
+                .expect("tape event should persist");
+        }
+        let guard = store.connection.lock().expect("journal lock should remain healthy");
+        guard
+            .execute(
+                "UPDATE orchestrator_sessions SET updated_at_unix_ms = ?2 WHERE session_ulid = ?1",
+                params!["01ARZ3NDEKTSV4RRFFQ69G5SN1", 100_i64],
+            )
+            .expect("older session timestamp should update");
+        guard
+            .execute(
+                "UPDATE orchestrator_sessions SET updated_at_unix_ms = ?2 WHERE session_ulid = ?1",
+                params!["01ARZ3NDEKTSV4RRFFQ69G5SN2", 200_i64],
+            )
+            .expect("newer session timestamp should update");
+        drop(guard);
+
+        let request = session_search_v2_test_request(SessionSearchOperationV2::Recent, "");
+        let outcome =
+            store.search_orchestrator_sessions_v2(&request).expect("recent browse should succeed");
+
+        assert_eq!(outcome.hits.len(), 2);
+        assert_eq!(outcome.hits[0].root_session_id, "01ARZ3NDEKTSV4RRFFQ69G5SN2");
+    }
+
+    #[test]
+    fn session_search_v2_scrolls_from_opaque_anchor() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SC1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RC1";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        for (seq, text) in [
+            (0, "first context"),
+            (1, "before context"),
+            (2, "opaque anchor target"),
+            (3, "after context"),
+            (4, "last context"),
+        ] {
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: run_id.to_owned(),
+                    seq,
+                    event_type: "message.received".to_owned(),
+                    payload_json: json!({"text": text}).to_string(),
+                })
+                .expect("tape event should persist");
+        }
+        let search_request = session_search_v2_test_request(
+            SessionSearchOperationV2::Search,
+            "opaque anchor target",
+        );
+        let search =
+            store.search_orchestrator_sessions_v2(&search_request).expect("search should succeed");
+        let anchor = search.hits[0].bookends[0].anchor.clone();
+        assert!(!anchor.cursor_sha256.contains(session_id));
+        assert!(!anchor.cursor_sha256.contains(run_id));
+
+        let mut before_request =
+            session_search_v2_test_request(SessionSearchOperationV2::ScrollBefore, "");
+        before_request.anchor = Some(anchor.clone());
+        let before = store
+            .search_orchestrator_sessions_v2(&before_request)
+            .expect("scroll before should work");
+        assert_eq!(before.hits[0].bookends[0].before[0].text, "before context");
+
+        let mut after_request =
+            session_search_v2_test_request(SessionSearchOperationV2::ScrollAfter, "");
+        after_request.anchor = Some(anchor);
+        let after = store
+            .search_orchestrator_sessions_v2(&after_request)
+            .expect("scroll after should work");
+        assert_eq!(after.hits[0].bookends[0].after[0].text, "after context");
+    }
+
+    #[test]
+    fn session_search_v2_excludes_archived_sessions_unless_requested() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SA1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RA1";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"Archived vermilion evidence."}"#.to_owned(),
+            })
+            .expect("tape event should persist");
+        store
+            .cleanup_orchestrator_session(&OrchestratorSessionCleanupRequest {
+                session_id: Some(session_id.to_owned()),
+                session_key: None,
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("session should archive");
+
+        let mut request =
+            session_search_v2_test_request(SessionSearchOperationV2::Search, "vermilion");
+        let excluded = store
+            .search_orchestrator_sessions_v2(&request)
+            .expect("archived-filtered search should succeed");
+        assert!(excluded.hits.is_empty());
+        request.include_archived = true;
+        let included = store
+            .search_orchestrator_sessions_v2(&request)
+            .expect("archived-inclusive search should succeed");
+        assert_eq!(included.hits.len(), 1);
+        assert!(included.hits[0].archived);
+    }
+
+    #[test]
+    fn session_search_v2_denies_cross_principal_candidates_before_ranking() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SP1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RP1";
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.to_owned(),
+                session_key: "foreign-principal".to_owned(),
+                session_label: Some("Foreign top-ranked secret".to_owned()),
+                principal: "user:other".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("foreign session should persist");
+        start_orchestrator_run(&store, session_id, run_id);
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"Foreign top-ranked secret."}"#.to_owned(),
+            })
+            .expect("foreign tape event should persist");
+
+        let request =
+            session_search_v2_test_request(SessionSearchOperationV2::Search, "top-ranked secret");
+        let outcome =
+            store.search_orchestrator_sessions_v2(&request).expect("scoped search should succeed");
+        assert!(outcome.hits.is_empty(), "foreign principal data must not reach ranking output");
+    }
+
+    #[test]
+    fn session_search_v2_rebuild_restores_projection_from_journal() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5SI1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RI1";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"Rebuildable indigo journal evidence."}"#.to_owned(),
+            })
+            .expect("tape event should persist");
+        {
+            let guard = store.connection.lock().expect("journal lock should remain healthy");
+            guard
+                .execute("DELETE FROM orchestrator_session_search_fts", [])
+                .expect("test should remove only the rebuildable projection");
+        }
+        let request =
+            session_search_v2_test_request(SessionSearchOperationV2::Search, "indigo journal");
+        let missing = store
+            .search_orchestrator_sessions_v2(&request)
+            .expect("empty projection search should succeed");
+        assert!(missing.hits.is_empty());
+
+        let rebuilt =
+            store.rebuild_orchestrator_session_search_index().expect("FTS rebuild should succeed");
+        assert_eq!(rebuilt, 1);
+        let restored = store
+            .search_orchestrator_sessions_v2(&request)
+            .expect("rebuilt projection search should succeed");
+        assert_eq!(restored.hits.len(), 1);
+        assert!(restored.hits[0].bookends[0].matched.text.contains("indigo"));
     }
 
     #[test]

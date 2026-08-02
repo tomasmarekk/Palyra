@@ -242,13 +242,21 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.memory.session_search",
-            "Search prior session transcripts for facts that were not stored as durable memory. Results expose stable prior_session/prior_run labels, not raw internal session_id or run_id values.",
+            "Search, browse, and navigate prior session transcripts through ACL-revalidated opaque anchors. Results group helpers under root sessions and expose stable labels instead of raw internal ids.",
             object_schema(
-                &["query"],
+                &[],
                 vec![
+                    (
+                        "operation",
+                        json!({"type":"string","enum":["search","recent","read","scroll_before","scroll_after","lineage","artifacts"],"description":"Defaults to search. Search requires query; recent browses without query; all other operations require an anchor returned by an earlier result."}),
+                    ),
                     (
                         "query",
                         json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."}),
+                    ),
+                    (
+                        "anchor",
+                        json!({"oneOf":[{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},{"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false}],"description":"Opaque cursor from a previous bookend. Possession does not grant access; scope is revalidated on every use."}),
                     ),
                     (
                         "channel",
@@ -258,12 +266,17 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     ("window_before", json!({"type":"integer","minimum":0,"maximum":8})),
                     ("window_after", json!({"type":"integer","minimum":0,"maximum":8})),
+                    ("page_size", json!({"type":"integer","minimum":1,"maximum":16})),
                     ("max_windows_per_session", json!({"type":"integer","minimum":1,"maximum":8})),
                     (
                         "include_current_session",
                         json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."}),
                     ),
                     ("include_archived", json!({"type":"boolean"})),
+                    (
+                        "semantic_rerank",
+                        json!({"type":"boolean","description":"Optional lane over ACL-filtered lexical candidates. The current host reports an explicit lexical degradation until a semantic provider is configured."}),
+                    ),
                 ],
                 false,
             ),
@@ -272,25 +285,35 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.session_search",
-            "Compatibility alias for palyra.memory.session_search; search prior session transcripts for facts that were not stored as durable memory. Results expose stable prior_session/prior_run labels, not raw internal session_id or run_id values.",
+            "Compatibility alias for palyra.memory.session_search; search, browse, and navigate prior transcripts through ACL-revalidated opaque anchors.",
             object_schema(
-                &["query"],
+                &[],
                 vec![
+                    (
+                        "operation",
+                        json!({"type":"string","enum":["search","recent","read","scroll_before","scroll_after","lineage","artifacts"]}),
+                    ),
                     (
                         "query",
                         json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."}),
+                    ),
+                    (
+                        "anchor",
+                        json!({"oneOf":[{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},{"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false}]}),
                     ),
                     ("channel", json!({"type":"string"})),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":24})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     ("window_before", json!({"type":"integer","minimum":0,"maximum":8})),
                     ("window_after", json!({"type":"integer","minimum":0,"maximum":8})),
+                    ("page_size", json!({"type":"integer","minimum":1,"maximum":16})),
                     ("max_windows_per_session", json!({"type":"integer","minimum":1,"maximum":8})),
                     (
                         "include_current_session",
                         json!({"type":"boolean","description":"Defaults to false so prior-session searches are not dominated by the current prompt. Set true only when the user explicitly asks to search this active session."}),
                     ),
                     ("include_archived", json!({"type":"boolean"})),
+                    ("semantic_rerank", json!({"type":"boolean"})),
                 ],
                 false,
             ),

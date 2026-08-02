@@ -55,20 +55,25 @@ use crate::{
     },
     domain::workspace::{normalize_workspace_path, normalize_workspace_prefix},
     gateway::{
-        current_unix_ms, GatewayRuntimeState, ListOrchestratorSessionsRequest, MemoryRuntimeConfig,
-        ToolRuntimeExecutionContext, MAX_MEMORY_SEARCH_TOP_K, MAX_MEMORY_TOOL_QUERY_BYTES,
-        MAX_MEMORY_TOOL_TAGS,
+        current_unix_ms, GatewayRuntimeState, MemoryRuntimeConfig, ToolRuntimeExecutionContext,
+        MAX_MEMORY_SEARCH_TOP_K, MAX_MEMORY_TOOL_QUERY_BYTES, MAX_MEMORY_TOOL_TAGS,
     },
     journal::{
         MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryMaintenanceStatus,
-        MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorSessionRecord,
-        SessionSearchEvent, SessionSearchGroup, SessionSearchLineage, SessionSearchOutcome,
-        SessionSearchProvenanceRef, SessionSearchRequest, SessionSearchRunRef, SessionSearchWindow,
-        WorkspaceDocumentDeleteRequest, WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest,
-        WorkspaceSearchHit, WorkspaceSearchRequest,
+        MemorySearchHit, MemorySearchRequest, MemorySource, SearchAnchor, SessionSearchEvent,
+        SessionSearchLineage, SessionSearchOperationV2, SessionSearchOutcomeV2,
+        SessionSearchRequestV2, SessionSearchRunRef, WorkspaceDocumentDeleteRequest,
+        WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
+        WorkspaceSearchRequest, SESSION_SEARCH_V2_SCHEMA_VERSION,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::auth::RequestContext,
+};
+
+#[cfg(test)]
+use crate::journal::{
+    OrchestratorSessionRecord, SessionSearchGroup, SessionSearchOutcome,
+    SessionSearchProvenanceRef, SessionSearchWindow,
 };
 
 const DEFAULT_MEMORY_RECALL_MAX_CANDIDATES: usize = 8;
@@ -429,6 +434,7 @@ pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope)
 /// labels (see [`SessionSearchOutputLabels`]); the absence of raw ULIDs in
 /// the serialized payload is pinned by tests. Session metadata hits act as a
 /// fallback evidence tier when no transcript windows matched.
+#[cfg(test)]
 pub(crate) fn memory_session_search_tool_output_payload(
     outcome: &SessionSearchOutcome,
     session_hits: &[OrchestratorSessionRecord],
@@ -473,6 +479,43 @@ pub(crate) fn memory_session_search_tool_output_payload(
                 None
             },
         },
+    })
+}
+
+/// Builds the model-safe Session Search 2.0 payload.
+///
+/// Durable journal ids stay inside the host contract. The model receives
+/// stable labels, one-way anchors, bounded bookends, and artifact labels.
+pub(crate) fn memory_session_search_v2_tool_output_payload(
+    outcome: &SessionSearchOutcomeV2,
+) -> Value {
+    let labels = session_search_v2_output_labels(outcome);
+    let bookend_count = outcome.hits.iter().map(|hit| hit.bookends.len()).sum::<usize>();
+    let artifact_count = outcome.hits.iter().map(|hit| hit.artifacts.len()).sum::<usize>();
+    let evidence_count = bookend_count.saturating_add(artifact_count);
+    json!({
+        "schema_version": outcome.schema_version,
+        "operation": outcome.operation,
+        "query": outcome.query,
+        "hit_count": outcome.hits.len(),
+        "bookend_count": bookend_count,
+        "artifact_count": artifact_count,
+        "id_policy": {
+            "raw_internal_ids": "omitted",
+            "anchor_authority": "cursor possession never grants access; every use is revalidated against principal, device, channel, archive, and current-session scope",
+            "citation_style": "cite session_search_label and source_ref_label values, never infer internal ids",
+        },
+        "claim_boundary": if evidence_count == 0 {
+            SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY
+        } else {
+            SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY
+        },
+        "hits": outcome
+            .hits
+            .iter()
+            .map(|hit| session_search_v2_hit_payload(hit, &labels))
+            .collect::<Vec<_>>(),
+        "diagnostics": outcome.diagnostics,
     })
 }
 
@@ -526,6 +569,7 @@ impl SessionSearchOutputLabels {
 /// Pre-registers every session/run id reachable from the outcome (groups,
 /// lineage, windows, events, provenance, fallback hits) so payload rendering
 /// never encounters an unlabeled id.
+#[cfg(test)]
 fn session_search_output_labels(
     outcome: &SessionSearchOutcome,
     session_hits: &[OrchestratorSessionRecord],
@@ -546,6 +590,86 @@ fn session_search_output_labels(
     labels
 }
 
+fn session_search_v2_output_labels(outcome: &SessionSearchOutcomeV2) -> SessionSearchOutputLabels {
+    let mut labels = SessionSearchOutputLabels::default();
+    for hit in &outcome.hits {
+        labels.insert_session(hit.root_session_id.as_str());
+        for session_id in &hit.matched_session_ids {
+            labels.insert_session(session_id);
+        }
+        collect_session_lineage_refs(&mut labels, &hit.lineage);
+        for bookend in &hit.bookends {
+            for event in &bookend.before {
+                collect_session_event_refs(&mut labels, event);
+            }
+            collect_session_event_refs(&mut labels, &bookend.matched);
+            for event in &bookend.after {
+                collect_session_event_refs(&mut labels, event);
+            }
+        }
+    }
+    labels
+}
+
+fn session_search_v2_hit_payload(
+    hit: &crate::journal::SessionSearchHitV2,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "session_search_label": labels.session_label(hit.root_session_id.as_str()),
+        "matched_session_labels": hit
+            .matched_session_ids
+            .iter()
+            .map(|session_id| labels.session_label(session_id))
+            .collect::<Vec<_>>(),
+        "title": hit.title,
+        "updated_at_unix_ms": hit.updated_at_unix_ms,
+        "archived": hit.archived,
+        "score": hit.score,
+        "helper_policy": hit.helper_policy,
+        "semantic_rerank_state": hit.semantic_rerank_state,
+        "lineage": session_search_lineage_payload(&hit.lineage, labels),
+        "bookends": hit
+            .bookends
+            .iter()
+            .enumerate()
+            .map(|(index, bookend)| {
+                json!({
+                    "source_ref_label": format!("session_window_{}", index.saturating_add(1)),
+                    "anchor": bookend.anchor,
+                    "before": bookend
+                        .before
+                        .iter()
+                        .map(|event| session_search_event_payload(event, labels))
+                        .collect::<Vec<_>>(),
+                    "matched": session_search_event_payload(&bookend.matched, labels),
+                    "after": bookend
+                        .after
+                        .iter()
+                        .map(|event| session_search_event_payload(event, labels))
+                        .collect::<Vec<_>>(),
+                    "has_more_before": bookend.has_more_before,
+                    "has_more_after": bookend.has_more_after,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "artifacts": hit
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| {
+                json!({
+                    "artifact_ref": format!("session_artifact_{}", index.saturating_add(1)),
+                    "artifact_kind": artifact.artifact_kind,
+                    "mime_type": artifact.mime_type,
+                    "created_at_unix_ms": artifact.created_at_unix_ms,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
 fn session_search_labeled_source_refs(
     outcome: &SessionSearchOutcome,
     labels: &SessionSearchOutputLabels,
@@ -571,6 +695,7 @@ fn session_search_labeled_source_refs(
         .collect()
 }
 
+#[cfg(test)]
 fn collect_session_record_refs(
     labels: &mut SessionSearchOutputLabels,
     session: &OrchestratorSessionRecord,
@@ -590,8 +715,12 @@ fn collect_session_lineage_refs(
     labels: &mut SessionSearchOutputLabels,
     lineage: &SessionSearchLineage,
 ) {
+    labels.insert_session(lineage.root_session_id.as_str());
     if let Some(parent_session_id) = lineage.parent_session_id.as_deref() {
         labels.insert_session(parent_session_id);
+    }
+    for member_session_id in &lineage.member_session_ids {
+        labels.insert_session(member_session_id);
     }
     if let Some(run_id) = lineage.branch_origin_run_id.as_deref() {
         labels.insert_run(run_id);
@@ -611,6 +740,7 @@ fn collect_session_run_ref_refs(labels: &mut SessionSearchOutputLabels, run: &Se
     }
 }
 
+#[cfg(test)]
 fn collect_session_window_refs(
     labels: &mut SessionSearchOutputLabels,
     window: &SessionSearchWindow,
@@ -638,6 +768,7 @@ fn collect_session_event_refs(labels: &mut SessionSearchOutputLabels, event: &Se
     }
 }
 
+#[cfg(test)]
 fn collect_session_provenance_refs(
     labels: &mut SessionSearchOutputLabels,
     provenance: &SessionSearchProvenanceRef,
@@ -646,6 +777,7 @@ fn collect_session_provenance_refs(
     labels.insert_run(provenance.run_id.as_str());
 }
 
+#[cfg(test)]
 fn session_search_group_payload(
     group: &SessionSearchGroup,
     labels: &SessionSearchOutputLabels,
@@ -676,9 +808,18 @@ fn session_search_lineage_payload(
     labels: &SessionSearchOutputLabels,
 ) -> Value {
     json!({
+        "root_session_id": labels.session_label(lineage.root_session_id.as_str()),
         "branch_state": lineage.branch_state,
         "parent_session_id": labels.optional_session_label(lineage.parent_session_id.as_deref()),
         "branch_origin_run_id": labels.optional_run_label(lineage.branch_origin_run_id.as_deref()),
+        "helper_policy": lineage.helper_policy,
+        "helper_session_count": lineage.helper_session_count,
+        "hidden_helper_session_count": lineage.hidden_helper_session_count,
+        "member_session_ids": lineage
+            .member_session_ids
+            .iter()
+            .map(|session_id| labels.session_label(session_id))
+            .collect::<Vec<_>>(),
         "runs": lineage
             .runs
             .iter()
@@ -699,6 +840,7 @@ fn session_search_run_ref_payload(
     })
 }
 
+#[cfg(test)]
 fn session_search_window_payload(
     window: &SessionSearchWindow,
     labels: &SessionSearchOutputLabels,
@@ -748,6 +890,7 @@ fn session_search_event_payload(
     })
 }
 
+#[cfg(test)]
 fn session_search_provenance_payload(
     provenance: &SessionSearchProvenanceRef,
     labels: &SessionSearchOutputLabels,
@@ -763,6 +906,7 @@ fn session_search_provenance_payload(
     })
 }
 
+#[cfg(test)]
 fn session_search_labeled_window_source_ref(
     window: &SessionSearchWindow,
     labels: &SessionSearchOutputLabels,
@@ -770,6 +914,7 @@ fn session_search_labeled_window_source_ref(
     session_search_labeled_provenance_source_ref(&window.provenance, labels)
 }
 
+#[cfg(test)]
 fn session_search_labeled_provenance_source_ref(
     provenance: &SessionSearchProvenanceRef,
     labels: &SessionSearchOutputLabels,
@@ -782,6 +927,7 @@ fn session_search_labeled_provenance_source_ref(
     )
 }
 
+#[cfg(test)]
 fn session_search_session_hit_payload(
     session: &OrchestratorSessionRecord,
     labels: &SessionSearchOutputLabels,
@@ -3207,7 +3353,7 @@ pub(crate) async fn execute_memory_session_search_tool(
     proposal_id: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
-    let attestation_namespace = b"palyra.memory.session_search.attestation.v1";
+    let attestation_namespace = b"palyra.memory.session_search.attestation.v2";
     let parsed = match parse_memory_tool_object(input_json) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -3221,8 +3367,8 @@ pub(crate) async fn execute_memory_session_search_tool(
             );
         }
     };
-    let query = match required_string_field(&parsed, "query") {
-        Ok(value) => value,
+    let operation = match parse_session_search_operation(parsed.get("operation")) {
+        Ok(operation) => operation,
         Err(error) => {
             return memory_tool_execution_outcome(
                 attestation_namespace,
@@ -3230,10 +3376,22 @@ pub(crate) async fn execute_memory_session_search_tool(
                 input_json,
                 false,
                 b"{}".to_vec(),
-                format!("palyra.memory.session_search {error}"),
+                error,
             );
         }
     };
+    let query = optional_trimmed_string(parsed.get("query")).unwrap_or_default();
+    if operation == SessionSearchOperationV2::Search && query.is_empty() {
+        return memory_tool_execution_outcome(
+            attestation_namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.memory.session_search requires non-empty string field 'query' for operation=search"
+                .to_owned(),
+        );
+    }
     if query.len() > MAX_MEMORY_TOOL_QUERY_BYTES {
         return memory_tool_execution_outcome(
             attestation_namespace,
@@ -3357,75 +3515,81 @@ pub(crate) async fn execute_memory_session_search_tool(
     let include_current_session =
         parsed.get("include_current_session").and_then(Value::as_bool).unwrap_or(false);
     let include_archived = parsed.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
+    let page_size =
+        match parse_optional_session_search_limit(parsed.get("page_size"), "page_size", 1, 16) {
+            Ok(value) => value.unwrap_or(window_before.max(window_after).max(1)),
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+        };
+    let anchor = match parse_session_search_anchor(parsed.get("anchor")) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
 
-    let request = SessionSearchRequest {
+    let request = SessionSearchRequestV2 {
+        schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+        operation,
         principal: context.principal.to_owned(),
         device_id: context.device_id.to_owned(),
-        channel: channel.clone(),
-        session_id: None,
-        exclude_session_id: if include_current_session {
-            None
-        } else {
-            Some(context.session_id.to_owned())
-        },
+        channel,
+        current_session_id: Some(context.session_id.to_owned()),
         query,
+        anchor,
         top_k,
         min_score,
-        window_before,
-        window_after,
-        max_windows_per_session,
+        page_size,
+        max_bookends_per_root: max_windows_per_session,
         include_archived,
+        include_current_session,
+        semantic_rerank: parsed.get("semantic_rerank").and_then(Value::as_bool).unwrap_or(false),
     };
 
-    let outcome = match runtime_state.search_orchestrator_session_windows(request).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return memory_tool_execution_outcome(
-                attestation_namespace,
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                format!("palyra.memory.session_search failed: {}", error.message()),
-            );
-        }
-    };
-    // Fetch one extra candidate when the current session will be filtered
-    // out below, so the fallback list can still reach top_k.
-    let session_fallback_limit =
-        if include_current_session { top_k } else { top_k.saturating_add(1) };
-    let mut session_hits = match runtime_state
-        .list_orchestrator_sessions(ListOrchestratorSessionsRequest {
-            after_session_key: None,
-            principal: context.principal.to_owned(),
-            device_id: context.device_id.to_owned(),
-            channel,
-            include_archived,
-            requested_limit: Some(session_fallback_limit),
-            search_query: Some(outcome.query.clone()),
-        })
-        .await
+    let state = Arc::clone(runtime_state);
+    let outcome = match tokio::task::spawn_blocking(move || {
+        state.journal_store.search_orchestrator_sessions_v2(&request)
+    })
+    .await
     {
-        Ok((sessions, _next_after_session_key)) => sessions
-            .into_iter()
-            .filter(|session| include_current_session || session.session_id != context.session_id)
-            .collect::<Vec<_>>(),
-        Err(error) => {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
             return memory_tool_execution_outcome(
                 attestation_namespace,
                 proposal_id,
                 input_json,
                 false,
                 b"{}".to_vec(),
-                format!(
-                    "palyra.memory.session_search session fallback failed: {}",
-                    error.message()
-                ),
+                format!("palyra.memory.session_search failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.session_search worker panicked".to_owned(),
             );
         }
     };
-    session_hits.truncate(top_k);
-    let payload = memory_session_search_tool_output_payload(&outcome, session_hits.as_slice());
+    let payload = memory_session_search_v2_tool_output_payload(&outcome);
     match serde_json::to_vec(&payload) {
         Ok(output_json) => memory_tool_execution_outcome(
             attestation_namespace,
@@ -3452,6 +3616,57 @@ fn parse_memory_tool_object(input_json: &[u8]) -> Result<Map<String, Value>, Str
         Ok(_) => Err("requires JSON object input".to_owned()),
         Err(error) => Err(format!("invalid JSON input: {error}")),
     }
+}
+
+fn parse_session_search_operation(
+    value: Option<&Value>,
+) -> Result<SessionSearchOperationV2, String> {
+    match value.and_then(Value::as_str).map(str::trim) {
+        None | Some("") | Some("search") => Ok(SessionSearchOperationV2::Search),
+        Some("recent") => Ok(SessionSearchOperationV2::Recent),
+        Some("read") => Ok(SessionSearchOperationV2::Read),
+        Some("scroll_before") => Ok(SessionSearchOperationV2::ScrollBefore),
+        Some("scroll_after") => Ok(SessionSearchOperationV2::ScrollAfter),
+        Some("lineage") => Ok(SessionSearchOperationV2::Lineage),
+        Some("artifacts") => Ok(SessionSearchOperationV2::Artifacts),
+        Some(_) => Err("palyra.memory.session_search operation must be one of search, recent, read, scroll_before, scroll_after, lineage, or artifacts".to_owned()),
+    }
+}
+
+fn parse_session_search_anchor(value: Option<&Value>) -> Result<Option<SearchAnchor>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let (cursor_sha256, created_at_unix_ms) = match value {
+        Value::String(cursor) => (cursor.trim(), 0),
+        Value::Object(map) => {
+            let cursor =
+                map.get("cursor_sha256").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+            let created_at_unix_ms =
+                map.get("created_at_unix_ms").and_then(Value::as_i64).unwrap_or(0);
+            (cursor, created_at_unix_ms)
+        }
+        _ => {
+            return Err(
+                "palyra.memory.session_search anchor must be a cursor string or anchor object"
+                    .to_owned(),
+            );
+        }
+    };
+    if cursor_sha256.len() != 64 || !cursor_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "palyra.memory.session_search anchor cursor_sha256 must be 64 hexadecimal characters"
+                .to_owned(),
+        );
+    }
+    Ok(Some(SearchAnchor {
+        schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+        cursor_sha256: cursor_sha256.to_ascii_lowercase(),
+        created_at_unix_ms,
+    }))
 }
 
 /// Parses an optional integer limit, clamping into `min..=max`; absent and
@@ -4989,9 +5204,14 @@ mod tests {
                 best_score: 0.97,
                 match_count: 1,
                 lineage: SessionSearchLineage {
+                    root_session_id: session_id.to_owned(),
                     branch_state: "root".to_owned(),
                     parent_session_id: None,
                     branch_origin_run_id: Some(origin_run_id.to_owned()),
+                    helper_policy: "group_under_root".to_owned(),
+                    helper_session_count: 0,
+                    hidden_helper_session_count: 0,
+                    member_session_ids: vec![session_id.to_owned()],
                     runs: vec![SessionSearchRunRef {
                         run_id: run_id.to_owned(),
                         origin_kind: "model".to_owned(),
@@ -5012,7 +5232,7 @@ mod tests {
                     score: 0.97,
                     snippet: "PALYRA_E2E_BETA".to_owned(),
                     before: Vec::new(),
-                    matched: event,
+                    matched: event.clone(),
                     after: Vec::new(),
                     provenance: SessionSearchProvenanceRef {
                         source_type: "orchestrator_tape".to_owned(),
@@ -5063,6 +5283,53 @@ mod tests {
         assert!(!serialized.contains(session_id), "{serialized}");
         assert!(!serialized.contains(run_id), "{serialized}");
         assert!(!serialized.contains(origin_run_id), "{serialized}");
+
+        let v2_outcome = SessionSearchOutcomeV2 {
+            schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+            operation: SessionSearchOperationV2::Search,
+            query: "feature flag".to_owned(),
+            hits: vec![crate::journal::SessionSearchHitV2 {
+                root_session_id: session_id.to_owned(),
+                matched_session_ids: vec![session_id.to_owned()],
+                title: "Feature flag note".to_owned(),
+                updated_at_unix_ms: 2,
+                archived: false,
+                score: 0.97,
+                lineage: outcome.groups[0].lineage.clone(),
+                bookends: vec![crate::journal::BookendProjection {
+                    anchor: SearchAnchor {
+                        schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
+                        cursor_sha256: "a".repeat(64),
+                        created_at_unix_ms: 2,
+                    },
+                    before: Vec::new(),
+                    matched: event,
+                    after: Vec::new(),
+                    has_more_before: false,
+                    has_more_after: false,
+                }],
+                source_refs: vec![format!(
+                    "orchestrator_tape:{session_id}:{run_id}:4:assistant_final"
+                )],
+                artifacts: vec![crate::journal::SessionSearchArtifactRefV2 {
+                    artifact_ref: "tool_result_artifact:RAW_ARTIFACT_ID".to_owned(),
+                    artifact_kind: "palyra.fs.read".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    created_at_unix_ms: 2,
+                }],
+                helper_policy: "group_under_root".to_owned(),
+                semantic_rerank_state: "disabled".to_owned(),
+            }],
+            diagnostics: outcome.diagnostics,
+        };
+        let v2_payload = memory_session_search_v2_tool_output_payload(&v2_outcome);
+        let v2_serialized = v2_payload.to_string();
+        assert_eq!(v2_payload["hits"][0]["session_search_label"], "prior_session_1");
+        assert_eq!(v2_payload["hits"][0]["bookends"][0]["anchor"]["cursor_sha256"], "a".repeat(64));
+        assert_eq!(v2_payload["hits"][0]["artifacts"][0]["artifact_ref"], "session_artifact_1");
+        assert!(!v2_serialized.contains(session_id), "{v2_serialized}");
+        assert!(!v2_serialized.contains(run_id), "{v2_serialized}");
+        assert!(!v2_serialized.contains("RAW_ARTIFACT_ID"), "{v2_serialized}");
     }
 
     #[test]
