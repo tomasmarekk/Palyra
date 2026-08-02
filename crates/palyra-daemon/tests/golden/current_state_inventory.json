@@ -12066,6 +12066,20 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/skills/{skill_id}/lifecycle",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.skills.by_skill_id.lifecycle",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.skills.by_skill_id.lifecycle.request.method-registry.v1",
+        "request_schema_hash": "efe306788e88619860921f0ebad771ad19322c5db746bee2f14e5eab037e855c",
+        "response_schema_id": "console.post.console.v1.skills.by_skill_id.lifecycle.response.method-registry.v1",
+        "response_schema_hash": "7f886e5019c92f83421ad7d4134897e83cfd09b4fc20d608abfa4beeffbc57fa",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/skills/{skill_id}/quarantine",
         "http_method": "POST",
         "method_name": "console.post.console.v1.skills.by_skill_id.quarantine",
@@ -13399,7 +13413,7 @@
       "diagnostics_sections": 61,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
-      "method_registry_methods": 526,
+      "method_registry_methods": 527,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -13431,7 +13445,7 @@
         "admin": 60,
         "canvas": 5,
         "compat": 16,
-        "console": 442,
+        "console": 443,
         "public": 2,
         "realtime": 1
       }
