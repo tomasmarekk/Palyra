@@ -170,8 +170,8 @@ export function validateRuntimeShadowRolloutGates(manifest, repoRoot) {
   if (!authoritativeGate) {
     errors.push("missing runtime_kernel_v2_authoritative promotion gate");
   } else {
-    if (authoritativeGate.release_stage !== "main_qualification") {
-      errors.push("runtime_kernel_v2_authoritative release_stage must remain main_qualification");
+    if (authoritativeGate.release_stage !== "stable") {
+      errors.push("runtime_kernel_v2_authoritative release_stage must remain stable");
     }
     if (authoritativeGate.required_qa_suite !== AUTHORITATIVE_SUITE) {
       errors.push(

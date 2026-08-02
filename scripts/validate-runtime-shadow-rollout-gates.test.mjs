@@ -70,6 +70,20 @@ test("authoritative V2 qualification remains a hard promotion blocker", () => {
   );
 });
 
+test("authoritative V2 remains at the stable release stage", () => {
+  const fixture = manifest();
+  const gate = fixture.gates.find(
+    (candidate) => candidate.feature_id === "runtime_kernel_v2_authoritative",
+  );
+  gate.release_stage = "main_qualification";
+
+  assert.ok(
+    validateRuntimeShadowRolloutGates(fixture, repoRoot).some((error) =>
+      error.includes("runtime_kernel_v2_authoritative release_stage must remain stable"),
+    ),
+  );
+});
+
 test("qa-lab directly gates shadow and authoritative suites with its built daemon", () => {
   const workflowPath = path.join(repoRoot, ".github", "workflows", "ci.yml");
   const workflow = fs.readFileSync(workflowPath, "utf8");
