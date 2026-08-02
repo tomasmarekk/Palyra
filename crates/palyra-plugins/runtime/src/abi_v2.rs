@@ -28,8 +28,9 @@ use palyra_plugins_sdk::{
     ToolResultMiddlewareResultV2, PLUGIN_ABI_V2_CORE_ALLOC_EXPORT,
     PLUGIN_ABI_V2_CORE_DEALLOC_EXPORT, PLUGIN_ABI_V2_CORE_INVOKE_EXPORT,
     PLUGIN_ABI_V2_CORE_MEMORY_EXPORT, PLUGIN_ABI_V2_EMIT_EVENT_IMPORT,
-    PLUGIN_ABI_V2_HOST_IMPORT_MODULE, PLUGIN_ABI_V2_IS_CANCELLED_IMPORT, PLUGIN_ABI_V2_VERSION,
-    PLUGIN_CORE_WIRE_MAGIC_V2, PLUGIN_CORE_WIRE_SCHEMA_VERSION_V2,
+    PLUGIN_ABI_V2_HOST_IMPORT_MODULE, PLUGIN_ABI_V2_IS_CANCELLED_IMPORT,
+    PLUGIN_ABI_V2_NEXT_CALL_IMPORT, PLUGIN_ABI_V2_VERSION, PLUGIN_CORE_WIRE_MAGIC_V2,
+    PLUGIN_CORE_WIRE_SCHEMA_VERSION_V2,
 };
 use wasmtime::{
     Caller, Extern, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -411,6 +412,11 @@ impl PluginRuntimeV2 {
                 max_events: request.budget.max_events,
                 events: Vec::new(),
                 host_failure: None,
+                next_call_allowed: request.contract
+                    == ExecutablePluginContractKindV2::RunLifecycleHook
+                    && RunLifecycleHookInvocationV2::decode_core_bytes(&request.input_bytes)
+                        .is_ok_and(|input| input.execution_wrapper.is_some()),
+                next_call_consumed: false,
                 request: request.clone(),
             },
         );
@@ -485,6 +491,7 @@ impl PluginRuntimeV2 {
                 | PluginInvocationErrorCodeV2::ResourceLimitExceeded
                 | PluginInvocationErrorCodeV2::InvalidContractOutput
                 | PluginInvocationErrorCodeV2::AuthorityExpansionDenied
+                | PluginInvocationErrorCodeV2::DoubleNextCall
                 | PluginInvocationErrorCodeV2::EventBackpressureExceeded
         ) {
             return;
@@ -509,6 +516,8 @@ struct AbiV2StoreState {
     max_events: u32,
     events: Vec<PluginInvocationEventV2>,
     host_failure: Option<PluginInvocationErrorCodeV2>,
+    next_call_allowed: bool,
+    next_call_consumed: bool,
     request: PluginInvocationRequestV2,
 }
 
@@ -701,6 +710,11 @@ fn register_abi_v2_host_imports(
         PLUGIN_ABI_V2_IS_CANCELLED_IMPORT,
         host_is_cancelled,
     )?;
+    linker.func_wrap(
+        PLUGIN_ABI_V2_HOST_IMPORT_MODULE,
+        PLUGIN_ABI_V2_NEXT_CALL_IMPORT,
+        host_next_call,
+    )?;
     Ok(())
 }
 
@@ -767,6 +781,47 @@ fn host_emit_event(mut caller: Caller<'_, AbiV2StoreState>, pointer: i32, length
 
 fn host_is_cancelled(caller: Caller<'_, AbiV2StoreState>) -> i32 {
     i32::from(caller.data().cancellation.is_cancelled())
+}
+
+fn host_next_call(
+    mut caller: Caller<'_, AbiV2StoreState>,
+    call_id_pointer: i32,
+    call_id_length: i32,
+) -> i32 {
+    let Ok(call_id_pointer) = usize::try_from(call_id_pointer) else {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::BindingMismatch);
+        return -1;
+    };
+    let Ok(call_id_length) = usize::try_from(call_id_length) else {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::BindingMismatch);
+        return -1;
+    };
+    if call_id_length != caller.data().call_id.as_str().len() {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::BindingMismatch);
+        return -1;
+    }
+    let Some(Extern::Memory(memory)) = caller.get_export(PLUGIN_ABI_V2_CORE_MEMORY_EXPORT) else {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::GuestRejected);
+        return -1;
+    };
+    let mut call_id_bytes = vec![0_u8; call_id_length];
+    if memory.read(&caller, call_id_pointer, &mut call_id_bytes).is_err()
+        || call_id_bytes.as_slice() != caller.data().call_id.as_str().as_bytes()
+    {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::BindingMismatch);
+        return -1;
+    }
+    if !caller.data().next_call_allowed {
+        caller.data_mut().host_failure =
+            Some(PluginInvocationErrorCodeV2::AuthorityExpansionDenied);
+        return -1;
+    }
+    if caller.data().next_call_consumed {
+        caller.data_mut().host_failure = Some(PluginInvocationErrorCodeV2::DoubleNextCall);
+        return -1;
+    }
+    caller.data_mut().next_call_consumed = true;
+    0
 }
 
 fn execute_guest_instance(
@@ -958,6 +1013,17 @@ fn validate_contract_output(
                 .map_err(|_| PluginInvocationErrorCodeV2::InvalidContractOutput)?;
             if output.role != input.role || !hook_action_allowed(output.role, output.action) {
                 return Err(PluginInvocationErrorCodeV2::AuthorityExpansionDenied);
+            }
+            let proposes_patch =
+                output.provider_request_patch.is_some() || output.tool_argument_patch.is_some();
+            if proposes_patch
+                && (input.role != RunLifecycleHookRoleV2::LimitedTransformer
+                    || output.action != RunLifecycleActionV2::Transform)
+            {
+                return Err(PluginInvocationErrorCodeV2::AuthorityExpansionDenied);
+            }
+            if output.provider_request_patch.is_some() && output.tool_argument_patch.is_some() {
+                return Err(PluginInvocationErrorCodeV2::InvalidContractOutput);
             }
         }
         ExecutablePluginContractKindV2::MemoryProvider => {

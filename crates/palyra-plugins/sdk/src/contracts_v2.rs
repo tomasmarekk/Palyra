@@ -214,6 +214,9 @@ pub struct RunLifecycleHookInvocationV2 {
     pub phase: String,
     /// Hash of the redacted host event.
     pub event_hash: PluginSchemaHashV2,
+    /// One-shot continuation capability for an execution-wrapper point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_wrapper: Option<ExecutionWrapperCapabilityV2>,
 }
 
 /// Lifecycle action proposed by a hook.
@@ -245,6 +248,73 @@ pub struct RunLifecycleHookResultV2 {
     /// Optional hash of a host-resolvable annotation or transform.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<PluginSchemaHashV2>,
+    /// Optional authority-reducing provider request patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_patch: Option<ProviderRequestPatchV2>,
+    /// Optional allowlisted tool argument patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_argument_patch: Option<ToolArgumentPatchV2>,
+}
+
+/// Authority-reducing patch proposed for a provider request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRequestPatchV2 {
+    /// Hash of the exact host-owned request revision.
+    pub base_request_hash: PluginSchemaHashV2,
+    /// Optional lower output-token ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Optional JSON-output request; the host rejects a downgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_mode: Option<bool>,
+}
+
+/// One existing top-level tool argument field to replace or remove.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolArgumentFieldPatchV2 {
+    /// Host-allowlisted existing field name.
+    pub field: String,
+    /// Bounded serialized replacement; `None` requests removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_bytes: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for ToolArgumentFieldPatchV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolArgumentFieldPatchV2")
+            .field("field", &self.field)
+            .field(
+                "replacement_bytes",
+                &self
+                    .replacement_bytes
+                    .as_ref()
+                    .map(|bytes| format_args!("<redacted:{} bytes>", bytes.len()).to_string()),
+            )
+            .finish()
+    }
+}
+
+/// Authority-preserving patch proposed for normalized tool arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolArgumentPatchV2 {
+    /// Hash of the exact normalized argument revision.
+    pub base_arguments_hash: PluginSchemaHashV2,
+    /// Deterministically ordered field changes.
+    pub fields: Vec<ToolArgumentFieldPatchV2>,
+}
+
+/// Guest-visible marker for the one-shot execution-wrapper capability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionWrapperCapabilityV2 {
+    /// Hash of the invocation identity this capability is bound to.
+    pub invocation_hash: PluginSchemaHashV2,
+    /// Always one; the host rejects a second `next-call` import.
+    pub max_next_calls: u8,
 }
 
 /// Request for candidate-only memory retrieval.
@@ -450,6 +520,17 @@ core_codec!(
         writer.u8(run_lifecycle_role_tag(value.role));
         writer.string(&value.phase)?;
         writer.hash(&value.event_hash);
+        match &value.execution_wrapper {
+            Some(capability) => {
+                if capability.max_next_calls != 1 {
+                    return Err(PluginContractCodecError::InvalidValue);
+                }
+                writer.u8(1);
+                writer.hash(&capability.invocation_hash);
+                writer.u8(capability.max_next_calls);
+            }
+            None => writer.u8(0),
+        }
         Ok(())
     },
     |reader: &mut ContractReader<'_>| {
@@ -457,6 +538,18 @@ core_codec!(
             role: decode_run_lifecycle_role(reader.u8()?)?,
             phase: reader.string()?,
             event_hash: reader.hash("event_hash")?,
+            execution_wrapper: match reader.u8()? {
+                0 => None,
+                1 => {
+                    let invocation_hash = reader.hash("invocation_hash")?;
+                    let max_next_calls = reader.u8()?;
+                    if max_next_calls != 1 {
+                        return Err(PluginContractCodecError::InvalidValue);
+                    }
+                    Some(ExecutionWrapperCapabilityV2 { invocation_hash, max_next_calls })
+                }
+                _ => return Err(PluginContractCodecError::InvalidTag),
+            },
         })
     }
 );
@@ -467,6 +560,8 @@ core_codec!(
         writer.u8(run_lifecycle_role_tag(value.role));
         writer.u8(run_lifecycle_action_tag(value.action));
         writer.optional_hash(value.artifact_hash.as_ref());
+        encode_optional_provider_request_patch(writer, value.provider_request_patch.as_ref())?;
+        encode_optional_tool_argument_patch(writer, value.tool_argument_patch.as_ref())?;
         Ok(())
     },
     |reader: &mut ContractReader<'_>| {
@@ -474,7 +569,99 @@ core_codec!(
             role: decode_run_lifecycle_role(reader.u8()?)?,
             action: decode_run_lifecycle_action(reader.u8()?)?,
             artifact_hash: reader.optional_hash("artifact_hash")?,
+            provider_request_patch: decode_optional_provider_request_patch(reader)?,
+            tool_argument_patch: decode_optional_tool_argument_patch(reader)?,
         })
+    }
+);
+
+core_codec!(
+    ProviderRequestPatchV2,
+    |writer: &mut ContractWriter, value: &ProviderRequestPatchV2| {
+        writer.hash(&value.base_request_hash);
+        match value.max_output_tokens {
+            Some(max_output_tokens) => {
+                writer.u8(1);
+                writer.u64(max_output_tokens);
+            }
+            None => writer.u8(0),
+        }
+        match value.json_mode {
+            Some(json_mode) => {
+                writer.u8(1);
+                writer.boolean(json_mode);
+            }
+            None => writer.u8(0),
+        }
+        Ok(())
+    },
+    |reader: &mut ContractReader<'_>| {
+        let base_request_hash = reader.hash("base_request_hash")?;
+        let max_output_tokens = match reader.u8()? {
+            0 => None,
+            1 => Some(reader.u64()?),
+            _ => return Err(PluginContractCodecError::InvalidTag),
+        };
+        let json_mode = match reader.u8()? {
+            0 => None,
+            1 => Some(reader.boolean()?),
+            _ => return Err(PluginContractCodecError::InvalidTag),
+        };
+        Ok(ProviderRequestPatchV2 { base_request_hash, max_output_tokens, json_mode })
+    }
+);
+
+core_codec!(
+    ToolArgumentPatchV2,
+    |writer: &mut ContractWriter, value: &ToolArgumentPatchV2| {
+        writer.hash(&value.base_arguments_hash);
+        writer.count(value.fields.len())?;
+        for field in &value.fields {
+            writer.string(&field.field)?;
+            match &field.replacement_bytes {
+                Some(bytes) => {
+                    writer.u8(1);
+                    writer.bytes(bytes)?;
+                }
+                None => writer.u8(0),
+            }
+        }
+        Ok(())
+    },
+    |reader: &mut ContractReader<'_>| {
+        let base_arguments_hash = reader.hash("base_arguments_hash")?;
+        let field_count = reader.count()?;
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            let field = reader.string()?;
+            let replacement_bytes = match reader.u8()? {
+                0 => None,
+                1 => Some(reader.bytes()?),
+                _ => return Err(PluginContractCodecError::InvalidTag),
+            };
+            fields.push(ToolArgumentFieldPatchV2 { field, replacement_bytes });
+        }
+        Ok(ToolArgumentPatchV2 { base_arguments_hash, fields })
+    }
+);
+
+core_codec!(
+    ExecutionWrapperCapabilityV2,
+    |writer: &mut ContractWriter, value: &ExecutionWrapperCapabilityV2| {
+        if value.max_next_calls != 1 {
+            return Err(PluginContractCodecError::InvalidValue);
+        }
+        writer.hash(&value.invocation_hash);
+        writer.u8(value.max_next_calls);
+        Ok(())
+    },
+    |reader: &mut ContractReader<'_>| {
+        let invocation_hash = reader.hash("invocation_hash")?;
+        let max_next_calls = reader.u8()?;
+        if max_next_calls != 1 {
+            return Err(PluginContractCodecError::InvalidValue);
+        }
+        Ok(ExecutionWrapperCapabilityV2 { invocation_hash, max_next_calls })
     }
 );
 
@@ -545,6 +732,104 @@ core_codec!(
         Ok(ModelAuthProviderResultV2 { credential_handle: reader.capability_handle()? })
     }
 );
+
+fn encode_optional_provider_request_patch(
+    writer: &mut ContractWriter,
+    patch: Option<&ProviderRequestPatchV2>,
+) -> Result<(), PluginContractCodecError> {
+    let Some(patch) = patch else {
+        writer.u8(0);
+        return Ok(());
+    };
+    writer.u8(1);
+    writer.hash(&patch.base_request_hash);
+    match patch.max_output_tokens {
+        Some(value) => {
+            writer.u8(1);
+            writer.u64(value);
+        }
+        None => writer.u8(0),
+    }
+    match patch.json_mode {
+        Some(value) => {
+            writer.u8(1);
+            writer.boolean(value);
+        }
+        None => writer.u8(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_provider_request_patch(
+    reader: &mut ContractReader<'_>,
+) -> Result<Option<ProviderRequestPatchV2>, PluginContractCodecError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => {
+            let base_request_hash = reader.hash("base_request_hash")?;
+            let max_output_tokens = match reader.u8()? {
+                0 => None,
+                1 => Some(reader.u64()?),
+                _ => return Err(PluginContractCodecError::InvalidTag),
+            };
+            let json_mode = match reader.u8()? {
+                0 => None,
+                1 => Some(reader.boolean()?),
+                _ => return Err(PluginContractCodecError::InvalidTag),
+            };
+            Ok(Some(ProviderRequestPatchV2 { base_request_hash, max_output_tokens, json_mode }))
+        }
+        _ => Err(PluginContractCodecError::InvalidTag),
+    }
+}
+
+fn encode_optional_tool_argument_patch(
+    writer: &mut ContractWriter,
+    patch: Option<&ToolArgumentPatchV2>,
+) -> Result<(), PluginContractCodecError> {
+    let Some(patch) = patch else {
+        writer.u8(0);
+        return Ok(());
+    };
+    writer.u8(1);
+    writer.hash(&patch.base_arguments_hash);
+    writer.count(patch.fields.len())?;
+    for field in &patch.fields {
+        writer.string(&field.field)?;
+        match &field.replacement_bytes {
+            Some(bytes) => {
+                writer.u8(1);
+                writer.bytes(bytes)?;
+            }
+            None => writer.u8(0),
+        }
+    }
+    Ok(())
+}
+
+fn decode_optional_tool_argument_patch(
+    reader: &mut ContractReader<'_>,
+) -> Result<Option<ToolArgumentPatchV2>, PluginContractCodecError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => {
+            let base_arguments_hash = reader.hash("base_arguments_hash")?;
+            let count = reader.count()?;
+            let mut fields = Vec::with_capacity(count);
+            for _ in 0..count {
+                let field = reader.string()?;
+                let replacement_bytes = match reader.u8()? {
+                    0 => None,
+                    1 => Some(reader.bytes()?),
+                    _ => return Err(PluginContractCodecError::InvalidTag),
+                };
+                fields.push(ToolArgumentFieldPatchV2 { field, replacement_bytes });
+            }
+            Ok(Some(ToolArgumentPatchV2 { base_arguments_hash, fields }))
+        }
+        _ => Err(PluginContractCodecError::InvalidTag),
+    }
+}
 
 #[derive(Default)]
 struct ContractWriter {
@@ -879,7 +1164,9 @@ fn decode_capability_scope(value: u8) -> Result<PluginCapabilityScopeV2, PluginC
 mod codec_tests {
     use super::{
         AgentHarnessInvocationV2, ContextEngineResultV2, ContextSegmentCandidateV2,
-        ModelAuthProviderResultV2, PluginContractCodecError,
+        ExecutionWrapperCapabilityV2, ModelAuthProviderResultV2, PluginContractCodecError,
+        ProviderRequestPatchV2, RunLifecycleActionV2, RunLifecycleHookResultV2,
+        RunLifecycleHookRoleV2, ToolArgumentFieldPatchV2, ToolArgumentPatchV2,
     };
     use crate::{
         PluginCapabilityHandleIdV2, PluginCapabilityHandleV2, PluginCapabilityScopeV2,
@@ -936,5 +1223,66 @@ mod codec_tests {
             AgentHarnessInvocationV2::decode_core_bytes(&encoded),
             Err(PluginContractCodecError::TrailingBytes)
         );
+    }
+
+    #[test]
+    fn middleware_patch_codecs_round_trip_without_raw_diagnostics() {
+        let provider_patch = ProviderRequestPatchV2 {
+            base_request_hash: hash('d'),
+            max_output_tokens: Some(128),
+            json_mode: Some(true),
+        };
+        let encoded = provider_patch.encode_core_bytes().expect("provider patch should encode");
+        assert_eq!(
+            ProviderRequestPatchV2::decode_core_bytes(&encoded)
+                .expect("provider patch should decode"),
+            provider_patch
+        );
+
+        let tool_patch = ToolArgumentPatchV2 {
+            base_arguments_hash: hash('e'),
+            fields: vec![ToolArgumentFieldPatchV2 {
+                field: "query".to_owned(),
+                replacement_bytes: Some(br#"\"redacted\""#.to_vec()),
+            }],
+        };
+        let encoded = tool_patch.encode_core_bytes().expect("tool patch should encode");
+        assert_eq!(
+            ToolArgumentPatchV2::decode_core_bytes(&encoded).expect("tool patch should decode"),
+            tool_patch
+        );
+        let debug = format!("{tool_patch:?}");
+        assert!(debug.contains("<redacted:"));
+        assert!(!debug.contains("\\\"redacted\\\""));
+
+        let lifecycle_result = RunLifecycleHookResultV2 {
+            role: RunLifecycleHookRoleV2::LimitedTransformer,
+            action: RunLifecycleActionV2::Transform,
+            artifact_hash: None,
+            provider_request_patch: Some(provider_patch),
+            tool_argument_patch: None,
+        };
+        let encoded = lifecycle_result.encode_core_bytes().expect("lifecycle patch should encode");
+        assert_eq!(
+            RunLifecycleHookResultV2::decode_core_bytes(&encoded)
+                .expect("lifecycle patch should decode"),
+            lifecycle_result
+        );
+    }
+
+    #[test]
+    fn execution_wrapper_capability_is_fixed_to_one_next_call() {
+        let capability =
+            ExecutionWrapperCapabilityV2 { invocation_hash: hash('f'), max_next_calls: 1 };
+        let encoded = capability.encode_core_bytes().expect("capability should encode");
+        assert_eq!(
+            ExecutionWrapperCapabilityV2::decode_core_bytes(&encoded)
+                .expect("capability should decode"),
+            capability
+        );
+
+        let invalid =
+            ExecutionWrapperCapabilityV2 { invocation_hash: hash('f'), max_next_calls: 2 };
+        assert_eq!(invalid.encode_core_bytes(), Err(PluginContractCodecError::InvalidValue));
     }
 }

@@ -829,7 +829,7 @@
         }
       ]
     },
-    "changelog_note": "Agent hooks define stable hook names, default redaction, capability grants, timeouts, priorities, and decision shapes.",
+    "changelog_note": "Agent hooks define stable hook names, typed production invocation points, default redaction, capability grants, timeouts, priorities, and decision shapes.",
     "decision_authority": {
       "changelog_note": "Hook authority distinguishes observe-only hooks from hooks that may affect control flow.",
       "name": "AgentHookDecisionAuthority",
@@ -1709,9 +1709,9 @@
         }
       ]
     },
-    "snapshot_version": "runtime-contracts.agent_hooks.v1"
+    "snapshot_version": "runtime-contracts.agent_hooks.v2"
   },
-  "changelog_note": "Adds exact session-queue delivery boundaries, terminal lifecycle evidence, and interrupt-specific cancellation classification.",
+  "changelog_note": "Adds typed authority-reducing middleware patches, one-shot execution wrappers, a complete invocation map, and bounded redacted invocation traces.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -4680,7 +4680,7 @@
     },
     "snapshot_version": "runtime-contracts.shared_runtime.v4"
   },
-  "snapshot_version": "runtime-contracts.v15",
+  "snapshot_version": "runtime-contracts.v16",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [
@@ -4829,5 +4829,331 @@
       ]
     },
     "snapshot_version": "runtime-contracts.tool_result_projection.v1"
+  },
+  "typed_middleware": {
+    "authority_increase_allowed": false,
+    "changelog_note": "Typed provider and tool patches can only reduce authority, execution wrappers consume next at most once, and durable traces retain bounded hash-only diffs.",
+    "execution_wrapper_next_calls": 1,
+    "failure_modes": [
+      {
+        "canonical": "fail_open",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "fail_closed",
+        "deprecated_aliases": []
+      }
+    ],
+    "invocation_map": [
+      {
+        "failure_mode": "fail_closed",
+        "hook": "run:before_run",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "run.admission"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "run:before_tool",
+        "patch_kind": "tool_arguments",
+        "role": "transformer",
+        "runtime_stage": "tool.request"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "run:after_tool",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "tool.result"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "run:before_delivery",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "delivery.request"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "run:after_run",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "run.terminal"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_model_resolve",
+        "patch_kind": "provider_request",
+        "role": "reducer",
+        "runtime_stage": "provider.resolve"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_prompt_build",
+        "patch_kind": "provider_request",
+        "role": "reducer",
+        "runtime_stage": "provider.prompt_build"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_agent_run",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "agent.run"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "before_agent_reply",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "agent.reply"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_agent_finalize",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "agent.finalize"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "agent_end",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "agent.end"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "model_call_started",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "provider.execution.started"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "model_call_ended",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "provider.execution.ended"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_tool_call",
+        "patch_kind": "tool_arguments",
+        "role": "execution_wrapper",
+        "runtime_stage": "tool.execution.started"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "after_tool_call",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "tool.execution.ended"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "inbound_claim",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "message.inbound_claim"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_message_write",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "message.persist"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "message_sending",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "message.send"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "reply_payload_sending",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "reply.send"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "reply_dispatch",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "reply.dispatched"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "session_start",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "session.started"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "session_end",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "session.ended"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_reset",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "session.reset"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_compaction",
+        "patch_kind": "none",
+        "role": "blocker",
+        "runtime_stage": "session.compaction.started"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "after_compaction",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "session.compaction.ended"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "subagent_spawned",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "subagent.started"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "subagent_ended",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "subagent.ended"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "before_tool_result_project",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "tool_result.project"
+      },
+      {
+        "failure_mode": "fail_open",
+        "hook": "tool_result_projected",
+        "patch_kind": "none",
+        "role": "observer",
+        "runtime_stage": "tool_result.projected"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "tool_result_persist",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "tool_result.persist"
+      },
+      {
+        "failure_mode": "fail_closed",
+        "hook": "tool_result_model_feed",
+        "patch_kind": "none",
+        "role": "transformer",
+        "runtime_stage": "tool_result.model_feed"
+      }
+    ],
+    "outcomes": [
+      {
+        "canonical": "applied",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "observed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "no_change",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "blocked",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "failed_open",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "failed_closed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "timed_out",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "panicked",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "conflict",
+        "deprecated_aliases": []
+      }
+    ],
+    "patch_kinds": [
+      {
+        "canonical": "none",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "provider_request",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "tool_arguments",
+        "deprecated_aliases": []
+      }
+    ],
+    "policy_revalidation_required": true,
+    "provider_request_patch_fields": [
+      "schema_version",
+      "base_request_sha256",
+      "max_output_tokens",
+      "json_mode"
+    ],
+    "roles": [
+      {
+        "canonical": "observer",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "reducer",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "blocker",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "transformer",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "execution_wrapper",
+        "deprecated_aliases": []
+      }
+    ],
+    "schema_revalidation_required": true,
+    "schema_version": 1,
+    "snapshot_version": "runtime-contracts.typed_middleware.v1",
+    "tool_argument_patch_fields": [
+      "schema_version",
+      "base_arguments_sha256",
+      "set_fields",
+      "remove_fields"
+    ],
+    "trace_max_applied_diffs": 16,
+    "trace_raw_payload_allowed": false
   }
 }

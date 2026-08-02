@@ -35,7 +35,7 @@ $drill = Read-RepoJson -RelativePath $DrillFixturePath
 
 if ($pack.schema_version -ne 1 -or
     $pack.contract_id -ne "palyra.stable-core-evidence.v1" -or
-    $pack.runtime_contract_version -ne "runtime-contracts.v15") {
+    $pack.runtime_contract_version -ne "runtime-contracts.v16") {
     throw "stable core evidence contract identity is invalid"
 }
 

@@ -22,6 +22,8 @@ pub const PLUGIN_ABI_V2_HOST_IMPORT_MODULE: &str = "palyra:plugins/abi-v2@2";
 pub const PLUGIN_ABI_V2_EMIT_EVENT_IMPORT: &str = "emit-event";
 /// Host import used by guests to observe cooperative cancellation.
 pub const PLUGIN_ABI_V2_IS_CANCELLED_IMPORT: &str = "is-cancelled";
+/// Host import that consumes the execution wrapper's one-shot continuation.
+pub const PLUGIN_ABI_V2_NEXT_CALL_IMPORT: &str = "next-call";
 /// Required guest linear-memory export.
 pub const PLUGIN_ABI_V2_CORE_MEMORY_EXPORT: &str = "memory";
 /// Required guest allocator export.
@@ -449,10 +451,10 @@ pub fn executable_plugin_contract_schema_v2(
             "b97e31bb6cae139a1bb65b5f98b13121a6fb26a154043cd8b17bd93574412b0e",
         ),
         ExecutablePluginContractKindV2::RunLifecycleHook => (
-            "palyra.plugin.run_lifecycle_hook.invocation.v2",
-            "e8baac369785d0c7723245398c00cad3235aee1821063ac903d0b8d4b83481ad",
-            "palyra.plugin.run_lifecycle_hook.result.v2",
-            "682d457aefda8c8187fd154dcdf1fb2dba0eb90509ac680425efd444b397b601",
+            "palyra.plugin.run_lifecycle_hook.invocation.v3",
+            "257248a8d25e7084354c91f5b57eceb19d1c311505ade4b2e9d3f210c5884fe7",
+            "palyra.plugin.run_lifecycle_hook.result.v3",
+            "29ccf1e2d68c992fd9db0c43bd74d3534a49e981d8fad054be4caa9dc64b0a0e",
         ),
         ExecutablePluginContractKindV2::MemoryProvider => (
             "palyra.plugin.memory_provider.invocation.v2",
@@ -727,6 +729,8 @@ pub enum PluginInvocationErrorCodeV2 {
     InvalidContractOutput,
     /// Guest attempted to expand or misrepresent host authority.
     AuthorityExpansionDenied,
+    /// An execution wrapper attempted to invoke its continuation more than once.
+    DoubleNextCall,
     /// Invocation was cooperatively cancelled.
     Cancelled,
     /// Binding was disposed during lifecycle cleanup.
@@ -755,6 +759,7 @@ impl PluginInvocationErrorCodeV2 {
             Self::ResourceLimitExceeded => "plugin.resource_limit.exceeded",
             Self::InvalidContractOutput => "plugin.contract_output.invalid",
             Self::AuthorityExpansionDenied => "plugin.authority_expansion.denied",
+            Self::DoubleNextCall => "plugin.execution_wrapper.double_next",
             Self::Cancelled => "plugin.invocation.cancelled",
             Self::Disposed => "plugin.binding.disposed",
             Self::Quarantined => "plugin.binding.quarantined",
@@ -1200,6 +1205,9 @@ mod tests {
         assert!(WIT_SOURCE_V2.contains("world model-auth-provider-plugin-v2"));
         assert!(WIT_SOURCE_V2.contains("candidate"));
         assert!(WIT_SOURCE_V2.contains("credential-handle"));
+        assert!(WIT_SOURCE_V2.contains("provider-request-patch"));
+        assert!(WIT_SOURCE_V2.contains("tool-argument-patch"));
+        assert!(WIT_SOURCE_V2.contains("next-call: func"));
         assert!(WIT_SOURCE_V2.contains("migrate"));
         assert_eq!(PLUGIN_ABI_V2_VERSION, "palyra.plugins.sdk.abi.v2");
     }

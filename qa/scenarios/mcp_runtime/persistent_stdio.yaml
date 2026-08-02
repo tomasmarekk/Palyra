@@ -53,7 +53,7 @@ expect:
     - name: mcp.conformance.inspect
       min_count: 2
   runtime_path:
-    runtime_contract_version: runtime-contracts.v15
+    runtime_contract_version: runtime-contracts.v16
     provider_lane: fixture
     attempt_owner: embedded_run_stream
     harness_id: embedded_run_stream

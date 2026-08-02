@@ -16,7 +16,7 @@ use crate::{
 };
 
 const LEGACY_RETIREMENT_SCHEMA_VERSION: u32 = 1;
-const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v15";
+const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v16";
 const REQUIRED_RETIRED_GENERATION_FLAGS: [&str; 6] = [
     "feature_rollouts.context_engine",
     "feature_rollouts.provider_stream_normalizer",

@@ -16,8 +16,8 @@ use std::{
 };
 
 use palyra_common::runtime_contracts::{
-    RuntimeIdempotencyClass, SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision,
-    ToolResultVisibility,
+    ExecutionWrapperCapability, RuntimeIdempotencyClass, SideEffectFenceState, SideEffectFenceV1,
+    SideEffectRetryDecision, ToolResultVisibility,
 };
 use serde_json::json;
 use tonic::Status;
@@ -161,7 +161,8 @@ pub(crate) async fn process_route_tool_proposal_event(
         )
         .await;
     }
-    let (execution_tool_name, execution_input_json) = if tool_name == TOOL_CATALOG_INVOKE_TOOL_NAME
+    let (execution_tool_name, mut execution_input_json) = if tool_name
+        == TOOL_CATALOG_INVOKE_TOOL_NAME
     {
         let target = match resolve_catalog_invoke_target(
             tool_catalog_snapshot,
@@ -257,6 +258,17 @@ pub(crate) async fn process_route_tool_proposal_event(
     } else {
         (tool_name.to_owned(), normalized_input_json)
     };
+    execution_input_json =
+        crate::application::run_stream::tool_flow::dispatch_tool_argument_patch_if_enabled(
+            runtime_state,
+            run_id,
+            proposal_id,
+            execution_tool_name.as_str(),
+            execution_input_json.as_slice(),
+            tool_catalog_snapshot,
+            tape_seq,
+        )
+        .await?;
     let tool_name = execution_tool_name.as_str();
     let input_json = execution_input_json.as_slice();
     let replay_safety_class = tool_catalog_snapshot
@@ -359,6 +371,15 @@ pub(crate) async fn process_route_tool_proposal_event(
         if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
             return Err(Status::cancelled(crate::gateway::CANCELLED_REASON));
         }
+        let mut execution_wrapper = ExecutionWrapperCapability::new(crate::sha256_hex(
+            format!("route-tool-wrapper-v1\0{run_id}\0{proposal_id}").as_bytes(),
+        ));
+        execution_wrapper.next_call().map_err(|error| {
+            Status::failed_precondition(format!(
+                "route tool execution wrapper rejected continuation {}: {}",
+                error.code, error.message
+            ))
+        })?;
         runtime_state.record_tool_execution_attempt();
         let started_at = Instant::now();
         let execution_timeout = route_tool_execution_timeout(runtime_state, tool_name);

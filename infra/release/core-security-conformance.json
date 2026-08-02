@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "runtime_contract_version": "runtime-contracts.v15",
+  "runtime_contract_version": "runtime-contracts.v16",
   "as_of": "2026-08-02",
   "attack_corpus_ref": "fixtures/security/critical_attack_scenarios.json",
   "suites": [

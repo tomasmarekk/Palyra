@@ -58,7 +58,7 @@ expect:
       max_count: 1
       success: false
   runtime_path:
-    runtime_contract_version: runtime-contracts.v15
+    runtime_contract_version: runtime-contracts.v16
     provider_lane: fixture
     attempt_owner: runtime_kernel_v2.embedded
     harness_id: runtime_kernel_v2.embedded

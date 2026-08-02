@@ -5,30 +5,47 @@
 //! (continue, annotate, request approval, block, transform preview, fail). A terminal lifecycle
 //! resolution is surfaced as a dispatch error so the calling run path stops fail-closed.
 
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use palyra_common::{
     runtime_contracts::{
-        resolve_run_lifecycle_hook_decisions, AgentHookKind, RunLifecycleHookDecision,
-        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecycleHookResolution,
+        hook_invocation_map_entry, resolve_provider_request_patches,
+        resolve_run_lifecycle_hook_decisions, resolve_tool_argument_patches, AgentHookKind,
+        HookFailureMode, HookInvocationOutcome, HookInvocationTrace, HookPatchKind,
+        ProviderRequestPatch, RunLifecycleHookDecision, RunLifecycleHookDecisionKind,
+        RunLifecycleHookPhase, RunLifecycleHookResolution, ToolArgumentPatch,
     },
     versioned_json::{
         migrate_updated_at_metadata_v0_to_v1, parse_versioned_json, VersionedJsonFormat,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
+
+use palyra_plugins_runtime::TypedPluginContractStatus;
+use palyra_plugins_sdk::{
+    RunLifecycleActionV2, RunLifecycleHookResultV2, RunLifecycleHookRoleV2, TypedPluginContractKind,
+};
 
 use crate::{
     gateway::GatewayRuntimeState,
     journal::{JournalEventRecord, SkillExecutionStatus},
     plugins::{
-        load_plugin_bindings_index, plugin_binding, resolve_plugins_root, PluginBindingRecord,
+        invoke_typed_run_lifecycle_hook, load_plugin_bindings_index, plugin_binding,
+        resolve_plugins_root, PluginBindingRecord,
     },
     transport::grpc::auth::RequestContext,
-    wasm_plugin_runner::{resolve_installed_skill_module, run_resolved_wasm_plugin},
+    wasm_plugin_runner::{
+        resolve_installed_skill_module, run_resolved_wasm_plugin, ResolvedInstalledSkillModule,
+    },
     *,
 };
 
@@ -164,6 +181,8 @@ pub(crate) struct HookDispatchOutcome {
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) output_json: Value,
+    pub(crate) duration_ms: u64,
+    pub(crate) invocation_outcome: HookInvocationOutcome,
 }
 
 /// Hook dispatch report used by inline run-stream call sites.
@@ -171,6 +190,9 @@ pub(crate) struct HookDispatchOutcome {
 pub(crate) struct HookDispatchReport {
     pub(crate) outcomes: Vec<HookDispatchOutcome>,
     pub(crate) lifecycle_resolution: Option<RunLifecycleHookResolution>,
+    pub(crate) provider_request_patch: Option<ProviderRequestPatch>,
+    pub(crate) tool_argument_patch: Option<ToolArgumentPatch>,
+    pub(crate) invocation_traces: Vec<HookInvocationTrace>,
 }
 
 /// Redacted event envelope passed to constrained plugin hooks.
@@ -632,6 +654,8 @@ pub(crate) async fn dispatch_named_event_with_report(
     event_payload: Value,
 ) -> Result<HookDispatchReport> {
     let lifecycle_phase = RunLifecycleHookPhase::parse_hook_event(event);
+    let hook_kind = AgentHookKind::parse(event);
+    let invocation_map = hook_kind.and_then(hook_invocation_map_entry);
     let event_envelope =
         serde_json::to_value(build_redacted_hook_event_envelope(event, event_payload.clone())?)
             .unwrap_or_else(|_| json!({}));
@@ -641,16 +665,19 @@ pub(crate) async fn dispatch_named_event_with_report(
     let plugins_index = load_plugin_bindings_index(plugins_root.as_path())?;
     let mut outcomes = Vec::new();
     let mut lifecycle_decisions = Vec::new();
+    let mut dispatch_failures = Vec::new();
 
     // The index is persisted sorted by hook_id, so hooks for the same event always run in a
     // deterministic order; lifecycle decision resolution depends on that stability.
     for hook in
         hooks_index.entries.into_iter().filter(|entry| entry.enabled && entry.event == event)
     {
+        let started_at = Instant::now();
         let plugin = match plugin_binding(&plugins_index, hook.plugin_id.as_str()) {
             Ok(plugin) if plugin.enabled => plugin,
             Ok(plugin) => {
                 let message = "plugin binding is disabled".to_owned();
+                dispatch_failures.push(message.clone());
                 record_hook_event(
                     Arc::clone(&runtime),
                     "hook.failed",
@@ -659,7 +686,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                     json!({
                         "event": event,
                         "reason": message,
-                        "event_payload": event_payload,
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -670,10 +696,14 @@ pub(crate) async fn dispatch_named_event_with_report(
                     success: false,
                     error: Some(message),
                     output_json: json!({}),
+                    duration_ms: elapsed_millis(started_at),
+                    invocation_outcome: HookInvocationOutcome::FailedClosed,
                 });
                 continue;
             }
             Err(error) => {
+                let message = sanitize_http_error_message(error.to_string().as_str());
+                dispatch_failures.push(message.clone());
                 record_hook_event(
                     Arc::clone(&runtime),
                     "hook.failed",
@@ -681,8 +711,7 @@ pub(crate) async fn dispatch_named_event_with_report(
                     None,
                     json!({
                         "event": event,
-                        "reason": sanitize_http_error_message(error.to_string().as_str()),
-                        "event_payload": event_payload,
+                        "reason": message,
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -701,6 +730,7 @@ pub(crate) async fn dispatch_named_event_with_report(
             Ok(resolved) => resolved,
             Err(error) => {
                 let message = sanitize_http_error_message(error.message.as_str());
+                dispatch_failures.push(message.clone());
                 record_hook_event(
                     Arc::clone(&runtime),
                     "hook.failed",
@@ -709,7 +739,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                     json!({
                         "event": event,
                         "reason": message,
-                        "event_payload": event_payload,
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -720,6 +749,8 @@ pub(crate) async fn dispatch_named_event_with_report(
                     success: false,
                     error: Some(message),
                     output_json: json!({}),
+                    duration_ms: elapsed_millis(started_at),
+                    invocation_outcome: HookInvocationOutcome::FailedClosed,
                 });
                 continue;
             }
@@ -746,6 +777,7 @@ pub(crate) async fn dispatch_named_event_with_report(
                 })
                 .unwrap_or("skill is unavailable")
                 .to_owned();
+            dispatch_failures.push(message.clone());
             record_hook_event(
                 Arc::clone(&runtime),
                 "hook.failed",
@@ -756,7 +788,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                     "reason": message,
                     "skill_id": resolved.skill_id,
                     "skill_version": resolved.skill_version,
-                    "event_payload": event_payload,
                     "event_envelope": event_envelope.clone(),
                 }),
             )
@@ -767,25 +798,28 @@ pub(crate) async fn dispatch_named_event_with_report(
                 success: false,
                 error: Some(message),
                 output_json: json!({}),
+                duration_ms: elapsed_millis(started_at),
+                invocation_outcome: HookInvocationOutcome::FailedClosed,
             });
             continue;
         }
 
-        // Run-lifecycle hooks execute with no requested capabilities: a plugin sitting on the
-        // run path only returns a decision and must not gain its full capability profile there.
-        let requested_capabilities = if lifecycle_phase.is_some() {
-            crate::wasm_plugin_runner::WasmPluginRequestedCapabilities::default()
-        } else {
-            plugin.capability_profile.to_requested_capabilities()
-        };
-        match run_resolved_wasm_plugin(policy, &resolved, requested_capabilities, execution_timeout)
-        {
-            Ok(success) => {
-                let mut output_json =
-                    serde_json::from_slice::<Value>(success.output_json.as_slice())
-                        .unwrap_or_else(|_| json!({}));
+        let event_sha256 =
+            crate::sha256_hex(serde_json::to_vec(&event_envelope).unwrap_or_default().as_slice());
+        match run_hook_plugin(
+            policy,
+            &resolved,
+            &plugin,
+            event,
+            event_sha256.as_str(),
+            invocation_map,
+            lifecycle_phase.is_some(),
+            execution_timeout,
+        ) {
+            Ok(mut output_json) => {
                 if let Err(error) = validate_hook_output_authority(&output_json) {
                     let message = sanitize_http_error_message(error.to_string().as_str());
+                    dispatch_failures.push(message.clone());
                     record_hook_event(
                         Arc::clone(&runtime),
                         "hook.failed",
@@ -796,7 +830,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                             "skill_id": resolved.skill_id,
                             "skill_version": resolved.skill_version,
                             "reason": message,
-                            "event_payload": event_payload,
                             "event_envelope": event_envelope.clone(),
                         }),
                     )
@@ -807,8 +840,39 @@ pub(crate) async fn dispatch_named_event_with_report(
                         success: false,
                         error: Some(message),
                         output_json: json!({}),
+                        duration_ms: elapsed_millis(started_at),
+                        invocation_outcome: HookInvocationOutcome::FailedClosed,
                     });
                     continue;
+                }
+                if lifecycle_phase.is_none() {
+                    if let Err(message) =
+                        enforce_middleware_control_output(invocation_map, &output_json)
+                    {
+                        dispatch_failures.push(message.clone());
+                        record_hook_event(
+                            Arc::clone(&runtime),
+                            "hook.blocked",
+                            &hook,
+                            Some(&plugin),
+                            json!({
+                                "event": event,
+                                "reason": message,
+                                "event_envelope": event_envelope.clone(),
+                            }),
+                        )
+                        .await;
+                        outcomes.push(HookDispatchOutcome {
+                            hook,
+                            plugin,
+                            success: false,
+                            error: Some(message),
+                            output_json: json!({}),
+                            duration_ms: elapsed_millis(started_at),
+                            invocation_outcome: HookInvocationOutcome::Blocked,
+                        });
+                        continue;
+                    }
                 }
                 if let Some(phase) = lifecycle_phase {
                     let decision =
@@ -819,6 +883,7 @@ pub(crate) async fn dispatch_named_event_with_report(
                             decision.kind.as_str(),
                             phase.as_str()
                         );
+                        dispatch_failures.push(message.clone());
                         record_hook_event(
                             Arc::clone(&runtime),
                             "hook.failed",
@@ -830,7 +895,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                                 "skill_version": resolved.skill_version,
                                 "reason": message,
                                 "decision": decision,
-                                "event_payload": event_payload,
                                 "event_envelope": event_envelope.clone(),
                             }),
                         )
@@ -841,6 +905,8 @@ pub(crate) async fn dispatch_named_event_with_report(
                             success: false,
                             error: Some(message),
                             output_json: json!({}),
+                            duration_ms: elapsed_millis(started_at),
+                            invocation_outcome: HookInvocationOutcome::FailedClosed,
                         });
                         continue;
                     }
@@ -858,8 +924,9 @@ pub(crate) async fn dispatch_named_event_with_report(
                         "skill_version": resolved.skill_version,
                         "module_path": resolved.module_path,
                         "entrypoint": resolved.entrypoint,
-                        "output": output_json,
-                        "event_payload": event_payload,
+                        "output_sha256": crate::sha256_hex(
+                            serde_json::to_vec(&output_json).unwrap_or_default().as_slice()
+                        ),
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -870,10 +937,13 @@ pub(crate) async fn dispatch_named_event_with_report(
                     success: true,
                     error: None,
                     output_json,
+                    duration_ms: elapsed_millis(started_at),
+                    invocation_outcome: HookInvocationOutcome::NoChange,
                 });
             }
             Err(error) => {
                 let message = sanitize_http_error_message(error.message.as_str());
+                dispatch_failures.push(message.clone());
                 record_hook_event(
                     Arc::clone(&runtime),
                     "hook.failed",
@@ -884,7 +954,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                         "skill_id": resolved.skill_id,
                         "skill_version": resolved.skill_version,
                         "reason": message,
-                        "event_payload": event_payload,
                         "event_envelope": event_envelope.clone(),
                     }),
                 )
@@ -895,9 +964,77 @@ pub(crate) async fn dispatch_named_event_with_report(
                     success: false,
                     error: Some(message),
                     output_json: json!({}),
+                    duration_ms: elapsed_millis(started_at),
+                    invocation_outcome: error.outcome,
                 });
             }
         }
+    }
+
+    let (provider_request_patch, tool_argument_patch) =
+        match resolve_dispatch_middleware_patches(invocation_map, &outcomes) {
+            Ok(patches) => patches,
+            Err(error) => {
+                dispatch_failures.push(error.to_string());
+                (None, None)
+            }
+        };
+    let invocation_traces = hook_kind.map_or_else(Vec::new, |kind| {
+        outcomes
+            .iter()
+            .enumerate()
+            .map(|(order, outcome)| {
+                let invocation_outcome = if outcome.success
+                    && invocation_map.is_some_and(|entry| {
+                        entry.role == palyra_common::runtime_contracts::HookMiddlewareRole::Observer
+                    }) {
+                    HookInvocationOutcome::Observed
+                } else if !outcome.success
+                    && invocation_map
+                        .is_some_and(|entry| entry.failure_mode == HookFailureMode::FailOpen)
+                    && !matches!(
+                        outcome.invocation_outcome,
+                        HookInvocationOutcome::TimedOut | HookInvocationOutcome::Panicked
+                    )
+                {
+                    HookInvocationOutcome::FailedOpen
+                } else {
+                    outcome.invocation_outcome
+                };
+                HookInvocationTrace::new(
+                    crate::sha256_hex(
+                        format!(
+                            "hook-invocation-v1\0{event}\0{}\0{}\0{order}",
+                            outcome.hook.hook_id, outcome.plugin.plugin_id
+                        )
+                        .as_bytes(),
+                    ),
+                    kind,
+                    u16::try_from(order).unwrap_or(u16::MAX),
+                    outcome.duration_ms,
+                    invocation_outcome,
+                    Vec::new(),
+                    hook_invocation_reason_code(invocation_outcome),
+                )
+            })
+            .collect()
+    });
+
+    for (outcome, trace) in outcomes.iter().zip(invocation_traces.iter()) {
+        record_hook_event(
+            Arc::clone(&runtime),
+            "hook.invocation.trace",
+            &outcome.hook,
+            Some(&outcome.plugin),
+            json!({ "trace": trace }),
+        )
+        .await;
+    }
+
+    if invocation_map.is_some_and(|entry| entry.failure_mode == HookFailureMode::FailClosed)
+        && !dispatch_failures.is_empty()
+    {
+        bail!("fail-closed hook dispatch for {event} failed: {}", dispatch_failures[0]);
     }
 
     let mut lifecycle_resolution = None;
@@ -915,7 +1052,6 @@ pub(crate) async fn dispatch_named_event_with_report(
                 json!({
                     "event": event,
                     "resolution": resolution,
-                    "event_payload": event_payload,
                     "event_envelope": event_envelope,
                 }),
             )
@@ -924,7 +1060,276 @@ pub(crate) async fn dispatch_named_event_with_report(
         lifecycle_resolution = Some(resolution);
     }
 
-    Ok(HookDispatchReport { outcomes, lifecycle_resolution })
+    Ok(HookDispatchReport {
+        outcomes,
+        lifecycle_resolution,
+        provider_request_patch,
+        tool_argument_patch,
+        invocation_traces,
+    })
+}
+
+struct HookPluginRunError {
+    message: String,
+    outcome: HookInvocationOutcome,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hook_plugin(
+    policy: &crate::wasm_plugin_runner::WasmPluginRunnerPolicy,
+    resolved: &ResolvedInstalledSkillModule,
+    plugin: &PluginBindingRecord,
+    event: &str,
+    event_sha256: &str,
+    invocation_map: Option<&palyra_common::runtime_contracts::HookInvocationMapEntry>,
+    lifecycle_event: bool,
+    execution_timeout: Duration,
+) -> std::result::Result<Value, HookPluginRunError> {
+    if plugin_has_typed_lifecycle_declaration(plugin)
+        && !plugin_declares_typed_lifecycle_hook(plugin)
+    {
+        return Err(HookPluginRunError {
+            message: "run_lifecycle_hook.contract_not_executable".to_owned(),
+            outcome: HookInvocationOutcome::FailedClosed,
+        });
+    }
+    if plugin_declares_typed_lifecycle_hook(plugin) {
+        let role =
+            invocation_map.map_or(RunLifecycleHookRoleV2::Observer, |entry| match entry.role {
+                palyra_common::runtime_contracts::HookMiddlewareRole::Observer => {
+                    RunLifecycleHookRoleV2::Observer
+                }
+                palyra_common::runtime_contracts::HookMiddlewareRole::Blocker => {
+                    RunLifecycleHookRoleV2::Blocker
+                }
+                palyra_common::runtime_contracts::HookMiddlewareRole::Reducer
+                | palyra_common::runtime_contracts::HookMiddlewareRole::Transformer
+                | palyra_common::runtime_contracts::HookMiddlewareRole::ExecutionWrapper => {
+                    RunLifecycleHookRoleV2::LimitedTransformer
+                }
+            });
+        let execution_wrapper = invocation_map.is_some_and(|entry| {
+            entry.role == palyra_common::runtime_contracts::HookMiddlewareRole::ExecutionWrapper
+        });
+        return invoke_typed_run_lifecycle_hook(
+            plugin,
+            policy,
+            role,
+            event,
+            event_sha256,
+            execution_wrapper,
+        )
+        .and_then(typed_lifecycle_output_json)
+        .map_err(|message| HookPluginRunError {
+            outcome: typed_hook_failure_outcome(message.as_str()),
+            message,
+        });
+    }
+
+    // Legacy lifecycle hooks retain the zero-capability posture. Non-lifecycle
+    // compatibility events keep their existing manifest-scoped grants.
+    let requested_capabilities = if lifecycle_event {
+        crate::wasm_plugin_runner::WasmPluginRequestedCapabilities::default()
+    } else {
+        plugin.capability_profile.to_requested_capabilities()
+    };
+    let success =
+        run_resolved_wasm_plugin(policy, resolved, requested_capabilities, execution_timeout)
+            .map_err(|error| HookPluginRunError {
+                message: error.message,
+                outcome: hook_run_failure_outcome(error.kind),
+            })?;
+    serde_json::from_slice::<Value>(success.output_json.as_slice()).map_err(|_| {
+        HookPluginRunError {
+            message: "hook output was not valid JSON".to_owned(),
+            outcome: HookInvocationOutcome::FailedClosed,
+        }
+    })
+}
+
+fn typed_lifecycle_output_json(
+    result: RunLifecycleHookResultV2,
+) -> std::result::Result<Value, String> {
+    let mut output = Map::new();
+    output.insert("exit_code".to_owned(), json!(typed_lifecycle_exit_code(result.action)));
+    if let Some(artifact_hash) = result.artifact_hash {
+        output.insert("artifact_sha256".to_owned(), json!(artifact_hash.as_str()));
+    }
+    if let Some(patch) = result.provider_request_patch {
+        output.insert(
+            "provider_request_patch".to_owned(),
+            json!({
+                "schema_version": 1,
+                "base_request_sha256": patch.base_request_hash.as_str(),
+                "max_output_tokens": patch.max_output_tokens,
+                "json_mode": patch.json_mode,
+            }),
+        );
+    }
+    if let Some(patch) = result.tool_argument_patch {
+        let mut set_fields = BTreeMap::new();
+        let mut remove_fields = Vec::new();
+        for field in patch.fields {
+            match field.replacement_bytes {
+                Some(bytes) => {
+                    let value = serde_json::from_slice::<Value>(bytes.as_slice())
+                        .map_err(|_| "run_lifecycle_hook.tool_patch_value_invalid".to_owned())?;
+                    if set_fields.insert(field.field, value).is_some() {
+                        return Err("run_lifecycle_hook.tool_patch_field_duplicate".to_owned());
+                    }
+                }
+                None => remove_fields.push(field.field),
+            }
+        }
+        output.insert(
+            "tool_argument_patch".to_owned(),
+            json!({
+                "schema_version": 1,
+                "base_arguments_sha256": patch.base_arguments_hash.as_str(),
+                "set_fields": set_fields,
+                "remove_fields": remove_fields,
+            }),
+        );
+    }
+    Ok(Value::Object(output))
+}
+
+const fn typed_lifecycle_exit_code(action: RunLifecycleActionV2) -> i64 {
+    match action {
+        RunLifecycleActionV2::Continue => LIFECYCLE_HOOK_EXIT_CONTINUE,
+        RunLifecycleActionV2::Annotate => LIFECYCLE_HOOK_EXIT_ANNOTATE,
+        RunLifecycleActionV2::Filter | RunLifecycleActionV2::Block => LIFECYCLE_HOOK_EXIT_BLOCK,
+        RunLifecycleActionV2::RequestApproval => LIFECYCLE_HOOK_EXIT_REQUEST_APPROVAL,
+        RunLifecycleActionV2::Transform => LIFECYCLE_HOOK_EXIT_TRANSFORM_PREVIEW,
+    }
+}
+
+fn typed_hook_failure_outcome(reason_code: &str) -> HookInvocationOutcome {
+    if reason_code.contains("deadline") || reason_code.contains("timed_out") {
+        HookInvocationOutcome::TimedOut
+    } else if reason_code.contains("trap") || reason_code.contains("runtime") {
+        HookInvocationOutcome::Panicked
+    } else {
+        HookInvocationOutcome::FailedClosed
+    }
+}
+
+fn enforce_middleware_control_output(
+    invocation_map: Option<&palyra_common::runtime_contracts::HookInvocationMapEntry>,
+    output: &Value,
+) -> std::result::Result<(), String> {
+    let Some(invocation_map) = invocation_map else {
+        return Ok(());
+    };
+    let exit_code = output.get("exit_code").and_then(Value::as_i64).unwrap_or_default();
+    if !(0..LIFECYCLE_HOOK_EXIT_FAIL_RUN).contains(&exit_code)
+        || matches!(exit_code, LIFECYCLE_HOOK_EXIT_REQUEST_APPROVAL | LIFECYCLE_HOOK_EXIT_BLOCK)
+    {
+        return Err(format!(
+            "hook {} returned terminal action code {exit_code}",
+            invocation_map.hook.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_dispatch_middleware_patches(
+    invocation_map: Option<&palyra_common::runtime_contracts::HookInvocationMapEntry>,
+    outcomes: &[HookDispatchOutcome],
+) -> Result<(Option<ProviderRequestPatch>, Option<ToolArgumentPatch>)> {
+    let mut provider_patches = Vec::new();
+    let mut tool_patches = Vec::new();
+    for outcome in outcomes.iter().filter(|outcome| outcome.success) {
+        let provider_patch = outcome.output_json.get("provider_request_patch");
+        let tool_patch = outcome.output_json.get("tool_argument_patch");
+        if provider_patch.is_none() && tool_patch.is_none() {
+            continue;
+        }
+        if !plugin_declares_typed_lifecycle_hook(&outcome.plugin) {
+            bail!(
+                "plugin {} returned typed middleware output without an accepted lifecycle contract",
+                outcome.plugin.plugin_id
+            );
+        }
+        if let Some(value) = provider_patch {
+            if invocation_map.map(|entry| entry.patch_kind) != Some(HookPatchKind::ProviderRequest)
+            {
+                bail!("provider request patch is not accepted at this hook point");
+            }
+            provider_patches.push(
+                serde_json::from_value::<ProviderRequestPatch>(value.clone())
+                    .context("invalid provider request patch")?,
+            );
+        }
+        if let Some(value) = tool_patch {
+            if invocation_map.map(|entry| entry.patch_kind) != Some(HookPatchKind::ToolArguments) {
+                bail!("tool argument patch is not accepted at this hook point");
+            }
+            tool_patches.push(
+                serde_json::from_value::<ToolArgumentPatch>(value.clone())
+                    .context("invalid tool argument patch")?,
+            );
+        }
+    }
+    let provider_patch = resolve_provider_request_patches(provider_patches.as_slice())
+        .map_err(|error| anyhow!("{}: {}", error.code, error.message))?;
+    let tool_patch = resolve_tool_argument_patches(tool_patches.as_slice())
+        .map_err(|error| anyhow!("{}: {}", error.code, error.message))?;
+    Ok((provider_patch, tool_patch))
+}
+
+fn plugin_declares_typed_lifecycle_hook(plugin: &PluginBindingRecord) -> bool {
+    plugin.typed_contracts.ready
+        && plugin.typed_contracts.entries.iter().any(|entry| {
+            entry.kind == TypedPluginContractKind::RunLifecycleHook
+                && entry.status == TypedPluginContractStatus::Accepted
+                && entry.adapter.as_deref() == Some("plugins.abi_v2.run_lifecycle_hook")
+        })
+}
+
+fn plugin_has_typed_lifecycle_declaration(plugin: &PluginBindingRecord) -> bool {
+    plugin
+        .typed_contracts
+        .entries
+        .iter()
+        .any(|entry| entry.kind == TypedPluginContractKind::RunLifecycleHook)
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn hook_run_failure_outcome(
+    kind: crate::wasm_plugin_runner::WasmPluginRunErrorKind,
+) -> HookInvocationOutcome {
+    match kind {
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::TimedOut => {
+            HookInvocationOutcome::TimedOut
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::RuntimeFailure => {
+            HookInvocationOutcome::Panicked
+        }
+        crate::wasm_plugin_runner::WasmPluginRunErrorKind::Disabled
+        | crate::wasm_plugin_runner::WasmPluginRunErrorKind::InvalidInput
+        | crate::wasm_plugin_runner::WasmPluginRunErrorKind::CapabilityDenied
+        | crate::wasm_plugin_runner::WasmPluginRunErrorKind::QuotaExceeded => {
+            HookInvocationOutcome::FailedClosed
+        }
+    }
+}
+
+fn hook_invocation_reason_code(outcome: HookInvocationOutcome) -> &'static str {
+    match outcome {
+        HookInvocationOutcome::Applied => "hook.invocation.applied",
+        HookInvocationOutcome::Observed => "hook.invocation.observed",
+        HookInvocationOutcome::NoChange => "hook.invocation.no_change",
+        HookInvocationOutcome::Blocked => "hook.invocation.blocked",
+        HookInvocationOutcome::FailedOpen => "hook.invocation.failed_open",
+        HookInvocationOutcome::FailedClosed => "hook.invocation.failed_closed",
+        HookInvocationOutcome::TimedOut => "hook.invocation.timed_out",
+        HookInvocationOutcome::Panicked => "hook.invocation.panicked",
+        HookInvocationOutcome::Conflict => "hook.invocation.conflict",
+    }
 }
 
 fn enforce_run_lifecycle_resolution(
@@ -1083,15 +1488,15 @@ mod tests {
     use std::fs;
 
     use palyra_common::runtime_contracts::{
-        resolve_run_lifecycle_hook_decisions, RunLifecycleHookDecision,
-        RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        resolve_run_lifecycle_hook_decisions, HookInvocationOutcome, RunLifecycleHookDecision,
+        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, HOOK_INVOCATION_MAP,
     };
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
         attach_lifecycle_decision, build_redacted_hook_event_envelope,
-        enforce_run_lifecycle_resolution, hook_bindings_index_path,
+        enforce_run_lifecycle_resolution, hook_bindings_index_path, hook_run_failure_outcome,
         lifecycle_decision_kind_from_exit_code, load_hook_bindings_index, normalize_hook_event,
         validate_hook_output_authority, HOOK_BINDINGS_LAYOUT_VERSION,
     };
@@ -1224,6 +1629,48 @@ mod tests {
 
         assert!(error.contains("$.approve_tool"), "{error}");
         assert!(error.contains("$.nested.mutate_historical_journal"), "{error}");
+    }
+
+    #[test]
+    fn runtime_timeout_and_panic_have_distinct_trace_outcomes() {
+        assert_eq!(
+            hook_run_failure_outcome(crate::wasm_plugin_runner::WasmPluginRunErrorKind::TimedOut),
+            HookInvocationOutcome::TimedOut
+        );
+        assert_eq!(
+            hook_run_failure_outcome(
+                crate::wasm_plugin_runner::WasmPluginRunErrorKind::RuntimeFailure
+            ),
+            HookInvocationOutcome::Panicked
+        );
+    }
+
+    #[test]
+    fn every_approved_hook_has_a_production_call_site() {
+        let production_sources = [
+            include_str!("application/run_stream/orchestration.rs"),
+            include_str!("application/run_stream/tool_flow.rs"),
+            include_str!("application/session_compaction.rs"),
+            include_str!("transport/grpc/services/gateway/service.rs"),
+        ]
+        .join("\n");
+
+        for entry in HOOK_INVOCATION_MAP {
+            let needle = match entry.hook {
+                palyra_common::runtime_contracts::AgentHookKind::RunBeforeTool => {
+                    "RunLifecycleHookPhase::BeforeTool".to_owned()
+                }
+                palyra_common::runtime_contracts::AgentHookKind::RunAfterTool => {
+                    "RunLifecycleHookPhase::AfterTool".to_owned()
+                }
+                hook => format!("AgentHookKind::{hook:?}"),
+            };
+            assert!(
+                production_sources.contains(needle.as_str()),
+                "{} has no production call site",
+                entry.hook.as_str()
+            );
+        }
     }
 
     #[test]

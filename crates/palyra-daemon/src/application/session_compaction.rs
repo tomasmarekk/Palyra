@@ -21,9 +21,13 @@ use std::sync::{Mutex, OnceLock};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
-use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
+use palyra_common::{
+    redaction::{redact_auth_error, redact_url_segments_in_text},
+    runtime_contracts::AgentHookKind,
+};
 use palyra_safety::{transform_text_for_prompt, SafetyContentKind, SafetySourceKind, TrustLabel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -971,6 +975,31 @@ pub(crate) async fn apply_session_compaction(
         });
         return Err(Status::failed_precondition(message));
     }
+    if request.runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        crate::hooks::dispatch_named_event_with_report(
+            Arc::clone(request.runtime_state),
+            &request.runtime_state.config.tool_call.wasm_runtime,
+            Duration::from_millis(request.runtime_state.config.tool_call.execution_timeout_ms),
+            AgentHookKind::BeforeCompaction.as_str(),
+            json!({
+                "schema_version": 1,
+                "session_id_sha256": crate::sha256_hex(
+                    request.session.session_id.as_bytes(),
+                ),
+                "run_id": request.run_id,
+                "mode": request.mode,
+                "source_event_count": plan.source_event_count,
+                "summary_sha256": crate::sha256_hex(plan.summary_text.as_bytes()),
+                "redaction_level": "metadata_and_hash_only",
+            }),
+        )
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "before-compaction hook rejected the durable transition: {error}"
+            ))
+        })?;
+    }
 
     let accept =
         request.accept_candidate_ids.iter().map(|value| value.as_str()).collect::<HashSet<_>>();
@@ -1245,6 +1274,35 @@ pub(crate) async fn apply_session_compaction(
             created_by_principal: request.actor_principal.to_owned(),
         })
         .await?;
+
+    if request.runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        // Compaction is already durable at this point, so the completion hook
+        // is observational and cannot retroactively roll back persisted state.
+        if let Err(error) = crate::hooks::dispatch_named_event_with_report(
+            Arc::clone(request.runtime_state),
+            &request.runtime_state.config.tool_call.wasm_runtime,
+            Duration::from_millis(request.runtime_state.config.tool_call.execution_timeout_ms),
+            AgentHookKind::AfterCompaction.as_str(),
+            json!({
+                "schema_version": 1,
+                "session_id_sha256": crate::sha256_hex(
+                    request.session.session_id.as_bytes(),
+                ),
+                "run_id": request.run_id,
+                "mode": request.mode,
+                "artifact_id_sha256": crate::sha256_hex(artifact.artifact_id.as_bytes()),
+                "summary_sha256": crate::sha256_hex(plan.summary_text.as_bytes()),
+                "redaction_level": "metadata_and_hash_only",
+            }),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                "fail-open after-compaction observer hook dispatch failed"
+            );
+        }
+    }
 
     Ok(SessionCompactionExecution {
         plan,

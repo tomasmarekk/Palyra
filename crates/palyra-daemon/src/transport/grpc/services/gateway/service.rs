@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
+use palyra_common::{
+    runtime_contracts::AgentHookKind, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
+};
 use serde_json::json;
 use tokio::{sync::mpsc, time::timeout};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -2366,6 +2368,47 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         })
                         .await;
                         let _ = sender.send(Err(error)).await;
+                    }
+                }
+                if state_for_stream.config.feature_rollouts.inline_runtime_hooks.enabled {
+                    // Terminal observer traces are journaled by the hook
+                    // dispatcher because the run tape has already closed.
+                    let delegation_ended = admission_ingress
+                        .as_ref()
+                        .is_some_and(RunStreamAdmissionIngress::is_delegation);
+                    for hook in [
+                        delegation_ended.then_some(AgentHookKind::SubagentEnded),
+                        Some(AgentHookKind::SessionEnd),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let payload = json!({
+                            "schema_version": 1,
+                            "run_id": run_id.as_str(),
+                            "session_id_sha256": active_session_id
+                                .as_deref()
+                                .map(|session_id| crate::sha256_hex(session_id.as_bytes())),
+                            "outcome": run_state.state().as_str(),
+                            "redaction_level": "metadata_only",
+                        });
+                        if let Err(error) = crate::hooks::dispatch_named_event_with_report(
+                            Arc::clone(&state_for_stream),
+                            &state_for_stream.config.tool_call.wasm_runtime,
+                            Duration::from_millis(
+                                state_for_stream.config.tool_call.execution_timeout_ms,
+                            ),
+                            hook.as_str(),
+                            payload,
+                        )
+                        .await
+                        {
+                            warn!(
+                                hook = hook.as_str(),
+                                error = %error,
+                                "fail-open terminal observer hook dispatch failed"
+                            );
+                        }
                     }
                 }
             }

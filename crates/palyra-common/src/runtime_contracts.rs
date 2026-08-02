@@ -115,6 +115,7 @@ mod generation;
 mod handles;
 mod health;
 mod identities;
+mod middleware;
 mod session_operations;
 mod side_effects;
 
@@ -126,6 +127,7 @@ pub use generation::*;
 pub use handles::*;
 pub use health::*;
 pub use identities::*;
+pub use middleware::*;
 pub use session_operations::*;
 pub use side_effects::*;
 
@@ -136,7 +138,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v15";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v16";
 /// Progress message emitted after the V2 provider effect has started.
 ///
 /// Fixture-backed cancellation QA uses this boundary to request cancellation
@@ -166,7 +168,7 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds exact session-queue delivery boundaries, terminal lifecycle evidence, and interrupt-specific cancellation classification.",
+        "changelog_note": "Adds typed authority-reducing middleware patches, one-shot execution wrappers, a complete invocation map, and bounded redacted invocation traces.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "runtime_error_contract": runtime_error_contract_snapshot(),
         "shared_runtime_primitives": shared_runtime_contract_snapshot(),
@@ -271,6 +273,7 @@ pub fn public_runtime_contract_snapshot() -> Value {
             ),
         ],
         "agent_hooks": agent_hook_contract_snapshot(),
+        "typed_middleware": typed_middleware_contract_snapshot(),
         "agent_harness": agent_harness_contract_snapshot(),
         "tool_result_projection": {
             "snapshot_version": "runtime-contracts.tool_result_projection.v1",
@@ -599,8 +602,8 @@ fn public_runtime_event_taxonomy_snapshot() -> Value {
 
 fn agent_hook_contract_snapshot() -> Value {
     json!({
-        "snapshot_version": "runtime-contracts.agent_hooks.v1",
-        "changelog_note": "Agent hooks define stable hook names, default redaction, capability grants, timeouts, priorities, and decision shapes.",
+        "snapshot_version": "runtime-contracts.agent_hooks.v2",
+        "changelog_note": "Agent hooks define stable hook names, typed production invocation points, default redaction, capability grants, timeouts, priorities, and decision shapes.",
         "kinds": enum_contract_snapshot(
             "AgentHookKind",
             "runtime-contracts.agent_hook_kind.v1",
@@ -632,6 +635,37 @@ fn agent_hook_contract_snapshot() -> Value {
             AgentHookDecisionKind::wire_contract_values(),
         ),
         "descriptors": AGENT_HOOK_DESCRIPTORS,
+    })
+}
+
+fn typed_middleware_contract_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.typed_middleware.v1",
+        "changelog_note": "Typed provider and tool patches can only reduce authority, execution wrappers consume next at most once, and durable traces retain bounded hash-only diffs.",
+        "schema_version": HOOK_MIDDLEWARE_SCHEMA_VERSION,
+        "roles": HookMiddlewareRole::wire_contract_values(),
+        "failure_modes": HookFailureMode::wire_contract_values(),
+        "patch_kinds": HookPatchKind::wire_contract_values(),
+        "outcomes": HookInvocationOutcome::wire_contract_values(),
+        "invocation_map": HOOK_INVOCATION_MAP,
+        "provider_request_patch_fields": [
+            "schema_version",
+            "base_request_sha256",
+            "max_output_tokens",
+            "json_mode"
+        ],
+        "tool_argument_patch_fields": [
+            "schema_version",
+            "base_arguments_sha256",
+            "set_fields",
+            "remove_fields"
+        ],
+        "execution_wrapper_next_calls": 1,
+        "schema_revalidation_required": true,
+        "policy_revalidation_required": true,
+        "authority_increase_allowed": false,
+        "trace_max_applied_diffs": MAX_HOOK_APPLIED_DIFFS,
+        "trace_raw_payload_allowed": false,
     })
 }
 

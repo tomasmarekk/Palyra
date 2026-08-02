@@ -27,8 +27,10 @@ use palyra_common::{
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
-        ArtifactRetentionPolicy, BackpressureOverflowAction, CancellationScopeKind,
-        CancellationSettlementOutcome, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        apply_tool_argument_patch, existing_tool_argument_fields, tool_patch_applied_diff,
+        AgentHookKind, ArtifactRetentionPolicy, BackpressureOverflowAction, CancellationScopeKind,
+        CancellationSettlementOutcome, ExecutionWrapperCapability, HookInvocationOutcome,
+        HookInvocationTrace, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
         RuntimeIdempotencyClass, SideEffectFenceState, SideEffectFenceV1, SideEffectRetryDecision,
         ToolResultArtifactRef, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
@@ -548,7 +550,8 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         .await?;
         return Ok(RunStreamToolProposalPreparationOutcome::Completed(outcome));
     }
-    let (execution_tool_name, execution_input_json) = if tool_name == TOOL_CATALOG_INVOKE_TOOL_NAME
+    let (execution_tool_name, mut execution_input_json) = if tool_name
+        == TOOL_CATALOG_INVOKE_TOOL_NAME
     {
         let target = match resolve_catalog_invoke_target(
             tool_catalog_snapshot,
@@ -645,6 +648,16 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     } else {
         (tool_name.to_owned(), normalized_input_json)
     };
+    execution_input_json = dispatch_tool_argument_patch_if_enabled(
+        runtime_state,
+        run_id,
+        proposal_id,
+        execution_tool_name.as_str(),
+        execution_input_json.as_slice(),
+        tool_catalog_snapshot,
+        tape_seq,
+    )
+    .await?;
 
     let RunStreamToolProposalPreparation {
         decision,
@@ -704,6 +717,139 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     }
 
     Ok(RunStreamToolProposalPreparationOutcome::Prepared(prepared))
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_tool_argument_patch_if_enabled(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+    tape_seq: &mut i64,
+) -> Result<Vec<u8>, Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(input_json.to_vec());
+    }
+    let arguments = serde_json::from_slice::<Value>(input_json).map_err(|error| {
+        Status::invalid_argument(format!("invalid normalized tool input: {error}"))
+    })?;
+    let base_arguments_sha256 = crate::sha256_hex(input_json);
+    let allowlisted_fields = existing_tool_argument_fields(&arguments);
+    let report = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        AgentHookKind::BeforeToolCall.as_str(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "proposal_id": proposal_id,
+            "tool_name": tool_name,
+            "base_arguments_sha256": base_arguments_sha256.as_str(),
+            "allowlisted_fields": allowlisted_fields.iter().collect::<Vec<_>>(),
+            "redaction_level": "field_names_and_hash_only",
+        }),
+    )
+    .await
+    .map_err(|error| {
+        Status::failed_precondition(format!("typed tool middleware dispatch failed: {error}"))
+    })?;
+    let Some(patch) = report.tool_argument_patch else {
+        return Ok(input_json.to_vec());
+    };
+    let patched = apply_tool_argument_patch(
+        base_arguments_sha256.as_str(),
+        &arguments,
+        &allowlisted_fields,
+        &patch,
+    )
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "typed tool middleware rejected patch {}: {}",
+            error.code, error.message
+        ))
+    })?;
+    let patched_bytes = serde_json::to_vec(&patched).map_err(|error| {
+        Status::internal(format!("failed to serialize typed tool middleware patch: {error}"))
+    })?;
+    let target_tool = tool_catalog_snapshot
+        .tools
+        .iter()
+        .chain(tool_catalog_snapshot.indexed_tools.iter())
+        .find(|tool| tool.name == tool_name)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "typed tool middleware target is not visible in the pinned catalog",
+            )
+        })?;
+    let revalidated = validate_tool_call_against_model_visible_tool(
+        tool_catalog_snapshot,
+        target_tool,
+        tool_name,
+        patched_bytes.as_slice(),
+    )
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "typed tool middleware schema revalidation failed {}: {}",
+            error.reason_code, error.message
+        ))
+    })?;
+    let revalidated_arguments = serde_json::from_slice::<Value>(revalidated.input_json.as_slice())
+        .map_err(|error| {
+            Status::internal(format!(
+                "typed tool middleware revalidation produced invalid JSON: {error}"
+            ))
+        })?;
+    let applied_diff =
+        tool_patch_applied_diff(&arguments, &revalidated_arguments, &patch, |value| {
+            crate::sha256_hex(serde_json::to_vec(value).unwrap_or_default().as_slice())
+        });
+    let duration_ms = report
+        .invocation_traces
+        .iter()
+        .fold(0_u64, |total, trace| total.saturating_add(trace.duration_ms));
+    let trace = HookInvocationTrace::new(
+        crate::sha256_hex(
+            format!("tool-middleware-v1\0{run_id}\0{proposal_id}\0{tool_name}").as_bytes(),
+        ),
+        AgentHookKind::BeforeToolCall,
+        0,
+        duration_ms,
+        if applied_diff.is_empty() {
+            HookInvocationOutcome::NoChange
+        } else {
+            HookInvocationOutcome::Applied
+        },
+        applied_diff,
+        "hook.tool_arguments.revalidated",
+    );
+    append_hook_invocation_trace_tape_event(runtime_state, run_id, tape_seq, &trace).await?;
+    Ok(revalidated.input_json)
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_hook_invocation_trace_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    trace: &HookInvocationTrace,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(trace).map_err(|error| {
+        Status::internal(format!("failed to serialize hook invocation trace: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "hook.invocation.trace".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1274,6 +1420,9 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
         | "palyra.work_graph.artifact"
         | "palyra.artifact.read"
         | "palyra.image.observe"
+        | "palyra.document.search"
+        | "palyra.document.read_page"
+        | "palyra.web.search"
         | "palyra.fs.read_file"
         | "palyra.fs.list_dir"
         | "palyra.fs.search"
@@ -2645,6 +2794,19 @@ async fn execute_prepared_tool_runtime(
             post_execution_error: None,
         }));
     }
+    let mut execution_wrapper = ExecutionWrapperCapability::new(crate::sha256_hex(
+        format!(
+            "tool-execution-wrapper-v1\0{}\0{}",
+            execution.run_id, execution.prepared.proposal_id
+        )
+        .as_bytes(),
+    ));
+    execution_wrapper.next_call().map_err(|error| {
+        Status::failed_precondition(format!(
+            "tool execution wrapper rejected continuation {}: {}",
+            error.code, error.message
+        ))
+    })?;
 
     // Keep the allowed path heap-pinned so the run-stream state machine does
     // not inline the full dispatch and cancellation state into its poll stack.
@@ -3631,6 +3793,14 @@ async fn project_prepared_tool_execution_outcome(
 ) -> Result<ToolExecutionOutcome, Status> {
     dispatch_after_tool_hook_if_enabled(runtime_state, run_id, prepared, &execution_outcome)
         .await?;
+    dispatch_tool_result_hook_if_enabled(
+        runtime_state,
+        AgentHookKind::BeforeToolResultProject,
+        run_id,
+        prepared,
+        &execution_outcome,
+    )
+    .await?;
     let replay_safety = classify_tool_result_replay_safety(
         prepared.proposal_id.as_str(),
         prepared.tool_name.as_str(),
@@ -3653,6 +3823,17 @@ async fn project_prepared_tool_execution_outcome(
         execution_outcome,
     )
     .await?;
+    if let Err(error) = dispatch_tool_result_hook_if_enabled(
+        runtime_state,
+        AgentHookKind::ToolResultProjected,
+        run_id,
+        prepared,
+        &projected.outcome,
+    )
+    .await
+    {
+        warn!(error = %error, "fail-open tool-result projection observer hook failed");
+    }
     append_tool_result_replay_safety_tape_event(runtime_state, run_id, tape_seq, &replay_safety)
         .await?;
     if let Some(report) = projected.middleware_report.as_ref() {
@@ -3698,6 +3879,15 @@ async fn commit_and_publish_projected_tool_execution_outcome(
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, ToolOutcomeFinalizationError> {
     let suspended = sessions_yield_suspended(prepared.tool_name.as_str(), &execution_outcome);
+    dispatch_tool_result_hook_if_enabled(
+        runtime_state,
+        AgentHookKind::ToolResultPersist,
+        run_id,
+        prepared,
+        &execution_outcome,
+    )
+    .await
+    .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
     let transition_is_atomic =
         side_effect_fence.is_some() && !execution_outcome.attestation.timed_out;
     if transition_is_atomic {
@@ -3790,6 +3980,15 @@ async fn commit_and_publish_projected_tool_execution_outcome(
     if suspended {
         return Ok(RunStreamToolExecutionOutcome::Suspended);
     }
+    dispatch_tool_result_hook_if_enabled(
+        runtime_state,
+        AgentHookKind::ToolResultModelFeed,
+        run_id,
+        prepared,
+        &execution_outcome,
+    )
+    .await
+    .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: prepared.proposal_id.clone(),
         tool_name: prepared.tool_name.clone(),
@@ -4137,7 +4336,64 @@ async fn dispatch_after_tool_hook_if_enabled(
             "inline after-tool hook requested fail_run before result projection",
         ));
     }
+    if let Err(error) = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        AgentHookKind::AfterToolCall.as_str(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "proposal_id": prepared.proposal_id.as_str(),
+            "tool_name": prepared.tool_name.as_str(),
+            "success": outcome.success,
+            "output_sha256": crate::sha256_hex(outcome.output_json.as_slice()),
+            "redaction_level": "hash_only_tool_result",
+        }),
+    )
+    .await
+    {
+        warn!(error = %error, "fail-open after-tool observer hook dispatch failed");
+    }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_tool_result_hook_if_enabled(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    hook_kind: AgentHookKind,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        hook_kind.as_str(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "proposal_id": prepared.proposal_id.as_str(),
+            "tool_name": prepared.tool_name.as_str(),
+            "success": outcome.success,
+            "output_bytes": outcome.output_json.len(),
+            "output_sha256": crate::sha256_hex(outcome.output_json.as_slice()),
+            "error_sha256": crate::sha256_hex(outcome.error.as_bytes()),
+            "redaction_level": "hash_only_tool_result",
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "inline {} hook dispatch failed: {error}",
+            hook_kind.as_str()
+        ))
+    })
 }
 
 async fn project_tool_result_for_model(
@@ -4552,6 +4808,19 @@ async fn append_sessions_spawn_tape_event_if_needed(
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
+    if runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        if let Err(error) = crate::hooks::dispatch_named_event_with_report(
+            Arc::clone(runtime_state),
+            &runtime_state.config.tool_call.wasm_runtime,
+            Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+            AgentHookKind::SubagentSpawned.as_str(),
+            payload,
+        )
+        .await
+        {
+            warn!(error = %error, "fail-open subagent-spawned observer hook dispatch failed");
+        }
+    }
     Ok(())
 }
 
@@ -5547,6 +5816,18 @@ mod tests {
         );
         assert_eq!(
             classify_tool_parallelism("palyra.fs.search", br#"{"query":"customerId"}"#),
+            ToolParallelism::ReadOnlySafe
+        );
+        assert_eq!(
+            classify_tool_parallelism("palyra.document.search", br#"{"query":"invoice"}"#),
+            ToolParallelism::ReadOnlySafe
+        );
+        assert_eq!(
+            classify_tool_parallelism("palyra.document.read_page", br#"{"document_id":"doc"}"#),
+            ToolParallelism::ReadOnlySafe
+        );
+        assert_eq!(
+            classify_tool_parallelism("palyra.web.search", br#"{"query":"rust async hooks"}"#),
             ToolParallelism::ReadOnlySafe
         );
         assert_eq!(

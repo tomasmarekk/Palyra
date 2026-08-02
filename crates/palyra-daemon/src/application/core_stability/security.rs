@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 const SECURITY_CONFORMANCE_SCHEMA_VERSION: u32 = 1;
-const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v15";
+const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v16";
 const MIN_CRITICAL_ATTACK_SCENARIOS: u32 = 15;
 
 const BUILTIN_REPORT_JSON: &str = include_str!(concat!(

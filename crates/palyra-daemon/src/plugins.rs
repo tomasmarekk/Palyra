@@ -32,11 +32,12 @@ use palyra_plugins_runtime::{
 use palyra_plugins_sdk::{
     executable_plugin_contract_schema_v2, AgentHarnessInvocationV2, AgentHarnessOutcomeV2,
     AgentHarnessResultV2, ExecutablePluginContractKindV2, ExecutablePluginOperationV2,
-    PluginBindingIdV2, PluginBindingRecordV2, PluginCallIdV2, PluginCapabilityHandleIdV2,
-    PluginCapabilityHandleV2, PluginCapabilityScopeV2, PluginInvocationBudgetV2,
-    PluginInvocationRequestV2, PluginInvocationTerminalOutcomeV2, PluginRuntimeDiagnosticsV2,
-    PluginRuntimeGenerationV2, PluginSchemaHashV2, TypedPluginCapabilityClass,
-    TypedPluginContractKind, DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS,
+    ExecutionWrapperCapabilityV2, PluginBindingIdV2, PluginBindingRecordV2, PluginCallIdV2,
+    PluginCapabilityHandleIdV2, PluginCapabilityHandleV2, PluginCapabilityScopeV2,
+    PluginInvocationBudgetV2, PluginInvocationRequestV2, PluginInvocationTerminalOutcomeV2,
+    PluginRuntimeDiagnosticsV2, PluginRuntimeGenerationV2, PluginSchemaHashV2,
+    RunLifecycleHookInvocationV2, RunLifecycleHookResultV2, RunLifecycleHookRoleV2,
+    TypedPluginCapabilityClass, TypedPluginContractKind, DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS,
 };
 use palyra_skills::{SkillConfigProperty, SkillConfigValueType, SkillManifest};
 use serde::{Deserialize, Serialize};
@@ -1372,6 +1373,135 @@ pub(crate) fn negotiate_plugin_typed_contracts(
         capability_classes: capability_classes.as_slice(),
         adapters: adapters.as_slice(),
     })
+}
+
+/// Executes an accepted lifecycle hook through executable plugin ABI v2.
+///
+/// Hook invocations intentionally receive no capability handles. Their only
+/// output is a typed lifecycle decision and an optional host-revalidated patch.
+///
+/// # Errors
+///
+/// Returns a stable redacted reason when module resolution, ABI admission,
+/// execution, or typed output validation fails.
+pub(crate) fn invoke_typed_run_lifecycle_hook(
+    binding: &PluginBindingRecord,
+    runtime_policy: &WasmPluginRunnerPolicy,
+    role: RunLifecycleHookRoleV2,
+    phase: &str,
+    event_sha256: &str,
+    execution_wrapper: bool,
+) -> std::result::Result<RunLifecycleHookResultV2, String> {
+    let resolved = resolve_installed_skill_module(
+        binding.skill_id.as_str(),
+        binding.skill_version.as_deref(),
+        binding.module_path.as_deref(),
+        binding.entrypoint.as_deref(),
+        binding.tool_id.as_deref(),
+    )
+    .map_err(|error| plugin_runtime_resolution_reason(error.kind))?;
+    let issued_at_unix_ms =
+        current_unix_ms().map_err(|_| "run_lifecycle_hook.clock_unavailable".to_owned())?;
+    let runtime_generation = PluginRuntimeGenerationV2::new(
+        u64::try_from(binding.updated_at_unix_ms.max(1)).unwrap_or(1),
+    )
+    .map_err(|_| "run_lifecycle_hook.generation_invalid".to_owned())?;
+    let expires_at_unix_ms = issued_at_unix_ms
+        .checked_add(EXECUTABLE_PLUGIN_BINDING_TTL_MS)
+        .ok_or_else(|| "run_lifecycle_hook.binding_expiry_invalid".to_owned())?;
+    let contract = ExecutablePluginContractKindV2::RunLifecycleHook;
+    let operation = ExecutablePluginOperationV2::DecideRunLifecycle;
+    let schema = executable_plugin_contract_schema_v2(contract);
+    let runtime_binding = PluginBindingRecordV2 {
+        binding_id: PluginBindingIdV2::new(format!(
+            "binding:{}",
+            sha256_framed_hex(
+                b"palyra.plugin.run-lifecycle.binding.v2",
+                &[binding.plugin_id.as_bytes(), phase.as_bytes()],
+            )
+        ))
+        .map_err(|_| "run_lifecycle_hook.binding_id_invalid".to_owned())?,
+        contract,
+        operation,
+        runtime_generation,
+        input_schema_hash: schema.input_schema_hash,
+        output_schema_hash: schema.output_schema_hash,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+        granted_capability_handles: Vec::new(),
+    };
+    let limits = installed_skill_runtime_limits(runtime_policy, &resolved)
+        .map_err(|error| plugin_runtime_resolution_reason(error.kind))?;
+    let invocation_timeout_ms = resolved
+        .manifest
+        .capabilities
+        .quotas
+        .wall_clock_timeout_ms
+        .clamp(1, DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS);
+    let host = ExecutablePluginRuntimeHost::new(runtime_policy, limits)
+        .map_err(plugin_runtime_host_reason)?;
+    host.bind(runtime_binding.clone(), resolved.module_bytes)
+        .map_err(plugin_runtime_host_reason)?;
+    let event_hash = PluginSchemaHashV2::parse("event_hash", event_sha256)
+        .map_err(|_| "run_lifecycle_hook.event_hash_invalid".to_owned())?;
+    let input_bytes = RunLifecycleHookInvocationV2 {
+        role,
+        phase: phase.to_owned(),
+        event_hash: event_hash.clone(),
+        execution_wrapper: execution_wrapper.then_some(ExecutionWrapperCapabilityV2 {
+            invocation_hash: event_hash,
+            max_next_calls: 1,
+        }),
+    }
+    .encode_core_bytes()
+    .map_err(|_| "run_lifecycle_hook.input_invalid".to_owned())?;
+    let issued_at_text = issued_at_unix_ms.to_string();
+    let request = PluginInvocationRequestV2 {
+        schema_version: 2,
+        call_id: PluginCallIdV2::new(format!(
+            "call:{}",
+            sha256_framed_hex(
+                b"palyra.plugin.run-lifecycle.call.v2",
+                &[
+                    binding.plugin_id.as_bytes(),
+                    phase.as_bytes(),
+                    event_sha256.as_bytes(),
+                    issued_at_text.as_bytes(),
+                ],
+            )
+        ))
+        .map_err(|_| "run_lifecycle_hook.call_id_invalid".to_owned())?,
+        binding_id: runtime_binding.binding_id.clone(),
+        runtime_generation,
+        contract,
+        operation,
+        budget: PluginInvocationBudgetV2 {
+            absolute_deadline_unix_ms: issued_at_unix_ms.saturating_add(invocation_timeout_ms),
+            max_input_bytes: EXECUTABLE_PLUGIN_MAX_INPUT_BYTES,
+            max_output_bytes: EXECUTABLE_PLUGIN_MAX_OUTPUT_BYTES,
+            max_event_bytes: EXECUTABLE_PLUGIN_MAX_EVENT_BYTES,
+            max_events: EXECUTABLE_PLUGIN_MAX_EVENTS,
+        },
+        input_schema_hash: runtime_binding.input_schema_hash.clone(),
+        output_schema_hash: runtime_binding.output_schema_hash.clone(),
+        input_bytes,
+        granted_capability_handles: Vec::new(),
+    };
+    let transcript = host
+        .invoke(&request, issued_at_unix_ms, PluginCoreWasmCancellationTokenV2::new())
+        .map_err(plugin_runtime_host_reason);
+    let _ = host.dispose(&runtime_binding.binding_id, runtime_generation);
+    let transcript = transcript?;
+    match &transcript.terminal().outcome {
+        PluginInvocationTerminalOutcomeV2::Completed { output_bytes, .. } => {
+            RunLifecycleHookResultV2::decode_core_bytes(output_bytes)
+                .map_err(|_| "run_lifecycle_hook.output_invalid".to_owned())
+        }
+        PluginInvocationTerminalOutcomeV2::Cancelled { .. } => {
+            Err("run_lifecycle_hook.cancelled".to_owned())
+        }
+        PluginInvocationTerminalOutcomeV2::Failed { error } => Err(error.reason_code().to_owned()),
+    }
 }
 
 /// Activates plugin-owned agent harness descriptors before harness selection.

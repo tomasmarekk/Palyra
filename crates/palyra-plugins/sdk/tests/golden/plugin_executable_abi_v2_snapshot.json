@@ -34,10 +34,10 @@
     },
     {
       "contract": "run_lifecycle_hook",
-      "input_schema_hash": "e8baac369785d0c7723245398c00cad3235aee1821063ac903d0b8d4b83481ad",
-      "input_schema_id": "palyra.plugin.run_lifecycle_hook.invocation.v2",
-      "output_schema_hash": "682d457aefda8c8187fd154dcdf1fb2dba0eb90509ac680425efd444b397b601",
-      "output_schema_id": "palyra.plugin.run_lifecycle_hook.result.v2",
+      "input_schema_hash": "257248a8d25e7084354c91f5b57eceb19d1c311505ade4b2e9d3f210c5884fe7",
+      "input_schema_id": "palyra.plugin.run_lifecycle_hook.invocation.v3",
+      "output_schema_hash": "29ccf1e2d68c992fd9db0c43bd74d3534a49e981d8fad054be4caa9dc64b0a0e",
+      "output_schema_id": "palyra.plugin.run_lifecycle_hook.result.v3",
       "timeout_disposition": "fail_closed"
     },
     {

@@ -16,21 +16,23 @@ use palyra_plugins_sdk::{
     executable_plugin_contract_schema_v2, AgentHarnessInvocationV2, AgentHarnessOutcomeV2,
     AgentHarnessResultV2, ContextEngineInvocationV2, ContextEngineResultV2,
     ContextSegmentCandidateV2, ExecutablePluginContractKindV2, ExecutablePluginOperationV2,
-    MemoryCandidateV2, MemoryProviderInvocationV2, MemoryProviderResultV2,
-    ModelAuthProviderInvocationV2, ModelAuthProviderResultV2, PluginBindingIdV2,
-    PluginBindingRecordV2, PluginBindingStateV2, PluginCallIdV2, PluginCapabilityHandleIdV2,
-    PluginCapabilityHandleV2, PluginCapabilityScopeV2, PluginInvocationBudgetV2,
-    PluginInvocationErrorCodeV2, PluginInvocationFrameV2, PluginInvocationRequestV2,
-    PluginInvocationTerminalOutcomeV2, PluginRuntimeGenerationV2, PluginSchemaHashV2,
-    PluginTimeoutDispositionV2, RunLifecycleActionV2, RunLifecycleHookInvocationV2,
-    RunLifecycleHookResultV2, RunLifecycleHookRoleV2, ToolMutationClassV2,
-    ToolResultMiddlewareInvocationV2, ToolResultMiddlewareResultV2, ToolResultVisibilityV2,
+    ExecutionWrapperCapabilityV2, MemoryCandidateV2, MemoryProviderInvocationV2,
+    MemoryProviderResultV2, ModelAuthProviderInvocationV2, ModelAuthProviderResultV2,
+    PluginBindingIdV2, PluginBindingRecordV2, PluginBindingStateV2, PluginCallIdV2,
+    PluginCapabilityHandleIdV2, PluginCapabilityHandleV2, PluginCapabilityScopeV2,
+    PluginInvocationBudgetV2, PluginInvocationErrorCodeV2, PluginInvocationFrameV2,
+    PluginInvocationRequestV2, PluginInvocationTerminalOutcomeV2, PluginRuntimeGenerationV2,
+    PluginSchemaHashV2, PluginTimeoutDispositionV2, ProviderRequestPatchV2, RunLifecycleActionV2,
+    RunLifecycleHookInvocationV2, RunLifecycleHookResultV2, RunLifecycleHookRoleV2,
+    ToolMutationClassV2, ToolResultMiddlewareInvocationV2, ToolResultMiddlewareResultV2,
+    ToolResultVisibilityV2,
 };
 
 const AGENT_HARNESS_TEMPLATE: &str = include_str!("fixtures/agent_harness_v2.wat");
 const CONTEXT_ENGINE_TEMPLATE: &str = include_str!("fixtures/context_engine_v2.wat");
 const TOOL_RESULT_TEMPLATE: &str = include_str!("fixtures/tool_result_middleware_v2.wat");
 const RUN_LIFECYCLE_TEMPLATE: &str = include_str!("fixtures/run_lifecycle_hook_v2.wat");
+const DOUBLE_NEXT_TEMPLATE: &str = include_str!("fixtures/execution_wrapper_double_next_v2.wat");
 const MEMORY_PROVIDER_TEMPLATE: &str = include_str!("fixtures/memory_provider_v2.wat");
 const MODEL_AUTH_TEMPLATE: &str = include_str!("fixtures/model_auth_provider_v2.wat");
 const CANCELLATION_MODULE: &[u8] = include_bytes!("fixtures/cancellation_stream_v2.wat");
@@ -130,6 +132,118 @@ fn invocation_transcript_is_accepted_event_exactly_one_terminal() {
             .count(),
         1
     );
+}
+
+#[test]
+fn execution_wrapper_rejects_a_second_continuation_call() {
+    let spec = executable_fixture_specs(1)
+        .into_iter()
+        .find(|fixture| fixture.contract == ExecutablePluginContractKindV2::RunLifecycleHook)
+        .expect("run lifecycle fixture should exist");
+    let input_bytes = RunLifecycleHookInvocationV2 {
+        role: RunLifecycleHookRoleV2::LimitedTransformer,
+        phase: "before_tool_call".to_owned(),
+        event_hash: hash('a'),
+        execution_wrapper: Some(ExecutionWrapperCapabilityV2 {
+            invocation_hash: hash('b'),
+            max_next_calls: 1,
+        }),
+    }
+    .encode_core_bytes()
+    .expect("execution-wrapper input should encode");
+    let (binding, request) = binding_and_request(
+        "double-next",
+        spec.contract,
+        spec.operation,
+        input_bytes,
+        spec.handles,
+        1,
+    );
+    let module =
+        materialize_execution_wrapper_fixture(&spec.output_bytes, request.call_id.as_str());
+    let mut runtime = PluginRuntimeV2::new().expect("runtime should initialize");
+    runtime.register_binding(binding).expect("binding should register");
+
+    let transcript = runtime
+        .invoke(&module, &request, NOW_UNIX_MS, PluginCoreWasmCancellationTokenV2::new())
+        .expect("request should be admitted");
+
+    assert_terminal_code(&transcript, PluginInvocationErrorCodeV2::DoubleNextCall);
+}
+
+#[test]
+fn lifecycle_hook_cannot_call_continuation_without_wrapper_capability() {
+    let spec = executable_fixture_specs(1)
+        .into_iter()
+        .find(|fixture| fixture.contract == ExecutablePluginContractKindV2::RunLifecycleHook)
+        .expect("run lifecycle fixture should exist");
+    let (binding, request) = binding_and_request(
+        "next-without-capability",
+        spec.contract,
+        spec.operation,
+        spec.input_bytes,
+        spec.handles,
+        1,
+    );
+    let module =
+        materialize_execution_wrapper_fixture(&spec.output_bytes, request.call_id.as_str());
+    let mut runtime = PluginRuntimeV2::new().expect("runtime should initialize");
+    runtime.register_binding(binding).expect("binding should register");
+
+    let transcript = runtime
+        .invoke(&module, &request, NOW_UNIX_MS, PluginCoreWasmCancellationTokenV2::new())
+        .expect("request should be admitted");
+
+    assert_terminal_code(&transcript, PluginInvocationErrorCodeV2::AuthorityExpansionDenied);
+}
+
+#[test]
+fn limited_transformer_can_return_a_typed_provider_patch() {
+    let input = RunLifecycleHookInvocationV2 {
+        role: RunLifecycleHookRoleV2::LimitedTransformer,
+        phase: "before_model_resolve".to_owned(),
+        event_hash: hash('a'),
+        execution_wrapper: None,
+    }
+    .encode_core_bytes()
+    .expect("hook input should encode");
+    let output = RunLifecycleHookResultV2 {
+        role: RunLifecycleHookRoleV2::LimitedTransformer,
+        action: RunLifecycleActionV2::Transform,
+        artifact_hash: None,
+        provider_request_patch: Some(ProviderRequestPatchV2 {
+            base_request_hash: hash('a'),
+            max_output_tokens: Some(128),
+            json_mode: Some(true),
+        }),
+        tool_argument_patch: None,
+    }
+    .encode_core_bytes()
+    .expect("hook patch output should encode");
+    let (binding, request) = binding_and_request(
+        "provider-patch",
+        ExecutablePluginContractKindV2::RunLifecycleHook,
+        ExecutablePluginOperationV2::DecideRunLifecycle,
+        input,
+        Vec::new(),
+        1,
+    );
+    let mut runtime = PluginRuntimeV2::new().expect("runtime should initialize");
+    runtime.register_binding(binding).expect("binding should register");
+
+    let transcript = runtime
+        .invoke(
+            &materialize_fixture(RUN_LIFECYCLE_TEMPLATE, &output),
+            &request,
+            NOW_UNIX_MS,
+            PluginCoreWasmCancellationTokenV2::new(),
+        )
+        .expect("request should be admitted");
+
+    assert!(matches!(
+        transcript.terminal().outcome,
+        PluginInvocationTerminalOutcomeV2::Completed { .. }
+    ));
 }
 
 #[test]
@@ -429,11 +543,14 @@ fn middleware_and_hook_cannot_expand_or_misrepresent_authority() {
         role: RunLifecycleHookRoleV2::Observer,
         phase: "before_terminal".to_owned(),
         event_hash: hash('b'),
+        execution_wrapper: None,
     };
     let forbidden_hook_output = RunLifecycleHookResultV2 {
         role: RunLifecycleHookRoleV2::Blocker,
         action: RunLifecycleActionV2::Block,
         artifact_hash: None,
+        provider_request_patch: None,
+        tool_argument_patch: None,
     }
     .encode_core_bytes()
     .expect("hook output should encode");
@@ -711,6 +828,7 @@ fn executable_fixture_specs(generation: u64) -> Vec<OwnedFixture> {
                 role: RunLifecycleHookRoleV2::Observer,
                 phase: "before_terminal".to_owned(),
                 event_hash: hash('e'),
+                execution_wrapper: None,
             }
             .encode_core_bytes()
             .expect("hook input should encode"),
@@ -718,6 +836,8 @@ fn executable_fixture_specs(generation: u64) -> Vec<OwnedFixture> {
                 role: RunLifecycleHookRoleV2::Observer,
                 action: RunLifecycleActionV2::Continue,
                 artifact_hash: None,
+                provider_request_patch: None,
+                tool_argument_patch: None,
             }
             .encode_core_bytes()
             .expect("hook output should encode"),
@@ -836,6 +956,15 @@ fn materialize_fixture(template: &str, output: &[u8]) -> Vec<u8> {
     template
         .replace("{{OUTPUT_LEN}}", output.len().to_string().as_str())
         .replace("{{OUTPUT}}", &escaped)
+        .into_bytes()
+}
+
+fn materialize_execution_wrapper_fixture(output: &[u8], call_id: &str) -> Vec<u8> {
+    let materialized = materialize_fixture(DOUBLE_NEXT_TEMPLATE, output);
+    String::from_utf8(materialized)
+        .expect("execution-wrapper fixture should remain UTF-8")
+        .replace("{{CALL_ID_LEN}}", call_id.len().to_string().as_str())
+        .replace("{{CALL_ID}}", call_id)
         .into_bytes()
 }
 

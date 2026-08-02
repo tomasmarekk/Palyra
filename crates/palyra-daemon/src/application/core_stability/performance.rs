@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 const CORE_PERFORMANCE_SCHEMA_VERSION: u32 = 1;
-const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v15";
+const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v16";
 const MIN_LONG_LIVED_ACTOR_CAPACITY: u32 = 100;
 const MAX_METADATA_TRACE_OVERHEAD_BPS: u32 = 500;
 
@@ -406,7 +406,7 @@ mod tests {
 
         assert_eq!(snapshot["qualified"], true);
         assert_eq!(snapshot["reason_code"], "core_performance.qualified");
-        assert_eq!(snapshot["runtime_contract_version"], "runtime-contracts.v15");
+        assert_eq!(snapshot["runtime_contract_version"], "runtime-contracts.v16");
         assert_eq!(snapshot["load_profile_count"], 5);
         assert_eq!(snapshot["measured_stage_count"], 12);
     }

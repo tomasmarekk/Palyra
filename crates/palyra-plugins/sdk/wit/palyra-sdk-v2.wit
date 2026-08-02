@@ -41,6 +41,27 @@ interface invocation-types-v2 {
     output-schema-hash: schema-hash,
     output-bytes: list<u8>,
   }
+
+  record provider-request-patch {
+    base-request-hash: schema-hash,
+    max-output-tokens: option<u64>,
+    json-mode: option<bool>,
+  }
+
+  record tool-argument-field-patch {
+    field: string,
+    replacement-bytes: option<list<u8>>,
+  }
+
+  record tool-argument-patch {
+    base-arguments-hash: schema-hash,
+    fields: list<tool-argument-field-patch>,
+  }
+
+  record execution-wrapper-capability {
+    invocation-hash: schema-hash,
+    max-next-calls: u8,
+  }
 }
 
 /// Host event and cancellation surface shared by all v2 worlds.
@@ -50,6 +71,7 @@ interface invocation-lifecycle-v2 {
   accepted: func(call-id: string, binding-id: string, runtime-generation: u64);
   emit-event: func(call-id: string, sequence: u32, schema: schema-hash, event: list<u8>) -> result<_, string>;
   is-cancelled: func(call-id: string) -> bool;
+  next-call: func(call-id: string) -> result<_, string>;
   cancel: func(call-id: string) -> result<_, string>;
   dispose: func(binding-id: string, runtime-generation: u64) -> result<_, string>;
 }

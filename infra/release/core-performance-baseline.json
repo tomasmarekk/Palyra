@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "runtime_contract_version": "runtime-contracts.v15",
+  "runtime_contract_version": "runtime-contracts.v16",
   "generated_from": "repository-owned deterministic core performance gate",
   "as_of": "2026-08-02",
   "load_profiles": [

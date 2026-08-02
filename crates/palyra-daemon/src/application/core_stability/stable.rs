@@ -11,7 +11,7 @@ use serde_json::Value;
 
 const STABLE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const STABLE_EVIDENCE_CONTRACT_ID: &str = "palyra.stable-core-evidence.v1";
-const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v15";
+const CORE_RUNTIME_CONTRACT_VERSION: &str = "runtime-contracts.v16";
 const REQUIRED_CAPABILITIES: [&str; 7] = [
     "runtime_kernel_v2",
     "provider_recovery",

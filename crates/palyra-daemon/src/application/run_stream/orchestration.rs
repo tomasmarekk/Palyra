@@ -23,9 +23,11 @@ use palyra_common::{
     },
     redaction::REDACTED,
     runtime_contracts::{
-        classify_agent_harness_terminal, AgentHarnessAttemptClassification,
-        AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
-        AgentHarnessSelectionMode, CancellationContextV1, CancellationReason, QueueMode,
+        apply_provider_request_patch, classify_agent_harness_terminal, provider_patch_applied_diff,
+        AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
+        AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHookKind,
+        CancellationContextV1, CancellationReason, ExecutionWrapperCapability,
+        HookInvocationOutcome, HookInvocationTrace, ProviderRequestPatchProjection, QueueMode,
         QueuedInputDeliveryBoundary, QueuedInputState, RuntimeErrorPhase, RuntimeSessionId,
         RuntimeTerminalOutcome,
     },
@@ -1257,6 +1259,241 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
     Ok(RunStreamPostProviderOutcome::Completed)
 }
 
+#[allow(clippy::result_large_err)]
+async fn apply_provider_request_middleware(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    provider_request: &mut ProviderRequest,
+    hook: AgentHookKind,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    let request_bytes = serde_json::to_vec(provider_request).map_err(|error| {
+        Status::internal(format!("failed to serialize provider middleware request: {error}"))
+    })?;
+    let base_request_sha256 = crate::sha256_hex(request_bytes.as_slice());
+    let before = ProviderRequestPatchProjection {
+        max_output_tokens: provider_request.max_output_tokens,
+        json_mode: provider_request.json_mode,
+    };
+    let report = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        hook.as_str(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "base_request_sha256": base_request_sha256.as_str(),
+            "max_output_tokens": provider_request.max_output_tokens,
+            "json_mode": provider_request.json_mode,
+            "message_count": provider_request.messages.len(),
+            "has_tool_catalog": provider_request.tool_catalog_snapshot.is_some(),
+            "redaction_level": "provider_shape_and_hash_only",
+        }),
+    )
+    .await
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "typed provider middleware dispatch failed at {}: {error}",
+            hook.as_str()
+        ))
+    })?;
+    let Some(patch) = report.provider_request_patch else {
+        append_hook_invocation_traces_to_tape(
+            runtime_state,
+            run_id,
+            tape_seq,
+            report.invocation_traces.as_slice(),
+        )
+        .await?;
+        return Ok(());
+    };
+    let after = apply_provider_request_patch(base_request_sha256.as_str(), before, &patch)
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "typed provider middleware rejected patch {}: {}",
+                error.code, error.message
+            ))
+        })?;
+    provider_request.max_output_tokens = after.max_output_tokens;
+    provider_request.json_mode = after.json_mode;
+    let revalidated_bytes = serde_json::to_vec(provider_request).map_err(|error| {
+        Status::internal(format!("provider middleware schema revalidation failed: {error}"))
+    })?;
+    if provider_request.messages.is_empty() && provider_request.input_text.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "provider middleware request has no model-visible input after revalidation",
+        ));
+    }
+    let applied_diff = provider_patch_applied_diff(before, after, |value| {
+        crate::sha256_hex(serde_json::to_vec(value).unwrap_or_default().as_slice())
+    });
+    let trace = HookInvocationTrace::new(
+        crate::sha256_hex(
+            format!(
+                "provider-middleware-v1\0{run_id}\0{}\0{}",
+                hook.as_str(),
+                crate::sha256_hex(revalidated_bytes.as_slice())
+            )
+            .as_bytes(),
+        ),
+        hook,
+        0,
+        report
+            .invocation_traces
+            .iter()
+            .fold(0_u64, |total, trace| total.saturating_add(trace.duration_ms)),
+        if applied_diff.is_empty() {
+            HookInvocationOutcome::NoChange
+        } else {
+            HookInvocationOutcome::Applied
+        },
+        applied_diff,
+        "hook.provider_request.revalidated",
+    );
+    append_hook_invocation_trace_to_tape(runtime_state, run_id, tape_seq, &trace).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_observer_hook(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    hook: AgentHookKind,
+    payload: Value,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    match crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        hook.as_str(),
+        payload,
+    )
+    .await
+    {
+        Ok(report) => {
+            append_hook_invocation_traces_to_tape(
+                runtime_state,
+                run_id,
+                tape_seq,
+                report.invocation_traces.as_slice(),
+            )
+            .await
+        }
+        Err(error) => {
+            warn!(hook = hook.as_str(), error = %error, "fail-open observer hook dispatch failed");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_required_hook(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    hook: AgentHookKind,
+    payload: Value,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    let report = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        hook.as_str(),
+        payload,
+    )
+    .await
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "required hook dispatch failed at {}: {error}",
+            hook.as_str()
+        ))
+    })?;
+    if report.lifecycle_resolution.as_ref().is_some_and(|resolution| resolution.terminal) {
+        return Err(Status::failed_precondition(format!(
+            "required lifecycle hook {} selected a terminal action",
+            hook.as_str()
+        )));
+    }
+    append_hook_invocation_traces_to_tape(
+        runtime_state,
+        run_id,
+        tape_seq,
+        report.invocation_traces.as_slice(),
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_pre_run_required_hook(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    hook: AgentHookKind,
+    payload: Value,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        hook.as_str(),
+        payload,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "pre-run hook dispatch failed at {}: {error}",
+            hook.as_str()
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_hook_invocation_traces_to_tape(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    traces: &[HookInvocationTrace],
+) -> Result<(), Status> {
+    for trace in traces {
+        append_hook_invocation_trace_to_tape(runtime_state, run_id, tape_seq, trace).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_hook_invocation_trace_to_tape(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    trace: &HookInvocationTrace,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(trace).map_err(|error| {
+        Status::internal(format!("failed to serialize hook invocation trace: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "hook.invocation.trace".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
+}
+
 // Runs one provider request under a deadline while polling for cancellation
 // (100 ms) and emitting waiting-status heartbeats (20 s). The provider future
 // is created once and pinned, so losing select races to the timers never
@@ -1318,6 +1555,35 @@ async fn execute_run_stream_provider_request(
         provider_deadline_timeout = provider_deadline_timeout
             .min(Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(1)));
     }
+    let provider_request_sha256 = crate::sha256_hex(
+        serde_json::to_vec(&provider_request)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "failed to serialize provider execution wrapper request: {error}"
+                ))
+            })?
+            .as_slice(),
+    );
+    dispatch_observer_hook(
+        runtime_state,
+        run_id,
+        tape_seq,
+        AgentHookKind::ModelCallStarted,
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "provider_request_sha256": provider_request_sha256.as_str(),
+            "redaction_level": "hash_only_provider_request",
+        }),
+    )
+    .await?;
+    let mut execution_wrapper = ExecutionWrapperCapability::new(provider_request_sha256.clone());
+    execution_wrapper.next_call().map_err(|error| {
+        Status::failed_precondition(format!(
+            "provider execution wrapper rejected continuation {}: {}",
+            error.code, error.message
+        ))
+    })?;
     let provider_span = tracing::info_span!(
         "provider.call",
         run_id = %run_id,
@@ -1394,6 +1660,21 @@ async fn execute_run_stream_provider_request(
                 return Ok(RunStreamProviderRequestOutcome::Terminal(effective_state));
             }
             provider_result = &mut provider_future => {
+                dispatch_observer_hook(
+                    runtime_state,
+                    run_id,
+                    tape_seq,
+                    AgentHookKind::ModelCallEnded,
+                    json!({
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "provider_request_sha256": provider_request_sha256.as_str(),
+                        "outcome": if provider_result.is_ok() { "completed" } else { "failed" },
+                        "duration_ms": duration_millis_u64(provider_started_at.elapsed()),
+                        "redaction_level": "hash_only_provider_request",
+                    }),
+                )
+                .await?;
                 return match provider_result {
                     Ok(response) => Ok(RunStreamProviderRequestOutcome::Completed {
                         response: Box::new(response),
@@ -1408,6 +1689,21 @@ async fn execute_run_stream_provider_request(
             _ = &mut provider_deadline => {
                 let _ = harness_cancel_sender.send(true);
                 dispose_run_stream_external_harness(harness_lifecycle.as_ref()).await;
+                dispatch_observer_hook(
+                    runtime_state,
+                    run_id,
+                    tape_seq,
+                    AgentHookKind::ModelCallEnded,
+                    json!({
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "provider_request_sha256": provider_request_sha256.as_str(),
+                        "outcome": "timed_out",
+                        "duration_ms": duration_millis_u64(provider_started_at.elapsed()),
+                        "redaction_level": "hash_only_provider_request",
+                    }),
+                )
+                .await?;
                 return Ok(RunStreamProviderRequestOutcome::TimedOut {
                     reason: timeout_reason,
                     message: provider_request_timeout_message(run_id, provider_deadline_timeout, timeout_reason),
@@ -3664,6 +3960,7 @@ async fn process_run_stream_message_inner(
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     let session_id = canonical_id(message.session_id, "session_id")?;
     let run_id = canonical_id(message.run_id, "run_id")?;
+    let starting_run = active_run_id.is_none();
 
     if let Some(expected_session) = active_session_id.as_ref() {
         if expected_session != &session_id {
@@ -3702,6 +3999,22 @@ async fn process_run_stream_message_inner(
     }
     let background_budget_tokens = *active_background_budget_tokens;
     if active_run_id.is_none() {
+        if message.reset_session {
+            // Reset authorization must complete before the journal mutates the
+            // existing session, so this pre-admission hook relies on its own
+            // durable hook audit instead of the not-yet-created run tape.
+            dispatch_pre_run_required_hook(
+                runtime_state,
+                AgentHookKind::BeforeReset,
+                json!({
+                    "schema_version": 1,
+                    "run_id": run_id.as_str(),
+                    "session_id_sha256": crate::sha256_hex(session_id.as_bytes()),
+                    "redaction_level": "metadata_only",
+                }),
+            )
+            .await?;
+        }
         run_state
             .transition(RunTransition::Accept)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -3944,6 +4257,65 @@ async fn process_run_stream_message_inner(
             tape_seq,
             common_v1::stream_status::StatusKind::Accepted,
             accepted_message.as_str(),
+        )
+        .await?;
+    }
+    dispatch_required_hook(
+        runtime_state,
+        run_id.as_str(),
+        tape_seq,
+        AgentHookKind::InboundClaim,
+        json!({
+            "schema_version": 1,
+            "run_id": run_id.as_str(),
+            "session_id_sha256": crate::sha256_hex(session_id.as_bytes()),
+            "origin_kind": origin_kind.as_str(),
+            "attachment_count": message
+                .input
+                .as_ref()
+                .and_then(|input| input.content.as_ref())
+                .map_or(0, |content| content.attachments.len()),
+            "redaction_level": "metadata_only",
+        }),
+    )
+    .await?;
+    if starting_run {
+        dispatch_required_hook(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            AgentHookKind::RunBeforeRun,
+            json!({
+                "schema_version": 1,
+                "run_id": run_id.as_str(),
+                "session_id_sha256": crate::sha256_hex(session_id.as_bytes()),
+                "redaction_level": "metadata_only",
+            }),
+        )
+        .await?;
+        dispatch_required_hook(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            AgentHookKind::BeforeAgentRun,
+            json!({
+                "schema_version": 1,
+                "run_id": run_id.as_str(),
+                "redaction_level": "metadata_only",
+            }),
+        )
+        .await?;
+        dispatch_observer_hook(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            AgentHookKind::SessionStart,
+            json!({
+                "schema_version": 1,
+                "session_id_sha256": crate::sha256_hex(session_id.as_bytes()),
+                "run_id": run_id.as_str(),
+                "redaction_level": "metadata_only",
+            }),
         )
         .await?;
     }
@@ -4814,6 +5186,22 @@ async fn process_run_stream_message_inner(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
         }
+        apply_provider_request_middleware(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            &mut provider_request,
+            AgentHookKind::BeforePromptBuild,
+        )
+        .await?;
+        apply_provider_request_middleware(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            &mut provider_request,
+            AgentHookKind::BeforeModelResolve,
+        )
+        .await?;
         // Follow-up deadlines apply to exactly one turn: the turn right after
         // a tool batch. Browser batches keep their shorter specialized guard;
         // other tools use the generic post-tool guard.
@@ -5743,6 +6131,43 @@ async fn process_run_stream_message_inner(
                             )
                             .await?;
                         }
+                        let reply_sha256 = crate::sha256_hex(reply_text.as_bytes());
+                        dispatch_observer_hook(
+                            runtime_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            AgentHookKind::BeforeAgentReply,
+                            json!({
+                                "schema_version": 1,
+                                "run_id": run_id.as_str(),
+                                "reply_sha256": reply_sha256.as_str(),
+                                "reply_bytes": reply_text.len(),
+                                "redaction_level": "hash_only_reply",
+                            }),
+                        )
+                        .await?;
+                        for hook in [
+                            AgentHookKind::BeforeAgentFinalize,
+                            AgentHookKind::RunBeforeDelivery,
+                            AgentHookKind::BeforeMessageWrite,
+                            AgentHookKind::MessageSending,
+                            AgentHookKind::ReplyPayloadSending,
+                        ] {
+                            dispatch_required_hook(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                hook,
+                                json!({
+                                    "schema_version": 1,
+                                    "run_id": run_id.as_str(),
+                                    "reply_sha256": reply_sha256.as_str(),
+                                    "reply_bytes": reply_text.len(),
+                                    "redaction_level": "hash_only_reply",
+                                }),
+                            )
+                            .await?;
+                        }
                         if final_reply_tokens_deferred {
                             send_deferred_final_reply_tokens(
                                 sender,
@@ -5775,6 +6200,19 @@ async fn process_run_stream_message_inner(
                             reply_text,
                         )
                         .await?;
+                        dispatch_observer_hook(
+                            runtime_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            AgentHookKind::ReplyDispatch,
+                            json!({
+                                "schema_version": 1,
+                                "run_id": run_id.as_str(),
+                                "reply_sha256": reply_sha256.as_str(),
+                                "redaction_level": "hash_only_reply",
+                            }),
+                        )
+                        .await?;
                     }
                     append_agent_loop_tape_event(
                         runtime_state,
@@ -5795,6 +6233,32 @@ async fn process_run_stream_message_inner(
                         run_id.as_str(),
                         tape_seq,
                         "agent_loop.terminated",
+                    )
+                    .await?;
+                    dispatch_observer_hook(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        AgentHookKind::AgentEnd,
+                        json!({
+                            "schema_version": 1,
+                            "run_id": run_id.as_str(),
+                            "outcome": "completed",
+                            "redaction_level": "metadata_only",
+                        }),
+                    )
+                    .await?;
+                    dispatch_observer_hook(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        AgentHookKind::RunAfterRun,
+                        json!({
+                            "schema_version": 1,
+                            "run_id": run_id.as_str(),
+                            "outcome": "completed",
+                            "redaction_level": "metadata_only",
+                        }),
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Continue);

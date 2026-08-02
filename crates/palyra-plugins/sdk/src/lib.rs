@@ -25,18 +25,19 @@ pub use abi_v2::{
     PLUGIN_ABI_V2_CORE_ALLOC_EXPORT, PLUGIN_ABI_V2_CORE_DEALLOC_EXPORT,
     PLUGIN_ABI_V2_CORE_INVOKE_EXPORT, PLUGIN_ABI_V2_CORE_MEMORY_EXPORT,
     PLUGIN_ABI_V2_EMIT_EVENT_IMPORT, PLUGIN_ABI_V2_HOST_IMPORT_MODULE,
-    PLUGIN_ABI_V2_IS_CANCELLED_IMPORT, PLUGIN_ABI_V2_VERSION, PLUGIN_ABI_V2_WIT_PACKAGE_ID,
-    PLUGIN_ABI_V2_WIT_WORLD_PREFIX, PLUGIN_CORE_WIRE_MAGIC_V2, PLUGIN_CORE_WIRE_SCHEMA_VERSION_V2,
-    WIT_SOURCE_V2,
+    PLUGIN_ABI_V2_IS_CANCELLED_IMPORT, PLUGIN_ABI_V2_NEXT_CALL_IMPORT, PLUGIN_ABI_V2_VERSION,
+    PLUGIN_ABI_V2_WIT_PACKAGE_ID, PLUGIN_ABI_V2_WIT_WORLD_PREFIX, PLUGIN_CORE_WIRE_MAGIC_V2,
+    PLUGIN_CORE_WIRE_SCHEMA_VERSION_V2, WIT_SOURCE_V2,
 };
 pub use contracts_v2::{
     AgentHarnessInvocationV2, AgentHarnessOutcomeV2, AgentHarnessResultV2,
-    ContextEngineInvocationV2, ContextEngineResultV2, ContextSegmentCandidateV2, MemoryCandidateV2,
-    MemoryProviderInvocationV2, MemoryProviderResultV2, ModelAuthProviderInvocationV2,
-    ModelAuthProviderResultV2, PluginContractCodecError, RunLifecycleActionV2,
+    ContextEngineInvocationV2, ContextEngineResultV2, ContextSegmentCandidateV2,
+    ExecutionWrapperCapabilityV2, MemoryCandidateV2, MemoryProviderInvocationV2,
+    MemoryProviderResultV2, ModelAuthProviderInvocationV2, ModelAuthProviderResultV2,
+    PluginContractCodecError, ProviderRequestPatchV2, RunLifecycleActionV2,
     RunLifecycleHookInvocationV2, RunLifecycleHookResultV2, RunLifecycleHookRoleV2,
-    ToolMutationClassV2, ToolResultMiddlewareInvocationV2, ToolResultMiddlewareResultV2,
-    ToolResultVisibilityV2,
+    ToolArgumentFieldPatchV2, ToolArgumentPatchV2, ToolMutationClassV2,
+    ToolResultMiddlewareInvocationV2, ToolResultMiddlewareResultV2, ToolResultVisibilityV2,
 };
 
 use serde::{Deserialize, Serialize};
