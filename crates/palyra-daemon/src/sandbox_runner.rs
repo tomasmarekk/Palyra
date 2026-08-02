@@ -18930,7 +18930,7 @@ mod tests {
         .expect("child script should be written");
         fs::write(
             launcher_script.as_path(),
-            "import pathlib, subprocess, sys, time\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\ntime.sleep(0.25)\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nsys.exit(1)\n",
+            "import pathlib, subprocess, sys\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nsys.exit(1)\n",
         )
         .expect("launcher script should be written");
         let mut policy =
