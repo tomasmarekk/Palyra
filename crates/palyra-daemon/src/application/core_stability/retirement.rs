@@ -365,9 +365,11 @@ mod tests {
 
     #[test]
     fn diagnostics_report_only_explicit_generation_flag_notices() {
-        let mut rollouts = FeatureRolloutsConfig::default();
-        rollouts.context_engine = FeatureRolloutSetting::from_config(true);
-        rollouts.provider_recovery = FeatureRolloutSetting::from_env(true);
+        let rollouts = FeatureRolloutsConfig {
+            context_engine: FeatureRolloutSetting::from_config(true),
+            provider_recovery: FeatureRolloutSetting::from_env(true),
+            ..FeatureRolloutsConfig::default()
+        };
         let resolver = RuntimeProfileResolver::resolve(
             &RuntimeKernelConfig::default(),
             &FeatureRolloutsConfig::default(),
