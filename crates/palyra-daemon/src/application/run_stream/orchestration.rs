@@ -16,38 +16,37 @@
 use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 
 use palyra_common::{
-    metadata_trace::{MetadataTraceIdDomainV1, metadata_trace_id_sha256},
+    metadata_trace::{metadata_trace_id_sha256, MetadataTraceIdDomainV1},
     qa_runtime_path::{
-        PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_ROUTE_CHANGE_EVENT,
+        ProviderRouteChangeEvent, PROVIDER_LANE_ATTESTATION_EVENT, PROVIDER_ROUTE_CHANGE_EVENT,
         PROVIDER_ROUTE_CHANGE_EVENT_SCHEMA_VERSION, PROVIDER_ROUTE_CHANGE_EVIDENCE_TRUNCATED_EVENT,
-        ProviderRouteChangeEvent,
     },
     redaction::REDACTED,
     runtime_contracts::{
+        apply_provider_request_patch, classify_agent_harness_terminal, provider_patch_applied_diff,
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
         AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHookKind,
         CancellationContextV1, CancellationReason, ExecutionWrapperCapability,
         HookInvocationOutcome, HookInvocationTrace, ProviderRequestPatchProjection, QueueMode,
         QueuedInputDeliveryBoundary, QueuedInputState, RuntimeErrorPhase, RuntimeSessionId,
-        RuntimeTerminalOutcome, apply_provider_request_patch, classify_agent_harness_terminal,
-        provider_patch_applied_diff,
+        RuntimeTerminalOutcome,
     },
     runtime_preview::RuntimePreviewMode,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{
     sync::mpsc,
-    time::{Instant as TokioInstant, MissedTickBehavior, interval, interval_at},
+    time::{interval, interval_at, Instant as TokioInstant, MissedTickBehavior},
 };
 use tonic::{Code, Status, Streaming};
-use tracing::{Instrument, debug, warn};
+use tracing::{debug, warn, Instrument};
 use ulid::Ulid;
 
 use crate::{
     application::advisor_fanout::{
-        AdvisorRuntimeMode, AdvisorRuntimeOutcome, AdvisorRuntimeRequest,
-        AdvisorRuntimeSelectionInput, run_advisor_runtime, select_advisor_runtime,
+        run_advisor_runtime, select_advisor_runtime, AdvisorRuntimeMode, AdvisorRuntimeOutcome,
+        AdvisorRuntimeRequest, AdvisorRuntimeSelectionInput,
     },
     application::agent_harness::{
         AgentHarnessRegistry, AgentHarnessSelectionDiagnostics, AgentHarnessSupportRequest,
@@ -58,36 +57,36 @@ use crate::{
         HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     },
     application::agent_harness_provider_bridge::{
-        ExternalHarnessProviderTurn, execute_external_harness_provider_turn,
+        execute_external_harness_provider_turn, ExternalHarnessProviderTurn,
     },
     application::agent_harness_v2::{LegacyAgentHarnessV2Adapter, SharedAgentHarnessV2},
     application::codex_app_server_bridge::{
-        CODEX_MANAGED_RUNTIME_ID, ManagedCodexAppServerConfig, codex_agent_harness_descriptor,
-        codex_managed_runtime_descriptor,
+        codex_agent_harness_descriptor, codex_managed_runtime_descriptor,
+        ManagedCodexAppServerConfig, CODEX_MANAGED_RUNTIME_ID,
     },
     application::context_recovery::{
-        CONTEXT_RECOVERY_EVENT, ContextPreflightRecoveryOutcome,
         recover_provider_request_after_overflow, recover_provider_request_preflight,
+        ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
     },
     application::external_agent_harness::ManagedExternalAgentHarness,
     application::learning::schedule_post_run_reflection,
     application::managed_runtime::StdioRuntimeTransport,
     application::provider_events::{
-        RunStreamProviderEventsOutcome, RunStreamToolResultForModel,
-        process_run_stream_provider_events,
+        process_run_stream_provider_events, RunStreamProviderEventsOutcome,
+        RunStreamToolResultForModel,
     },
     application::provider_input::{
-        MemoryPromptFailureMode, PrepareModelProviderInputRequest, build_provider_image_inputs,
-        prepare_model_provider_input,
+        build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
+        PrepareModelProviderInputRequest,
     },
     application::provider_turn_recovery::{
-        ContextPressureInput, ContextPressureReport, PROVIDER_ATTEMPT_OUTCOME_EVENT,
-        PROVIDER_ATTEMPT_PLAN_EVENT, PROVIDER_CANCELLATION_CLOSURE_EVENT,
-        PROVIDER_CONTEXT_PRESSURE_EVENT, PROVIDER_TURN_RECOVERY_EVENT, ProviderAttemptPlan,
+        anomaly_from_terminal_outcome, anomaly_from_terminal_validation, cancellation_closure,
+        ContextPressureInput, ContextPressureReport, ProviderAttemptPlan,
         ProviderAttemptStateMachine, ProviderCancellationPhase, ProviderRecoveryCommand,
         ProviderRecoverySideEffectState, ProviderTurnAnomaly, ProviderTurnRecoveryInput,
-        RECOVERY_ACTION_STARTED_EVENT, RecoveryExecutorInput, anomaly_from_terminal_outcome,
-        anomaly_from_terminal_validation, cancellation_closure,
+        RecoveryExecutorInput, PROVIDER_ATTEMPT_OUTCOME_EVENT, PROVIDER_ATTEMPT_PLAN_EVENT,
+        PROVIDER_CANCELLATION_CLOSURE_EVENT, PROVIDER_CONTEXT_PRESSURE_EVENT,
+        PROVIDER_TURN_RECOVERY_EVENT, RECOVERY_ACTION_STARTED_EVENT,
     },
     application::run_admission::{
         AdmissionCaller, RunAdmissionCommand, RunAdmissionController, RunAdmissionControllerOutcome,
@@ -107,75 +106,75 @@ use crate::{
     },
     application::session_queue::queue_outcome,
     application::tool_governance::{
-        BeforeFinalizeBudget, BeforeFinalizeDecision, BeforeFinalizeEvent,
-        HarnessToolSurfaceRuntime, project_harness_tool_surface,
+        project_harness_tool_surface, BeforeFinalizeBudget, BeforeFinalizeDecision,
+        BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
     },
     application::tool_registry::{
-        ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolCatalogPolicySnapshot,
-        ToolExposureSurface, build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
+        build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
         snapshot_to_provider_request_value, tool_catalog_tape_payload,
+        ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolCatalogPolicySnapshot,
+        ToolExposureSurface,
     },
     commitments::{
-        CommitmentExtractionInput, POST_TURN_COMMITMENT_EXTRACTION_EVENT,
-        PostTurnCommitmentExtractionProjection, build_commitment_create_plan,
-        select_post_turn_commitment_extraction,
+        build_commitment_create_plan, select_post_turn_commitment_extraction,
+        CommitmentExtractionInput, PostTurnCommitmentExtractionProjection,
+        POST_TURN_COMMITMENT_EXTRACTION_EVENT,
     },
     delegation::DelegationSnapshot,
     gateway::{
-        CANCELLED_REASON, GatewayProviderSelectionSnapshot, GatewayRuntimeConfigSnapshot,
-        GatewayRuntimeState, ManagedRuntimeHealthFamily, canonical_id, cleanup_run_resources,
-        current_unix_ms, ingest_memory_best_effort, is_provider_reconfigured_status, non_empty,
-        record_message_router_journal_event, security_requests_json_mode, truncate_with_ellipsis,
+        canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort,
+        is_provider_reconfigured_status, non_empty, record_message_router_journal_event,
+        security_requests_json_mode, truncate_with_ellipsis, GatewayProviderSelectionSnapshot,
+        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, ManagedRuntimeHealthFamily,
+        CANCELLED_REASON,
     },
     journal::{
-        DelegatedRunAdmissionV1, MemorySource, OrchestratorCancelRequest,
-        OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
-        OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
-        OrchestratorRunTerminalSettlement, OrchestratorRunTerminalSettlementRequest,
-        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest,
-        OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
-        run_admission::JournalRunAdmissionSessionSelector,
+        run_admission::JournalRunAdmissionSessionSelector, DelegatedRunAdmissionV1, MemorySource,
+        OrchestratorCancelRequest, OrchestratorQueuedInputRecord,
+        OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
+        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlement,
+        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionResolveRequest,
+        OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
     },
     model_provider::{
-        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, NormalizedProviderStreamV2,
-        PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
-        PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT, ProviderAttemptSummary, ProviderEvent,
-        ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
-        ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
-        ProviderRouteCandidateTrace, ProviderRouteSelectionTrace, ProviderTerminalDisposition,
-        ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext,
-        TOOL_CALL_ASSEMBLER_AUDIT_EVENT, TerminalOutcomeClass, TerminalOutcomeClassification,
-        ToolCallAssemblyPolicy, assemble_canonical_tool_calls,
-        bounded_provider_turn_output_for_persistence,
+        assemble_canonical_tool_calls, bounded_provider_turn_output_for_persistence,
         canonical_events_from_normalized_provider_events_v2, classify_terminal_outcome,
         decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
         normalized_provider_stream_from_output_v2, provider_events_from_output,
         tool_repair_audit_events_for_decision, validate_canonical_provider_stream,
+        NormalizedProviderStreamV2, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
+        ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
+        ProviderRouteCandidateTrace, ProviderRouteSelectionTrace, ProviderTerminalDisposition,
+        ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext, TerminalOutcomeClass,
+        TerminalOutcomeClassification, ToolCallAssemblyPolicy,
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
+        PROVIDER_RECOVERY_DECISION_EVENT, PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT,
+        TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
     },
     orchestrator::{
-        RunLifecycleState, RunStateMachine, RunTransition, estimate_token_count, is_cancel_command,
+        estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
     },
     plugins::{
-        AgentHarnessPluginActivationRequest,
         activate_agent_harness_plugins_before_selection_with_policy, load_plugin_bindings_index,
-        resolve_plugins_root,
+        resolve_plugins_root, AgentHarnessPluginActivationRequest,
     },
     provider_leases::ProviderLeaseExecutionContext,
     self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
     tool_protocol::ToolRequestContext,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
     usage_governance::{
-        RoutingDecision, RoutingTaskClass, UsageRoutingPlanRequest, plan_usage_routing,
+        plan_usage_routing, RoutingDecision, RoutingTaskClass, UsageRoutingPlanRequest,
     },
 };
 
 use super::{
-    admission_ingress::{RunStreamAdmissionIngress, admission_environment},
+    admission_ingress::{admission_environment, RunStreamAdmissionIngress},
     agent_loop::{
-        AgentLoopTerminationReason, AgentRunLoopState, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
-        FinalizationVerificationReport, FinalizationVerificationStatus, RunProgressAttempt,
-        RunProgressController, RunProgressIntervention, RunProgressOutcomeClass,
+        AgentLoopTerminationReason, AgentRunLoopState, FinalizationVerificationReport,
+        FinalizationVerificationStatus, RunProgressAttempt, RunProgressController,
+        RunProgressIntervention, RunProgressOutcomeClass, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
         TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
         VERIFICATION_FINALIZER_NUDGE_EVENT, VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
     },
@@ -185,9 +184,9 @@ use super::{
     },
     flow_control::{LiveCancellationScope, RunInterruptPhase, RunStreamFlowControl},
     tape::{
-        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE, maybe_compact_context_after_tool_results,
-        send_model_token_with_tape, send_settled_final_status, send_status_with_tape,
-        status_tape_payload,
+        maybe_compact_context_after_tool_results, send_model_token_with_tape,
+        send_settled_final_status, send_status_with_tape, status_tape_payload,
+        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
 
@@ -199,8 +198,8 @@ mod token_estimation;
 mod v2_driver;
 
 use shadow_planning::{
-    LegacyShadowPlanObservation, RunStreamShadowComparisonInput,
     run_stream_shadow_comparison_plans, selected_v2_shadow_catalog_binding,
+    LegacyShadowPlanObservation, RunStreamShadowComparisonInput,
 };
 #[cfg(test)]
 use shadow_planning::{
@@ -8876,17 +8875,8 @@ async fn persist_run_stream_provider_retry_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use super::{
-        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT,
-        MAX_LENGTH_RECOVERY_ATTEMPTS, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RUN_STREAM_HARNESS_RUNTIME_POLICY,
-        RUNTIME_SELECTED_METADATA_EVENT, RepeatedToolFailureTracker, RunLoopPhase,
-        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-        RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
-        RunStreamProviderRequestOutcome, RunStreamToolResultForModel,
-        TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS, TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
-        ToolCatalogPolicySnapshot, active_run_steering_guidance, advisor_synthesis_message,
+        active_run_steering_guidance, advisor_synthesis_message,
         agent_loop_budget_exhausted_message, agent_loop_terminal_status_message,
         apply_background_budget_guard, background_budget_overrun_message,
         background_run_budget_tokens, bounded_provider_retry_evidence,
@@ -8918,8 +8908,17 @@ mod tests {
         should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
         tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
         tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+        RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+        RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
+        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT,
+        MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
+        RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
+        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
+    use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::advisor_fanout::AdvisorRuntimeMode;
     use crate::application::agent_harness::{
         AgentHarnessSelectionDiagnostics, EMBEDDED_PALYRA_HARNESS_ID,
@@ -8934,10 +8933,10 @@ mod tests {
         tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     };
     use crate::application::runtime_kernel_v2::shadow::{
-        RuntimeDifferentialClassification, ShadowCandidatePlanInputsV1, ShadowCandidatePlannerV1,
-        ShadowComparisonPlansV1, ShadowContextSegmentSemanticV1, ShadowPlanSemanticInputsV1,
-        ShadowPolicySemanticV1, ShadowSelectionSemanticV1, ShadowToolCatalogSemanticV1,
-        ShadowV2PreContextInputV1, compare_shadow_comparison_plans_for_test,
+        compare_shadow_comparison_plans_for_test, RuntimeDifferentialClassification,
+        ShadowCandidatePlanInputsV1, ShadowCandidatePlannerV1, ShadowComparisonPlansV1,
+        ShadowContextSegmentSemanticV1, ShadowPlanSemanticInputsV1, ShadowPolicySemanticV1,
+        ShadowSelectionSemanticV1, ShadowToolCatalogSemanticV1, ShadowV2PreContextInputV1,
     };
     use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
     use crate::gateway::tests::build_test_runtime_state;
@@ -8959,14 +8958,14 @@ mod tests {
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
         AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
         CancellationContextV1, CancellationReason, CancellationScopeKind, QueueMode,
-        QueuedInputDeliveryBoundary, QueuedInputState, RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
-        RuntimeErrorPhase, RuntimeGeneration, RuntimeGenerationLane,
-        RuntimeGenerationTransitionKind, RuntimeOperationId,
+        QueuedInputDeliveryBoundary, QueuedInputState, RuntimeErrorPhase, RuntimeGeneration,
+        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
+        RUNTIME_FLOW_CONTROL_SCHEMA_VERSION,
     };
     use palyra_common::runtime_preview::RuntimePreviewMode;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{mpsc, Notify};
     use tonic::{Code, Status};
 
     #[test]
@@ -8977,13 +8976,11 @@ mod tests {
         assert!(manual.contains("\"instruction_authority\":\"none\""));
         assert!(manual.contains("\"tool_authority\":false"));
         assert!(manual.contains("bounded finding"));
-        assert!(
-            advisor_synthesis_message(
-                AdvisorRuntimeMode::Shadow,
-                Some("must not reach acting request")
-            )
-            .is_none()
-        );
+        assert!(advisor_synthesis_message(
+            AdvisorRuntimeMode::Shadow,
+            Some("must not reach acting request")
+        )
+        .is_none());
     }
 
     struct BlockingProvider {
@@ -9691,17 +9688,15 @@ mod tests {
                 .expect("V2 selection semantics should validate");
         let authoritative_semantics = ShadowPlanSemanticInputsV1::new(
             authoritative_selection,
-            vec![
-                ShadowContextSegmentSemanticV1::new(
-                    "current_turn".to_owned(),
-                    "b".repeat(64),
-                    0,
-                    "untrusted".to_owned(),
-                    "volatile".to_owned(),
-                    None,
-                )
-                .expect("legacy context semantics should validate"),
-            ],
+            vec![ShadowContextSegmentSemanticV1::new(
+                "current_turn".to_owned(),
+                "b".repeat(64),
+                0,
+                "untrusted".to_owned(),
+                "volatile".to_owned(),
+                None,
+            )
+            .expect("legacy context semantics should validate")],
             None,
             None,
             512,
@@ -10404,28 +10399,22 @@ mod tests {
         assert_eq!(admission.parent_session_id, "parent-session");
         assert_eq!(admission.child_session_id, "child-session");
 
-        assert!(
-            delegated_run_admission(
-                "delegation",
-                "wrong-child-session",
-                Some("parent-run"),
-                Some(parameter_delta.as_str()),
-            )
-            .is_err()
-        );
-        assert!(
-            delegated_run_admission("delegation", "child-session", Some("parent-run"), None)
-                .is_err()
-        );
-        assert!(
-            delegated_run_admission(
-                "manual",
-                "child-session",
-                Some("parent-run"),
-                Some(parameter_delta.as_str()),
-            )
-            .is_err()
-        );
+        assert!(delegated_run_admission(
+            "delegation",
+            "wrong-child-session",
+            Some("parent-run"),
+            Some(parameter_delta.as_str()),
+        )
+        .is_err());
+        assert!(delegated_run_admission("delegation", "child-session", Some("parent-run"), None)
+            .is_err());
+        assert!(delegated_run_admission(
+            "manual",
+            "child-session",
+            Some("parent-run"),
+            Some(parameter_delta.as_str()),
+        )
+        .is_err());
     }
 
     #[test]
@@ -10465,11 +10454,9 @@ mod tests {
 
     #[test]
     fn background_budget_overrun_detects_provider_usage_after_turn() {
-        assert!(
-            background_budget_overrun_message(1_000, 1_001)
-                .expect("usage above budget must be rejected")
-                .contains("budget_tokens=1000")
-        );
+        assert!(background_budget_overrun_message(1_000, 1_001)
+            .expect("usage above budget must be rejected")
+            .contains("budget_tokens=1000"));
         assert!(background_budget_overrun_message(1_000, 1_000).is_none());
     }
 
@@ -10928,12 +10915,10 @@ mod tests {
         assert_eq!(parsed["decision"], "compact_and_retry");
         assert_eq!(parsed["reason_code"], "provider.recovery.compact_and_retry");
         assert_eq!(parsed["redaction_level"], "status_message_redacted");
-        assert!(
-            !parsed["message"]
-                .as_str()
-                .expect("message should be a string")
-                .contains("sk-secret-token")
-        );
+        assert!(!parsed["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("sk-secret-token"));
     }
 
     #[test]
@@ -11399,10 +11384,8 @@ mod tests {
     fn incomplete_final_answer_without_tools_allows_requested_reply_only_ack_sentinel() {
         let messages = vec![ProviderMessage::user_text("Reply ACK-READY-4 only.".to_owned())];
 
-        assert!(
-            incomplete_final_answer_without_tools(Some("ACK-READY-4"), messages.as_slice())
-                .is_none()
-        );
+        assert!(incomplete_final_answer_without_tools(Some("ACK-READY-4"), messages.as_slice())
+            .is_none());
     }
 
     #[test]
@@ -11428,13 +11411,11 @@ mod tests {
 
     #[test]
     fn incomplete_final_answer_without_tools_allows_negated_deferred_work() {
-        assert!(
-            incomplete_final_answer_without_tools(
-                Some("I will not edit files because you asked only for an explanation."),
-                &[]
-            )
-            .is_none()
-        );
+        assert!(incomplete_final_answer_without_tools(
+            Some("I will not edit files because you asked only for an explanation."),
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -11736,13 +11717,11 @@ mod tests {
 
     #[test]
     fn incomplete_final_answer_without_tools_allows_plain_answers() {
-        assert!(
-            incomplete_final_answer_without_tools(
-                Some("Use `cargo test -p palyra-daemon` to run the daemon tests."),
-                &[]
-            )
-            .is_none()
-        );
+        assert!(incomplete_final_answer_without_tools(
+            Some("Use `cargo test -p palyra-daemon` to run the daemon tests."),
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -11823,13 +11802,11 @@ mod tests {
             "palyra.fs.apply_patch",
         );
 
-        assert!(
-            incomplete_terminal_final_answer(
-                Some("Created fixtures/notes-api and summarized the changed files."),
-                &state,
-            )
-            .is_none()
-        );
+        assert!(incomplete_terminal_final_answer(
+            Some("Created fixtures/notes-api and summarized the changed files."),
+            &state,
+        )
+        .is_none());
     }
 
     #[test]
@@ -11837,12 +11814,10 @@ mod tests {
         let state =
             loop_state_after_tool("Read README.md and summarize it.", "palyra.fs.read_file");
 
-        assert!(
-            incomplete_terminal_final_answer(
-                Some("I read the file. It describes the local development workflow."),
-                &state,
-            )
-            .is_none()
-        );
+        assert!(incomplete_terminal_final_answer(
+            Some("I read the file. It describes the local development workflow."),
+            &state,
+        )
+        .is_none());
     }
 }

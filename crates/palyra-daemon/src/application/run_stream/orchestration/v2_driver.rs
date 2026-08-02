@@ -6,17 +6,17 @@ use std::{
 };
 
 use palyra_common::{
-    CANONICAL_PROTOCOL_MAJOR,
     qa_runtime_path::{
-        CONTEXT_ENGINE_BINDING_EVENT, PROVIDER_LANE_ATTESTATION_EVENT, ProviderLaneAttestationEvent,
+        ProviderLaneAttestationEvent, CONTEXT_ENGINE_BINDING_EVENT, PROVIDER_LANE_ATTESTATION_EVENT,
     },
     runtime_contracts::{
-        RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE, RuntimeAttemptId,
-        RuntimeDeliveryIntentId, RuntimeErrorClass, RuntimeErrorEnvelopeV1,
+        RuntimeAttemptId, RuntimeDeliveryIntentId, RuntimeErrorClass, RuntimeErrorEnvelopeV1,
         RuntimeErrorEnvelopeV1Input, RuntimeErrorPhase, RuntimeErrorSecurityClass,
         RuntimeErrorUserVisibility, RuntimeEventId, RuntimeGenerationLane, RuntimeOperationId,
         RuntimeRetryability, RuntimeSubsystem, RuntimeTerminalOutcome, RuntimeToolProposalId,
+        RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE,
     },
+    CANONICAL_PROTOCOL_MAJOR,
 };
 use tonic::{Status, Streaming};
 use ulid::Ulid;
@@ -24,18 +24,18 @@ use ulid::Ulid;
 use crate::{
     application::{
         context_recovery::{
-            CONTEXT_RECOVERY_EVENT, ContextRecoveryAction, ContextRecoveryController,
-            ContextRecoveryPlan, ContextRecoveryStep, TokenBreakdownCategory,
             context_recovery_input_for_request, estimated_required_tokens_for_request,
-            reduce_optional_context, truncate_old_tool_tails,
+            reduce_optional_context, truncate_old_tool_tails, ContextRecoveryAction,
+            ContextRecoveryController, ContextRecoveryPlan, ContextRecoveryStep,
+            TokenBreakdownCategory, CONTEXT_RECOVERY_EVENT,
         },
         provider_turn_recovery::{
-            PROVIDER_ATTEMPT_OUTCOME_EVENT, PROVIDER_ATTEMPT_PLAN_EVENT,
-            PROVIDER_TURN_RECOVERY_EVENT, ProviderAttemptOutcome, ProviderAttemptPlan,
+            anomaly_from_terminal_validation, ProviderAttemptOutcome, ProviderAttemptPlan,
             ProviderAttemptStateMachine, ProviderRecoveryCommand, ProviderRecoverySideEffectState,
             ProviderTurnAnomaly, ProviderTurnRecoveryDecision, ProviderTurnRecoveryInput,
-            RECOVERY_ACTION_STARTED_EVENT, RecoveryActionOutcome, RecoveryExecutorInput,
-            anomaly_from_terminal_validation,
+            RecoveryActionOutcome, RecoveryExecutorInput, PROVIDER_ATTEMPT_OUTCOME_EVENT,
+            PROVIDER_ATTEMPT_PLAN_EVENT, PROVIDER_TURN_RECOVERY_EVENT,
+            RECOVERY_ACTION_STARTED_EVENT,
         },
         run_admission::PersistedV2AdmissionToken,
         run_stream::{
@@ -45,13 +45,12 @@ use crate::{
             },
             flow_control::RunStreamFlowControl,
             tape::{
-                RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE, redact_run_stream_text,
-                tool_result_event, tool_result_tape_payload,
+                redact_run_stream_text, tool_result_event, tool_result_tape_payload,
+                RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
             },
             tool_flow::{RunStreamLiveToolHost, RunStreamRetainedToolProposal},
         },
         runtime_kernel_v2::{
-            KernelLaneAuthoritySet, KernelTerminalOutcome, RuntimeKernelV2,
             context::{
                 KernelAuthorityError, KernelLaneAuthority, RuntimeKernelContext,
                 RuntimeKernelLifecycleServices, RuntimeKernelServices, RuntimeKernelTurnServices,
@@ -71,32 +70,33 @@ use crate::{
             },
             production_flow::ProductionKernelFlowAuthorities,
             production_services::{
-                PreparedProductionProviderTurn, ProductionAttemptCallbacks,
-                ProductionServiceBundle,
                 compaction::{RunStreamCompactionInput, RunStreamCompactionProjectionStore},
                 context_assembly::{
-                    PreassembledContextAssemblyInput, v2_context_retained_token_estimate,
+                    v2_context_retained_token_estimate, PreassembledContextAssemblyInput,
                 },
+                PreparedProductionProviderTurn, ProductionAttemptCallbacks,
+                ProductionServiceBundle,
             },
             selection_host::select_production_runtime,
+            KernelLaneAuthoritySet, KernelTerminalOutcome, RuntimeKernelV2,
         },
-        tool_registry::{ModelVisibleToolCatalogSnapshot, snapshot_to_provider_request_value},
+        tool_registry::{snapshot_to_provider_request_value, ModelVisibleToolCatalogSnapshot},
     },
     gateway::{
-        CANCELLED_REASON, GatewayRuntimeState, MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
-        cleanup_run_resources,
+        cleanup_run_resources, GatewayRuntimeState, CANCELLED_REASON,
+        MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
     },
     journal::{
         OrchestratorRunTerminalSettlement, OrchestratorRunTerminalSettlementRequest,
         OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent, OrchestratorUsageDelta,
     },
     model_provider::{
-        PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT, ProviderEvent, ProviderFinishReason,
-        ProviderMessage, ProviderMessageRole, ProviderOutputContentPart, ProviderRawProviderRefs,
-        ProviderRequest, ProviderResponse, ProviderTerminalDisposition,
-        ProviderTerminalValidationOutcome, ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass,
-        TerminalOutcomeClassification, bounded_provider_turn_output_for_persistence,
-        normalized_provider_stream_from_output_v2, provider_events_from_output,
+        bounded_provider_turn_output_for_persistence, normalized_provider_stream_from_output_v2,
+        provider_events_from_output, ProviderEvent, ProviderFinishReason, ProviderMessage,
+        ProviderMessageRole, ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
+        ProviderResponse, ProviderTerminalDisposition, ProviderTerminalValidationOutcome,
+        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+        PROVIDER_TERMINAL_VALIDATION_AUDIT_EVENT,
     },
     orchestrator::{RunLifecycleState, RunStateMachine},
     provider_leases::ProviderLeaseExecutionContext,
@@ -107,10 +107,10 @@ use crate::{
 };
 
 use super::{
+    append_agent_loop_tape_event, persist_accepted_final_reply_side_effects,
+    run_runtime_path_summary_payload, send_settled_final_status, status_tape_payload,
+    user_requested_summary_only_closeout, RunStreamMessageProcessingOutcome,
     RUNTIME_SELECTED_METADATA_EVENT, RUNTIME_SELECTED_METADATA_SCHEMA_V1,
-    RunStreamMessageProcessingOutcome, append_agent_loop_tape_event,
-    persist_accepted_final_reply_side_effects, run_runtime_path_summary_payload,
-    send_settled_final_status, status_tape_payload, user_requested_summary_only_closeout,
 };
 
 struct RunStreamV2Callbacks {

@@ -16,11 +16,11 @@ use palyra_common::runtime_preview::{
     RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tonic::Status;
 
 use crate::{
-    gateway::{GatewayRuntimeState, RequestContext, is_provider_reconfigured_status},
+    gateway::{is_provider_reconfigured_status, GatewayRuntimeState, RequestContext},
     model_provider::{
         PromptCacheReport, ProviderImageInput, ProviderRequest, ProviderResponse,
         ProviderStatusSnapshot,
@@ -31,8 +31,8 @@ use crate::{
     },
     provider_leases::ProviderLeaseExecutionContext,
     usage_governance::{
-        RoutingDecision, RoutingTaskClass, UsageRoutingPlanRequest, plan_usage_routing,
-        resolve_provider_binding_for_model,
+        plan_usage_routing, resolve_provider_binding_for_model, RoutingDecision, RoutingTaskClass,
+        UsageRoutingPlanRequest,
     },
 };
 
@@ -825,19 +825,19 @@ pub(crate) fn auxiliary_stop_condition(
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{mpsc, Notify};
     use ulid::Ulid;
 
     use super::{
-        AuxiliaryAuthorityProfile, AuxiliaryExecutionRequest, AuxiliaryFallbackPolicy,
-        AuxiliaryModelPreference, AuxiliaryStopConditionInput, AuxiliaryTaskType,
-        auxiliary_stop_condition, execute_auxiliary_task,
+        auxiliary_stop_condition, execute_auxiliary_task, AuxiliaryAuthorityProfile,
+        AuxiliaryExecutionRequest, AuxiliaryFallbackPolicy, AuxiliaryModelPreference,
+        AuxiliaryStopConditionInput, AuxiliaryTaskType,
     };
     use crate::{
         gateway::{
-            RequestContext,
-            runtime::tests::{SuccessfulModelProvider, provider_status_snapshot},
+            runtime::tests::{provider_status_snapshot, SuccessfulModelProvider},
             tests::build_test_runtime_state,
+            RequestContext,
         },
         journal::OrchestratorSessionUpsertRequest,
         model_provider::{

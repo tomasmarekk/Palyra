@@ -10,24 +10,24 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use palyra_common::runtime_contracts::{ArtifactRetentionPolicy, ToolResultSensitivity};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{
     sync::Semaphore,
-    time::{Instant, timeout},
+    time::{timeout, Instant},
 };
 use tonic::{Code, Status};
 use ulid::Ulid;
 
 use crate::{
     application::context_engine::{
-        AdvisorContextEvidencePack, build_advisor_context_evidence_pack,
+        build_advisor_context_evidence_pack, AdvisorContextEvidencePack,
     },
     auxiliary_executor::{
-        AuxiliaryExecutionPolicy, AuxiliaryExecutionRequest, AuxiliaryExecutionResult,
-        AuxiliaryTaskType, execute_auxiliary_task_with_policy,
+        execute_auxiliary_task_with_policy, AuxiliaryExecutionPolicy, AuxiliaryExecutionRequest,
+        AuxiliaryExecutionResult, AuxiliaryTaskType,
     },
     gateway::{GatewayRuntimeState, RequestContext},
     journal::ToolResultArtifactCreateRequest,
@@ -1668,7 +1668,11 @@ fn normalize_label(value: &str, default: &str) -> String {
         .take(96)
         .collect::<String>()
         .to_ascii_lowercase();
-    if normalized.is_empty() { default.to_owned() } else { normalized }
+    if normalized.is_empty() {
+        default.to_owned()
+    } else {
+        normalized
+    }
 }
 
 fn normalized_claim_key(value: &str) -> String {
@@ -1845,9 +1849,10 @@ mod tests {
         );
 
         assert!(plan.invocations.is_empty());
-        assert!(
-            plan.skipped.iter().all(|entry| entry.reason == AdvisorSkipReason::RecursionDenied)
-        );
+        assert!(plan
+            .skipped
+            .iter()
+            .all(|entry| entry.reason == AdvisorSkipReason::RecursionDenied));
     }
 
     #[test]
