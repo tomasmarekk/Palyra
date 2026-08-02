@@ -238,6 +238,8 @@ pub(crate) const CLARIFY_ASK_TOOL_NAME: &str = "palyra.clarify.ask";
 pub(crate) const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 pub(crate) const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 pub(crate) const ARTIFACT_READ_TOOL_NAME: &str = "palyra.artifact.read";
+pub(crate) const DOCUMENT_SEARCH_TOOL_NAME: &str = "palyra.document.search";
+pub(crate) const DOCUMENT_READ_PAGE_TOOL_NAME: &str = "palyra.document.read_page";
 pub(crate) const DELEGATION_QUERY_TOOL_NAME: &str = "palyra.delegation.query";
 pub(crate) const DELEGATION_CONTROL_TOOL_NAME: &str = "palyra.delegation.control";
 pub(crate) const WORK_GRAPH_QUERY_TOOL_NAME: &str = "palyra.work_graph.query";
@@ -275,6 +277,7 @@ pub(crate) const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
 pub(crate) const PROCESS_LIST_TOOL_NAME: &str = "palyra.process.list";
 pub(crate) const HTTP_FETCH_TOOL_NAME: &str = "palyra.http.fetch";
 pub(crate) const IMAGE_OBSERVE_TOOL_NAME: &str = "palyra.image.observe";
+pub(crate) const WEB_SEARCH_TOOL_NAME: &str = "palyra.web.search";
 pub(crate) const TOOL_PROGRAM_RUN_TOOL_NAME: &str = "palyra.tool_program.run";
 pub(crate) const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 pub(crate) const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
@@ -1118,6 +1121,15 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
+    } else if matches!(tool_name, DOCUMENT_SEARCH_TOOL_NAME | DOCUMENT_READ_PAGE_TOOL_NAME) {
+        crate::application::tool_runtime::document::execute_document_tool(
+            runtime_state,
+            context,
+            tool_name,
+            proposal_id,
+            input_json,
+        )
+        .await
     } else if tool_name == WORKSPACE_READ_FILE_TOOL_NAME {
         crate::application::tool_runtime::workspace_file::execute_workspace_read_file_tool(
             runtime_state,
@@ -1154,6 +1166,14 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if tool_name == HTTP_FETCH_TOOL_NAME {
         crate::application::tool_runtime::http_fetch::execute_http_fetch_tool(
             runtime_state,
+            proposal_id,
+            input_json,
+        )
+        .await
+    } else if tool_name == WEB_SEARCH_TOOL_NAME {
+        crate::application::tool_runtime::web_search::execute_web_search_tool(
+            runtime_state,
+            context,
             proposal_id,
             input_json,
         )

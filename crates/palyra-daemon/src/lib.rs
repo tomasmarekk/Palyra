@@ -144,6 +144,15 @@ pub fn dispatch_internal_process_supervisor() {
 pub fn dispatch_internal_codex_app_server_bridge() {
     application::codex_app_server_bridge::dispatch_internal_codex_app_server_bridge();
 }
+
+/// Dispatches the exact hidden document-extractor worker before daemon startup.
+///
+/// Normal daemon invocations return immediately. A matching hidden invocation
+/// is process-isolated and never continues into the daemon runtime.
+#[doc(hidden)]
+pub fn dispatch_internal_document_extractor() {
+    media_derived::document::dispatch_internal_document_extractor();
+}
 use app::{
     bootstrap::load_runtime_bootstrap,
     logging::init_tracing,
@@ -3406,6 +3415,9 @@ pub async fn run() -> Result<()> {
         loaded.media.clone(),
     );
     let channels = Arc::new(channels.context("failed to initialize channel connector platform")?);
+    runtime
+        .install_media_platform(Arc::clone(&channels))
+        .map_err(|_| anyhow::anyhow!("media platform was installed more than once"))?;
     #[cfg(feature = "qa-fault-injection")]
     let recovered_connector_fault_activations = channels
         .reconcile_pending_qa_fault_recoveries(&runtime.fault_injection)

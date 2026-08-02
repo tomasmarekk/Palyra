@@ -950,7 +950,7 @@
       "inactive_reason": "context_engine is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
       "trace_schema_version": 1,
       "trace_event_type": "context.engine.plan",
-      "instruction_compiler_version": 32
+      "instruction_compiler_version": 34
     },
     "execution_backend_remote_node": {
       "enabled": false,

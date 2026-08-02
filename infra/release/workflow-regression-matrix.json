@@ -819,7 +819,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "application::tool_runtime::image_observe::tests::image_observe_reads_png_metadata_without_base64_payload",
+        "application::tool_runtime::image_observe::tests::image_observe_reads_scoped_png_without_returning_bytes",
         "--",
         "--exact",
         "--test-threads=1"

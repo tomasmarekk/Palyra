@@ -32,6 +32,7 @@ use palyra_common::{
     },
     tool_catalog::ToolCatalogExposureMode,
 };
+use serde_json::json;
 use std::sync::{Mutex, OnceLock};
 
 static AVAILABILITY_PROBE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1774,13 +1775,47 @@ fn artifact_read_schema_defaults_to_text_preview() {
 fn image_observe_schema_exposes_path_and_artifact_targets() {
     let entry = registry_entry("palyra.image.observe").expect("image observe should be registered");
 
-    assert!(entry.description.contains("error_code=vision_not_available"));
-    assert!(entry.description.contains("provider_handoff_available=false"));
-    assert!(entry.description.contains("Provider/model vision capability"));
+    assert!(entry.description.contains("auxiliary vision route"));
+    assert!(entry.description.contains("instruction_authority=none"));
+    assert!(entry.description.contains("never fabricate OCR"));
     assert!(entry.input_schema["properties"].get("path").is_some());
     assert!(entry.input_schema["properties"].get("artifact_id").is_some());
+    assert_eq!(entry.input_schema["properties"]["mode"]["default"], "auto");
+    assert_eq!(entry.input_schema["properties"]["question"]["maxLength"], 2_000);
     assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
     assert_eq!(entry.projection_policy, ToolResultProjectionPolicy::InlineUnlessLarge);
+}
+
+#[test]
+fn document_schemas_are_scoped_read_only_contracts() {
+    let search =
+        registry_entry("palyra.document.search").expect("document search should be registered");
+    let read_page = registry_entry("palyra.document.read_page")
+        .expect("document page read should be registered");
+
+    assert!(search.description.contains("instruction_authority=none"));
+    assert_eq!(search.input_schema["required"], json!(["artifact_id", "query"]));
+    assert_eq!(search.input_schema["properties"]["limit"]["maximum"], 32);
+    assert_eq!(search.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+    assert!(read_page.description.contains("immutable source"));
+    assert_eq!(read_page.input_schema["required"], json!(["artifact_id", "locator"]));
+    assert_eq!(read_page.input_schema["properties"]["max_chars"]["maximum"], 16_384);
+    assert_eq!(read_page.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+}
+
+#[test]
+fn web_search_schema_is_provider_neutral_and_bounded() {
+    let entry = registry_entry("palyra.web.search").expect("web search should be registered");
+
+    assert!(entry.description.contains("provider-neutral"));
+    assert!(entry.description.contains("instruction_authority=none"));
+    assert!(entry.description.contains("citation artifacts"));
+    assert_eq!(entry.input_schema["required"], json!(["query"]));
+    assert_eq!(entry.input_schema["properties"]["query"]["maxLength"], 512);
+    assert_eq!(entry.input_schema["properties"]["provider"]["default"], "auto");
+    assert_eq!(entry.input_schema["properties"]["limit"]["maximum"], 12);
+    assert_eq!(entry.input_schema["properties"]["domains"]["maxItems"], 16);
+    assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
 }
 
 #[test]

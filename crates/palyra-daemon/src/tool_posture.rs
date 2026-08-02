@@ -818,6 +818,14 @@ pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
         recommend_always_allow: false,
     },
     ToolCatalogEntry {
+        tool_name: "palyra.web.search",
+        title: "Web search",
+        description: "Searches public sources through the governed provider-neutral search broker.",
+        category: "network",
+        risk_level: ApprovalRiskLevel::High,
+        recommend_always_allow: false,
+    },
+    ToolCatalogEntry {
         tool_name: "palyra.image.observe",
         title: "Image observe",
         description: "Returns image metadata or a structured OCR/vision capability error.",
@@ -1129,6 +1137,10 @@ const PRESET_CONSERVATIVE_CODING: &[ToolPosturePresetAssignment] = &[
         state: ToolPostureState::AskEachTime,
     },
     ToolPosturePresetAssignment {
+        tool_name: "palyra.web.search",
+        state: ToolPostureState::AskEachTime,
+    },
+    ToolPosturePresetAssignment {
         tool_name: "palyra.browser.navigate",
         state: ToolPostureState::Disabled,
     },
@@ -1192,6 +1204,10 @@ const PRESET_READ_MOSTLY_RESEARCH: &[ToolPosturePresetAssignment] = &[
     },
     ToolPosturePresetAssignment {
         tool_name: "palyra.http.fetch",
+        state: ToolPostureState::AskEachTime,
+    },
+    ToolPosturePresetAssignment {
+        tool_name: "palyra.web.search",
         state: ToolPostureState::AskEachTime,
     },
     ToolPosturePresetAssignment {
@@ -2009,5 +2025,20 @@ mod tests {
         let catalog = tool_catalog_entry("palyra.browser.storage").expect("catalog entry exists");
         assert!(!catalog.recommend_always_allow);
         assert!(catalog.description.contains("withheld"));
+    }
+
+    #[test]
+    fn web_search_catalog_keeps_network_access_reviewed() {
+        let catalog = tool_catalog_entry("palyra.web.search").expect("catalog entry exists");
+        assert_eq!(catalog.risk_level, ApprovalRiskLevel::High);
+        assert!(!catalog.recommend_always_allow);
+
+        let research = tool_posture_preset("read_mostly_research").expect("preset exists");
+        let assignment = research
+            .assignments
+            .iter()
+            .find(|assignment| assignment.tool_name == "palyra.web.search")
+            .expect("research preset should define web search posture");
+        assert_eq!(assignment.state, ToolPostureState::AskEachTime);
     }
 }

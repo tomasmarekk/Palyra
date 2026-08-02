@@ -167,6 +167,8 @@ const SAFE_CHAT_PROFILE_TOOLS: &[&str] = &[
     "sessions_status",
     "sessions_history",
     "palyra.artifact.read",
+    "palyra.document.search",
+    "palyra.document.read_page",
     "palyra.image.observe",
 ];
 
@@ -202,6 +204,9 @@ const RESEARCH_PROFILE_TOOLS: &[&str] = &[
     "palyra.memory.recall",
     "palyra.memory.session_search",
     "palyra.session_search",
+    "palyra.document.search",
+    "palyra.document.read_page",
+    "palyra.web.search",
     "palyra.http.fetch",
     "palyra.browser.session.create",
     "palyra.browser.navigate",
@@ -525,14 +530,19 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.plan.manage" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
-        "palyra.artifact.read" => Some(ToolMetadata {
-            capabilities: ARTIFACT_READ_CAPABILITIES,
-            default_sensitive: false,
-        }),
+        "palyra.artifact.read" | "palyra.document.search" | "palyra.document.read_page" => {
+            Some(ToolMetadata {
+                capabilities: ARTIFACT_READ_CAPABILITIES,
+                default_sensitive: false,
+            })
+        }
         "palyra.image.observe" => Some(ToolMetadata {
             capabilities: ARTIFACT_READ_CAPABILITIES,
             default_sensitive: false,
         }),
+        "palyra.web.search" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.http.fetch" => Some(ToolMetadata {
             capabilities: HTTP_FETCH_TOOL_CAPABILITIES,
             default_sensitive: true,
@@ -870,6 +880,20 @@ mod tests {
     fn image_observe_is_read_only_without_approval() {
         assert!(!tool_requires_approval("palyra.image.observe"));
         assert_eq!(tool_policy_capability_names("palyra.image.observe"), vec!["artifacts_read"]);
+    }
+
+    #[test]
+    fn document_tools_are_read_only_without_approval() {
+        for tool_name in ["palyra.document.search", "palyra.document.read_page"] {
+            assert!(!tool_requires_approval(tool_name));
+            assert_eq!(tool_policy_capability_names(tool_name), vec!["artifacts_read"]);
+        }
+    }
+
+    #[test]
+    fn web_search_exposes_network_capability() {
+        assert!(tool_requires_approval("palyra.web.search"));
+        assert_eq!(tool_policy_capability_names("palyra.web.search"), vec!["network"]);
     }
 
     #[test]

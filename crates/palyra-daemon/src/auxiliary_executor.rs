@@ -44,6 +44,9 @@ const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
 const AUXILIARY_OUTPUT_TEXT_LIMIT: usize = 4_000;
 const MAX_AUXILIARY_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
 const PROVIDER_RECONFIGURED_REASON_CODE: &str = "runtime.generation.provider_reconfigured";
+const VISION_STARTED_REASON_CODE: &str = "image_observe.auxiliary_vision_started";
+const VISION_COMPLETED_REASON_CODE: &str = "image_observe.auxiliary_vision_completed";
+const VISION_FAILED_REASON_CODE: &str = "image_observe.auxiliary_vision_failed";
 
 /// Auxiliary task families this executor can run; a strict subset of
 /// `AuxiliaryTaskKind` (queue-only kinds are handled elsewhere).
@@ -370,10 +373,10 @@ pub(crate) async fn execute_auxiliary_task(
         model_profile_override: None,
     })
     .await?;
-    let started_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
-        OBJECTIVE_JUDGE_STARTED_EVENT
-    } else {
-        "auxiliary executor acquired usage routing plan"
+    let started_reason = match request.task_type {
+        AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_STARTED_EVENT,
+        AuxiliaryTaskType::Vision => VISION_STARTED_REASON_CODE,
+        _ => "auxiliary executor acquired usage routing plan",
     };
     record_auxiliary_lifecycle_event(
         runtime_state,
@@ -483,10 +486,10 @@ pub(crate) async fn execute_auxiliary_task(
                 // Best-effort by design: surfacing the provider error to the
                 // caller matters more than the failure journal entry, so a
                 // journaling error here is deliberately discarded.
-                let failed_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
-                    OBJECTIVE_JUDGE_FAILED_EVENT
-                } else {
-                    "auxiliary executor provider request failed"
+                let failed_reason = match request.task_type {
+                    AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_FAILED_EVENT,
+                    AuxiliaryTaskType::Vision => VISION_FAILED_REASON_CODE,
+                    _ => "auxiliary executor provider request failed",
                 };
                 let _ = record_auxiliary_lifecycle_event(
                     runtime_state,
@@ -522,10 +525,10 @@ pub(crate) async fn execute_auxiliary_task(
         routing,
         response,
     );
-    let completed_reason = if result.task_type == AuxiliaryTaskType::ObjectiveJudge {
-        OBJECTIVE_JUDGE_COMPLETED_EVENT
-    } else {
-        "auxiliary executor completed provider request"
+    let completed_reason = match result.task_type {
+        AuxiliaryTaskType::ObjectiveJudge => OBJECTIVE_JUDGE_COMPLETED_EVENT,
+        AuxiliaryTaskType::Vision => VISION_COMPLETED_REASON_CODE,
+        _ => "auxiliary executor completed provider request",
     };
     record_auxiliary_lifecycle_event(
         runtime_state,

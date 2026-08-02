@@ -1079,6 +1079,9 @@ mod tests {
     fn execution_gate_defaults_to_read_only_tools() {
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.read_file", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.artifact.read", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.document.search", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.document.read_page", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.web.search", false));
     }
 
     #[test]

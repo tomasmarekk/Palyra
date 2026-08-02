@@ -2946,6 +2946,7 @@ pub struct GatewayRuntimeState {
         Option<Arc<crate::application::managed_coding_services::ManagedCodingRuntimeServices>>,
     local_resource_governor: crate::application::local_resource_governor::LocalResourceGovernor,
     mcp_runtime: OnceLock<Arc<crate::application::mcp_runtime::McpProductionRuntime>>,
+    media_platform: OnceLock<Arc<crate::channels::ChannelPlatform>>,
     pub(crate) journal_store: JournalStore,
     pub(crate) daemon_lifecycle: DaemonLifecycleController,
     daemon_lifecycle_transition_lock: Mutex<()>,
@@ -4347,6 +4348,50 @@ impl GatewayRuntimeState {
         self.mcp_runtime.get()
     }
 
+    /// Installs the process-wide media authority after channel startup.
+    ///
+    /// # Errors
+    /// Returns the supplied platform when another owner was already installed.
+    pub(crate) fn install_media_platform(
+        &self,
+        platform: Arc<crate::channels::ChannelPlatform>,
+    ) -> Result<(), Arc<crate::channels::ChannelPlatform>> {
+        self.media_platform.set(platform)
+    }
+
+    /// Loads a console media artifact after revalidating the active tool scope.
+    pub(crate) async fn load_scoped_media_artifact(
+        &self,
+        artifact_id: &str,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Option<crate::media::MediaArtifactPayload>, Status> {
+        let Some(platform) = self.media_platform.get().cloned() else {
+            return Ok(None);
+        };
+        let artifact_id = artifact_id.to_owned();
+        let session_id = session_id.to_owned();
+        let principal = principal.to_owned();
+        let device_id = device_id.to_owned();
+        let channel = channel.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            platform
+                .load_console_chat_attachment(
+                    artifact_id.as_str(),
+                    session_id.as_str(),
+                    principal.as_str(),
+                    device_id.as_str(),
+                    channel.as_deref(),
+                )
+                .map_err(|_| ())
+        })
+        .await
+        .map_err(|_| Status::internal("media artifact read worker panicked"))?
+        .map_err(|()| Status::internal("media artifact read failed"))
+    }
+
     /// Shares the daemon-wide durable resource authority with MCP actors.
     pub(crate) fn mcp_resource_governor(
         &self,
@@ -4784,6 +4829,7 @@ impl GatewayRuntimeState {
             managed_coding_services,
             local_resource_governor,
             mcp_runtime: OnceLock::new(),
+            media_platform: OnceLock::new(),
             journal_store,
             daemon_lifecycle: DaemonLifecycleController::new(daemon_lifecycle_startup),
             daemon_lifecycle_transition_lock: Mutex::new(()),

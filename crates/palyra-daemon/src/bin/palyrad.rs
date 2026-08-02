@@ -13,6 +13,7 @@ const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 fn main() -> Result<()> {
     palyra_daemon::dispatch_internal_process_supervisor();
     palyra_daemon::dispatch_internal_codex_app_server_bridge();
+    palyra_daemon::dispatch_internal_document_extractor();
     tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .enable_all()

@@ -6285,14 +6285,20 @@ async fn derive_console_attachment_artifacts(
     persisted.push(metadata_record);
 
     if crate::media_derived::supports_document_extraction(artifact.content_type.as_str()) {
-        match crate::media_derived::extract_document_content(
-            &crate::media_derived::AttachmentTextExtractionRequest {
-                filename: artifact.filename.as_str(),
-                content_type: artifact.content_type.as_str(),
-                bytes: artifact.bytes.as_slice(),
+        match crate::media_derived::document::extract_document_content_bounded(
+            crate::media_derived::document::DocumentExtractionRequest {
+                source_artifact_id: artifact.artifact_id.clone(),
+                filename: artifact.filename.clone(),
+                content_type: artifact.content_type.clone(),
+                expected_source_sha256: Some(artifact.sha256.clone()),
+                bytes: artifact.bytes.clone(),
+                limits: crate::media_derived::document::DocumentExtractionLimits::default(),
             },
-        ) {
-            Ok(derived) => {
+        )
+        .await
+        {
+            Ok(extraction) => {
+                let derived = extraction.content;
                 let record = state
                     .channels
                     .upsert_console_chat_derived_artifact(
@@ -6316,6 +6322,8 @@ async fn derive_console_attachment_artifacts(
                 persisted.push(record);
             }
             Err(error) => {
+                let failure_reason =
+                    format!("{}:{}:{}", error.status.as_str(), error.reason_code, error.message);
                 persisted.push(
                     state
                         .channels
@@ -6335,7 +6343,7 @@ async fn derive_console_attachment_artifacts(
                                 parser_version:
                                     crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_VERSION,
                                 background_task_id: Some(background_task_id),
-                                failure_reason: error.as_str(),
+                                failure_reason: failure_reason.as_str(),
                             },
                         )
                         .map_err(|error| error.to_string())?,

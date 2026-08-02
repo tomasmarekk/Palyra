@@ -326,7 +326,9 @@ const MAX_CODE_INTEL_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_OS_FILE_TOOL_INPUT_BYTES: usize = 384 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_DOCUMENT_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_WEB_SEARCH_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_MCP_UTILITY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 
@@ -1055,6 +1057,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "artifact_scope".to_owned(),
             execution_manifest: None,
         },
+        "palyra.document.search" | "palyra.document.read_page" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("{tool_name} requires gateway document runtime context"),
+            timed_out: false,
+            executor: "document_runtime".to_owned(),
+            sandbox_enforcement: "artifact_scope".to_owned(),
+            execution_manifest: None,
+        },
         "palyra.image.observe" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1063,6 +1074,15 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "image_observe".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
+        },
+        "palyra.web.search" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.web.search requires gateway web search runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_web_search".to_owned(),
+            sandbox_enforcement: "egress_proxy_and_source_artifacts".to_owned(),
             execution_manifest: None,
         },
         "palyra.http.fetch" => ToolExecutionRawResult {
@@ -1267,7 +1287,10 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "sessions_interrupt"
                 | "sessions_switch_model"
                 | "palyra.artifact.read"
+                | "palyra.document.search"
+                | "palyra.document.read_page"
                 | "palyra.image.observe"
+                | "palyra.web.search"
                 | "palyra.http.fetch"
                 | "palyra.process.run"
                 | "palyra.exec.run"
@@ -1349,10 +1372,14 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "os_file".to_owned()
     } else if tool_name == "palyra.http.fetch" {
         "gateway_http_fetch".to_owned()
+    } else if tool_name == "palyra.web.search" {
+        "gateway_web_search".to_owned()
     } else if is_mcp_utility_tool(tool_name) {
         "mcp_broker".to_owned()
     } else if tool_name == "palyra.image.observe" {
         "image_observe".to_owned()
+    } else if matches!(tool_name, "palyra.document.search" | "palyra.document.read_page") {
+        "document_runtime".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_broker".to_owned()
     } else if tool_name == "palyra.context.inspect" {
@@ -1405,7 +1432,10 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         } else {
             "delegation_runtime".to_owned()
         }
-    } else if tool_name == "palyra.artifact.read" {
+    } else if matches!(
+        tool_name,
+        "palyra.artifact.read" | "palyra.document.search" | "palyra.document.read_page"
+    ) {
         "gateway_artifacts".to_owned()
     } else if tool_name == "palyra.plugin.run" {
         "sandbox_tier_a".to_owned()
@@ -1453,7 +1483,9 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
             MAX_WORK_GRAPH_TOOL_INPUT_BYTES
         }
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
+        "palyra.document.search" | "palyra.document.read_page" => MAX_DOCUMENT_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
+        "palyra.web.search" => MAX_WEB_SEARCH_TOOL_INPUT_BYTES,
         tool_name if is_mcp_utility_tool(tool_name) => MAX_MCP_UTILITY_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run"
@@ -1529,11 +1561,16 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
         "approved_os_paths".to_owned()
     } else if tool_name == "palyra.http.fetch" {
         "ssrf_guard".to_owned()
+    } else if tool_name == "palyra.web.search" {
+        "egress_proxy_and_source_artifacts".to_owned()
     } else if is_mcp_utility_tool(tool_name) {
         "mcp_host_mediated".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_service".to_owned()
-    } else if tool_name == "palyra.artifact.read" {
+    } else if matches!(
+        tool_name,
+        "palyra.artifact.read" | "palyra.document.search" | "palyra.document.read_page"
+    ) {
         "artifact_scope".to_owned()
     } else if matches!(
         tool_name,
@@ -1915,9 +1952,10 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, is_runtime_supported_tool,
-        tool_input_limit_bytes, tool_metadata, tool_policy_snapshot, tool_requires_approval,
-        ToolCallConfig, ToolCapability, ToolRequestContext, MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
-        MAX_MCP_UTILITY_TOOL_INPUT_BYTES, MCP_UTILITY_TOOL_NAMES,
+        sandbox_enforcement_for_tool, tool_executor_name, tool_input_limit_bytes, tool_metadata,
+        tool_policy_snapshot, tool_requires_approval, ToolCallConfig, ToolCapability,
+        ToolRequestContext, MAX_DOCUMENT_TOOL_INPUT_BYTES, MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
+        MAX_MCP_UTILITY_TOOL_INPUT_BYTES, MAX_WEB_SEARCH_TOOL_INPUT_BYTES, MCP_UTILITY_TOOL_NAMES,
     };
     use crate::sandbox_runner::{
         EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
@@ -2424,6 +2462,7 @@ mod tests {
         assert!(!tool_requires_approval("palyra.routines.query"));
         assert!(!tool_requires_approval("palyra.artifact.read"));
         assert!(!tool_requires_approval("palyra.image.observe"));
+        assert!(tool_requires_approval("palyra.web.search"));
         assert!(!tool_requires_approval("palyra.fs.read_file"));
         assert!(!tool_requires_approval("palyra.fs.list_dir"));
         assert!(!tool_requires_approval("palyra.fs.search"));
@@ -2496,11 +2535,41 @@ mod tests {
     }
 
     #[test]
+    fn document_tools_expose_artifact_capability_without_default_approval() {
+        for tool_name in ["palyra.document.search", "palyra.document.read_page"] {
+            let metadata = tool_metadata(tool_name).expect("document tool metadata");
+            assert_eq!(metadata.capabilities, &[ToolCapability::ArtifactsRead]);
+            assert!(!metadata.default_sensitive);
+            assert!(!tool_requires_approval(tool_name));
+            assert!(is_runtime_supported_tool(tool_name));
+            assert_eq!(tool_input_limit_bytes(tool_name), MAX_DOCUMENT_TOOL_INPUT_BYTES);
+        }
+    }
+
+    #[test]
     fn http_fetch_tool_exposes_network_and_secret_read_capabilities() {
         let metadata = tool_metadata("palyra.http.fetch").expect("http fetch metadata");
         assert_eq!(metadata.capabilities, &[ToolCapability::Network, ToolCapability::SecretsRead]);
         assert!(metadata.default_sensitive);
         assert!(tool_requires_approval("palyra.http.fetch"));
+    }
+
+    #[test]
+    fn web_search_is_a_host_routed_bounded_network_tool() {
+        let metadata = tool_metadata("palyra.web.search").expect("web search metadata");
+        assert_eq!(metadata.capabilities, &[ToolCapability::Network]);
+        assert!(metadata.default_sensitive);
+        assert!(tool_requires_approval("palyra.web.search"));
+        assert!(is_runtime_supported_tool("palyra.web.search"));
+        assert_eq!(tool_input_limit_bytes("palyra.web.search"), MAX_WEB_SEARCH_TOOL_INPUT_BYTES);
+        assert_eq!(
+            tool_executor_name(&allowlisted_config(), "palyra.web.search"),
+            "gateway_web_search"
+        );
+        assert_eq!(
+            sandbox_enforcement_for_tool(&allowlisted_config(), "palyra.web.search"),
+            "egress_proxy_and_source_artifacts"
+        );
     }
 
     #[test]

@@ -10533,7 +10533,7 @@ where
 }
 
 #[cfg(windows)]
-fn resume_suspended_windows_process(pid: u32) -> io::Result<()> {
+pub(crate) fn resume_suspended_windows_process(pid: u32) -> io::Result<()> {
     // SAFETY: TH32CS_SNAPTHREAD ignores the process-id parameter and returns an owned snapshot
     // handle on success.
     let snapshot_handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };

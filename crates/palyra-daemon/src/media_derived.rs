@@ -21,6 +21,8 @@ use zip::ZipArchive;
 
 use crate::model_provider::AudioTranscriptionResponse;
 
+pub(crate) mod document;
+
 /// Parser identity persisted with each derived row; bump the version when
 /// output for the same input changes, so stale rows can be detected.
 pub const METADATA_SUMMARY_PARSER_NAME: &str = "attachment-metadata";
@@ -29,7 +31,7 @@ pub const METADATA_SUMMARY_PARSER_VERSION: &str = "1";
 /// Parser identity for document text extraction.
 pub const DOCUMENT_EXTRACTOR_PARSER_NAME: &str = "attachment-document-extractor";
 /// Version paired with [`DOCUMENT_EXTRACTOR_PARSER_NAME`].
-pub const DOCUMENT_EXTRACTOR_PARSER_VERSION: &str = "1";
+pub const DOCUMENT_EXTRACTOR_PARSER_VERSION: &str = "2";
 /// Parser identity for audio transcription formatting.
 pub const AUDIO_TRANSCRIBER_PARSER_NAME: &str = "attachment-audio-transcriber";
 /// Version paired with [`AUDIO_TRANSCRIBER_PARSER_NAME`].
