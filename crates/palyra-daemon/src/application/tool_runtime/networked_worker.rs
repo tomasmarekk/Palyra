@@ -15,13 +15,21 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{
     redaction::{redact_auth_error, redact_auth_error_strict, redact_url_segments_in_text},
     runtime_contracts::{
-        RuntimeGeneration, RuntimeRunId, RuntimeSessionId, REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
+        ArtifactRetentionPolicy, RuntimeGeneration, RuntimeRunId, RuntimeSessionId,
+        ToolResultArtifactRef, ToolResultSensitivity, REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
     },
+    tool_catalog::{tool_metadata, tool_policy_capability_names, tool_requires_approval},
 };
 use palyra_workerd::{
+    computer_use::{
+        ComputerUseAction, ComputerUseApproval, ComputerUseBackendKind,
+        ComputerUseCapabilityProfile, ComputerUseRiskClass, ComputerUseTaskContract,
+        ComputerUseToolInput, ComputerUseWorkerOutput,
+    },
     remote_protocol::{RemoteTaskOutcome, RemoteWorkerProtocolV1},
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
     WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding,
@@ -35,10 +43,15 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    application::approvals::build_tool_approval_subject_id,
     execution_backends::{ExecutionBackendPreference, WorkspaceStrategyDescriptor},
     gateway::{
         current_unix_ms, GatewayRuntimeState, ManagedRuntimeHealthAuthority,
-        ManagedRuntimeHealthFamily, ToolRuntimeExecutionContext,
+        ManagedRuntimeHealthFamily, ToolRuntimeExecutionContext, APPROVAL_POLICY_ID,
+    },
+    journal::{
+        ApprovalDecision, ApprovalDecisionScope, ApprovalRecord, ApprovalSubjectType,
+        ToolResultArtifactCreateRequest,
     },
     node_runtime::{
         CapabilityDispatchAuthorizer, CapabilityExecutionNotification, CapabilityExecutionReceiver,
@@ -58,6 +71,12 @@ const NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
 const NETWORKED_WORKER_NODE_CAPABILITY_MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
 const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_BYTES: usize = 384 * 1024;
 const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_ENTRIES: usize = 128;
+const COMPUTER_USE_VIEWPORT_WIDTH: u32 = 320;
+const COMPUTER_USE_VIEWPORT_HEIGHT: u32 = 180;
+const COMPUTER_USE_MAX_WALL_CLOCK_MS: u64 = 25_000;
+const COMPUTER_USE_MAX_WAIT_MS: u64 = 5_000;
+const COMPUTER_USE_MAX_SCREENSHOT_BYTES: u64 = 256 * 1024;
+const COMPUTER_USE_APPROVAL_JOURNAL_WINDOW: usize = 512;
 const NETWORKED_WORKER_SKIPPED_DIRECTORIES: &[&str] =
     &[".git", "node_modules", "target", "dist", "build"];
 
@@ -107,6 +126,12 @@ struct NetworkedWorkerTaskRequest<'a> {
     session_id: &'a str,
     run_generation: RuntimeGeneration,
     workspace_transfer: WorkerRemoteWorkspaceTransfer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComputerUseHostApprovalAuthority {
+    approval_id: String,
+    expires_at_unix_ms: Option<i64>,
 }
 
 /// One remote worker response plus optional node-delivery settlement identity.
@@ -667,6 +692,20 @@ async fn execute_networked_worker_tool_owned(
             "networked_worker_fail_closed",
         );
     }
+    let is_computer_use = matches!(
+        WorkerRemoteToolKind::from_tool_name(tool_name),
+        Some(WorkerRemoteToolKind::ComputerUse)
+    );
+    if is_computer_use && !runtime_state.config.feature_rollouts.computer_use.enabled {
+        return networked_worker_failure_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            "computer use is disabled; set feature_rollouts.computer_use=true together with the networked-worker rollout"
+                .to_owned(),
+            "computer_use_rollout_disabled",
+        );
+    }
     let (generation_session_id, run_generation) =
         match runtime_state.runtime_generation_for_tool_blocking(context.run_id) {
             Ok(Some(authority)) => authority,
@@ -722,6 +761,25 @@ async fn execute_networked_worker_tool_owned(
             "networked_worker_stale_generation",
         );
     }
+
+    let computer_use_approval = if is_computer_use {
+        match resolve_computer_use_host_approval(runtime_state, context, proposal_id, input_json)
+            .await
+        {
+            Ok(approval) => Some(approval),
+            Err(error) => {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    error,
+                    "computer_use_approval_missing",
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let request = match build_worker_lease_request(
         runtime_state,
@@ -845,6 +903,51 @@ async fn execute_networked_worker_tool_owned(
                 );
             }
         };
+    let remote_input_json = if is_computer_use {
+        match build_host_bound_computer_use_task(
+            input_json,
+            proposal_id,
+            &lease,
+            run_generation,
+            worker_attestation.image_digest_sha256.as_str(),
+            computer_use_approval.as_ref(),
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                runtime_state.record_managed_runtime_health_observation_for_run(
+                    &health_authority,
+                    &generation_session_id,
+                    &run_identity,
+                    run_generation,
+                    false,
+                    "runtime.health.computer_use_input_invalid",
+                );
+                if let Err(cleanup_error) =
+                    record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+                {
+                    return networked_worker_failure_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        format!(
+                            "computer-use input and cleanup failed: {error}; {}",
+                            cleanup_error.message()
+                        ),
+                        "networked_worker_cleanup_failed",
+                    );
+                }
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    error,
+                    "computer_use_input_invalid",
+                );
+            }
+        }
+    } else {
+        input_json.to_vec()
+    };
     let workspace_transfer =
         match prepare_networked_worker_workspace_transfer(&lease, tool_name, input_json).await {
             Ok(transfer) => transfer,
@@ -880,7 +983,7 @@ async fn execute_networked_worker_tool_owned(
     let remote_request = match build_worker_remote_tool_request(NetworkedWorkerTaskRequest {
         proposal_id,
         tool_name,
-        input_json,
+        input_json: remote_input_json.as_slice(),
         lease: &lease,
         worker_attestation: &worker_attestation,
         session_id: generation_session_id.as_str(),
@@ -1124,6 +1227,53 @@ async fn execute_networked_worker_tool_owned(
             "networked_worker_canonical_protocol_failed",
         );
     }
+    let computer_use_projection =
+        if matches!(remote_request.tool_kind, WorkerRemoteToolKind::ComputerUse) {
+            match persist_computer_use_evidence(
+                runtime_state,
+                context,
+                proposal_id,
+                &remote_request,
+                &remote_result,
+            )
+            .await
+            {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    runtime_state.record_managed_runtime_health_observation_for_run(
+                        &health_authority,
+                        &generation_session_id,
+                        &run_identity,
+                        run_generation,
+                        false,
+                        "runtime.health.computer_use_evidence_invalid",
+                    );
+                    if let Err(cleanup_error) =
+                        record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+                    {
+                        return networked_worker_failure_outcome(
+                            proposal_id,
+                            tool_name,
+                            input_json,
+                            format!(
+                                "computer-use evidence and cleanup failed: {error}; {}",
+                                cleanup_error.message()
+                            ),
+                            "networked_worker_cleanup_failed",
+                        );
+                    }
+                    return networked_worker_failure_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        error,
+                        "computer_use_evidence_invalid",
+                    );
+                }
+            }
+        } else {
+            None
+        };
     let receipt = crate::gateway::NetworkedWorkerArtifactReceipt {
         request_id: remote_result.request_id.clone(),
         proposal_id: proposal_id.to_owned(),
@@ -1203,10 +1353,365 @@ async fn execute_networked_worker_tool_owned(
         &run_identity,
         run_generation,
         true,
-        "runtime.health.worker_dispatch_succeeded",
+        if matches!(remote_request.tool_kind, WorkerRemoteToolKind::ComputerUse) {
+            "runtime.health.computer_use_dispatch_succeeded"
+        } else {
+            "runtime.health.worker_dispatch_succeeded"
+        },
     );
 
-    networked_worker_outcome_from_validated_remote_result(&remote_request, remote_result)
+    networked_worker_outcome_from_validated_remote_result_with_projection(
+        &remote_request,
+        remote_result,
+        computer_use_projection,
+        input_json,
+    )
+}
+
+async fn resolve_computer_use_host_approval(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> Result<ComputerUseHostApprovalAuthority, String> {
+    const TOOL_NAME: &str = "palyra.computer.use";
+    if tool_metadata(TOOL_NAME).is_none()
+        || !tool_requires_approval(TOOL_NAME)
+        || tool_policy_capability_names(TOOL_NAME)
+            != vec!["filesystem_read", "network", "secrets_read"]
+    {
+        return Err(
+            "computer-use catalog metadata is missing or does not require the host security gate"
+                .to_owned(),
+        );
+    }
+
+    let snapshot = runtime_state
+        .journal_snapshot_for_run(context.run_id.to_owned(), COMPUTER_USE_APPROVAL_JOURNAL_WINDOW)
+        .await
+        .map_err(|error| {
+            format!("computer-use approval journal could not be verified: {}", error.message())
+        })?;
+    let mut candidate_approval_ids = Vec::new();
+    for event in snapshot.events.iter().rev() {
+        if event.session_id != context.session_id
+            || event.run_id != context.run_id
+            || event.principal != context.principal
+            || event.device_id != context.device_id
+            || event.channel.as_deref() != context.channel
+        {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload_json.as_str())
+        else {
+            continue;
+        };
+        if payload.get("event").and_then(serde_json::Value::as_str) != Some("approval.resolved")
+            || payload.get("proposal_id").and_then(serde_json::Value::as_str) != Some(proposal_id)
+            || payload.get("decision").and_then(serde_json::Value::as_str) != Some("allow")
+        {
+            continue;
+        }
+        if let Some(approval_id) = payload
+            .get("approval_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            candidate_approval_ids.push(approval_id.to_owned());
+        }
+    }
+
+    let expected_subject = build_tool_approval_subject_id(TOOL_NAME, None, input_json);
+    let now_unix_ms = current_unix_ms();
+    for approval_id in candidate_approval_ids {
+        let Some(record) =
+            runtime_state.approval_record(approval_id.clone()).await.map_err(|error| {
+                format!("computer-use approval record could not be verified: {}", error.message())
+            })?
+        else {
+            continue;
+        };
+        if let Ok(authority) = validate_computer_use_host_approval_record(
+            &record,
+            context,
+            approval_id.as_str(),
+            expected_subject.as_str(),
+            now_unix_ms,
+        ) {
+            return Ok(authority);
+        }
+    }
+    Err("computer use requires a durable allowed host approval for this exact tool proposal"
+        .to_owned())
+}
+
+fn validate_computer_use_host_approval_record(
+    record: &ApprovalRecord,
+    context: ToolRuntimeExecutionContext<'_>,
+    approval_id: &str,
+    expected_subject: &str,
+    now_unix_ms: i64,
+) -> Result<ComputerUseHostApprovalAuthority, String> {
+    const TOOL_NAME: &str = "palyra.computer.use";
+    let subject_is_exact_or_skill_scoped = record.subject_id == expected_subject
+        || record
+            .subject_id
+            .strip_prefix(expected_subject)
+            .is_some_and(|suffix| suffix.starts_with("|skill:") && suffix.len() > 7);
+    let details = serde_json::from_str::<serde_json::Value>(record.prompt.details_json.as_str())
+        .map_err(|_| "computer-use approval details are invalid".to_owned())?;
+    let deny_is_default = record
+        .prompt
+        .options
+        .iter()
+        .any(|option| option.default_selected && option.option_id.starts_with("deny"));
+    let allow_is_default = record
+        .prompt
+        .options
+        .iter()
+        .any(|option| option.default_selected && option.option_id.starts_with("allow"));
+    if record.approval_id != approval_id
+        || record.session_id != context.session_id
+        || record.run_id != context.run_id
+        || record.principal != context.principal
+        || record.device_id != context.device_id
+        || record.channel.as_deref() != context.channel
+        || record.subject_type != ApprovalSubjectType::Tool
+        || !subject_is_exact_or_skill_scoped
+        || record.prompt.subject_id != record.subject_id
+        || record.decision != Some(ApprovalDecision::Allow)
+        || record.resolved_at_unix_ms.is_none_or(|resolved| resolved > now_unix_ms)
+        || record.requested_at_unix_ms > now_unix_ms
+        || details.get("tool_name").and_then(serde_json::Value::as_str) != Some(TOOL_NAME)
+        || details.get("subject_id").and_then(serde_json::Value::as_str)
+            != Some(record.subject_id.as_str())
+        || details
+            .pointer("/input_json/permission_request/source")
+            .and_then(serde_json::Value::as_str)
+            != Some("tool_proposal")
+        || details
+            .pointer("/input_json/permission_request/tool_name")
+            .and_then(serde_json::Value::as_str)
+            != Some(TOOL_NAME)
+        || details
+            .pointer("/input_json/permission_request/subject_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(record.subject_id.as_str())
+        || details
+            .pointer("/input_json/permission_request/requested_scope")
+            .and_then(serde_json::Value::as_str)
+            != Some("single_tool_call")
+        || details
+            .pointer("/input_json/permission_request/requester/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("host_approval_relay")
+        || details
+            .pointer("/input_json/permission_request/execution_backend/resolved")
+            .and_then(serde_json::Value::as_str)
+            != Some("networked_worker")
+        || details
+            .pointer("/input_json/permission_request/execution_backend/approval_required")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || record.policy_snapshot.policy_id != APPROVAL_POLICY_ID
+        || record.policy_snapshot.evaluation_summary
+            != "action=tool.execute resource=tool:palyra.computer.use approval_required=true deny_by_default=true"
+        || !deny_is_default
+        || allow_is_default
+    {
+        return Err(
+            "computer-use approval record is not bound to the standard sensitive-tool host gate"
+                .to_owned(),
+        );
+    }
+    let expires_at_unix_ms = match record.decision_scope {
+        Some(ApprovalDecisionScope::Once | ApprovalDecisionScope::Session) => None,
+        Some(ApprovalDecisionScope::Timeboxed) => {
+            let ttl_ms = record
+                .decision_scope_ttl_ms
+                .filter(|ttl_ms| *ttl_ms > 0)
+                .ok_or_else(|| "computer-use timeboxed approval omitted its TTL".to_owned())?;
+            let expiry = record.updated_at_unix_ms.saturating_add(ttl_ms);
+            if expiry <= now_unix_ms {
+                return Err("computer-use host approval has expired".to_owned());
+            }
+            Some(expiry)
+        }
+        None => return Err("computer-use approval has no decision scope".to_owned()),
+    };
+    Ok(ComputerUseHostApprovalAuthority { approval_id: approval_id.to_owned(), expires_at_unix_ms })
+}
+
+fn build_host_bound_computer_use_task(
+    input_json: &[u8],
+    proposal_id: &str,
+    lease: &WorkerLease,
+    run_generation: RuntimeGeneration,
+    isolation_attestation_sha256: &str,
+    approval_authority: Option<&ComputerUseHostApprovalAuthority>,
+) -> Result<Vec<u8>, String> {
+    let input = serde_json::from_slice::<ComputerUseToolInput>(input_json)
+        .map_err(|error| format!("computer-use input must match its strict schema: {error}"))?;
+    input.validate().map_err(|error| error.to_string())?;
+    let mut filesystem_roots = input
+        .actions
+        .iter()
+        .filter_map(|requested| match &requested.action {
+            ComputerUseAction::FileChooser { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    filesystem_roots.sort();
+    filesystem_roots.dedup();
+    let approval_authority = approval_authority.ok_or_else(|| {
+        "computer-use host approval authority is required before worker dispatch".to_owned()
+    })?;
+    let approval = ComputerUseApproval {
+        approval_id: approval_authority.approval_id.clone(),
+        task_id: proposal_id.to_owned(),
+        run_generation,
+        approved_risks: vec![
+            ComputerUseRiskClass::CredentialEntry,
+            ComputerUseRiskClass::Payment,
+            ComputerUseRiskClass::DestructiveFileOperation,
+            ComputerUseRiskClass::PrivilegePrompt,
+        ],
+        expires_at_unix_ms: approval_authority
+            .expires_at_unix_ms
+            .map_or(lease.expires_at_unix_ms, |expiry| expiry.min(lease.expires_at_unix_ms)),
+    };
+    let contract = ComputerUseTaskContract {
+        v: input.v,
+        initial_ui_text: input.initial_ui_text,
+        profile: ComputerUseCapabilityProfile {
+            capability: "computer.use".to_owned(),
+            backend: ComputerUseBackendKind::IsolatedVirtualDesktop,
+            isolation_attestation_sha256: isolation_attestation_sha256.to_owned(),
+            host_desktop_access: false,
+            filesystem_roots,
+            network_hosts: Vec::new(),
+            clipboard_read: false,
+            clipboard_write: false,
+            max_actions: u32::try_from(input.actions.len()).unwrap_or(u32::MAX),
+            max_wall_clock_ms: COMPUTER_USE_MAX_WALL_CLOCK_MS,
+            max_wait_ms: COMPUTER_USE_MAX_WAIT_MS,
+            viewport_width: COMPUTER_USE_VIEWPORT_WIDTH,
+            viewport_height: COMPUTER_USE_VIEWPORT_HEIGHT,
+            max_screenshot_bytes: COMPUTER_USE_MAX_SCREENSHOT_BYTES,
+        },
+        actions: input.actions,
+        approval: Some(approval),
+    };
+    contract.profile.validate().map_err(|error| error.to_string())?;
+    serde_json::to_vec(&contract)
+        .map_err(|error| format!("failed to encode host-bound computer-use task: {error}"))
+}
+
+async fn persist_computer_use_evidence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: &WorkerRemoteToolResultEnvelope,
+) -> Result<Vec<u8>, String> {
+    let protocol = request
+        .canonical_protocol
+        .as_ref()
+        .ok_or_else(|| "computer-use result omitted canonical protocol".to_owned())?;
+    let contract = serde_json::from_str::<ComputerUseTaskContract>(request.input_json.as_str())
+        .map_err(|error| format!("computer-use canonical task is invalid: {error}"))?;
+    let output = serde_json::from_str::<ComputerUseWorkerOutput>(result.output_json.as_str())
+        .map_err(|error| format!("computer-use worker output is invalid: {error}"))?;
+    output
+        .validate_against(&protocol.task, &contract.profile)
+        .map_err(|error| error.to_string())?;
+    if output.succeeded != result.success {
+        return Err("computer-use terminal result disagrees with its action evidence".to_owned());
+    }
+
+    let mut screenshot_artifacts = Vec::<ToolResultArtifactRef>::with_capacity(2);
+    for screenshot in &output.screenshots {
+        let bytes = BASE64_STANDARD
+            .decode(screenshot.bytes_base64.as_bytes())
+            .map_err(|_| "computer-use screenshot base64 is invalid".to_owned())?;
+        let artifact = runtime_state
+            .create_tool_result_artifact(ToolResultArtifactCreateRequest {
+                artifact_id: Ulid::new().to_string(),
+                session_id: context.session_id.to_owned(),
+                run_id: context.run_id.to_owned(),
+                proposal_id: proposal_id.to_owned(),
+                tool_name: request.tool_name.clone(),
+                mime_type: screenshot.artifact.media_type.clone(),
+                sensitivity: ToolResultSensitivity::ApprovalRiskData,
+                retention: ArtifactRetentionPolicy::keep(),
+                redacted_preview: format!(
+                    "redacted computer-use screenshot generation={} sha256={}",
+                    screenshot.artifact.observation_generation, screenshot.artifact.sha256
+                ),
+                content: bytes,
+            })
+            .await
+            .map_err(|error| {
+                format!("failed to persist computer-use screenshot: {}", error.message())
+            })?;
+        if artifact.digest_sha256 != screenshot.artifact.sha256
+            || artifact.size_bytes != screenshot.artifact.size_bytes
+        {
+            return Err(
+                "persisted computer-use screenshot does not match worker integrity metadata"
+                    .to_owned(),
+            );
+        }
+        screenshot_artifacts.push(artifact);
+    }
+
+    let action_trace_bytes = serde_json::to_vec(&output.action_trace)
+        .map_err(|error| format!("failed to encode computer-use action trace: {error}"))?;
+    if sha256_hex(action_trace_bytes.as_slice()) != output.action_trace_sha256 {
+        return Err("computer-use action trace digest changed before persistence".to_owned());
+    }
+    let action_trace_artifact = runtime_state
+        .create_tool_result_artifact(ToolResultArtifactCreateRequest {
+            artifact_id: Ulid::new().to_string(),
+            session_id: context.session_id.to_owned(),
+            run_id: context.run_id.to_owned(),
+            proposal_id: proposal_id.to_owned(),
+            tool_name: request.tool_name.clone(),
+            mime_type: "application/vnd.palyra.computer-use-actions+json".to_owned(),
+            sensitivity: ToolResultSensitivity::ApprovalRiskData,
+            retention: ArtifactRetentionPolicy::keep(),
+            redacted_preview: format!(
+                "computer-use action trace count={} sha256={}",
+                output.action_trace.len(),
+                output.action_trace_sha256
+            ),
+            content: action_trace_bytes,
+        })
+        .await
+        .map_err(|error| {
+            format!("failed to persist computer-use action trace: {}", error.message())
+        })?;
+    if action_trace_artifact.digest_sha256 != output.action_trace_sha256 {
+        return Err("persisted computer-use action trace digest is invalid".to_owned());
+    }
+
+    serde_json::to_vec(&serde_json::json!({
+        "v": output.v,
+        "task_id": output.task_id,
+        "run_generation": output.run_generation,
+        "scope_profile_sha256": output.scope_profile_sha256,
+        "initial_observation": output.initial_observation,
+        "final_observation": output.final_observation,
+        "screenshot_artifacts": screenshot_artifacts,
+        "action_trace_artifact": action_trace_artifact,
+        "action_trace_sha256": output.action_trace_sha256,
+        "action_receipts": output.action_trace,
+        "succeeded": output.succeeded,
+        "reason_code": output.reason_code,
+        "raw_screenshot_bytes_exposed": false,
+        "instruction_authority": "none",
+    }))
+    .map_err(|error| format!("failed to encode computer-use evidence projection: {error}"))
 }
 
 async fn prepare_networked_worker_workspace_transfer(
@@ -1306,6 +1811,16 @@ fn build_scoped_networked_worker_workspace(
                             relative.display()
                         ));
                     }
+                }
+            }
+        }
+        WorkerRemoteToolKind::ComputerUse => {
+            let input = serde_json::from_slice::<ComputerUseToolInput>(input_json)
+                .map_err(|error| format!("computer-use input is invalid: {error}"))?;
+            input.validate().map_err(|error| error.to_string())?;
+            for requested in input.actions {
+                if let ComputerUseAction::FileChooser { path } = requested.action {
+                    add_remote_workspace_file(&root, Path::new(path.as_str()), &mut entries)?;
                 }
             }
         }
@@ -1985,26 +2500,44 @@ fn networked_worker_outcome_from_remote_result(
     networked_worker_outcome_from_validated_remote_result(request, result)
 }
 
+#[cfg(test)]
 fn networked_worker_outcome_from_validated_remote_result(
     request: &WorkerRemoteToolRequestEnvelope,
     result: WorkerRemoteToolResultEnvelope,
+) -> ToolExecutionOutcome {
+    let original_input_json = request.input_json.as_bytes();
+    networked_worker_outcome_from_validated_remote_result_with_projection(
+        request,
+        result,
+        None,
+        original_input_json,
+    )
+}
+
+fn networked_worker_outcome_from_validated_remote_result_with_projection(
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: WorkerRemoteToolResultEnvelope,
+    projected_output_json: Option<Vec<u8>>,
+    original_input_json: &[u8],
 ) -> ToolExecutionOutcome {
     if let Err(error) = validate_networked_worker_canonical_outcome(request, &result) {
         return networked_worker_failure_outcome(
             request.proposal_id.as_str(),
             request.tool_name.as_str(),
-            request.input_json.as_bytes(),
+            original_input_json,
             format!("networked worker canonical outcome failed validation: {error}"),
             "networked_worker_canonical_protocol_failed",
         );
     }
     let manifest = networked_worker_execution_manifest(request, &result);
+    let output_json =
+        projected_output_json.unwrap_or_else(|| result.output_json.as_bytes().to_vec());
     build_tool_execution_outcome_with_manifest(
         request.proposal_id.as_str(),
         request.tool_name.as_str(),
-        request.input_json.as_bytes(),
+        original_input_json,
         result.success,
-        result.output_json.into_bytes(),
+        output_json,
         result.error.unwrap_or_default(),
         false,
         format!("networked_worker:{}", result.worker_id),
@@ -2137,6 +2670,24 @@ fn networked_worker_allowed_paths(
                 })?;
             remote_patch_paths(patch)?
         }
+        WorkerRemoteToolKind::ComputerUse => {
+            let input = serde_json::from_slice::<ComputerUseToolInput>(input_json)
+                .map_err(|error| format!("computer-use input is invalid: {error}"))?;
+            input.validate().map_err(|error| error.to_string())?;
+            let paths = input
+                .actions
+                .into_iter()
+                .filter_map(|requested| match requested.action {
+                    ComputerUseAction::FileChooser { path } => Some(PathBuf::from(path)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                vec![PathBuf::from(".")]
+            } else {
+                paths
+            }
+        }
         _ => {
             return Err(format!(
                 "reference network worker does not implement portable scope for {}",
@@ -2163,6 +2714,7 @@ fn remote_tool_kind_uses_read_only_workspace(tool_kind: WorkerRemoteToolKind) ->
             | WorkerRemoteToolKind::FsList
             | WorkerRemoteToolKind::FsSearch
             | WorkerRemoteToolKind::ArtifactRead
+            | WorkerRemoteToolKind::ComputerUse
     )
 }
 
@@ -2269,18 +2821,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_scoped_networked_worker_workspace, networked_worker_outcome_from_remote_result,
-        networked_worker_supports_tool, networked_worker_tool_capability,
-        remote_tool_kind_uses_read_only_workspace, sha256_hex,
+        build_host_bound_computer_use_task, build_scoped_networked_worker_workspace,
+        networked_worker_outcome_from_remote_result, networked_worker_supports_tool,
+        networked_worker_tool_capability, remote_tool_kind_uses_read_only_workspace, sha256_hex,
+        validate_computer_use_host_approval_record, ComputerUseHostApprovalAuthority,
     };
     use palyra_common::runtime_contracts::RuntimeGeneration;
     use palyra_workerd::{
-        WorkerArtifactTransport, WorkerCleanupReport, WorkerRemoteIdentity,
-        WorkerRemoteLeaseBinding, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
-        WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer, WorkerWorkspaceScope,
+        computer_use::ComputerUseTaskContract, WorkerArtifactTransport, WorkerCleanupReport,
+        WorkerLease, WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolKind,
+        WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope,
+        WorkerRemoteWorkspaceTransfer, WorkerRunGrant, WorkerWorkspaceScope,
         WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
     };
     use serde_json::{json, Value};
+
+    use crate::{
+        execution_backends::ExecutionBackendPreference,
+        gateway::ToolRuntimeExecutionContext,
+        journal::{
+            ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
+            ApprovalPromptRecord, ApprovalRecord, ApprovalRiskLevel, ApprovalSubjectType,
+        },
+    };
 
     struct FakeRemoteWorker {
         identity: WorkerRemoteIdentity,
@@ -2391,6 +2954,215 @@ mod tests {
             encrypted_secret_artifact: None,
             canonical_protocol: None,
         }
+    }
+
+    fn computer_use_context() -> ToolRuntimeExecutionContext<'static> {
+        ToolRuntimeExecutionContext {
+            principal: "operator:test",
+            device_id: "device-test",
+            channel: Some("test"),
+            session_id: "session-test",
+            run_id: "run-test",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "test.networked_worker",
+        }
+    }
+
+    fn allowed_computer_use_approval() -> ApprovalRecord {
+        ApprovalRecord {
+            approval_id: "approval-computer-use".to_owned(),
+            session_id: "session-test".to_owned(),
+            run_id: "run-test".to_owned(),
+            principal: "operator:test".to_owned(),
+            device_id: "device-test".to_owned(),
+            channel: Some("test".to_owned()),
+            requested_at_unix_ms: 1_000,
+            resolved_at_unix_ms: Some(1_100),
+            subject_type: ApprovalSubjectType::Tool,
+            subject_id: "tool:palyra.computer.use".to_owned(),
+            request_summary: "computer use approval".to_owned(),
+            decision: Some(ApprovalDecision::Allow),
+            decision_scope: Some(ApprovalDecisionScope::Once),
+            decision_reason: Some("operator_allowed".to_owned()),
+            decision_scope_ttl_ms: None,
+            policy_snapshot: ApprovalPolicySnapshot {
+                policy_id: "tool_call_policy.v1".to_owned(),
+                policy_hash: sha256_hex(b"policy"),
+                evaluation_summary: "action=tool.execute resource=tool:palyra.computer.use approval_required=true deny_by_default=true".to_owned(),
+            },
+            prompt: ApprovalPromptRecord {
+                title: "Approve palyra.computer.use".to_owned(),
+                risk_level: ApprovalRiskLevel::High,
+                subject_id: "tool:palyra.computer.use".to_owned(),
+                summary: "Computer use requires approval".to_owned(),
+                options: vec![
+                    ApprovalPromptOption {
+                        option_id: "allow_once".to_owned(),
+                        label: "Allow once".to_owned(),
+                        description: "Allow".to_owned(),
+                        default_selected: false,
+                        decision_scope: ApprovalDecisionScope::Once,
+                        timebox_ttl_ms: None,
+                    },
+                    ApprovalPromptOption {
+                        option_id: "deny_once".to_owned(),
+                        label: "Deny".to_owned(),
+                        description: "Deny".to_owned(),
+                        default_selected: true,
+                        decision_scope: ApprovalDecisionScope::Once,
+                        timebox_ttl_ms: None,
+                    },
+                ],
+                timeout_seconds: 60,
+                details_json: json!({
+                    "tool_name": "palyra.computer.use",
+                    "subject_id": "tool:palyra.computer.use",
+                    "input_json": {
+                        "permission_request": {
+                            "source": "tool_proposal",
+                            "tool_name": "palyra.computer.use",
+                            "subject_id": "tool:palyra.computer.use",
+                            "requested_scope": "single_tool_call",
+                            "requester": {"kind": "host_approval_relay"},
+                            "execution_backend": {
+                                "resolved": "networked_worker",
+                                "approval_required": true
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                policy_explanation:
+                    "Sensitive tool actions are deny-by-default until explicitly approved"
+                        .to_owned(),
+            },
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 1_100,
+        }
+    }
+
+    #[test]
+    fn computer_use_approval_requires_standard_durable_host_record() {
+        let context = computer_use_context();
+        let allowed = allowed_computer_use_approval();
+        let authority = validate_computer_use_host_approval_record(
+            &allowed,
+            context,
+            allowed.approval_id.as_str(),
+            "tool:palyra.computer.use",
+            2_000,
+        )
+        .expect("standard allowed approval should grant worker authority");
+        assert_eq!(
+            authority,
+            ComputerUseHostApprovalAuthority {
+                approval_id: "approval-computer-use".to_owned(),
+                expires_at_unix_ms: None,
+            }
+        );
+
+        let mut missing = allowed.clone();
+        missing.decision = None;
+        assert!(validate_computer_use_host_approval_record(
+            &missing,
+            context,
+            missing.approval_id.as_str(),
+            "tool:palyra.computer.use",
+            2_000,
+        )
+        .is_err());
+
+        let mut bypass = allowed.clone();
+        bypass.prompt.details_json = json!({
+            "tool_name": "palyra.computer.use",
+            "subject_id": "tool:palyra.computer.use",
+            "input_json": {}
+        })
+        .to_string();
+        assert!(validate_computer_use_host_approval_record(
+            &bypass,
+            context,
+            bypass.approval_id.as_str(),
+            "tool:palyra.computer.use",
+            2_000,
+        )
+        .is_err());
+
+        let mut unknown = allowed.clone();
+        unknown.subject_id = "tool:palyra.computer.unknown".to_owned();
+        unknown.prompt.subject_id = unknown.subject_id.clone();
+        assert!(validate_computer_use_host_approval_record(
+            &unknown,
+            context,
+            unknown.approval_id.as_str(),
+            "tool:palyra.computer.use",
+            2_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn computer_use_task_builder_cannot_self_approve_from_worker_lease() {
+        let input = json!({
+            "v": 1,
+            "initial_ui_text": "untrusted UI",
+            "actions": [{
+                "expected_observation_generation": 1,
+                "action": {"kind": "click", "x": 20, "y": 24}
+            }]
+        })
+        .to_string();
+        let lease = WorkerLease {
+            lease_id: "lease-computer-use".to_owned(),
+            worker_id: "worker-computer-use".to_owned(),
+            run_id: "run-test".to_owned(),
+            expires_at_unix_ms: 10_000,
+            required_capabilities: vec!["tool:palyra.computer.use".to_owned()],
+            workspace_scope: WorkerWorkspaceScope {
+                workspace_root: "/workspace".to_owned(),
+                allowed_paths: vec![".".to_owned()],
+                read_only: true,
+            },
+            artifact_transport: WorkerArtifactTransport {
+                input_manifest_sha256: sha256_hex(input.as_bytes()),
+                output_manifest_sha256: sha256_hex(b"pending"),
+                log_stream_id: "logs/computer-use".to_owned(),
+                scratch_directory_id: "scratch/computer-use".to_owned(),
+            },
+            grant: WorkerRunGrant {
+                grant_id: "lease-grant-is-not-approval".to_owned(),
+                run_id: "run-test".to_owned(),
+                tool_name: "palyra.computer.use".to_owned(),
+                expires_at_unix_ms: 10_000,
+            },
+        };
+        let generation = RuntimeGeneration::new(7).expect("generation");
+        let missing = build_host_bound_computer_use_task(
+            input.as_bytes(),
+            "proposal-computer-use",
+            &lease,
+            generation,
+            sha256_hex(b"isolated-image").as_str(),
+            None,
+        )
+        .expect_err("worker lease grant must not self-approve computer use");
+        assert!(missing.contains("host approval authority is required"));
+
+        let encoded = build_host_bound_computer_use_task(
+            input.as_bytes(),
+            "proposal-computer-use",
+            &lease,
+            generation,
+            sha256_hex(b"isolated-image").as_str(),
+            Some(&ComputerUseHostApprovalAuthority {
+                approval_id: "approval-computer-use".to_owned(),
+                expires_at_unix_ms: None,
+            }),
+        )
+        .expect("durable host authority should bind an approval");
+        let contract: ComputerUseTaskContract =
+            serde_json::from_slice(encoded.as_slice()).expect("computer-use contract");
+        assert_eq!(contract.approval.expect("approval").approval_id, "approval-computer-use");
     }
 
     #[test]

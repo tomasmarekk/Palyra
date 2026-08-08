@@ -124,6 +124,7 @@ fn registry_entries_classify_replay_safety() {
     let sleep = registry_entry("palyra.sleep").expect("sleep entry exists");
     let process_run = registry_entry("palyra.process.run").expect("process run entry exists");
     let browser_type = registry_entry("palyra.browser.type").expect("browser type entry exists");
+    let computer_use = registry_entry("palyra.computer.use").expect("computer-use entry exists");
 
     let apply_patch = registry_entry("palyra.fs.apply_patch").expect("patch entry exists");
     let http_fetch = registry_entry("palyra.http.fetch").expect("http entry exists");
@@ -132,9 +133,17 @@ fn registry_entries_classify_replay_safety() {
     assert_eq!(sleep.replay_safety_class, ToolReplaySafetyClass::IdempotentWrite);
     assert_eq!(process_run.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
     assert_eq!(browser_type.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
+    assert_eq!(computer_use.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
     assert_eq!(apply_patch.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
     assert_eq!(http_fetch.replay_safety_class, ToolReplaySafetyClass::ExternalSideEffect);
     assert_eq!(process_run.approval_posture, ToolApprovalPosture::ApprovalRequired);
+    assert_eq!(computer_use.approval_posture, ToolApprovalPosture::ApprovalRequired);
+    assert_eq!(computer_use.parallelism_policy, ToolParallelismPolicy::Exclusive);
+    assert_eq!(
+        computer_use.projection_policy,
+        ToolResultProjectionPolicy::RedactedPreviewAndArtifact
+    );
+    assert_eq!(computer_use.capabilities, ["filesystem_read", "network", "secrets_read"]);
     assert_eq!(apply_patch.approval_posture, ToolApprovalPosture::ApprovalRequired);
 }
 
@@ -228,6 +237,14 @@ fn input_aware_reconciler_registry_covers_major_mutation_classes() {
             "sessions_spawn",
             br#"{"task":"inspect the workspace"}"#.as_slice(),
             ToolReplaySafetyClass::NonIdempotentWrite,
+            RuntimeIdempotencyClass::ReconciliableMutation,
+            ReconciliationStrategy::WorkerLeaseReceipt,
+            false,
+        ),
+        (
+            "palyra.computer.use",
+            br#"{"v":1,"initial_ui_text":"untrusted","actions":[]}"#.as_slice(),
+            ToolReplaySafetyClass::ExternalSideEffect,
             RuntimeIdempotencyClass::ReconciliableMutation,
             ReconciliationStrategy::WorkerLeaseReceipt,
             false,

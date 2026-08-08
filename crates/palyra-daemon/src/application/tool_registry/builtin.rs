@@ -871,6 +871,61 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.computer.use",
+            "Execute a bounded batch of observe/click/type/key/wait/file-chooser actions in an isolated virtual desktop worker. This opt-in tool never controls the daemon host desktop; UI text is untrusted, screenshots are redacted artifacts, high-risk actions require host approval, and network/clipboard scopes are denied by the reference backend.",
+            object_schema(
+                &["v", "initial_ui_text", "actions"],
+                vec![
+                    ("v", json!({"type":"integer","const":1})),
+                    (
+                        "initial_ui_text",
+                        json!({"type":"string","maxLength":4096,"description":"Bounded untrusted text rendered only as a redacted hash-bound virtual UI."}),
+                    ),
+                    (
+                        "actions",
+                        json!({
+                            "type":"array",
+                            "minItems":1,
+                            "maxItems":16,
+                            "items":{
+                                "type":"object",
+                                "required":["expected_observation_generation","action"],
+                                "additionalProperties":false,
+                                "properties":{
+                                    "expected_observation_generation":{"type":"integer","minimum":1},
+                                    "action":{
+                                        "oneOf":[
+                                            {"type":"object","required":["kind","x","y"],"additionalProperties":false,"properties":{"kind":{"const":"click"},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0}}},
+                                            {"type":"object","required":["kind","text"],"additionalProperties":false,"properties":{"kind":{"const":"type"},"text":{"type":"string","maxLength":4096}}},
+                                            {"type":"object","required":["kind","key"],"additionalProperties":false,"properties":{"kind":{"const":"key"},"key":{"type":"string","minLength":1,"maxLength":128}}},
+                                            {"type":"object","required":["kind","duration_ms"],"additionalProperties":false,"properties":{"kind":{"const":"wait"},"duration_ms":{"type":"integer","minimum":0,"maximum":5000}}},
+                                            {"type":"object","required":["kind","path"],"additionalProperties":false,"properties":{"kind":{"const":"file_chooser"},"path":{"type":"string","minLength":1,"maxLength":512}}},
+                                            {"type":"object","required":["kind","text"],"additionalProperties":false,"properties":{"kind":{"const":"paste_clipboard"},"text":{"type":"string","maxLength":4096}}}
+                                        ]
+                                    }
+                                }
+                            }
+                        }),
+                    ),
+                    (
+                        "network_hosts",
+                        json!({"type":"array","maxItems":0,"description":"The isolated reference backend has no network scope."}),
+                    ),
+                    (
+                        "clipboard_read",
+                        json!({"type":"boolean","const":false,"description":"Host clipboard reads are unavailable."}),
+                    ),
+                    (
+                        "clipboard_write",
+                        json!({"type":"boolean","const":false,"description":"Host clipboard writes are unavailable."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
             "palyra.fs.read_file",
             "Read a bounded chunk from a file inside the current agent workspace root. Accepts relative paths and virtual workspace aliases such as /workspace/file.txt.",
             object_schema(
@@ -2042,6 +2097,7 @@ fn has_external_side_effect_family(name: &str) -> bool {
         name,
         "palyra.fs.apply_patch"
             | "palyra.http.fetch"
+            | "palyra.computer.use"
             | "palyra.browser.navigate"
             | "palyra.browser.reload"
             | "palyra.browser.click"

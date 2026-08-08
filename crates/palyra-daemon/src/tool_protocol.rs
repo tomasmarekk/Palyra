@@ -328,6 +328,7 @@ const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_DOCUMENT_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_COMPUTER_USE_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WEB_SEARCH_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_MCP_UTILITY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
@@ -1172,6 +1173,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "workspace_roots".to_owned(),
             execution_manifest: None,
         },
+        "palyra.computer.use" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.computer.use requires the isolated networked-worker runtime".to_owned(),
+            timed_out: false,
+            executor: "networked_worker_remote_dispatcher".to_owned(),
+            sandbox_enforcement: "isolated_computer_use_worker".to_owned(),
+            execution_manifest: None,
+        },
         tool_name if is_code_intel_tool(tool_name) => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1290,6 +1300,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.document.search"
                 | "palyra.document.read_page"
                 | "palyra.image.observe"
+                | "palyra.computer.use"
                 | "palyra.web.search"
                 | "palyra.http.fetch"
                 | "palyra.process.run"
@@ -1378,6 +1389,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "mcp_broker".to_owned()
     } else if tool_name == "palyra.image.observe" {
         "image_observe".to_owned()
+    } else if tool_name == "palyra.computer.use" {
+        "networked_worker_remote_dispatcher".to_owned()
     } else if matches!(tool_name, "palyra.document.search" | "palyra.document.read_page") {
         "document_runtime".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
@@ -1485,6 +1498,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.document.search" | "palyra.document.read_page" => MAX_DOCUMENT_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
+        "palyra.computer.use" => MAX_COMPUTER_USE_TOOL_INPUT_BYTES,
         "palyra.web.search" => MAX_WEB_SEARCH_TOOL_INPUT_BYTES,
         tool_name if is_mcp_utility_tool(tool_name) => MAX_MCP_UTILITY_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
@@ -1567,6 +1581,8 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
         "mcp_host_mediated".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_service".to_owned()
+    } else if tool_name == "palyra.computer.use" {
+        "isolated_computer_use_worker".to_owned()
     } else if matches!(
         tool_name,
         "palyra.artifact.read" | "palyra.document.search" | "palyra.document.read_page"
@@ -1954,8 +1970,9 @@ mod tests {
         decide_tool_call, denied_execution_outcome, execute_tool_call, is_runtime_supported_tool,
         sandbox_enforcement_for_tool, tool_executor_name, tool_input_limit_bytes, tool_metadata,
         tool_policy_snapshot, tool_requires_approval, ToolCallConfig, ToolCapability,
-        ToolRequestContext, MAX_DOCUMENT_TOOL_INPUT_BYTES, MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
-        MAX_MCP_UTILITY_TOOL_INPUT_BYTES, MAX_WEB_SEARCH_TOOL_INPUT_BYTES, MCP_UTILITY_TOOL_NAMES,
+        ToolRequestContext, MAX_COMPUTER_USE_TOOL_INPUT_BYTES, MAX_DOCUMENT_TOOL_INPUT_BYTES,
+        MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES, MAX_MCP_UTILITY_TOOL_INPUT_BYTES,
+        MAX_WEB_SEARCH_TOOL_INPUT_BYTES, MCP_UTILITY_TOOL_NAMES,
     };
     use crate::sandbox_runner::{
         EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
@@ -2476,6 +2493,7 @@ mod tests {
         assert!(tool_requires_approval("palyra.process.list"));
         assert!(tool_requires_approval("palyra.fs.apply_patch"));
         assert!(tool_requires_approval("palyra.fs.os_file"));
+        assert!(tool_requires_approval("palyra.computer.use"));
         assert!(tool_requires_approval("palyra.tool_program.run"));
         assert!(tool_requires_approval("palyra.browser.session.create"));
         assert!(tool_requires_approval("palyra.browser.navigate"));
@@ -2769,6 +2787,48 @@ mod tests {
         );
         assert_eq!(outcome.attestation.executor, "tool_program_runtime");
         assert_eq!(outcome.attestation.sandbox_enforcement, "nested_tool_policy");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn computer_use_has_only_the_isolated_worker_runtime() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.computer.use".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+
+        assert!(is_runtime_supported_tool("palyra.computer.use"));
+        assert_eq!(
+            tool_input_limit_bytes("palyra.computer.use"),
+            MAX_COMPUTER_USE_TOOL_INPUT_BYTES
+        );
+        assert_eq!(
+            tool_executor_name(&config, "palyra.computer.use"),
+            "networked_worker_remote_dispatcher"
+        );
+        assert_eq!(
+            sandbox_enforcement_for_tool(&config, "palyra.computer.use"),
+            "isolated_computer_use_worker"
+        );
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FCU",
+            "palyra.computer.use",
+            br#"{"v":1,"initial_ui_text":"untrusted","actions":[]}"#,
+        )
+        .await;
+
+        assert!(!outcome.success);
+        assert!(
+            outcome.error.contains("requires the isolated networked-worker runtime"),
+            "generic tool execution must fail closed without an isolated worker: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "networked_worker_remote_dispatcher");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "isolated_computer_use_worker");
     }
 
     #[tokio::test(flavor = "multi_thread")]

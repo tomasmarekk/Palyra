@@ -20,8 +20,8 @@ use palyra_identity::{
     build_device_pairing_hello, DeviceIdentity, PairingClientKind, PairingSession,
 };
 use palyra_workerd::{
-    network_runtime::ReferenceNetworkWorker,
-    remote_protocol::verify_authenticated_delivery_hmac_sha256, WorkerRemoteToolRequestEnvelope,
+    remote_protocol::verify_authenticated_delivery_hmac_sha256,
+    transport_adapters::CanonicalWorkerStdioAdapter, WorkerRemoteToolRequestEnvelope,
     WORKER_REMOTE_TOOL_PROTOCOL,
 };
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,7 @@ const NODE_HOST_MAX_RECONNECT_ATTEMPTS: u32 = 8;
 const NODE_HOST_RECONNECT_STABLE_MS: u64 = 60_000;
 const NODE_WORKER_REPLAY_SCHEMA_VERSION: u32 = 1;
 const NODE_WORKER_REPLAY_MAX_RECORDS: usize = 2_048;
+const NODE_WORKER_CHILD_MAX_TIMEOUT_MS: u64 = 120_000;
 const NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY: &str =
     "protocol:palyra.networked_worker.delivery_fence.v2";
 
@@ -1120,13 +1121,44 @@ async fn execute_networked_worker_capability(
     }
 
     let observed_at_unix_ms = i64::try_from(now_unix_ms()).unwrap_or(i64::MAX);
-    let request_for_worker = request.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        ReferenceNetworkWorker::execute_remote_request(&request_for_worker, observed_at_unix_ms)
-    })
-    .await
-    .context("networked worker execution task failed")?
-    .map_err(anyhow::Error::from);
+    let adapter = (|| -> Result<CanonicalWorkerStdioAdapter> {
+        let workerd_executable = resolve_sibling_workerd_binary(
+            support::lifecycle::current_cli_binary_path()?.as_path(),
+        )?;
+        let lease_remaining_ms = request
+            .lease
+            .expires_at_unix_ms
+            .saturating_sub(observed_at_unix_ms)
+            .try_into()
+            .unwrap_or(0_u64);
+        let task_wall_time_ms = request
+            .canonical_protocol
+            .as_ref()
+            .map_or(0, |protocol| protocol.task.resource_limits.wall_time_ms);
+        let child_timeout_ms =
+            lease_remaining_ms.min(task_wall_time_ms).min(NODE_WORKER_CHILD_MAX_TIMEOUT_MS);
+        CanonicalWorkerStdioAdapter::local_workerd(workerd_executable, child_timeout_ms)
+            .context("networked worker child process is unavailable")
+    })();
+    let result = match adapter {
+        Ok(adapter) => {
+            let request_for_worker = request.clone();
+            tokio::task::spawn_blocking(move || {
+                adapter.execute(&request_for_worker, observed_at_unix_ms)
+            })
+            .await
+            .map_err(|error| anyhow!("networked worker execution task failed: {error}"))
+            .and_then(|result| result.map_err(anyhow::Error::from))
+        }
+        Err(error) => Err(error),
+    }
+    .and_then(|result| {
+        let receipt_unix_ms = i64::try_from(now_unix_ms()).unwrap_or(i64::MAX);
+        result
+            .validate_against_request(&request, receipt_unix_ms)
+            .context("networked worker child result arrived after its authority expired")?;
+        Ok(result)
+    });
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -1178,6 +1210,23 @@ async fn execute_networked_worker_capability(
         "error": "",
         "reason_code": "networked_worker_completed",
     }))
+}
+
+fn resolve_sibling_workerd_binary(current_cli_binary: &Path) -> Result<PathBuf> {
+    if !current_cli_binary.is_absolute() {
+        anyhow::bail!("current CLI executable path is not absolute");
+    }
+    let parent = current_cli_binary.parent().ok_or_else(|| {
+        anyhow!("current CLI executable has no install directory: {}", current_cli_binary.display())
+    })?;
+    let executable_name = if cfg!(windows) { "palyra-workerd.exe" } else { "palyra-workerd" };
+    let workerd = parent.join(executable_name);
+    if !workerd.is_file() {
+        anyhow::bail!("isolated network worker executable is unavailable at {}", workerd.display());
+    }
+    workerd
+        .canonicalize()
+        .with_context(|| format!("failed to resolve isolated worker {}", workerd.display()))
 }
 
 fn validate_networked_worker_payload_response(
@@ -1868,9 +1917,9 @@ mod tests {
         admit_networked_worker_replay_at, build_capability_lifecycle_payload,
         capability_requires_local_mediation, next_reconnect_attempt, open_path_capability,
         open_url_capability, read_networked_worker_replay_registry_at, render_node_lifecycle_text,
-        resolve_pairing_code_input, settle_networked_worker_replay_at, NodeLifecyclePayload,
-        NodeWorkerReplayState, NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY,
-        NODE_HOST_RECONNECT_STABLE_MS,
+        resolve_pairing_code_input, resolve_sibling_workerd_binary,
+        settle_networked_worker_replay_at, NodeLifecyclePayload, NodeWorkerReplayState,
+        NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY, NODE_HOST_RECONNECT_STABLE_MS,
     };
     use crate::proto::palyra::{common::v1 as common_v1, node::v1 as node_v1};
 
@@ -2008,6 +2057,29 @@ mod tests {
         );
         assert_eq!(next_reconnect_attempt(7, false, std::time::Duration::from_secs(120)), 8);
         assert_eq!(next_reconnect_attempt(7, true, std::time::Duration::from_secs(1)), 8);
+    }
+
+    #[test]
+    fn networked_worker_uses_only_fixed_sibling_process() {
+        let install = tempfile::tempdir().expect("install root");
+        let cli = install.path().join(if cfg!(windows) { "palyra.exe" } else { "palyra" });
+        let workerd = install.path().join(if cfg!(windows) {
+            "palyra-workerd.exe"
+        } else {
+            "palyra-workerd"
+        });
+        std::fs::write(cli.as_path(), b"cli").expect("CLI fixture");
+        std::fs::write(workerd.as_path(), b"worker").expect("workerd fixture");
+
+        let resolved =
+            resolve_sibling_workerd_binary(cli.as_path()).expect("fixed sibling should resolve");
+
+        assert_eq!(resolved, workerd.canonicalize().expect("fixture should canonicalize"));
+        std::fs::remove_file(workerd.as_path()).expect("remove worker fixture");
+        assert!(
+            resolve_sibling_workerd_binary(cli.as_path()).is_err(),
+            "missing isolated worker must fail closed without an in-process fallback"
+        );
     }
 
     #[test]

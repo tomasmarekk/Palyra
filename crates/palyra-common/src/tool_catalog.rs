@@ -145,6 +145,8 @@ const BROWSER_UPLOAD_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::FilesystemRead, ToolCapability::SecretsRead];
 const HTTP_FETCH_TOOL_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead];
+const COMPUTER_USE_CAPABILITIES: &[ToolCapability] =
+    &[ToolCapability::FilesystemRead, ToolCapability::Network, ToolCapability::SecretsRead];
 const ARTIFACT_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ArtifactsRead];
 const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
@@ -547,6 +549,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             capabilities: HTTP_FETCH_TOOL_CAPABILITIES,
             default_sensitive: true,
         }),
+        "palyra.computer.use" => {
+            Some(ToolMetadata { capabilities: COMPUTER_USE_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.process.run"
         | "palyra.exec.run"
         | "palyra.process.input"
@@ -880,6 +885,39 @@ mod tests {
     fn image_observe_is_read_only_without_approval() {
         assert!(!tool_requires_approval("palyra.image.observe"));
         assert_eq!(tool_policy_capability_names("palyra.image.observe"), vec!["artifacts_read"]);
+    }
+
+    #[test]
+    fn computer_use_has_explicit_host_capability_and_approval_gates() {
+        assert_eq!(
+            tool_policy_capability_names("palyra.computer.use"),
+            vec!["filesystem_read", "network", "secrets_read"]
+        );
+        assert!(tool_requires_approval("palyra.computer.use"));
+        assert!(
+            tool_metadata("palyra.computer.use").is_some_and(|metadata| metadata.default_sensitive)
+        );
+
+        for profile in [
+            ToolsetProfileName::SafeChat,
+            ToolsetProfileName::Code,
+            ToolsetProfileName::Research,
+            ToolsetProfileName::Automation,
+            ToolsetProfileName::Ops,
+        ] {
+            assert!(
+                !profile.tools().contains(&"palyra.computer.use"),
+                "computer use must remain explicit opt-in for profile {}",
+                profile.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_tool_metadata_stays_fail_closed() {
+        assert!(tool_metadata("palyra.computer.unknown").is_none());
+        assert!(tool_requires_approval("palyra.computer.unknown"));
+        assert!(tool_policy_capability_names("palyra.computer.unknown").is_empty());
     }
 
     #[test]

@@ -354,6 +354,9 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         "palyra.work_graph.control" => {
             BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
         }
+        "palyra.computer.use" => {
+            BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
+        }
         "sessions_steer" | "sessions_interrupt" | "sessions_switch_model" => {
             BuiltinToolEffectResolution::mutation(ToolMutationClass::WorkerTask)
         }

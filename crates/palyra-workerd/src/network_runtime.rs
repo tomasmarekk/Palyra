@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
+    computer_use::{ComputerUseAction, ComputerUseTaskContract, IsolatedComputerUseWorker},
     remote_protocol::{
         ContentAddressedArtifact, RemoteCleanupAttestation, RemotePatchBundle, RemoteResourceUsage,
         RemoteTaskOutcome, RemoteWorkerProtocolError, RemoteWorkerProtocolV1,
@@ -255,6 +256,9 @@ impl ReferenceNetworkWorker {
         let workspace = tempfile::tempdir()
             .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?;
         materialize_scoped_workspace(workspace.path(), request)?;
+        if matches!(request.tool_kind, crate::WorkerRemoteToolKind::ComputerUse) {
+            validate_computer_use_remote_scopes(request)?;
+        }
         let worker = Self::new(request.lease.worker_id.clone(), workspace.path().to_path_buf())?;
         let response = worker.execute(protocol, observed_at_unix_ms)?;
         drop(worker);
@@ -281,7 +285,7 @@ impl ReferenceNetworkWorker {
             success: response.outcome.success,
             output_json: response.output_json,
             output_json_sha256: response.outcome.output_sha256,
-            error: None,
+            error: (!response.outcome.success).then(|| response.outcome.reason_code.clone()),
             output_manifest_sha256: response
                 .outcome
                 .output_artifacts
@@ -329,17 +333,53 @@ impl ReferenceNetworkWorker {
     ) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
         protocol.validate(observed_at_unix_ms)?;
         let started = std::time::Instant::now();
-        let (output_json, patch_bundle) = match protocol.task.tool_name.as_str() {
-            "palyra.fs.read_file" => (self.execute_read(protocol.task.input_json.as_str())?, None),
-            "palyra.fs.list_dir" => (self.execute_list(protocol.task.input_json.as_str())?, None),
-            "palyra.fs.search" => (self.execute_search(protocol.task.input_json.as_str())?, None),
-            "palyra.fs.apply_patch" => self.execute_patch(protocol.task.input_json.as_str())?,
-            other => {
-                return Err(NetworkWorkerRuntimeError::UnsupportedTool {
-                    tool_name: other.to_owned(),
-                })
-            }
-        };
+        let (output_json, patch_bundle, success, reason_code) =
+            match protocol.task.tool_name.as_str() {
+                "palyra.fs.read_file" => (
+                    self.execute_read(protocol.task.input_json.as_str())?,
+                    None,
+                    true,
+                    "worker.task.succeeded",
+                ),
+                "palyra.fs.list_dir" => (
+                    self.execute_list(protocol.task.input_json.as_str())?,
+                    None,
+                    true,
+                    "worker.task.succeeded",
+                ),
+                "palyra.fs.search" => (
+                    self.execute_search(protocol.task.input_json.as_str())?,
+                    None,
+                    true,
+                    "worker.task.succeeded",
+                ),
+                "palyra.fs.apply_patch" => {
+                    let (output, patch) = self.execute_patch(protocol.task.input_json.as_str())?;
+                    (output, patch, true, "worker.task.succeeded")
+                }
+                "palyra.computer.use" => {
+                    let output = IsolatedComputerUseWorker::execute_task(
+                        protocol.task.clone(),
+                        observed_at_unix_ms,
+                    )
+                    .map_err(|error| NetworkWorkerRuntimeError::ComputerUse(error.to_string()))?;
+                    let success = output.succeeded;
+                    let reason_code =
+                        if success { "worker.task.succeeded" } else { "worker.task.action_denied" };
+                    (
+                        serde_json::to_string(&output)
+                            .map_err(|error| NetworkWorkerRuntimeError::Input(error.to_string()))?,
+                        None,
+                        success,
+                        reason_code,
+                    )
+                }
+                other => {
+                    return Err(NetworkWorkerRuntimeError::UnsupportedTool {
+                        tool_name: other.to_owned(),
+                    })
+                }
+            };
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         if output_json.len() > MAX_WORKER_OUTPUT_BYTES
             || output_json.len()
@@ -356,7 +396,7 @@ impl ReferenceNetworkWorker {
             response_sequence: 1,
             run_generation: protocol.task.run_generation,
             fence_generation: protocol.task.fence_generation,
-            success: true,
+            success,
             output_sha256: output_sha256.clone(),
             output_artifacts: vec![ContentAddressedArtifact {
                 artifact_id: "reference-worker-output".to_owned(),
@@ -385,7 +425,7 @@ impl ReferenceNetworkWorker {
             },
             completed_at_unix_ms: observed_at_unix_ms
                 .saturating_add(i64::try_from(duration_ms).unwrap_or(i64::MAX)),
-            reason_code: "worker.task.succeeded".to_owned(),
+            reason_code: reason_code.to_owned(),
         };
         outcome.validate_against(&protocol.task, observed_at_unix_ms)?;
         Ok(ReferenceWorkerResponse { outcome, output_json })
@@ -749,6 +789,9 @@ pub enum NetworkWorkerRuntimeError {
     /// Output exceeds its host-issued budget.
     #[error("network worker output exceeds its budget")]
     OutputLimitExceeded,
+    /// Isolated computer-use execution or evidence validation failed.
+    #[error("network worker computer use failed closed: {0}")]
+    ComputerUse(String),
 }
 
 impl NetworkWorkerRuntimeError {
@@ -760,6 +803,65 @@ impl NetworkWorkerRuntimeError {
             _ => "worker.runtime.failed_closed",
         }
     }
+}
+
+fn validate_computer_use_remote_scopes(
+    request: &WorkerRemoteToolRequestEnvelope,
+) -> Result<(), NetworkWorkerRuntimeError> {
+    let contract = serde_json::from_str::<ComputerUseTaskContract>(request.input_json.as_str())
+        .map_err(|error| NetworkWorkerRuntimeError::ComputerUse(error.to_string()))?;
+    contract
+        .profile
+        .validate()
+        .map_err(|error| NetworkWorkerRuntimeError::ComputerUse(error.to_string()))?;
+    if contract.profile.isolation_attestation_sha256 != request.worker_identity.image_digest_sha256
+        || contract.profile.host_desktop_access
+        || !contract.profile.network_hosts.is_empty()
+        || contract.profile.clipboard_read
+        || contract.profile.clipboard_write
+        || contract.profile.max_wall_clock_ms
+            > request
+                .canonical_protocol
+                .as_ref()
+                .map_or(0, |protocol| protocol.task.resource_limits.wall_time_ms)
+    {
+        return Err(NetworkWorkerRuntimeError::ComputerUse(
+            "computer-use capability profile exceeds host-issued worker authority".to_owned(),
+        ));
+    }
+    for root in &contract.profile.filesystem_roots {
+        if !portable_path_allowed_by_lease(
+            root,
+            request.lease.workspace_scope.allowed_paths.as_slice(),
+        ) || !request.workspace_transfer.scoped_entries.iter().any(|entry| entry.path == *root)
+        {
+            return Err(NetworkWorkerRuntimeError::ComputerUse(
+                "computer-use filesystem scope is not content-addressed by the lease".to_owned(),
+            ));
+        }
+    }
+    for requested in &contract.actions {
+        if let ComputerUseAction::FileChooser { path } = &requested.action {
+            if !contract.profile.filesystem_roots.iter().any(|root| root == path) {
+                return Err(NetworkWorkerRuntimeError::ComputerUse(
+                    "computer-use file chooser path exceeds its dedicated filesystem scope"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn portable_path_allowed_by_lease(path: &str, allowed_paths: &[String]) -> bool {
+    let path = Path::new(path);
+    allowed_paths.iter().any(|allowed| {
+        if allowed == "." {
+            return true;
+        }
+        let allowed = Path::new(allowed);
+        path == allowed || path.starts_with(allowed)
+    })
 }
 
 fn materialize_scoped_workspace(

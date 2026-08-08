@@ -299,6 +299,17 @@ pub struct CanonicalWorkerStdioAdapter {
 }
 
 impl CanonicalWorkerStdioAdapter {
+    /// Builds the fixed local worker subprocess adapter used by authenticated nodes.
+    ///
+    /// # Errors
+    /// Rejects a non-absolute executable, missing regular file, or invalid timeout.
+    pub fn local_workerd(
+        executable: impl Into<PathBuf>,
+        timeout_ms: u64,
+    ) -> Result<Self, WorkerTransportAdapterError> {
+        Self::new(executable, vec![OsString::from("--stdio")], timeout_ms)
+    }
+
     fn new(
         executable: impl Into<PathBuf>,
         arguments: Vec<OsString>,
