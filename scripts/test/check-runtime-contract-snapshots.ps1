@@ -134,6 +134,14 @@ Invoke-ExactContractCheck `
     -ExpectedTest "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" `
     -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled", "--locked", "--", "--exact")
 Invoke-ExactContractCheck `
+    -Label "Docker rollout direct container-path proof" `
+    -ExpectedTest "gateway::tests::docker_runtime_selects_container_process_path" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::docker_runtime_selects_container_process_path", "--locked", "--", "--exact")
+Invoke-ExactContractCheck `
+    -Label "Docker rollout no-hidden-fallback proof" `
+    -ExpectedTest "gateway::tests::docker_runtime_fails_closed_without_host_fallback" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::docker_runtime_fails_closed_without_host_fallback", "--locked", "--", "--exact")
+Invoke-ExactContractCheck `
     -Label "stable core evidence contract" `
     -ExpectedTest "application::core_stability::stable::tests::builtin_evidence_pack_qualifies" `
     -CargoArgs @("test", "-p", "palyra-daemon", "--lib", "application::core_stability::stable::tests::builtin_evidence_pack_qualifies", "--locked", "--", "--exact")

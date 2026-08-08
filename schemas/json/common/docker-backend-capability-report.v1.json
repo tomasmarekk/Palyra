@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/docker-backend-capability-report.v1.json",
+  "title": "Docker Backend Capability Report V1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile_id",
+    "host_os",
+    "host_arch",
+    "daemon_os",
+    "daemon_arch",
+    "daemon_version",
+    "daemon_api_version",
+    "image_digest_pinned",
+    "readonly_rootfs",
+    "non_root_user",
+    "workspace_mounts_scoped",
+    "network_policy",
+    "resource_limits_bounded",
+    "vault_env_scoped",
+    "qualified",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "profile_id": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "host_os": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "host_arch": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "daemon_os": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "daemon_arch": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "daemon_version": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "daemon_api_version": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "image_digest_pinned": {
+      "type": "boolean"
+    },
+    "readonly_rootfs": {
+      "type": "boolean"
+    },
+    "non_root_user": {
+      "type": "boolean"
+    },
+    "workspace_mounts_scoped": {
+      "type": "boolean"
+    },
+    "network_policy": {
+      "enum": [
+        "container_network:none",
+        "container_network:egress_proxy"
+      ]
+    },
+    "resource_limits_bounded": {
+      "type": "boolean"
+    },
+    "vault_env_scoped": {
+      "type": "boolean"
+    },
+    "qualified": {
+      "type": "boolean"
+    },
+    "reason_code": {
+      "$ref": "#/$defs/reason_code"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "bounded_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_.-]+$"
+    }
+  }
+}

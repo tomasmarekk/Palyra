@@ -10404,6 +10404,33 @@ async fn networked_worker_cleanup_gap_preserves_report_without_artifact_attestat
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn docker_runtime_selects_container_process_path() {
+    let state = build_test_runtime_state(false);
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-docker-process-runtime",
+            run_id: "run-docker-process-runtime",
+            execution_backend: ExecutionBackendPreference::Docker,
+            backend_reason_code: "backend.available.docker",
+        },
+        "proposal-docker-process-runtime",
+        "palyra.process.run",
+        br#"{"command":"echo","args":["must-stay-in-container"]}"#,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success, "an unconfigured Docker target must fail closed");
+    assert_eq!(outcome.attestation.executor, "docker");
+    assert_eq!(outcome.attestation.sandbox_enforcement, "runner_selection");
+    assert_ne!(outcome.attestation.executor, "local_sandbox");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn docker_runtime_fails_closed_without_host_fallback() {
     let state = build_test_runtime_state(false);
     let outcome = super::execute_tool_with_runtime_dispatch(

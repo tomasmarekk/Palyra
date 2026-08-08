@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/container-cleanup-attestation.v1.json",
+  "title": "Container Cleanup Attestation V1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "strategy",
+    "container_removed",
+    "workspace_cleanup_required",
+    "volume_removed",
+    "resource_lease_required",
+    "resource_lease_id_sha256",
+    "resource_lease_released",
+    "success",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "strategy": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_.-]+$"
+    },
+    "container_removed": {
+      "type": "boolean"
+    },
+    "workspace_cleanup_required": {
+      "type": "boolean"
+    },
+    "volume_removed": {
+      "type": "boolean"
+    },
+    "resource_lease_required": {
+      "type": "boolean"
+    },
+    "resource_lease_id_sha256": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/sha256"
+        }
+      ]
+    },
+    "resource_lease_released": {
+      "type": "boolean"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_.-]+$"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

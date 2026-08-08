@@ -17,8 +17,9 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -53,6 +54,7 @@ use palyra_workerd::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use ulid::Ulid;
 
 use crate::{
@@ -2270,6 +2272,8 @@ impl Drop for DockerEnvFileCleanupGuard {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContainerCleanupAttestation {
+    /// Contract schema version.
+    pub(crate) schema_version: u32,
     pub(crate) strategy: String,
     pub(crate) container_removed: bool,
     pub(crate) workspace_cleanup_required: bool,
@@ -2581,6 +2585,47 @@ fn docker_bound_streams(
     )
 }
 
+#[derive(Debug)]
+struct DockerBoundedStream {
+    bytes: Vec<u8>,
+    original_bytes: usize,
+    truncated: bool,
+}
+
+async fn read_docker_stream_bounded<R>(
+    mut stream: R,
+    remaining: Arc<AtomicUsize>,
+) -> Result<DockerBoundedStream, std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut original_bytes = 0usize;
+    let mut truncated = false;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        original_bytes = original_bytes.saturating_add(read);
+        let retained = remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                Some(available.saturating_sub(read))
+            })
+            .unwrap_or_else(|available| available)
+            .min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(DockerBoundedStream { bytes, original_bytes, truncated })
+}
+
+fn docker_cpu_ulimit(cpu_time_limit_ms: u64) -> String {
+    let seconds = cpu_time_limit_ms.saturating_add(999).checked_div(1_000).unwrap_or(1).max(1);
+    format!("cpu={seconds}:{seconds}")
+}
+
 impl DockerEngine for DockerCliEngine {
     fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
         Box::pin(async move {
@@ -2616,7 +2661,11 @@ impl DockerEngine for DockerCliEngine {
                 });
             }
             let (run_plan, writeback_capture) = prepare_docker_run_plan(&plan)?;
+            reap_expired_docker_containers(crate::gateway::current_unix_ms()).await?;
             let container_name = format!("palyra-{}", Ulid::new().to_string().to_ascii_lowercase());
+            let cleanup_deadline_unix_ms = crate::gateway::current_unix_ms()
+                .saturating_add(i64::try_from(run_plan.execution_timeout_ms).unwrap_or(i64::MAX))
+                .saturating_add(30_000);
             let mut command = tokio::process::Command::new("docker");
             command
                 .arg("run")
@@ -2625,6 +2674,8 @@ impl DockerEngine for DockerCliEngine {
                 .arg(container_name.as_str())
                 .arg("--label")
                 .arg("palyra.managed=true")
+                .arg("--label")
+                .arg(format!("palyra.cleanup_deadline_unix_ms={cleanup_deadline_unix_ms}"))
                 .arg("--pids-limit")
                 .arg("128");
             if run_plan.readonly_rootfs {
@@ -2634,6 +2685,7 @@ impl DockerEngine for DockerCliEngine {
             command.arg("--network").arg(docker_network_arg(run_plan.network));
             command.arg("--workdir").arg(run_plan.working_dir.as_str());
             command.arg("--memory").arg(format!("{}b", run_plan.limits.memory_limit_bytes));
+            command.arg("--ulimit").arg(docker_cpu_ulimit(run_plan.limits.cpu_time_limit_ms));
             for mount in &run_plan.mounts {
                 command.arg("--mount").arg(docker_mount_arg(mount));
             }
@@ -2651,44 +2703,80 @@ impl DockerEngine for DockerCliEngine {
             command.arg(run_plan.image.as_str());
             command.arg(run_plan.command.as_str());
             command.args(run_plan.args.iter().map(String::as_str));
-            command.kill_on_drop(true);
-            let output_future = command.output();
-            tokio::pin!(output_future);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = command.spawn().map_err(|error| DockerEngineError {
+                reason_code: "docker.spawn_failed".to_owned(),
+                message: format!(
+                    "failed to launch Docker CLI for profile {}: {error}",
+                    run_plan.profile_id
+                ),
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| DockerEngineError {
+                reason_code: "docker.stdout_unavailable".to_owned(),
+                message: "Docker CLI did not expose its bounded stdout pipe".to_owned(),
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| DockerEngineError {
+                reason_code: "docker.stderr_unavailable".to_owned(),
+                message: "Docker CLI did not expose its bounded stderr pipe".to_owned(),
+            })?;
+            let output_budget =
+                usize::try_from(run_plan.limits.max_output_bytes).unwrap_or(usize::MAX);
+            let remaining = Arc::new(AtomicUsize::new(output_budget));
+            let stdout_reader =
+                tokio::spawn(read_docker_stream_bounded(stdout, Arc::clone(&remaining)));
+            let stderr_reader = tokio::spawn(read_docker_stream_bounded(stderr, remaining));
             let cancellation_future =
                 wait_for_docker_cancellation(run_plan.cancellation_requested.clone());
             tokio::pin!(cancellation_future);
             let timeout =
                 tokio::time::sleep(Duration::from_millis(run_plan.execution_timeout_ms.max(1)));
             tokio::pin!(timeout);
-            let (exit_code, stdout, stderr, termination_reason_code) = tokio::select! {
-                output = &mut output_future => {
-                    let output = output.map_err(|error| DockerEngineError {
-                        reason_code: "docker.spawn_failed".to_owned(),
+            let (exit_code, termination_reason_code) = tokio::select! {
+                status = child.wait() => {
+                    let status = status.map_err(|error| DockerEngineError {
+                        reason_code: "docker.wait_failed".to_owned(),
                         message: format!(
-                            "failed to launch Docker CLI for profile {}: {error}",
+                            "failed to wait for Docker CLI profile {}: {error}",
                             run_plan.profile_id
                         ),
                     })?;
-                    (
-                        output.status.code().unwrap_or(1),
-                        output.stdout,
-                        output.stderr,
-                        None,
-                    )
+                    (status.code().unwrap_or(1), None)
                 }
-                () = &mut cancellation_future => (
-                    130,
-                    Vec::new(),
-                    b"Docker execution cancelled by the owning run".to_vec(),
-                    Some("docker.execution.cancelled".to_owned()),
-                ),
-                () = &mut timeout => (
-                    124,
-                    Vec::new(),
-                    b"Docker execution exceeded its wall-time budget".to_vec(),
-                    Some("docker.execution.timeout".to_owned()),
-                ),
+                () = &mut cancellation_future => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    (130, Some("docker.execution.cancelled".to_owned()))
+                },
+                () = &mut timeout => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    (124, Some("docker.execution.timeout".to_owned()))
+                },
             };
+            let stdout = stdout_reader
+                .await
+                .map_err(|error| DockerEngineError {
+                    reason_code: "docker.stdout_reader_failed".to_owned(),
+                    message: format!("Docker stdout reader task failed: {error}"),
+                })?
+                .map_err(|error| DockerEngineError {
+                    reason_code: "docker.stdout_read_failed".to_owned(),
+                    message: format!("failed to read bounded Docker stdout: {error}"),
+                })?;
+            let stderr = stderr_reader
+                .await
+                .map_err(|error| DockerEngineError {
+                    reason_code: "docker.stderr_reader_failed".to_owned(),
+                    message: format!("Docker stderr reader task failed: {error}"),
+                })?
+                .map_err(|error| DockerEngineError {
+                    reason_code: "docker.stderr_read_failed".to_owned(),
+                    message: format!("failed to read bounded Docker stderr: {error}"),
+                })?;
             let container_removed =
                 ensure_docker_container_removed(container_name.as_str()).await?;
             let workspace_cleanup_required = writeback_capture.is_some();
@@ -2698,24 +2786,17 @@ impl DockerEngine for DockerCliEngine {
             };
             let volume_removed = true;
             let cleanup_success = container_removed && volume_removed;
-            let (
-                stdout,
-                stderr,
-                stdout_original_bytes,
-                stderr_original_bytes,
-                stdout_truncated,
-                stderr_truncated,
-            ) = docker_bound_streams(stdout, stderr, run_plan.limits.max_output_bytes);
             Ok(DockerRunReport {
                 exit_code,
-                stdout,
-                stderr,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
                 resource_usage: DockerResourceUsage {
                     duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                     memory_limit_bytes: plan.limits.memory_limit_bytes,
                     cpu_time_limit_ms: plan.limits.cpu_time_limit_ms,
                 },
                 cleanup: ContainerCleanupAttestation {
+                    schema_version: 1,
                     strategy: plan.cleanup_strategy,
                     container_removed,
                     workspace_cleanup_required,
@@ -2734,10 +2815,10 @@ impl DockerEngine for DockerCliEngine {
                 patch_bundle,
                 capability_report,
                 termination_reason_code,
-                stdout_original_bytes,
-                stderr_original_bytes,
-                stdout_truncated,
-                stderr_truncated,
+                stdout_original_bytes: stdout.original_bytes,
+                stderr_original_bytes: stderr.original_bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
             })
         })
     }
@@ -2763,6 +2844,74 @@ async fn ensure_docker_container_removed(container_name: &str) -> Result<bool, D
         });
     }
     Ok(false)
+}
+
+async fn reap_expired_docker_containers(
+    now_unix_ms: i64,
+) -> Result<Vec<String>, DockerEngineError> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=palyra.managed=true",
+            "--format",
+            r#"{{.ID}}|{{.Label "palyra.cleanup_deadline_unix_ms"}}"#,
+        ])
+        .output()
+        .await
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.orphan_reaper.probe_spawn_failed".to_owned(),
+            message: format!("failed to launch Docker orphan probe: {error}"),
+        })?;
+    if !output.status.success() {
+        let stderr = &output.stderr[..output.stderr.len().min(DOCKER_CLEANUP_DIAGNOSTIC_MAX_BYTES)];
+        return Err(DockerEngineError {
+            reason_code: "docker.orphan_reaper.probe_failed".to_owned(),
+            message: format!(
+                "Docker orphan probe failed: {}",
+                redact_diagnostic_text(String::from_utf8_lossy(stderr).as_ref())
+            ),
+        });
+    }
+
+    let mut reaped = Vec::new();
+    for line in String::from_utf8_lossy(output.stdout.as_slice()).lines() {
+        let Some((container_id, deadline)) = line.trim().split_once('|') else {
+            continue;
+        };
+        let Ok(deadline_unix_ms) = deadline.parse::<i64>() else {
+            continue;
+        };
+        if container_id.is_empty() || deadline_unix_ms > now_unix_ms {
+            continue;
+        }
+        let removal =
+            tokio::process::Command::new("docker").args(["rm", "-f", container_id]).output().await;
+        match removal {
+            Ok(result) if result.status.success() => reaped.push(container_id.to_owned()),
+            Ok(result) => {
+                let stderr =
+                    &result.stderr[..result.stderr.len().min(DOCKER_CLEANUP_DIAGNOSTIC_MAX_BYTES)];
+                return Err(DockerEngineError {
+                    reason_code: "docker.orphan_reaper.remove_failed".to_owned(),
+                    message: format!(
+                        "failed to remove expired managed Docker container: {}",
+                        redact_diagnostic_text(String::from_utf8_lossy(stderr).as_ref())
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(DockerEngineError {
+                    reason_code: "docker.orphan_reaper.remove_spawn_failed".to_owned(),
+                    message: format!(
+                        "failed to launch removal for an expired managed Docker container: {error}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(reaped)
 }
 
 async fn docker_exact_name_container_absent(
@@ -6004,6 +6153,7 @@ mod tests {
                 cpu_time_limit_ms: 1_000,
             },
             cleanup: ContainerCleanupAttestation {
+                schema_version: 1,
                 strategy: "remove_container_and_volume".to_owned(),
                 container_removed: true,
                 workspace_cleanup_required: true,
@@ -6862,6 +7012,33 @@ mod tests {
         assert!(stderr_truncated);
     }
 
+    #[tokio::test]
+    async fn docker_stream_reader_drains_after_shared_budget_is_exhausted() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            writer.write_all(&[b'x'; 32]).await.expect("duplex write");
+        });
+        let capture = super::read_docker_stream_bounded(
+            reader,
+            Arc::new(std::sync::atomic::AtomicUsize::new(10)),
+        )
+        .await
+        .expect("bounded reader");
+        write.await.expect("writer task");
+
+        assert_eq!(capture.bytes, vec![b'x'; 10]);
+        assert_eq!(capture.original_bytes, 32);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn docker_cpu_limit_rounds_up_to_a_nonzero_hard_ulimit() {
+        assert_eq!(super::docker_cpu_ulimit(1), "cpu=1:1");
+        assert_eq!(super::docker_cpu_ulimit(1_001), "cpu=2:2");
+    }
+
     #[test]
     fn docker_exact_name_probe_requires_an_empty_container_listing() {
         assert!(super::docker_exact_name_probe_is_empty(b"\r\n"));
@@ -7121,6 +7298,142 @@ mod tests {
         assert_eq!(payload["cleanup"]["container_removed"], true);
         assert_eq!(payload["cleanup"]["resource_lease_released"], true);
         assert!(governor.active_leases().expect("leases should remain readable").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
+    async fn docker_live_e2e_enforces_resource_caps_and_reaps_expired_orphan() {
+        let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
+            .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
+        let temporary = tempfile::tempdir().expect("live Docker root should exist");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::write(temporary.path().join("host-secret.txt"), "must-not-be-mounted\n")
+            .expect("mount escape sentinel should exist");
+        let mut profile = safe_container_profile();
+        profile.profile_id = "docker-live-resource-caps".to_owned();
+        profile.image = image.clone();
+        profile.mounts[0].host_path = workspace.to_string_lossy().into_owned();
+        profile.user = current_docker_user();
+        profile.limits.cpu_time_limit_ms = 1_000;
+        profile.limits.memory_limit_bytes = 32 * 1024 * 1024;
+        profile.limits.max_output_bytes = 1_024;
+        let runner = DockerRunner::new(profile, super::DockerCliEngine)
+            .expect("live Docker profile should validate");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["sh".to_owned()];
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = 15_000;
+
+        let output_outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-live-output-cap",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"sh","args":["-c","test ! -e /host-secret.txt && yes x | head -c 65536"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        assert!(output_outcome.success, "{}", output_outcome.error);
+        let output_payload: serde_json::Value =
+            serde_json::from_slice(&output_outcome.output_json).expect("Docker output JSON");
+        assert_eq!(output_payload["stdout_truncated"], true);
+        assert_eq!(output_payload["stdout_bytes"], 65_536);
+        assert!(
+            output_payload["stdout"].as_str().is_some_and(|stdout| stdout.len() <= 1_024),
+            "captured stdout must respect the configured memory budget"
+        );
+
+        let cpu_started = std::time::Instant::now();
+        let cpu_outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-live-cpu-cap",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"sh","args":["-c","while :; do :; done"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        let cpu_elapsed_ms = u64::try_from(cpu_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        assert!(!cpu_outcome.success, "CPU-bound command must hit the Docker CPU ulimit");
+        assert!(
+            cpu_elapsed_ms < 10_000,
+            "CPU ulimit must terminate the container before the wall-time fallback"
+        );
+        let cpu_payload: serde_json::Value =
+            serde_json::from_slice(&cpu_outcome.output_json).expect("Docker CPU output JSON");
+        assert_eq!(cpu_payload["cleanup"]["container_removed"], true);
+
+        let orphan_name = format!("palyra-orphan-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let docker_user = current_docker_user();
+        let orphan = tokio::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                orphan_name.as_str(),
+                "--label",
+                "palyra.managed=true",
+                "--label",
+                "palyra.cleanup_deadline_unix_ms=1",
+                "--read-only",
+                "--network",
+                "none",
+                "--user",
+                docker_user.as_str(),
+                image.as_str(),
+                "sleep",
+                "30",
+            ])
+            .output()
+            .await
+            .expect("expired orphan fixture should launch");
+        assert!(
+            orphan.status.success(),
+            "expired orphan fixture failed: {}",
+            String::from_utf8_lossy(orphan.stderr.as_slice())
+        );
+        let reaped = super::reap_expired_docker_containers(crate::gateway::current_unix_ms())
+            .await
+            .expect("expired orphan reaper should succeed");
+        assert!(!reaped.is_empty());
+        assert!(super::docker_exact_name_container_absent(orphan_name.as_str())
+            .await
+            .expect("orphan absence probe"));
+        if let Some(report_path) = std::env::var_os("PALYRA_DOCKER_LIVE_REPORT").map(PathBuf::from)
+        {
+            let evidence_path = report_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("resource-and-orphan-report.json");
+            let evidence = json!({
+                "schema_version": 1,
+                "output_original_bytes": output_payload["stdout_bytes"],
+                "output_truncated": output_payload["stdout_truncated"],
+                "output_limit_bytes": 1_024,
+                "cpu_limit_ms": 1_000,
+                "cpu_terminated_before_wall_timeout": true,
+                "cpu_elapsed_ms": cpu_elapsed_ms,
+                "mount_escape_sentinel_visible": false,
+                "expired_orphan_reaped": true,
+                "reaped_container_count": reaped.len(),
+                "remaining_managed_container": false,
+            });
+            fs::write(
+                evidence_path,
+                serde_json::to_vec_pretty(&evidence).expect("resource evidence should serialize"),
+            )
+            .expect("resource evidence should be written");
+        }
     }
 
     #[cfg(feature = "qa-fault-injection")]

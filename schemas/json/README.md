@@ -29,6 +29,12 @@ ACL-compatible evidence references, epistemic labels, source citations,
 contradiction posture, quality comparison, approval generation, retrieval
 feedback, bounded retention, degradation, archive, and rollback history.
 
+`docker-backend-capability-report.v1.json` and
+`container-cleanup-attestation.v1.json` pin the daemon/profile qualification
+matrix and fail-closed cleanup settlement for production-gated Docker runs.
+They expose resource and cleanup posture without container output, environment
+values, mount contents, or raw resource-lease identities.
+
 Managed coding runtime contracts are split by durable or operator-visible
 responsibility:
 

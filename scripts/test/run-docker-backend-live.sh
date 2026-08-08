@@ -14,6 +14,7 @@ cleanup_residual_containers() {
   local residual
   residual="$(docker ps -aq --filter label=palyra.managed=true 2>/dev/null || true)"
   if [[ -n "$residual" ]]; then
+    docker inspect $residual >"$artifact_root/residual-containers-on-exit.json" 2>/dev/null || true
     docker rm -f $residual >/dev/null 2>&1 || true
   fi
 }

@@ -109,6 +109,14 @@ run_exact_contract_check \
   "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" \
   "$CARGO_BIN" test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact
 run_exact_contract_check \
+  "Docker rollout direct container-path proof" \
+  "gateway::tests::docker_runtime_selects_container_process_path" \
+  "$CARGO_BIN" test -p palyra-daemon gateway::tests::docker_runtime_selects_container_process_path --locked -- --exact
+run_exact_contract_check \
+  "Docker rollout no-hidden-fallback proof" \
+  "gateway::tests::docker_runtime_fails_closed_without_host_fallback" \
+  "$CARGO_BIN" test -p palyra-daemon gateway::tests::docker_runtime_fails_closed_without_host_fallback --locked -- --exact
+run_exact_contract_check \
   "stable core evidence contract" \
   "application::core_stability::stable::tests::builtin_evidence_pack_qualifies" \
   "$CARGO_BIN" test -p palyra-daemon --lib application::core_stability::stable::tests::builtin_evidence_pack_qualifies --locked -- --exact

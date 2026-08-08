@@ -178,6 +178,28 @@
       "legacy_removal_condition": "Remove the local fallback only after stable promotion proves direct-path usage with zero hidden fallback for one supported release window.",
       "direct_hot_path_test_ref": "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure --locked -- --exact",
       "no_hidden_fallback_test_ref": "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact"
+    },
+    "docker_backend_live": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon --lib docker_ --locked",
+        "cargo test -p palyra-daemon gateway::tests::docker_runtime_selects_container_process_path --locked -- --exact",
+        "cargo test -p palyra-daemon gateway::tests::docker_runtime_fails_closed_without_host_fallback --locked -- --exact",
+        "bash scripts/test/run-docker-backend-live.sh",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "sli": {
+        "indicator": "qualified Docker execution and cleanup settlement rate",
+        "objective": "all admitted runs enforce resource, network, mount, output, and cleanup policy with zero residual managed containers",
+        "window": "each Docker backend live qualification run and supported Linux release candidate"
+      },
+      "rollback": {
+        "mechanism": "disable execution_backend_docker without routing the request to a weaker backend",
+        "verification": "Docker requests return an explicit unavailable outcome and residual-container reconciliation remains green"
+      },
+      "compatibility_commitment": "Docker execution remains opt-in and preserves the canonical execution result, patch bundle, and cleanup evidence contracts.",
+      "legacy_removal_condition": "Remove a lower-security alternative only after stable Docker qualification and one supported compatibility window.",
+      "direct_hot_path_test_ref": "cargo test -p palyra-daemon gateway::tests::docker_runtime_selects_container_process_path --locked -- --exact",
+      "no_hidden_fallback_test_ref": "cargo test -p palyra-daemon gateway::tests::docker_runtime_fails_closed_without_host_fallback --locked -- --exact"
     }
   },
   "rollouts": [
@@ -236,14 +258,14 @@
     {
       "capability": "execution_backend_docker",
       "owner_component": "execution backends",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "gated_production",
+      "support_maturity": "preview",
       "lifecycle": "active",
-      "evidence_profile": "execution_backend_blocked",
-      "promotion_blockers": ["container policy, attestation, and cleanup parity are incomplete"],
-      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "evidence_profile": "docker_backend_live",
+      "promotion_blockers": ["stable promotion requires qualified production-window usage evidence on the supported Linux matrix"],
+      "removal_condition": "remove the local sandbox alternative only after stable Docker qualification and one supported compatibility window",
       "shadow_side_effect_posture": "not_applicable"
     },
     {
