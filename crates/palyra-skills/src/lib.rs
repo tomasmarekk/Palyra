@@ -12,6 +12,7 @@ mod artifact;
 mod audit;
 mod constants;
 mod contract;
+mod dynamic_tools;
 mod error;
 mod extension;
 mod install_policy;
@@ -34,6 +35,7 @@ pub use contract::{
     skill_manifest_contract_snapshot, SKILL_MANIFEST_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
     SKILL_MANIFEST_CONTRACT_SNAPSHOT_VERSION,
 };
+pub use dynamic_tools::*;
 pub use error::SkillPackagingError;
 pub use extension::*;
 pub use install_policy::*;

@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/dynamic-tool-artifact.v1.json",
+  "title": "Signed Dynamic Tool Artifact V1",
+  "type": "object",
+  "required": [
+    "v",
+    "proposal",
+    "implementation_bytes",
+    "implementation_sha256",
+    "provenance",
+    "eval_pack",
+    "payload_sha256",
+    "signature",
+    "artifact_sha256"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "implementation_bytes": {
+      "type": "array",
+      "maxItems": 4194304,
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      }
+    },
+    "implementation_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "eval_pack": {
+      "$ref": "#/$defs/eval_pack"
+    },
+    "payload_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "signature": {
+      "$ref": "#/$defs/signature"
+    },
+    "artifact_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bounded_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "tool_name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$"
+    },
+    "semantics": {
+      "type": "object",
+      "required": [
+        "mutating",
+        "idempotent",
+        "requires_approval",
+        "max_execution_ms"
+      ],
+      "properties": {
+        "mutating": {
+          "type": "boolean"
+        },
+        "idempotent": {
+          "type": "boolean"
+        },
+        "requires_approval": {
+          "type": "boolean"
+        },
+        "max_execution_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        }
+      },
+      "additionalProperties": false
+    },
+    "proposal": {
+      "type": "object",
+      "required": [
+        "v",
+        "tool_name",
+        "description",
+        "input_schema",
+        "output_schema",
+        "capability_needs",
+        "deterministic_constraints",
+        "implementation_type",
+        "semantics",
+        "previous_artifact_sha256"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "tool_name": {
+          "$ref": "#/$defs/tool_name"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "input_schema": {
+          "type": "object",
+          "maxProperties": 128
+        },
+        "output_schema": {
+          "type": "object",
+          "maxProperties": 128
+        },
+        "capability_needs": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 256
+          }
+        },
+        "deterministic_constraints": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "implementation_type": {
+          "enum": [
+            "declarative_composition",
+            "wasm_component"
+          ]
+        },
+        "semantics": {
+          "$ref": "#/$defs/semantics"
+        },
+        "previous_artifact_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "builder_id",
+        "proposal_sha256",
+        "implementation_sha256",
+        "eval_pack_sha256",
+        "built_at_unix_ms"
+      ],
+      "properties": {
+        "builder_id": {
+          "$ref": "#/$defs/bounded_identifier"
+        },
+        "proposal_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "implementation_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "eval_pack_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "built_at_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "eval_case": {
+      "type": "object",
+      "required": [
+        "kind",
+        "passed",
+        "evidence_sha256",
+        "duration_ms",
+        "reason_code"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "happy_path",
+            "malformed_input",
+            "timeout",
+            "secret_handling",
+            "rollback",
+            "authority"
+          ]
+        },
+        "passed": {
+          "const": true
+        },
+        "evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "reason_code": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "eval_pack": {
+      "type": "object",
+      "required": [
+        "v",
+        "cases",
+        "pack_sha256"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/eval_case"
+          }
+        },
+        "pack_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "signature": {
+      "type": "object",
+      "required": [
+        "algorithm",
+        "publisher",
+        "key_id",
+        "public_key_base64",
+        "payload_sha256",
+        "signature_base64",
+        "signed_at_unix_ms"
+      ],
+      "properties": {
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "publisher": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^ed25519:[0-9a-f]{16}$"
+        },
+        "public_key_base64": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 44
+        },
+        "payload_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88
+        },
+        "signed_at_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

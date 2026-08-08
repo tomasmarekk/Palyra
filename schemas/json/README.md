@@ -17,6 +17,12 @@ contract: it closes unknown fields, carries only bounded redacted text, and keep
 retry and side-effect uncertainty as typed metadata rather than message-derived
 behavior.
 
+`dynamic-tool-artifact.v1.json` and
+`dynamic-tool-activation-decision.v1.json` pin the immutable signed artifact,
+six-case conformance evidence, host approval generation, catalog epoch, and
+rollback pointer for restricted declarative or WASM dynamic tools. Artifact
+presence alone never grants catalog or execution authority.
+
 Managed coding runtime contracts are split by durable or operator-visible
 responsibility:
 
