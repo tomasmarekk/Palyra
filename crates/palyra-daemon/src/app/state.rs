@@ -20,7 +20,7 @@ use crate::gateway::proto::palyra::common::v1 as common_v1;
 use crate::{
     access_control::AccessRegistry,
     acp::AcpRuntime,
-    application::mcp_broker::McpRuntimeSupervisor,
+    application::{audio_pipeline::AudioSessionRegistry, mcp_broker::McpRuntimeSupervisor},
     channels,
     config::LoadedConfig,
     cron::CronTimezoneMode,
@@ -69,6 +69,7 @@ pub(crate) struct AppState {
     pub(crate) openai_oauth_attempts: Arc<Mutex<HashMap<String, OpenAiOAuthAttempt>>>,
     pub(crate) relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     pub(crate) console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
+    pub(crate) audio_sessions: Arc<AudioSessionRegistry>,
     pub(crate) support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
     pub(crate) doctor_jobs: Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
     pub(crate) console_memory_index_active: Arc<AtomicBool>,

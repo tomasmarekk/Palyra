@@ -137,6 +137,7 @@ pub struct MediaConnectorSnapshot {
     pub retention: MediaRetentionSnapshot,
     pub recent_blocked_reasons: Vec<MediaEventSnapshot>,
     pub recent_upload_failures: Vec<MediaEventSnapshot>,
+    pub recent_audio_jobs: Vec<MediaEventSnapshot>,
 }
 
 /// Store-wide counterpart of [`MediaConnectorSnapshot`], aggregated across all
@@ -148,6 +149,7 @@ pub struct MediaGlobalSnapshot {
     pub retention: MediaRetentionSnapshot,
     pub recent_blocked_reasons: Vec<MediaEventSnapshot>,
     pub recent_upload_failures: Vec<MediaEventSnapshot>,
+    pub recent_audio_jobs: Vec<MediaEventSnapshot>,
 }
 
 /// Current store occupancy. `stored_content_count` counts distinct content
@@ -344,6 +346,29 @@ pub struct InboundAttachmentIngestRequest<'a> {
     pub attachment_index: usize,
     pub attachment_count: usize,
     pub total_declared_bytes: u64,
+}
+
+/// Redacted scalar evidence for one connector-neutral audio job.
+///
+/// Raw media, transcript text, provider payloads, and unhashed session ids are
+/// intentionally absent so the durable media event remains safe to inspect.
+#[derive(Debug, Clone)]
+pub struct MediaAudioJobEventRequest<'a> {
+    pub source_artifact_id: &'a str,
+    pub source_artifact_sha256: &'a str,
+    pub session_id: &'a str,
+    pub job_kind: &'a str,
+    pub state: &'a str,
+    pub reason_code: &'a str,
+    pub derived_artifact_sha256: Option<&'a str>,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub audio_duration_ms: u64,
+    pub billable_units: u64,
+    pub estimated_cost_microunits: u64,
+    pub session_bytes: u64,
+    pub session_duration_ms: u64,
+    pub active_jobs: u32,
 }
 
 /// Failure modes of the media store.
@@ -1710,6 +1735,8 @@ impl MediaArtifactStore {
             "attachment.upload.failed",
             RECENT_EVENT_LIMIT,
         )?;
+        let audio_jobs =
+            self.query_recent_events_locked(&guard, connector_id, "audio.%", RECENT_EVENT_LIMIT)?;
         Ok(MediaConnectorSnapshot {
             policy: self.config.clone(),
             usage,
@@ -1720,6 +1747,7 @@ impl MediaArtifactStore {
             },
             recent_blocked_reasons: blocked,
             recent_upload_failures: upload_failures,
+            recent_audio_jobs: audio_jobs,
         })
     }
 
@@ -1753,7 +1781,86 @@ impl MediaArtifactStore {
                 "attachment.upload.failed",
                 RECENT_EVENT_LIMIT,
             )?,
+            recent_audio_jobs: self.query_recent_events_global_locked(
+                &guard,
+                "audio.%",
+                RECENT_EVENT_LIMIT,
+            )?,
         })
+    }
+
+    /// Persists bounded audio lifecycle, metering, and session-budget evidence.
+    ///
+    /// # Errors
+    /// Returns an invalid-attachment error for unsupported lifecycle labels and
+    /// propagates SQLite persistence failures.
+    pub fn record_audio_job_event(
+        &self,
+        request: MediaAudioJobEventRequest<'_>,
+    ) -> Result<(), MediaStoreError> {
+        if !matches!(request.job_kind, "transcription" | "synthesis")
+            || !matches!(
+                request.state,
+                "succeeded" | "failed" | "timed_out" | "cancelled" | "blocked"
+            )
+            || request.reason_code.trim().is_empty()
+            || request.reason_code.len() > 128
+            || !request.reason_code.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+            || request.source_artifact_id.trim().is_empty()
+            || request.source_artifact_id.len() > 256
+            || request.session_id.trim().is_empty()
+            || request.session_id.len() > 256
+            || !is_valid_lowercase_sha256_hex(request.source_artifact_sha256)
+            || request
+                .derived_artifact_sha256
+                .is_some_and(|digest| !is_valid_lowercase_sha256_hex(digest))
+        {
+            return Err(MediaStoreError::InvalidAttachment(
+                "audio job event contains an unsupported lifecycle label".to_owned(),
+            ));
+        }
+        let event_type = format!("audio.{}.{}", request.job_kind, request.state);
+        let direction = if request.job_kind == "synthesis" {
+            MediaDirection::Outbound
+        } else {
+            MediaDirection::Inbound
+        };
+        self.record_event(
+            "audio_pipeline",
+            direction,
+            MediaEventRecord {
+                event_type: event_type.as_str(),
+                artifact_id: Some(request.source_artifact_id),
+                attachment_id: Some(request.source_artifact_id),
+                filename: None,
+                reason: request.reason_code.to_owned(),
+                details: json!({
+                    "schema_version": 1,
+                    "session_id_sha256": sha256_hex(request.session_id.as_bytes()),
+                    "source_artifact_sha256": request.source_artifact_sha256,
+                    "derived_artifact_sha256": request.derived_artifact_sha256,
+                    "job_kind": request.job_kind,
+                    "state": request.state,
+                    "reason_code": request.reason_code,
+                    "usage": {
+                        "input_bytes": request.input_bytes,
+                        "output_bytes": request.output_bytes,
+                        "audio_duration_ms": request.audio_duration_ms,
+                        "billable_units": request.billable_units,
+                        "estimated_cost_microunits": request.estimated_cost_microunits,
+                    },
+                    "session_usage": {
+                        "bytes": request.session_bytes,
+                        "duration_ms": request.session_duration_ms,
+                    },
+                    "active_jobs": request.active_jobs,
+                }),
+            },
+        )
     }
 
     /// Records an `attachment.upload.succeeded` audit event.
@@ -2761,6 +2868,11 @@ fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_valid_lowercase_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn validate_content_digest(expected_sha256: &str) -> Result<(), MediaStoreError> {
     if !is_valid_sha256_hex(expected_sha256)
         || expected_sha256.contains("..")
@@ -2969,6 +3081,7 @@ mod tests {
     use palyra_connectors::{AttachmentKind, AttachmentRef};
     use reqwest::Url;
     use rusqlite::params;
+    use serde_json::Value;
     use tempfile::TempDir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2981,9 +3094,9 @@ mod tests {
         build_media_http_client_with_resolved_addresses, content_relative_path,
         read_response_body_with_limit, resolve_content_storage_path,
         should_prune_retention_after_ingest, sniff_content, ConsoleAttachmentStoreRequest,
-        InboundAttachmentIngestRequest, MediaArtifactStore, MediaDerivedArtifactUpsertRequest,
-        MediaMaintenanceState, MediaRuntimeConfig, RETENTION_PRUNE_MAX_DEFERRED_INGESTS,
-        RETENTION_PRUNE_MIN_INTERVAL_MS,
+        InboundAttachmentIngestRequest, MediaArtifactStore, MediaAudioJobEventRequest,
+        MediaDerivedArtifactUpsertRequest, MediaMaintenanceState, MediaRuntimeConfig,
+        MediaStoreError, RETENTION_PRUNE_MAX_DEFERRED_INGESTS, RETENTION_PRUNE_MIN_INTERVAL_MS,
     };
 
     #[test]
@@ -3058,6 +3171,96 @@ mod tests {
             store.build_connector_snapshot("discord:default").expect("snapshot should succeed");
         assert_eq!(snapshot.usage.artifact_count, 0);
         assert_eq!(snapshot.policy.max_attachments_per_message, 4);
+    }
+
+    #[test]
+    fn audio_job_event_persists_only_hashed_session_and_bounded_usage() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let store = MediaArtifactStore::open(
+            tempdir.path().join("media.sqlite3"),
+            tempdir.path().join("media"),
+            MediaRuntimeConfig::default(),
+        )
+        .expect("media store should initialize");
+        let source_artifact_sha256 = "a".repeat(64);
+        let derived_artifact_sha256 = "b".repeat(64);
+        store
+            .record_audio_job_event(MediaAudioJobEventRequest {
+                source_artifact_id: "artifact-1",
+                source_artifact_sha256: source_artifact_sha256.as_str(),
+                session_id: "secret-session-id",
+                job_kind: "transcription",
+                state: "succeeded",
+                reason_code: "audio.transcription.succeeded",
+                derived_artifact_sha256: Some(derived_artifact_sha256.as_str()),
+                input_bytes: 128,
+                output_bytes: 0,
+                audio_duration_ms: 1_250,
+                billable_units: 1_250,
+                estimated_cost_microunits: 3,
+                session_bytes: 128,
+                session_duration_ms: 1_250,
+                active_jobs: 1,
+            })
+            .expect("audio event should persist");
+
+        let guard = store.connection.lock().expect("media connection");
+        let details: String = guard
+            .query_row(
+                "SELECT details_json FROM media_events WHERE event_type = ?1",
+                params!["audio.transcription.succeeded"],
+                |row| row.get(0),
+            )
+            .expect("audio event details");
+        let details: Value = serde_json::from_str(details.as_str()).expect("details JSON");
+        assert_eq!(details["usage"]["estimated_cost_microunits"], 3);
+        assert_eq!(details["session_usage"]["bytes"], 128);
+        assert_eq!(
+            details["session_id_sha256"],
+            Value::String(super::sha256_hex(b"secret-session-id"))
+        );
+        assert!(!details.to_string().contains("secret-session-id"));
+    }
+
+    #[test]
+    fn audio_job_event_rejects_non_digest_evidence_before_persistence() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let store = MediaArtifactStore::open(
+            tempdir.path().join("media.sqlite3"),
+            tempdir.path().join("media"),
+            MediaRuntimeConfig::default(),
+        )
+        .expect("media store should initialize");
+        let error = store
+            .record_audio_job_event(MediaAudioJobEventRequest {
+                source_artifact_id: "artifact-1",
+                source_artifact_sha256: "not-a-digest-secret-value",
+                session_id: "session-1",
+                job_kind: "transcription",
+                state: "blocked",
+                reason_code: "audio_artifact_contract_invalid",
+                derived_artifact_sha256: None,
+                input_bytes: 0,
+                output_bytes: 0,
+                audio_duration_ms: 0,
+                billable_units: 0,
+                estimated_cost_microunits: 0,
+                session_bytes: 0,
+                session_duration_ms: 0,
+                active_jobs: 0,
+            })
+            .expect_err("invalid digest evidence must fail closed");
+        assert!(matches!(error, MediaStoreError::InvalidAttachment(_)));
+
+        let guard = store.connection.lock().expect("media connection");
+        let event_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM media_events WHERE event_type LIKE 'audio.%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audio event count");
+        assert_eq!(event_count, 0);
     }
 
     #[test]

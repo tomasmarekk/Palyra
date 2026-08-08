@@ -35,6 +35,12 @@ matrix and fail-closed cleanup settlement for production-gated Docker runs.
 They expose resource and cleanup posture without container output, environment
 values, mount contents, or raw resource-lease identities.
 
+`audio-input-artifact.v1.json`, `transcription-artifact.v1.json`, and
+`audio-output-artifact.v1.json` pin connector-neutral media provenance,
+untrusted transcript citations, metered usage, bounded retention, and
+post-delivery audio descriptors. Raw audio bytes remain outside these durable
+contracts.
+
 Managed coding runtime contracts are split by durable or operator-visible
 responsibility:
 

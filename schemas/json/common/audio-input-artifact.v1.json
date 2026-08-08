@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/audio-input-artifact.v1.json",
+  "title": "Audio Input Artifact V1",
+  "type": "object",
+  "required": [
+    "v",
+    "artifact_id",
+    "file_name",
+    "content_type",
+    "codec",
+    "bytes",
+    "duration_ms",
+    "language_hint",
+    "sha256",
+    "created_at_unix_ms",
+    "expires_at_unix_ms",
+    "provenance"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "artifact_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "file_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "content_type": {
+      "$ref": "#/$defs/media_type"
+    },
+    "codec": {
+      "$ref": "#/$defs/bounded_text"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 26214400
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 900000
+    },
+    "language_hint": {
+      "$ref": "#/$defs/optional_language"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "created_at_unix_ms": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "expires_at_unix_ms": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "bounded_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "media_type": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "optional_language": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 35,
+          "pattern": "^[A-Za-z0-9-]+$"
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "source_kind",
+        "source_reference_sha256",
+        "received_at_unix_ms",
+        "principal_scope_sha256",
+        "session_id"
+      ],
+      "properties": {
+        "source_kind": {
+          "$ref": "#/$defs/bounded_text"
+        },
+        "source_reference_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "received_at_unix_ms": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "principal_scope_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "session_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

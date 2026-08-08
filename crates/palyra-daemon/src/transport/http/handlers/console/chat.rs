@@ -240,6 +240,7 @@ pub(crate) async fn console_chat_session_reset_handler(
             "session_id must be a canonical ULID",
         ))
     })?;
+    let _cancelled_media_jobs = state.audio_sessions.cancel_session(session_id.as_str());
     let outcome = state
         .runtime
         .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
@@ -2885,6 +2886,8 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
+    let _media_job_cancelled =
+        state.audio_sessions.cancel_job(task.session_id.as_str(), task.task_id.as_str());
     let task_state = AuxiliaryTaskState::from_str(task.state.as_str());
     if matches!(task_state, Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested))
     {
@@ -6271,6 +6274,64 @@ impl application::audio_pipeline::AudioTranscriptionBackend for GatewayAudioTran
     }
 }
 
+fn record_console_audio_job_event(
+    state: &AppState,
+    session_id: &str,
+    source_artifact: &media::MediaArtifactPayload,
+    job_state: &str,
+    reason_code: &str,
+    derived_artifact_sha256: Option<&str>,
+    usage: application::audio_pipeline::MediaUsage,
+) -> Result<(), String> {
+    let session = state.audio_sessions.diagnostics(session_id).ok_or_else(|| {
+        "audio session diagnostics disappeared before durable event settlement".to_owned()
+    })?;
+    state
+        .channels
+        .record_audio_job_event(media::MediaAudioJobEventRequest {
+            source_artifact_id: source_artifact.artifact_id.as_str(),
+            source_artifact_sha256: source_artifact.sha256.as_str(),
+            session_id,
+            job_kind: "transcription",
+            state: job_state,
+            reason_code,
+            derived_artifact_sha256,
+            input_bytes: usage.input_bytes,
+            output_bytes: usage.output_bytes,
+            audio_duration_ms: usage.audio_duration_ms,
+            billable_units: usage.billable_units,
+            estimated_cost_microunits: usage.estimated_cost_microunits,
+            session_bytes: session.usage.bytes,
+            session_duration_ms: session.usage.duration_ms,
+            active_jobs: session.active_jobs,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn audio_job_state_for_error(
+    error: &application::audio_pipeline::AudioPipelineError,
+) -> &'static str {
+    use application::audio_pipeline::AudioPipelineError;
+
+    match error {
+        AudioPipelineError::Cancelled => "cancelled",
+        AudioPipelineError::TimedOut => "timed_out",
+        AudioPipelineError::Backend(_) => "failed",
+        AudioPipelineError::JobByteBudgetExceeded
+        | AudioPipelineError::JobDurationBudgetExceeded
+        | AudioPipelineError::SessionByteBudgetExceeded
+        | AudioPipelineError::SessionDurationBudgetExceeded
+        | AudioPipelineError::InvalidMediaIdentity
+        | AudioPipelineError::DuplicateMediaJob
+        | AudioPipelineError::SessionRegistryCapacityExceeded
+        | AudioPipelineError::SessionJobLimitExceeded
+        | AudioPipelineError::ArtifactIntegrityMismatch
+        | AudioPipelineError::ArtifactContractInvalid
+        | AudioPipelineError::TranscriptBudgetExceeded
+        | AudioPipelineError::BackendOutputInvalid => "blocked",
+    }
+}
+
 /// Derives artifacts for an uploaded attachment: always a metadata summary,
 /// plus extracted text for documents and a transcript for audio when
 /// supported. Per-kind extraction failures are persisted as failed derived
@@ -6378,7 +6439,10 @@ async fn derive_console_attachment_artifacts(
         }
     }
 
-    if crate::media_derived::supports_audio_transcription(artifact.content_type.as_str()) {
+    if should_transcribe_audio_attachment(
+        state.runtime.config.feature_rollouts.audio_pipeline.enabled,
+        artifact.content_type.as_str(),
+    ) {
         let transcription_started_at = std::time::Instant::now();
         let retention = application::audio_pipeline::MediaRetentionPolicy::default();
         let input_artifact = application::audio_pipeline::AudioInputArtifactV1::from_payload(
@@ -6404,56 +6468,36 @@ async fn derive_console_attachment_artifacts(
             },
             retention,
         );
-        let mut audio_pipeline = application::audio_pipeline::AudioPipeline::new(
-            application::audio_pipeline::MediaSessionBudget::default(),
-            retention,
-        );
-        let cancellation = application::audio_pipeline::AudioJobCancellation::default();
+        let mut audio_job = state
+            .audio_sessions
+            .begin_job(session_id, background_task_id)
+            .map_err(|error| format!("{}:{error}", error.reason_code()))?;
+        let cancellation = audio_job.cancellation();
         let backend = GatewayAudioTranscriptionAdapter { runtime: Arc::clone(&state.runtime) };
-        match audio_pipeline
+        match audio_job
+            .pipeline_mut()
             .transcribe(&input_artifact, artifact.bytes.as_slice(), &backend, &cancellation)
             .await
         {
-            Ok(transcript) => match crate::media_derived::build_transcription_content(
-                crate::model_provider::AudioTranscriptionResponse {
-                    text: transcript.text,
-                    language: transcript.detected_language,
-                    duration_ms: Some(transcript.duration_ms),
-                    model_name: transcript.model_name,
-                    retry_count: 0,
-                    segments: Vec::new(),
-                },
-                transcription_started_at.elapsed().as_millis() as u64,
-            ) {
-                Ok(derived) => {
-                    let record = state
-                        .channels
-                        .upsert_console_chat_derived_artifact(
-                            media::MediaDerivedArtifactUpsertRequest {
-                                source_artifact_id: artifact.artifact_id.as_str(),
-                                attachment_id: Some(artifact.artifact_id.as_str()),
-                                session_id: Some(session_id),
-                                principal: Some(session.context.principal.as_str()),
-                                device_id: Some(session.context.device_id.as_str()),
-                                channel: session.context.channel.as_deref(),
-                                filename: artifact.filename.as_str(),
-                                declared_content_type: artifact.content_type.as_str(),
-                                source_content_hash: artifact.sha256.as_str(),
-                                background_task_id: Some(background_task_id),
-                                derived: &derived,
-                            },
-                        )
-                        .map_err(|error| error.to_string())?;
-                    index_derived_artifact_targets(state, session, session_id, artifact, &record)
-                        .await?;
-                    persisted.push(record);
-                }
-                Err(error) => {
-                    persisted.push(
-                        state
+            Ok(transcript) => {
+                let transcript_sha256 = transcript.transcript_sha256.clone();
+                let transcript_usage = transcript.usage;
+                match crate::media_derived::build_transcription_content(
+                    crate::model_provider::AudioTranscriptionResponse {
+                        text: transcript.text,
+                        language: transcript.detected_language,
+                        duration_ms: Some(transcript.duration_ms),
+                        model_name: transcript.model_name,
+                        retry_count: 0,
+                        segments: Vec::new(),
+                    },
+                    transcription_started_at.elapsed().as_millis() as u64,
+                ) {
+                    Ok(derived) => {
+                        let record = state
                             .channels
-                            .upsert_console_chat_failed_derived_artifact(
-                                media::MediaFailedDerivedArtifactUpsertRequest {
+                            .upsert_console_chat_derived_artifact(
+                                media::MediaDerivedArtifactUpsertRequest {
                                     source_artifact_id: artifact.artifact_id.as_str(),
                                     attachment_id: Some(artifact.artifact_id.as_str()),
                                     session_id: Some(session_id),
@@ -6463,20 +6507,74 @@ async fn derive_console_attachment_artifacts(
                                     filename: artifact.filename.as_str(),
                                     declared_content_type: artifact.content_type.as_str(),
                                     source_content_hash: artifact.sha256.as_str(),
-                                    kind: crate::media_derived::DerivedArtifactKind::Transcript,
-                                    parser_name:
-                                        crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
-                                    parser_version:
-                                        crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
                                     background_task_id: Some(background_task_id),
-                                    failure_reason: error.as_str(),
+                                    derived: &derived,
                                 },
                             )
-                            .map_err(|error| error.to_string())?,
-                    );
+                            .map_err(|error| error.to_string())?;
+                        index_derived_artifact_targets(
+                            state, session, session_id, artifact, &record,
+                        )
+                        .await?;
+                        record_console_audio_job_event(
+                            state,
+                            session_id,
+                            artifact,
+                            "succeeded",
+                            "audio.transcription.succeeded",
+                            Some(transcript_sha256.as_str()),
+                            transcript_usage,
+                        )?;
+                        persisted.push(record);
+                    }
+                    Err(error) => {
+                        record_console_audio_job_event(
+                            state,
+                            session_id,
+                            artifact,
+                            "failed",
+                            "audio.transcription.derived_artifact_failed",
+                            None,
+                            transcript_usage,
+                        )?;
+                        persisted.push(
+                            state
+                                .channels
+                                .upsert_console_chat_failed_derived_artifact(
+                                    media::MediaFailedDerivedArtifactUpsertRequest {
+                                        source_artifact_id: artifact.artifact_id.as_str(),
+                                        attachment_id: Some(artifact.artifact_id.as_str()),
+                                        session_id: Some(session_id),
+                                        principal: Some(session.context.principal.as_str()),
+                                        device_id: Some(session.context.device_id.as_str()),
+                                        channel: session.context.channel.as_deref(),
+                                        filename: artifact.filename.as_str(),
+                                        declared_content_type: artifact.content_type.as_str(),
+                                        source_content_hash: artifact.sha256.as_str(),
+                                        kind: crate::media_derived::DerivedArtifactKind::Transcript,
+                                        parser_name:
+                                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
+                                        parser_version:
+                                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
+                                        background_task_id: Some(background_task_id),
+                                        failure_reason: error.as_str(),
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
                 }
-            },
+            }
             Err(error) => {
+                record_console_audio_job_event(
+                    state,
+                    session_id,
+                    artifact,
+                    audio_job_state_for_error(&error),
+                    error.reason_code(),
+                    None,
+                    application::audio_pipeline::MediaUsage::default(),
+                )?;
                 let failure_message = format!("{}:{error}", error.reason_code());
                 persisted.push(
                     state
@@ -6507,6 +6605,10 @@ async fn derive_console_attachment_artifacts(
     }
 
     Ok(persisted)
+}
+
+fn should_transcribe_audio_attachment(rollout_enabled: bool, content_type: &str) -> bool {
+    rollout_enabled && crate::media_derived::supports_audio_transcription(content_type)
 }
 
 /// Indexes a derived artifact for retrieval by upserting a workspace document
@@ -6881,13 +6983,20 @@ mod tests {
         derive_canvas_transcript_reference, derived_artifact_index_content,
         derived_artifact_matches_console_context, extract_canvas_id_from_frame_reference,
         resolve_console_background_task_kind, retry_parameter_delta_from_payload_or_run,
-        run_matches_console_context,
+        run_matches_console_context, should_transcribe_audio_attachment,
     };
     use crate::{
         app::state::ConsoleSession, domain::workspace::normalize_workspace_path, gateway, journal,
         media, transport::grpc::proto::palyra::common::v1 as common_v1,
     };
     use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
+
+    #[test]
+    fn audio_transcription_requires_its_product_rollout() {
+        assert!(!should_transcribe_audio_attachment(false, "audio/ogg"));
+        assert!(should_transcribe_audio_attachment(true, "audio/ogg"));
+        assert!(!should_transcribe_audio_attachment(true, "image/png"));
+    }
 
     #[test]
     fn run_matches_console_context_rejects_mismatched_principal() {

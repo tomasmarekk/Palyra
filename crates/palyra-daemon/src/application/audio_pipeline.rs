@@ -3,7 +3,11 @@
 //! Raw media remains an ephemeral job input. Durable contracts contain only
 //! bounded, redacted text, content hashes, provenance, usage, and retention.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use palyra_model_providers::AudioTranscriptionResponse;
@@ -23,6 +27,8 @@ const DEFAULT_MAX_SESSION_MEDIA_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_MAX_SESSION_MEDIA_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_TRACKED_MEDIA_SESSIONS: usize = 1_024;
+const MAX_ACTIVE_MEDIA_JOBS_PER_SESSION: usize = 32;
 
 /// Media origin without connector-specific business semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,10 +205,12 @@ impl Default for MediaRetentionPolicy {
 }
 
 /// Mutable accounting held by one session's media coordinator.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaSessionUsage {
     pub bytes: u64,
     pub duration_ms: u64,
+    pub billable_units: u64,
+    pub estimated_cost_microunits: u64,
 }
 
 /// Cloneable cancellation source shared with in-flight STT and TTS jobs.
@@ -233,6 +241,190 @@ impl AudioJobCancellation {
                 return;
             }
         }
+    }
+}
+
+/// Redacted per-session media state exposed to diagnostics and durable events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSessionDiagnosticsV1 {
+    pub v: u32,
+    pub active_jobs: u32,
+    pub usage: MediaSessionUsage,
+    pub reason_code: String,
+}
+
+#[derive(Debug)]
+struct MediaSessionRuntime {
+    usage: Arc<Mutex<MediaSessionUsage>>,
+    active_jobs: HashMap<String, AudioJobCancellation>,
+    last_touched_at_unix_ms: u64,
+}
+
+/// Bounded daemon-owned registry for session usage and in-flight cancellation.
+///
+/// The registry deliberately stores no raw audio, transcript text, principal,
+/// or connector identity. Callers persist redacted job artifacts separately.
+#[derive(Debug)]
+pub struct AudioSessionRegistry {
+    budget: MediaSessionBudget,
+    retention: MediaRetentionPolicy,
+    sessions: Mutex<HashMap<String, MediaSessionRuntime>>,
+}
+
+impl Default for AudioSessionRegistry {
+    fn default() -> Self {
+        Self::new(MediaSessionBudget::default(), MediaRetentionPolicy::default())
+    }
+}
+
+impl AudioSessionRegistry {
+    #[must_use]
+    pub fn new(budget: MediaSessionBudget, retention: MediaRetentionPolicy) -> Self {
+        Self { budget, retention, sessions: Mutex::new(HashMap::new()) }
+    }
+
+    /// Registers one in-flight job and returns a lease sharing the session budget.
+    ///
+    /// # Errors
+    /// Returns a typed error for invalid identities, duplicate jobs, or bounded
+    /// registry/job capacity exhaustion.
+    pub fn begin_job(
+        self: &Arc<Self>,
+        session_id: &str,
+        job_id: &str,
+    ) -> Result<AudioSessionJob, AudioPipelineError> {
+        validate_media_identity(session_id)?;
+        validate_media_identity(job_id)?;
+        let now_unix_ms = unix_ms();
+        let mut sessions = lock_media_sessions(&self.sessions);
+        if !sessions.contains_key(session_id) && sessions.len() >= MAX_TRACKED_MEDIA_SESSIONS {
+            let evictable = sessions
+                .iter()
+                .filter(|(_, session)| session.active_jobs.is_empty())
+                .min_by_key(|(_, session)| session.last_touched_at_unix_ms)
+                .map(|(session_id, _)| session_id.clone());
+            if let Some(evictable) = evictable {
+                sessions.remove(evictable.as_str());
+            }
+        }
+        if !sessions.contains_key(session_id) && sessions.len() >= MAX_TRACKED_MEDIA_SESSIONS {
+            return Err(AudioPipelineError::SessionRegistryCapacityExceeded);
+        }
+        let session =
+            sessions.entry(session_id.to_owned()).or_insert_with(|| MediaSessionRuntime {
+                usage: Arc::new(Mutex::new(MediaSessionUsage::default())),
+                active_jobs: HashMap::new(),
+                last_touched_at_unix_ms: now_unix_ms,
+            });
+        if session.active_jobs.contains_key(job_id) {
+            return Err(AudioPipelineError::DuplicateMediaJob);
+        }
+        if session.active_jobs.len() >= MAX_ACTIVE_MEDIA_JOBS_PER_SESSION {
+            return Err(AudioPipelineError::SessionJobLimitExceeded);
+        }
+        let cancellation = AudioJobCancellation::default();
+        session.active_jobs.insert(job_id.to_owned(), cancellation.clone());
+        session.last_touched_at_unix_ms = now_unix_ms;
+        let usage = Arc::clone(&session.usage);
+        drop(sessions);
+        Ok(AudioSessionJob {
+            registry: Arc::clone(self),
+            session_id: session_id.to_owned(),
+            job_id: job_id.to_owned(),
+            pipeline: AudioPipeline::with_shared_usage(self.budget, self.retention, usage),
+            cancellation,
+        })
+    }
+
+    /// Requests cancellation for one exact in-flight media job.
+    #[must_use]
+    pub fn cancel_job(&self, session_id: &str, job_id: &str) -> bool {
+        let mut sessions = lock_media_sessions(&self.sessions);
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        let Some(cancellation) = session.active_jobs.get(job_id) else {
+            return false;
+        };
+        cancellation.cancel();
+        session.last_touched_at_unix_ms = unix_ms();
+        true
+    }
+
+    /// Requests cancellation for every in-flight job owned by one session.
+    #[must_use]
+    pub fn cancel_session(&self, session_id: &str) -> usize {
+        let mut sessions = lock_media_sessions(&self.sessions);
+        let Some(session) = sessions.get_mut(session_id) else {
+            return 0;
+        };
+        for cancellation in session.active_jobs.values() {
+            cancellation.cancel();
+        }
+        session.last_touched_at_unix_ms = unix_ms();
+        session.active_jobs.len()
+    }
+
+    /// Returns a redacted bounded snapshot without exposing the session id.
+    #[must_use]
+    pub fn diagnostics(&self, session_id: &str) -> Option<MediaSessionDiagnosticsV1> {
+        let sessions = lock_media_sessions(&self.sessions);
+        let session = sessions.get(session_id)?;
+        let usage = *lock_media_usage(&session.usage);
+        Some(MediaSessionDiagnosticsV1 {
+            v: AUDIO_PIPELINE_SCHEMA_VERSION,
+            active_jobs: u32::try_from(session.active_jobs.len()).unwrap_or(u32::MAX),
+            usage,
+            reason_code: if session.active_jobs.is_empty() {
+                "audio.session.idle"
+            } else {
+                "audio.session.active"
+            }
+            .to_owned(),
+        })
+    }
+
+    fn finish_job(&self, session_id: &str, job_id: &str) {
+        let mut sessions = lock_media_sessions(&self.sessions);
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.active_jobs.remove(job_id);
+            session.last_touched_at_unix_ms = unix_ms();
+        }
+    }
+}
+
+/// RAII owner for one registered media job.
+#[derive(Debug)]
+pub struct AudioSessionJob {
+    registry: Arc<AudioSessionRegistry>,
+    session_id: String,
+    job_id: String,
+    pipeline: AudioPipeline,
+    cancellation: AudioJobCancellation,
+}
+
+impl AudioSessionJob {
+    /// Returns the session-budgeted pipeline owned by this job lease.
+    pub fn pipeline_mut(&mut self) -> &mut AudioPipeline {
+        &mut self.pipeline
+    }
+
+    /// Returns a cancellation source tied to this exact job generation.
+    #[must_use]
+    pub fn cancellation(&self) -> AudioJobCancellation {
+        self.cancellation.clone()
+    }
+
+    /// Returns the aggregate media usage committed by this session.
+    #[must_use]
+    pub fn usage(&self) -> MediaSessionUsage {
+        self.pipeline.usage()
+    }
+}
+
+impl Drop for AudioSessionJob {
+    fn drop(&mut self) {
+        self.registry.finish_job(self.session_id.as_str(), self.job_id.as_str());
     }
 }
 
@@ -355,10 +547,22 @@ pub enum AudioPipelineError {
     SessionByteBudgetExceeded,
     #[error("media session duration budget exhausted")]
     SessionDurationBudgetExceeded,
+    #[error("media session or job identity is invalid")]
+    InvalidMediaIdentity,
+    #[error("media session already owns this job")]
+    DuplicateMediaJob,
+    #[error("media session registry capacity exhausted")]
+    SessionRegistryCapacityExceeded,
+    #[error("media session active job limit exhausted")]
+    SessionJobLimitExceeded,
     #[error("audio payload does not match artifact metadata")]
     ArtifactIntegrityMismatch,
+    #[error("audio artifact metadata is invalid")]
+    ArtifactContractInvalid,
     #[error("transcription output exceeds transcript budget")]
     TranscriptBudgetExceeded,
+    #[error("media backend returned invalid output")]
+    BackendOutputInvalid,
     #[error("media backend failed: {0}")]
     Backend(String),
 }
@@ -372,8 +576,14 @@ impl AudioPipelineError {
             Self::JobDurationBudgetExceeded => "audio_job_duration_budget_exceeded",
             Self::SessionByteBudgetExceeded => "audio_session_byte_budget_exceeded",
             Self::SessionDurationBudgetExceeded => "audio_session_duration_budget_exceeded",
+            Self::InvalidMediaIdentity => "audio_session_identity_invalid",
+            Self::DuplicateMediaJob => "audio_session_job_duplicate",
+            Self::SessionRegistryCapacityExceeded => "audio_session_registry_capacity_exceeded",
+            Self::SessionJobLimitExceeded => "audio_session_job_limit_exceeded",
             Self::ArtifactIntegrityMismatch => "audio_artifact_integrity_mismatch",
+            Self::ArtifactContractInvalid => "audio_artifact_contract_invalid",
             Self::TranscriptBudgetExceeded => "audio_transcript_budget_exceeded",
+            Self::BackendOutputInvalid => "audio_backend_output_invalid",
             Self::Backend(_) => "audio_backend_failed",
         }
     }
@@ -384,16 +594,28 @@ impl AudioPipelineError {
 pub struct AudioPipeline {
     budget: MediaSessionBudget,
     retention: MediaRetentionPolicy,
-    usage: MediaSessionUsage,
+    usage: Arc<Mutex<MediaSessionUsage>>,
 }
 
 impl AudioPipeline {
     pub fn new(budget: MediaSessionBudget, retention: MediaRetentionPolicy) -> Self {
-        Self { budget, retention, usage: MediaSessionUsage::default() }
+        Self::with_shared_usage(
+            budget,
+            retention,
+            Arc::new(Mutex::new(MediaSessionUsage::default())),
+        )
+    }
+
+    fn with_shared_usage(
+        budget: MediaSessionBudget,
+        retention: MediaRetentionPolicy,
+        usage: Arc<Mutex<MediaSessionUsage>>,
+    ) -> Self {
+        Self { budget, retention, usage }
     }
 
     pub fn usage(&self) -> MediaSessionUsage {
-        self.usage
+        *lock_media_usage(&self.usage)
     }
 
     /// Runs STT and produces a redacted, non-authoritative context segment.
@@ -404,7 +626,10 @@ impl AudioPipeline {
         backend: &B,
         cancellation: &AudioJobCancellation,
     ) -> Result<TranscriptionArtifact, AudioPipelineError> {
-        self.admit(input.bytes, input.duration_ms)?;
+        self.validate_job_bounds(input.bytes, input.duration_ms)?;
+        if !valid_audio_input_artifact(input) {
+            return Err(AudioPipelineError::ArtifactContractInvalid);
+        }
         if input.bytes != u64::try_from(raw_audio.len()).unwrap_or(u64::MAX)
             || input.sha256 != sha256_hex(raw_audio)
         {
@@ -427,8 +652,17 @@ impl AudioPipeline {
         let response = result
             .map_err(|_| AudioPipelineError::TimedOut)?
             .map_err(AudioPipelineError::Backend)?;
-        if response.text.len() > self.budget.max_transcript_bytes {
+        if response.text.is_empty() || response.text.len() > self.budget.max_transcript_bytes {
             return Err(AudioPipelineError::TranscriptBudgetExceeded);
+        }
+        if !valid_bounded_text(response.model_name.as_str(), 256)
+            || response
+                .detected_language
+                .as_deref()
+                .is_some_and(|language| !valid_language_tag(language))
+            || response.confidence.is_some_and(|confidence| !confidence.is_finite())
+        {
+            return Err(AudioPipelineError::BackendOutputInvalid);
         }
         let redaction = redact_text_for_export(
             response.text.as_str(),
@@ -441,7 +675,12 @@ impl AudioPipeline {
         let text = redaction.redacted_text;
         let transcript_sha256 = sha256_hex(text.as_bytes());
         let duration_ms = response.duration_ms.unwrap_or(input.duration_ms);
-        self.admit(input.bytes, duration_ms)?;
+        let usage = MediaUsage {
+            input_bytes: input.bytes,
+            audio_duration_ms: duration_ms,
+            ..response.usage
+        };
+        self.commit_usage(usage)?;
         let context_segment = UntrustedTranscriptContextSegment {
             text: text.clone(),
             trust_label: "external_untrusted".to_owned(),
@@ -449,8 +688,6 @@ impl AudioPipeline {
             artifact_citation: format!("artifact://{artifact_id}"),
             source_artifact_sha256: input.sha256.clone(),
         };
-        self.usage.bytes = self.usage.bytes.saturating_add(input.bytes);
-        self.usage.duration_ms = self.usage.duration_ms.saturating_add(duration_ms);
         Ok(TranscriptionArtifact {
             v: AUDIO_PIPELINE_SCHEMA_VERSION,
             artifact_id,
@@ -462,11 +699,7 @@ impl AudioPipeline {
             confidence: response.confidence.map(|value| value.clamp(0.0, 1.0)),
             duration_ms,
             model_name: response.model_name,
-            usage: MediaUsage {
-                input_bytes: input.bytes,
-                audio_duration_ms: duration_ms,
-                ..response.usage
-            },
+            usage,
             redacted: redaction.redacted,
             created_at_unix_ms,
             expires_at_unix_ms: created_at_unix_ms.saturating_add(self.retention.transcript_ttl_ms),
@@ -492,6 +725,19 @@ impl AudioPipeline {
                 artifact: None,
                 payload: None,
             };
+        }
+        if validate_media_identity(receipt.run_id.as_str()).is_err()
+            || receipt.text.trim().is_empty()
+            || receipt.text.len() > self.budget.max_transcript_bytes
+            || !valid_media_delivery_descriptor(&delivery)
+            || !valid_bounded_text(voice_id, 256)
+            || !valid_bounded_text(codec, 128)
+        {
+            return failed_tts_outcome(
+                true,
+                MediaJobState::Blocked,
+                "tts_request_contract_invalid",
+            );
         }
         let request = AudioSynthesisJobRequest {
             source_run_id: receipt.run_id.clone(),
@@ -520,7 +766,19 @@ impl AudioPipeline {
             Ok(Ok(response)) => response,
         };
         let output_bytes = u64::try_from(response.bytes.len()).unwrap_or(u64::MAX);
-        if let Err(error) = self.admit(output_bytes, response.duration_ms) {
+        if response.bytes.is_empty()
+            || output_bytes > DEFAULT_MAX_AUDIO_BYTES
+            || response.duration_ms > DEFAULT_MAX_AUDIO_DURATION_MS
+            || response.content_type != delivery.content_type
+            || response.codec != codec
+            || response.voice_id != voice_id
+            || !valid_bounded_text(response.model_name.as_str(), 256)
+        {
+            return failed_tts_outcome(true, MediaJobState::Failed, "tts_backend_output_invalid");
+        }
+        let usage =
+            MediaUsage { output_bytes, audio_duration_ms: response.duration_ms, ..response.usage };
+        if let Err(error) = self.commit_usage(usage) {
             return failed_tts_outcome(true, MediaJobState::Blocked, error.reason_code());
         }
         let created_at_unix_ms = unix_ms();
@@ -536,14 +794,12 @@ impl AudioPipeline {
             sha256: sha256_hex(response.bytes.as_slice()),
             model_name: response.model_name,
             voice_id: response.voice_id,
-            usage: MediaUsage { output_bytes, ..response.usage },
+            usage,
             created_at_unix_ms,
             expires_at_unix_ms: created_at_unix_ms
                 .saturating_add(self.retention.synthesized_audio_ttl_ms),
             delivery,
         };
-        self.usage.bytes = self.usage.bytes.saturating_add(output_bytes);
-        self.usage.duration_ms = self.usage.duration_ms.saturating_add(response.duration_ms);
         TtsPostDeliveryOutcome {
             text_run_success: true,
             state: MediaJobState::Succeeded,
@@ -553,22 +809,119 @@ impl AudioPipeline {
         }
     }
 
-    fn admit(&self, bytes: u64, duration_ms: u64) -> Result<(), AudioPipelineError> {
+    fn validate_job_bounds(&self, bytes: u64, duration_ms: u64) -> Result<(), AudioPipelineError> {
         if bytes > self.budget.max_job_bytes {
             return Err(AudioPipelineError::JobByteBudgetExceeded);
         }
         if duration_ms > self.budget.max_job_duration_ms {
             return Err(AudioPipelineError::JobDurationBudgetExceeded);
         }
-        if self.usage.bytes.saturating_add(bytes) > self.budget.max_session_bytes {
+        Ok(())
+    }
+
+    fn commit_usage(&self, usage: MediaUsage) -> Result<(), AudioPipelineError> {
+        let bytes = usage.input_bytes.saturating_add(usage.output_bytes);
+        self.validate_job_bounds(bytes, usage.audio_duration_ms)?;
+        let mut session_usage = lock_media_usage(&self.usage);
+        if session_usage.bytes.saturating_add(bytes) > self.budget.max_session_bytes {
             return Err(AudioPipelineError::SessionByteBudgetExceeded);
         }
-        if self.usage.duration_ms.saturating_add(duration_ms) > self.budget.max_session_duration_ms
+        if session_usage.duration_ms.saturating_add(usage.audio_duration_ms)
+            > self.budget.max_session_duration_ms
         {
             return Err(AudioPipelineError::SessionDurationBudgetExceeded);
         }
+        session_usage.bytes = session_usage.bytes.saturating_add(bytes);
+        session_usage.duration_ms =
+            session_usage.duration_ms.saturating_add(usage.audio_duration_ms);
+        session_usage.billable_units =
+            session_usage.billable_units.saturating_add(usage.billable_units);
+        session_usage.estimated_cost_microunits =
+            session_usage.estimated_cost_microunits.saturating_add(usage.estimated_cost_microunits);
         Ok(())
     }
+}
+
+fn valid_media_delivery_descriptor(delivery: &MediaDeliveryDescriptor) -> bool {
+    validate_media_identity(delivery.delivery_key.as_str()).is_ok()
+        && valid_sha256(delivery.destination_scope_sha256.as_str())
+        && valid_audio_media_type(delivery.content_type.as_str())
+        && !delivery.file_name.trim().is_empty()
+        && delivery.file_name.len() <= 512
+        && !delivery.file_name.chars().any(char::is_control)
+        && !delivery.file_name.chars().any(|character| matches!(character, '/' | '\\'))
+        && !matches!(delivery.file_name.as_str(), "." | "..")
+}
+
+fn valid_media_type_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-')
+}
+
+fn validate_media_identity(value: &str) -> Result<(), AudioPipelineError> {
+    if value.trim().is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+    {
+        return Err(AudioPipelineError::InvalidMediaIdentity);
+    }
+    Ok(())
+}
+
+fn valid_audio_input_artifact(input: &AudioInputArtifactV1) -> bool {
+    input.v == AUDIO_PIPELINE_SCHEMA_VERSION
+        && validate_media_identity(input.artifact_id.as_str()).is_ok()
+        && valid_file_name(input.file_name.as_str())
+        && valid_audio_media_type(input.content_type.as_str())
+        && valid_bounded_text(input.codec.as_str(), 128)
+        && (1..=DEFAULT_MAX_AUDIO_BYTES).contains(&input.bytes)
+        && input.duration_ms <= DEFAULT_MAX_AUDIO_DURATION_MS
+        && input.language_hint.as_deref().is_none_or(valid_language_tag)
+        && valid_sha256(input.sha256.as_str())
+        && input.expires_at_unix_ms >= input.created_at_unix_ms
+        && valid_bounded_text(input.provenance.source_kind.as_str(), 128)
+        && valid_sha256(input.provenance.source_reference_sha256.as_str())
+        && valid_sha256(input.provenance.principal_scope_sha256.as_str())
+        && validate_media_identity(input.provenance.session_id.as_str()).is_ok()
+}
+
+fn valid_audio_media_type(value: &str) -> bool {
+    value.len() <= 128
+        && value.split_once('/').is_some_and(|(kind, subtype)| {
+            kind == "audio" && !subtype.is_empty() && subtype.bytes().all(valid_media_type_byte)
+        })
+}
+
+fn valid_bounded_text(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_file_name(value: &str) -> bool {
+    valid_bounded_text(value, 512)
+        && !value.chars().any(|character| matches!(character, '/' | '\\'))
+        && !matches!(value, "." | "..")
+}
+
+fn valid_language_tag(value: &str) -> bool {
+    (2..=35).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn lock_media_sessions(
+    sessions: &Mutex<HashMap<String, MediaSessionRuntime>>,
+) -> MutexGuard<'_, HashMap<String, MediaSessionRuntime>> {
+    sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_media_usage(usage: &Mutex<MediaSessionUsage>) -> MutexGuard<'_, MediaSessionUsage> {
+    usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn failed_tts_outcome(
@@ -760,6 +1113,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stt_rejects_schema_invalid_artifacts_and_backend_metadata() {
+        let bytes = b"audio";
+        let mut artifact = input(bytes, 1_250, None);
+        artifact.file_name = "../voice.ogg".to_owned();
+        let backend =
+            StubStt { delay: Duration::ZERO, result: Ok(stt_result("transcript", Some("en"))) };
+        let mut pipeline =
+            AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
+        assert_eq!(
+            pipeline.transcribe(&artifact, bytes, &backend, &AudioJobCancellation::default()).await,
+            Err(AudioPipelineError::ArtifactContractInvalid)
+        );
+
+        let invalid_backend = StubStt {
+            delay: Duration::ZERO,
+            result: Ok(AudioTranscriptionBackendResult {
+                model_name: String::new(),
+                ..stt_result("transcript", Some("en"))
+            }),
+        };
+        assert_eq!(
+            pipeline
+                .transcribe(
+                    &input(bytes, 1_250, None),
+                    bytes,
+                    &invalid_backend,
+                    &AudioJobCancellation::default(),
+                )
+                .await,
+            Err(AudioPipelineError::BackendOutputInvalid)
+        );
+    }
+
+    #[tokio::test]
     async fn tts_failure_and_cancel_preserve_text_success_and_delivery_is_connector_neutral() {
         let receipt = TextDeliveryReceipt {
             run_id: "run-1".to_owned(),
@@ -822,6 +1209,153 @@ mod tests {
         let artifact = success.artifact.expect("TTS artifact should exist");
         assert_eq!(artifact.delivery, delivery);
         assert_eq!(artifact.source_run_id, receipt.run_id);
+        assert_eq!(artifact.usage.audio_duration_ms, 900);
+        assert_eq!(pipeline.usage().duration_ms, 900);
         assert!(success.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn tts_never_runs_before_successful_text_delivery() {
+        let receipt = TextDeliveryReceipt {
+            run_id: "run-1".to_owned(),
+            text: "Unsettled text".to_owned(),
+            success: false,
+            delivered_at_unix_ms: unix_ms(),
+        };
+        let invoked = Arc::new(AtomicBool::new(false));
+        let backend = StubTts { fail: false, invoked: Arc::clone(&invoked) };
+        let mut pipeline =
+            AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
+        let outcome = pipeline
+            .synthesize_after_delivery(
+                &receipt,
+                "voice-a",
+                "opus",
+                MediaDeliveryDescriptor {
+                    delivery_key: "delivery-1".to_owned(),
+                    destination_scope_sha256: sha256_hex(b"destination"),
+                    content_type: "audio/ogg".to_owned(),
+                    file_name: "reply.ogg".to_owned(),
+                },
+                &backend,
+                &AudioJobCancellation::default(),
+            )
+            .await;
+
+        assert!(!outcome.text_run_success);
+        assert_eq!(outcome.state, MediaJobState::Blocked);
+        assert_eq!(outcome.reason_code, "tts_text_delivery_not_successful");
+        assert!(!invoked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tts_rejects_unsafe_delivery_filename_before_backend_dispatch() {
+        let receipt = TextDeliveryReceipt {
+            run_id: "run-1".to_owned(),
+            text: "Delivered text".to_owned(),
+            success: true,
+            delivered_at_unix_ms: unix_ms(),
+        };
+        let invoked = Arc::new(AtomicBool::new(false));
+        let backend = StubTts { fail: false, invoked: Arc::clone(&invoked) };
+        let mut pipeline =
+            AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
+        let outcome = pipeline
+            .synthesize_after_delivery(
+                &receipt,
+                "voice-a",
+                "opus",
+                MediaDeliveryDescriptor {
+                    delivery_key: "delivery-1".to_owned(),
+                    destination_scope_sha256: sha256_hex(b"destination"),
+                    content_type: "audio/ogg".to_owned(),
+                    file_name: "../reply.ogg".to_owned(),
+                },
+                &backend,
+                &AudioJobCancellation::default(),
+            )
+            .await;
+
+        assert!(outcome.text_run_success);
+        assert_eq!(outcome.state, MediaJobState::Blocked);
+        assert_eq!(outcome.reason_code, "tts_request_contract_invalid");
+        assert!(!invoked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn session_registry_shares_budget_usage_and_cancellation_across_jobs() {
+        let registry = Arc::new(AudioSessionRegistry::new(
+            MediaSessionBudget {
+                max_job_bytes: 8,
+                max_session_bytes: 10,
+                ..MediaSessionBudget::default()
+            },
+            MediaRetentionPolicy::default(),
+        ));
+        let first_bytes = b"first!";
+        let second_bytes = b"second";
+        let backend = StubStt {
+            delay: Duration::ZERO,
+            result: Ok(stt_result("shared transcript", Some("en"))),
+        };
+        let mut first = registry.begin_job("session-shared", "job-1").expect("first job");
+        let first_cancellation = first.cancellation();
+        first
+            .pipeline_mut()
+            .transcribe(
+                &input(first_bytes, 1_250, None),
+                first_bytes,
+                &backend,
+                &first_cancellation,
+            )
+            .await
+            .expect("first job should fit the shared budget");
+        assert_eq!(first.usage().bytes, 6);
+        assert_eq!(first.usage().estimated_cost_microunits, 3);
+
+        let mut second = registry.begin_job("session-shared", "job-2").expect("second job");
+        let second_cancellation = second.cancellation();
+        assert_eq!(
+            second
+                .pipeline_mut()
+                .transcribe(
+                    &input(second_bytes, 1_250, None),
+                    second_bytes,
+                    &backend,
+                    &second_cancellation,
+                )
+                .await,
+            Err(AudioPipelineError::SessionByteBudgetExceeded)
+        );
+        assert_eq!(second.usage().bytes, 6);
+
+        assert!(registry.cancel_job("session-shared", "job-2"));
+        assert_eq!(
+            second
+                .pipeline_mut()
+                .transcribe(&input(b"x", 1, None), b"x", &backend, &second_cancellation,)
+                .await,
+            Err(AudioPipelineError::Cancelled)
+        );
+        drop(first);
+        drop(second);
+        let diagnostics = registry.diagnostics("session-shared").expect("diagnostics");
+        assert_eq!(diagnostics.active_jobs, 0);
+        assert_eq!(diagnostics.usage.bytes, 6);
+        assert_eq!(diagnostics.reason_code, "audio.session.idle");
+    }
+
+    #[test]
+    fn session_registry_rejects_duplicate_and_invalid_job_identity() {
+        let registry = Arc::new(AudioSessionRegistry::default());
+        let _job = registry.begin_job("session-1", "job-1").expect("first job");
+        assert!(matches!(
+            registry.begin_job("session-1", "job-1"),
+            Err(AudioPipelineError::DuplicateMediaJob)
+        ));
+        assert!(matches!(
+            registry.begin_job("", "job-2"),
+            Err(AudioPipelineError::InvalidMediaIdentity)
+        ));
     }
 }

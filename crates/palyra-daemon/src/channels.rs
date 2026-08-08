@@ -40,8 +40,9 @@ use ulid::Ulid;
 
 use crate::media::{
     ConsoleAttachmentStoreRequest, MediaArtifactPayload, MediaArtifactStore,
-    MediaDerivedArtifactRecord, MediaDerivedArtifactSelection, MediaDerivedArtifactUpsertRequest,
-    MediaDerivedStatsSnapshot, MediaFailedDerivedArtifactUpsertRequest, MediaRuntimeConfig,
+    MediaAudioJobEventRequest, MediaDerivedArtifactRecord, MediaDerivedArtifactSelection,
+    MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot,
+    MediaFailedDerivedArtifactUpsertRequest, MediaRuntimeConfig,
 };
 use crate::transport::grpc::{
     auth::{GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL},

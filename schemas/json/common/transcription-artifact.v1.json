@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/transcription-artifact.v1.json",
+  "title": "Transcription Artifact V1",
+  "type": "object",
+  "required": [
+    "v",
+    "artifact_id",
+    "source_artifact_id",
+    "source_artifact_sha256",
+    "transcript_sha256",
+    "text",
+    "detected_language",
+    "confidence",
+    "duration_ms",
+    "model_name",
+    "usage",
+    "redacted",
+    "created_at_unix_ms",
+    "expires_at_unix_ms",
+    "context_segment"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "artifact_id": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/identifier"
+    },
+    "source_artifact_id": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/identifier"
+    },
+    "source_artifact_sha256": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+    },
+    "transcript_sha256": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 262144
+    },
+    "detected_language": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/optional_language"
+    },
+    "confidence": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      ]
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 900000
+    },
+    "model_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "usage": {
+      "$ref": "#/$defs/usage"
+    },
+    "redacted": {
+      "type": "boolean"
+    },
+    "created_at_unix_ms": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/timestamp"
+    },
+    "expires_at_unix_ms": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/timestamp"
+    },
+    "context_segment": {
+      "$ref": "#/$defs/context_segment"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "usage": {
+      "type": "object",
+      "required": [
+        "input_bytes",
+        "output_bytes",
+        "audio_duration_ms",
+        "billable_units",
+        "estimated_cost_microunits"
+      ],
+      "properties": {
+        "input_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "audio_duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "billable_units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "estimated_cost_microunits": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "context_segment": {
+      "type": "object",
+      "required": [
+        "text",
+        "trust_label",
+        "instruction_authority",
+        "artifact_citation",
+        "source_artifact_sha256"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 262144
+        },
+        "trust_label": {
+          "const": "external_untrusted"
+        },
+        "instruction_authority": {
+          "const": false
+        },
+        "artifact_citation": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 256,
+          "pattern": "^artifact://[A-Za-z0-9_.:-]+$"
+        },
+        "source_artifact_sha256": {
+          "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

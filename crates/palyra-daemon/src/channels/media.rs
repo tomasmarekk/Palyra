@@ -19,6 +19,17 @@ impl ChannelPlatform {
         })
     }
 
+    /// Persists one redacted audio lifecycle and metering event.
+    ///
+    /// # Errors
+    /// Propagates media-store validation and persistence errors.
+    pub fn record_audio_job_event(
+        &self,
+        request: MediaAudioJobEventRequest<'_>,
+    ) -> Result<(), ChannelPlatformError> {
+        self.media_store.record_audio_job_event(request).map_err(ChannelPlatformError::from)
+    }
+
     /// Stores a console chat upload under a fresh attachment id, scoped to
     /// the session/principal/device identity in the request.
     ///

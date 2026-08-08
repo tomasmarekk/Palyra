@@ -17,7 +17,7 @@ use super::state::{
 use crate::{
     access_control::AccessRegistry,
     acp::AcpRuntime,
-    application::mcp_broker::McpRuntimeSupervisor,
+    application::{audio_pipeline::AudioSessionRegistry, mcp_broker::McpRuntimeSupervisor},
     channels,
     config::{BrowserServiceConfig, LoadedConfig},
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
@@ -100,6 +100,7 @@ pub(crate) fn build_app_state(
         openai_oauth_attempts: Arc::new(Mutex::new(HashMap::new())),
         relay_tokens: Arc::new(Mutex::new(HashMap::<String, ConsoleRelayToken>::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::<String, ConsoleChatRunStream>::new())),
+        audio_sessions: Arc::new(AudioSessionRegistry::default()),
         support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
         doctor_jobs: Arc::new(Mutex::new(HashMap::new())),
         console_memory_index_active: Arc::new(AtomicBool::new(false)),

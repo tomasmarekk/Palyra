@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/audio-output-artifact.v1.json",
+  "title": "Audio Output Artifact V1",
+  "type": "object",
+  "required": [
+    "v",
+    "artifact_id",
+    "source_run_id",
+    "source_text_sha256",
+    "content_type",
+    "codec",
+    "bytes",
+    "duration_ms",
+    "sha256",
+    "model_name",
+    "voice_id",
+    "usage",
+    "created_at_unix_ms",
+    "expires_at_unix_ms",
+    "delivery"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "artifact_id": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/identifier"
+    },
+    "source_run_id": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/identifier"
+    },
+    "source_text_sha256": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+    },
+    "content_type": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/media_type"
+    },
+    "codec": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/bounded_text"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 26214400
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 900000
+    },
+    "sha256": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+    },
+    "model_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "voice_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "usage": {
+      "$ref": "transcription-artifact.v1.json#/$defs/usage"
+    },
+    "created_at_unix_ms": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/timestamp"
+    },
+    "expires_at_unix_ms": {
+      "$ref": "audio-input-artifact.v1.json#/$defs/timestamp"
+    },
+    "delivery": {
+      "$ref": "#/$defs/delivery"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "delivery": {
+      "type": "object",
+      "required": [
+        "delivery_key",
+        "destination_scope_sha256",
+        "content_type",
+        "file_name"
+      ],
+      "properties": {
+        "delivery_key": {
+          "$ref": "audio-input-artifact.v1.json#/$defs/identifier"
+        },
+        "destination_scope_sha256": {
+          "$ref": "audio-input-artifact.v1.json#/$defs/sha256"
+        },
+        "content_type": {
+          "$ref": "audio-input-artifact.v1.json#/$defs/media_type"
+        },
+        "file_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
