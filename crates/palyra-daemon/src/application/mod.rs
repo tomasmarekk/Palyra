@@ -79,6 +79,7 @@ pub mod resume_classifier;
 pub(crate) mod run_admission;
 pub(crate) mod runtime_kernel_v2;
 pub mod runtime_resource_manifest;
+pub mod semantic_memory;
 pub mod service_authorization;
 pub mod session_compaction;
 pub mod session_pruning;

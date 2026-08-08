@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/consolidated-memory-record.v1.json",
+  "title": "Consolidated Memory Record V1",
+  "type": "object",
+  "required": [
+    "v",
+    "memory_id",
+    "version",
+    "lifecycle",
+    "claim_key",
+    "claim_value_sha256",
+    "summary_text",
+    "summary_sha256",
+    "epistemic_kind",
+    "acl_scope",
+    "sensitivity",
+    "confidence_basis_points",
+    "contradiction_status",
+    "evidence_refs",
+    "citations",
+    "retention_expires_at_unix_ms",
+    "quality_eval",
+    "approval_generation",
+    "activated_at_unix_ms",
+    "degraded_at_unix_ms",
+    "archived_at_unix_ms",
+    "previous_record_sha256",
+    "rollback_history_sha256",
+    "retrieval_metrics",
+    "reason_code",
+    "record_sha256"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "memory_id": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "lifecycle": {
+      "enum": [
+        "active",
+        "degraded",
+        "archived",
+        "rolled_back"
+      ]
+    },
+    "claim_key": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/reference"
+    },
+    "claim_value_sha256": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/sha256"
+    },
+    "summary_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "summary_sha256": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/sha256"
+    },
+    "epistemic_kind": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/epistemic_kind"
+    },
+    "acl_scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "sensitivity": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/sensitivity"
+    },
+    "confidence_basis_points": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/basis_points"
+    },
+    "contradiction_status": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/contradiction_status"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 64,
+      "items": {
+        "$ref": "semantic-memory-candidate.v1.json#/$defs/evidence_ref"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 64,
+      "items": {
+        "$ref": "semantic-memory-candidate.v1.json#/$defs/citation"
+      }
+    },
+    "retention_expires_at_unix_ms": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/optional_timestamp"
+    },
+    "quality_eval": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/quality_eval"
+    },
+    "approval_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "activated_at_unix_ms": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/timestamp"
+    },
+    "degraded_at_unix_ms": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/optional_timestamp"
+    },
+    "archived_at_unix_ms": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/optional_timestamp"
+    },
+    "previous_record_sha256": {
+      "oneOf": [
+        {
+          "$ref": "semantic-memory-candidate.v1.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rollback_history_sha256": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "semantic-memory-candidate.v1.json#/$defs/sha256"
+      }
+    },
+    "retrieval_metrics": {
+      "$ref": "#/$defs/retrieval_metrics"
+    },
+    "reason_code": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/reason_code"
+    },
+    "record_sha256": {
+      "$ref": "semantic-memory-candidate.v1.json#/$defs/sha256"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "retrieval_metrics": {
+      "type": "object",
+      "required": [
+        "retrieval_count",
+        "useful_count",
+        "not_useful_count",
+        "correction_count",
+        "last_retrieved_at_unix_ms",
+        "last_corrected_at_unix_ms"
+      ],
+      "properties": {
+        "retrieval_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "useful_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_useful_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "correction_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_retrieved_at_unix_ms": {
+          "$ref": "semantic-memory-candidate.v1.json#/$defs/optional_timestamp"
+        },
+        "last_corrected_at_unix_ms": {
+          "$ref": "semantic-memory-candidate.v1.json#/$defs/optional_timestamp"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

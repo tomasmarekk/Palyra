@@ -23,6 +23,12 @@ six-case conformance evidence, host approval generation, catalog epoch, and
 rollback pointer for restricted declarative or WASM dynamic tools. Artifact
 presence alone never grants catalog or execution authority.
 
+`semantic-memory-candidate.v1.json` and
+`consolidated-memory-record.v1.json` pin candidate-only semantic consolidation:
+ACL-compatible evidence references, epistemic labels, source citations,
+contradiction posture, quality comparison, approval generation, retrieval
+feedback, bounded retention, degradation, archive, and rollback history.
+
 Managed coding runtime contracts are split by durable or operator-visible
 responsibility:
 

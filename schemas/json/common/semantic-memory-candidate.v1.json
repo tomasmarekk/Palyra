@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/common/semantic-memory-candidate.v1.json",
+  "title": "Semantic Memory Candidate V1",
+  "type": "object",
+  "required": [
+    "v",
+    "candidate_id",
+    "claim_key",
+    "claim_value_sha256",
+    "summary_text",
+    "summary_sha256",
+    "epistemic_kind",
+    "acl_scope",
+    "sensitivity",
+    "confidence_basis_points",
+    "contradiction_status",
+    "evidence_refs",
+    "citations",
+    "retention_expires_at_unix_ms",
+    "review_required",
+    "quality_eval",
+    "created_at_unix_ms",
+    "reason_code"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "candidate_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "claim_key": {
+      "$ref": "#/$defs/reference"
+    },
+    "claim_value_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "summary_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "summary_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "epistemic_kind": {
+      "$ref": "#/$defs/epistemic_kind"
+    },
+    "acl_scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "sensitivity": {
+      "$ref": "#/$defs/sensitivity"
+    },
+    "confidence_basis_points": {
+      "$ref": "#/$defs/basis_points"
+    },
+    "contradiction_status": {
+      "$ref": "#/$defs/contradiction_status"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/evidence_ref"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/citation"
+      }
+    },
+    "retention_expires_at_unix_ms": {
+      "$ref": "#/$defs/optional_timestamp"
+    },
+    "review_required": {
+      "type": "boolean"
+    },
+    "quality_eval": {
+      "$ref": "#/$defs/quality_eval"
+    },
+    "created_at_unix_ms": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "reason_code": {
+      "$ref": "#/$defs/reason_code"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "optional_timestamp": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "basis_points": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "epistemic_kind": {
+      "enum": [
+        "user_fact",
+        "observed_fact",
+        "model_inference",
+        "preference"
+      ]
+    },
+    "sensitivity": {
+      "enum": [
+        "public",
+        "internal",
+        "sensitive",
+        "restricted"
+      ]
+    },
+    "contradiction_status": {
+      "enum": [
+        "none",
+        "detected",
+        "resolved_by_user_correction"
+      ]
+    },
+    "evidence_ref": {
+      "type": "object",
+      "required": [
+        "v",
+        "evidence_id",
+        "source_ref",
+        "citation_uri",
+        "content_sha256",
+        "provenance_sha256",
+        "claim_key",
+        "claim_value_sha256",
+        "acl_scope",
+        "epistemic_kind",
+        "sensitivity",
+        "confidence_basis_points",
+        "observed_at_unix_ms",
+        "expires_at_unix_ms",
+        "corrects_evidence_ids"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "evidence_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "citation_uri": {
+          "$ref": "#/$defs/reference"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "provenance_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "claim_key": {
+          "$ref": "#/$defs/reference"
+        },
+        "claim_value_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "acl_scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "epistemic_kind": {
+          "$ref": "#/$defs/epistemic_kind"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/sensitivity"
+        },
+        "confidence_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/optional_timestamp"
+        },
+        "corrects_evidence_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "citation": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "source_ref",
+        "citation_uri",
+        "content_sha256",
+        "provenance_sha256"
+      ],
+      "properties": {
+        "evidence_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "citation_uri": {
+          "$ref": "#/$defs/reference"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "provenance_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    },
+    "quality_eval": {
+      "type": "object",
+      "required": [
+        "v",
+        "sample_count",
+        "baseline_precision_basis_points",
+        "consolidated_precision_basis_points",
+        "baseline_usefulness_basis_points",
+        "consolidated_usefulness_basis_points",
+        "baseline_correction_rate_basis_points",
+        "consolidated_correction_rate_basis_points",
+        "evidence_sha256"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 10
+        },
+        "baseline_precision_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "consolidated_precision_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "baseline_usefulness_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "consolidated_usefulness_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "baseline_correction_rate_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "consolidated_correction_rate_basis_points": {
+          "$ref": "#/$defs/basis_points"
+        },
+        "evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
