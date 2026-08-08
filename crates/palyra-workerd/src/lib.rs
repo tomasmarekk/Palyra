@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
+pub mod remote_protocol;
+
 const MAX_WORKER_ID_BYTES: usize = 128;
 const MAX_GRANT_ID_BYTES: usize = 128;
 const MAX_RECENT_LIFECYCLE_EVENTS: usize = 64;
@@ -466,6 +468,9 @@ pub struct WorkerRemoteToolRequestEnvelope {
     pub lease: WorkerRemoteLeaseBinding,
     pub worker_identity: WorkerRemoteIdentity,
     pub workspace_transfer: WorkerRemoteWorkspaceTransfer,
+    /// Additive canonical protocol binding shared by every production adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_protocol: Option<remote_protocol::RemoteWorkerProtocolV1>,
 }
 
 impl WorkerRemoteToolRequestEnvelope {
@@ -483,6 +488,17 @@ impl WorkerRemoteToolRequestEnvelope {
                 expires_at_unix_ms: self.lease.expires_at_unix_ms,
                 observed_at_unix_ms: now_unix_ms,
             });
+        }
+        if let Some(canonical) = self.canonical_protocol.as_ref() {
+            canonical.validate(now_unix_ms).map_err(|error| {
+                WorkerRemoteToolContractError::CanonicalProtocol { reason: error.to_string() }
+            })?;
+            let expected = remote_protocol::RemoteWorkerProtocolV1::from_remote_request(self);
+            if canonical != &expected {
+                return Err(WorkerRemoteToolContractError::CanonicalProtocol {
+                    reason: "canonical task does not match the established RPC envelope".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -715,6 +731,8 @@ pub enum WorkerRemoteToolContractError {
     InvalidCompletionTimestamp,
     #[error("worker remote cleanup gap for lease '{lease_id}': {reason}")]
     CleanupGap { lease_id: String, reason: String },
+    #[error("worker remote canonical protocol validation failed: {reason}")]
+    CanonicalProtocol { reason: String },
 }
 
 fn validate_protocol(

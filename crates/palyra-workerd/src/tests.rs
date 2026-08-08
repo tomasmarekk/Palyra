@@ -306,6 +306,7 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
         },
         worker_identity: remote_identity("worker-remote-01"),
         workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(hex_digest("4")),
+        canonical_protocol: None,
     }
 }
 

@@ -16,6 +16,7 @@ use palyra_common::{
     },
 };
 use palyra_workerd::{
+    remote_protocol::{RemoteTaskOutcome, RemoteWorkerProtocolV1},
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
     WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding,
     WorkerRemoteToolContractError, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
@@ -1128,7 +1129,7 @@ fn build_worker_remote_tool_request(
     let workspace_manifest_sha256 = serde_json::to_vec(&lease.workspace_scope)
         .map(|bytes| sha256_hex(bytes.as_slice()))
         .unwrap_or_else(|_| sha256_hex(lease.workspace_scope.workspace_root.as_bytes()));
-    let request = WorkerRemoteToolRequestEnvelope {
+    let mut request = WorkerRemoteToolRequestEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
         request_id: Ulid::new().to_string(),
@@ -1140,7 +1141,9 @@ fn build_worker_remote_tool_request(
         lease: WorkerRemoteLeaseBinding::from_lease(lease, session_id, run_generation),
         worker_identity: WorkerRemoteIdentity::from(worker_attestation),
         workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(workspace_manifest_sha256),
+        canonical_protocol: None,
     };
+    request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
     request
         .validate(current_unix_ms())
         .map_err(|error| format!("networked worker remote request validation failed: {error}"))?;
@@ -1456,6 +1459,23 @@ fn networked_worker_outcome_from_validated_remote_result(
     request: &WorkerRemoteToolRequestEnvelope,
     result: WorkerRemoteToolResultEnvelope,
 ) -> ToolExecutionOutcome {
+    let canonical_task = request
+        .canonical_protocol
+        .as_ref()
+        .map(|protocol| protocol.task.clone())
+        .unwrap_or_else(|| RemoteWorkerProtocolV1::from_remote_request(request).task);
+    let canonical_outcome = RemoteTaskOutcome::from_remote_result(request, &result);
+    if let Err(error) =
+        canonical_outcome.validate_against(&canonical_task, result.completed_at_unix_ms)
+    {
+        return networked_worker_failure_outcome(
+            request.proposal_id.as_str(),
+            request.tool_name.as_str(),
+            request.input_json.as_bytes(),
+            format!("networked worker canonical outcome failed validation: {error}"),
+            "networked_worker_canonical_protocol_failed",
+        );
+    }
     let manifest = networked_worker_execution_manifest(request, &result);
     build_tool_execution_outcome_with_manifest(
         request.proposal_id.as_str(),
@@ -1782,6 +1802,7 @@ mod tests {
             workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(sha256_hex(
                 b"workspace-manifest",
             )),
+            canonical_protocol: None,
         }
     }
 
