@@ -28,6 +28,7 @@ use crate::{
     },
     *,
 };
+use async_trait::async_trait;
 use base64::Engine as _;
 use palyra_common::{
     runtime_contracts::{
@@ -6245,6 +6246,31 @@ async fn build_console_gateway_client(
 
 // --- Attachment derivation pipeline ---
 
+/// Bridges admitted media jobs to the existing provider-health runtime.
+struct GatewayAudioTranscriptionAdapter {
+    runtime: Arc<gateway::GatewayRuntimeState>,
+}
+
+#[async_trait]
+impl application::audio_pipeline::AudioTranscriptionBackend for GatewayAudioTranscriptionAdapter {
+    async fn transcribe(
+        &self,
+        request: application::audio_pipeline::AudioTranscriptionJobRequest,
+    ) -> Result<application::audio_pipeline::AudioTranscriptionBackendResult, String> {
+        self.runtime
+            .execute_audio_transcription(crate::model_provider::AudioTranscriptionRequest {
+                file_name: request.file_name,
+                content_type: request.content_type,
+                bytes: request.bytes,
+                prompt: None,
+                language: request.language_hint,
+            })
+            .await
+            .map(Into::into)
+            .map_err(|status| status.message().to_owned())
+    }
+}
+
 /// Derives artifacts for an uploaded attachment: always a metadata summary,
 /// plus extracted text for documents and a transcript for audio when
 /// supported. Per-kind extraction failures are persisted as failed derived
@@ -6354,19 +6380,49 @@ async fn derive_console_attachment_artifacts(
 
     if crate::media_derived::supports_audio_transcription(artifact.content_type.as_str()) {
         let transcription_started_at = std::time::Instant::now();
-        match state
-            .runtime
-            .execute_audio_transcription(crate::model_provider::AudioTranscriptionRequest {
+        let retention = application::audio_pipeline::MediaRetentionPolicy::default();
+        let input_artifact = application::audio_pipeline::AudioInputArtifactV1::from_payload(
+            application::audio_pipeline::AudioInputDescriptor {
                 file_name: artifact.filename.clone(),
                 content_type: artifact.content_type.clone(),
-                bytes: artifact.bytes.clone(),
-                prompt: None,
-                language: None,
-            })
+                codec: artifact
+                    .content_type
+                    .split_once('/')
+                    .map(|(_, codec)| codec)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                duration_ms: 0,
+                language_hint: None,
+            },
+            artifact.bytes.as_slice(),
+            application::audio_pipeline::AudioArtifactProvenance {
+                source_kind: "console_attachment".to_owned(),
+                source_reference_sha256: artifact.sha256.clone(),
+                received_at_unix_ms: u64::try_from(gateway::current_unix_ms()).unwrap_or_default(),
+                principal_scope_sha256: crate::sha256_hex(session.context.principal.as_bytes()),
+                session_id: session_id.to_owned(),
+            },
+            retention,
+        );
+        let mut audio_pipeline = application::audio_pipeline::AudioPipeline::new(
+            application::audio_pipeline::MediaSessionBudget::default(),
+            retention,
+        );
+        let cancellation = application::audio_pipeline::AudioJobCancellation::default();
+        let backend = GatewayAudioTranscriptionAdapter { runtime: Arc::clone(&state.runtime) };
+        match audio_pipeline
+            .transcribe(&input_artifact, artifact.bytes.as_slice(), &backend, &cancellation)
             .await
         {
-            Ok(response) => match crate::media_derived::build_transcription_content(
-                response,
+            Ok(transcript) => match crate::media_derived::build_transcription_content(
+                crate::model_provider::AudioTranscriptionResponse {
+                    text: transcript.text,
+                    language: transcript.detected_language,
+                    duration_ms: Some(transcript.duration_ms),
+                    model_name: transcript.model_name,
+                    retry_count: 0,
+                    segments: Vec::new(),
+                },
                 transcription_started_at.elapsed().as_millis() as u64,
             ) {
                 Ok(derived) => {
@@ -6421,7 +6477,7 @@ async fn derive_console_attachment_artifacts(
                 }
             },
             Err(error) => {
-                let failure_message = error.message().to_owned();
+                let failure_message = format!("{}:{error}", error.reason_code());
                 persisted.push(
                     state
                         .channels

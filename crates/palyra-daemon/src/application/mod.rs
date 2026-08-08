@@ -14,6 +14,7 @@ pub mod agent_harness_threads;
 pub mod agent_harness_tool_bridge;
 pub mod agent_harness_v2;
 pub mod approvals;
+pub mod audio_pipeline;
 pub mod auth;
 pub mod channel_commands;
 pub mod channel_turn;
