@@ -14,6 +14,8 @@ use palyra_common::qa_fault_injection::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::remote_protocol::RemoteWorkerProtocolV1;
+
 use super::{
     networked_worker_lifecycle_event_id, RuntimeGeneration, TrustedEndpointHealth,
     TrustedEndpointPolicy, TrustedEndpointRecord, TrustedEndpointRegistry,
@@ -292,6 +294,11 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
             grant_tool_name: tool_name.to_owned(),
             expires_at_unix_ms: 3_000,
             required_capabilities: vec![tool_kind.required_capability()],
+            process_executable_allowlist: if matches!(tool_kind, WorkerRemoteToolKind::ProcessRun) {
+                vec!["echo".to_owned()]
+            } else {
+                Vec::new()
+            },
             work_graph_claim: None,
             work_graph_posture: Default::default(),
             workspace_scope: WorkerWorkspaceScope {
@@ -450,6 +457,37 @@ fn remote_result_requires_cleanup_and_identity_stability() {
         .validate_against_request(&request, 2_000)
         .expect_err("identity drift must fail closed");
     assert!(matches!(error, WorkerRemoteToolContractError::WorkerIdentityMismatch { .. }));
+}
+
+#[test]
+fn remote_process_lease_requires_exact_digest_bound_executable_authority() {
+    let mut request = remote_request("palyra.process.run");
+    request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
+    request.validate(2_000).expect("exact process executable authority should validate");
+
+    let mut missing = request.clone();
+    missing.lease.process_executable_allowlist.clear();
+    missing.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&missing));
+    assert_eq!(
+        missing.validate(2_000).expect_err("missing process authority must fail closed"),
+        WorkerRemoteToolContractError::ProcessExecutableAuthorityInvalid
+    );
+
+    let mut wildcard = request.clone();
+    wildcard.lease.process_executable_allowlist = vec!["*".to_owned()];
+    wildcard.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&wildcard));
+    assert_eq!(
+        wildcard.validate(2_000).expect_err("wildcard process authority must fail closed"),
+        WorkerRemoteToolContractError::ProcessExecutableAuthorityInvalid
+    );
+
+    let mut rotated = request.clone();
+    rotated.lease.process_executable_allowlist = vec!["printf".to_owned()];
+    rotated.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&rotated));
+    assert_ne!(
+        request.canonical_protocol.as_ref().expect("canonical request").task.policy_sha256,
+        rotated.canonical_protocol.as_ref().expect("rotated canonical request").task.policy_sha256
+    );
 }
 
 #[test]

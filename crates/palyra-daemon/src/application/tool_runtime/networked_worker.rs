@@ -17,6 +17,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{
+    process_runner_input::parse_process_runner_tool_input,
     redaction::{redact_auth_error, redact_auth_error_strict, redact_url_segments_in_text},
     runtime_contracts::{
         ArtifactRetentionPolicy, RuntimeGeneration, RuntimeRunId, RuntimeSessionId,
@@ -125,6 +126,7 @@ struct NetworkedWorkerTaskRequest<'a> {
     worker_attestation: &'a WorkerAttestation,
     session_id: &'a str,
     run_generation: RuntimeGeneration,
+    process_executable_allowlist: Vec<String>,
     workspace_transfer: WorkerRemoteWorkspaceTransfer,
 }
 
@@ -948,6 +950,44 @@ async fn execute_networked_worker_tool_owned(
     } else {
         input_json.to_vec()
     };
+    let process_executable_allowlist = match networked_worker_process_executable_authority(
+        tool_name,
+        remote_input_json.as_slice(),
+        runtime_state.config.tool_call.process_runner.allowed_executables.as_slice(),
+    ) {
+        Ok(authority) => authority,
+        Err(error) => {
+            runtime_state.record_managed_runtime_health_observation_for_run(
+                &health_authority,
+                &generation_session_id,
+                &run_identity,
+                run_generation,
+                false,
+                "runtime.health.worker_process_authority_invalid",
+            );
+            if let Err(cleanup_error) =
+                record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+            {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!(
+                        "networked worker process authority and cleanup failed: {error}; {}",
+                        cleanup_error.message()
+                    ),
+                    "networked_worker_cleanup_failed",
+                );
+            }
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                error,
+                "networked_worker_process_authority_invalid",
+            );
+        }
+    };
     let workspace_transfer =
         match prepare_networked_worker_workspace_transfer(&lease, tool_name, input_json).await {
             Ok(transfer) => transfer,
@@ -988,6 +1028,7 @@ async fn execute_networked_worker_tool_owned(
         worker_attestation: &worker_attestation,
         session_id: generation_session_id.as_str(),
         run_generation,
+        process_executable_allowlist,
         workspace_transfer,
     }) {
         Ok(request) => request,
@@ -2163,6 +2204,7 @@ fn build_worker_remote_tool_request(
         worker_attestation,
         session_id,
         run_generation,
+        process_executable_allowlist,
         workspace_transfer,
     } = request_context;
     let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name).ok_or_else(|| {
@@ -2182,7 +2224,10 @@ fn build_worker_remote_tool_request(
         tool_kind,
         input_json: input_json_text,
         input_json_sha256: sha256_hex(input_json),
-        lease: WorkerRemoteLeaseBinding::from_lease(lease, session_id.to_owned(), run_generation),
+        lease: WorkerRemoteLeaseBinding {
+            process_executable_allowlist,
+            ..WorkerRemoteLeaseBinding::from_lease(lease, session_id.to_owned(), run_generation)
+        },
         worker_identity: WorkerRemoteIdentity::from(worker_attestation),
         workspace_transfer,
         encrypted_secret_artifact: None,
@@ -2193,6 +2238,78 @@ fn build_worker_remote_tool_request(
         .validate(current_unix_ms())
         .map_err(|error| format!("networked worker remote request validation failed: {error}"))?;
     Ok(request)
+}
+
+fn networked_worker_process_executable_authority(
+    tool_name: &str,
+    input_json: &[u8],
+    allowed_executables: &[String],
+) -> Result<Vec<String>, String> {
+    if tool_name != "palyra.process.run" {
+        return Ok(Vec::new());
+    }
+    let input = parse_process_runner_tool_input(input_json)
+        .map_err(|error| format!("networked worker process input is invalid: {error}"))?;
+    let command = input.command.as_str();
+    if command.trim() != command
+        || !networked_worker_process_command_is_unambiguous(command)
+        || networked_worker_process_command_is_raw_shell(command)
+    {
+        return Err(
+            "networked worker process command is not an unambiguous executable token".to_owned()
+        );
+    }
+    if !allowed_executables.iter().any(|allowed| {
+        let allowed = allowed.trim();
+        allowed != "*"
+            && networked_worker_process_command_is_unambiguous(allowed)
+            && allowed == command
+    }) {
+        return Err(
+            "networked worker process executable is not admitted by exact host policy".to_owned()
+        );
+    }
+    Ok(vec![command.to_owned()])
+}
+
+fn networked_worker_process_command_is_unambiguous(command: &str) -> bool {
+    if command.is_empty()
+        || command.len() > 256
+        || command.contains('\\')
+        || command.bytes().any(|byte| {
+            byte.is_ascii_whitespace() || byte == b'\0' || b"*;&|><`$'\"()".contains(&byte)
+        })
+    {
+        return false;
+    }
+    if let Some(absolute) = command.strip_prefix('/') {
+        return !absolute.is_empty()
+            && absolute
+                .split('/')
+                .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."));
+    }
+    !command.contains('/')
+        && command
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn networked_worker_process_command_is_raw_shell(command: &str) -> bool {
+    let command_name =
+        Path::new(command).file_name().and_then(|name| name.to_str()).unwrap_or(command);
+    matches!(
+        command_name.to_ascii_lowercase().as_str(),
+        "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+    )
 }
 
 async fn dispatch_networked_worker_remote_tool(
@@ -2822,8 +2939,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         build_host_bound_computer_use_task, build_scoped_networked_worker_workspace,
-        networked_worker_outcome_from_remote_result, networked_worker_supports_tool,
-        networked_worker_tool_capability, remote_tool_kind_uses_read_only_workspace, sha256_hex,
+        networked_worker_outcome_from_remote_result, networked_worker_process_executable_authority,
+        networked_worker_supports_tool, networked_worker_tool_capability,
+        remote_tool_kind_uses_read_only_workspace, sha256_hex,
         validate_computer_use_host_approval_record, ComputerUseHostApprovalAuthority,
     };
     use palyra_common::runtime_contracts::RuntimeGeneration;
@@ -2933,6 +3051,14 @@ mod tests {
                 grant_tool_name: tool_name.to_owned(),
                 expires_at_unix_ms: 3_000,
                 required_capabilities: vec![tool_kind.required_capability()],
+                process_executable_allowlist: if matches!(
+                    tool_kind,
+                    WorkerRemoteToolKind::ProcessRun
+                ) {
+                    vec!["echo".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 work_graph_claim: None,
                 work_graph_posture: Default::default(),
                 workspace_scope: WorkerWorkspaceScope {
@@ -3190,6 +3316,42 @@ mod tests {
 
         assert!(!networked_worker_supports_tool("palyra.echo"));
         assert!(!networked_worker_supports_tool("palyra.sleep"));
+    }
+
+    #[test]
+    fn networked_worker_process_authority_is_exact_host_policy() {
+        let allowed = vec!["cargo".to_owned()];
+        let authority = networked_worker_process_executable_authority(
+            "palyra.process.run",
+            br#"{"command":"cargo","args":["check"]}"#,
+            allowed.as_slice(),
+        )
+        .expect("exact host policy should yield one task-bound executable");
+        assert_eq!(authority, vec!["cargo".to_owned()]);
+
+        for (input, policy) in [
+            (br#"{"command":"cargo","args":["check"]}"#.as_slice(), vec!["*".to_owned()]),
+            (br#"{"command":"./cargo","args":["check"]}"#.as_slice(), vec!["cargo".to_owned()]),
+            (br#"{"command":"sh","args":["-c","cargo check"]}"#.as_slice(), vec!["sh".to_owned()]),
+            (br#"{"command":"cargo","unknown":true}"#.as_slice(), vec!["cargo".to_owned()]),
+        ] {
+            assert!(
+                networked_worker_process_executable_authority(
+                    "palyra.process.run",
+                    input,
+                    policy.as_slice(),
+                )
+                .is_err(),
+                "wildcard, path alias, shell, and malformed authority must fail closed"
+            );
+        }
+        assert!(networked_worker_process_executable_authority(
+            "palyra.fs.read_file",
+            br#"{"path":"src/lib.rs"}"#,
+            allowed.as_slice(),
+        )
+        .expect("non-process tools retain an empty compatibility authority")
+        .is_empty());
     }
 
     #[test]

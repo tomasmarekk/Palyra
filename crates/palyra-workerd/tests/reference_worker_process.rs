@@ -118,6 +118,7 @@ fn desktop_adapter_executes_the_same_scoped_stdio_protocol() {
             grant_tool_name: "palyra.fs.read_file".to_owned(),
             expires_at_unix_ms: now.saturating_add(30_000),
             required_capabilities: vec!["tool:palyra.fs.read_file".to_owned()],
+            process_executable_allowlist: Vec::new(),
             work_graph_claim: None,
             work_graph_posture: Default::default(),
             workspace_scope: WorkerWorkspaceScope {
@@ -232,6 +233,7 @@ fn isolated_computer_use_executes_only_in_the_workerd_child() {
             grant_tool_name: "palyra.computer.use".to_owned(),
             expires_at_unix_ms: now.saturating_add(30_000),
             required_capabilities: vec!["tool:palyra.computer.use".to_owned()],
+            process_executable_allowlist: Vec::new(),
             work_graph_claim: None,
             work_graph_posture: Default::default(),
             workspace_scope: WorkerWorkspaceScope {

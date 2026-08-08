@@ -3430,12 +3430,13 @@ dependencies = [
 name = "palyra-workerd"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "chrono",
  "getrandom 0.4.3",
  "hex",
  "hkdf",
  "palyra-common",
+ "palyra-sandbox",
  "ring",
  "serde",
  "serde_json",

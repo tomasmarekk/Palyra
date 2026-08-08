@@ -4,13 +4,26 @@
 
 use std::{
     fs,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
-use palyra_common::workspace_patch::{
-    apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
-    WorkspacePatchRequest,
+use palyra_common::{
+    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    redaction::redact_diagnostic_text,
+    workspace_patch::{
+        apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
+        WorkspacePatchRequest,
+    },
 };
+use palyra_sandbox::{build_tier_c_command_plan, TierCCommandRequest, TierCPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -29,6 +42,9 @@ use crate::{
 
 const MAX_WORKER_OUTPUT_BYTES: usize = 512 * 1_024;
 const MAX_CAPABILITIES: usize = 128;
+const MAX_PROCESS_ARGUMENTS: usize = 256;
+const MAX_PROCESS_ARGUMENT_BYTES: usize = 32 * 1_024;
+const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
 /// Transport used by an authenticated network worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +253,14 @@ impl ReferenceNetworkWorker {
         request: &WorkerRemoteToolRequestEnvelope,
         observed_at_unix_ms: i64,
     ) -> Result<WorkerRemoteToolResultEnvelope, NetworkWorkerRuntimeError> {
+        Self::execute_remote_request_with_cancellation(request, observed_at_unix_ms, None)
+    }
+
+    fn execute_remote_request_with_cancellation(
+        request: &WorkerRemoteToolRequestEnvelope,
+        observed_at_unix_ms: i64,
+        cancellation_requested: Option<&AtomicBool>,
+    ) -> Result<WorkerRemoteToolResultEnvelope, NetworkWorkerRuntimeError> {
         request
             .validate(observed_at_unix_ms)
             .map_err(|error| NetworkWorkerRuntimeError::Input(error.to_string()))?;
@@ -260,7 +284,12 @@ impl ReferenceNetworkWorker {
             validate_computer_use_remote_scopes(request)?;
         }
         let worker = Self::new(request.lease.worker_id.clone(), workspace.path().to_path_buf())?;
-        let response = worker.execute(protocol, observed_at_unix_ms)?;
+        let response = worker.execute_with_authority(
+            protocol,
+            request.lease.process_executable_allowlist.as_slice(),
+            observed_at_unix_ms,
+            cancellation_requested,
+        )?;
         drop(worker);
         workspace
             .close()
@@ -331,6 +360,16 @@ impl ReferenceNetworkWorker {
         protocol: &RemoteWorkerProtocolV1,
         observed_at_unix_ms: i64,
     ) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
+        self.execute_with_authority(protocol, &[], observed_at_unix_ms, None)
+    }
+
+    fn execute_with_authority(
+        &self,
+        protocol: &RemoteWorkerProtocolV1,
+        process_executable_allowlist: &[String],
+        observed_at_unix_ms: i64,
+        cancellation_requested: Option<&AtomicBool>,
+    ) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
         protocol.validate(observed_at_unix_ms)?;
         let started = std::time::Instant::now();
         let (output_json, patch_bundle, success, reason_code) =
@@ -356,6 +395,15 @@ impl ReferenceNetworkWorker {
                 "palyra.fs.apply_patch" => {
                     let (output, patch) = self.execute_patch(protocol.task.input_json.as_str())?;
                     (output, patch, true, "worker.task.succeeded")
+                }
+                "palyra.process.run" => {
+                    let result = self.execute_process(
+                        protocol,
+                        process_executable_allowlist,
+                        observed_at_unix_ms,
+                        cancellation_requested,
+                    )?;
+                    (result.output_json, None, result.success, result.reason_code)
                 }
                 "palyra.computer.use" => {
                     let output = IsolatedComputerUseWorker::execute_task(
@@ -429,6 +477,132 @@ impl ReferenceNetworkWorker {
         };
         outcome.validate_against(&protocol.task, observed_at_unix_ms)?;
         Ok(ReferenceWorkerResponse { outcome, output_json })
+    }
+
+    fn execute_process(
+        &self,
+        protocol: &RemoteWorkerProtocolV1,
+        process_executable_allowlist: &[String],
+        observed_at_unix_ms: i64,
+        cancellation_requested: Option<&AtomicBool>,
+    ) -> Result<ProcessExecutionResult, NetworkWorkerRuntimeError> {
+        let input = parse_process_runner_tool_input(protocol.task.input_json.as_bytes())
+            .map_err(|error| NetworkWorkerRuntimeError::Input(error.to_string()))?;
+        validate_process_input(&input, process_executable_allowlist)?;
+        if cancellation_requested.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(NetworkWorkerRuntimeError::ProcessCancelled);
+        }
+        let cwd = input
+            .cwd
+            .as_deref()
+            .map_or_else(|| Ok(self.workspace_root.clone()), |raw| self.resolve_scoped_path(raw))?;
+        if !cwd.is_dir() {
+            return Err(NetworkWorkerRuntimeError::Workspace(
+                "network worker process cwd is not a directory".to_owned(),
+            ));
+        }
+        let deadline_remaining_ms =
+            protocol.task.deadline_unix_ms.saturating_sub(observed_at_unix_ms);
+        let host_timeout_ms = protocol
+            .task
+            .resource_limits
+            .wall_time_ms
+            .min(u64::try_from(deadline_remaining_ms).unwrap_or(0));
+        let timeout_ms = input.timeout_ms.unwrap_or(host_timeout_ms).min(host_timeout_ms);
+        if timeout_ms == 0 {
+            return Err(NetworkWorkerRuntimeError::ProcessTimeout);
+        }
+        let command_plan = build_tier_c_command_plan(
+            &TierCPolicy {
+                workspace_root: self.workspace_root.clone(),
+                cwd: cwd.clone(),
+                enforce_network_isolation: true,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+            },
+            &TierCCommandRequest { command: input.command.clone(), args: input.args.clone() },
+        )
+        .map_err(|error| NetworkWorkerRuntimeError::ProcessSandboxUnavailable(error.to_string()))?;
+        let capture_budget = usize::try_from(protocol.task.max_output_bytes)
+            .unwrap_or(usize::MAX)
+            .min(MAX_WORKER_OUTPUT_BYTES)
+            .saturating_sub(4 * 1_024);
+        if capture_budget == 0 {
+            return Err(NetworkWorkerRuntimeError::OutputLimitExceeded);
+        }
+        let child = Command::new(command_plan.program.as_str())
+            .args(command_plan.args.as_slice())
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| NetworkWorkerRuntimeError::ProcessSpawnFailed)?;
+        let mut child = ProcessChildGuard::new(child);
+        let stdout =
+            child.child_mut()?.stdout.take().ok_or(NetworkWorkerRuntimeError::ProcessIo)?;
+        let stderr =
+            child.child_mut()?.stderr.take().ok_or(NetworkWorkerRuntimeError::ProcessIo)?;
+        let bytes_observed = Arc::new(AtomicUsize::new(0));
+        let output_limit_exceeded = Arc::new(AtomicBool::new(false));
+        let stdout_reader = spawn_bounded_process_reader(
+            stdout,
+            Arc::clone(&bytes_observed),
+            Arc::clone(&output_limit_exceeded),
+            capture_budget,
+        );
+        let stderr_reader = spawn_bounded_process_reader(
+            stderr,
+            Arc::clone(&bytes_observed),
+            Arc::clone(&output_limit_exceeded),
+            capture_budget,
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(timeout_ms);
+        let status = loop {
+            if cancellation_requested.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                child.terminate_and_wait();
+                join_process_readers(stdout_reader, stderr_reader);
+                return Err(NetworkWorkerRuntimeError::ProcessCancelled);
+            }
+            if output_limit_exceeded.load(Ordering::Acquire) {
+                child.terminate_and_wait();
+                join_process_readers(stdout_reader, stderr_reader);
+                return Err(NetworkWorkerRuntimeError::OutputLimitExceeded);
+            }
+            if Instant::now() >= deadline {
+                child.terminate_and_wait();
+                join_process_readers(stdout_reader, stderr_reader);
+                return Err(NetworkWorkerRuntimeError::ProcessTimeout);
+            }
+            match child.try_wait().map_err(|_| NetworkWorkerRuntimeError::ProcessIo)? {
+                Some(status) => break status,
+                None => thread::sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MS)),
+            }
+        };
+        child.disarm();
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| NetworkWorkerRuntimeError::ProcessIo)?
+            .map_err(|_| NetworkWorkerRuntimeError::ProcessIo)?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| NetworkWorkerRuntimeError::ProcessIo)?
+            .map_err(|_| NetworkWorkerRuntimeError::ProcessIo)?;
+        if output_limit_exceeded.load(Ordering::Acquire) {
+            return Err(NetworkWorkerRuntimeError::OutputLimitExceeded);
+        }
+        process_execution_result(
+            command_plan.backend.executor_label(),
+            status,
+            stdout,
+            stderr,
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
     }
 
     fn execute_read(&self, input_json: &str) -> Result<String, NetworkWorkerRuntimeError> {
@@ -684,6 +858,200 @@ impl ReferenceNetworkWorker {
     }
 }
 
+struct ProcessExecutionResult {
+    output_json: String,
+    success: bool,
+    reason_code: &'static str,
+}
+
+fn validate_process_input(
+    input: &ProcessRunnerToolInput,
+    process_executable_allowlist: &[String],
+) -> Result<(), NetworkWorkerRuntimeError> {
+    if !process_executable_allowlist.iter().any(|allowed| allowed == &input.command) {
+        return Err(NetworkWorkerRuntimeError::ProcessExecutableDenied);
+    }
+    if process_executable_is_raw_shell(input.command.as_str()) {
+        return Err(NetworkWorkerRuntimeError::ProcessShellDenied);
+    }
+    if input.args.len() > MAX_PROCESS_ARGUMENTS
+        || input
+            .args
+            .iter()
+            .try_fold(0_usize, |total, argument| total.checked_add(argument.len()))
+            .is_none_or(|total| total > MAX_PROCESS_ARGUMENT_BYTES)
+        || input.args.iter().any(|argument| argument.as_bytes().contains(&b'\0'))
+    {
+        return Err(NetworkWorkerRuntimeError::ProcessArgumentsInvalid);
+    }
+    if input.args.iter().any(|argument| process_argument_escapes_workspace(argument)) {
+        return Err(NetworkWorkerRuntimeError::WorkspaceEscape);
+    }
+    if input.background
+        || input.keep_running_after_run
+        || input.interactive
+        || input.stdin
+        || input.pty
+        || input.notify_on_complete
+        || !input.watch_patterns.is_empty()
+        || !input.port_hints.is_empty()
+        || input.elevated_intent
+        || input.effective_lifetime_mode().is_detached_handoff()
+    {
+        return Err(NetworkWorkerRuntimeError::ProcessLifecycleDenied);
+    }
+    if !input.env.is_empty() || input.env_profile_id.is_some() || !input.prepend_path.is_empty() {
+        return Err(NetworkWorkerRuntimeError::ProcessEnvironmentDenied);
+    }
+    if !input.requested_egress_hosts.is_empty() {
+        return Err(NetworkWorkerRuntimeError::ProcessEgressDenied);
+    }
+    Ok(())
+}
+
+fn process_argument_escapes_workspace(argument: &str) -> bool {
+    if argument.contains('\\') || argument.to_ascii_lowercase().starts_with("file:") {
+        return true;
+    }
+    let candidate = argument.split_once('=').map_or(argument, |(_, value)| value);
+    let path = Path::new(candidate);
+    path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+}
+
+fn process_executable_is_raw_shell(command: &str) -> bool {
+    let executable = command.rsplit('/').next().unwrap_or(command).to_ascii_lowercase();
+    matches!(
+        executable.as_str(),
+        "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+    )
+}
+
+fn process_execution_result(
+    executor: &str,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    duration_ms: u64,
+) -> Result<ProcessExecutionResult, NetworkWorkerRuntimeError> {
+    let success = status.success();
+    let reason_code = if success { "worker.task.succeeded" } else { "worker.process.exit_nonzero" };
+    let stdout_text = String::from_utf8_lossy(stdout.as_slice());
+    let stderr_text = String::from_utf8_lossy(stderr.as_slice());
+    let redacted_stdout = redact_diagnostic_text(stdout_text.as_ref());
+    let redacted_stderr = redact_diagnostic_text(stderr_text.as_ref());
+    let output_json = serde_json::to_string(&serde_json::json!({
+        "schema_version": 2,
+        "exit_code": status.code(),
+        "stdout": redacted_stdout,
+        "stderr": redacted_stderr,
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_redacted": redacted_stdout.as_str() != stdout_text.as_ref(),
+        "stderr_redacted": redacted_stderr.as_str() != stderr_text.as_ref(),
+        "stdout_bytes": stdout.len(),
+        "stderr_bytes": stderr.len(),
+        "stdout_sha256": sha256_hex(stdout.as_slice()),
+        "stderr_sha256": sha256_hex(stderr.as_slice()),
+        "duration_ms": duration_ms,
+        "tier": "C",
+        "sandbox_backend": executor,
+        "remote_worker": {
+            "network_isolation": "os_enforced",
+            "environment": "fixed_minimal",
+            "cleanup": "process_reaped",
+        },
+    }))
+    .map_err(|error| NetworkWorkerRuntimeError::Input(error.to_string()))?;
+    Ok(ProcessExecutionResult { output_json, success, reason_code })
+}
+
+struct ProcessChildGuard {
+    child: Option<Child>,
+}
+
+impl ProcessChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, NetworkWorkerRuntimeError> {
+        self.child.as_mut().ok_or(NetworkWorkerRuntimeError::ProcessIo)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("process child is not owned"))?
+            .try_wait()
+    }
+
+    fn terminate_and_wait(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.child.take();
+    }
+}
+
+impl Drop for ProcessChildGuard {
+    fn drop(&mut self) {
+        self.terminate_and_wait();
+    }
+}
+
+fn spawn_bounded_process_reader<R>(
+    mut reader: R,
+    bytes_observed: Arc<AtomicUsize>,
+    output_limit_exceeded: Arc<AtomicBool>,
+    capture_budget: usize,
+) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8 * 1_024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let previous = bytes_observed.fetch_add(read, Ordering::AcqRel);
+            let retained = capture_budget.saturating_sub(previous).min(read);
+            output.extend_from_slice(&buffer[..retained]);
+            if retained != read {
+                output_limit_exceeded.store(true, Ordering::Release);
+                break;
+            }
+        }
+        Ok(output)
+    })
+}
+
+fn join_process_readers(
+    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+) {
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+}
+
 #[derive(Debug, Deserialize)]
 struct ReadInput {
     path: String,
@@ -789,6 +1157,39 @@ pub enum NetworkWorkerRuntimeError {
     /// Output exceeds its host-issued budget.
     #[error("network worker output exceeds its budget")]
     OutputLimitExceeded,
+    /// The exact executable token was not present in host-issued authority.
+    #[error("network worker process executable is not authorized")]
+    ProcessExecutableDenied,
+    /// Shell interpreters are outside the canonical process safe subset.
+    #[error("network worker process shell execution is denied")]
+    ProcessShellDenied,
+    /// Process arguments exceed their closed shape or byte bounds.
+    #[error("network worker process arguments are invalid")]
+    ProcessArgumentsInvalid,
+    /// Background, interactive, elevated, or detached process lifecycle was requested.
+    #[error("network worker process lifecycle is not supported")]
+    ProcessLifecycleDenied,
+    /// Task-controlled environment or PATH mutation was requested.
+    #[error("network worker process environment authority is denied")]
+    ProcessEnvironmentDenied,
+    /// The reference process worker only supports OS-enforced network denial.
+    #[error("network worker process egress is denied")]
+    ProcessEgressDenied,
+    /// The target host cannot enforce the required Tier-C sandbox.
+    #[error("network worker process sandbox is unavailable: {0}")]
+    ProcessSandboxUnavailable(String),
+    /// The sandbox wrapper could not be spawned.
+    #[error("network worker process failed to start")]
+    ProcessSpawnFailed,
+    /// Process pipe or wait handling failed.
+    #[error("network worker process I/O failed")]
+    ProcessIo,
+    /// Host cancellation terminated and reaped the process.
+    #[error("network worker process was cancelled")]
+    ProcessCancelled,
+    /// The process exceeded its canonical deadline and was reaped.
+    #[error("network worker process timed out")]
+    ProcessTimeout,
     /// Isolated computer-use execution or evidence validation failed.
     #[error("network worker computer use failed closed: {0}")]
     ComputerUse(String),
@@ -800,6 +1201,17 @@ impl NetworkWorkerRuntimeError {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::SecretLeaseUnsupported => "worker.secret_lease.unsupported_by_safe_subset",
+            Self::ProcessExecutableDenied => "worker.process.executable_denied",
+            Self::ProcessShellDenied => "worker.process.shell_denied",
+            Self::ProcessArgumentsInvalid => "worker.process.arguments_invalid",
+            Self::ProcessLifecycleDenied => "worker.process.lifecycle_denied",
+            Self::ProcessEnvironmentDenied => "worker.process.environment_denied",
+            Self::ProcessEgressDenied => "worker.process.egress_denied",
+            Self::ProcessSandboxUnavailable(_) => "worker.process.sandbox_unavailable",
+            Self::ProcessSpawnFailed => "worker.process.spawn_failed",
+            Self::ProcessIo => "worker.process.io_failed",
+            Self::ProcessCancelled => "worker.process.cancelled",
+            Self::ProcessTimeout => "worker.process.timeout",
             _ => "worker.runtime.failed_closed",
         }
     }
@@ -1038,6 +1450,128 @@ mod tests {
     }
 
     #[test]
+    fn remote_process_denies_executable_shell_cwd_and_environment_authority() {
+        let executable = process_request(r#"{"command":"printf","args":["ok"]}"#, "sleep");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&executable, 60_000),
+            Err(NetworkWorkerRuntimeError::ProcessExecutableDenied)
+        ));
+
+        let shell = process_request(r#"{"command":"sh","args":["-c","echo unsafe"]}"#, "sh");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&shell, 60_000),
+            Err(NetworkWorkerRuntimeError::ProcessShellDenied)
+        ));
+
+        let cwd_escape =
+            process_request(r#"{"command":"printf","args":["ok"],"cwd":"../outside"}"#, "printf");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&cwd_escape, 60_000),
+            Err(NetworkWorkerRuntimeError::WorkspaceEscape)
+        ));
+
+        let argument_escape =
+            process_request(r#"{"command":"printf","args":["--output=/etc/passwd"]}"#, "printf");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&argument_escape, 60_000),
+            Err(NetworkWorkerRuntimeError::WorkspaceEscape)
+        ));
+
+        let environment = process_request(
+            r#"{"command":"printf","args":["ok"],"env":{"AWS_SECRET_ACCESS_KEY":"not-a-real-secret"}}"#,
+            "printf",
+        );
+        let error = ReferenceNetworkWorker::execute_remote_request(&environment, 60_000)
+            .expect_err("task environment must not reach the sandbox");
+        assert!(matches!(error, NetworkWorkerRuntimeError::ProcessEnvironmentDenied));
+        assert!(!error.to_string().contains("not-a-real-secret"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_process_runs_in_tier_c_with_bounded_output_and_cleanup() {
+        let request = process_request(
+            r#"{"command":"/usr/bin/printf","args":["worker-ok"]}"#,
+            "/usr/bin/printf",
+        );
+
+        let result = match ReferenceNetworkWorker::execute_remote_request(&request, 60_000) {
+            Ok(result) => result,
+            Err(NetworkWorkerRuntimeError::ProcessSandboxUnavailable(reason))
+                if reason.contains("requires binary 'bwrap'") =>
+            {
+                return;
+            }
+            Err(error) => {
+                panic!("Tier-C process should execute or fail for missing bwrap: {error}")
+            }
+        };
+        let output: serde_json::Value =
+            serde_json::from_str(result.output_json.as_str()).expect("process output");
+
+        assert!(result.success);
+        assert_eq!(output["stdout"], "worker-ok");
+        assert_eq!(output["network_isolation"], "os_enforced");
+        assert_eq!(output["environment"], "fixed_minimal");
+        assert_eq!(output["cleanup"], "process_reaped");
+        assert!(result.cleanup_report.is_verified());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_process_timeout_output_limit_and_cancellation_reap_child() {
+        let timeout = process_request(
+            r#"{"command":"/usr/bin/sleep","args":["5"],"timeout_ms":20}"#,
+            "/usr/bin/sleep",
+        );
+        match ReferenceNetworkWorker::execute_remote_request(&timeout, 60_000) {
+            Err(NetworkWorkerRuntimeError::ProcessTimeout) => {}
+            Err(NetworkWorkerRuntimeError::ProcessSandboxUnavailable(reason))
+                if reason.contains("requires binary 'bwrap'") =>
+            {
+                return;
+            }
+            other => panic!("Tier-C timeout should reap or fail for missing bwrap: {other:?}"),
+        }
+
+        let output_limit =
+            process_request(r#"{"command":"/usr/bin/yes","args":["bounded"]}"#, "/usr/bin/yes");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&output_limit, 60_000),
+            Err(NetworkWorkerRuntimeError::OutputLimitExceeded)
+        ));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let cancellation =
+            process_request(r#"{"command":"/usr/bin/sleep","args":["5"]}"#, "/usr/bin/sleep");
+        let execution = thread::spawn(move || {
+            ReferenceNetworkWorker::execute_remote_request_with_cancellation(
+                &cancellation,
+                60_000,
+                Some(worker_cancelled.as_ref()),
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        cancelled.store(true, Ordering::Release);
+
+        assert!(matches!(
+            execution.join().expect("worker execution thread"),
+            Err(NetworkWorkerRuntimeError::ProcessCancelled)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_process_has_no_unsandboxed_windows_fallback() {
+        let request = process_request(r#"{"command":"where.exe","args":["rustc"]}"#, "where.exe");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&request, 60_000),
+            Err(NetworkWorkerRuntimeError::ProcessSandboxUnavailable(_))
+        ));
+    }
+
+    #[test]
     fn reference_safe_subset_rejects_secret_lease_without_downgrade() {
         let recipient_secret = x25519_dalek::StaticSecret::from([7_u8; 32]);
         let recipient_public = x25519_dalek::PublicKey::from(&recipient_secret).to_bytes();
@@ -1062,6 +1596,18 @@ mod tests {
 
         assert!(matches!(&error, NetworkWorkerRuntimeError::SecretLeaseUnsupported));
         assert_eq!(error.reason_code(), "worker.secret_lease.unsupported_by_safe_subset");
+    }
+
+    fn process_request(input_json: &str, executable: &str) -> WorkerRemoteToolRequestEnvelope {
+        let mut request = scoped_request(
+            "palyra.process.run",
+            WorkerRemoteToolKind::ProcessRun,
+            input_json,
+            b"process workspace",
+        );
+        request.lease.process_executable_allowlist = vec![executable.to_owned()];
+        request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
+        request
     }
 
     fn scoped_request(
@@ -1097,6 +1643,14 @@ mod tests {
                 grant_tool_name: tool_name.to_owned(),
                 expires_at_unix_ms: 120_000,
                 required_capabilities: vec![tool_kind.required_capability()],
+                process_executable_allowlist: if matches!(
+                    tool_kind,
+                    WorkerRemoteToolKind::ProcessRun
+                ) {
+                    vec!["printf".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 work_graph_claim: None,
                 work_graph_posture: Default::default(),
                 workspace_scope: WorkerWorkspaceScope {

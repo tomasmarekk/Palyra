@@ -31,6 +31,8 @@ const DEFAULT_WORKER_SDK_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_WORKER_WIT_ABI_VERSION: &str = "palyra-worker-abi/v1";
 const MAX_REMOTE_WORKSPACE_ENTRIES: usize = 128;
 const MAX_REMOTE_WORKSPACE_BYTES: usize = 384 * 1_024;
+const MAX_REMOTE_PROCESS_EXECUTABLES: usize = 32;
+const MAX_REMOTE_PROCESS_EXECUTABLE_BYTES: usize = 256;
 
 fn default_worker_sdk_protocol_version() -> u32 {
     DEFAULT_WORKER_SDK_PROTOCOL_VERSION
@@ -546,6 +548,9 @@ pub struct WorkerRemoteLeaseBinding {
     pub expires_at_unix_ms: i64,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Exact host-policy executable tokens admitted for `palyra.process.run`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_executable_allowlist: Vec<String>,
     /// Exact WorkGraph claim authority, if this task was claim-dispatched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_graph_claim: Option<remote_protocol::RemoteWorkGraphClaimBinding>,
@@ -574,6 +579,7 @@ impl WorkerRemoteLeaseBinding {
             grant_tool_name: lease.grant.tool_name.clone(),
             expires_at_unix_ms: lease.expires_at_unix_ms,
             required_capabilities: lease.required_capabilities.clone(),
+            process_executable_allowlist: Vec::new(),
             // A normal worker lease has no WorkClaimAuthority. Claim-aware callers
             // must bind the exact host claim instead of deriving it from run IDs.
             work_graph_claim: None,
@@ -743,6 +749,10 @@ impl WorkerRemoteToolRequestEnvelope {
                 capability: required_capability,
             });
         }
+        validate_process_executable_authority(
+            self.tool_kind,
+            self.lease.process_executable_allowlist.as_slice(),
+        )?;
         Ok(())
     }
 }
@@ -913,6 +923,8 @@ pub enum WorkerRemoteToolContractError {
     LeaseToolMismatch { expected: String, actual: String },
     #[error("worker remote lease missing capability '{capability}'")]
     MissingRequiredCapability { capability: String },
+    #[error("worker remote process executable authority is missing or ambiguous")]
+    ProcessExecutableAuthorityInvalid,
     #[error("worker remote lease '{lease_id}' expired at {expires_at_unix_ms}; observed at {observed_at_unix_ms}")]
     LeaseExpired { lease_id: String, expires_at_unix_ms: i64, observed_at_unix_ms: i64 },
     #[error("worker remote identity mismatch: expected {expected}, got {actual}")]
@@ -925,6 +937,55 @@ pub enum WorkerRemoteToolContractError {
     CleanupGap { lease_id: String, reason: String },
     #[error("worker remote canonical protocol validation failed: {reason}")]
     CanonicalProtocol { reason: String },
+}
+
+fn validate_process_executable_authority(
+    tool_kind: WorkerRemoteToolKind,
+    allowlist: &[String],
+) -> Result<(), WorkerRemoteToolContractError> {
+    if !matches!(tool_kind, WorkerRemoteToolKind::ProcessRun) {
+        return if allowlist.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerRemoteToolContractError::ProcessExecutableAuthorityInvalid)
+        };
+    }
+    if allowlist.is_empty() || allowlist.len() > MAX_REMOTE_PROCESS_EXECUTABLES {
+        return Err(WorkerRemoteToolContractError::ProcessExecutableAuthorityInvalid);
+    }
+    let mut previous: Option<&str> = None;
+    for executable in allowlist {
+        if !remote_process_executable_is_unambiguous(executable)
+            || previous.is_some_and(|value| value >= executable.as_str())
+        {
+            return Err(WorkerRemoteToolContractError::ProcessExecutableAuthorityInvalid);
+        }
+        previous = Some(executable.as_str());
+    }
+    Ok(())
+}
+
+fn remote_process_executable_is_unambiguous(executable: &str) -> bool {
+    if executable.is_empty()
+        || executable.len() > MAX_REMOTE_PROCESS_EXECUTABLE_BYTES
+        || executable.trim() != executable
+        || executable.contains('\\')
+        || executable.bytes().any(|byte| {
+            byte.is_ascii_whitespace() || byte == b'\0' || b"*;&|><`$'\"()".contains(&byte)
+        })
+    {
+        return false;
+    }
+    if let Some(absolute) = executable.strip_prefix('/') {
+        return !absolute.is_empty()
+            && absolute
+                .split('/')
+                .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."));
+    }
+    !executable.contains('/')
+        && executable
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
 }
 
 fn workspace_entry_is_allowed(

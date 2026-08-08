@@ -256,6 +256,7 @@ impl WorkerTaskEnvelope {
             request.lease.grant_id.as_str(),
             request.lease.grant_tool_name.as_str(),
             request.lease.required_capabilities.as_slice(),
+            request.lease.process_executable_allowlist.as_slice(),
         ));
         let mut input_artifacts = if request.workspace_transfer.scoped_entries.is_empty() {
             vec![ContentAddressedArtifact {
@@ -1042,6 +1043,7 @@ mod tests {
                 grant_tool_name: "palyra.fs.read_file".to_owned(),
                 expires_at_unix_ms: 120_000,
                 required_capabilities: vec!["tool:palyra.fs.read_file".to_owned()],
+                process_executable_allowlist: Vec::new(),
                 work_graph_claim: None,
                 work_graph_posture: Default::default(),
                 workspace_scope: WorkerWorkspaceScope {
