@@ -1,7 +1,7 @@
 //! Candidate-only semantic memory consolidation with evidence and citations.
 //!
-//! Consolidation never writes ordinary memory directly. Host validation,
-//! quality evaluation, review, lifecycle, and rollback remain explicit.
+//! This module derives inert contracts. Durable review and the ordinary-memory
+//! projection are committed together by the journal integration.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +17,8 @@ const MAX_SUMMARY_BYTES: usize = 8 * 1024;
 const MAX_SCOPE_BYTES: usize = 256;
 const MAX_REASON_CODE_BYTES: usize = 128;
 const MIN_QUALITY_EVAL_SAMPLES: u32 = 10;
+const MAX_QUALITY_EVAL_CASES: usize = 64;
+const MAX_QUALITY_EVAL_HITS_PER_CASE: usize = 16;
 const BASIS_POINTS_MAX: u16 = 10_000;
 
 /// Epistemic origin retained through consolidation and retrieval projection.
@@ -30,7 +32,7 @@ pub enum SemanticMemoryEpistemicKind {
 }
 
 impl SemanticMemoryEpistemicKind {
-    const fn retrieval_label(self) -> &'static str {
+    pub(crate) const fn retrieval_label(self) -> &'static str {
         match self {
             Self::UserFact => "user_fact",
             Self::ObservedFact => "observed_fact",
@@ -116,6 +118,24 @@ pub struct SemanticMemoryQualityEvalV1 {
     pub evidence_sha256: String,
 }
 
+/// One host-labeled retrieval case; outcomes are always observed server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticMemoryQualityEvalCaseV1 {
+    pub case_id: String,
+    pub query: String,
+    pub expected_baseline_memory_ids: Vec<String>,
+    pub candidate_relevant: bool,
+}
+
+/// Bounded retrieval output captured by the isolated evaluation adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticMemoryQualityEvalObservationV1 {
+    pub case_id: String,
+    pub baseline_memory_ids: Vec<String>,
+    pub consolidated_memory_ids: Vec<String>,
+}
+
 impl SemanticMemoryQualityEvalV1 {
     #[must_use]
     pub fn qualifies(&self) -> bool {
@@ -137,6 +157,17 @@ impl SemanticMemoryQualityEvalV1 {
                 <= self.baseline_correction_rate_basis_points
             && valid_sha256(self.evidence_sha256.as_str())
     }
+}
+
+/// Candidate input before the server derives authoritative retrieval evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticMemoryCandidateDraftV1 {
+    pub candidate_id: String,
+    pub summary_text: String,
+    pub evidence_refs: Vec<SemanticMemoryEvidenceRefV1>,
+    pub retention_expires_at_unix_ms: Option<i64>,
+    pub created_at_unix_ms: i64,
 }
 
 /// Inert summary candidate that retains every source citation.
@@ -291,6 +322,8 @@ pub enum SemanticMemoryError {
     InsufficientCorroboration,
     #[error("semantic memory quality evaluation does not beat baseline")]
     QualityEvalFailed,
+    #[error("semantic memory quality evaluation evidence is invalid")]
+    QualityEvalEvidenceInvalid,
     #[error("semantic memory raw evidence copy requires explicit policy")]
     VerbatimEvidenceDenied,
     #[error("semantic memory sensitive retention is invalid")]
@@ -313,6 +346,153 @@ pub enum SemanticMemoryError {
     RecordDigestInvalid,
     #[error("semantic memory serialization failed")]
     Serialization,
+}
+
+/// Derives the authoritative quality report from host labels and observed hits.
+///
+/// # Errors
+/// Rejects malformed, duplicate, missing, or caller-reordered observations.
+pub fn derive_semantic_memory_quality_eval(
+    candidate_memory_id: &str,
+    cases: &[SemanticMemoryQualityEvalCaseV1],
+    observations: &[SemanticMemoryQualityEvalObservationV1],
+) -> Result<SemanticMemoryQualityEvalV1, SemanticMemoryError> {
+    if !valid_identifier(candidate_memory_id)
+        || cases.len() < MIN_QUALITY_EVAL_SAMPLES as usize
+        || cases.len() > MAX_QUALITY_EVAL_CASES
+        || cases.len() != observations.len()
+    {
+        return Err(SemanticMemoryError::QualityEvalEvidenceInvalid);
+    }
+    let mut case_ids = BTreeSet::new();
+    let mut baseline_relevant = 0_u64;
+    let mut baseline_retrieved = 0_u64;
+    let mut consolidated_relevant = 0_u64;
+    let mut consolidated_retrieved = 0_u64;
+    let mut baseline_useful = 0_u64;
+    let mut consolidated_useful = 0_u64;
+    let mut baseline_corrections = 0_u64;
+    let mut consolidated_corrections = 0_u64;
+    let mut evidence_hasher = Sha256::new();
+    evidence_hasher.update(b"palyra.semantic-memory.quality-eval.v1\0");
+
+    for (case, observation) in cases.iter().zip(observations) {
+        if !valid_identifier(case.case_id.as_str())
+            || !case_ids.insert(case.case_id.as_str())
+            || case.query.trim().is_empty()
+            || case.query.len() > MAX_SUMMARY_BYTES
+            || case.expected_baseline_memory_ids.len() > MAX_QUALITY_EVAL_HITS_PER_CASE
+            || case.expected_baseline_memory_ids.iter().any(|id| !valid_identifier(id.as_str()))
+            || observation.case_id != case.case_id
+            || observation.baseline_memory_ids.len() > MAX_QUALITY_EVAL_HITS_PER_CASE
+            || observation.consolidated_memory_ids.len() > MAX_QUALITY_EVAL_HITS_PER_CASE
+            || observation
+                .baseline_memory_ids
+                .iter()
+                .chain(&observation.consolidated_memory_ids)
+                .any(|id| !valid_identifier(id.as_str()))
+        {
+            return Err(SemanticMemoryError::QualityEvalEvidenceInvalid);
+        }
+        let expected_baseline =
+            case.expected_baseline_memory_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let baseline_hits =
+            observation.baseline_memory_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let consolidated_hits =
+            observation.consolidated_memory_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if baseline_hits.len() != observation.baseline_memory_ids.len()
+            || consolidated_hits.len() != observation.consolidated_memory_ids.len()
+        {
+            return Err(SemanticMemoryError::QualityEvalEvidenceInvalid);
+        }
+
+        let baseline_case_relevant = baseline_hits.intersection(&expected_baseline).count() as u64;
+        let consolidated_baseline_relevant =
+            consolidated_hits.intersection(&expected_baseline).count() as u64;
+        let consolidated_candidate_relevant =
+            u64::from(case.candidate_relevant && consolidated_hits.contains(candidate_memory_id));
+        baseline_relevant = baseline_relevant.saturating_add(baseline_case_relevant);
+        baseline_retrieved =
+            baseline_retrieved.saturating_add(observation.baseline_memory_ids.len() as u64);
+        consolidated_relevant = consolidated_relevant
+            .saturating_add(consolidated_baseline_relevant)
+            .saturating_add(consolidated_candidate_relevant);
+        consolidated_retrieved =
+            consolidated_retrieved.saturating_add(observation.consolidated_memory_ids.len() as u64);
+
+        let baseline_case_useful = if case.candidate_relevant || !expected_baseline.is_empty() {
+            baseline_case_relevant > 0
+        } else {
+            baseline_hits.is_empty()
+        };
+        let consolidated_case_useful = if case.candidate_relevant || !expected_baseline.is_empty() {
+            consolidated_baseline_relevant > 0 || consolidated_candidate_relevant > 0
+        } else {
+            consolidated_hits.is_empty()
+        };
+        baseline_useful = baseline_useful.saturating_add(u64::from(baseline_case_useful));
+        consolidated_useful =
+            consolidated_useful.saturating_add(u64::from(consolidated_case_useful));
+        baseline_corrections = baseline_corrections.saturating_add(
+            (observation.baseline_memory_ids.len() as u64).saturating_sub(baseline_case_relevant),
+        );
+        consolidated_corrections = consolidated_corrections.saturating_add(
+            (observation.consolidated_memory_ids.len() as u64)
+                .saturating_sub(consolidated_baseline_relevant)
+                .saturating_sub(consolidated_candidate_relevant),
+        );
+
+        update_hash_field(&mut evidence_hasher, case.case_id.as_bytes());
+        update_hash_field(&mut evidence_hasher, sha256_hex(case.query.as_bytes()).as_bytes());
+        evidence_hasher.update(u8::from(case.candidate_relevant).to_le_bytes());
+        for id in &case.expected_baseline_memory_ids {
+            update_hash_field(&mut evidence_hasher, id.as_bytes());
+        }
+        for id in &observation.baseline_memory_ids {
+            update_hash_field(&mut evidence_hasher, id.as_bytes());
+        }
+        for id in &observation.consolidated_memory_ids {
+            update_hash_field(&mut evidence_hasher, id.as_bytes());
+        }
+    }
+
+    let sample_count =
+        u32::try_from(cases.len()).map_err(|_| SemanticMemoryError::QualityEvalEvidenceInvalid)?;
+    Ok(SemanticMemoryQualityEvalV1 {
+        v: SEMANTIC_MEMORY_SCHEMA_VERSION,
+        sample_count,
+        baseline_precision_basis_points: ratio_basis_points(
+            baseline_relevant,
+            baseline_retrieved,
+            true,
+        ),
+        consolidated_precision_basis_points: ratio_basis_points(
+            consolidated_relevant,
+            consolidated_retrieved,
+            true,
+        ),
+        baseline_usefulness_basis_points: ratio_basis_points(
+            baseline_useful,
+            cases.len() as u64,
+            false,
+        ),
+        consolidated_usefulness_basis_points: ratio_basis_points(
+            consolidated_useful,
+            cases.len() as u64,
+            false,
+        ),
+        baseline_correction_rate_basis_points: ratio_basis_points(
+            baseline_corrections,
+            baseline_retrieved,
+            false,
+        ),
+        consolidated_correction_rate_basis_points: ratio_basis_points(
+            consolidated_corrections,
+            consolidated_retrieved,
+            false,
+        ),
+        evidence_sha256: hex::encode(evidence_hasher.finalize()),
+    })
 }
 
 /// Groups compatible evidence into an inert, reviewable candidate.
@@ -540,6 +720,13 @@ pub fn apply_semantic_memory_retrieval_feedback(
         {
             return Err(SemanticMemoryError::EvidenceInvalid("correction evidence mismatch"));
         }
+    }
+    advance_record_version(record)?;
+    if feedback.corrected {
+        let correction = feedback
+            .correction_evidence_ref
+            .as_ref()
+            .ok_or(SemanticMemoryError::EvidenceInvalid("correction evidence missing"))?;
         record.evidence_refs.push(correction.clone());
         record.citations.push(citation_from_evidence(correction));
         record.retrieval_metrics.correction_count =
@@ -548,6 +735,14 @@ pub fn apply_semantic_memory_retrieval_feedback(
         record.lifecycle = ConsolidatedMemoryLifecycle::Degraded;
         record.degraded_at_unix_ms = Some(feedback.retrieved_at_unix_ms);
         record.reason_code = "semantic_memory.degraded_by_correction".to_owned();
+    } else if !feedback.useful
+        && record.retrieval_metrics.not_useful_count.saturating_add(1)
+            >= record.retrieval_metrics.useful_count.saturating_add(2)
+        && record.retrieval_metrics.retrieval_count >= 2
+    {
+        record.lifecycle = ConsolidatedMemoryLifecycle::Degraded;
+        record.degraded_at_unix_ms = Some(feedback.retrieved_at_unix_ms);
+        record.reason_code = "semantic_memory.degraded_by_feedback".to_owned();
     }
     record.retrieval_metrics.retrieval_count =
         record.retrieval_metrics.retrieval_count.saturating_add(1);
@@ -582,6 +777,7 @@ pub fn mark_semantic_memory_stale(
     if !age_stale && !retention_stale {
         return Ok(false);
     }
+    advance_record_version(record)?;
     record.lifecycle = ConsolidatedMemoryLifecycle::Degraded;
     record.degraded_at_unix_ms = Some(observed_at_unix_ms);
     record.reason_code = "semantic_memory.stale".to_owned();
@@ -601,6 +797,7 @@ pub fn archive_semantic_memory(
     if archived_at_unix_ms < record.activated_at_unix_ms {
         return Err(SemanticMemoryError::EvidenceInvalid("archive timestamp"));
     }
+    advance_record_version(record)?;
     record.lifecycle = ConsolidatedMemoryLifecycle::Archived;
     record.archived_at_unix_ms = Some(archived_at_unix_ms);
     record.reason_code = "semantic_memory.archived".to_owned();
@@ -654,12 +851,7 @@ pub fn rollback_semantic_memory(
 pub fn semantic_memory_retrieval_projection(
     record: &ConsolidatedMemoryRecord,
 ) -> Option<SemanticMemoryRetrievalProjectionV1> {
-    if validate_record(record).is_err()
-        || !matches!(
-            record.lifecycle,
-            ConsolidatedMemoryLifecycle::Active | ConsolidatedMemoryLifecycle::Degraded
-        )
-    {
+    if validate_record(record).is_err() || record.lifecycle != ConsolidatedMemoryLifecycle::Active {
         return None;
     }
     Some(SemanticMemoryRetrievalProjectionV1 {
@@ -670,7 +862,7 @@ pub fn semantic_memory_retrieval_projection(
         epistemic_label: record.epistemic_kind.retrieval_label().to_owned(),
         citations: record.citations.clone(),
         confidence_basis_points: record.confidence_basis_points,
-        degraded: record.lifecycle == ConsolidatedMemoryLifecycle::Degraded,
+        degraded: false,
         instruction_authority: false,
     })
 }
@@ -894,6 +1086,16 @@ fn refresh_record_digest(record: &mut ConsolidatedMemoryRecord) -> Result<(), Se
     Ok(())
 }
 
+fn advance_record_version(
+    record: &mut ConsolidatedMemoryRecord,
+) -> Result<(), SemanticMemoryError> {
+    let previous_digest = record.record_sha256.clone();
+    record.version =
+        record.version.checked_add(1).ok_or(SemanticMemoryError::ApprovalGenerationInvalid)?;
+    record.previous_record_sha256 = Some(previous_digest);
+    Ok(())
+}
+
 fn expected_record_digest(
     record: &ConsolidatedMemoryRecord,
 ) -> Result<String, SemanticMemoryError> {
@@ -922,7 +1124,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn valid_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn ratio_basis_points(numerator: u64, denominator: u64, empty_is_perfect: bool) -> u16 {
+    if denominator == 0 {
+        return if empty_is_perfect { BASIS_POINTS_MAX } else { 0 };
+    }
+    let scaled = numerator
+        .saturating_mul(u64::from(BASIS_POINTS_MAX))
+        .saturating_div(denominator)
+        .min(u64::from(BASIS_POINTS_MAX));
+    u16::try_from(scaled).unwrap_or(BASIS_POINTS_MAX)
+}
+
+fn update_hash_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_le_bytes());
+    hasher.update(field);
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -1126,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_memory_degrades_and_stays_citable() {
+    fn stale_memory_degrades_and_leaves_current_retrieval() {
         let candidate = candidate();
         let mut active =
             activate_semantic_memory_candidate("memory-1".to_owned(), &candidate, &gate(1), None)
@@ -1134,9 +1353,10 @@ mod tests {
         assert!(mark_semantic_memory_stale(&mut active, NOW + 10_000, 100)
             .expect("staleness should evaluate"));
         assert_eq!(active.lifecycle, ConsolidatedMemoryLifecycle::Degraded);
-        let projection =
-            semantic_memory_retrieval_projection(&active).expect("degraded memory stays citable");
-        assert!(projection.degraded);
+        assert!(
+            semantic_memory_retrieval_projection(&active).is_none(),
+            "degraded memory must retain evidence without remaining current"
+        );
     }
 
     #[test]
@@ -1252,6 +1472,40 @@ mod tests {
             &serde_json::to_value(record).expect("record should serialize"),
             include_str!("../../../../schemas/json/common/consolidated-memory-record.v1.json"),
         );
+    }
+
+    #[test]
+    fn quality_eval_is_derived_from_observed_rankings_and_rejects_uppercase_digest() {
+        let candidate_id = "semantic-eval-candidate";
+        let cases = (0..10)
+            .map(|index| SemanticMemoryQualityEvalCaseV1 {
+                case_id: format!("case-{index}"),
+                query: "preferred editor helix".to_owned(),
+                expected_baseline_memory_ids: Vec::new(),
+                candidate_relevant: true,
+            })
+            .collect::<Vec<_>>();
+        let observations = cases
+            .iter()
+            .map(|case| SemanticMemoryQualityEvalObservationV1 {
+                case_id: case.case_id.clone(),
+                baseline_memory_ids: Vec::new(),
+                consolidated_memory_ids: vec![candidate_id.to_owned()],
+            })
+            .collect::<Vec<_>>();
+        let derived = derive_semantic_memory_quality_eval(
+            candidate_id,
+            cases.as_slice(),
+            observations.as_slice(),
+        )
+        .expect("server observations should derive an eval");
+        assert!(derived.qualifies());
+        assert_eq!(derived.baseline_usefulness_basis_points, 0);
+        assert_eq!(derived.consolidated_usefulness_basis_points, 10_000);
+
+        let mut uppercase = derived;
+        uppercase.evidence_sha256 = uppercase.evidence_sha256.to_ascii_uppercase();
+        assert!(!uppercase.qualifies());
     }
 
     fn assert_schema_required_fields(value: &serde_json::Value, schema_json: &str) {

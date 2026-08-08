@@ -64,6 +64,7 @@ use crate::{
         classify_resume, summarize_resume_tape_observations, ResumeClassifierInput, ResumeDecision,
         ResumeTapeObservation, DEFAULT_RESUME_FRESHNESS_TTL_MS, RUN_RESUME_DECISION_RECORDED_EVENT,
     },
+    application::semantic_memory::SemanticMemoryRetrievalProjectionV1,
     delegation::{DelegationMergeResult, DelegationSnapshot},
     domain::flow_dependencies::{
         validate_flow_dependency_graph, FlowDependencyNode, FlowDependencyValidationReport,
@@ -94,6 +95,7 @@ mod retrieval_index_status;
 pub(crate) mod run_admission;
 pub(crate) mod runtime_finalization;
 pub(crate) mod runtime_kernel;
+pub(crate) mod semantic_memory;
 pub(crate) mod session_operations;
 mod shared_runtime;
 pub(crate) mod startup_recovery;
@@ -747,6 +749,8 @@ pub struct MemorySearchHit {
     pub snippet: String,
     pub score: f64,
     pub breakdown: MemoryScoreBreakdown,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticMemoryRetrievalProjectionV1>,
 }
 
 /// Per-signal score components behind a workspace search hit.
@@ -7995,6 +7999,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 104,
         name: "signed_dynamic_tool_lifecycle",
         sql: dynamic_tools::MIGRATION_104_SQL,
+    },
+    Migration {
+        version: 105,
+        name: "semantic_memory_lifecycle",
+        sql: semantic_memory::MIGRATION_105_SQL,
     },
 ];
 
@@ -25054,12 +25063,16 @@ impl JournalStore {
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
     pub fn purge_expired_memory_items(&self, now_unix_ms: i64) -> Result<u64, JournalError> {
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let deleted = guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let semantic_expired =
+            semantic_memory::reconcile_expired_semantic_memory_tx(&transaction, now_unix_ms)?;
+        let deleted = transaction.execute(
             "DELETE FROM memory_items WHERE ttl_unix_ms IS NOT NULL AND ttl_unix_ms <= ?1",
             params![now_unix_ms],
         )?;
-        Ok(deleted as u64)
+        transaction.commit()?;
+        Ok(deleted.saturating_add(semantic_expired) as u64)
     }
 
     /// Returns memory usage plus maintenance and vacuum bookkeeping.
@@ -26372,6 +26385,7 @@ impl JournalStore {
                         source_quality_score: 0.0,
                         final_score,
                     },
+                    semantic: None,
                 }
             })
             .filter(|hit| hit.score >= request.min_score)
@@ -26385,6 +26399,7 @@ impl JournalStore {
                 .then_with(|| left.item.memory_id.cmp(&right.item.memory_id))
         });
         hits.truncate(request.top_k.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT));
+        self.enrich_semantic_memory_hits(hits.as_mut_slice())?;
         Ok(hits)
     }
 

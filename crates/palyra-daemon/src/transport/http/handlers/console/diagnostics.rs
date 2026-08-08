@@ -86,6 +86,17 @@ pub(crate) async fn console_diagnostics_handler(
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let memory_embeddings =
         state.runtime.memory_embeddings_status().await.map_err(runtime_status_response)?;
+    let semantic_memory = state
+        .runtime
+        .journal_store
+        .semantic_memory_diagnostics(&journal::semantic_memory::SemanticMemoryTargetScope {
+            principal: session.context.principal.clone(),
+            channel: session.context.channel.clone(),
+            session_id: None,
+        })
+        .map_err(|_| {
+            runtime_status_response(tonic::Status::internal("semantic_memory.internal"))
+        })?;
     let retrieval_backend =
         state.runtime.retrieval_backend_snapshot().map_err(runtime_status_response)?;
     let retrieval_config = state.runtime.retrieval_config_snapshot();
@@ -224,7 +235,16 @@ pub(crate) async fn console_diagnostics_handler(
             "last_vacuum_at_unix_ms": memory_status.last_vacuum_at_unix_ms,
             "next_vacuum_due_at_unix_ms": memory_status.next_vacuum_due_at_unix_ms,
             "next_run_at_unix_ms": memory_status.next_maintenance_run_at_unix_ms,
-        }
+        },
+        "semantic_memory": {
+            "rollout_enabled": state
+                .runtime
+                .config
+                .feature_rollouts
+                .semantic_memory_consolidation
+                .enabled,
+            "diagnostics": semantic_memory,
+        },
     });
     let null_payload = Value::Null;
     let runtime_preview_payload =

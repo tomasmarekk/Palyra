@@ -4486,6 +4486,7 @@ fn memory_hit_provenance(hit: &MemorySearchHit) -> Value {
         "channel": hit.item.channel.as_deref(),
         "content_hash": hit.item.content_hash.as_str(),
         "fence": MEMORY_CONTEXT_FENCE_VERSION,
+        "semantic": hit.semantic,
     })
 }
 

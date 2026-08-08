@@ -805,7 +805,7 @@ async fn search_memory_for_auto_inject(
 ) -> Result<Vec<MemorySearchHit>, Status> {
     let mut merged_hits = Vec::new();
     for query in query_variants.iter().take(MAX_MEMORY_QUERY_VARIANTS) {
-        let hits = runtime_state
+        let ordinary_hits = runtime_state
             .search_memory(MemorySearchRequest {
                 principal: context.principal.clone(),
                 channel: context.channel.clone(),
@@ -817,7 +817,20 @@ async fn search_memory_for_auto_inject(
                 sources: curated_memory_sources_for_prompt_context(),
             })
             .await?;
-        merge_memory_search_hits_by_id(&mut merged_hits, hits);
+        merge_memory_search_hits_by_id(&mut merged_hits, ordinary_hits);
+        let semantic_hits = runtime_state
+            .search_active_semantic_memory(MemorySearchRequest {
+                principal: context.principal.clone(),
+                channel: context.channel.clone(),
+                session_id: Some(session_id.to_owned()),
+                query: query.to_owned(),
+                top_k,
+                min_score: MEMORY_AUTO_INJECT_MIN_SCORE,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .await?;
+        merge_memory_search_hits_by_id(&mut merged_hits, semantic_hits);
     }
     sort_and_truncate_memory_search_hits(&mut merged_hits, top_k);
     Ok(merged_hits)
@@ -2310,8 +2323,9 @@ fn render_memory_recall_block(hits: &[MemorySearchHit]) -> String {
     let mut context_lines = Vec::with_capacity(hits.len());
     for (index, hit) in hits.iter().enumerate() {
         let snippet = sanitize_prompt_inline_value(hit.snippet.as_str());
+        let semantic = render_semantic_memory_prompt_provenance(hit);
         context_lines.push(format!(
-            "{}. id={} source={} scope={} trust_label={} score={:.4} created_at_unix_ms={} provenance=content_hash:{} snippet={}",
+            "{}. id={} source={} scope={} trust_label={} score={:.4} created_at_unix_ms={} provenance=content_hash:{} semantic={} snippet={}",
             index + 1,
             hit.item.memory_id,
             hit.item.source.as_str(),
@@ -2320,6 +2334,7 @@ fn render_memory_recall_block(hits: &[MemorySearchHit]) -> String {
             hit.score,
             hit.item.created_at_unix_ms,
             hit.item.content_hash,
+            semantic,
             truncate_with_ellipsis(snippet, 256),
         ));
     }
@@ -2333,6 +2348,40 @@ fn render_memory_recall_block(hits: &[MemorySearchHit]) -> String {
     block.push_str(context_lines.join("\n").as_str());
     block.push_str("\n</memory_context>");
     block
+}
+
+fn render_semantic_memory_prompt_provenance(hit: &MemorySearchHit) -> String {
+    let Some(semantic) = &hit.semantic else {
+        return "none".to_owned();
+    };
+    let citations = semantic
+        .citations
+        .iter()
+        .take(8)
+        .map(|citation| {
+            json!({
+                "evidence_id": bounded_semantic_prompt_field(citation.evidence_id.as_str()),
+                "source_ref": bounded_semantic_prompt_field(citation.source_ref.as_str()),
+                "citation_uri": bounded_semantic_prompt_field(citation.citation_uri.as_str()),
+                "content_sha256": citation.content_sha256,
+                "provenance_sha256": citation.provenance_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "memory_id": semantic.memory_id,
+        "version": semantic.version,
+        "epistemic_label": semantic.epistemic_label,
+        "confidence_basis_points": semantic.confidence_basis_points,
+        "instruction_authority": false,
+        "citation_count": semantic.citations.len(),
+        "citations": citations,
+    })
+    .to_string()
+}
+
+fn bounded_semantic_prompt_field(value: &str) -> String {
+    truncate_with_ellipsis(sanitize_prompt_inline_value(value), 128)
 }
 
 fn memory_hit_scope_label(hit: &MemorySearchHit) -> &'static str {
@@ -2481,13 +2530,21 @@ mod tests {
         build_prompt_cache_metadata, curated_memory_sources_for_prompt_context,
         parse_provider_reasoning_effort_override, parse_provider_service_tier_override,
         previous_run_provider_source_messages, render_legacy_runtime_context_prompt,
-        sanitize_prompt_inline_value, PromptCacheSessionMetadata,
+        render_memory_augmented_prompt, sanitize_prompt_inline_value, PromptCacheSessionMetadata,
     };
-    use crate::journal::{MemorySource, OrchestratorTapeRecord};
     use crate::model_provider::{
         project_provider_transcript, PromptCacheStrategy, ProviderMessage, ProviderMessageRole,
         ProviderPromptCacheHint, ProviderPromptSegmentKind, ProviderReasoningEffort,
         ProviderServiceTier, ProviderTranscriptDialect, ProviderTranscriptProjectionRequest,
+    };
+    use crate::{
+        application::semantic_memory::{
+            SemanticMemoryCitationV1, SemanticMemoryRetrievalProjectionV1,
+        },
+        journal::{
+            MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit, MemorySource,
+            OrchestratorTapeRecord,
+        },
     };
     use chrono::TimeZone;
     use serde_json::json;
@@ -2589,6 +2646,65 @@ mod tests {
         assert!(!sources.contains(&MemorySource::TapeUserMessage));
         assert!(!sources.contains(&MemorySource::TapeToolResult));
         assert!(!sources.contains(&MemorySource::Summary));
+    }
+
+    #[test]
+    fn semantic_prompt_provenance_is_bounded_and_omits_duplicate_summary() {
+        let long_reference = "source-segment-".repeat(80);
+        let citations = (0..64)
+            .map(|index| SemanticMemoryCitationV1 {
+                evidence_id: format!("evidence-{index}-{long_reference}"),
+                source_ref: long_reference.clone(),
+                citation_uri: format!("memory://{index}/{long_reference}"),
+                content_sha256: format!("{index:064x}"),
+                provenance_sha256: format!("{:064x}", index + 1),
+            })
+            .collect();
+        let hit = MemorySearchHit {
+            item: MemoryItemRecord {
+                memory_id: "semantic-memory-item".to_owned(),
+                principal: "user-1".to_owned(),
+                channel: None,
+                session_id: None,
+                source: MemorySource::Summary,
+                content_text: "bounded semantic summary".to_owned(),
+                content_hash: "a".repeat(64),
+                tags: vec!["semantic_memory".to_owned()],
+                confidence: Some(0.9),
+                ttl_unix_ms: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+            snippet: "bounded semantic summary".to_owned(),
+            score: 0.9,
+            breakdown: MemoryScoreBreakdown {
+                lexical_score: 0.9,
+                vector_score: 0.8,
+                recency_score: 1.0,
+                source_quality_score: 0.9,
+                final_score: 0.9,
+            },
+            semantic: Some(SemanticMemoryRetrievalProjectionV1 {
+                v: 1,
+                memory_id: "semantic-memory".to_owned(),
+                version: 4,
+                summary_text: "duplicate-summary-marker ".repeat(400),
+                epistemic_label: "preference".to_owned(),
+                citations,
+                confidence_basis_points: 9_000,
+                degraded: false,
+                instruction_authority: false,
+            }),
+        };
+
+        let prompt = render_memory_augmented_prompt(&[hit], "");
+
+        assert!(prompt.len() < 12_000);
+        assert!(!prompt.contains("duplicate-summary-marker"));
+        assert!(prompt.contains("\"citation_count\":64"));
+        assert!(prompt.contains("evidence-7"));
+        assert!(!prompt.contains("evidence-8-"));
+        assert!(!prompt.contains(long_reference.as_str()));
     }
 
     #[test]

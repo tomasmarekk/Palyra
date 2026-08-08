@@ -1008,6 +1008,7 @@ pub(crate) fn score_memory_candidates(
                     source_quality_score: breakdown.source_quality_score,
                     final_score: breakdown.final_score,
                 },
+                semantic: None,
             }
         })
         .filter(|hit| hit.score >= min_score)

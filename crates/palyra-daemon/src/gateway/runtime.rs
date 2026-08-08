@@ -19943,16 +19943,28 @@ impl GatewayRuntimeState {
         let state = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || {
             let retrieval_config = state.retrieval_config_snapshot();
-            let candidate_outcome = state
+            let mut candidate_outcome = state
                 .retrieval_backend
                 .search_memory_candidate_outcome(&state.journal_store, &request, &retrieval_config)
                 .map_err(|error| map_memory_store_error("search memory items", error))?;
+            if !state.config.feature_rollouts.semantic_memory_consolidation.enabled {
+                state
+                    .journal_store
+                    .remove_semantic_memory_candidates(&mut candidate_outcome.candidates)
+                    .map_err(|error| {
+                        map_memory_store_error("filter semantic memory items", error)
+                    })?;
+            }
             let fusion_started = Instant::now();
-            let hits = score_memory_candidates(
+            let mut hits = score_memory_candidates(
                 candidate_outcome.candidates,
                 request.min_score,
                 &retrieval_config,
             );
+            state
+                .journal_store
+                .enrich_semantic_memory_hits(hits.as_mut_slice())
+                .map_err(|error| map_memory_store_error("enrich semantic memory hits", error))?;
             let diagnostics = complete_retrieval_diagnostics(
                 candidate_outcome.diagnostics,
                 elapsed_millis(fusion_started),
@@ -20028,15 +20040,22 @@ impl GatewayRuntimeState {
         let state = Arc::clone(self);
         let results = tokio::task::spawn_blocking(move || {
             let retrieval_config = state.retrieval_config_snapshot();
-            let candidates = state
+            let mut candidates = state
                 .retrieval_backend
                 .search_memory_candidates(&state.journal_store, &request, &retrieval_config)
                 .map_err(|error| map_memory_store_error("search memory items", error))?;
-            Ok::<_, Status>(score_memory_candidates(
-                candidates,
-                request.min_score,
-                &retrieval_config,
-            ))
+            if !state.config.feature_rollouts.semantic_memory_consolidation.enabled {
+                state.journal_store.remove_semantic_memory_candidates(&mut candidates).map_err(
+                    |error| map_memory_store_error("filter semantic memory items", error),
+                )?;
+            }
+            let mut hits =
+                score_memory_candidates(candidates, request.min_score, &retrieval_config);
+            state
+                .journal_store
+                .enrich_semantic_memory_hits(hits.as_mut_slice())
+                .map_err(|error| map_memory_store_error("enrich semantic memory hits", error))?;
+            Ok::<_, Status>(hits)
         })
         .await
         .map_err(|_| Status::internal("memory search worker panicked"))??;
@@ -20083,6 +20102,48 @@ impl GatewayRuntimeState {
             }
         }
         Ok(results)
+    }
+
+    /// Searches only reviewed, currently active semantic-memory projections.
+    ///
+    /// This is separate from ordinary curated auto-recall because unreviewed
+    /// model summaries remain ineligible for prompt injection.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker
+    /// panicked.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn search_active_semantic_memory(
+        self: &Arc<Self>,
+        mut request: MemorySearchRequest,
+    ) -> Result<Vec<MemorySearchHit>, Status> {
+        if !self.config.feature_rollouts.semantic_memory_consolidation.enabled {
+            return Ok(Vec::new());
+        }
+        self.counters.memory_search_requests.fetch_add(1, Ordering::Relaxed);
+        request.sources = vec![MemorySource::Summary];
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let retrieval_config = state.retrieval_config_snapshot();
+            let mut candidates = state
+                .retrieval_backend
+                .search_memory_candidates(&state.journal_store, &request, &retrieval_config)
+                .map_err(|error| map_memory_store_error("search semantic memory items", error))?;
+            state
+                .journal_store
+                .retain_active_semantic_memory_candidates(&mut candidates)
+                .map_err(|error| map_memory_store_error("filter semantic memory items", error))?;
+            let mut hits =
+                score_memory_candidates(candidates, request.min_score, &retrieval_config);
+            hits.truncate(request.top_k.max(1));
+            state
+                .journal_store
+                .enrich_semantic_memory_hits(hits.as_mut_slice())
+                .map_err(|error| map_memory_store_error("enrich semantic memory hits", error))?;
+            Ok::<_, Status>(hits)
+        })
+        .await
+        .map_err(|_| Status::internal("semantic memory search worker panicked"))?
     }
 
     /// Loads a workspace document by path within the principal/channel/agent scope.

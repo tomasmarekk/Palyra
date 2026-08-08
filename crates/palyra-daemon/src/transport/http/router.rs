@@ -1343,6 +1343,46 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::memory::console_learning_candidate_apply_handler),
         )
         .route(
+            "/console/v1/memory/semantic/proposals",
+            post(console::semantic_memory::console_semantic_memory_proposal_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/proposals/{candidate_id}",
+            get(console::semantic_memory::console_semantic_memory_proposal_detail_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/activate",
+            post(console::semantic_memory::console_semantic_memory_activation_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/search",
+            get(console::semantic_memory::console_semantic_memory_search_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/{memory_id}/feedback",
+            post(console::semantic_memory::console_semantic_memory_feedback_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/{memory_id}/stale",
+            post(console::semantic_memory::console_semantic_memory_stale_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/{memory_id}/archive",
+            post(console::semantic_memory::console_semantic_memory_archive_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/rollback/proposals",
+            post(console::semantic_memory::console_semantic_memory_rollback_proposal_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/rollback",
+            post(console::semantic_memory::console_semantic_memory_rollback_handler),
+        )
+        .route(
+            "/console/v1/memory/semantic/diagnostics",
+            get(console::semantic_memory::console_semantic_memory_diagnostics_handler),
+        )
+        .route(
             "/console/v1/memory/preferences",
             get(console::memory::console_learning_preferences_list_handler),
         )

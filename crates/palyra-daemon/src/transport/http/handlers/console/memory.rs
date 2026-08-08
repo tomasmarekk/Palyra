@@ -110,6 +110,17 @@ pub(crate) async fn console_memory_status_handler(
         None,
     );
     let learning_config = state.runtime.learning_config_snapshot();
+    let semantic_memory = state
+        .runtime
+        .journal_store
+        .semantic_memory_diagnostics(&journal::semantic_memory::SemanticMemoryTargetScope {
+            principal: session.context.principal.clone(),
+            channel: session.context.channel.clone(),
+            session_id: None,
+        })
+        .map_err(|_| {
+            runtime_status_response(tonic::Status::internal("semantic_memory.internal"))
+        })?;
     let counters = state.runtime.counters.snapshot();
     let workspace_preview = state
         .runtime
@@ -204,6 +215,15 @@ pub(crate) async fn console_memory_status_handler(
                 "candidates_created": counters.learning_candidates_created,
                 "candidates_auto_applied": counters.learning_candidates_auto_applied,
             },
+        },
+        "semantic_memory": {
+            "rollout_enabled": state
+                .runtime
+                .config
+                .feature_rollouts
+                .semantic_memory_consolidation
+                .enabled,
+            "diagnostics": semantic_memory,
         },
         "workspace": {
             "roots": curated_workspace_roots(),
