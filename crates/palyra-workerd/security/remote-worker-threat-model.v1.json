@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "contract_id": "palyra.remote-worker-threat-model",
+  "approval": {
+    "status": "approved_for_opt_in",
+    "owner": "@tomasmarekk"
+  },
+  "rollout": {
+    "default_enabled": false,
+    "silent_fallback_allowed": false
+  },
+  "controls": {
+    "authenticated_transport_identity": true,
+    "signed_exact_task_delivery": true,
+    "capability_and_policy_binding": true,
+    "content_addressed_workspace": true,
+    "scoped_path_enforcement": true,
+    "encrypted_ephemeral_secrets": true,
+    "restart_safe_duplicate_reconciliation": true,
+    "late_result_rejection": true,
+    "verified_cleanup": true,
+    "arbitrary_shell_denied": true
+  }
+}
