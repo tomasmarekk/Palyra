@@ -853,6 +853,12 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
             request.get_ref().fetch_token.as_str(),
             self.runtime.as_ref(),
         )?;
+        let authenticated_delivery_hmac_sha256 =
+            palyra_workerd::remote_protocol::authenticated_delivery_hmac_sha256(
+                request.get_ref().fetch_token.as_str(),
+                payload.request_sha256.as_str(),
+                payload.input_json.as_slice(),
+            );
         Ok(Response::new(node_v1::FetchNetworkedWorkerPayloadResponse {
             v: request.get_ref().v.max(1),
             request_id: Some(common_v1::CanonicalId { ulid: payload.request_id }),
@@ -860,6 +866,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
             input_json: payload.input_json,
             max_payload_bytes: payload.max_payload_bytes,
             request_sha256: payload.request_sha256,
+            authenticated_delivery_hmac_sha256,
         }))
     }
 

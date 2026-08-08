@@ -1,6 +1,6 @@
 //! Reference canonical worker process for transport conformance and local deployment.
-//! It accepts one `RemoteWorkerProtocolV1` JSON document on stdin and emits one
-//! bounded `ReferenceWorkerResponse` JSON document on stdout.
+//! `--stdio` executes the full remote request envelope from a scoped bundle;
+//! positional arguments retain the lower-level canonical-task conformance mode.
 
 use std::{
     env,
@@ -10,6 +10,7 @@ use std::{
 
 use palyra_workerd::{
     network_runtime::ReferenceNetworkWorker, remote_protocol::RemoteWorkerProtocolV1,
+    WorkerRemoteToolRequestEnvelope,
 };
 
 fn main() {
@@ -21,14 +22,19 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
-    let workspace_root = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("usage: palyra-workerd <workspace-root> <worker-id>")?;
+    let first =
+        args.next().ok_or("usage: palyra-workerd --stdio | <workspace-root> <worker-id>")?;
+    if first == "--stdio" {
+        if args.next().is_some() {
+            return Err("palyra-workerd --stdio does not accept additional arguments".into());
+        }
+        return run_canonical_stdio();
+    }
+    let workspace_root = PathBuf::from(first);
     let worker_id = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .ok_or("usage: palyra-workerd <workspace-root> <worker-id>")?;
+        .ok_or("usage: palyra-workerd --stdio | <workspace-root> <worker-id>")?;
     if args.next().is_some() {
         return Err("unexpected palyra-workerd arguments".into());
     }
@@ -39,6 +45,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let observed_at_unix_ms = unix_time_ms()?;
     let response = worker.execute(&protocol, observed_at_unix_ms)?;
     let output = serde_json::to_vec(&response)?;
+    io::stdout().write_all(output.as_slice())?;
+    Ok(())
+}
+
+fn run_canonical_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = Vec::new();
+    io::stdin().take(1024 * 1024 + 1).read_to_end(&mut input)?;
+    if input.len() > 1024 * 1024 {
+        return Err("palyra-workerd request exceeds the stdio transport limit".into());
+    }
+    let request: WorkerRemoteToolRequestEnvelope = serde_json::from_slice(input.as_slice())?;
+    let response = ReferenceNetworkWorker::execute_remote_request(&request, unix_time_ms()?)?;
+    let output = serde_json::to_vec(&response)?;
+    if output.len() > 1024 * 1024 {
+        return Err("palyra-workerd response exceeds the stdio transport limit".into());
+    }
     io::stdout().write_all(output.as_slice())?;
     Ok(())
 }

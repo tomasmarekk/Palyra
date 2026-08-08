@@ -7,10 +7,16 @@
 //! denial, cleanup failure, journal failure) fails closed with a reason-coded
 //! [`ToolExecutionOutcome`] instead of falling back to another backend.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use palyra_common::{
-    redaction::{redact_auth_error, redact_url_segments_in_text},
+    redaction::{redact_auth_error, redact_auth_error_strict, redact_url_segments_in_text},
     runtime_contracts::{
         RuntimeGeneration, RuntimeRunId, RuntimeSessionId, REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
     },
@@ -20,8 +26,9 @@ use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
     WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding,
     WorkerRemoteToolContractError, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
-    WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer, WorkerRunGrant,
-    WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceEntry, WorkerRemoteWorkspaceEntryKind,
+    WorkerRemoteWorkspaceTransfer, WorkerRunGrant, WorkerWorkspaceScope,
+    WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -49,6 +56,10 @@ use crate::{
 
 const NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
 const NETWORKED_WORKER_NODE_CAPABILITY_MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
+const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_BYTES: usize = 384 * 1024;
+const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_ENTRIES: usize = 128;
+const NETWORKED_WORKER_SKIPPED_DIRECTORIES: &[&str] =
+    &[".git", "node_modules", "target", "dist", "build"];
 
 #[derive(Debug, Clone)]
 struct OwnedToolRuntimeExecutionContext {
@@ -85,6 +96,17 @@ impl OwnedToolRuntimeExecutionContext {
             backend_reason_code: self.backend_reason_code.as_str(),
         }
     }
+}
+
+struct NetworkedWorkerTaskRequest<'a> {
+    proposal_id: &'a str,
+    tool_name: &'a str,
+    input_json: &'a [u8],
+    lease: &'a WorkerLease,
+    worker_attestation: &'a WorkerAttestation,
+    session_id: &'a str,
+    run_generation: RuntimeGeneration,
+    workspace_transfer: WorkerRemoteWorkspaceTransfer,
 }
 
 /// One remote worker response plus optional node-delivery settlement identity.
@@ -701,8 +723,24 @@ async fn execute_networked_worker_tool_owned(
         );
     }
 
-    let request =
-        build_worker_lease_request(runtime_state, context, proposal_id, tool_name, input_json);
+    let request = match build_worker_lease_request(
+        runtime_state,
+        context,
+        proposal_id,
+        tool_name,
+        input_json,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                error,
+                "networked_worker_workspace_scope_invalid",
+            );
+        }
+    };
     let lease = match runtime_state
         .assign_next_networked_worker_lease_for_run(
             request,
@@ -807,15 +845,48 @@ async fn execute_networked_worker_tool_owned(
                 );
             }
         };
-    let remote_request = match build_worker_remote_tool_request(
+    let workspace_transfer =
+        match prepare_networked_worker_workspace_transfer(&lease, tool_name, input_json).await {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                runtime_state.record_managed_runtime_health_observation_for_run(
+                    &health_authority,
+                    &generation_session_id,
+                    &run_identity,
+                    run_generation,
+                    false,
+                    "runtime.health.worker_workspace_transfer_invalid",
+                );
+                if let Err(cleanup_error) =
+                    record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+                {
+                    return networked_worker_failure_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        format!("networked worker cleanup failed: {}", cleanup_error.message()),
+                        "networked_worker_cleanup_failed",
+                    );
+                }
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    error,
+                    "networked_worker_workspace_transfer_failed",
+                );
+            }
+        };
+    let remote_request = match build_worker_remote_tool_request(NetworkedWorkerTaskRequest {
         proposal_id,
         tool_name,
         input_json,
-        &lease,
-        &worker_attestation,
-        generation_session_id.as_str().to_owned(),
+        lease: &lease,
+        worker_attestation: &worker_attestation,
+        session_id: generation_session_id.as_str(),
         run_generation,
-    ) {
+        workspace_transfer,
+    }) {
         Ok(request) => request,
         Err(error) => {
             runtime_state.record_managed_runtime_health_observation_for_run(
@@ -1024,6 +1095,35 @@ async fn execute_networked_worker_tool_owned(
                 );
             }
         };
+    if let Err(error) = validate_networked_worker_canonical_outcome(&remote_request, &remote_result)
+    {
+        runtime_state.record_managed_runtime_health_observation_for_run(
+            &health_authority,
+            &generation_session_id,
+            &run_identity,
+            run_generation,
+            false,
+            "runtime.health.worker_canonical_outcome_invalid",
+        );
+        if let Err(cleanup_error) =
+            record_unverified_networked_worker_cleanup(runtime_state, &lease).await
+        {
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!("networked worker cleanup failed: {}", cleanup_error.message()),
+                "networked_worker_cleanup_failed",
+            );
+        }
+        return networked_worker_failure_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            format!("networked worker canonical outcome failed validation: {error}"),
+            "networked_worker_canonical_protocol_failed",
+        );
+    }
     let receipt = crate::gateway::NetworkedWorkerArtifactReceipt {
         request_id: remote_result.request_id.clone(),
         proposal_id: proposal_id.to_owned(),
@@ -1109,15 +1209,447 @@ async fn execute_networked_worker_tool_owned(
     networked_worker_outcome_from_validated_remote_result(&remote_request, remote_result)
 }
 
-fn build_worker_remote_tool_request(
-    proposal_id: &str,
+async fn prepare_networked_worker_workspace_transfer(
+    lease: &WorkerLease,
     tool_name: &str,
     input_json: &[u8],
-    lease: &WorkerLease,
-    worker_attestation: &WorkerAttestation,
-    session_id: String,
-    run_generation: RuntimeGeneration,
+) -> Result<WorkerRemoteWorkspaceTransfer, String> {
+    let workspace_root = PathBuf::from(lease.workspace_scope.workspace_root.as_str());
+    let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name)
+        .ok_or_else(|| format!("networked worker tool {tool_name} is unsupported"))?;
+    let input_json = input_json.to_vec();
+    let allowed_paths = lease.workspace_scope.allowed_paths.clone();
+    tokio::task::spawn_blocking(move || {
+        build_scoped_networked_worker_workspace(
+            workspace_root.as_path(),
+            allowed_paths.as_slice(),
+            tool_kind,
+            &input_json,
+        )
+    })
+    .await
+    .map_err(|error| format!("networked worker workspace transfer task failed: {error}"))?
+}
+
+fn build_scoped_networked_worker_workspace(
+    workspace_root: &Path,
+    allowed_paths: &[String],
+    tool_kind: WorkerRemoteToolKind,
+    input_json: &[u8],
+) -> Result<WorkerRemoteWorkspaceTransfer, String> {
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("networked worker workspace root is unavailable: {error}"))?;
+    if !root.is_dir() {
+        return Err("networked worker workspace root is not a directory".to_owned());
+    }
+    let input = serde_json::from_slice::<serde_json::Value>(input_json)
+        .map_err(|error| format!("networked worker tool input is invalid JSON: {error}"))?;
+    let object = input
+        .as_object()
+        .ok_or_else(|| "networked worker tool input must be a JSON object".to_owned())?;
+    if object.get("workspace_root").and_then(serde_json::Value::as_str).is_some_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "/workspace" && value != "workspace"
+    }) {
+        return Err("networked worker scoped transfer does not accept a secondary workspace_root"
+            .to_owned());
+    }
+
+    let mut entries = BTreeMap::<String, WorkerRemoteWorkspaceEntry>::new();
+    match tool_kind {
+        WorkerRemoteToolKind::FsRead => {
+            let relative = required_remote_workspace_path(object, "path")?;
+            add_remote_workspace_file(&root, relative.as_path(), &mut entries)?;
+        }
+        WorkerRemoteToolKind::FsList => {
+            let relative = optional_remote_workspace_path(object, "path")?;
+            add_remote_workspace_directory_listing(&root, relative.as_path(), &mut entries)?;
+        }
+        WorkerRemoteToolKind::FsSearch => {
+            let relative = optional_remote_workspace_path(object, "path")?;
+            add_remote_workspace_search_tree(&root, relative.as_path(), &mut entries)?;
+        }
+        WorkerRemoteToolKind::ApplyPatch => {
+            let patch = object
+                .get("patch")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "networked worker apply_patch requires non-empty patch".to_owned()
+                })?;
+            for relative in remote_patch_paths(patch)? {
+                let candidate = root.join(relative.as_path());
+                match fs::symlink_metadata(candidate.as_path()) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "networked worker scoped transfer rejects symlink path {}",
+                            relative.display()
+                        ));
+                    }
+                    Ok(metadata) if metadata.is_file() => {
+                        add_remote_workspace_file(&root, relative.as_path(), &mut entries)?;
+                    }
+                    Ok(metadata) if metadata.is_dir() => {
+                        add_remote_workspace_directory_entry(relative.as_path(), &mut entries)?;
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "networked worker scoped transfer rejects non-file path {}",
+                            relative.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "networked worker failed to inspect patch path {}: {error}",
+                            relative.display()
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "reference network worker does not implement portable workspace transfer for {}",
+                tool_kind.tool_name()
+            ));
+        }
+    }
+    let entries = entries.into_values().collect::<Vec<_>>();
+    for entry in &entries {
+        if !remote_workspace_entry_is_allowed(Path::new(entry.path.as_str()), allowed_paths)? {
+            return Err(format!(
+                "networked worker scoped entry is outside its lease allowlist: {}",
+                entry.path
+            ));
+        }
+    }
+    let workspace_manifest_sha256 = serde_json::to_vec(&entries)
+        .map(|bytes| sha256_hex(bytes.as_slice()))
+        .map_err(|error| format!("networked worker workspace manifest failed: {error}"))?;
+    WorkerRemoteWorkspaceTransfer::scoped(workspace_manifest_sha256, entries)
+        .map_err(|error| format!("networked worker workspace transfer failed validation: {error}"))
+}
+
+fn required_remote_workspace_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<PathBuf, String> {
+    let raw = object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("networked worker tool requires non-empty {field}"))?;
+    normalize_remote_workspace_path(raw)
+}
+
+fn optional_remote_workspace_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<PathBuf, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_remote_workspace_path)
+        .transpose()
+        .map(|path| path.unwrap_or_default())
+}
+
+fn normalize_remote_workspace_path(raw: &str) -> Result<PathBuf, String> {
+    let replaced = raw.trim().replace('\\', "/");
+    let normalized = replaced
+        .strip_prefix("/workspace/")
+        .or_else(|| replaced.strip_prefix("workspace/"))
+        .unwrap_or(replaced.as_str())
+        .trim_matches('/');
+    if normalized.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let path = Path::new(normalized);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        })
+    {
+        return Err(format!("networked worker workspace path escapes the scoped root: {raw}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn add_remote_workspace_file(
+    root: &Path,
+    relative: &Path,
+    entries: &mut BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| {
+        format!("networked worker failed to inspect {}: {error}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "networked worker scoped file is not a regular file: {}",
+            relative.display()
+        ));
+    }
+    if remote_workspace_path_may_contain_secrets(relative) {
+        return Err(format!(
+            "networked worker scoped transfer blocks secret-bearing path {}",
+            relative.display()
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|error| {
+        format!("networked worker failed to resolve {}: {error}", path.display())
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "networked worker scoped file escapes the workspace: {}",
+            relative.display()
+        ));
+    }
+    let bytes = fs::read(canonical.as_path())
+        .map_err(|error| format!("networked worker failed to read {}: {error}", path.display()))?;
+    if std::str::from_utf8(bytes.as_slice())
+        .is_ok_and(|text| redact_auth_error_strict(text).as_str() != text)
+    {
+        return Err(format!(
+            "networked worker scoped transfer blocks potential secret content in {}",
+            relative.display()
+        ));
+    }
+    let current_bytes = entries.values().map(|entry| entry.bytes.len()).sum::<usize>();
+    if bytes.len() > NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_BYTES
+        || current_bytes.saturating_add(bytes.len()) > NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_BYTES
+    {
+        return Err("networked worker scoped workspace exceeds its byte budget".to_owned());
+    }
+    let key = remote_workspace_path_string(relative)?;
+    entries.insert(
+        key.clone(),
+        WorkerRemoteWorkspaceEntry {
+            path: key,
+            kind: WorkerRemoteWorkspaceEntryKind::File,
+            sha256: sha256_hex(bytes.as_slice()),
+            bytes,
+        },
+    );
+    enforce_remote_workspace_entry_limit(entries)
+}
+
+fn add_remote_workspace_directory_listing(
+    root: &Path,
+    relative: &Path,
+    entries: &mut BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    let lexical_directory = root.join(relative);
+    let lexical_metadata = fs::symlink_metadata(lexical_directory.as_path()).map_err(|error| {
+        format!("networked worker failed to inspect directory {}: {error}", relative.display())
+    })?;
+    if lexical_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "networked worker directory listing rejects symlink {}",
+            relative.display()
+        ));
+    }
+    let directory = lexical_directory.canonicalize().map_err(|error| {
+        format!("networked worker failed to resolve directory {}: {error}", relative.display())
+    })?;
+    if !directory.starts_with(root) || !directory.is_dir() {
+        return Err(format!(
+            "networked worker directory escapes the workspace: {}",
+            relative.display()
+        ));
+    }
+    if !relative.as_os_str().is_empty() {
+        add_remote_workspace_directory_entry(relative, entries)?;
+    }
+    for child in fs::read_dir(directory.as_path()).map_err(|error| {
+        format!("networked worker failed to list directory {}: {error}", relative.display())
+    })? {
+        let child = child.map_err(|error| {
+            format!("networked worker failed to inspect directory {}: {error}", relative.display())
+        })?;
+        let child_relative = relative.join(child.file_name());
+        let file_type = child.file_type().map_err(|error| {
+            format!("networked worker failed to inspect {}: {error}", child_relative.display())
+        })?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "networked worker directory listing rejects symlink {}",
+                child_relative.display()
+            ));
+        }
+        if file_type.is_dir() {
+            add_remote_workspace_directory_entry(child_relative.as_path(), entries)?;
+        } else if file_type.is_file() {
+            add_remote_workspace_file(root, child_relative.as_path(), entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_remote_workspace_search_tree(
+    root: &Path,
+    relative: &Path,
+    entries: &mut BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| {
+        format!("networked worker failed to inspect search path {}: {error}", relative.display())
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("networked worker search path is a symlink: {}", relative.display()));
+    }
+    if metadata.is_file() {
+        return add_remote_workspace_file(root, relative, entries);
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "networked worker search path is not a file or directory: {}",
+            relative.display()
+        ));
+    }
+    if !relative.as_os_str().is_empty() {
+        add_remote_workspace_directory_entry(relative, entries)?;
+    }
+    for child in fs::read_dir(path.as_path()).map_err(|error| {
+        format!("networked worker failed to read search path {}: {error}", relative.display())
+    })? {
+        let child = child.map_err(|error| {
+            format!(
+                "networked worker failed to inspect search path {}: {error}",
+                relative.display()
+            )
+        })?;
+        if child
+            .file_name()
+            .to_str()
+            .is_some_and(|name| NETWORKED_WORKER_SKIPPED_DIRECTORIES.contains(&name))
+        {
+            continue;
+        }
+        add_remote_workspace_search_tree(
+            root,
+            relative.join(child.file_name()).as_path(),
+            entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn add_remote_workspace_directory_entry(
+    relative: &Path,
+    entries: &mut BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    let key = remote_workspace_path_string(relative)?;
+    entries.insert(
+        key.clone(),
+        WorkerRemoteWorkspaceEntry {
+            path: key,
+            kind: WorkerRemoteWorkspaceEntryKind::Directory,
+            sha256: sha256_hex(&[]),
+            bytes: Vec::new(),
+        },
+    );
+    enforce_remote_workspace_entry_limit(entries)
+}
+
+fn enforce_remote_workspace_entry_limit(
+    entries: &BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    if entries.len() > NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_ENTRIES {
+        Err("networked worker scoped workspace exceeds its entry budget".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn remote_workspace_path_string(path: &Path) -> Result<String, String> {
+    let rendered = path.to_string_lossy().replace('\\', "/");
+    if rendered.is_empty() {
+        Err("networked worker workspace entry path must not be empty".to_owned())
+    } else {
+        Ok(rendered)
+    }
+}
+
+fn remote_workspace_entry_is_allowed(
+    relative: &Path,
+    allowed_paths: &[String],
+) -> Result<bool, String> {
+    if allowed_paths.is_empty() {
+        return Err("networked worker lease workspace allowlist is empty".to_owned());
+    }
+    for raw in allowed_paths {
+        let allowed = normalize_remote_workspace_path(raw)?;
+        if allowed.as_os_str().is_empty()
+            || allowed == Path::new(".")
+            || relative == allowed
+            || relative.starts_with(allowed.as_path())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remote_workspace_path_may_contain_secrets(path: &Path) -> bool {
+    path.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        name.to_str().is_some_and(|name| {
+            let normalized = name.to_ascii_lowercase();
+            normalized == ".env"
+                || normalized.starts_with(".env.")
+                || normalized.contains("credential")
+                || normalized.contains("secret")
+                || normalized.ends_with(".pem")
+                || normalized.ends_with(".key")
+        })
+    })
+}
+
+fn remote_patch_paths(patch: &str) -> Result<Vec<PathBuf>, String> {
+    let mut paths = BTreeMap::<String, PathBuf>::new();
+    for line in patch.lines() {
+        let trimmed = line.trim();
+        let raw = [
+            "*** Add File: ",
+            "*** Replace File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Replace Line: ",
+            "*** Move to: ",
+        ]
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix));
+        let Some(raw) = raw else {
+            continue;
+        };
+        let path = normalize_remote_workspace_path(raw)?;
+        let key = remote_workspace_path_string(path.as_path())?;
+        paths.insert(key, path);
+    }
+    if paths.is_empty() {
+        return Err("networked worker patch contains no supported path headers".to_owned());
+    }
+    Ok(paths.into_values().collect())
+}
+
+fn build_worker_remote_tool_request(
+    request_context: NetworkedWorkerTaskRequest<'_>,
 ) -> Result<WorkerRemoteToolRequestEnvelope, String> {
+    let NetworkedWorkerTaskRequest {
+        proposal_id,
+        tool_name,
+        input_json,
+        lease,
+        worker_attestation,
+        session_id,
+        run_generation,
+        workspace_transfer,
+    } = request_context;
     let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name).ok_or_else(|| {
         format!(
             "backend policy blocked tool={tool_name}; reason_code=backend.policy.tool_unsupported; resolved_backend=networked_worker"
@@ -1126,9 +1658,6 @@ fn build_worker_remote_tool_request(
     let input_json_text = std::str::from_utf8(input_json)
         .map_err(|error| format!("networked worker remote input is not UTF-8 JSON: {error}"))?
         .to_owned();
-    let workspace_manifest_sha256 = serde_json::to_vec(&lease.workspace_scope)
-        .map(|bytes| sha256_hex(bytes.as_slice()))
-        .unwrap_or_else(|_| sha256_hex(lease.workspace_scope.workspace_root.as_bytes()));
     let mut request = WorkerRemoteToolRequestEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -1138,9 +1667,10 @@ fn build_worker_remote_tool_request(
         tool_kind,
         input_json: input_json_text,
         input_json_sha256: sha256_hex(input_json),
-        lease: WorkerRemoteLeaseBinding::from_lease(lease, session_id, run_generation),
+        lease: WorkerRemoteLeaseBinding::from_lease(lease, session_id.to_owned(), run_generation),
         worker_identity: WorkerRemoteIdentity::from(worker_attestation),
-        workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(workspace_manifest_sha256),
+        workspace_transfer,
+        encrypted_secret_artifact: None,
         canonical_protocol: None,
     };
     request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
@@ -1459,15 +1989,7 @@ fn networked_worker_outcome_from_validated_remote_result(
     request: &WorkerRemoteToolRequestEnvelope,
     result: WorkerRemoteToolResultEnvelope,
 ) -> ToolExecutionOutcome {
-    let canonical_task = request
-        .canonical_protocol
-        .as_ref()
-        .map(|protocol| protocol.task.clone())
-        .unwrap_or_else(|| RemoteWorkerProtocolV1::from_remote_request(request).task);
-    let canonical_outcome = RemoteTaskOutcome::from_remote_result(request, &result);
-    if let Err(error) =
-        canonical_outcome.validate_against(&canonical_task, result.completed_at_unix_ms)
-    {
+    if let Err(error) = validate_networked_worker_canonical_outcome(request, &result) {
         return networked_worker_failure_outcome(
             request.proposal_id.as_str(),
             request.tool_name.as_str(),
@@ -1497,6 +2019,19 @@ fn networked_worker_outcome_from_validated_remote_result(
         ),
         manifest,
     )
+}
+
+fn validate_networked_worker_canonical_outcome(
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: &WorkerRemoteToolResultEnvelope,
+) -> Result<(), palyra_workerd::remote_protocol::RemoteWorkerProtocolError> {
+    let canonical_task = request
+        .canonical_protocol
+        .as_ref()
+        .map(|protocol| protocol.task.clone())
+        .unwrap_or_else(|| RemoteWorkerProtocolV1::from_remote_request(request).task);
+    let canonical_outcome = RemoteTaskOutcome::from_remote_result(request, result);
+    canonical_outcome.validate_against(&canonical_task, result.completed_at_unix_ms)
 }
 
 fn networked_worker_cleanup_failure_outcome(
@@ -1529,13 +2064,16 @@ fn build_worker_lease_request(
     proposal_id: &str,
     tool_name: &str,
     input_json: &[u8],
-) -> WorkerLeaseRequest {
+) -> Result<WorkerLeaseRequest, String> {
     let now_unix_ms = current_unix_ms();
     let ttl_ms = runtime_state.config.networked_workers.lease_ttl_ms;
     let grant_id = Ulid::new().to_string();
     let read_only = WorkerRemoteToolKind::from_tool_name(tool_name)
         .is_none_or(remote_tool_kind_uses_read_only_workspace);
-    WorkerLeaseRequest {
+    let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name)
+        .ok_or_else(|| format!("networked worker tool {tool_name} is unsupported"))?;
+    let allowed_paths = networked_worker_allowed_paths(tool_kind, input_json)?;
+    Ok(WorkerLeaseRequest {
         run_id: context.run_id.to_owned(),
         ttl_ms,
         required_capabilities: vec![networked_worker_tool_capability(tool_name)],
@@ -1547,7 +2085,7 @@ fn build_worker_lease_request(
                 .workspace_root
                 .to_string_lossy()
                 .into_owned(),
-            allowed_paths: Vec::new(),
+            allowed_paths,
             read_only,
         },
         artifact_transport: WorkerArtifactTransport {
@@ -1570,7 +2108,52 @@ fn build_worker_lease_request(
             // grant immediately, which fails safe.
             expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms as i64),
         },
-    }
+    })
+}
+
+fn networked_worker_allowed_paths(
+    tool_kind: WorkerRemoteToolKind,
+    input_json: &[u8],
+) -> Result<Vec<String>, String> {
+    let input = serde_json::from_slice::<serde_json::Value>(input_json)
+        .map_err(|error| format!("networked worker tool input is invalid JSON: {error}"))?;
+    let object = input
+        .as_object()
+        .ok_or_else(|| "networked worker tool input must be a JSON object".to_owned())?;
+    let paths = match tool_kind {
+        WorkerRemoteToolKind::FsRead => {
+            vec![required_remote_workspace_path(object, "path")?]
+        }
+        WorkerRemoteToolKind::FsList | WorkerRemoteToolKind::FsSearch => {
+            vec![optional_remote_workspace_path(object, "path")?]
+        }
+        WorkerRemoteToolKind::ApplyPatch => {
+            let patch = object
+                .get("patch")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "networked worker apply_patch requires non-empty patch".to_owned()
+                })?;
+            remote_patch_paths(patch)?
+        }
+        _ => {
+            return Err(format!(
+                "reference network worker does not implement portable scope for {}",
+                tool_kind.tool_name()
+            ));
+        }
+    };
+    paths
+        .iter()
+        .map(|path| {
+            if path.as_os_str().is_empty() {
+                Ok(".".to_owned())
+            } else {
+                remote_workspace_path_string(path.as_path())
+            }
+        })
+        .collect()
 }
 
 fn remote_tool_kind_uses_read_only_workspace(tool_kind: WorkerRemoteToolKind) -> bool {
@@ -1686,8 +2269,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        networked_worker_outcome_from_remote_result, networked_worker_supports_tool,
-        networked_worker_tool_capability, remote_tool_kind_uses_read_only_workspace, sha256_hex,
+        build_scoped_networked_worker_workspace, networked_worker_outcome_from_remote_result,
+        networked_worker_supports_tool, networked_worker_tool_capability,
+        remote_tool_kind_uses_read_only_workspace, sha256_hex,
     };
     use palyra_common::runtime_contracts::RuntimeGeneration;
     use palyra_workerd::{
@@ -1786,6 +2370,8 @@ mod tests {
                 grant_tool_name: tool_name.to_owned(),
                 expires_at_unix_ms: 3_000,
                 required_capabilities: vec![tool_kind.required_capability()],
+                work_graph_claim: None,
+                work_graph_posture: Default::default(),
                 workspace_scope: WorkerWorkspaceScope {
                     workspace_root: "/workspace".to_owned(),
                     allowed_paths: vec!["src".to_owned()],
@@ -1802,6 +2388,7 @@ mod tests {
             workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(sha256_hex(
                 b"workspace-manifest",
             )),
+            encrypted_secret_artifact: None,
             canonical_protocol: None,
         }
     }
@@ -1842,6 +2429,89 @@ mod tests {
         assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ProcessRun));
         assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ApplyPatch));
         assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ToolProgramRun));
+    }
+
+    #[test]
+    fn scoped_workspace_transfer_hashes_exact_bytes_and_blocks_secret_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/lib.rs"), b"pub fn worker() {}\n")
+            .expect("source fixture");
+        std::fs::write(
+            workspace.path().join("src/config.txt"),
+            b"authorization=PALYRA_TEST_SECRET",
+        )
+        .expect("embedded secret fixture");
+        std::fs::create_dir_all(workspace.path().join("listing")).expect("listing directory");
+        std::fs::write(workspace.path().join("listing/item.txt"), b"12345")
+            .expect("listing fixture");
+        std::fs::write(workspace.path().join(".env"), b"PALYRA_TEST_SECRET=blocked")
+            .expect("secret fixture");
+
+        let transfer = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &["src/lib.rs".to_owned()],
+            WorkerRemoteToolKind::FsRead,
+            br#"{"path":"src/lib.rs"}"#,
+        )
+        .expect("scoped transfer");
+        assert_eq!(transfer.scoped_entries.len(), 1);
+        assert_eq!(transfer.scoped_entries[0].path, "src/lib.rs");
+        assert_eq!(transfer.scoped_entries[0].bytes, b"pub fn worker() {}\n");
+        assert_eq!(
+            transfer.scoped_entries[0].sha256,
+            sha256_hex(transfer.scoped_entries[0].bytes.as_slice())
+        );
+        let outside_allowlist = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &["other".to_owned()],
+            WorkerRemoteToolKind::FsRead,
+            br#"{"path":"src/lib.rs"}"#,
+        )
+        .expect_err("lease allowlist must fence every transferred entry");
+        assert!(outside_allowlist.contains("outside its lease allowlist"));
+
+        let listing = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &["listing".to_owned()],
+            WorkerRemoteToolKind::FsList,
+            br#"{"path":"listing"}"#,
+        )
+        .expect("listing transfer");
+        let listed_file = listing
+            .scoped_entries
+            .iter()
+            .find(|entry| entry.path == "listing/item.txt")
+            .expect("listed file entry");
+        assert_eq!(listed_file.bytes, b"12345");
+        assert_eq!(listed_file.sha256, sha256_hex(b"12345"));
+
+        let secret = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &[".env".to_owned()],
+            WorkerRemoteToolKind::FsRead,
+            br#"{"path":".env"}"#,
+        )
+        .expect_err("secret-bearing path must fail closed");
+        assert!(secret.contains("blocks secret-bearing path"));
+
+        let embedded_secret = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &["src/config.txt".to_owned()],
+            WorkerRemoteToolKind::FsRead,
+            br#"{"path":"src/config.txt"}"#,
+        )
+        .expect_err("embedded secret content must fail closed");
+        assert!(embedded_secret.contains("blocks potential secret content"));
+
+        let escape = build_scoped_networked_worker_workspace(
+            workspace.path(),
+            &[".".to_owned()],
+            WorkerRemoteToolKind::FsRead,
+            br#"{"path":"../outside"}"#,
+        )
+        .expect_err("workspace escape must fail closed");
+        assert!(escape.contains("escapes the scoped root"));
     }
 
     #[test]
@@ -1995,5 +2665,30 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.error.contains("identity mismatch"));
         assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_fail_closed");
+    }
+
+    #[test]
+    fn fake_worker_remote_malicious_patch_fails_canonical_validation() {
+        let request = remote_request("palyra.fs.apply_patch");
+        let fake = FakeRemoteWorker::healthy("worker-remote-01");
+        let result = fake.execute(
+            &request,
+            json!({
+                "remote_patch_bundle": {
+                    "patch_sha256": "a".repeat(64),
+                    "touched_paths": ["../outside"],
+                    "review_required": true
+                }
+            }),
+        );
+
+        let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
+
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.attestation.sandbox_enforcement,
+            "networked_worker_canonical_protocol_failed"
+        );
+        assert!(outcome.error.contains("patch path escapes"));
     }
 }

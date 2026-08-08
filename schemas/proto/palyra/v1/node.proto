@@ -227,8 +227,10 @@ message FetchNetworkedWorkerPayloadResponse {
   bytes input_json = 4;
   uint64 max_payload_bytes = 5;
   string request_sha256 = 6;
+  // One-time HMAC keyed by the delivery token received over the authenticated mTLS stream.
+  string authenticated_delivery_hmac_sha256 = 7;
 
-  reserved 7 to 12;
+  reserved 8 to 12;
 }
 
 message AcknowledgeNetworkedWorkerPayloadRequest {

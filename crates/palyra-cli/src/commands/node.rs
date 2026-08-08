@@ -4,6 +4,7 @@
 //! the CLI state root in the `node-host` directory.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -18,8 +19,14 @@ use anyhow::{anyhow, Context, Result};
 use palyra_identity::{
     build_device_pairing_hello, DeviceIdentity, PairingClientKind, PairingSession,
 };
+use palyra_workerd::{
+    network_runtime::ReferenceNetworkWorker,
+    remote_protocol::verify_authenticated_delivery_hmac_sha256, WorkerRemoteToolRequestEnvelope,
+    WORKER_REMOTE_TOOL_PROTOCOL,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,9 +47,16 @@ const NODE_HOST_CONFIG_FILE_NAME: &str = "node-host.json";
 const NODE_HOST_PROCESS_FILE_NAME: &str = "node-host-process.json";
 const NODE_HOST_STDOUT_LOG_FILE_NAME: &str = "node-host.stdout.log";
 const NODE_HOST_STDERR_LOG_FILE_NAME: &str = "node-host.stderr.log";
+const NODE_HOST_WORKER_REPLAY_FILE_NAME: &str = "networked-worker-replay.v1.json";
 const NODE_HOST_CERTIFICATE_SECRET_KEY_SUFFIX: &str = "node-mtls-client.json";
 const DEFAULT_NODE_POLL_INTERVAL_MS: u64 = 1_000;
 const NODE_HOST_START_POLL_MS: u64 = 750;
+const NODE_HOST_MAX_RECONNECT_ATTEMPTS: u32 = 8;
+const NODE_HOST_RECONNECT_STABLE_MS: u64 = 60_000;
+const NODE_WORKER_REPLAY_SCHEMA_VERSION: u32 = 1;
+const NODE_WORKER_REPLAY_MAX_RECORDS: usize = 2_048;
+const NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY: &str =
+    "protocol:palyra.networked_worker.delivery_fence.v2";
 
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -74,6 +88,38 @@ struct StoredNodeClientCertificate {
     certificate_pem: String,
     private_key_pem: String,
     cert_expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeWorkerReplayRegistry {
+    schema_version: u32,
+    records: BTreeMap<String, NodeWorkerReplayRecord>,
+}
+
+impl Default for NodeWorkerReplayRegistry {
+    fn default() -> Self {
+        Self { schema_version: NODE_WORKER_REPLAY_SCHEMA_VERSION, records: BTreeMap::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeWorkerReplayRecord {
+    request_id: String,
+    state: NodeWorkerReplayState,
+    updated_at_unix_ms: u64,
+    #[serde(default)]
+    reconcile_after_unix_ms: u64,
+    result_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NodeWorkerReplayState {
+    InFlight,
+    OutcomeUnknown,
+    Settled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,12 +167,23 @@ struct NodeCapabilityDescriptor {
     requires_local_mediation: bool,
 }
 
-const NODE_CAPABILITY_DESCRIPTORS: [NodeCapabilityDescriptor; 5] = [
+const NODE_CAPABILITY_DESCRIPTORS: [NodeCapabilityDescriptor; 10] = [
     NodeCapabilityDescriptor { name: "echo", requires_local_mediation: false },
     NodeCapabilityDescriptor { name: "system.health", requires_local_mediation: false },
     NodeCapabilityDescriptor { name: "system.identity", requires_local_mediation: false },
     NodeCapabilityDescriptor { name: "desktop.open_url", requires_local_mediation: true },
     NodeCapabilityDescriptor { name: "desktop.open_path", requires_local_mediation: true },
+    NodeCapabilityDescriptor {
+        name: NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY,
+        requires_local_mediation: false,
+    },
+    NodeCapabilityDescriptor { name: "tool:palyra.fs.read_file", requires_local_mediation: false },
+    NodeCapabilityDescriptor { name: "tool:palyra.fs.list_dir", requires_local_mediation: false },
+    NodeCapabilityDescriptor { name: "tool:palyra.fs.search", requires_local_mediation: false },
+    NodeCapabilityDescriptor {
+        name: "tool:palyra.fs.apply_patch",
+        requires_local_mediation: false,
+    },
 ];
 
 /// Runs a `palyra node` subcommand on a dedicated Tokio runtime.
@@ -217,6 +274,50 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
     let device = DeviceIdentity::load(store.as_ref(), config.device_id.as_str())
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to load node device identity {}", config.device_id))?;
+    let mut reconnect_attempt = 0_u32;
+    let mut emit_started_payload = true;
+    loop {
+        let connection_started = std::time::Instant::now();
+        let mut connection_established = false;
+        match run_node_connection(
+            config,
+            &device,
+            emit_started_payload,
+            json_output,
+            &mut connection_established,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                reconnect_attempt = next_reconnect_attempt(
+                    reconnect_attempt,
+                    connection_established,
+                    connection_started.elapsed(),
+                );
+                if reconnect_attempt > NODE_HOST_MAX_RECONNECT_ATTEMPTS {
+                    return Err(error).context(format!(
+                        "node host exhausted {NODE_HOST_MAX_RECONNECT_ATTEMPTS} reconnect attempts"
+                    ));
+                }
+                emit_started_payload = false;
+                let exponent = reconnect_attempt.saturating_sub(1).min(4);
+                let backoff_ms = 250_u64.saturating_mul(1_u64 << exponent);
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+}
+
+async fn run_node_connection(
+    config: &NodeHostConfig,
+    device: &DeviceIdentity,
+    emit_started_payload: bool,
+    json_output: bool,
+    connection_established: &mut bool,
+) -> Result<()> {
+    // Certificate material is reloaded for every connection so an operator
+    // rotation takes effect without restarting the durable node host.
     let client_material = load_node_client_material(config)?;
     let mut client = connect_node_service(
         config.grpc_url.as_str(),
@@ -224,7 +325,6 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
         Some(&client_material.certificate),
     )
     .await?;
-
     let capabilities = supported_capabilities()
         .iter()
         .map(|descriptor| node_v1::DeviceCapability {
@@ -247,24 +347,27 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
     if !response.accepted {
         anyhow::bail!("node registration failed: {}", response.reason);
     }
+    *connection_established = true;
 
-    emit_node_run_payload(
-        &NodeRunPayload {
-            action: "run",
-            device_id: config.device_id.clone(),
-            grpc_url: config.grpc_url.clone(),
-            poll_interval_ms: config.poll_interval_ms,
-            paired: true,
-            capability_count,
-        },
-        json_output,
-    )?;
+    if emit_started_payload {
+        emit_node_run_payload(
+            &NodeRunPayload {
+                action: "run",
+                device_id: config.device_id.clone(),
+                grpc_url: config.grpc_url.clone(),
+                poll_interval_ms: config.poll_interval_ms,
+                paired: true,
+                capability_count,
+            },
+            json_output,
+        )?;
+    }
 
     let (sender, receiver) = mpsc::channel::<node_v1::NodeEventRequest>(16);
     sender
         .send(build_node_event_request(
             config.device_id.as_str(),
-            "node.started",
+            if emit_started_payload { "node.started" } else { "node.reconnected" },
             json!({
                 "device_id": config.device_id,
                 "platform": node_platform_label(),
@@ -276,6 +379,7 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
                     }))
                     .collect::<Vec<_>>(),
                 "started_at_unix_ms": now_unix_ms(),
+                "reconnected": !emit_started_payload,
             }),
         )?)
         .await
@@ -285,6 +389,27 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
         .await
         .context("failed to open node event stream")?
         .into_inner();
+    let heartbeat_sender = sender.clone();
+    let heartbeat_device_id = config.device_id.clone();
+    let heartbeat_interval_ms = config.poll_interval_ms.max(100);
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(heartbeat_interval_ms)).await;
+            let Ok(request) = build_node_event_request(
+                heartbeat_device_id.as_str(),
+                "node.heartbeat",
+                json!({
+                    "device_id": heartbeat_device_id.clone(),
+                    "heartbeat_at_unix_ms": now_unix_ms(),
+                }),
+            ) else {
+                break;
+            };
+            if heartbeat_sender.send(request).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -303,7 +428,13 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
                             .await
                             .context("failed to send capability mediation event to gateway")?;
                     }
-                    let result_payload = execute_dispatched_capability(&dispatch, config, &device)?;
+                    let result_payload =
+                        match execute_dispatched_capability(&mut client, &dispatch, config, device)
+                            .await
+                        {
+                            Ok(payload) => payload,
+                            Err(error) => capability_failure_payload(&dispatch, &error)?,
+                        };
                     sender
                         .send(build_node_event_request(
                             config.device_id.as_str(),
@@ -313,19 +444,6 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
                         .await
                         .context("failed to send capability result to gateway")?;
                 }
-            }
-            _ = sleep(Duration::from_millis(config.poll_interval_ms.max(100))) => {
-                sender
-                    .send(build_node_event_request(
-                        config.device_id.as_str(),
-                        "node.heartbeat",
-                        json!({
-                            "device_id": config.device_id,
-                            "heartbeat_at_unix_ms": now_unix_ms(),
-                        }),
-                    )?)
-                    .await
-                    .context("failed to send node heartbeat")?;
             }
             _ = tokio::signal::ctrl_c() => {
                 let _ = sender
@@ -343,6 +461,54 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
             }
         }
     }
+}
+
+fn next_reconnect_attempt(
+    current_attempt: u32,
+    connection_established: bool,
+    connection_uptime: Duration,
+) -> u32 {
+    if connection_established
+        && connection_uptime >= Duration::from_millis(NODE_HOST_RECONNECT_STABLE_MS)
+    {
+        1
+    } else {
+        current_attempt.saturating_add(1)
+    }
+}
+
+fn capability_failure_payload(
+    dispatch: &node_v1::NodeCapabilityDispatch,
+    _error: &anyhow::Error,
+) -> Result<Value> {
+    let request_id = dispatch
+        .request_id
+        .as_ref()
+        .map(|value| value.ulid.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("capability dispatch is missing request_id"))?;
+    let delivery_attempt_id = dispatch
+        .networked_worker_reservation
+        .as_ref()
+        .and_then(|reservation| reservation.delivery_attempt_id.as_ref())
+        .map(|value| value.ulid.as_str())
+        .filter(|value| !value.trim().is_empty());
+    let run_generation =
+        dispatch.networked_worker_reservation.as_ref().map(|value| value.run_generation);
+    let reason_code = if dispatch.networked_worker_reservation.is_some() {
+        "networked_worker_dispatch_failed"
+    } else {
+        "node_capability_failed"
+    };
+    Ok(json!({
+        "request_id": request_id,
+        "delivery_attempt_id": delivery_attempt_id,
+        "run_generation": run_generation,
+        "success": false,
+        "output_json": Value::Null,
+        "error": "node capability failed closed",
+        "reason_code": reason_code,
+    }))
 }
 
 fn run_node_start(json_output: bool) -> Result<()> {
@@ -799,7 +965,19 @@ async fn connect_node_service(
     Ok(node_v1::node_service_client::NodeServiceClient::new(channel))
 }
 
-fn execute_dispatched_capability(
+async fn execute_dispatched_capability(
+    client: &mut node_v1::node_service_client::NodeServiceClient<Channel>,
+    dispatch: &node_v1::NodeCapabilityDispatch,
+    config: &NodeHostConfig,
+    device: &DeviceIdentity,
+) -> Result<Value> {
+    if dispatch.networked_worker_reservation.is_some() {
+        return execute_networked_worker_capability(client, dispatch, config, device).await;
+    }
+    execute_generic_dispatched_capability(dispatch, config, device)
+}
+
+fn execute_generic_dispatched_capability(
     dispatch: &node_v1::NodeCapabilityDispatch,
     config: &NodeHostConfig,
     device: &DeviceIdentity,
@@ -845,6 +1023,372 @@ fn execute_dispatched_capability(
         "output_json": output_json,
         "error": error,
     }))
+}
+
+async fn execute_networked_worker_capability(
+    client: &mut node_v1::node_service_client::NodeServiceClient<Channel>,
+    dispatch: &node_v1::NodeCapabilityDispatch,
+    config: &NodeHostConfig,
+    device: &DeviceIdentity,
+) -> Result<Value> {
+    let request_id = dispatch
+        .request_id
+        .as_ref()
+        .map(|value| value.ulid.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("networked worker dispatch is missing request_id"))?;
+    let reservation = dispatch
+        .networked_worker_reservation
+        .as_ref()
+        .ok_or_else(|| anyhow!("networked worker dispatch is missing delivery reservation"))?;
+    let reservation_request_id = reservation
+        .request_id
+        .as_ref()
+        .map(|value| value.ulid.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("networked worker reservation is missing request_id"))?;
+    let delivery_attempt_id = reservation
+        .delivery_attempt_id
+        .as_ref()
+        .map(|value| value.ulid.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("networked worker reservation is missing delivery_attempt_id"))?;
+    if request_id != reservation_request_id
+        || reservation.v == 0
+        || reservation.protocol != WORKER_REMOTE_TOOL_PROTOCOL
+        || reservation.worker_id != config.device_id
+        || reservation.fleet_generation == 0
+        || reservation.run_generation == 0
+        || reservation.expires_at_unix_ms <= now_unix_ms()
+        || reservation.fetch_token.trim().is_empty()
+    {
+        anyhow::bail!("networked worker reservation does not match this authenticated node");
+    }
+
+    let response = client
+        .fetch_networked_worker_payload(Request::new(node_v1::FetchNetworkedWorkerPayloadRequest {
+            v: RUN_STREAM_REQUEST_VERSION,
+            device_id: Some(canonical_id(config.device_id.as_str())),
+            request_id: Some(canonical_id(request_id)),
+            delivery_attempt_id: Some(canonical_id(delivery_attempt_id)),
+            fetch_token: reservation.fetch_token.clone(),
+        }))
+        .await
+        .context("failed to fetch reserved networked worker payload")?
+        .into_inner();
+    validate_networked_worker_payload_response(
+        &response,
+        reservation,
+        request_id,
+        delivery_attempt_id,
+        dispatch.max_payload_bytes,
+    )?;
+    let request =
+        serde_json::from_slice::<WorkerRemoteToolRequestEnvelope>(response.input_json.as_slice())
+            .context("failed to decode canonical networked worker request")?;
+    validate_networked_worker_request_binding(&request, dispatch, reservation, config, device)?;
+
+    let idempotency_key = request
+        .canonical_protocol
+        .as_ref()
+        .map(|protocol| protocol.task.idempotency_key.as_str())
+        .ok_or_else(|| anyhow!("networked worker request omitted canonical protocol binding"))?;
+    admit_networked_worker_replay(
+        idempotency_key,
+        request.request_id.as_str(),
+        u64::try_from(request.lease.expires_at_unix_ms).unwrap_or(u64::MAX),
+    )?;
+
+    let acknowledgement = client
+        .acknowledge_networked_worker_payload(Request::new(
+            node_v1::AcknowledgeNetworkedWorkerPayloadRequest {
+                v: RUN_STREAM_REQUEST_VERSION,
+                device_id: Some(canonical_id(config.device_id.as_str())),
+                request_id: Some(canonical_id(request_id)),
+                delivery_attempt_id: Some(canonical_id(delivery_attempt_id)),
+                fetch_token: reservation.fetch_token.clone(),
+            },
+        ))
+        .await
+        .context("failed to acknowledge networked worker payload")?
+        .into_inner();
+    if !acknowledgement.acknowledged {
+        anyhow::bail!(
+            "networked worker payload acknowledgement rejected: {}",
+            acknowledgement.reason
+        );
+    }
+
+    let observed_at_unix_ms = i64::try_from(now_unix_ms()).unwrap_or(i64::MAX);
+    let request_for_worker = request.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        ReferenceNetworkWorker::execute_remote_request(&request_for_worker, observed_at_unix_ms)
+    })
+    .await
+    .context("networked worker execution task failed")?
+    .map_err(anyhow::Error::from);
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            settle_networked_worker_replay(
+                idempotency_key,
+                request.request_id.as_str(),
+                sha256_hex(error.to_string().as_bytes()),
+            )?;
+            return Ok(json!({
+                "request_id": request_id,
+                "delivery_attempt_id": delivery_attempt_id,
+                "run_generation": reservation.run_generation,
+                "success": false,
+                "output_json": Value::Null,
+                "error": "networked worker execution failed",
+                "reason_code": "networked_worker_execution_failed",
+            }));
+        }
+    };
+    let encoded =
+        serde_json::to_vec(&result).context("failed to encode networked worker result envelope")?;
+    if encoded.len() > usize::try_from(dispatch.max_payload_bytes).unwrap_or(usize::MAX) {
+        settle_networked_worker_replay(
+            idempotency_key,
+            request.request_id.as_str(),
+            sha256_hex(encoded.as_slice()),
+        )?;
+        return Ok(json!({
+            "request_id": request_id,
+            "delivery_attempt_id": delivery_attempt_id,
+            "run_generation": reservation.run_generation,
+            "success": false,
+            "output_json": Value::Null,
+            "error": "networked worker result exceeds max_payload_bytes",
+            "reason_code": "networked_worker_result_oversized",
+        }));
+    }
+    settle_networked_worker_replay(
+        idempotency_key,
+        request.request_id.as_str(),
+        sha256_hex(encoded.as_slice()),
+    )?;
+    Ok(json!({
+        "request_id": request_id,
+        "delivery_attempt_id": delivery_attempt_id,
+        "run_generation": reservation.run_generation,
+        "success": true,
+        "output_json": result,
+        "error": "",
+        "reason_code": "networked_worker_completed",
+    }))
+}
+
+fn validate_networked_worker_payload_response(
+    response: &node_v1::FetchNetworkedWorkerPayloadResponse,
+    reservation: &node_v1::NetworkedWorkerDeliveryReservation,
+    request_id: &str,
+    delivery_attempt_id: &str,
+    expected_max_payload_bytes: u64,
+) -> Result<()> {
+    let response_request_id =
+        response.request_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    let response_delivery_attempt_id =
+        response.delivery_attempt_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    let observed_sha256 = sha256_hex(response.input_json.as_slice());
+    if response_request_id != request_id
+        || response_delivery_attempt_id != delivery_attempt_id
+        || response.request_sha256 != reservation.request_sha256
+        || response.request_sha256 != observed_sha256
+        || response.max_payload_bytes != expected_max_payload_bytes
+        || response.input_json.len()
+            > usize::try_from(response.max_payload_bytes).unwrap_or(usize::MAX)
+    {
+        anyhow::bail!("networked worker payload response failed identity or digest validation");
+    }
+    if !verify_authenticated_delivery_hmac_sha256(
+        reservation.fetch_token.as_str(),
+        response.request_sha256.as_str(),
+        response.input_json.as_slice(),
+        response.authenticated_delivery_hmac_sha256.as_str(),
+    ) {
+        anyhow::bail!("networked worker payload authentication failed");
+    }
+    Ok(())
+}
+
+fn validate_networked_worker_request_binding(
+    request: &WorkerRemoteToolRequestEnvelope,
+    dispatch: &node_v1::NodeCapabilityDispatch,
+    reservation: &node_v1::NetworkedWorkerDeliveryReservation,
+    config: &NodeHostConfig,
+    device: &DeviceIdentity,
+) -> Result<()> {
+    let now = i64::try_from(now_unix_ms()).unwrap_or(i64::MAX);
+    request.validate(now).context("networked worker request contract validation failed")?;
+    let expected_capability = request.tool_kind.required_capability();
+    let lease_id =
+        reservation.lease_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    let run_id = reservation.run_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    if request.lease.worker_id != config.device_id
+        || request.worker_identity.worker_id != config.device_id
+        || request.lease.lease_id != lease_id
+        || request.lease.run_id != run_id
+        || request.lease.run_generation.get() != reservation.run_generation
+        || request.lease.expires_at_unix_ms
+            != i64::try_from(reservation.expires_at_unix_ms).unwrap_or(i64::MAX)
+        || expected_capability != dispatch.capability
+        || request.lease.required_capabilities.iter().any(|required| {
+            !supported_capabilities().iter().any(|available| available.name == required.as_str())
+        })
+    {
+        anyhow::bail!(
+            "networked worker request does not match the authenticated delivery reservation"
+        );
+    }
+    let device_authority_sha256 = sha256_hex(&device.signing_public_key());
+    if request.worker_identity.capability_authority_sha256.as_deref()
+        != Some(device_authority_sha256.as_str())
+    {
+        anyhow::bail!(
+            "networked worker attestation is not bound to the authenticated device signing key"
+        );
+    }
+    Ok(())
+}
+
+fn node_host_worker_replay_path() -> Result<PathBuf> {
+    Ok(node_host_state_dir(true)?.join(NODE_HOST_WORKER_REPLAY_FILE_NAME))
+}
+
+fn read_networked_worker_replay_registry_at(path: &Path) -> Result<NodeWorkerReplayRegistry> {
+    if !path.exists() {
+        return Ok(NodeWorkerReplayRegistry::default());
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read worker replay registry {}", path.display()))?;
+    let registry = serde_json::from_slice::<NodeWorkerReplayRegistry>(bytes.as_slice())
+        .with_context(|| format!("failed to parse worker replay registry {}", path.display()))?;
+    if registry.schema_version != NODE_WORKER_REPLAY_SCHEMA_VERSION {
+        anyhow::bail!("worker replay registry schema {} is unsupported", registry.schema_version);
+    }
+    Ok(registry)
+}
+
+fn write_networked_worker_replay_registry_at(
+    path: &Path,
+    registry: &NodeWorkerReplayRegistry,
+) -> Result<()> {
+    let payload = serde_json::to_vec(registry)
+        .context("failed to encode networked worker replay registry")?;
+    write_file_atomically(path, payload.as_slice())
+        .with_context(|| format!("failed to write worker replay registry {}", path.display()))
+}
+
+fn admit_networked_worker_replay(
+    idempotency_key: &str,
+    request_id: &str,
+    reconcile_after_unix_ms: u64,
+) -> Result<()> {
+    let path = node_host_worker_replay_path()?;
+    admit_networked_worker_replay_at(
+        path.as_path(),
+        idempotency_key,
+        request_id,
+        now_unix_ms(),
+        reconcile_after_unix_ms,
+    )
+}
+
+fn admit_networked_worker_replay_at(
+    path: &Path,
+    idempotency_key: &str,
+    request_id: &str,
+    observed_at_unix_ms: u64,
+    reconcile_after_unix_ms: u64,
+) -> Result<()> {
+    let mut registry = read_networked_worker_replay_registry_at(path)?;
+    let mut reconciled = false;
+    for record in registry.records.values_mut() {
+        if record.state == NodeWorkerReplayState::InFlight
+            && record.reconcile_after_unix_ms <= observed_at_unix_ms
+        {
+            record.state = NodeWorkerReplayState::OutcomeUnknown;
+            record.updated_at_unix_ms = observed_at_unix_ms;
+            reconciled = true;
+        }
+    }
+    if reconciled {
+        write_networked_worker_replay_registry_at(path, &registry)?;
+    }
+    if let Some(record) = registry.records.get(idempotency_key) {
+        let state = match record.state {
+            NodeWorkerReplayState::InFlight => "in_flight",
+            NodeWorkerReplayState::OutcomeUnknown => "outcome_unknown",
+            NodeWorkerReplayState::Settled => "settled",
+        };
+        anyhow::bail!(
+            "networked worker duplicate task requires reconciliation: prior_request_id={}, state={state}",
+            record.request_id,
+        );
+    }
+    if registry.records.len() >= NODE_WORKER_REPLAY_MAX_RECORDS {
+        let oldest_settled = registry
+            .records
+            .iter()
+            .filter(|(_, record)| record.state == NodeWorkerReplayState::Settled)
+            .min_by_key(|(_, record)| record.updated_at_unix_ms)
+            .map(|(key, _)| key.clone())
+            .ok_or_else(|| anyhow!("networked worker replay registry has no evictable records"))?;
+        registry.records.remove(oldest_settled.as_str());
+    }
+    registry.records.insert(
+        idempotency_key.to_owned(),
+        NodeWorkerReplayRecord {
+            request_id: request_id.to_owned(),
+            state: NodeWorkerReplayState::InFlight,
+            updated_at_unix_ms: observed_at_unix_ms,
+            reconcile_after_unix_ms,
+            result_sha256: None,
+        },
+    );
+    write_networked_worker_replay_registry_at(path, &registry)
+}
+
+fn settle_networked_worker_replay(
+    idempotency_key: &str,
+    request_id: &str,
+    result_sha256: String,
+) -> Result<()> {
+    let path = node_host_worker_replay_path()?;
+    settle_networked_worker_replay_at(
+        path.as_path(),
+        idempotency_key,
+        request_id,
+        result_sha256,
+        now_unix_ms(),
+    )
+}
+
+fn settle_networked_worker_replay_at(
+    path: &Path,
+    idempotency_key: &str,
+    request_id: &str,
+    result_sha256: String,
+    observed_at_unix_ms: u64,
+) -> Result<()> {
+    let mut registry = read_networked_worker_replay_registry_at(path)?;
+    let record = registry
+        .records
+        .get_mut(idempotency_key)
+        .filter(|record| {
+            record.request_id == request_id && record.state == NodeWorkerReplayState::InFlight
+        })
+        .ok_or_else(|| anyhow!("networked worker replay fence disappeared before settlement"))?;
+    record.state = NodeWorkerReplayState::Settled;
+    record.updated_at_unix_ms = observed_at_unix_ms;
+    record.result_sha256 = Some(result_sha256);
+    write_networked_worker_replay_registry_at(path, &registry)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn execute_local_capability(
@@ -1321,9 +1865,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_capability_lifecycle_payload, capability_requires_local_mediation,
-        open_path_capability, open_url_capability, render_node_lifecycle_text,
-        resolve_pairing_code_input, NodeLifecyclePayload,
+        admit_networked_worker_replay_at, build_capability_lifecycle_payload,
+        capability_requires_local_mediation, next_reconnect_attempt, open_path_capability,
+        open_url_capability, read_networked_worker_replay_registry_at, render_node_lifecycle_text,
+        resolve_pairing_code_input, settle_networked_worker_replay_at, NodeLifecyclePayload,
+        NodeWorkerReplayState, NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY,
+        NODE_HOST_RECONNECT_STABLE_MS,
     };
     use crate::proto::palyra::{common::v1 as common_v1, node::v1 as node_v1};
 
@@ -1382,6 +1929,7 @@ mod tests {
         assert!(capability_requires_local_mediation("desktop.open_path"));
         assert!(!capability_requires_local_mediation("system.health"));
         assert!(!capability_requires_local_mediation("echo"));
+        assert!(!capability_requires_local_mediation(NETWORKED_WORKER_DELIVERY_FENCE_CAPABILITY));
     }
 
     #[test]
@@ -1445,6 +1993,92 @@ mod tests {
         assert!(
             error.to_string().contains("requires an absolute path"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn node_reconnect_budget_resets_after_a_stable_connection() {
+        assert_eq!(
+            next_reconnect_attempt(
+                7,
+                true,
+                std::time::Duration::from_millis(NODE_HOST_RECONNECT_STABLE_MS),
+            ),
+            1
+        );
+        assert_eq!(next_reconnect_attempt(7, false, std::time::Duration::from_secs(120)), 8);
+        assert_eq!(next_reconnect_attempt(7, true, std::time::Duration::from_secs(1)), 8);
+    }
+
+    #[test]
+    fn networked_worker_replay_fence_survives_restart_without_payload_persistence() {
+        let state = tempfile::tempdir().expect("state root");
+        let path = state.path().join("worker-replay.json");
+        let idempotency_key = "a".repeat(64);
+        admit_networked_worker_replay_at(
+            path.as_path(),
+            idempotency_key.as_str(),
+            "request-first",
+            10,
+            100,
+        )
+        .expect("first request should be admitted");
+
+        let duplicate = admit_networked_worker_replay_at(
+            path.as_path(),
+            idempotency_key.as_str(),
+            "request-retry",
+            20,
+            100,
+        )
+        .expect_err("reloaded registry must reject duplicate execution");
+        assert!(duplicate.to_string().contains("requires reconciliation"));
+
+        settle_networked_worker_replay_at(
+            path.as_path(),
+            idempotency_key.as_str(),
+            "request-first",
+            "b".repeat(64),
+            30,
+        )
+        .expect("settlement should persist");
+        let reloaded = read_networked_worker_replay_registry_at(path.as_path())
+            .expect("registry should reload");
+        let record = reloaded.records.get(idempotency_key.as_str()).expect("replay record");
+        assert_eq!(record.state, NodeWorkerReplayState::Settled);
+        assert_eq!(
+            record.result_sha256.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+
+        let persisted = std::fs::read_to_string(path.as_path()).expect("persisted registry");
+        assert!(!persisted.contains("input_json"));
+        assert!(!persisted.contains("output_json"));
+        assert!(!persisted.contains("fetch_token"));
+
+        let unknown_key = "c".repeat(64);
+        admit_networked_worker_replay_at(
+            path.as_path(),
+            unknown_key.as_str(),
+            "request-crashed",
+            40,
+            50,
+        )
+        .expect("crash candidate should be admitted");
+        let unknown = admit_networked_worker_replay_at(
+            path.as_path(),
+            unknown_key.as_str(),
+            "request-after-restart",
+            60,
+            70,
+        )
+        .expect_err("expired in-flight execution must require explicit reconciliation");
+        assert!(unknown.to_string().contains("state=outcome_unknown"));
+        let reconciled = read_networked_worker_replay_registry_at(path.as_path())
+            .expect("reconciled registry should reload");
+        assert_eq!(
+            reconciled.records.get(unknown_key.as_str()).map(|record| record.state),
+            Some(NodeWorkerReplayState::OutcomeUnknown)
         );
     }
 }
