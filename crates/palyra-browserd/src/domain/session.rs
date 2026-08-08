@@ -454,13 +454,14 @@ impl BrowserSessionRecord {
 
 /// Process-wide daemon state shared across gRPC/HTTP handlers.
 ///
-/// The three session maps have independent mutexes; guards must be dropped before awaiting
-/// engine or network operations (see `consume_action_budget_and_snapshot` for the pattern).
+/// The session maps have independent mutexes; guards must be dropped before awaiting engine or
+/// network operations (see `consume_action_budget_and_snapshot` for the pattern).
 pub(crate) struct BrowserRuntimeState {
     pub(crate) started_at: Instant,
     pub(crate) auth_token: Option<String>,
     pub(crate) engine_mode: BrowserEngineMode,
     pub(crate) chromium: ChromiumEngineConfig,
+    pub(crate) resilience_profile: BrowserResilienceProfile,
     pub(crate) default_idle_ttl: Duration,
     pub(crate) default_budget: SessionBudget,
     pub(crate) max_sessions: usize,
@@ -468,6 +469,10 @@ pub(crate) struct BrowserRuntimeState {
     pub(crate) profile_registry_lock: Mutex<()>,
     pub(crate) sessions: Mutex<HashMap<String, BrowserSessionRecord>>,
     pub(crate) chromium_sessions: Mutex<HashMap<String, ChromiumSessionState>>,
+    pub(crate) browser_session_health:
+        Mutex<HashMap<String, Arc<std::sync::Mutex<BrowserSessionHealth>>>>,
+    /// Serializes the rare recovery path without delaying normal healthy operations.
+    pub(crate) chromium_reconnect_lock: Mutex<()>,
     pub(crate) download_sessions: Mutex<HashMap<String, DownloadSandboxSession>>,
 }
 
@@ -475,8 +480,9 @@ impl BrowserRuntimeState {
     /// Builds runtime state from CLI args plus environment overrides.
     ///
     /// # Errors
-    /// Fails when `session_idle_ttl_ms`, `max_sessions`, or `chromium_startup_timeout_ms` is
-    /// zero, or when the persisted state store cannot be initialized.
+    /// Fails when `session_idle_ttl_ms`, `max_sessions`, or `chromium_startup_timeout_ms` is zero,
+    /// when the resilience profile is invalid, or when the persisted state store cannot be
+    /// initialized.
     pub(crate) fn new(args: &Args) -> Result<Self> {
         if args.session_idle_ttl_ms == 0
             || args.max_sessions == 0
@@ -487,6 +493,7 @@ impl BrowserRuntimeState {
             );
         }
         let state_store = build_state_store_from_env()?;
+        let resilience_profile = BrowserResilienceProfile::from_env()?;
         let engine_mode = BrowserEngineMode::from_env_or_default(args.engine_mode);
         let chromium_path = args
             .chromium_path
@@ -516,6 +523,7 @@ impl BrowserRuntimeState {
                 executable_path: chromium_path,
                 startup_timeout: Duration::from_millis(chromium_startup_timeout),
             },
+            resilience_profile,
             default_idle_ttl: Duration::from_millis(args.session_idle_ttl_ms),
             default_budget: SessionBudget {
                 max_navigation_timeout_ms: args.max_navigation_timeout_ms.max(1),
@@ -540,6 +548,8 @@ impl BrowserRuntimeState {
             profile_registry_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             chromium_sessions: Mutex::new(HashMap::new()),
+            browser_session_health: Mutex::new(HashMap::new()),
+            chromium_reconnect_lock: Mutex::new(()),
             download_sessions: Mutex::new(HashMap::new()),
         })
     }

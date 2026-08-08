@@ -23,6 +23,8 @@ pub(crate) struct ChromiumSessionState {
         HashMap<String, Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>>,
     /// Per-tab dialog generations fed by CDP opening/closing events.
     pub(crate) dialog_trackers: HashMap<String, Arc<std::sync::Mutex<ChromiumDialogTracker>>>,
+    /// Health evidence survives target replacement and mirrors the process-independent map.
+    pub(crate) health: Arc<std::sync::Mutex<BrowserSessionHealth>>,
     pub(crate) private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
     /// First remote-IP guard incident, if any; consuming it terminates the session.
     pub(crate) security_incident: Arc<std::sync::Mutex<Option<String>>>,

@@ -66,6 +66,8 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserConsoleEntry;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserDialogEvent;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserElementCapture;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserHealthRequest;
@@ -81,6 +83,8 @@ pub mod palyra_browser_v1 {
     pub struct BrowserRect;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserSessionDetail;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserSessionHealth;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserSessionSummary;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,6 +139,10 @@ pub mod palyra_browser_v1 {
     pub struct GetTitleRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct HandleDialogRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct HandleDialogResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct HighlightRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -270,6 +278,7 @@ pub mod palyra_browser_v1 {
         fn GetPermissions(&self);
         fn GetSession(&self);
         fn GetTitle(&self);
+        fn HandleDialog(&self);
         fn Health(&self);
         fn Highlight(&self);
         fn InspectSession(&self);

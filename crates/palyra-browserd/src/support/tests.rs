@@ -4,22 +4,23 @@
 use super::{
     action_log_entry_to_proto, browser_v1, build_accessibility_tree_snapshot, build_dom_snapshot,
     build_state_store_from_env, chromium_active_tab_for_session,
-    chromium_new_tab_error_is_retryable, default_browserd_state_dir_from_env,
-    derive_state_encryption_key, encrypt_state_blob, enforce_non_loopback_bind_auth,
-    fetch_http_attachment_download_artifact, navigate_with_guards, parse_daemon_bind_socket,
-    persisted_snapshot_hash, persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
-    reset_dns_validation_tracking_for_tests, run_chromium_blocking, sha256_hex,
-    store_dns_nxdomain_cache, store_generated_artifact, update_profile_state_metadata_locked,
-    validate_restored_snapshot_against_profile, validate_target_url, validate_target_url_blocking,
-    Args, BrowserActionLogEntryInternal, BrowserEngineMode, BrowserProfileRecord,
-    BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, ChromiumPrivateTargetPolicy,
-    ChromiumSessionProxy, DnsValidationCache, NetworkLogEntryInternal, NetworkLogHeaderInternal,
+    chromium_new_tab_error_is_retryable, chromium_tab_for_session,
+    default_browserd_state_dir_from_env, derive_state_encryption_key, encrypt_state_blob,
+    enforce_non_loopback_bind_auth, fetch_http_attachment_download_artifact, navigate_with_guards,
+    parse_daemon_bind_socket, persisted_snapshot_hash, persisted_snapshot_legacy_hash,
+    record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
+    run_chromium_blocking, sha256_hex, store_dns_nxdomain_cache, store_generated_artifact,
+    update_profile_state_metadata_locked, validate_restored_snapshot_against_profile,
+    validate_target_url, validate_target_url_blocking, Args, BrowserActionLogEntryInternal,
+    BrowserEngineMode, BrowserProfileRecord, BrowserResilienceProfile, BrowserRuntimeState,
+    BrowserServiceImpl, BrowserTabRecord, ChromiumPrivateTargetPolicy, ChromiumSessionProxy,
+    DnsValidationCache, NetworkLogEntryInternal, NetworkLogHeaderInternal,
     PersistedSessionSnapshot, PersistedStateStore, SessionPermissionsInternal,
-    AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS,
-    CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
-    DEFAULT_MAX_TABS_PER_SESSION, DOWNLOAD_MAX_FILE_BYTES, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG,
-    PRINCIPAL_HEADER, PROFILE_RECORD_SCHEMA_VERSION, STATE_DIR_ENV, STATE_KEY_ENV, STATE_KEY_LEN,
-    STATE_ROOT_ENV,
+    AUTHORIZATION_HEADER, BROWSER_DIALOG_NAVIGATION_CLEANUP_REASON, BROWSER_RESILIENCE_PROFILE_ENV,
+    CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV,
+    DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, DEFAULT_MAX_TABS_PER_SESSION,
+    DOWNLOAD_MAX_FILE_BYTES, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PRINCIPAL_HEADER,
+    PROFILE_RECORD_SCHEMA_VERSION, STATE_DIR_ENV, STATE_KEY_ENV, STATE_KEY_LEN, STATE_ROOT_ENV,
 };
 use crate::proto;
 use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -161,6 +162,22 @@ fn simulated_runtime_for_tests() -> Arc<BrowserRuntimeState> {
     )
 }
 
+#[test]
+fn browser_resilience_profile_is_a_strict_separate_rollout() {
+    let _env_guard = browserd_env_test_guard();
+    let profile_guard = EnvVarGuard::set(BROWSER_RESILIENCE_PROFILE_ENV, "resilient");
+    let enabled =
+        BrowserResilienceProfile::from_env().expect("resilient profile should be accepted");
+    assert!(enabled.automatic_reconnect);
+    assert_eq!(enabled.name(), "resilient");
+
+    drop(profile_guard);
+    let _invalid = EnvVarGuard::set(BROWSER_RESILIENCE_PROFILE_ENV, "shadow-ish");
+    let error = BrowserResilienceProfile::from_env()
+        .expect_err("unknown resilience profile must fail closed");
+    assert!(error.to_string().contains(BROWSER_RESILIENCE_PROFILE_ENV));
+}
+
 async fn create_test_session(
     service: &BrowserServiceImpl,
     principal: &str,
@@ -246,6 +263,8 @@ async fn browser_service_health_reports_engine_capabilities() {
     assert!(!health.javascript_execution_enabled);
     assert!(!health.subresource_loading_enabled);
     assert!(!health.dom_interaction_enabled);
+    assert_eq!(health.resilience_profile, "disabled");
+    assert!(!health.automatic_reconnect_enabled);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2073,28 +2092,31 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
         r#"<html><head><title>Dialog Fixture</title></head><body>
 <div id="result">idle</div>
 </body></html>"#,
-        4,
+        8,
     );
-    let runtime = std::sync::Arc::new(
-        browser_runtime_state_for_tests(&Args {
-            bind: "127.0.0.1".to_owned(),
-            port: 7143,
-            grpc_bind: "127.0.0.1".to_owned(),
-            grpc_port: 7543,
-            auth_token: None,
-            session_idle_ttl_ms: 60_000,
-            max_sessions: 16,
-            max_navigation_timeout_ms: 10_000,
-            max_session_lifetime_ms: 60_000,
-            max_screenshot_bytes: 128 * 1024,
-            max_response_bytes: 128 * 1024,
-            max_title_bytes: 4 * 1024,
-            engine_mode: BrowserEngineMode::Chromium,
-            chromium_path: Some(chromium_path),
-            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
-        })
-        .expect("chromium runtime should initialize"),
-    );
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
+        bind: "127.0.0.1".to_owned(),
+        port: 7143,
+        grpc_bind: "127.0.0.1".to_owned(),
+        grpc_port: 7543,
+        auth_token: None,
+        session_idle_ttl_ms: 60_000,
+        max_sessions: 16,
+        max_navigation_timeout_ms: 10_000,
+        max_session_lifetime_ms: 60_000,
+        max_screenshot_bytes: 128 * 1024,
+        max_response_bytes: 128 * 1024,
+        max_title_bytes: 4 * 1024,
+        engine_mode: BrowserEngineMode::Chromium,
+        chromium_path: Some(chromium_path),
+        chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+    })
+    .expect("chromium runtime should initialize");
+    runtime_state.resilience_profile = BrowserResilienceProfile {
+        dialog_timeout_ms: 3_000,
+        ..BrowserResilienceProfile::resilient_for_tests()
+    };
+    let runtime = std::sync::Arc::new(runtime_state);
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
     let created = create_session_with_retry_for_chromium_test(
         &service,
@@ -2121,7 +2143,7 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
         .navigate(Request::new(browser_v1::NavigateRequest {
             v: 1,
             session_id: Some(session_id.clone()),
-            url,
+            url: url.clone(),
             timeout_ms: 8_000,
             allow_redirects: true,
             max_redirects: 3,
@@ -2251,7 +2273,7 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
     let dismissed = service
         .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
             v: 1,
-            session_id: Some(session_id),
+            session_id: Some(session_id.clone()),
             action: browser_v1::BrowserDialogAction::Dismiss.into(),
             expected_generation: second_event.generation,
             prompt_text: String::new(),
@@ -2262,7 +2284,298 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
     assert!(dismissed.success, "current dialog dismissal should succeed");
     assert!(dismissed.mutated_page);
 
+    let (_, tab) = chromium_active_tab_for_session(runtime.as_ref(), session_id.ulid.as_str())
+        .await
+        .expect("active Chromium tab should still exist");
+    run_chromium_blocking("schedule secret-bearing alert", move || {
+        tab.evaluate("setTimeout(() => alert('authorization: Bearer secret-value'), 0);", false)
+            .map(|_| ())
+            .map_err(|error| format!("failed to schedule alert: {error}"))
+    })
+    .await
+    .expect("alert should be scheduled");
+    let mut alert_event = None;
+    for _ in 0..12 {
+        let response = service
+            .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                action: browser_v1::BrowserDialogAction::Inspect.into(),
+                expected_generation: 0,
+                prompt_text: String::new(),
+            }))
+            .await
+            .expect("alert inspection should execute")
+            .into_inner();
+        if response.present {
+            alert_event = response.event;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let alert_event = alert_event.expect("native alert should become observable");
+    assert_eq!(alert_event.dialog_type, "alert");
+    assert_eq!(alert_event.message, "<redacted>");
+    let alert_dismissed = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Dismiss.into(),
+            expected_generation: alert_event.generation,
+            prompt_text: String::new(),
+        }))
+        .await
+        .expect("alert dismissal should execute")
+        .into_inner();
+    assert!(alert_dismissed.success);
+
+    let (_, tab) = chromium_active_tab_for_session(runtime.as_ref(), session_id.ulid.as_str())
+        .await
+        .expect("active Chromium tab should still exist");
+    run_chromium_blocking("schedule expiring alert", move || {
+        tab.evaluate("setTimeout(() => alert('Timeout safely'), 0);", false)
+            .map(|_| ())
+            .map_err(|error| format!("failed to schedule timeout alert: {error}"))
+    })
+    .await
+    .expect("timeout alert should be scheduled");
+    let mut timeout_event = None;
+    for _ in 0..12 {
+        let response = service
+            .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                action: browser_v1::BrowserDialogAction::Inspect.into(),
+                expected_generation: 0,
+                prompt_text: String::new(),
+            }))
+            .await
+            .expect("timeout alert inspection should execute")
+            .into_inner();
+        if response.present {
+            timeout_event = response.event;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let timeout_event = timeout_event.expect("expiring alert should become observable");
+    tokio::time::sleep(Duration::from_millis(3_300)).await;
+    let timed_out = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Accept.into(),
+            expected_generation: timeout_event.generation,
+            prompt_text: String::new(),
+        }))
+        .await
+        .expect("timed-out dialog response should execute")
+        .into_inner();
+    assert!(!timed_out.success);
+    assert!(timed_out.timed_out);
+    assert_eq!(timed_out.error_code, "dialog_timed_out_safe_dismiss");
+
+    let (_, tab) = chromium_active_tab_for_session(runtime.as_ref(), session_id.ulid.as_str())
+        .await
+        .expect("active Chromium tab should still exist");
+    run_chromium_blocking("schedule navigation cleanup confirmation", move || {
+        tab.evaluate("setTimeout(() => confirm('Clear before navigation?'), 0);", false)
+            .map(|_| ())
+            .map_err(|error| format!("failed to schedule cleanup confirmation: {error}"))
+    })
+    .await
+    .expect("cleanup confirmation should be scheduled");
+    let mut cleanup_event = None;
+    for _ in 0..12 {
+        let response = service
+            .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                action: browser_v1::BrowserDialogAction::Inspect.into(),
+                expected_generation: 0,
+                prompt_text: String::new(),
+            }))
+            .await
+            .expect("cleanup dialog inspection should execute")
+            .into_inner();
+        if response.present {
+            cleanup_event = response.event;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let cleanup_event = cleanup_event.expect("cleanup confirmation should become observable");
+    let renavigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigation cleanup should execute")
+        .into_inner();
+    assert!(renavigate.success, "navigation should clean pending dialog: {}", renavigate.error);
+    let stale_after_navigation = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Accept.into(),
+            expected_generation: cleanup_event.generation,
+            prompt_text: String::new(),
+        }))
+        .await
+        .expect("cleaned dialog generation should remain observable")
+        .into_inner();
+    assert!(!stale_after_navigation.success);
+    assert_eq!(stale_after_navigation.error_code, "stale_dialog_generation");
+
+    let health = runtime
+        .browser_session_health
+        .lock()
+        .await
+        .get(session_id.ulid.as_str())
+        .cloned()
+        .expect("session health should exist");
+    let snapshot = health.lock().expect("session health lock").snapshot();
+    assert_eq!(snapshot.dialog_timeout_count, 1);
+    assert_eq!(snapshot.dialog_navigation_cleanup_count, 1);
+    assert_eq!(snapshot.reason_code, BROWSER_DIALOG_NAVIGATION_CLEANUP_REASON);
+
     drop(handle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_recovers_target_and_process_with_health_evidence() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
+        bind: "127.0.0.1".to_owned(),
+        port: 7143,
+        grpc_bind: "127.0.0.1".to_owned(),
+        grpc_port: 7543,
+        auth_token: None,
+        session_idle_ttl_ms: 60_000,
+        max_sessions: 16,
+        max_navigation_timeout_ms: 10_000,
+        max_session_lifetime_ms: 60_000,
+        max_screenshot_bytes: 128 * 1024,
+        max_response_bytes: 128 * 1024,
+        max_title_bytes: 4 * 1024,
+        engine_mode: BrowserEngineMode::Chromium,
+        chromium_path: Some(chromium_path),
+        chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+    })
+    .expect("chromium runtime should initialize");
+    runtime_state.resilience_profile = BrowserResilienceProfile::resilient_for_tests();
+    let runtime = Arc::new(runtime_state);
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for Chromium mode");
+    let session_id = created.session_id.expect("session id should exist");
+    let tab_id = runtime
+        .sessions
+        .lock()
+        .await
+        .get(session_id.ulid.as_str())
+        .expect("logical session should exist")
+        .active_tab_id
+        .clone();
+
+    let original_tab =
+        chromium_tab_for_session(runtime.as_ref(), session_id.ulid.as_str(), tab_id.as_str())
+            .await
+            .expect("original target should be healthy");
+    let original_target_id = original_tab.get_target_id().to_string();
+    run_chromium_blocking("close target for reconnect test", move || {
+        original_tab
+            .close(false)
+            .map(|_| ())
+            .map_err(|error| format!("failed to close target for reconnect test: {error}"))
+    })
+    .await
+    .expect("target crash simulation should succeed");
+    let recovered_target =
+        chromium_tab_for_session(runtime.as_ref(), session_id.ulid.as_str(), tab_id.as_str())
+            .await
+            .expect("resilient profile should replace a closed target");
+    assert_ne!(recovered_target.get_target_id().to_string(), original_target_id);
+
+    let removed_runtime = runtime.chromium_sessions.lock().await.remove(session_id.ulid.as_str());
+    drop(removed_runtime);
+    let recovered_after_process_loss =
+        chromium_tab_for_session(runtime.as_ref(), session_id.ulid.as_str(), tab_id.as_str())
+            .await
+            .expect("resilient profile should replace a missing process runtime");
+    recovered_after_process_loss
+        .get_target_info()
+        .expect("recovered process should expose a live target");
+
+    let health = service
+        .health(Request::new(browser_v1::BrowserHealthRequest { v: 1 }))
+        .await
+        .expect("health diagnostics should execute")
+        .into_inner();
+    assert_eq!(health.resilience_profile, "resilient");
+    assert!(health.automatic_reconnect_enabled);
+    assert_eq!(health.healthy_sessions, 1);
+    assert_eq!(health.target_reconnect_count, 1);
+    assert_eq!(health.process_reconnect_count, 1);
+
+    let mut inspect = Request::new(browser_v1::InspectSessionRequest {
+        v: 1,
+        session_id: Some(session_id),
+        include_cookies: false,
+        include_storage: false,
+        include_action_log: false,
+        include_network_log: false,
+        include_page_snapshot: false,
+        include_console_log: false,
+        include_page_diagnostics: false,
+        max_cookie_bytes: 0,
+        max_storage_bytes: 0,
+        max_action_log_entries: 0,
+        max_network_log_entries: 0,
+        max_network_log_bytes: 0,
+        max_dom_snapshot_bytes: 0,
+        max_visible_text_bytes: 0,
+        max_console_log_entries: 0,
+        max_console_log_bytes: 0,
+    });
+    insert_principal(&mut inspect, "user:ops");
+    let inspected = service
+        .inspect_session(inspect)
+        .await
+        .expect("session diagnostics should execute")
+        .into_inner();
+    let session_health = inspected.session_health.expect("explicit session health should exist");
+    assert_eq!(session_health.state, "ready");
+    assert_eq!(session_health.target_reconnect_count, 1);
+    assert_eq!(session_health.process_reconnect_count, 1);
+    assert_eq!(session_health.reason_code, "browser.process.reconnected");
 }
 
 #[tokio::test(flavor = "multi_thread")]

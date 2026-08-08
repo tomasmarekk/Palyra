@@ -162,6 +162,12 @@ pub(crate) fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
                 }
             }
             {
+                let mut browser_session_health = runtime.browser_session_health.lock().await;
+                for session_id in &expired_ids {
+                    browser_session_health.remove(session_id.as_str());
+                }
+            }
+            {
                 let mut download_sessions = runtime.download_sessions.lock().await;
                 for session_id in &expired_ids {
                     download_sessions.remove(session_id.as_str());

@@ -86,6 +86,9 @@ public enum PalyraBrowserV1 {
     public struct BrowserConsoleEntry: Equatable {
         public init() {}
     }
+    public struct BrowserDialogEvent: Equatable {
+        public init() {}
+    }
     public struct BrowserElementCapture: Equatable {
         public init() {}
     }
@@ -108,6 +111,9 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct BrowserSessionDetail: Equatable {
+        public init() {}
+    }
+    public struct BrowserSessionHealth: Equatable {
         public init() {}
     }
     public struct BrowserSessionSummary: Equatable {
@@ -189,6 +195,12 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct GetTitleResponse: Equatable {
+        public init() {}
+    }
+    public struct HandleDialogRequest: Equatable {
+        public init() {}
+    }
+    public struct HandleDialogResponse: Equatable {
         public init() {}
     }
     public struct HighlightRequest: Equatable {
@@ -387,6 +399,7 @@ public enum PalyraBrowserV1 {
         func getPermissions()
         func getSession()
         func getTitle()
+        func handleDialog()
         func health()
         func highlight()
         func inspectSession()

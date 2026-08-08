@@ -117,6 +117,15 @@ struct BrowserRuntimeCapabilities {
     javascript_execution: Option<bool>,
     subresource_loading: Option<bool>,
     dom_interaction: Option<bool>,
+    health_status: String,
+    resilience_profile: String,
+    automatic_reconnect: Option<bool>,
+    degraded_sessions: u32,
+    reconnecting_sessions: u32,
+    blocked_sessions: u32,
+    process_reconnect_count: u64,
+    target_reconnect_count: u64,
+    dialog_timeout_count: u64,
     warning: Option<&'static str>,
 }
 
@@ -132,6 +141,15 @@ impl BrowserRuntimeCapabilities {
                 javascript_execution: Some(response.javascript_execution_enabled),
                 subresource_loading: Some(response.subresource_loading_enabled),
                 dom_interaction: Some(response.dom_interaction_enabled),
+                health_status: response.status.clone(),
+                resilience_profile: response.resilience_profile.clone(),
+                automatic_reconnect: Some(response.automatic_reconnect_enabled),
+                degraded_sessions: response.degraded_sessions,
+                reconnecting_sessions: response.reconnecting_sessions,
+                blocked_sessions: response.blocked_sessions,
+                process_reconnect_count: response.process_reconnect_count,
+                target_reconnect_count: response.target_reconnect_count,
+                dialog_timeout_count: response.dialog_timeout_count,
                 warning: None,
             },
             "simulated" => Self {
@@ -140,6 +158,15 @@ impl BrowserRuntimeCapabilities {
                 javascript_execution: Some(response.javascript_execution_enabled),
                 subresource_loading: Some(response.subresource_loading_enabled),
                 dom_interaction: Some(response.dom_interaction_enabled),
+                health_status: response.status.clone(),
+                resilience_profile: response.resilience_profile.clone(),
+                automatic_reconnect: Some(response.automatic_reconnect_enabled),
+                degraded_sessions: response.degraded_sessions,
+                reconnecting_sessions: response.reconnecting_sessions,
+                blocked_sessions: response.blocked_sessions,
+                process_reconnect_count: response.process_reconnect_count,
+                target_reconnect_count: response.target_reconnect_count,
+                dialog_timeout_count: response.dialog_timeout_count,
                 warning: Some(BROWSER_STATIC_HTML_RUNTIME_WARNING),
             },
             _ => Self::unknown("browserd.health", Some(BROWSER_UNKNOWN_RUNTIME_WARNING)),
@@ -157,6 +184,15 @@ impl BrowserRuntimeCapabilities {
             javascript_execution: None,
             subresource_loading: None,
             dom_interaction: None,
+            health_status: "unknown".to_owned(),
+            resilience_profile: "unknown".to_owned(),
+            automatic_reconnect: None,
+            degraded_sessions: 0,
+            reconnecting_sessions: 0,
+            blocked_sessions: 0,
+            process_reconnect_count: 0,
+            target_reconnect_count: 0,
+            dialog_timeout_count: 0,
             warning,
         }
     }
@@ -168,6 +204,15 @@ impl BrowserRuntimeCapabilities {
             "javascript_execution": self.javascript_execution,
             "subresource_loading": self.subresource_loading,
             "dom_interaction": self.dom_interaction,
+            "health_status": self.health_status,
+            "resilience_profile": self.resilience_profile,
+            "automatic_reconnect": self.automatic_reconnect,
+            "degraded_sessions": self.degraded_sessions,
+            "reconnecting_sessions": self.reconnecting_sessions,
+            "blocked_sessions": self.blocked_sessions,
+            "process_reconnect_count": self.process_reconnect_count,
+            "target_reconnect_count": self.target_reconnect_count,
+            "dialog_timeout_count": self.dialog_timeout_count,
             "warning": self.warning,
         })
     }
@@ -6251,12 +6296,24 @@ mod tests {
                 javascript_execution_enabled: false,
                 subresource_loading_enabled: false,
                 dom_interaction_enabled: false,
+                resilience_profile: "disabled".to_owned(),
+                automatic_reconnect_enabled: false,
+                healthy_sessions: 1,
+                degraded_sessions: 0,
+                reconnecting_sessions: 0,
+                blocked_sessions: 0,
+                process_reconnect_count: 0,
+                target_reconnect_count: 0,
+                dialog_timeout_count: 0,
             });
 
         assert_eq!(capabilities.engine_mode, "simulated");
         assert_eq!(capabilities.javascript_execution, Some(false));
         assert_eq!(capabilities.subresource_loading, Some(false));
         assert_eq!(capabilities.dom_interaction, Some(false));
+        assert_eq!(capabilities.health_status, "ok");
+        assert_eq!(capabilities.resilience_profile, "disabled");
+        assert_eq!(capabilities.automatic_reconnect, Some(false));
         assert!(capabilities.warning.is_some_and(|warning| warning.contains("static_html_only")));
     }
 
@@ -6291,6 +6348,15 @@ mod tests {
                 javascript_execution_enabled: false,
                 subresource_loading_enabled: false,
                 dom_interaction_enabled: false,
+                resilience_profile: "disabled".to_owned(),
+                automatic_reconnect_enabled: false,
+                healthy_sessions: 1,
+                degraded_sessions: 0,
+                reconnecting_sessions: 0,
+                blocked_sessions: 0,
+                process_reconnect_count: 0,
+                target_reconnect_count: 0,
+                dialog_timeout_count: 0,
             });
         let output = browser_output_with_runtime_capabilities(
             br#"{"success":true,"title":"S020 Vite Env Demo","status_code":200}"#.to_vec(),
@@ -6302,6 +6368,9 @@ mod tests {
         assert_eq!(output["browser_runtime"]["engine_mode"], "simulated");
         assert_eq!(output["browser_runtime"]["javascript_execution"], false);
         assert_eq!(output["browser_runtime"]["subresource_loading"], false);
+        assert_eq!(output["browser_runtime"]["health_status"], "ok");
+        assert_eq!(output["browser_runtime"]["resilience_profile"], "disabled");
+        assert_eq!(output["browser_runtime"]["automatic_reconnect"], false);
         assert!(output["browser_validation_warning"]
             .as_str()
             .is_some_and(|warning| warning.contains("static_html_only")));

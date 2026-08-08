@@ -336,6 +336,107 @@ struct ObserveInclusions {
     include_visible_text: bool,
 }
 
+#[derive(Debug, Default)]
+struct BrowserHealthRollup {
+    healthy_sessions: u32,
+    degraded_sessions: u32,
+    reconnecting_sessions: u32,
+    blocked_sessions: u32,
+    process_reconnect_count: u64,
+    target_reconnect_count: u64,
+    dialog_timeout_count: u64,
+}
+
+async fn browser_health_rollup(runtime: &BrowserRuntimeState) -> BrowserHealthRollup {
+    if runtime.engine_mode != BrowserEngineMode::Chromium {
+        return BrowserHealthRollup {
+            healthy_sessions: u32::try_from(runtime.sessions.lock().await.len())
+                .unwrap_or(u32::MAX),
+            ..BrowserHealthRollup::default()
+        };
+    }
+    let trackers =
+        runtime.browser_session_health.lock().await.values().cloned().collect::<Vec<_>>();
+    let mut rollup = BrowserHealthRollup::default();
+    for tracker in trackers {
+        let Ok(tracker) = tracker.lock() else {
+            rollup.degraded_sessions = rollup.degraded_sessions.saturating_add(1);
+            continue;
+        };
+        let snapshot = tracker.snapshot();
+        match snapshot.state {
+            BrowserSessionHealthState::Ready => {
+                rollup.healthy_sessions = rollup.healthy_sessions.saturating_add(1);
+            }
+            BrowserSessionHealthState::Degraded => {
+                rollup.degraded_sessions = rollup.degraded_sessions.saturating_add(1);
+            }
+            BrowserSessionHealthState::Reconnecting => {
+                rollup.reconnecting_sessions = rollup.reconnecting_sessions.saturating_add(1);
+            }
+            BrowserSessionHealthState::Blocked => {
+                rollup.blocked_sessions = rollup.blocked_sessions.saturating_add(1);
+            }
+        }
+        rollup.process_reconnect_count =
+            rollup.process_reconnect_count.saturating_add(snapshot.process_reconnect_count);
+        rollup.target_reconnect_count =
+            rollup.target_reconnect_count.saturating_add(snapshot.target_reconnect_count);
+        rollup.dialog_timeout_count =
+            rollup.dialog_timeout_count.saturating_add(snapshot.dialog_timeout_count);
+    }
+    rollup
+}
+
+async fn browser_session_health_to_proto(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> browser_v1::BrowserSessionHealth {
+    let snapshot = if runtime.engine_mode == BrowserEngineMode::Chromium {
+        let tracker = runtime.browser_session_health.lock().await.get(session_id).cloned();
+        tracker
+            .and_then(|tracker| tracker.lock().ok().map(|tracker| tracker.snapshot()))
+            .unwrap_or_else(|| BrowserSessionHealth::default().snapshot())
+    } else {
+        let mut health = BrowserSessionHealth::default();
+        health.mark_initial_ready();
+        health.snapshot()
+    };
+    let pending_dialog_count = if runtime.engine_mode == BrowserEngineMode::Chromium {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        chromium_sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .dialog_trackers
+                    .values()
+                    .filter(|tracker| {
+                        tracker.lock().is_ok_and(|tracker| tracker.pending().is_some())
+                    })
+                    .count()
+            })
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    browser_v1::BrowserSessionHealth {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        state: snapshot.state.as_str().to_owned(),
+        resilience_profile: runtime.resilience_profile.name().to_owned(),
+        automatic_reconnect_enabled: runtime.resilience_profile.automatic_reconnect,
+        runtime_generation: snapshot.runtime_generation,
+        process_reconnect_count: snapshot.process_reconnect_count,
+        target_reconnect_count: snapshot.target_reconnect_count,
+        dialog_timeout_count: snapshot.dialog_timeout_count,
+        dialog_navigation_cleanup_count: snapshot.dialog_navigation_cleanup_count,
+        dialog_close_cleanup_count: snapshot.dialog_close_cleanup_count,
+        pending_dialog_count,
+        reason_code: snapshot.reason_code,
+        updated_at_unix_ms: snapshot.updated_at_unix_ms,
+    }
+}
+
 /// Resolves the include flags: all-false (the proto3 default) means the
 /// caller selected nothing, so everything is included; any explicit selection
 /// is honored as-is.
@@ -366,15 +467,33 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
     ) -> Result<Response<browser_v1::BrowserHealthResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
         let active_sessions = self.runtime.sessions.lock().await.len();
+        let rollup = browser_health_rollup(self.runtime.as_ref()).await;
+        let status = if rollup.degraded_sessions > 0
+            || rollup.reconnecting_sessions > 0
+            || rollup.blocked_sessions > 0
+        {
+            "degraded"
+        } else {
+            "ok"
+        };
         Ok(Response::new(browser_v1::BrowserHealthResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
-            status: "ok".to_owned(),
+            status: status.to_owned(),
             uptime_seconds: self.runtime.started_at.elapsed().as_secs(),
             active_sessions: u32::try_from(active_sessions).unwrap_or(u32::MAX),
             engine_mode: self.runtime.engine_mode.as_str().to_owned(),
             javascript_execution_enabled: self.runtime.engine_mode.executes_javascript(),
             subresource_loading_enabled: self.runtime.engine_mode.loads_subresources(),
             dom_interaction_enabled: self.runtime.engine_mode.supports_live_dom_interaction(),
+            resilience_profile: self.runtime.resilience_profile.name().to_owned(),
+            automatic_reconnect_enabled: self.runtime.resilience_profile.automatic_reconnect,
+            healthy_sessions: rollup.healthy_sessions,
+            degraded_sessions: rollup.degraded_sessions,
+            reconnecting_sessions: rollup.reconnecting_sessions,
+            blocked_sessions: rollup.blocked_sessions,
+            process_reconnect_count: rollup.process_reconnect_count,
+            target_reconnect_count: rollup.target_reconnect_count,
+            dialog_timeout_count: rollup.dialog_timeout_count,
         }))
     }
 
@@ -626,6 +745,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .await
             {
                 self.runtime.sessions.lock().await.remove(session_id.as_str());
+                self.runtime.browser_session_health.lock().await.remove(session_id.as_str());
                 self.runtime.download_sessions.lock().await.remove(session_id.as_str());
                 return Err(Status::internal(format!(
                     "failed to initialize chromium session runtime: {error}"
@@ -659,6 +779,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .map_err(Status::invalid_argument)?;
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
         self.runtime.chromium_sessions.lock().await.remove(session_id.as_str());
+        self.runtime.browser_session_health.lock().await.remove(session_id.as_str());
         self.runtime.download_sessions.lock().await.remove(session_id.as_str());
         if let Some(record) = removed.as_ref() {
             if record.persistence.enabled {
@@ -814,6 +935,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         console_log: Vec::new(),
                         console_log_truncated: false,
                         page_diagnostics: None,
+                        session_health: None,
                         error: "session_not_found".to_owned(),
                     }));
                 };
@@ -853,6 +975,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     console_log: Vec::new(),
                     console_log_truncated: false,
                     page_diagnostics: None,
+                    session_health: None,
                     error: "session_not_found".to_owned(),
                 }));
             };
@@ -883,6 +1006,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 console_log: Vec::new(),
                 console_log_truncated: false,
                 page_diagnostics: None,
+                session_health: Some(
+                    browser_session_health_to_proto(self.runtime.as_ref(), session_id.as_str())
+                        .await,
+                ),
                 error: "active_tab_not_found".to_owned(),
             }));
         };
@@ -1030,6 +1157,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         } else {
             None
         };
+        let session_health =
+            browser_session_health_to_proto(self.runtime.as_ref(), session_id.as_str()).await;
 
         Ok(Response::new(browser_v1::InspectSessionResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -1051,6 +1180,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             console_log,
             console_log_truncated,
             page_diagnostics,
+            session_health: Some(session_health),
             error: String::new(),
         }))
     }

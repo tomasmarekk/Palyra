@@ -59,8 +59,18 @@ message BrowserHealthResponse {
   bool javascript_execution_enabled = 14;
   bool subresource_loading_enabled = 15;
   bool dom_interaction_enabled = 16;
+  string resilience_profile = 17;
+  bool automatic_reconnect_enabled = 18;
+  uint32 healthy_sessions = 19;
+  uint32 degraded_sessions = 20;
+  uint32 reconnecting_sessions = 21;
+  uint32 blocked_sessions = 22;
+  uint64 process_reconnect_count = 23;
+  uint64 target_reconnect_count = 24;
+  uint64 dialog_timeout_count = 25;
 
   reserved 5 to 12;
+  reserved 26 to 32;
 }
 
 message SessionBudget {
@@ -277,8 +287,28 @@ message InspectSessionResponse {
   repeated BrowserConsoleEntry console_log = 25;
   bool console_log_truncated = 26;
   BrowserPageDiagnostics page_diagnostics = 27;
+  BrowserSessionHealth session_health = 28;
 
   reserved 18 to 24;
+  reserved 29 to 32;
+}
+
+message BrowserSessionHealth {
+  uint32 v = 1;
+  string state = 2;
+  string resilience_profile = 3;
+  bool automatic_reconnect_enabled = 4;
+  uint64 runtime_generation = 5;
+  uint64 process_reconnect_count = 6;
+  uint64 target_reconnect_count = 7;
+  uint64 dialog_timeout_count = 8;
+  uint64 dialog_navigation_cleanup_count = 9;
+  uint64 dialog_close_cleanup_count = 10;
+  uint32 pending_dialog_count = 11;
+  string reason_code = 12;
+  uint64 updated_at_unix_ms = 13;
+
+  reserved 14 to 20;
 }
 
 message NavigateRequest {

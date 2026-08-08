@@ -169,6 +169,8 @@ struct ChromiumTabRuntimeHooks {
     tab_id: String,
     network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
     dialog_tracker: Arc<std::sync::Mutex<ChromiumDialogTracker>>,
+    health: Arc<std::sync::Mutex<BrowserSessionHealth>>,
+    resilience_profile: BrowserResilienceProfile,
 }
 
 type ChromiumLocalStorageSnapshot = Option<(String, HashMap<String, String>)>;
@@ -1898,6 +1900,7 @@ fn install_chromium_dialog_listener(
     tab: &Arc<HeadlessTab>,
     tab_id: String,
     tracker: Arc<std::sync::Mutex<ChromiumDialogTracker>>,
+    health: Arc<std::sync::Mutex<BrowserSessionHealth>>,
     profile: BrowserResilienceProfile,
 ) -> Result<(), String> {
     let weak_tab = Arc::downgrade(tab);
@@ -1929,20 +1932,30 @@ fn install_chromium_dialog_listener(
                 return;
             };
             let timeout_tracker = Arc::clone(&tracker);
+            let timeout_health = Arc::clone(&health);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(profile.dialog_timeout_ms));
-                let should_dismiss = timeout_tracker
+                let pending_event = timeout_tracker
                     .lock()
-                    .is_ok_and(|guard| guard.is_pending_generation(generation));
-                if !should_dismiss {
+                    .ok()
+                    .and_then(|guard| guard.pending())
+                    .filter(|event| event.generation == generation);
+                let Some(pending_event) = pending_event else {
                     return;
-                }
-                if tab.get_dialog().dismiss().is_ok() {
+                };
+                let dismissed = tab.get_dialog().dismiss().is_ok();
+                if dismissed {
                     if let Ok(mut guard) = timeout_tracker.lock() {
-                        let _ = guard.clear_generation(generation);
+                        guard.remember_resolution(
+                            pending_event,
+                            BrowserDialogResolutionKind::TimedOut,
+                        );
                     }
                 } else {
                     warn!(generation, "failed to apply safe default to expired Chromium dialog");
+                }
+                if let Ok(mut health) = timeout_health.lock() {
+                    health.record_dialog_timeout(dismissed);
                 }
             });
         }
@@ -2037,7 +2050,8 @@ fn configure_chromium_tab(
         tab,
         hooks.tab_id,
         hooks.dialog_tracker,
-        BrowserResilienceProfile::default(),
+        hooks.health,
+        hooks.resilience_profile,
     )?;
     Ok(())
 }
@@ -2151,18 +2165,14 @@ fn create_configured_chromium_tab_with_retry(
     ))
 }
 
-/// Launches the per-session Chromium process and restores persisted tabs.
-///
-/// # Errors
-/// Returns an error string when the proxy spawn, profile-dir allocation,
-/// browser launch, or tab creation fails; per-tab live-state restore failures
-/// are logged and skipped.
-pub(crate) async fn initialize_chromium_session_runtime(
+async fn launch_chromium_session_runtime(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     session: &BrowserSessionRecord,
+    health: Arc<std::sync::Mutex<BrowserSessionHealth>>,
 ) -> Result<(), String> {
     let chromium = runtime.chromium.clone();
+    let resilience_profile = runtime.resilience_profile;
     let allow_private_targets = session.allow_private_targets;
     let navigation_timeout = Duration::from_millis(session.budget.max_navigation_timeout_ms.max(1));
     let active_tab_id = session.active_tab_id.clone();
@@ -2206,6 +2216,8 @@ pub(crate) async fn initialize_chromium_session_runtime(
                         tab_id: tab_id.clone(),
                         network_log: Arc::clone(&network_log),
                         dialog_tracker: Arc::clone(&dialog_tracker),
+                        health: Arc::clone(&health),
+                        resilience_profile,
                     },
                     Arc::clone(&private_target_policy),
                     navigation_timeout,
@@ -2236,6 +2248,7 @@ pub(crate) async fn initialize_chromium_session_runtime(
                 tabs,
                 network_logs,
                 dialog_trackers,
+                health,
                 private_target_policy,
                 security_incident,
                 _profile_dir: profile_dir,
@@ -2252,6 +2265,34 @@ pub(crate) async fn initialize_chromium_session_runtime(
     chromium_session._proxy = Some(proxy);
     runtime.chromium_sessions.lock().await.insert(session_id.to_owned(), chromium_session);
     Ok(())
+}
+
+/// Launches the per-session Chromium process and restores persisted tabs.
+///
+/// # Errors
+/// Returns an error string when the proxy spawn, profile-dir allocation, browser launch, or tab
+/// creation fails; per-tab live-state restore failures are logged and skipped.
+pub(crate) async fn initialize_chromium_session_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    session: &BrowserSessionRecord,
+) -> Result<(), String> {
+    let health = Arc::new(std::sync::Mutex::new(BrowserSessionHealth::default()));
+    runtime.browser_session_health.lock().await.insert(session_id.to_owned(), Arc::clone(&health));
+    match launch_chromium_session_runtime(runtime, session_id, session, Arc::clone(&health)).await {
+        Ok(()) => {
+            if let Ok(mut health) = health.lock() {
+                health.mark_initial_ready();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Ok(mut health) = health.lock() {
+                health.mark_reconnect_failed();
+            }
+            Err(error)
+        }
+    }
 }
 
 fn restore_chromium_tab_live_state(
@@ -2334,7 +2375,7 @@ pub(crate) async fn chromium_open_tab_runtime(
         };
         session.budget.max_navigation_timeout_ms.max(1)
     };
-    let (browser, private_target_policy, security_incident) = {
+    let (browser, private_target_policy, security_incident, health) = {
         let chromium_sessions = runtime.chromium_sessions.lock().await;
         let Some(chromium_session) = chromium_sessions.get(session_id) else {
             return Err("chromium_session_not_found".to_owned());
@@ -2343,9 +2384,11 @@ pub(crate) async fn chromium_open_tab_runtime(
             Arc::clone(&chromium_session.browser),
             Arc::clone(&chromium_session.private_target_policy),
             Arc::clone(&chromium_session.security_incident),
+            Arc::clone(&chromium_session.health),
         )
     };
     let owned_tab_id = tab_id.to_owned();
+    let resilience_profile = runtime.resilience_profile;
     let (tab, network_log, dialog_tracker) =
         run_chromium_blocking("chromium open tab", move || {
             let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
@@ -2356,6 +2399,8 @@ pub(crate) async fn chromium_open_tab_runtime(
                     tab_id: owned_tab_id,
                     network_log: Arc::clone(&network_log),
                     dialog_tracker: Arc::clone(&dialog_tracker),
+                    health,
+                    resilience_profile,
                 },
                 private_target_policy,
                 Duration::from_millis(timeout_ms),
@@ -2386,7 +2431,7 @@ pub(crate) async fn chromium_sync_session_tabs(
     session_id: &str,
 ) -> Result<u32, String> {
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
-    let (browser, private_target_policy, security_incident, timeout, existing_target_ids) = {
+    let (browser, private_target_policy, security_incident, health, timeout, existing_target_ids) = {
         let sessions = runtime.sessions.lock().await;
         let Some(session) = sessions.get(session_id) else {
             return Err("session_not_found".to_owned());
@@ -2405,10 +2450,12 @@ pub(crate) async fn chromium_sync_session_tabs(
             Arc::clone(&chromium_session.browser),
             Arc::clone(&chromium_session.private_target_policy),
             Arc::clone(&chromium_session.security_incident),
+            Arc::clone(&chromium_session.health),
             timeout,
             existing_target_ids,
         )
     };
+    let resilience_profile = runtime.resilience_profile;
     let discovered = run_chromium_blocking("chromium sync session tabs", move || {
         browser.register_missing_tabs();
         let live_tabs = browser
@@ -2449,6 +2496,8 @@ pub(crate) async fn chromium_sync_session_tabs(
                     tab_id: target_id,
                     network_log: Arc::clone(&network_log),
                     dialog_tracker: Arc::clone(&dialog_tracker),
+                    health: Arc::clone(&health),
+                    resilience_profile,
                 },
                 Arc::clone(&private_target_policy),
                 timeout,
@@ -2516,7 +2565,39 @@ pub(crate) async fn chromium_close_tab_runtime(
     session_id: &str,
     tab_id: &str,
 ) -> Result<(), String> {
-    let tab = {
+    let (tab, tracker, health) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        (
+            chromium_session.tabs.get(tab_id).cloned(),
+            chromium_session.dialog_trackers.get(tab_id).cloned(),
+            Arc::clone(&chromium_session.health),
+        )
+    };
+    if let (Some(tab), Some(tracker)) = (tab.as_ref(), tracker) {
+        let pending = tracker
+            .lock()
+            .map_err(|_| "failed to inspect Chromium dialog state before page close".to_owned())?
+            .pending();
+        if let Some(event) = pending {
+            let close_tab = Arc::clone(tab);
+            let _ = run_chromium_blocking("chromium dialog page-close cleanup", move || {
+                close_tab.get_dialog().dismiss().map_err(|error| {
+                    format!("failed to dismiss Chromium dialog before page close: {error}")
+                })
+            })
+            .await;
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.remember_resolution(event, BrowserDialogResolutionKind::PageCloseCleanup);
+            }
+            if let Ok(mut health) = health.lock() {
+                health.record_dialog_close_cleanup();
+            }
+        }
+    }
+    let detached_tab = {
         let mut chromium_sessions = runtime.chromium_sessions.lock().await;
         let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
             return Err("chromium_session_not_found".to_owned());
@@ -2525,7 +2606,7 @@ pub(crate) async fn chromium_close_tab_runtime(
         chromium_session.dialog_trackers.remove(tab_id);
         chromium_session.tabs.remove(tab_id)
     };
-    if let Some(tab) = tab {
+    if let Some(tab) = detached_tab {
         let _ = run_chromium_blocking("chromium close tab", move || {
             tab.close(true).map_err(|error| format!("failed to close Chromium tab: {error}"))?;
             Ok(())
@@ -2566,6 +2647,7 @@ pub(crate) async fn enforce_chromium_remote_ip_guard(
 
     runtime.sessions.lock().await.remove(session_id);
     runtime.chromium_sessions.lock().await.remove(session_id);
+    runtime.browser_session_health.lock().await.remove(session_id);
     runtime.download_sessions.lock().await.remove(session_id);
     warn!(
         session_id = session_id,
@@ -2575,20 +2657,245 @@ pub(crate) async fn enforce_chromium_remote_ip_guard(
     Err(format!("chromium remote IP guard blocked request: {reason}"))
 }
 
+enum ChromiumRuntimeProbe {
+    Healthy(Arc<HeadlessTab>),
+    ProcessUnavailable(String),
+    TargetUnavailable(String),
+}
+
+async fn chromium_session_health_tracker(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Arc<std::sync::Mutex<BrowserSessionHealth>> {
+    let mut health = runtime.browser_session_health.lock().await;
+    Arc::clone(
+        health
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(BrowserSessionHealth::default()))),
+    )
+}
+
+async fn probe_chromium_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> ChromiumRuntimeProbe {
+    let (browser, tab) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return ChromiumRuntimeProbe::ProcessUnavailable(
+                "chromium_session_not_found".to_owned(),
+            );
+        };
+        let Some(tab) = chromium_session.tabs.get(tab_id) else {
+            return ChromiumRuntimeProbe::TargetUnavailable("chromium_tab_not_found".to_owned());
+        };
+        (Arc::clone(&chromium_session.browser), Arc::clone(tab))
+    };
+    let probe_tab = Arc::clone(&tab);
+    match run_chromium_blocking("chromium runtime health probe", move || {
+        if let Err(error) = browser.get_version() {
+            return Ok(ChromiumRuntimeProbe::ProcessUnavailable(sanitize_debug_text(
+                error.to_string().as_str(),
+                512,
+            )));
+        }
+        if let Err(error) = probe_tab.get_target_info() {
+            return Ok(ChromiumRuntimeProbe::TargetUnavailable(sanitize_debug_text(
+                error.to_string().as_str(),
+                512,
+            )));
+        }
+        Ok(ChromiumRuntimeProbe::Healthy(probe_tab))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => ChromiumRuntimeProbe::ProcessUnavailable(error),
+    }
+}
+
+async fn reconnect_chromium_tab_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<Arc<HeadlessTab>, String> {
+    let (restored_tab, storage_entries, navigation_timeout) = {
+        let sessions = runtime.sessions.lock().await;
+        let session = sessions.get(session_id).ok_or_else(|| "session_not_found".to_owned())?;
+        let restored_tab =
+            session.tabs.get(tab_id).cloned().ok_or_else(|| "tab_not_found".to_owned())?;
+        (
+            restored_tab,
+            session.storage_entries.clone(),
+            Duration::from_millis(session.budget.max_navigation_timeout_ms.max(1)),
+        )
+    };
+    let (browser, private_target_policy, security_incident, health) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let session = chromium_sessions
+            .get(session_id)
+            .ok_or_else(|| "chromium_session_not_found".to_owned())?;
+        (
+            Arc::clone(&session.browser),
+            Arc::clone(&session.private_target_policy),
+            Arc::clone(&session.security_incident),
+            Arc::clone(&session.health),
+        )
+    };
+    let owned_tab_id = tab_id.to_owned();
+    let health_for_tab = Arc::clone(&health);
+    let resilience_profile = runtime.resilience_profile;
+    let (tab, network_log, dialog_tracker) =
+        run_chromium_blocking("chromium target reconnect", move || {
+            let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let dialog_tracker = Arc::new(std::sync::Mutex::new(ChromiumDialogTracker::default()));
+            let tab = create_configured_chromium_tab_with_retry(
+                &browser,
+                ChromiumTabRuntimeHooks {
+                    tab_id: owned_tab_id.clone(),
+                    network_log: Arc::clone(&network_log),
+                    dialog_tracker: Arc::clone(&dialog_tracker),
+                    health: health_for_tab,
+                    resilience_profile,
+                },
+                private_target_policy,
+                navigation_timeout,
+                security_incident,
+                "failed to reconnect Chromium target",
+            )?;
+            restore_chromium_tab_live_state(
+                &tab,
+                owned_tab_id.as_str(),
+                &restored_tab,
+                &storage_entries,
+                navigation_timeout,
+            )?;
+            Ok((tab, network_log, dialog_tracker))
+        })
+        .await?;
+
+    let replaced_tab = {
+        let mut chromium_sessions = runtime.chromium_sessions.lock().await;
+        let session = chromium_sessions
+            .get_mut(session_id)
+            .ok_or_else(|| "chromium_session_not_found".to_owned())?;
+        session.network_logs.insert(tab_id.to_owned(), network_log);
+        session.dialog_trackers.insert(tab_id.to_owned(), dialog_tracker);
+        session.tabs.insert(tab_id.to_owned(), Arc::clone(&tab))
+    };
+    if let Some(replaced_tab) = replaced_tab {
+        let _ = run_chromium_blocking("chromium stale target close", move || {
+            let _ = replaced_tab.close(false);
+            Ok(())
+        })
+        .await;
+    }
+    if let Ok(mut health) = health.lock() {
+        health.mark_target_reconnected();
+    }
+    Ok(tab)
+}
+
+async fn reconnect_chromium_process_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<Arc<HeadlessTab>, String> {
+    let session = {
+        let sessions = runtime.sessions.lock().await;
+        sessions.get(session_id).cloned().ok_or_else(|| "session_not_found".to_owned())?
+    };
+    let health = chromium_session_health_tracker(runtime, session_id).await;
+    if let Ok(mut health) = health.lock() {
+        health.mark_reconnecting();
+    }
+    if let Err(error) =
+        launch_chromium_session_runtime(runtime, session_id, &session, Arc::clone(&health)).await
+    {
+        if let Ok(mut health) = health.lock() {
+            health.mark_reconnect_failed();
+        }
+        return Err(format!("chromium process reconnect failed: {error}"));
+    }
+    if let Ok(mut health) = health.lock() {
+        health.mark_process_reconnected();
+    }
+    let chromium_sessions = runtime.chromium_sessions.lock().await;
+    chromium_sessions
+        .get(session_id)
+        .and_then(|session| session.tabs.get(tab_id))
+        .cloned()
+        .ok_or_else(|| "chromium tab missing after process reconnect".to_owned())
+}
+
 /// Looks up the live tab handle for a session/tab pair.
 ///
 /// # Errors
-/// Returns the `chromium_session_not_found`/`chromium_tab_not_found` sentinels.
+/// Returns lookup sentinels when resilience is disabled. With the resilient profile enabled,
+/// probes process and target health, then performs one serialized target or process recovery.
 pub(crate) async fn chromium_tab_for_session(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     tab_id: &str,
 ) -> Result<Arc<HeadlessTab>, String> {
-    let chromium_sessions = runtime.chromium_sessions.lock().await;
-    let Some(chromium_session) = chromium_sessions.get(session_id) else {
-        return Err("chromium_session_not_found".to_owned());
-    };
-    chromium_session.tabs.get(tab_id).cloned().ok_or_else(|| "chromium_tab_not_found".to_owned())
+    if !runtime.resilience_profile.automatic_reconnect {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let result = chromium_sessions
+            .get(session_id)
+            .ok_or_else(|| "chromium_session_not_found".to_owned())
+            .and_then(|session| {
+                session.tabs.get(tab_id).cloned().ok_or_else(|| "chromium_tab_not_found".to_owned())
+            });
+        drop(chromium_sessions);
+        if result.is_err() {
+            let health = chromium_session_health_tracker(runtime, session_id).await;
+            if let Ok(mut health) = health.lock() {
+                health.mark_reconnect_disabled();
+            };
+        }
+        return result;
+    }
+
+    if let ChromiumRuntimeProbe::Healthy(tab) =
+        probe_chromium_runtime(runtime, session_id, tab_id).await
+    {
+        return Ok(tab);
+    }
+
+    let _reconnect_guard = runtime.chromium_reconnect_lock.lock().await;
+    match probe_chromium_runtime(runtime, session_id, tab_id).await {
+        ChromiumRuntimeProbe::Healthy(tab) => Ok(tab),
+        ChromiumRuntimeProbe::TargetUnavailable(reason) => {
+            warn!(
+                session_id,
+                tab_id,
+                reason = reason.as_str(),
+                "reconnecting unavailable Chromium target"
+            );
+            match reconnect_chromium_tab_runtime(runtime, session_id, tab_id).await {
+                Ok(tab) => Ok(tab),
+                Err(target_error) => {
+                    warn!(
+                        session_id,
+                        tab_id,
+                        error = target_error.as_str(),
+                        "target reconnect failed; replacing Chromium process"
+                    );
+                    reconnect_chromium_process_runtime(runtime, session_id, tab_id).await
+                }
+            }
+        }
+        ChromiumRuntimeProbe::ProcessUnavailable(reason) => {
+            warn!(
+                session_id,
+                tab_id,
+                reason = reason.as_str(),
+                "reconnecting unavailable Chromium process"
+            );
+            reconnect_chromium_process_runtime(runtime, session_id, tab_id).await
+        }
+    }
 }
 
 /// Drains the CDP-captured network log buffered for a tab.
@@ -2677,14 +2984,54 @@ pub(crate) async fn chromium_tab_and_private_target_policy_for_session(
     session_id: &str,
     tab_id: &str,
 ) -> Result<(Arc<HeadlessTab>, Arc<ChromiumPrivateTargetPolicy>), String> {
+    let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
     let chromium_sessions = runtime.chromium_sessions.lock().await;
     let Some(chromium_session) = chromium_sessions.get(session_id) else {
         return Err("chromium_session_not_found".to_owned());
     };
-    let Some(tab) = chromium_session.tabs.get(tab_id) else {
-        return Err("chromium_tab_not_found".to_owned());
+    Ok((tab, Arc::clone(&chromium_session.private_target_policy)))
+}
+
+async fn chromium_cleanup_dialog_before_navigation(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+    tab: &Arc<HeadlessTab>,
+) -> Result<(), String> {
+    let (tracker, health) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let session = chromium_sessions
+            .get(session_id)
+            .ok_or_else(|| "chromium_session_not_found".to_owned())?;
+        (
+            session
+                .dialog_trackers
+                .get(tab_id)
+                .cloned()
+                .ok_or_else(|| "chromium_dialog_tracker_not_found".to_owned())?,
+            Arc::clone(&session.health),
+        )
     };
-    Ok((Arc::clone(tab), Arc::clone(&chromium_session.private_target_policy)))
+    let pending =
+        tracker.lock().map_err(|_| "failed to inspect Chromium dialog state".to_owned())?.pending();
+    let Some(event) = pending else {
+        return Ok(());
+    };
+    let cleanup_tab = Arc::clone(tab);
+    run_chromium_blocking("chromium dialog navigation cleanup", move || {
+        cleanup_tab.get_dialog().dismiss().map_err(|error| {
+            format!("failed to dismiss Chromium dialog before navigation: {error}")
+        })
+    })
+    .await?;
+    tracker
+        .lock()
+        .map_err(|_| "failed to update Chromium dialog state".to_owned())?
+        .remember_resolution(event, BrowserDialogResolutionKind::NavigationCleanup);
+    if let Ok(mut health) = health.lock() {
+        health.record_dialog_navigation_cleanup();
+    }
+    Ok(())
 }
 
 /// Resolves the session's active tab ID and its live tab handle.
@@ -2719,7 +3066,7 @@ pub(crate) async fn chromium_handle_dialog(
     expected_generation: u64,
     prompt_text: Option<String>,
 ) -> Result<ChromiumDialogOutcome, String> {
-    let profile = BrowserResilienceProfile::default();
+    let profile = runtime.resilience_profile;
     let (tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
     let tracker = {
         let chromium_sessions = runtime.chromium_sessions.lock().await;
@@ -2732,9 +3079,37 @@ pub(crate) async fn chromium_handle_dialog(
             .cloned()
             .ok_or_else(|| "chromium_dialog_tracker_not_found".to_owned())?
     };
-    let event =
-        tracker.lock().map_err(|_| "failed to inspect Chromium dialog state".to_owned())?.pending();
+    let (event, resolution) = {
+        let tracker =
+            tracker.lock().map_err(|_| "failed to inspect Chromium dialog state".to_owned())?;
+        (
+            tracker.pending(),
+            (expected_generation != 0)
+                .then(|| tracker.resolution_for_generation(expected_generation))
+                .flatten(),
+        )
+    };
     let Some(mut event) = event else {
+        if let Some(resolution) = resolution {
+            let timed_out = resolution.kind == BrowserDialogResolutionKind::TimedOut;
+            let (error_code, error) = if timed_out {
+                (
+                    "dialog_timed_out_safe_dismiss",
+                    "dialog expired and was dismissed with the safe default",
+                )
+            } else {
+                ("stale_dialog_generation", "dialog was cleared by browser lifecycle cleanup")
+            };
+            return Ok(ChromiumDialogOutcome {
+                success: false,
+                present: false,
+                event: Some(resolution.event),
+                mutated_page: false,
+                timed_out,
+                error_code: error_code.to_owned(),
+                error: error.to_owned(),
+            });
+        }
         let (error_code, error) = if action.mutates_page() {
             ("dialog_not_found", "no native dialog is pending on the active tab")
         } else {
@@ -4360,6 +4735,13 @@ pub(crate) async fn navigate_tab_with_chromium(
                 return outcome;
             }
         };
+    if let Err(error) =
+        chromium_cleanup_dialog_before_navigation(runtime, session_id, tab_id, &tab).await
+    {
+        outcome.success = false;
+        outcome.error = format!("chromium dialog navigation cleanup failed: {error}");
+        return outcome;
+    }
     let tab_target_id = tab.get_target_id().to_string();
     let _scoped_private_target = if params.allow_private_targets {
         match private_target_policy
