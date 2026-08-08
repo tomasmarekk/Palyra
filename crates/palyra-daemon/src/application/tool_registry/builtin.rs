@@ -2587,11 +2587,15 @@ fn browser_tool_schema(tool_name: &str) -> Value {
         "palyra.browser.dialog" => {
             properties.push((
                 "action",
-                json!({"type":"string","enum":["inspect","accept","dismiss","respond"],"default":"inspect","description":"Dialog operation to request. Mutating actions fail closed unless browserd exposes native dialog support."}),
+                json!({"type":"string","enum":["inspect","accept","dismiss","respond"],"default":"inspect","description":"Native dialog operation. Inspect first and pass its generation to every mutating action."}),
             ));
             properties.push((
                 "prompt_text",
-                json!({"type":"string","description":"Text for prompt dialogs when action=respond. Ignored when native dialog support is unavailable."}),
+                json!({"type":"string","maxLength":4096,"description":"Bounded text for prompt dialogs when action=respond."}),
+            ));
+            properties.push((
+                "expected_generation",
+                json!({"type":"integer","minimum":1,"description":"Generation returned by inspect. Required by callers for accept, dismiss, and respond so delayed actions cannot resolve a newer dialog."}),
             ));
         }
         "palyra.browser.cdp.invoke" => {

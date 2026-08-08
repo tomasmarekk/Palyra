@@ -27,6 +27,7 @@ service BrowserService {
   rpc Scroll(ScrollRequest) returns (ScrollResponse);
   rpc WaitFor(WaitForRequest) returns (WaitForResponse);
   rpc GetTitle(GetTitleRequest) returns (GetTitleResponse);
+  rpc HandleDialog(HandleDialogRequest) returns (HandleDialogResponse);
   rpc Screenshot(ScreenshotRequest) returns (ScreenshotResponse);
   rpc Observe(ObserveRequest) returns (ObserveResponse);
   rpc NetworkLog(NetworkLogRequest) returns (NetworkLogResponse);
@@ -1172,4 +1173,50 @@ message SetPermissionsResponse {
   string error = 4;
 
   reserved 5 to 12;
+}
+
+enum BrowserDialogAction {
+  BROWSER_DIALOG_ACTION_UNSPECIFIED = 0;
+  BROWSER_DIALOG_ACTION_INSPECT = 1;
+  BROWSER_DIALOG_ACTION_ACCEPT = 2;
+  BROWSER_DIALOG_ACTION_DISMISS = 3;
+  BROWSER_DIALOG_ACTION_RESPOND = 4;
+}
+
+message BrowserDialogEvent {
+  uint32 v = 1;
+  uint64 generation = 2;
+  palyra.common.v1.CanonicalId tab_id = 3;
+  string dialog_type = 4;
+  string message = 5;
+  string default_prompt = 6;
+  string page_url = 7;
+  uint64 opened_at_unix_ms = 8;
+  uint64 expires_at_unix_ms = 9;
+
+  reserved 10 to 16;
+}
+
+message HandleDialogRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  BrowserDialogAction action = 3;
+  uint64 expected_generation = 4;
+  string prompt_text = 5;
+
+  reserved 6 to 12;
+}
+
+message HandleDialogResponse {
+  uint32 v = 1;
+  bool success = 2;
+  bool present = 3;
+  BrowserDialogEvent event = 4;
+  bool mutated_page = 5;
+  bool timed_out = 6;
+  bool backend_support = 7;
+  string error_code = 8;
+  string error = 9;
+
+  reserved 10 to 16;
 }

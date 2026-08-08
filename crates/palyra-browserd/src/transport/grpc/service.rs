@@ -96,6 +96,20 @@ fn browser_layout_metrics_to_proto(
     }
 }
 
+fn browser_dialog_event_to_proto(event: BrowserDialogEvent) -> browser_v1::BrowserDialogEvent {
+    browser_v1::BrowserDialogEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        generation: event.generation,
+        tab_id: Some(proto::palyra::common::v1::CanonicalId { ulid: event.tab_id }),
+        dialog_type: event.dialog_type,
+        message: event.message,
+        default_prompt: event.default_prompt,
+        page_url: event.page_url,
+        opened_at_unix_ms: event.opened_at_unix_ms,
+        expires_at_unix_ms: event.expires_at_unix_ms,
+    }
+}
+
 /// Effective observe byte cap: zero means the session limit, anything else is
 /// clamped to it, with a floor of one byte.
 fn observe_byte_limit(requested: u64, session_limit: u64) -> usize {
@@ -2818,6 +2832,83 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             success: true,
             title: truncate_utf8_bytes(title.as_str(), max_title_bytes),
             error: String::new(),
+        }))
+    }
+
+    async fn handle_dialog(
+        &self,
+        request: Request<browser_v1::HandleDialogRequest>,
+    ) -> Result<Response<browser_v1::HandleDialogResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let action = match browser_v1::BrowserDialogAction::try_from(payload.action)
+            .unwrap_or(browser_v1::BrowserDialogAction::Unspecified)
+        {
+            browser_v1::BrowserDialogAction::Inspect => BrowserDialogAction::Inspect,
+            browser_v1::BrowserDialogAction::Accept => BrowserDialogAction::Accept,
+            browser_v1::BrowserDialogAction::Dismiss => BrowserDialogAction::Dismiss,
+            browser_v1::BrowserDialogAction::Respond => BrowserDialogAction::Respond,
+            browser_v1::BrowserDialogAction::Unspecified => {
+                return Err(Status::invalid_argument("dialog action must be specified"));
+            }
+        };
+        if payload.prompt_text.len() > MAX_BROWSER_DIALOG_PROMPT_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "dialog prompt response exceeds {MAX_BROWSER_DIALOG_PROMPT_BYTES} bytes"
+            )));
+        }
+        {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::HandleDialogResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    present: false,
+                    event: None,
+                    mutated_page: false,
+                    timed_out: false,
+                    backend_support: self.runtime.engine_mode == BrowserEngineMode::Chromium,
+                    error_code: "session_not_found".to_owned(),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+        }
+        if self.runtime.engine_mode != BrowserEngineMode::Chromium {
+            return Ok(Response::new(browser_v1::HandleDialogResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                present: false,
+                event: None,
+                mutated_page: false,
+                timed_out: false,
+                backend_support: false,
+                error_code: "dialog_backend_unavailable".to_owned(),
+                error: "native dialogs require the Chromium browser engine".to_owned(),
+            }));
+        }
+        let prompt_text = (action == BrowserDialogAction::Respond).then_some(payload.prompt_text);
+        let outcome = chromium_handle_dialog(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            action,
+            payload.expected_generation,
+            prompt_text,
+        )
+        .await
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(browser_v1::HandleDialogResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: outcome.success,
+            present: outcome.present,
+            event: outcome.event.map(browser_dialog_event_to_proto),
+            mutated_page: outcome.mutated_page,
+            timed_out: outcome.timed_out,
+            backend_support: true,
+            error_code: outcome.error_code,
+            error: outcome.error,
         }))
     }
 

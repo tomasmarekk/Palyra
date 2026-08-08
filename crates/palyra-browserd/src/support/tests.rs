@@ -2063,6 +2063,209 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_handles_native_dialogs_with_generation_fence() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let (url, handle) = spawn_static_http_server_with_request_budget(
+        200,
+        r#"<html><head><title>Dialog Fixture</title></head><body>
+<div id="result">idle</div>
+</body></html>"#,
+        4,
+    );
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium mode");
+    let session_id = created.session_id.expect("session id should exist");
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(navigate.success, "chromium navigate should succeed: {}", navigate.error);
+
+    let (_, tab) = chromium_active_tab_for_session(runtime.as_ref(), session_id.ulid.as_str())
+        .await
+        .expect("active Chromium tab should exist");
+    run_chromium_blocking("schedule test prompt", move || {
+        tab.evaluate(
+            "setTimeout(() => { const value = prompt('Choose a bounded value', 'default'); document.getElementById('result').textContent = value ?? 'dismissed'; }, 0);",
+            false,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("failed to schedule test prompt: {error}"))
+    })
+    .await
+    .expect("prompt should be scheduled");
+
+    let mut inspected = None;
+    for _ in 0..40 {
+        let response = service
+            .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                action: browser_v1::BrowserDialogAction::Inspect.into(),
+                expected_generation: 0,
+                prompt_text: String::new(),
+            }))
+            .await
+            .expect("dialog inspection should execute")
+            .into_inner();
+        if response.present {
+            inspected = Some(response);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let inspected = inspected.expect("native prompt should become observable");
+    assert!(inspected.success);
+    let first_event = inspected.event.expect("dialog event should be returned");
+    assert_eq!(first_event.dialog_type, "prompt");
+    assert_eq!(first_event.message, "Choose a bounded value");
+
+    let responded = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Respond.into(),
+            expected_generation: first_event.generation,
+            prompt_text: "handled".to_owned(),
+        }))
+        .await
+        .expect("dialog response should execute")
+        .into_inner();
+    assert!(responded.success, "prompt response should succeed: {}", responded.error);
+    assert!(responded.mutated_page);
+
+    let updated = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#result".to_owned(),
+            text: "handled".to_owned(),
+            timeout_ms: 3_000,
+            poll_interval_ms: 25,
+            capture_failure_screenshot: false,
+            max_failure_screenshot_bytes: 0,
+        }))
+        .await
+        .expect("wait_for should execute")
+        .into_inner();
+    assert!(updated.success, "prompt result should reach the live DOM: {}", updated.error);
+
+    let (_, tab) = chromium_active_tab_for_session(runtime.as_ref(), session_id.ulid.as_str())
+        .await
+        .expect("active Chromium tab should still exist");
+    run_chromium_blocking("schedule test confirmation", move || {
+        tab.evaluate("setTimeout(() => confirm('Continue safely?'), 0);", false)
+            .map(|_| ())
+            .map_err(|error| format!("failed to schedule test confirmation: {error}"))
+    })
+    .await
+    .expect("confirmation should be scheduled");
+    let mut second_event = None;
+    for _ in 0..40 {
+        let response = service
+            .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                action: browser_v1::BrowserDialogAction::Inspect.into(),
+                expected_generation: 0,
+                prompt_text: String::new(),
+            }))
+            .await
+            .expect("second dialog inspection should execute")
+            .into_inner();
+        if response.present {
+            second_event = response.event;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let second_event = second_event.expect("confirmation should become observable");
+    assert!(second_event.generation > first_event.generation);
+
+    let stale = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Accept.into(),
+            expected_generation: first_event.generation,
+            prompt_text: String::new(),
+        }))
+        .await
+        .expect("stale dialog action should execute")
+        .into_inner();
+    assert!(!stale.success);
+    assert_eq!(stale.error_code, "stale_dialog_generation");
+    assert!(stale.present);
+
+    let dismissed = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id),
+            action: browser_v1::BrowserDialogAction::Dismiss.into(),
+            expected_generation: second_event.generation,
+            prompt_text: String::new(),
+        }))
+        .await
+        .expect("current dialog dismissal should execute")
+        .into_inner();
+    assert!(dismissed.success, "current dialog dismissal should succeed");
+    assert!(dismissed.mutated_page);
+
+    drop(handle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_chromium_captures_blob_download_artifacts() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;

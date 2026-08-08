@@ -3490,23 +3490,97 @@ pub(crate) async fn execute_browser_tool(
                     ),
                 );
             }
-            let output = json!({
-                "success": false,
-                "session_id": session_id,
-                "action": action,
-                "error": "dialog_backend_unavailable",
-                "error_code": "dialog_backend_unavailable",
-                "dialog_state": "unknown",
-                "blocking_status": "unknown",
-                "backend_support": false,
-                "mutated_page": false,
-                "next_action": "retry with browserd dialog RPC support before claiming a dialog was accepted, dismissed, or absent",
+            let expected_generation =
+                payload.get("expected_generation").and_then(Value::as_u64).unwrap_or(0);
+            if action != "inspect" && expected_generation == 0 {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_DIALOG_TOOL_NAME} mutating actions require expected_generation from a prior inspect"
+                    ),
+                );
+            }
+            let proto_action = match action {
+                "inspect" => browser_v1::BrowserDialogAction::Inspect,
+                "accept" => browser_v1::BrowserDialogAction::Accept,
+                "dismiss" => browser_v1::BrowserDialogAction::Dismiss,
+                "respond" => browser_v1::BrowserDialogAction::Respond,
+                _ => unreachable!("dialog action validated above"),
+            };
+            let mut request = Request::new(browser_v1::HandleDialogRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
+                action: proto_action.into(),
+                expected_generation,
+                prompt_text: payload
+                    .get("prompt_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
             });
-            (
-                false,
-                serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
-                format!("{BROWSER_DIALOG_TOOL_NAME} failed: browserd dialog RPC unavailable"),
-            )
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.handle_dialog(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let dialog = response.event.map(|event| {
+                        json!({
+                            "generation": event.generation,
+                            "tab_id": event.tab_id.map(|value| value.ulid).unwrap_or_default(),
+                            "dialog_type": event.dialog_type,
+                            "message": event.message,
+                            "default_prompt": event.default_prompt,
+                            "page_url": event.page_url,
+                            "opened_at_unix_ms": event.opened_at_unix_ms,
+                            "expires_at_unix_ms": event.expires_at_unix_ms,
+                        })
+                    });
+                    let error = response.error.clone();
+                    let output = json!({
+                        "success": response.success,
+                        "session_id": session_id,
+                        "action": action,
+                        "dialog_present": response.present,
+                        "dialog": dialog,
+                        "blocking_status": if response.present { "blocked" } else { "clear" },
+                        "backend_support": response.backend_support,
+                        "mutated_page": response.mutated_page,
+                        "timed_out": response.timed_out,
+                        "error_code": response.error_code,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success {
+                            String::new()
+                        } else {
+                            format!("{BROWSER_DIALOG_TOOL_NAME} failed: {error}")
+                        },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_DIALOG_TOOL_NAME} failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
         }
         BROWSER_CDP_INVOKE_TOOL_NAME => {
             let session_id = match parse_browser_tool_session_id(&payload) {

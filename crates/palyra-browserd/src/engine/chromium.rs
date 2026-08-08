@@ -6,7 +6,7 @@
 //! through [`run_chromium_blocking`].
 
 use crate::*;
-use headless_chrome::protocol::cdp::{Browser, Emulation};
+use headless_chrome::protocol::cdp::{types::Event, Browser, Emulation};
 use headless_chrome::{
     browser::tab::ModifierKey,
     types::{Bounds, PrintToPdfOptions},
@@ -55,6 +55,18 @@ pub(crate) struct ChromiumWaitOutcome {
     pub(crate) matched_text: String,
     pub(crate) attempts: u32,
     pub(crate) waited_ms: u64,
+    pub(crate) error: String,
+}
+
+/// Native dialog inspection or mutation result returned to the gRPC layer.
+#[derive(Debug)]
+pub(crate) struct ChromiumDialogOutcome {
+    pub(crate) success: bool,
+    pub(crate) present: bool,
+    pub(crate) event: Option<BrowserDialogEvent>,
+    pub(crate) mutated_page: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) error_code: String,
     pub(crate) error: String,
 }
 
@@ -148,8 +160,15 @@ pub(crate) struct ChromiumClientDownload {
 struct DiscoveredChromiumTab {
     tab: Arc<HeadlessTab>,
     network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
+    dialog_tracker: Arc<std::sync::Mutex<ChromiumDialogTracker>>,
     url: String,
     title: String,
+}
+
+struct ChromiumTabRuntimeHooks {
+    tab_id: String,
+    network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
+    dialog_tracker: Arc<std::sync::Mutex<ChromiumDialogTracker>>,
 }
 
 type ChromiumLocalStorageSnapshot = Option<(String, HashMap<String, String>)>;
@@ -1875,16 +1894,79 @@ pub(crate) fn chromium_loopback_remote_ip_is_expected_proxy_hop(
     validate_target_url_blocking(response_url, allow_private_targets).is_ok()
 }
 
+fn install_chromium_dialog_listener(
+    tab: &Arc<HeadlessTab>,
+    tab_id: String,
+    tracker: Arc<std::sync::Mutex<ChromiumDialogTracker>>,
+    profile: BrowserResilienceProfile,
+) -> Result<(), String> {
+    let weak_tab = Arc::downgrade(tab);
+    tab.add_event_listener(Arc::new(move |event: &Event| match event {
+        Event::PageJavascriptDialogOpening(opening) => {
+            let dialog_type = format!("{:?}", opening.params.Type).to_ascii_lowercase();
+            let default_prompt = opening.params.default_prompt.as_deref().unwrap_or_default();
+            let generation = match tracker.lock() {
+                Ok(mut guard) => {
+                    guard
+                        .record_opening(
+                            tab_id.as_str(),
+                            dialog_type.as_str(),
+                            opening.params.message.as_str(),
+                            default_prompt,
+                            opening.params.url.as_str(),
+                            profile,
+                        )
+                        .generation
+                }
+                Err(_) => {
+                    warn!(
+                        "failed to record Chromium dialog opening because tracker lock is poisoned"
+                    );
+                    return;
+                }
+            };
+            let Some(tab) = weak_tab.upgrade() else {
+                return;
+            };
+            let timeout_tracker = Arc::clone(&tracker);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(profile.dialog_timeout_ms));
+                let should_dismiss = timeout_tracker
+                    .lock()
+                    .is_ok_and(|guard| guard.is_pending_generation(generation));
+                if !should_dismiss {
+                    return;
+                }
+                if tab.get_dialog().dismiss().is_ok() {
+                    if let Ok(mut guard) = timeout_tracker.lock() {
+                        let _ = guard.clear_generation(generation);
+                    }
+                } else {
+                    warn!(generation, "failed to apply safe default to expired Chromium dialog");
+                }
+            });
+        }
+        Event::PageJavascriptDialogClosed(_) => {
+            if let Ok(mut guard) = tracker.lock() {
+                guard.clear();
+            }
+        }
+        _ => {}
+    }))
+    .map(|_| ())
+    .map_err(|error| format!("failed to register Chromium dialog callback: {error}"))
+}
+
 /// Wires a fresh tab with policy and diagnostics: request interception that
 /// fails disallowed targets, network log capture, page diagnostics hooks, and
 /// the remote-IP response guard.
 ///
 /// # Errors
 /// Returns an error string when any CDP registration call fails.
-pub(crate) fn configure_chromium_tab(
+fn configure_chromium_tab(
     tab: &Arc<HeadlessTab>,
+    hooks: ChromiumTabRuntimeHooks,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
-    network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
     timeout: Duration,
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<(), String> {
@@ -1911,7 +1993,7 @@ pub(crate) fn configure_chromium_tab(
     tab.enable_request_interception(request_interceptor).map_err(|error| {
         format!("failed to register Chromium request interception callback: {error}")
     })?;
-    let network_log_buffer = Arc::clone(&network_log);
+    let network_log_buffer = Arc::clone(&hooks.network_log);
     tab.register_response_handling(
         CHROMIUM_NETWORK_LOG_HANDLER_NAME,
         Box::new(move |response, _fetch_body| {
@@ -1951,6 +2033,12 @@ pub(crate) fn configure_chromium_tab(
         }),
     )
     .map_err(|error| format!("failed to register Chromium response guard callback: {error}"))?;
+    install_chromium_dialog_listener(
+        tab,
+        hooks.tab_id,
+        hooks.dialog_tracker,
+        BrowserResilienceProfile::default(),
+    )?;
     Ok(())
 }
 
@@ -2018,10 +2106,10 @@ pub(crate) fn chromium_new_tab_error_is_retryable(message: &str) -> bool {
 /// Returns `{failure_prefix}: ...` when tab creation fails terminally or
 /// exhausts its retry budget, or the configuration error from
 /// [`configure_chromium_tab`].
-pub(crate) fn create_configured_chromium_tab_with_retry(
+fn create_configured_chromium_tab_with_retry(
     browser: &Arc<HeadlessBrowser>,
+    hooks: ChromiumTabRuntimeHooks,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
-    network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
     timeout: Duration,
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
     failure_prefix: &str,
@@ -2031,8 +2119,8 @@ pub(crate) fn create_configured_chromium_tab_with_retry(
             Ok(tab) => {
                 configure_chromium_tab(
                     &tab,
+                    hooks,
                     Arc::clone(&private_target_policy),
-                    Arc::clone(&network_log),
                     timeout,
                     security_incident,
                 )?;
@@ -2107,12 +2195,19 @@ pub(crate) async fn initialize_chromium_session_runtime(
                 })?);
             let mut tabs = HashMap::new();
             let mut network_logs = HashMap::new();
+            let mut dialog_trackers = HashMap::new();
             for tab_id in tab_order.iter() {
                 let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+                let dialog_tracker =
+                    Arc::new(std::sync::Mutex::new(ChromiumDialogTracker::default()));
                 let tab = create_configured_chromium_tab_with_retry(
                     &browser,
+                    ChromiumTabRuntimeHooks {
+                        tab_id: tab_id.clone(),
+                        network_log: Arc::clone(&network_log),
+                        dialog_tracker: Arc::clone(&dialog_tracker),
+                    },
                     Arc::clone(&private_target_policy),
-                    Arc::clone(&network_log),
                     navigation_timeout,
                     Arc::clone(&security_incident),
                     "failed to create Chromium tab for session restore",
@@ -2134,11 +2229,13 @@ pub(crate) async fn initialize_chromium_session_runtime(
                 }
                 tabs.insert(tab_id.clone(), tab);
                 network_logs.insert(tab_id.clone(), network_log);
+                dialog_trackers.insert(tab_id.clone(), dialog_tracker);
             }
             Ok(ChromiumSessionState {
                 browser,
                 tabs,
                 network_logs,
+                dialog_trackers,
                 private_target_policy,
                 security_incident,
                 _profile_dir: profile_dir,
@@ -2248,25 +2345,33 @@ pub(crate) async fn chromium_open_tab_runtime(
             Arc::clone(&chromium_session.security_incident),
         )
     };
-    let (tab, network_log) = run_chromium_blocking("chromium open tab", move || {
-        let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-        let tab = create_configured_chromium_tab_with_retry(
-            &browser,
-            private_target_policy,
-            Arc::clone(&network_log),
-            Duration::from_millis(timeout_ms),
-            security_incident,
-            "failed to allocate Chromium tab",
-        )?;
-        Ok((tab, network_log))
-    })
-    .await?;
+    let owned_tab_id = tab_id.to_owned();
+    let (tab, network_log, dialog_tracker) =
+        run_chromium_blocking("chromium open tab", move || {
+            let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let dialog_tracker = Arc::new(std::sync::Mutex::new(ChromiumDialogTracker::default()));
+            let tab = create_configured_chromium_tab_with_retry(
+                &browser,
+                ChromiumTabRuntimeHooks {
+                    tab_id: owned_tab_id,
+                    network_log: Arc::clone(&network_log),
+                    dialog_tracker: Arc::clone(&dialog_tracker),
+                },
+                private_target_policy,
+                Duration::from_millis(timeout_ms),
+                security_incident,
+                "failed to allocate Chromium tab",
+            )?;
+            Ok((tab, network_log, dialog_tracker))
+        })
+        .await?;
     let mut chromium_sessions = runtime.chromium_sessions.lock().await;
     let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
         return Err("chromium_session_not_found".to_owned());
     };
     chromium_session.tabs.insert(tab_id.to_owned(), tab);
     chromium_session.network_logs.insert(tab_id.to_owned(), network_log);
+    chromium_session.dialog_trackers.insert(tab_id.to_owned(), dialog_tracker);
     Ok(())
 }
 
@@ -2337,15 +2442,20 @@ pub(crate) async fn chromium_sync_session_tabs(
                 }
             }
             let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let dialog_tracker = Arc::new(std::sync::Mutex::new(ChromiumDialogTracker::default()));
             configure_chromium_tab(
                 &tab,
+                ChromiumTabRuntimeHooks {
+                    tab_id: target_id,
+                    network_log: Arc::clone(&network_log),
+                    dialog_tracker: Arc::clone(&dialog_tracker),
+                },
                 Arc::clone(&private_target_policy),
-                Arc::clone(&network_log),
                 timeout,
                 Arc::clone(&security_incident),
             )?;
             let title = tab.get_title().unwrap_or_default();
-            discovered.push(DiscoveredChromiumTab { tab, network_log, url, title });
+            discovered.push(DiscoveredChromiumTab { tab, network_log, dialog_tracker, url, title });
         }
         Ok(discovered)
     })
@@ -2377,6 +2487,7 @@ pub(crate) async fn chromium_sync_session_tabs(
             session.active_tab_id = tab_id.clone();
             chromium_session.tabs.insert(tab_id.clone(), discovered_tab.tab);
             chromium_session.network_logs.insert(tab_id.clone(), discovered_tab.network_log);
+            chromium_session.dialog_trackers.insert(tab_id.clone(), discovered_tab.dialog_tracker);
             new_tab_ids.push(tab_id);
         }
     }
@@ -2411,6 +2522,7 @@ pub(crate) async fn chromium_close_tab_runtime(
             return Err("chromium_session_not_found".to_owned());
         };
         chromium_session.network_logs.remove(tab_id);
+        chromium_session.dialog_trackers.remove(tab_id);
         chromium_session.tabs.remove(tab_id)
     };
     if let Some(tab) = tab {
@@ -2593,6 +2705,128 @@ pub(crate) async fn chromium_active_tab_for_session(
     };
     let tab = chromium_tab_for_session(runtime, session_id, active_tab_id.as_str()).await?;
     Ok((active_tab_id, tab))
+}
+
+/// Inspects or resolves the active tab's generation-fenced native dialog.
+///
+/// # Errors
+/// Returns session/tab lookup sentinels or a CDP mutation failure. Stale
+/// generations and invalid prompt operations are returned as typed outcomes.
+pub(crate) async fn chromium_handle_dialog(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    action: BrowserDialogAction,
+    expected_generation: u64,
+    prompt_text: Option<String>,
+) -> Result<ChromiumDialogOutcome, String> {
+    let profile = BrowserResilienceProfile::default();
+    let (tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    let tracker = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        chromium_session
+            .dialog_trackers
+            .get(tab_id.as_str())
+            .cloned()
+            .ok_or_else(|| "chromium_dialog_tracker_not_found".to_owned())?
+    };
+    let event =
+        tracker.lock().map_err(|_| "failed to inspect Chromium dialog state".to_owned())?.pending();
+    let Some(mut event) = event else {
+        let (error_code, error) = if action.mutates_page() {
+            ("dialog_not_found", "no native dialog is pending on the active tab")
+        } else {
+            ("", "")
+        };
+        return Ok(ChromiumDialogOutcome {
+            success: !action.mutates_page(),
+            present: false,
+            event: None,
+            mutated_page: false,
+            timed_out: false,
+            error_code: error_code.to_owned(),
+            error: error.to_owned(),
+        });
+    };
+    event.tab_id.clone_from(&tab_id);
+
+    if expected_generation != 0 && expected_generation != event.generation {
+        return Ok(ChromiumDialogOutcome {
+            success: false,
+            present: true,
+            event: Some(event),
+            mutated_page: false,
+            timed_out: false,
+            error_code: "stale_dialog_generation".to_owned(),
+            error: "dialog generation changed before the requested action".to_owned(),
+        });
+    }
+    if !action.mutates_page() {
+        return Ok(ChromiumDialogOutcome {
+            success: true,
+            present: true,
+            event: Some(event),
+            mutated_page: false,
+            timed_out: false,
+            error_code: String::new(),
+            error: String::new(),
+        });
+    }
+    if action == BrowserDialogAction::Respond && event.dialog_type != "prompt" {
+        return Ok(ChromiumDialogOutcome {
+            success: false,
+            present: true,
+            event: Some(event),
+            mutated_page: false,
+            timed_out: false,
+            error_code: "dialog_response_not_supported".to_owned(),
+            error: "respond is valid only for a native prompt dialog".to_owned(),
+        });
+    }
+    let prompt_text = prompt_text.unwrap_or_default();
+    if prompt_text.len() > profile.max_prompt_response_bytes {
+        return Ok(ChromiumDialogOutcome {
+            success: false,
+            present: true,
+            event: Some(event),
+            mutated_page: false,
+            timed_out: false,
+            error_code: "dialog_prompt_too_large".to_owned(),
+            error: format!(
+                "dialog prompt response exceeds {} bytes",
+                profile.max_prompt_response_bytes
+            ),
+        });
+    }
+
+    let generation = event.generation;
+    let dialog_action = action;
+    run_chromium_blocking("chromium handle dialog", move || {
+        let dialog = tab.get_dialog();
+        match dialog_action {
+            BrowserDialogAction::Accept => dialog.accept(None),
+            BrowserDialogAction::Dismiss => dialog.dismiss(),
+            BrowserDialogAction::Respond => dialog.accept(Some(prompt_text)),
+            BrowserDialogAction::Inspect => unreachable!("inspection returned before CDP mutation"),
+        }
+        .map_err(|error| format!("failed to handle Chromium dialog: {error}"))
+    })
+    .await?;
+    tracker
+        .lock()
+        .map_err(|_| "failed to update Chromium dialog state".to_owned())?
+        .clear_generation(generation);
+    Ok(ChromiumDialogOutcome {
+        success: true,
+        present: false,
+        event: Some(event),
+        mutated_page: true,
+        timed_out: false,
+        error_code: String::new(),
+        error: String::new(),
+    })
 }
 
 async fn chromium_selector_not_found_error(
