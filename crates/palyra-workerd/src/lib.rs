@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
+pub mod network_runtime;
 pub mod remote_protocol;
+pub mod transport_adapters;
 
 const MAX_WORKER_ID_BYTES: usize = 128;
 const MAX_GRANT_ID_BYTES: usize = 128;
