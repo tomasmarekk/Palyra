@@ -11,6 +11,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BrowserBinaryPath,
     [Parameter(Mandatory = $true)]
+    [string]$WorkerdBinaryPath,
+    [Parameter(Mandatory = $true)]
     [string]$CliBinaryPath,
     [string]$WebDistPath
 )
@@ -46,6 +48,7 @@ if ($ArtifactKind -eq "desktop") {
 
 $resolvedDaemonBinary = Assert-FileExists -Path $DaemonBinaryPath -Label "Daemon binary"
 $resolvedBrowserBinary = Assert-FileExists -Path $BrowserBinaryPath -Label "Browser service binary"
+$resolvedWorkerdBinary = Assert-FileExists -Path $WorkerdBinaryPath -Label "Isolated worker binary"
 $resolvedCliBinary = Assert-FileExists -Path $CliBinaryPath -Label "CLI binary"
 $resolvedHelpSnapshotsRoot = Join-Path $repoRoot "crates/palyra-cli/tests/help_snapshots"
 $null = Assert-FileExists -Path (Join-Path $resolvedHelpSnapshotsRoot "docs-help.txt") -Label "CLI help snapshot bundle"
@@ -84,6 +87,7 @@ if ($ArtifactKind -eq "desktop") {
 }
 Copy-BinaryIntoPayload -SourcePath $resolvedDaemonBinary -LogicalName "palyrad"
 Copy-BinaryIntoPayload -SourcePath $resolvedBrowserBinary -LogicalName "palyra-browserd"
+Copy-BinaryIntoPayload -SourcePath $resolvedWorkerdBinary -LogicalName "palyra-workerd"
 Copy-BinaryIntoPayload -SourcePath $resolvedCliBinary -LogicalName "palyra"
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $payloadRoot "LICENSE.txt") -Force
@@ -130,7 +134,7 @@ Platform: $Platform
 
 Install
 1. Extract this archive into a dedicated directory.
-2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra`, and the `web/` directory in the same directory.
+2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra-workerd`, `palyra`, and the `web/` directory in the same directory. `palyra-workerd` is a per-task child and must not be started as a standalone service.
 3. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
 4. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
 5. Use `palyra docs search gateway` for bundled offline CLI help guidance.
@@ -162,6 +166,7 @@ Install
 7. Use `palyra docs search gateway` for bundled offline CLI help guidance.
 8. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
 9. Start `palyra-browserd` only when browser automation is intentionally enabled by config.
+10. For an intentionally paired networked-worker host, run `palyra node run --json`; it launches the colocated `palyra-workerd --stdio` child per assigned task.
 
 Update
 1. Stop `palyrad`.
@@ -190,8 +195,8 @@ $releaseNotesBody =
 @"
 Release notes for Palyra $Version
 
-- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle, with installer support for exposing `palyra` as a user-scoped command.
-- Portable headless packages now ship repeatable archive-based install/update flow with `palyra setup`, config initialization/migration validation, and installer support for exposing `palyra` as a user-scoped command.
+- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra-workerd`, `palyra`, and the colocated `web/` dashboard bundle, with installer support for exposing `palyra` as a user-scoped command.
+- Portable headless packages now ship repeatable archive-based install/update flow with `palyra setup`, config initialization/migration validation, and a colocated isolated `palyra-workerd` child for explicitly paired `palyra node run` hosts.
 - Portable packages now bundle offline CLI help snapshots so `palyra docs` remains usable outside a source checkout.
 - Windows and macOS remain the supported v1 desktop runtime targets; the Linux desktop bundle continues as a release-regression/package artifact until the Tauri Linux dependency chain is unblocked.
 - Release artifacts now include SHA256 manifests, release manifests, provenance sidecars, and package-boundary validation.

@@ -54,14 +54,25 @@ try {
 
     $requiredBinaries =
         if ($manifest.artifact_kind -eq "desktop") {
-            @("palyra-desktop-control-center", "palyrad", "palyra-browserd", "palyra")
+            @("palyra-desktop-control-center", "palyrad", "palyra-browserd", "palyra-workerd", "palyra")
         } else {
-            @("palyrad", "palyra-browserd", "palyra")
+            @("palyrad", "palyra-browserd", "palyra-workerd", "palyra")
         }
 
     foreach ($logicalName in $requiredBinaries) {
         $binaryName = Resolve-ExecutableName -BaseName $logicalName
-        Assert-FileExists -Path (Join-Path $payloadRoot $binaryName) -Label $binaryName | Out-Null
+        $binaryPath = Assert-FileExists -Path (Join-Path $payloadRoot $binaryName) -Label $binaryName
+        $manifestEntries = @($manifest.binaries) |
+            Where-Object { $_.logical_name -eq $logicalName }
+        if ($manifestEntries.Count -ne 1) {
+            throw "Release manifest must contain exactly one binary entry for '$logicalName'."
+        }
+        $manifestEntry = $manifestEntries[0]
+        if ($manifestEntry.file_name -ne $binaryName -or
+            $manifestEntry.sha256 -ne (Get-Sha256Hex -Path $binaryPath) -or
+            [int64]$manifestEntry.size_bytes -ne (Get-Item -LiteralPath $binaryPath).Length) {
+            throw "Release manifest binary metadata does not match '$binaryName'."
+        }
     }
 
     $forbiddenNamePatterns = @(

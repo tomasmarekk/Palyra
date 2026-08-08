@@ -77,6 +77,14 @@ try {
             throw "Missing deployment smoke artifact: $path"
         }
     }
+    $workerCompose = Get-Content -LiteralPath (Join-Path $smokeRoot "recipes/worker-enabled/compose/worker-enabled.yml") -Raw
+    $workerSystemd = Get-Content -LiteralPath (Join-Path $smokeRoot "recipes/worker-enabled/systemd/palyra-workerd.service") -Raw
+    if (-not $workerCompose.Contains('command: ["/opt/palyra/palyra", "node", "run", "--json"]') -or
+        -not $workerSystemd.Contains("ExecStart=/opt/palyra/palyra node run --json") -or
+        $workerCompose.Contains('command: ["/opt/palyra/palyra-workerd"]') -or
+        $workerSystemd.Contains("ExecStart=/opt/palyra/palyra-workerd")) {
+        throw "Worker deployment must supervise the networked node host, not the one-shot worker child."
+    }
 
     $workerConfig = Join-Path $smokeRoot "configs/worker-enabled.toml"
     Invoke-PalyraCli deployment upgrade-smoke --deployment-profile worker-enabled --path $workerConfig --json |

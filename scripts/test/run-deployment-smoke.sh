@@ -108,6 +108,10 @@ done
 test -f "$SMOKE_ROOT/recipes/single-vm/compose/single-vm.yml"
 test -f "$SMOKE_ROOT/recipes/worker-enabled/compose/worker-enabled.yml"
 test -f "$SMOKE_ROOT/recipes/worker-enabled/systemd/palyra-workerd.service"
+grep -Fq 'command: ["/opt/palyra/palyra", "node", "run", "--json"]' "$SMOKE_ROOT/recipes/worker-enabled/compose/worker-enabled.yml"
+grep -Fq 'ExecStart=/opt/palyra/palyra node run --json' "$SMOKE_ROOT/recipes/worker-enabled/systemd/palyra-workerd.service"
+! grep -Fq 'command: ["/opt/palyra/palyra-workerd"]' "$SMOKE_ROOT/recipes/worker-enabled/compose/worker-enabled.yml"
+! grep -Fq 'ExecStart=/opt/palyra/palyra-workerd' "$SMOKE_ROOT/recipes/worker-enabled/systemd/palyra-workerd.service"
 
 worker_config="$SMOKE_ROOT/configs/worker-enabled.toml"
 run_cli deployment upgrade-smoke --deployment-profile worker-enabled --path "$worker_config" --json > "$SMOKE_ROOT/reports/upgrade-smoke-worker-enabled.json"

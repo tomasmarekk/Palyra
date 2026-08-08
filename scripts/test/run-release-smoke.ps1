@@ -51,6 +51,16 @@ function Invoke-InstalledCliSmoke {
     )
 
     Assert-CommandResolvesFromRoot -CommandName "palyra" -ExpectedRoot $ExpectedCommandRoot
+    $installedWorkerd = Join-Path $InstallRoot (Resolve-ExecutableName -BaseName "palyra-workerd")
+    Assert-FileExists -Path $installedWorkerd -Label "installed isolated worker child" | Out-Null
+    $workerSystemd = Get-Content -LiteralPath (Join-Path $InstallRoot "deployment/worker-enabled/systemd/palyra-workerd.service") -Raw
+    $workerCompose = Get-Content -LiteralPath (Join-Path $InstallRoot "deployment/worker-enabled/compose/worker-enabled.yml") -Raw
+    if (-not $workerSystemd.Contains("ExecStart=/opt/palyra/palyra node run --json") -or
+        -not $workerCompose.Contains('command: ["/opt/palyra/palyra", "node", "run", "--json"]') -or
+        $workerSystemd.Contains("ExecStart=/opt/palyra/palyra-workerd") -or
+        $workerCompose.Contains('command: ["/opt/palyra/palyra-workerd"]')) {
+        throw "Worker deployment recipe must run the long-lived node host, not the one-shot worker child."
+    }
 
     $helpCommands = @(
         @("setup", "--help"),
@@ -146,7 +156,7 @@ Push-Location $repoRoot
 try {
     & (Join-Path $repoRoot "scripts/test/ensure-desktop-ui.ps1")
     & (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1")
-    cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+    cargo build -p palyra-daemon -p palyra-browserd -p palyra-workerd -p palyra-cli --release --locked
     cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
 }
 finally {
@@ -156,6 +166,7 @@ finally {
 $desktopBinary = Join-Path $repoRoot ("apps/desktop/src-tauri/target/release/" + (Resolve-ExecutableName -BaseName "palyra-desktop-control-center"))
 $daemonBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))
 $browserBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))
+$workerdBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-workerd"))
 $cliBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))
 $webDist = Join-Path $repoRoot "apps/web/dist"
 
@@ -169,6 +180,7 @@ $headlessPackageOutput = Join-Path $outputRoot "headless"
     -DesktopBinaryPath $desktopBinary `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
+    -WorkerdBinaryPath $workerdBinary `
     -CliBinaryPath $cliBinary `
     -WebDistPath $webDist | Out-Null
 
@@ -178,6 +190,7 @@ $headlessPackageOutput = Join-Path $outputRoot "headless"
     -OutputRoot $headlessPackageOutput `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
+    -WorkerdBinaryPath $workerdBinary `
     -CliBinaryPath $cliBinary `
     -WebDistPath $webDist | Out-Null
 

@@ -101,8 +101,8 @@ jobs:
           $releaseNotes = @"
           # Palyra $repoVersion
 
-          - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle.
-          - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard bundle.
+          - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra-workerd`, `palyra`, and the colocated `web/` dashboard bundle.
+          - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard and isolated worker child.
           - Windows and macOS remain the supported v1 desktop runtime targets; the Linux desktop bundle continues as a release-regression/package artifact until the Tauri Linux dependency chain is unblocked.
           - Release assets include SHA256 manifests, release manifests, provenance sidecars, and GitHub build attestations.
           - Release packaging smoke now validates canonical lifecycle surfaces (`setup`, `gateway`, `onboarding wizard`) plus compatibility aliases (`init`, `daemon`, `onboard`) before release publication.
@@ -182,7 +182,7 @@ jobs:
       - name: Build release binaries
         shell: pwsh
         run: |
-          cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+          cargo build -p palyra-daemon -p palyra-browserd -p palyra-workerd -p palyra-cli --release --locked
           cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
 
       - name: Package portable desktop bundle
@@ -201,6 +201,7 @@ jobs:
             -DesktopBinaryPath (Join-Path $PWD ("apps/desktop/src-tauri/target/release/" + (Resolve-ExecutableName -BaseName "palyra-desktop-control-center"))) `
             -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
             -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
+            -WorkerdBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-workerd"))) `
             -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) `
             -WebDistPath (Join-Path $PWD "apps/web/dist") | Out-Null
 
@@ -281,7 +282,7 @@ jobs:
         run: ./scripts/test/ensure-web-ui.ps1
 
       - name: Build release binaries
-        run: cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+        run: cargo build -p palyra-daemon -p palyra-browserd -p palyra-workerd -p palyra-cli --release --locked
 
       - name: Run deployment smoke
         run: bash scripts/test/run-deployment-smoke.sh
@@ -301,6 +302,7 @@ jobs:
             -OutputRoot $outputRoot `
             -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
             -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
+            -WorkerdBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-workerd"))) `
             -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) `
             -WebDistPath (Join-Path $PWD "apps/web/dist") | Out-Null
 

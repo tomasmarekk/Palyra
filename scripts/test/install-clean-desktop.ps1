@@ -75,6 +75,7 @@ $cliCommandRoot = Join-Path $workspaceRoot "cli-bin"
 $desktopExecutable = Resolve-ExecutableName -BaseName "palyra-desktop-control-center"
 $daemonExecutable = Resolve-ExecutableName -BaseName "palyrad"
 $browserExecutable = Resolve-ExecutableName -BaseName "palyra-browserd"
+$workerdExecutable = Resolve-ExecutableName -BaseName "palyra-workerd"
 $cliExecutable = Resolve-ExecutableName -BaseName "palyra"
 
 function Set-Utf8File {
@@ -253,7 +254,7 @@ if (-not $SkipBuild) {
         $env:CARGO_TARGET_DIR = $cargoTargetRoot
         & (Join-Path $repoRoot "scripts/test/ensure-desktop-ui.ps1")
         & (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1")
-        cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+        cargo build -p palyra-daemon -p palyra-browserd -p palyra-workerd -p palyra-cli --release --locked
         cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
     }
     finally {
@@ -271,6 +272,7 @@ $platform = Get-PlatformSlug
 $isolatedDesktopBinary = Join-Path $cargoTargetRoot ("release/" + $desktopExecutable)
 $isolatedDaemonBinary = Join-Path $cargoTargetRoot ("release/" + $daemonExecutable)
 $isolatedBrowserBinary = Join-Path $cargoTargetRoot ("release/" + $browserExecutable)
+$isolatedWorkerdBinary = Join-Path $cargoTargetRoot ("release/" + $workerdExecutable)
 $isolatedCliBinary = Join-Path $cargoTargetRoot ("release/" + $cliExecutable)
 $desktopBinary =
     if (Test-Path -LiteralPath $isolatedDesktopBinary -PathType Leaf) {
@@ -290,6 +292,12 @@ $browserBinary =
     } else {
         Join-Path $repoRoot ("target/release/" + $browserExecutable)
     }
+$workerdBinary =
+    if (Test-Path -LiteralPath $isolatedWorkerdBinary -PathType Leaf) {
+        $isolatedWorkerdBinary
+    } else {
+        Join-Path $repoRoot ("target/release/" + $workerdExecutable)
+    }
 $cliBinary =
     if (Test-Path -LiteralPath $isolatedCliBinary -PathType Leaf) {
         $isolatedCliBinary
@@ -305,6 +313,7 @@ $packageOutput = & (Join-Path $repoRoot "scripts/release/package-portable.ps1") 
     -DesktopBinaryPath $desktopBinary `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
+    -WorkerdBinaryPath $workerdBinary `
     -CliBinaryPath $cliBinary `
     -WebDistPath $webDist
 $packageMetadata = Convert-KeyValueOutputToHashtable -Lines $packageOutput
@@ -334,6 +343,9 @@ $resolvedInstallRoot = $installMetadata["install_root"]
 if ([string]::IsNullOrWhiteSpace($resolvedInstallRoot)) {
     $resolvedInstallRoot = $installRoot
 }
+$null = Assert-FileExists `
+    -Path (Join-Path $resolvedInstallRoot $workerdExecutable) `
+    -Label "Installed isolated worker child"
 $resolvedCliCommandRoot = $installMetadata["cli_command_root"]
 if ([string]::IsNullOrWhiteSpace($resolvedCliCommandRoot)) {
     $resolvedCliCommandRoot = Get-PalyraCliCommandRoot

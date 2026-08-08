@@ -27,9 +27,11 @@ Expand-ZipArchiveSafely -ArchivePath $archivePath -DestinationPath $installRoot
 $cliBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra")
 $daemonBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyrad")
 $browserBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-browserd")
+$workerdBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-workerd")
 Set-ExecutablePermissions -Path $cliBinary
 Set-ExecutablePermissions -Path $daemonBinary
 Set-ExecutablePermissions -Path $browserBinary
+Set-ExecutablePermissions -Path $workerdBinary
 
 $resolvedStateRoot = $null
 $resolvedConfigPath = $null

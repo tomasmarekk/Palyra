@@ -434,13 +434,14 @@ try {
     Invoke-TranscriptCommand `
         -Label "cargo-build-release" `
         -Command "cargo" `
-        -Arguments @("build", "-p", "palyra-daemon", "-p", "palyra-browserd", "-p", "palyra-cli", "--release", "--locked") `
+        -Arguments @("build", "-p", "palyra-daemon", "-p", "palyra-browserd", "-p", "palyra-workerd", "-p", "palyra-cli", "--release", "--locked") `
         -WorkingDirectory $repoRoot `
         -LogPath (Join-Path $logsRoot "cargo-build-release.log") `
         -Environment $cargoEnvironment | Out-Null
 
     $daemonBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyrad")
     $browserBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyra-browserd")
+    $workerdBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyra-workerd")
     $cliBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyra")
     $webDist = Join-Path $repoRoot "apps/web/dist"
 
@@ -453,6 +454,7 @@ try {
             "-OutputRoot", $headlessPackageOutput,
             "-DaemonBinaryPath", $daemonBinary,
             "-BrowserBinaryPath", $browserBinary,
+            "-WorkerdBinaryPath", $workerdBinary,
             "-CliBinaryPath", $cliBinary,
             "-WebDistPath", $webDist
         ) `
@@ -483,6 +485,8 @@ try {
         -LogPath (Join-Path $logsRoot "install-headless-package.log") | Out-Null
 
     $installManifest = Read-JsonFile -Path $installMetadataPath
+    $installedWorkerd = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-workerd")
+    Assert-FileExists -Path $installedWorkerd -Label "installed isolated worker child" | Out-Null
     $binaryUnderTest = [string]$installManifest.cli_exposure.target_binary_path
     if ([string]::IsNullOrWhiteSpace($binaryUnderTest)) {
         throw "install metadata did not expose cli_exposure.target_binary_path"

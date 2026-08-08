@@ -655,7 +655,7 @@ fn build_rollback_plan(profile_id: DeploymentProfileId) -> RollbackPlan {
             rollback_step(
                 6,
                 "restart_services",
-                "restart palyrad and optional browserd/workerd services",
+                "restart palyrad and optional browserd/networked node host services",
             ),
             rollback_step(
                 7,
@@ -725,9 +725,9 @@ fn render_dockerfile() -> String {
 FROM debian:bookworm-slim
 RUN useradd --system --create-home --home-dir /var/lib/palyra palyra
 WORKDIR /opt/palyra
-COPY palyrad palyra-browserd palyra /opt/palyra/
+COPY palyrad palyra-browserd palyra-workerd palyra /opt/palyra/
 COPY web /opt/palyra/web
-RUN chmod 0755 /opt/palyra/palyrad /opt/palyra/palyra-browserd /opt/palyra/palyra
+RUN chmod 0755 /opt/palyra/palyrad /opt/palyra/palyra-browserd /opt/palyra/palyra-workerd /opt/palyra/palyra
 USER palyra
 ENV PALYRA_STATE_ROOT=/var/lib/palyra
 EXPOSE 7142 7443
@@ -742,7 +742,7 @@ fn render_compose(manifest: &DeploymentProfileManifest) -> String {
         "\
   palyra-workerd:
     image: palyra:local
-    command: [\"/opt/palyra/palyra-workerd\"]
+    command: [\"/opt/palyra/palyra\", \"node\", \"run\", \"--json\"]
     env_file: ../env/palyra.env
     depends_on:
       palyrad:
@@ -850,7 +850,7 @@ WantedBy=multi-user.target
 fn render_workerd_systemd() -> String {
     "\
 [Unit]
-Description=Palyra worker daemon
+Description=Palyra networked worker node host
 After=network-online.target palyrad.service
 Wants=network-online.target
 Requires=palyrad.service
@@ -860,7 +860,7 @@ Type=simple
 User=palyra
 Group=palyra
 EnvironmentFile=/etc/palyra/palyra.env
-ExecStart=/opt/palyra/palyra-workerd
+ExecStart=/opt/palyra/palyra node run --json
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -990,10 +990,20 @@ mod tests {
         let bundle = build_recipe_bundle(DeploymentProfileId::WorkerEnabled)
             .expect("recipe bundle should render");
         assert!(bundle.files.contains_key("systemd/palyra-workerd.service"));
+        let compose =
+            bundle.files.get("compose/worker-enabled.yml").expect("compose file should exist");
+        let systemd = bundle
+            .files
+            .get("systemd/palyra-workerd.service")
+            .expect("worker node service should exist");
+        assert!(compose.contains("[\"/opt/palyra/palyra\", \"node\", \"run\", \"--json\"]"));
+        assert!(systemd.contains("ExecStart=/opt/palyra/palyra node run --json"));
+        assert!(!compose.contains("command: [\"/opt/palyra/palyra-workerd\"]"));
+        assert!(!systemd.contains("ExecStart=/opt/palyra/palyra-workerd"));
         assert!(bundle
             .files
-            .get("compose/worker-enabled.yml")
-            .expect("compose file should exist")
+            .get("docker/Dockerfile.palyra")
+            .expect("Dockerfile should exist")
             .contains("palyra-workerd"));
     }
 
