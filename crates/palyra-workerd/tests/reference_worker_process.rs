@@ -36,7 +36,15 @@ fn reference_worker_executes_canonical_task_in_a_separate_process() {
         secret_lease: None,
         run_generation: RuntimeGeneration::new(1).expect("generation"),
         fence_generation: 1,
-        work_graph_claim_id: None,
+        work_graph_claim: None,
+        work_graph_posture: Default::default(),
+        resource_limits: palyra_workerd::remote_protocol::RemoteResourceLimits {
+            wall_time_ms: 30_000,
+            memory_bytes: 128 * 1_024 * 1_024,
+            cpu_time_ms: 30_000,
+            input_artifact_bytes: 64 * 1_024,
+            output_artifact_bytes: 64 * 1_024,
+        },
         max_output_bytes: 64 * 1024,
     };
     let protocol = RemoteWorkerProtocolV1 {

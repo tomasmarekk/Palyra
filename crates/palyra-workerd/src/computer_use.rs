@@ -746,7 +746,15 @@ mod tests {
             secret_lease: None,
             run_generation: RuntimeGeneration::new(7).expect("generation should be valid"),
             fence_generation: 7,
-            work_graph_claim_id: None,
+            work_graph_claim: None,
+            work_graph_posture: Default::default(),
+            resource_limits: crate::remote_protocol::RemoteResourceLimits {
+                wall_time_ms: 60_000,
+                memory_bytes: 512 * 1_024 * 1_024,
+                cpu_time_ms: 60_000,
+                input_artifact_bytes: 256 * 1_024,
+                output_artifact_bytes: 512 * 1_024,
+            },
             max_output_bytes: 512 * 1024,
         }
     }

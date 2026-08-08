@@ -292,6 +292,8 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
             grant_tool_name: tool_name.to_owned(),
             expires_at_unix_ms: 3_000,
             required_capabilities: vec![tool_kind.required_capability()],
+            work_graph_claim: None,
+            work_graph_posture: Default::default(),
             workspace_scope: WorkerWorkspaceScope {
                 workspace_root: "/workspace".to_owned(),
                 allowed_paths: vec!["src".to_owned()],
@@ -306,6 +308,7 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
         },
         worker_identity: remote_identity("worker-remote-01"),
         workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(hex_digest("4")),
+        encrypted_secret_artifact: None,
         canonical_protocol: None,
     }
 }

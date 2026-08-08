@@ -3428,15 +3428,21 @@ dependencies = [
 name = "palyra-workerd"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "getrandom 0.4.3",
  "hex",
+ "hkdf",
  "palyra-common",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "ulid",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

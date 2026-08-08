@@ -13,14 +13,18 @@ default = []
 qa-fault-injection = []
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
+getrandom.workspace = true
 hex.workspace = true
+hkdf.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true

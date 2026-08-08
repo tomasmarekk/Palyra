@@ -29,6 +29,8 @@ const NETWORKED_WORKER_EXPIRY_EVENT_ID_PREFIX: &str = "worker-expiry:";
 const NETWORKED_WORKER_LIFECYCLE_EVENT_ID_PREFIX: &str = "worker-lifecycle:";
 const DEFAULT_WORKER_SDK_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_WORKER_WIT_ABI_VERSION: &str = "palyra-worker-abi/v1";
+const MAX_REMOTE_WORKSPACE_ENTRIES: usize = 128;
+const MAX_REMOTE_WORKSPACE_BYTES: usize = 384 * 1_024;
 
 fn default_worker_sdk_protocol_version() -> u32 {
     DEFAULT_WORKER_SDK_PROTOCOL_VERSION
@@ -398,6 +400,31 @@ impl WorkerRemoteWorkspaceTransferMode {
     }
 }
 
+/// Kind of one bounded entry in a content-addressed scoped workspace bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemoteWorkspaceEntryKind {
+    /// Regular file whose exact bytes are carried by the bundle.
+    File,
+    /// Directory required to preserve the scoped tree shape.
+    Directory,
+}
+
+/// One workspace-relative entry transferred to an isolated remote worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemoteWorkspaceEntry {
+    /// Slash-separated path relative to the leased workspace root.
+    pub path: String,
+    /// Entry kind used during materialization.
+    pub kind: WorkerRemoteWorkspaceEntryKind,
+    /// SHA-256 of file bytes, or the SHA-256 of an empty byte slice for directories.
+    pub sha256: String,
+    /// Exact bounded file bytes. Directories must carry an empty vector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bytes: Vec<u8>,
+}
+
 /// Integrity metadata for workspace material made visible to a remote worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRemoteWorkspaceTransfer {
@@ -405,6 +432,9 @@ pub struct WorkerRemoteWorkspaceTransfer {
     pub workspace_manifest_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoped_bundle_sha256: Option<String>,
+    /// Bounded content-addressed entries for a scoped-bundle transfer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_entries: Vec<WorkerRemoteWorkspaceEntry>,
     pub writeback_mode: String,
 }
 
@@ -416,8 +446,90 @@ impl WorkerRemoteWorkspaceTransfer {
             mode: WorkerRemoteWorkspaceTransferMode::Manifest,
             workspace_manifest_sha256,
             scoped_bundle_sha256: None,
+            scoped_entries: Vec::new(),
             writeback_mode: "patch_bundle".to_owned(),
         }
+    }
+
+    /// Builds a bounded content-addressed transfer for a portable worker workspace.
+    ///
+    /// # Errors
+    /// Returns a typed contract error when an entry path escapes the scope, a
+    /// digest is invalid, directory bytes are present, or aggregate limits are exceeded.
+    pub fn scoped(
+        workspace_manifest_sha256: String,
+        scoped_entries: Vec<WorkerRemoteWorkspaceEntry>,
+    ) -> Result<Self, WorkerRemoteToolContractError> {
+        let mut transfer = Self {
+            mode: WorkerRemoteWorkspaceTransferMode::ScopedBundle,
+            workspace_manifest_sha256,
+            scoped_bundle_sha256: None,
+            scoped_entries,
+            writeback_mode: "patch_bundle".to_owned(),
+        };
+        transfer.scoped_bundle_sha256 = Some(transfer.canonical_bundle_sha256()?);
+        Ok(transfer)
+    }
+
+    /// Validates entry integrity and returns the canonical scoped-bundle digest.
+    ///
+    /// # Errors
+    /// Returns a typed contract error for malformed paths, digests, duplicate
+    /// entries, directory payloads, or aggregate resource-limit violations.
+    pub fn canonical_bundle_sha256(&self) -> Result<String, WorkerRemoteToolContractError> {
+        use std::path::{Component, Path};
+
+        if self.scoped_entries.len() > MAX_REMOTE_WORKSPACE_ENTRIES {
+            return Err(WorkerRemoteToolContractError::WorkspaceBundleLimitExceeded);
+        }
+        let mut total_bytes = 0_usize;
+        let mut previous_path: Option<&str> = None;
+        for entry in &self.scoped_entries {
+            let path = Path::new(entry.path.as_str());
+            if entry.path.trim().is_empty()
+                || entry.path.contains('\\')
+                || entry
+                    .path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+                || path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(WorkerRemoteToolContractError::WorkspaceEntryPathInvalid {
+                    path: entry.path.clone(),
+                });
+            }
+            if previous_path.is_some_and(|previous| previous >= entry.path.as_str()) {
+                return Err(WorkerRemoteToolContractError::WorkspaceEntriesNotCanonical);
+            }
+            previous_path = Some(entry.path.as_str());
+            validate_sha256_hex(entry.sha256.as_str(), "workspace_entry_sha256")?;
+            if matches!(entry.kind, WorkerRemoteWorkspaceEntryKind::Directory) {
+                if !entry.bytes.is_empty() || entry.sha256 != sha256_hex(&[]) {
+                    return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                        path: entry.path.clone(),
+                    });
+                }
+            } else if entry.sha256 != sha256_hex(entry.bytes.as_slice()) {
+                return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                    path: entry.path.clone(),
+                });
+            }
+            total_bytes = total_bytes
+                .checked_add(entry.bytes.len())
+                .ok_or(WorkerRemoteToolContractError::WorkspaceBundleLimitExceeded)?;
+            if total_bytes > MAX_REMOTE_WORKSPACE_BYTES {
+                return Err(WorkerRemoteToolContractError::WorkspaceBundleLimitExceeded);
+            }
+        }
+        serde_json::to_vec(&self.scoped_entries)
+            .map(|bytes| sha256_hex(bytes.as_slice()))
+            .map_err(|_| WorkerRemoteToolContractError::WorkspaceEntriesNotCanonical)
     }
 }
 
@@ -434,6 +546,12 @@ pub struct WorkerRemoteLeaseBinding {
     pub expires_at_unix_ms: i64,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Exact WorkGraph claim authority, if this task was claim-dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_graph_claim: Option<remote_protocol::RemoteWorkGraphClaimBinding>,
+    /// Typed posture prevents an absent claim from being interpreted implicitly.
+    #[serde(default)]
+    pub work_graph_posture: remote_protocol::RemoteWorkGraphTaskPosture,
     pub workspace_scope: WorkerWorkspaceScope,
     pub artifact_transport: WorkerArtifactTransport,
 }
@@ -456,9 +574,24 @@ impl WorkerRemoteLeaseBinding {
             grant_tool_name: lease.grant.tool_name.clone(),
             expires_at_unix_ms: lease.expires_at_unix_ms,
             required_capabilities: lease.required_capabilities.clone(),
+            // A normal worker lease has no WorkClaimAuthority. Claim-aware callers
+            // must bind the exact host claim instead of deriving it from run IDs.
+            work_graph_claim: None,
+            work_graph_posture: remote_protocol::RemoteWorkGraphTaskPosture::DirectToolDispatch,
             workspace_scope: lease.workspace_scope.clone(),
             artifact_transport: lease.artifact_transport.clone(),
         }
+    }
+
+    /// Replaces the direct-dispatch posture with exact host claim authority.
+    #[must_use]
+    pub fn with_work_graph_claim(
+        mut self,
+        claim: remote_protocol::RemoteWorkGraphClaimBinding,
+    ) -> Self {
+        self.work_graph_claim = Some(claim);
+        self.work_graph_posture = remote_protocol::RemoteWorkGraphTaskPosture::Claimed;
+        self
     }
 }
 
@@ -476,6 +609,9 @@ pub struct WorkerRemoteToolRequestEnvelope {
     pub lease: WorkerRemoteLeaseBinding,
     pub worker_identity: WorkerRemoteIdentity,
     pub workspace_transfer: WorkerRemoteWorkspaceTransfer,
+    /// Optional short-lived ciphertext addressed and authenticated by its descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_secret_artifact: Option<remote_protocol::EncryptedWorkerSecretArtifact>,
     /// Additive canonical protocol binding shared by every production adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_protocol: Option<remote_protocol::RemoteWorkerProtocolV1>,
@@ -538,6 +674,40 @@ impl WorkerRemoteToolRequestEnvelope {
         }
         if let Some(digest) = self.workspace_transfer.scoped_bundle_sha256.as_deref() {
             validate_sha256_hex(digest, "scoped_bundle_sha256")?;
+        }
+        match self.workspace_transfer.mode {
+            WorkerRemoteWorkspaceTransferMode::Manifest => {
+                if !self.workspace_transfer.scoped_entries.is_empty() {
+                    return Err(WorkerRemoteToolContractError::UnexpectedScopedBundleEntries);
+                }
+            }
+            WorkerRemoteWorkspaceTransferMode::ScopedBundle => {
+                let observed = self.workspace_transfer.canonical_bundle_sha256()?;
+                if self.workspace_transfer.scoped_bundle_sha256.as_deref()
+                    != Some(observed.as_str())
+                {
+                    return Err(WorkerRemoteToolContractError::DigestMismatch {
+                        field: "scoped_bundle_sha256",
+                    });
+                }
+                if self.lease.workspace_scope.allowed_paths.is_empty()
+                    || self.lease.workspace_scope.allowed_paths.len() > MAX_REMOTE_WORKSPACE_ENTRIES
+                {
+                    return Err(WorkerRemoteToolContractError::WorkspaceScopeInvalid);
+                }
+                for entry in &self.workspace_transfer.scoped_entries {
+                    if !workspace_entry_is_allowed(
+                        entry.path.as_str(),
+                        self.lease.workspace_scope.allowed_paths.as_slice(),
+                    )? {
+                        return Err(
+                            WorkerRemoteToolContractError::WorkspaceEntryOutsideLeaseScope {
+                                path: entry.path.clone(),
+                            },
+                        );
+                    }
+                }
+            }
         }
         let expected_kind = WorkerRemoteToolKind::from_tool_name(self.tool_name.as_str())
             .ok_or_else(|| WorkerRemoteToolContractError::UnsupportedTool {
@@ -723,6 +893,20 @@ pub enum WorkerRemoteToolContractError {
     DigestMismatch { field: &'static str },
     #[error("worker remote scoped bundle transfer requires scoped_bundle_sha256")]
     MissingScopedBundleDigest,
+    #[error("worker remote manifest transfer cannot carry scoped workspace entries")]
+    UnexpectedScopedBundleEntries,
+    #[error("worker remote scoped workspace entry path is invalid: {path}")]
+    WorkspaceEntryPathInvalid { path: String },
+    #[error("worker remote scoped workspace entries are not sorted and unique")]
+    WorkspaceEntriesNotCanonical,
+    #[error("worker remote scoped workspace entry digest mismatch: {path}")]
+    WorkspaceEntryDigestMismatch { path: String },
+    #[error("worker remote scoped workspace bundle exceeds its entry or byte limit")]
+    WorkspaceBundleLimitExceeded,
+    #[error("worker remote workspace lease allowlist is missing or invalid")]
+    WorkspaceScopeInvalid,
+    #[error("worker remote workspace entry is outside its lease allowlist: {path}")]
+    WorkspaceEntryOutsideLeaseScope { path: String },
     #[error("worker remote tool kind mismatch for {tool_name}: expected {expected}, got {actual}")]
     ToolKindMismatch { tool_name: String, expected: &'static str, actual: &'static str },
     #[error("worker remote lease tool mismatch: expected {expected}, got {actual}")]
@@ -741,6 +925,39 @@ pub enum WorkerRemoteToolContractError {
     CleanupGap { lease_id: String, reason: String },
     #[error("worker remote canonical protocol validation failed: {reason}")]
     CanonicalProtocol { reason: String },
+}
+
+fn workspace_entry_is_allowed(
+    entry_path: &str,
+    allowed_paths: &[String],
+) -> Result<bool, WorkerRemoteToolContractError> {
+    let entry = portable_workspace_segments(entry_path)?;
+    for raw in allowed_paths {
+        let allowed = portable_workspace_segments(raw.as_str())?;
+        if allowed.is_empty()
+            || entry == allowed
+            || (entry.len() > allowed.len() && entry.starts_with(allowed.as_slice()))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn portable_workspace_segments(raw: &str) -> Result<Vec<String>, WorkerRemoteToolContractError> {
+    if raw.contains('\\') {
+        return Err(WorkerRemoteToolContractError::WorkspaceScopeInvalid);
+    }
+    let trimmed = raw.trim().trim_matches('/');
+    let normalized = trimmed.strip_prefix("workspace/").unwrap_or(trimmed);
+    if normalized.is_empty() || matches!(normalized, "." | "workspace") {
+        return Ok(Vec::new());
+    }
+    let segments = normalized.split('/').map(str::to_owned).collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty() || matches!(segment.as_str(), "." | "..")) {
+        return Err(WorkerRemoteToolContractError::WorkspaceScopeInvalid);
+    }
+    Ok(segments)
 }
 
 fn validate_protocol(
