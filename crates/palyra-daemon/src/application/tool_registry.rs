@@ -20,11 +20,13 @@ mod types;
 mod tests;
 
 #[cfg(test)]
-pub(crate) use catalog::build_model_visible_tool_catalog_snapshot_with_external_tools;
-#[cfg(test)]
 pub(crate) use catalog::effective_tool_surface_report;
+#[cfg(test)]
 pub(crate) use catalog::{
     build_model_visible_tool_catalog_snapshot,
+    build_model_visible_tool_catalog_snapshot_with_external_tools,
+};
+pub(crate) use catalog::{
     build_model_visible_tool_catalog_snapshot_with_external_records, describe_catalog_tool,
     projection_policy_for_tool, provider_tools_from_catalog_snapshot,
     resolve_catalog_invoke_target, search_tool_catalog_index, snapshot_to_provider_request_value,
@@ -47,3 +49,70 @@ pub(crate) use types::{
     ToolResultProjectionPolicy, ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
     TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
 };
+
+/// Converts one verified durable dynamic-tool version into the standard
+/// registry model used by every provider surface.
+pub(crate) fn dynamic_tool_registry_entry(
+    record: &crate::journal::dynamic_tools::DynamicToolActiveRecord,
+) -> ToolRegistryEntry {
+    let proposal = &record.artifact.proposal;
+    let parallelism_policy = if !proposal.semantics.mutating {
+        ToolParallelismPolicy::ReadOnly
+    } else if proposal.semantics.idempotent {
+        ToolParallelismPolicy::Idempotent
+    } else {
+        ToolParallelismPolicy::Exclusive
+    };
+    ToolRegistryEntry {
+        name: proposal.tool_name.clone(),
+        description: proposal.description.clone(),
+        version: 1,
+        provenance: dynamic_tool_record_provenance(record),
+        input_schema: proposal.input_schema.clone(),
+        schema_hash: stable_hash_value(&proposal.input_schema),
+        capabilities: proposal.capability_needs.clone(),
+        // Dynamic names are fail-closed in the standard policy metadata, so the
+        // catalog must not advertise a weaker posture than dispatch enforces.
+        approval_posture: ToolApprovalPosture::ApprovalRequired,
+        projection_policy: ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        parallelism_policy,
+        replay_safety_class: ToolReplaySafetyClass::RequiresHumanConfirmation,
+        target_surfaces: vec![ToolExposureSurface::RunStream, ToolExposureSurface::RouteMessage],
+    }
+}
+
+/// Returns the exact digest/generation fence embedded in a catalog snapshot.
+pub(crate) fn dynamic_tool_record_provenance(
+    record: &crate::journal::dynamic_tools::DynamicToolActiveRecord,
+) -> String {
+    format!(
+        "dynamic:{}:{}:{}:{}:{}",
+        record.artifact.artifact_sha256,
+        record.runtime_eval.evidence_sha256,
+        record.decision.approval_generation,
+        record.decision.catalog_epoch,
+        record.registry_catalog_epoch,
+    )
+}
+
+/// Extracts a dynamic entry's exact provenance from the snapshot seen by the model.
+pub(crate) fn dynamic_tool_snapshot_provenance(
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+    tool_name: &str,
+) -> Result<Option<String>, &'static str> {
+    if !tool_name.starts_with("dynamic.") {
+        return Ok(None);
+    }
+    let mut matches = snapshot
+        .tools
+        .iter()
+        .chain(snapshot.indexed_tools.iter())
+        .filter(|tool| tool.name == tool_name);
+    let Some(tool) = matches.next() else {
+        return Err("dynamic_tool.catalog_binding_missing");
+    };
+    if matches.next().is_some() || !tool.provenance.starts_with("dynamic:") {
+        return Err("dynamic_tool.catalog_binding_invalid");
+    }
+    Ok(Some(tool.provenance.clone()))
+}

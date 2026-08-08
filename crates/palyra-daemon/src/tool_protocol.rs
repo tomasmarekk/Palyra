@@ -1243,6 +1243,15 @@ async fn run_allowlisted_tool_with_cancellation(
             execution_manifest: None,
         },
         "palyra.plugin.run" => execute_wasm_plugin_tool(config, input_json).await,
+        tool_name if is_namespaced_dynamic_tool(tool_name) => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("{tool_name} requires gateway signed dynamic registry context"),
+            timed_out: false,
+            executor: "signed_dynamic_tool".to_owned(),
+            sandbox_enforcement: "artifact_capability_scoped".to_owned(),
+            execution_manifest: None,
+        },
         _ => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1260,7 +1269,10 @@ async fn run_allowlisted_tool_with_cancellation(
 // broker remains the authority for the exact active tool, pinned catalog
 // epoch, schema, approval, and policy after this dispatch-family check.
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    if is_mcp_utility_tool(tool_name) || is_namespaced_mcp_tool(tool_name) {
+    if is_mcp_utility_tool(tool_name)
+        || is_namespaced_mcp_tool(tool_name)
+        || is_namespaced_dynamic_tool(tool_name)
+    {
         return true;
     }
     is_code_intel_tool(tool_name)
@@ -1350,6 +1362,17 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.browser.downloads.get"
                 | "palyra.plugin.run"
         )
+}
+
+fn is_namespaced_dynamic_tool(tool_name: &str) -> bool {
+    let Some(name) = tool_name.strip_prefix("dynamic.") else {
+        return false;
+    };
+    !name.is_empty()
+        && tool_name.len() <= 128
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 fn is_namespaced_mcp_tool(tool_name: &str) -> bool {
@@ -2596,6 +2619,33 @@ mod tests {
         assert!(is_runtime_supported_tool("mcp.workspace.files.read"));
         assert!(!is_runtime_supported_tool("mcp."));
         assert!(!is_runtime_supported_tool("mcp.docs"));
+    }
+
+    #[test]
+    fn namespaced_dynamic_tools_are_host_routed_and_fail_closed_for_approval() {
+        assert!(is_runtime_supported_tool("dynamic.echo"));
+        assert!(is_runtime_supported_tool("dynamic.namespace.echo_2"));
+        assert!(!is_runtime_supported_tool("dynamic."));
+        assert!(!is_runtime_supported_tool("dynamic.Uppercase"));
+        assert!(tool_metadata("dynamic.echo").is_none());
+        assert!(tool_requires_approval("dynamic.echo"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dynamic_tool_has_no_direct_executor_fallback() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["dynamic.echo".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome =
+            execute_tool_call(&config, "01ARZ3NDEKTSV4RRFFQ69G5FA2", "dynamic.echo", br#"{}"#)
+                .await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.executor, "signed_dynamic_tool");
+        assert!(outcome.error.contains("requires gateway signed dynamic registry context"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

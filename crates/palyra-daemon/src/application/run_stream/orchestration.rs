@@ -116,8 +116,8 @@ use crate::{
         BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
     },
     application::tool_registry::{
-        build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
-        snapshot_to_provider_request_value, tool_catalog_tape_payload,
+        build_model_visible_tool_catalog_snapshot_with_external_records, canonical_json_bytes,
+        dynamic_tool_registry_entry, snapshot_to_provider_request_value, tool_catalog_tape_payload,
         ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolCatalogPolicySnapshot,
         ToolExposureSurface,
     },
@@ -1911,10 +1911,26 @@ async fn build_run_stream_tool_catalog_snapshot(
         remaining_tool_budget: None,
         created_at_unix_ms,
     };
-    Ok(if let Some(runtime) = runtime_state.mcp_runtime() {
-        runtime.build_tool_catalog_snapshot(request)
+    let dynamic_tools = if runtime_state.config.feature_rollouts.dynamic_tool_builder.enabled {
+        runtime_state
+            .journal_store
+            .active_dynamic_tools()
+            .map_err(|_| Status::internal("dynamic_tool.registry_unavailable"))?
+            .iter()
+            .map(dynamic_tool_registry_entry)
+            .collect::<Vec<_>>()
     } else {
-        build_model_visible_tool_catalog_snapshot(request)
+        Vec::new()
+    };
+    Ok(if let Some(runtime) = runtime_state.mcp_runtime() {
+        runtime.build_tool_catalog_snapshot_with_external_tools(request, dynamic_tools.as_slice())
+    } else {
+        build_model_visible_tool_catalog_snapshot_with_external_records(
+            request,
+            dynamic_tools.as_slice(),
+            &[],
+            &[],
+        )
     })
 }
 

@@ -1507,6 +1507,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::skills::console_skill_builder_candidates_list_handler)
                 .post(console::skills::console_skill_builder_candidate_create_handler),
         )
+        .route(
+            "/console/v1/skills/dynamic-tools/proposals",
+            post(console::dynamic_tools::console_dynamic_tool_proposal_handler),
+        )
+        .route(
+            "/console/v1/skills/dynamic-tools/activate",
+            post(console::dynamic_tools::console_dynamic_tool_activation_handler),
+        )
         .route("/console/v1/skills/install", post(console::skills::console_skills_install_handler))
         .route(
             "/console/v1/skills/{skill_id}/verify",

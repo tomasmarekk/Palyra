@@ -1855,10 +1855,26 @@ pub fn namespaced_tool_id(server_name: &str, tool_name: &str) -> Result<String, 
 /// Only reports for enabled, healthy servers in `supervisor_snapshot` supply
 /// external registry entries. Filtered tools and unhealthy server entries are
 /// still surfaced as catalog availability evidence with their MCP reason codes.
+#[cfg(test)]
 pub(crate) fn build_mcp_tool_catalog_snapshot(
     request: ToolCatalogBuildRequest<'_>,
     supervisor_snapshot: &McpRuntimeSupervisorSnapshot,
     discovery_reports: &[McpToolDiscoveryReport],
+) -> ModelVisibleToolCatalogSnapshot {
+    build_mcp_tool_catalog_snapshot_with_external_tools(
+        request,
+        supervisor_snapshot,
+        discovery_reports,
+        &[],
+    )
+}
+
+/// Projects MCP and other host-verified tools through one standard catalog.
+pub(crate) fn build_mcp_tool_catalog_snapshot_with_external_tools(
+    request: ToolCatalogBuildRequest<'_>,
+    supervisor_snapshot: &McpRuntimeSupervisorSnapshot,
+    discovery_reports: &[McpToolDiscoveryReport],
+    trusted_external_tools: &[ToolRegistryEntry],
 ) -> ModelVisibleToolCatalogSnapshot {
     let healthy_servers = supervisor_snapshot
         .servers
@@ -1905,6 +1921,7 @@ pub(crate) fn build_mcp_tool_catalog_snapshot(
             ));
         }
     }
+    registry_entries.extend(trusted_external_tools.iter().cloned());
 
     registry_entries.sort_by(|left, right| left.name.cmp(&right.name));
     registry_entries.dedup_by(|left, right| left.name == right.name);

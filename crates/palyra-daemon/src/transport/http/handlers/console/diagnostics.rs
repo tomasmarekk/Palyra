@@ -2209,6 +2209,7 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
     }
 
     runtime_errors.truncate(5);
+    let dynamic_registry = state.runtime.journal_store.dynamic_tool_registry_diagnostics();
 
     json!({
         "skills_root": skills_root,
@@ -2237,6 +2238,14 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
                 .as_ref()
                 .map(|index| index.entries.iter().filter(|entry| entry.source_kind == "prompt").count())
                 .unwrap_or(0),
+            "dynamic_registry": match dynamic_registry {
+                Ok(diagnostics) => serde_json::to_value(diagnostics).unwrap_or_else(|_| json!({
+                    "reason_code": "dynamic_tool.diagnostics_serialization_failed"
+                })),
+                Err(_) => json!({
+                    "reason_code": "dynamic_tool.registry_unavailable"
+                }),
+            },
         },
     })
 }

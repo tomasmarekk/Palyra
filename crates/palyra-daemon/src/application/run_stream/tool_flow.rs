@@ -67,9 +67,9 @@ use crate::{
         ToolCallSignature, ToolResultMiddlewareReport,
     },
     application::tool_registry::{
-        describe_catalog_tool, normalization_audit_tape_payload, projection_policy_for_tool,
-        rejection_tape_payload, resolve_catalog_invoke_target, resolve_tool_execution_semantics,
-        search_tool_catalog_index, tool_call_rejection_outcome,
+        describe_catalog_tool, dynamic_tool_snapshot_provenance, normalization_audit_tape_payload,
+        projection_policy_for_tool, rejection_tape_payload, resolve_catalog_invoke_target,
+        resolve_tool_execution_semantics, search_tool_catalog_index, tool_call_rejection_outcome,
         validate_tool_call_against_catalog_snapshot, validate_tool_call_against_model_visible_tool,
         ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
         ToolCallRejection, ToolCatalogBridgeError, ToolReplaySafetyClass,
@@ -188,6 +188,7 @@ pub(crate) struct RunStreamToolProposalPreparation {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
     backend_selection: ToolProposalBackendSelection,
+    expected_dynamic_provenance: Option<String>,
     tool_signature: ToolCallSignature,
     synthetic_outcome: Option<ToolExecutionOutcome>,
     approval_timed_out: bool,
@@ -223,6 +224,7 @@ pub(crate) struct RunStreamPreparedToolExecution {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
     backend_selection: ToolProposalBackendSelection,
+    expected_dynamic_provenance: Option<String>,
 }
 
 struct PreparedToolRuntimeExecution<'a> {
@@ -659,14 +661,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     )
     .await?;
 
-    let RunStreamToolProposalPreparation {
-        decision,
-        resolved_session_id,
-        backend_selection,
-        tool_signature,
-        synthetic_outcome,
-        approval_timed_out: _,
-    } = prepare_run_stream_tool_proposal_execution(
+    let mut preparation = prepare_run_stream_tool_proposal_execution(
         sender,
         stream,
         runtime_state,
@@ -684,6 +679,18 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         tape_seq,
     )
     .await?;
+    preparation.expected_dynamic_provenance =
+        dynamic_tool_snapshot_provenance(tool_catalog_snapshot, execution_tool_name.as_str())
+            .map_err(Status::failed_precondition)?;
+    let RunStreamToolProposalPreparation {
+        decision,
+        resolved_session_id,
+        backend_selection,
+        expected_dynamic_provenance,
+        tool_signature,
+        synthetic_outcome,
+        approval_timed_out: _,
+    } = preparation;
 
     let replay_safety_class = tool_catalog_snapshot
         .tools
@@ -700,6 +707,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         decision,
         resolved_session_id,
         backend_selection,
+        expected_dynamic_provenance,
     };
     if let Some(outcome) = synthetic_outcome {
         let completed = finalize_prepared_tool_execution_outcome(
@@ -2195,6 +2203,7 @@ async fn resolve_run_stream_tool_gate_approval(
         decision,
         resolved_session_id,
         backend_selection,
+        expected_dynamic_provenance: None,
         tool_signature,
         synthetic_outcome,
         approval_timed_out,
@@ -2930,6 +2939,7 @@ async fn execute_allowed_prepared_tool_runtime(
     let execution_proposal_id = prepared.proposal_id.clone();
     let execution_tool_name = prepared.tool_name.clone();
     let execution_input_json = prepared.input_json.clone();
+    let expected_dynamic_provenance = prepared.expected_dynamic_provenance.clone();
     let execution_backend = prepared.backend_selection.resolution.resolved;
     let execution_backend_reason = prepared.backend_selection.resolution.reason_code.clone();
     let execution_cancellation =
@@ -2980,6 +2990,7 @@ async fn execute_allowed_prepared_tool_runtime(
                     process_progress_sink,
                     cancellation_context: Some(execution_cancellation),
                     child_task_parent_context: Some(child_task_parent_context),
+                    expected_dynamic_provenance,
                 },
             )
             .await
@@ -5273,6 +5284,7 @@ mod tests {
                     reason: "test local sandbox".to_owned(),
                 },
             },
+            expected_dynamic_provenance: None,
         }
     }
 

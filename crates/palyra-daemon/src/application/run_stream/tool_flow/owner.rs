@@ -75,6 +75,7 @@ struct PendingProposalEntry {
     execution_tool_name: String,
     execution_input_json: Vec<u8>,
     replay_safety_class: ToolReplaySafetyClass,
+    expected_dynamic_provenance: Option<String>,
     retained_proposal: crate::application::runtime_kernel_v2::phases::RetainedToolProposalRef,
     authority_class: crate::application::runtime_kernel_v2::phases::ToolAuthorityClass,
 }
@@ -290,6 +291,18 @@ impl RunStreamLiveToolFlowOwner {
                 )?,
             });
         }
+        let expected_dynamic_provenance =
+            match dynamic_tool_snapshot_provenance(
+                &entry.proposal.catalog,
+                resolved.tool_name.as_str(),
+            ) {
+                Ok(provenance) => provenance,
+                Err(reason) => {
+                    return Ok(LiveToolGateResult::Denied {
+                        evidence: self.required_evidence(LiveToolFlowStage::Gate, reason)?,
+                    });
+                }
+            };
 
         let prepared_gate = prepare_run_stream_tool_gate_without_approval(
             host.sender,
@@ -319,6 +332,7 @@ impl RunStreamLiveToolFlowOwner {
                     execution_tool_name: resolved.tool_name,
                     execution_input_json: resolved.input_json,
                     replay_safety_class: resolved.replay_safety_class,
+                    expected_dynamic_provenance,
                     retained_proposal: request.retained_proposal,
                     authority_class: request.requested_authority,
                 },
@@ -326,7 +340,7 @@ impl RunStreamLiveToolFlowOwner {
             return Ok(LiveToolGateResult::ApprovalRequired { approval_subject_id: subject });
         }
 
-        let preparation = resolve_run_stream_tool_gate_approval(
+        let mut preparation = resolve_run_stream_tool_gate_approval(
             host.sender,
             host.stream,
             host.runtime_state,
@@ -345,6 +359,7 @@ impl RunStreamLiveToolFlowOwner {
         )
         .await
         .map_err(|error| self.status_failure(LiveToolFlowStage::Gate, &error))?;
+        preparation.expected_dynamic_provenance = expected_dynamic_provenance;
         self.finish_gate(FinishGateRequest {
             proposal_id: request.proposal_id,
             tool_name: resolved.tool_name,
@@ -460,7 +475,7 @@ impl RunStreamLiveToolFlowOwner {
                 self.failure(LiveToolFlowStage::Approval, "approval.subject_binding_mismatch")
             );
         }
-        let preparation = resolve_run_stream_tool_gate_approval(
+        let mut preparation = resolve_run_stream_tool_gate_approval(
             host.sender,
             host.stream,
             host.runtime_state,
@@ -479,6 +494,7 @@ impl RunStreamLiveToolFlowOwner {
         )
         .await
         .map_err(|error| self.status_failure(LiveToolFlowStage::Approval, &error))?;
+        preparation.expected_dynamic_provenance = pending.expected_dynamic_provenance;
         let approval_timed_out = preparation.approval_timed_out;
         let result = self.finish_gate(FinishGateRequest {
             proposal_id: request.proposal_id,
@@ -700,6 +716,7 @@ impl RunStreamLiveToolFlowOwner {
                     decision: preparation.decision,
                     resolved_session_id: preparation.resolved_session_id,
                     backend_selection: preparation.backend_selection,
+                    expected_dynamic_provenance: preparation.expected_dynamic_provenance,
                 },
                 retained_proposal,
                 authority_class,
@@ -965,12 +982,23 @@ const fn authority_class_for_parallelism(
 #[cfg(test)]
 mod live_owner_tests {
     use super::{
-        RunStreamLiveToolCommand, TOOL_APPROVAL_RESPONSE_TIMEOUT, ToolParallelism,
-        authority_class_for_parallelism, run_stream_live_tool_flow,
+        FinishGateRequest, RunStreamLiveToolCommand, RunStreamToolProposalPreparation,
+        TOOL_APPROVAL_RESPONSE_TIMEOUT, ToolParallelism, authority_class_for_parallelism,
+        run_stream_live_tool_flow,
+    };
+    use crate::{
+        application::{
+            tool_governance::build_tool_call_signature,
+            tool_runtime::dynamic_tools::dynamic_tool_provenance_is_current,
+            tool_security::ToolProposalBackendSelection,
+        },
+        execution_backends::{ExecutionBackendPreference, ExecutionBackendResolution},
+        tool_protocol::ToolDecision,
     };
     use crate::application::runtime_kernel_v2::phases::ToolAuthorityClass;
     use palyra_common::runtime_contracts::{
         RuntimeGeneration, RuntimeGenerationLane, RuntimeLeaseId, RuntimeRunId, RuntimeSessionId,
+        RuntimeToolProposalId,
     };
 
     const OWNER_SOURCE: &str = include_str!("owner.rs");
@@ -1069,6 +1097,93 @@ mod live_owner_tests {
     fn stale_generation_is_rejected_before_stage_dispatch() {
         assert!(OWNER_SOURCE.contains("tool_flow.stale_or_cross_run_authority"));
         assert!(OWNER_SOURCE.contains("observed != &self.lane_authority"));
+    }
+
+    #[test]
+    fn owner_retains_snapshot_provenance_across_update_and_rollback() {
+        let generation = RuntimeGeneration::new(1).expect("generation");
+        let authority =
+            crate::application::runtime_kernel_v2::phases::PhaseLaneAuthority::test_only_from_host_leases(
+                RuntimeSessionId::parse("session_dynamic_snapshot").expect("session"),
+                RuntimeRunId::parse("run_dynamic_snapshot").expect("run"),
+                generation,
+                RuntimeLeaseId::parse("run_lease_dynamic_snapshot").expect("run lease"),
+                RuntimeGenerationLane::Tool,
+                generation,
+                RuntimeLeaseId::parse("tool_lease_dynamic_snapshot").expect("tool lease"),
+            );
+        let (_, mut owner) = run_stream_live_tool_flow(authority);
+        let proposal_id =
+            RuntimeToolProposalId::parse("tool-proposal:01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .expect("proposal");
+        let tool_name = "dynamic.snapshot".to_owned();
+        let input_json = br#"{"value":"snapshot"}"#.to_vec();
+        let snapshot_provenance = "dynamic:artifact-v2:eval-v2:2:7:11".to_owned();
+        let preparation = RunStreamToolProposalPreparation {
+            decision: ToolDecision {
+                allowed: true,
+                reason: "test_policy_grant".to_owned(),
+                approval_required: false,
+                policy_enforced: true,
+            },
+            resolved_session_id: "session_dynamic_snapshot".to_owned(),
+            backend_selection: ToolProposalBackendSelection {
+                agent_id: None,
+                requested_preference: ExecutionBackendPreference::LocalSandbox,
+                resolution: ExecutionBackendResolution {
+                    requested: ExecutionBackendPreference::LocalSandbox,
+                    resolved: ExecutionBackendPreference::LocalSandbox,
+                    fallback_used: false,
+                    reason_code: "test_local_sandbox".to_owned(),
+                    approval_required: false,
+                    reason: "test local sandbox".to_owned(),
+                },
+            },
+            expected_dynamic_provenance: Some(snapshot_provenance.clone()),
+            tool_signature: build_tool_call_signature(&tool_name, &input_json),
+            synthetic_outcome: None,
+            approval_timed_out: false,
+        };
+        let retained_proposal =
+            crate::application::runtime_kernel_v2::phases::LiveToolAuthorityGateway::retained_proposal_ref(
+                super::LiveToolHostRef {
+                    id: palyra_common::runtime_contracts::RuntimeOperationId::parse(
+                        "retained-proposal:01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                    )
+                    .expect("retained proposal"),
+                    sha256: [7; 32],
+                },
+            );
+        owner
+            .finish_gate(FinishGateRequest {
+                proposal_id: proposal_id.clone(),
+                tool_name,
+                input_json,
+                replay_safety_class:
+                    crate::application::tool_registry::ToolReplaySafetyClass::RequiresHumanConfirmation,
+                retained_proposal,
+                authority_class: ToolAuthorityClass::ExternalEffect,
+                approval_subject_id: None,
+                preparation,
+                stage: super::LiveToolFlowStage::Gate,
+            })
+            .expect("snapshot gate");
+
+        let retained = owner.prepared.get(proposal_id.as_str()).expect("prepared");
+        let observed = retained
+            .prepared
+            .expected_dynamic_provenance
+            .as_deref()
+            .expect("snapshot provenance");
+        assert_eq!(observed, snapshot_provenance);
+        assert!(!dynamic_tool_provenance_is_current(
+            observed,
+            "dynamic:artifact-v3:eval-v3:3:8:12"
+        ));
+        assert!(!dynamic_tool_provenance_is_current(
+            observed,
+            "dynamic:artifact-v1:eval-v1:4:9:13"
+        ));
     }
 
     #[tokio::test]

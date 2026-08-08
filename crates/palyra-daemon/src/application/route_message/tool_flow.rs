@@ -44,7 +44,8 @@ use crate::{
         },
         tool_governance::{apply_host_tool_result_middleware, ToolResultMiddlewareReport},
         tool_registry::{
-            describe_catalog_tool, normalization_audit_tape_payload, rejection_tape_payload,
+            describe_catalog_tool, dynamic_tool_snapshot_provenance,
+            normalization_audit_tape_payload, rejection_tape_payload,
             resolve_catalog_invoke_target, resolve_tool_execution_semantics,
             search_tool_catalog_index, tool_call_rejection_outcome,
             validate_tool_call_against_catalog_snapshot,
@@ -271,6 +272,9 @@ pub(crate) async fn process_route_tool_proposal_event(
         .await?;
     let tool_name = execution_tool_name.as_str();
     let input_json = execution_input_json.as_slice();
+    let expected_dynamic_provenance =
+        dynamic_tool_snapshot_provenance(tool_catalog_snapshot, tool_name)
+            .map_err(Status::failed_precondition)?;
     let replay_safety_class = tool_catalog_snapshot
         .tools
         .iter()
@@ -434,6 +438,7 @@ pub(crate) async fn process_route_tool_proposal_event(
         let execution_proposal_id = proposal_id.to_owned();
         let execution_tool_name = tool_name.to_owned();
         let dispatched_input_json = execution_input_json.clone();
+        let expected_dynamic_provenance = expected_dynamic_provenance.clone();
         let execution_backend = backend_selection.resolution.resolved;
         let execution_backend_reason = backend_selection.resolution.reason_code.clone();
         let execution_cancellation = effective_cancellation.clone();
@@ -461,6 +466,7 @@ pub(crate) async fn process_route_tool_proposal_event(
                     process_progress_sink: None,
                     cancellation_context: Some(execution_cancellation),
                     child_task_parent_context: Some(child_task_parent_context),
+                    expected_dynamic_provenance,
                 },
             )
             .await

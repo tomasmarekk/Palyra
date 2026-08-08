@@ -11,6 +11,7 @@ pub(crate) mod code_intel;
 pub(crate) mod context;
 pub(crate) mod delegation;
 pub(crate) mod document;
+pub(crate) mod dynamic_tools;
 pub(crate) mod http_fetch;
 pub(crate) mod image_observe;
 pub(crate) mod memory;

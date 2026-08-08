@@ -40,6 +40,7 @@ const LAST_GOOD_GRACE_MS: u64 = 120_000;
 ///
 /// Principal and channel identifiers are hashed before they enter the
 /// snapshot so the catalog never carries raw identity strings.
+#[cfg(test)]
 pub(crate) fn build_model_visible_tool_catalog_snapshot(
     request: ToolCatalogBuildRequest<'_>,
 ) -> ModelVisibleToolCatalogSnapshot {
@@ -52,6 +53,7 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
 /// provider-schema, deterministic ordering, and catalog hashing gates as
 /// builtins. Callers are responsible for namespacing external tools before
 /// import so provider-visible names cannot collide with builtins.
+#[cfg(test)]
 pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_tools(
     request: ToolCatalogBuildRequest<'_>,
     external_tools: &[ToolRegistryEntry],

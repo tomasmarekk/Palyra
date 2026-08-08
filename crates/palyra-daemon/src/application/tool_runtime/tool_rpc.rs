@@ -444,6 +444,7 @@ pub(crate) async fn execute_granted_tool_rpc_call(
             process_progress_sink: None,
             cancellation_context: None,
             child_task_parent_context: child_task_parent_context.cloned(),
+            expected_dynamic_provenance: None,
         },
     ));
     let outcome = match timeout {

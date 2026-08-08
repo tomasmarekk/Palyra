@@ -43,14 +43,11 @@ use crate::{
         ResourceServiceKind, ResourceUnitsV1,
     },
     application::mcp_broker::{
-        build_mcp_tool_catalog_snapshot, mcp_manifest_from_config, McpBroker, McpBrokerPolicy,
-        McpRuntimeSupervisor, McpRuntimeTransport, McpServerLifecycleState, McpToolDiscoveryReport,
-        McpToolInvocationOutcome,
+        build_mcp_tool_catalog_snapshot_with_external_tools, mcp_manifest_from_config, McpBroker,
+        McpBrokerPolicy, McpRuntimeSupervisor, McpRuntimeTransport, McpServerLifecycleState,
+        McpToolDiscoveryReport, McpToolInvocationOutcome,
     },
-    application::tool_registry::{
-        build_model_visible_tool_catalog_snapshot, ModelVisibleToolCatalogSnapshot,
-        ToolCatalogBuildRequest,
-    },
+    application::tool_registry::{ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest},
     config::{
         McpServerConfig, McpServerEgressPolicy, McpServerOAuthGrant, McpServerSamplingMode,
         McpServerTransport, McpServerTrustLevel, McpServersConfig,
@@ -232,16 +229,20 @@ impl McpProductionRuntime {
         self.discovery_reports.read().map(|reports| reports.clone()).unwrap_or_default()
     }
 
-    /// Builds the run-pinned tool catalog from production discovery evidence.
-    ///
-    /// Preview-only mode may exercise actors and conformance but cannot expose
-    /// external tools to a model or dispatcher.
-    pub(crate) fn build_tool_catalog_snapshot(
+    /// Builds the same catalog while merging additional host-verified entries.
+    pub(crate) fn build_tool_catalog_snapshot_with_external_tools(
         &self,
         request: ToolCatalogBuildRequest<'_>,
+        external_tools: &[crate::application::tool_registry::ToolRegistryEntry],
     ) -> ModelVisibleToolCatalogSnapshot {
         if self.mode != RuntimePreviewMode::Enabled {
-            return build_model_visible_tool_catalog_snapshot(request);
+            return crate::application::tool_registry::
+                build_model_visible_tool_catalog_snapshot_with_external_records(
+                    request,
+                    external_tools,
+                    &[],
+                    &[],
+                );
         }
         let supervisor = self
             .supervisor
@@ -252,7 +253,12 @@ impl McpProductionRuntime {
                     .snapshot(now_unix_ms())
             });
         let reports = self.discovery_reports();
-        build_mcp_tool_catalog_snapshot(request, &supervisor, reports.as_slice())
+        build_mcp_tool_catalog_snapshot_with_external_tools(
+            request,
+            &supervisor,
+            reports.as_slice(),
+            external_tools,
+        )
     }
 
     /// Invokes one already-admitted external tool through the broker's

@@ -10,8 +10,9 @@ use super::types::{
     ToolCatalogFilterReasonCode, ToolParallelismPolicy, ToolRegistryEntry, ToolReplaySafetyClass,
 };
 use super::{
-    build_model_visible_tool_catalog_snapshot, describe_catalog_tool,
-    effective_tool_surface_report, projection_policy_for_tool,
+    build_model_visible_tool_catalog_snapshot,
+    build_model_visible_tool_catalog_snapshot_with_external_records, describe_catalog_tool,
+    dynamic_tool_snapshot_provenance, effective_tool_surface_report, projection_policy_for_tool,
     provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target,
     resolve_tool_execution_semantics, safe_resume_matrix, search_tool_catalog_index,
     snapshot_to_provider_request_value, stable_hash_value, tool_execution_semantics,
@@ -116,6 +117,54 @@ fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
     assert!(snapshot.tools.iter().all(|tool| !tool.internal_schema_hash.is_empty()));
     assert!(snapshot.filtered_tools.iter().any(|tool| tool.name == "palyra.process.run"));
     assert!(snapshot.snapshot_id.starts_with("toolcat_"));
+}
+
+#[test]
+fn dynamic_catalog_snapshot_preserves_exact_activation_provenance() {
+    let config = config(&["dynamic.echo"]);
+    let provenance = format!("dynamic:{}:{}:7:11:13", "a".repeat(64), "b".repeat(64));
+    let entry = ToolRegistryEntry {
+        name: "dynamic.echo".to_owned(),
+        description: "Approved dynamic echo".to_owned(),
+        version: 1,
+        provenance: provenance.clone(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": false
+        }),
+        schema_hash: "c".repeat(64),
+        capabilities: vec!["tool:palyra.echo".to_owned()],
+        approval_posture: ToolApprovalPosture::ApprovalRequired,
+        projection_policy: ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        parallelism_policy: ToolParallelismPolicy::ReadOnly,
+        replay_safety_class: ToolReplaySafetyClass::RequiresHumanConfirmation,
+        target_surfaces: vec![ToolExposureSurface::RunStream],
+    };
+    let snapshot = build_model_visible_tool_catalog_snapshot_with_external_records(
+        ToolCatalogBuildRequest {
+            config: &config,
+            catalog_policy: &catalog_policy(&config),
+            browser_service_enabled: false,
+            browser_service_configured: false,
+            request_context: &request_context(),
+            provider_kind: "openai_compatible",
+            provider_model_id: Some("gpt-test"),
+            surface: ToolExposureSurface::RunStream,
+            remaining_tool_budget: None,
+            created_at_unix_ms: 42,
+        },
+        &[entry],
+        &[],
+        &[],
+    );
+
+    assert_eq!(dynamic_tool_snapshot_provenance(&snapshot, "dynamic.echo"), Ok(Some(provenance)));
+    assert_eq!(
+        dynamic_tool_snapshot_provenance(&snapshot, "dynamic.missing"),
+        Err("dynamic_tool.catalog_binding_missing")
+    );
 }
 
 #[test]

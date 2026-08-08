@@ -845,6 +845,8 @@ pub(crate) struct ToolRuntimeDispatchControls {
     /// ToolExecution scope which scheduled them.
     pub(crate) child_task_parent_context:
         Option<palyra_common::runtime_contracts::CancellationContextV1>,
+    /// Exact dynamic registry version observed in the model-visible catalog.
+    pub(crate) expected_dynamic_provenance: Option<String>,
 }
 
 /// Wraps an initial legacy counter in the shared handle.
@@ -924,6 +926,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
             process_progress_sink: None,
             cancellation_context: None,
             child_task_parent_context: None,
+            expected_dynamic_provenance: None,
         },
     )
     .await
@@ -1575,6 +1578,16 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         outcome
     } else if tool_name == PROCESS_LIST_TOOL_NAME {
         execute_process_list_tool(runtime_state, context, proposal_id, input_json)
+    } else if tool_name.starts_with("dynamic.") {
+        Box::pin(crate::application::tool_runtime::dynamic_tools::execute_dynamic_tool(
+            runtime_state,
+            context,
+            proposal_id,
+            tool_name,
+            input_json,
+            controls,
+        ))
+        .await
     } else if tool_name.starts_with("mcp.") {
         // Keep the persistent transport state machine out of the common dispatch future. Tool
         // turns poll this dispatcher through nested agent-loop futures on bounded Tokio stacks.

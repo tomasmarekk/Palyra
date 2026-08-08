@@ -83,6 +83,7 @@ pub(crate) mod autonomous_wakes;
 pub(crate) mod autonomy;
 pub mod child_completion;
 pub(crate) mod commitment_candidates;
+pub(crate) mod dynamic_tools;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_runtime;
 mod metadata_trace;
@@ -7990,6 +7991,11 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration { version: 102, name: "session_search_fts_projection", sql: MIGRATION_102_SQL },
     Migration { version: 103, name: "memory_index_rebuild_checkpoints", sql: MIGRATION_103_SQL },
+    Migration {
+        version: 104,
+        name: "signed_dynamic_tool_lifecycle",
+        sql: dynamic_tools::MIGRATION_104_SQL,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(
