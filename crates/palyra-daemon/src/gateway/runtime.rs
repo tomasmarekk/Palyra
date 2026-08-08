@@ -9700,6 +9700,153 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Synthesizes speech under the current provider generation and capacity gate.
+    ///
+    /// # Errors
+    /// Returns a typed unsupported-provider status, provider admission failure,
+    /// stale-provider abort, or mapped terminal upstream error.
+    #[allow(clippy::result_large_err)]
+    pub async fn execute_audio_synthesis(
+        self: &Arc<Self>,
+        request: AudioSynthesisRequest,
+    ) -> Result<AudioSynthesisResponse, Status> {
+        let provider_runtime = self.current_model_provider_runtime();
+        let model_provider = Arc::clone(&provider_runtime.provider);
+        let provider_status = model_provider.status_snapshot();
+        let lease_context = ProviderLeaseExecutionContext {
+            provider_id: provider_status.provider_id.clone(),
+            credential_id: provider_status.credential_id.clone(),
+            priority: LeasePriority::Foreground,
+            task_label: "audio_synthesis".to_owned(),
+            max_wait_ms: 30_000,
+            session_id: None,
+            run_id: None,
+            runtime_authority: None,
+            diagnostic_scope_id: None,
+        };
+        let candidate_admission = GatewayProviderAttemptAdmission {
+            runtime_state: Arc::clone(self),
+            lease_context,
+            expected_configuration_epoch: provider_runtime.configuration_epoch,
+            health_authority_by_provider: Arc::new(
+                provider_runtime.health_authority_by_provider.clone(),
+            ),
+            feedback: Arc::new(Mutex::new(Vec::new())),
+            attempted_profile_ids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            #[cfg(test)]
+            fail_health_observation_once: None,
+        };
+
+        self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
+        let result = if model_provider.uses_candidate_attempt_admission() {
+            model_provider
+                .synthesize_audio_with_attempt_admission(
+                    request,
+                    Arc::new(candidate_admission.clone()),
+                )
+                .await
+        } else {
+            let model_id = provider_status.model_id.as_deref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "model provider does not identify its speech synthesis authority",
+                )
+            })?;
+            loop {
+                let binding = match candidate_admission
+                    .prepare_attempt(
+                        provider_status.provider_id.as_str(),
+                        provider_status.credential_id.as_str(),
+                        model_id,
+                    )
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if let Err(error) = candidate_admission.check_eligibility(&binding) {
+                    break Err(provider_attempt_admission_provider_error(error));
+                }
+                let _permit = match candidate_admission.acquire(&binding).await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let credential = match candidate_admission.materialize_credential(&binding).await {
+                    Ok(credential) => credential,
+                    Err(_) if binding.credential_attempt.is_some() => continue,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let runtime_authority = match candidate_admission.record_started(&binding).await {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                let attempt_result = model_provider
+                    .synthesize_audio_with_credential(request.clone(), credential.as_ref())
+                    .await;
+                drop(credential);
+                let completion = match &attempt_result {
+                    Ok(_) => candidate_admission.record_success(&binding, runtime_authority).await,
+                    Err(error) => {
+                        candidate_admission.record_failure(&binding, runtime_authority, error).await
+                    }
+                };
+                let completion = match completion {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        break Err(provider_attempt_admission_provider_error(error));
+                    }
+                };
+                if completion == ProviderAttemptCompletionDisposition::StaleSuppressed {
+                    break Err(crate::model_provider::provider_attempt_superseded_error());
+                }
+                if let Err(error) = &attempt_result {
+                    if binding.credential_attempt.is_some()
+                        && crate::model_provider::provider_error_allows_credential_rotation(
+                            error, false,
+                        )
+                    {
+                        continue;
+                    }
+                }
+                break attempt_result;
+            }
+        };
+        if !candidate_admission.apply_buffered_feedback() {
+            return Err(provider_reconfigured_status());
+        }
+        match result {
+            Ok(response) => {
+                if response.retry_count > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(u64::from(response.retry_count), Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.counters.model_provider_failures.fetch_add(1, Ordering::Relaxed);
+                if error.retry_count() > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(u64::from(error.retry_count()), Ordering::Relaxed);
+                }
+                if error.is_circuit_open() {
+                    self.counters
+                        .model_provider_circuit_open_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(map_provider_error(error))
+            }
+        }
+    }
+
     /// Runs a host-owned, fixed provider probe and atomically settles its durable lease.
     ///
     /// The provider determines no routing, failover, cache, prompt, or tool input from

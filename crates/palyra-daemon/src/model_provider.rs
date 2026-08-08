@@ -1,9 +1,9 @@
 //! Model/provider orchestration: registry-backed routing across chat,
-//! embeddings, and audio-transcription backends with retries, circuit
+//! embeddings, audio transcription, and speech synthesis backends with retries, circuit
 //! breaking, response caching, and console status snapshots.
 //!
 //! Provider abstraction model: [`ModelProvider`] (chat completion, audio
-//! transcription, status) and [`EmbeddingsProvider`] are the runtime traits.
+//! transforms, status) and [`EmbeddingsProvider`] are the runtime traits.
 //! Concrete backends are a deterministic offline provider (fixtures, smoke
 //! flows), an OpenAI-compatible HTTP provider, and an Anthropic-compatible
 //! HTTP provider that also serves MiniMax via bearer auth.
@@ -100,11 +100,12 @@ use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
-    classify_terminal_outcome, project_provider_transcript, AudioTranscriptionRequest,
-    AudioTranscriptionResponse, AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse,
-    PromptCachePolicy, PromptCacheReport, PromptCacheStrategy, ProviderAttemptState,
-    ProviderAttemptSummary, ProviderEvent, ProviderFinishReason, ProviderImageInput,
-    ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+    classify_terminal_outcome, project_provider_transcript, AudioSynthesisRequest,
+    AudioSynthesisResponse, AudioTranscriptionRequest, AudioTranscriptionResponse,
+    AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy,
+    PromptCacheReport, PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary,
+    ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
     ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
     ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
     ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
@@ -141,6 +142,9 @@ const OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const OPENAI_CHATGPT_ACCOUNT_ID_CLAIM: &str = "chatgpt_account_id";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
+const OPENAI_AUDIO_SPEECH_PATH: &str = "/audio/speech";
+const OPENAI_AUDIO_SPEECH_MODEL: &str = "gpt-4o-mini-tts";
+const MAX_AUDIO_SYNTHESIS_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 const ANTHROPIC_OAUTH_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
@@ -1033,6 +1037,16 @@ pub trait ModelProvider: Send + Sync {
         self.transcribe_audio(request)
     }
 
+    /// Synthesizes speech with an optional host-owned credential override.
+    fn synthesize_audio_with_credential<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+        _credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        self.synthesize_audio(request)
+    }
+
     /// Executes exactly one chat request for a host-owned probe.
     ///
     /// Registry HTTP backends override this to bypass ordinary retry and circuit
@@ -1113,6 +1127,29 @@ pub trait ModelProvider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
     {
         self.transcribe_audio(request)
+    }
+
+    /// Synthesizes speech through a supported provider.
+    ///
+    /// The default is a typed fail-closed outcome so adding a new chat backend
+    /// never silently makes it eligible for media side effects.
+    fn synthesize_audio<'a>(
+        &'a self,
+        _request: AudioSynthesisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        let provider = self.status_snapshot().kind;
+        Box::pin(async move { Err(ProviderError::AudioSynthesisUnsupported { provider }) })
+    }
+
+    /// Synthesizes speech with host-owned admission around the exact provider candidate.
+    fn synthesize_audio_with_attempt_admission<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+        _admission: Arc<dyn ProviderAttemptAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        self.synthesize_audio(request)
     }
     /// Returns the current status snapshot for console/diagnostics surfaces.
     fn status_snapshot(&self) -> ProviderStatusSnapshot;
@@ -2673,6 +2710,109 @@ impl ModelProvider for RegistryBackedModelProvider {
                 let result = runtime
                     .provider
                     .transcribe_audio_with_credential(request.clone(), credential.as_ref())
+                    .await;
+                drop(credential);
+                match result {
+                    Ok(response) => {
+                        if admission
+                            .record_success(&binding, runtime_authority)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        if admission
+                            .record_failure(&binding, runtime_authority, &error)
+                            .await
+                            .map_err(provider_attempt_admission_provider_error)?
+                            == ProviderAttemptCompletionDisposition::StaleSuppressed
+                        {
+                            return Err(provider_attempt_superseded_error());
+                        }
+                        if binding.credential_attempt.is_some()
+                            && provider_error_allows_credential_rotation(&error, false)
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        })
+    }
+
+    fn synthesize_audio<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        self.synthesize_audio_with_attempt_admission(
+            request,
+            Arc::new(UnrestrictedProviderAttemptAdmission),
+        )
+    }
+
+    fn synthesize_audio_with_attempt_admission<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+        admission: Arc<dyn ProviderAttemptAdmission>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let model_id = self.registry.default_chat_model_id.clone().ok_or_else(|| {
+                ProviderError::RequestFailed {
+                    message: "provider registry does not define a chat provider for speech"
+                        .to_owned(),
+                    retryable: false,
+                    retry_count: 0,
+                    classification: fail_closed_provider_classification(
+                        "registry_audio_synthesis_provider_missing",
+                    ),
+                }
+            })?;
+            let model = self.models.get(model_id.as_str()).ok_or(ProviderError::StatePoisoned)?;
+            let runtime = self
+                .providers
+                .get(model.provider_id.as_str())
+                .ok_or(ProviderError::StatePoisoned)?;
+            if runtime.entry.kind != ModelProviderKind::OpenAiCompatible {
+                return Err(ProviderError::AudioSynthesisUnsupported {
+                    provider: runtime.entry.kind.as_str().to_owned(),
+                });
+            }
+            let credential_id = registry_provider_credential_id(&runtime.entry);
+            loop {
+                let binding = admission
+                    .prepare_attempt(
+                        model.provider_id.as_str(),
+                        credential_id.as_str(),
+                        model.model_id.as_str(),
+                    )
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                admission
+                    .check_eligibility(&binding)
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let _permit = admission
+                    .acquire(&binding)
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let credential = match admission.materialize_credential(&binding).await {
+                    Ok(credential) => credential,
+                    Err(_) if binding.credential_attempt.is_some() => continue,
+                    Err(error) => return Err(provider_attempt_admission_provider_error(error)),
+                };
+                let runtime_authority = admission
+                    .record_started(&binding)
+                    .await
+                    .map_err(provider_attempt_admission_provider_error)?;
+                let result = runtime
+                    .provider
+                    .synthesize_audio_with_credential(request.clone(), credential.as_ref())
                     .await;
                 drop(credential);
                 match result {
@@ -4772,6 +4912,10 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    fn audio_speech_endpoint(&self) -> String {
+        format!("{}{}", self.config.openai_base_url.trim_end_matches('/'), OPENAI_AUDIO_SPEECH_PATH)
+    }
+
     fn transcription_model_name(&self) -> Option<&str> {
         self.audio_transcription_model_id.as_deref().and_then(configured_model_id).or_else(|| {
             configured_model_id(self.config.openai_model.as_str()).filter(|model_id| {
@@ -5246,6 +5390,145 @@ impl OpenAiCompatibleProvider {
             segments,
         })
     }
+
+    async fn synthesize_audio_once(
+        &self,
+        api_key: &str,
+        request: &AudioSynthesisRequest,
+    ) -> Result<AudioSynthesisResponse, AttemptError> {
+        let content_type =
+            audio_synthesis_content_type(request.codec.as_str()).ok_or_else(|| {
+                AttemptError::request_failed(
+                    "openai-compatible audio synthesis codec is unsupported".to_owned(),
+                    false,
+                    user_action_provider_classification(
+                        "openai_compatible_audio_synthesis_codec_unsupported",
+                    ),
+                )
+            })?;
+        if request.text.trim().is_empty()
+            || request.text.len() > 32 * 1024
+            || !valid_provider_audio_identifier(request.voice.as_str(), 128)
+        {
+            return Err(AttemptError::request_failed(
+                "openai-compatible audio synthesis request is invalid".to_owned(),
+                false,
+                user_action_provider_classification(
+                    "openai_compatible_audio_synthesis_request_invalid",
+                ),
+            ));
+        }
+        let mut response = self
+            .client
+            .post(self.audio_speech_endpoint())
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&json!({
+                "model": OPENAI_AUDIO_SPEECH_MODEL,
+                "input": request.text,
+                "voice": request.voice,
+                "response_format": request.codec,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                AttemptError::request_failed(
+                    format!("openai-compatible audio synthesis request failed: {error}"),
+                    true,
+                    classify_reqwest_provider_failure(
+                        "openai_compatible_audio_synthesis_request",
+                        &error,
+                    ),
+                )
+            })?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            return Err(AttemptError::request_failed(
+                format!(
+                    "openai-compatible audio synthesis endpoint returned HTTP {status}: {}",
+                    sanitize_remote_error(&body_text)
+                ),
+                retryable,
+                classify_http_provider_failure_with_retry_after(
+                    status,
+                    retryable,
+                    "openai_compatible_audio_synthesis_http",
+                    body_text.as_str(),
+                    retry_after_ms,
+                ),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_AUDIO_SYNTHESIS_RESPONSE_BYTES as u64)
+        {
+            return Err(AttemptError::invalid_response(
+                "openai-compatible audio synthesis response exceeded the byte limit".to_owned(),
+                "openai_compatible_audio_synthesis_response_too_large",
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            AttemptError::request_failed(
+                format!("openai-compatible audio synthesis body read failed: {error}"),
+                true,
+                classify_reqwest_provider_failure("openai_compatible_audio_synthesis_body", &error),
+            )
+        })? {
+            let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+                AttemptError::invalid_response(
+                    "openai-compatible audio synthesis response size overflowed".to_owned(),
+                    "openai_compatible_audio_synthesis_response_too_large",
+                )
+            })?;
+            if next_len > MAX_AUDIO_SYNTHESIS_RESPONSE_BYTES {
+                return Err(AttemptError::invalid_response(
+                    "openai-compatible audio synthesis response exceeded the byte limit".to_owned(),
+                    "openai_compatible_audio_synthesis_response_too_large",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(AttemptError::invalid_response(
+                "openai-compatible audio synthesis response was empty".to_owned(),
+                "openai_compatible_audio_synthesis_response_empty",
+            ));
+        }
+        Ok(AudioSynthesisResponse {
+            bytes,
+            content_type: content_type.to_owned(),
+            codec: request.codec.clone(),
+            model_name: OPENAI_AUDIO_SPEECH_MODEL.to_owned(),
+            voice: request.voice.clone(),
+            input_characters: u64::try_from(request.text.chars().count()).unwrap_or(u64::MAX),
+            retry_count: 0,
+        })
+    }
+}
+
+fn audio_synthesis_content_type(codec: &str) -> Option<&'static str> {
+    match codec {
+        "mp3" => Some("audio/mpeg"),
+        "opus" => Some("audio/ogg"),
+        "aac" => Some("audio/aac"),
+        "flac" => Some("audio/flac"),
+        "wav" => Some("audio/wav"),
+        _ => None,
+    }
+}
+
+fn valid_provider_audio_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
 fn openai_chatgpt_oauth_claims(token: &str) -> Option<Value> {
@@ -5870,6 +6153,44 @@ impl OpenAiCompatibleProvider {
             ),
         })
     }
+
+    async fn synthesize_audio_with_api_key(
+        &self,
+        request: AudioSynthesisRequest,
+        api_key: &str,
+    ) -> Result<AudioSynthesisResponse, ProviderError> {
+        self.ensure_circuit_closed()?;
+
+        let mut retry_count = 0_u32;
+        for attempt in 0..=self.config.max_retries {
+            match self.synthesize_audio_once(api_key, &request).await {
+                Ok(mut response) => {
+                    self.record_success()?;
+                    response.retry_count = retry_count;
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let can_retry = error.retryable && attempt < self.config.max_retries;
+                    if can_retry {
+                        tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                        retry_count = retry_count.saturating_add(1);
+                        continue;
+                    }
+                    self.record_failure()?;
+                    return Err(error.into_provider_error(retry_count));
+                }
+            }
+        }
+
+        Err(ProviderError::RequestFailed {
+            message: "openai-compatible audio synthesis exhausted retries".to_owned(),
+            retryable: true,
+            retry_count,
+            classification: retry_provider_classification(
+                "openai_compatible_audio_synthesis_retries_exhausted",
+            ),
+        })
+    }
 }
 
 impl ModelProvider for OpenAiCompatibleProvider {
@@ -5946,6 +6267,33 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 return self.transcribe_audio(request).await;
             };
             self.transcribe_audio_with_api_key(request, credential.secret_utf8()?).await
+        })
+    }
+
+    fn synthesize_audio<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(api_key) = self.config.openai_api_key.as_ref() else {
+                return Err(ProviderError::MissingApiKey);
+            };
+            self.synthesize_audio_with_api_key(request, api_key.as_str()).await
+        })
+    }
+
+    fn synthesize_audio_with_credential<'a>(
+        &'a self,
+        request: AudioSynthesisRequest,
+        credential: Option<&'a ProviderCredentialLease>,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioSynthesisResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(credential) = credential else {
+                return self.synthesize_audio(request).await;
+            };
+            self.synthesize_audio_with_api_key(request, credential.secret_utf8()?).await
         })
     }
 
@@ -6944,16 +7292,17 @@ mod tests {
         qa_provider_binding_sha256, run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
-        AnthropicProvider, AudioTranscriptionRequest, EmbeddingsRequest, ModelProvider,
-        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
-        ModelProviderKind, ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter,
-        OpenAiCompatibleProvider, ProviderAttemptAdmission, ProviderAttemptAdmissionError,
-        ProviderAttemptBinding, ProviderAttemptCompletionDisposition,
-        ProviderAttemptCompletionFuture, ProviderAttemptHealthAuthority, ProviderAttemptPermit,
-        ProviderAttemptPermitFuture, ProviderAttemptPreparationFuture,
-        ProviderAttemptRuntimeAuthority, ProviderAttemptStartFuture, ProviderCapabilitiesSnapshot,
-        ProviderChatAdapter, ProviderCredentialLease, ProviderCredentialLeaseFuture, ProviderError,
-        ProviderEvent, ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
+        AnthropicProvider, AudioSynthesisRequest, AudioTranscriptionRequest, EmbeddingsRequest,
+        ModelProvider, ModelProviderAuthProviderKind, ModelProviderConfig,
+        ModelProviderCredentialSource, ModelProviderKind, ModelProviderRegistryConfig,
+        OpenAiCompatibleChatAdapter, OpenAiCompatibleProvider, ProviderAttemptAdmission,
+        ProviderAttemptAdmissionError, ProviderAttemptBinding,
+        ProviderAttemptCompletionDisposition, ProviderAttemptCompletionFuture,
+        ProviderAttemptHealthAuthority, ProviderAttemptPermit, ProviderAttemptPermitFuture,
+        ProviderAttemptPreparationFuture, ProviderAttemptRuntimeAuthority,
+        ProviderAttemptStartFuture, ProviderCapabilitiesSnapshot, ProviderChatAdapter,
+        ProviderCredentialLease, ProviderCredentialLeaseFuture, ProviderError, ProviderEvent,
+        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
         ProviderHealthProbeTarget, ProviderImageInput, ProviderLiveBindingMetadata,
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
         ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
@@ -6963,8 +7312,8 @@ mod tests {
         QaProviderAttestationContext, RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER,
         ANTHROPIC_OAUTH_USER_AGENT, FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID,
         FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID, FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID,
-        OPENAI_RETRYABLE_STATUS_CODES, QA_PROVIDER_FIXTURE_MATERIALIZATION,
-        QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+        OPENAI_AUDIO_SPEECH_MODEL, OPENAI_RETRYABLE_STATUS_CODES,
+        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use palyra_auth::{AuthCredentialType, CredentialAttemptBinding, CredentialSelectionReport};
@@ -9495,6 +9844,72 @@ turns:
         assert!(!captured.body.contains("gpt-4o-mini"));
         drop(requests);
         handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_speech_adapter_uses_configured_gateway_and_exact_request_contract() {
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![(200_u16, "ID3mock-audio".to_owned())]);
+        let provider = build_model_provider(&openai_chat_and_audio_test_config(base_url))
+            .expect("combined registry provider should build");
+        let admission = Arc::new(RecordingProviderAttemptAdmission::default());
+
+        let response = provider
+            .synthesize_audio_with_attempt_admission(
+                AudioSynthesisRequest {
+                    text: "Delivered answer".to_owned(),
+                    voice: "alloy".to_owned(),
+                    codec: "mp3".to_owned(),
+                },
+                admission.clone(),
+            )
+            .await
+            .expect("supported OpenAI-compatible speech request should succeed");
+
+        assert_eq!(response.bytes, b"ID3mock-audio");
+        assert_eq!(response.content_type, "audio/mpeg");
+        assert_eq!(response.model_name, OPENAI_AUDIO_SPEECH_MODEL);
+        assert_eq!(response.input_characters, 16);
+        let acquired =
+            admission.acquired.lock().expect("attempt admission lock should not be poisoned");
+        assert_eq!(acquired.len(), 1);
+        assert_eq!(acquired[0].model_id, "gpt-4o-mini");
+        drop(acquired);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        let captured = requests.first().expect("speech server should capture one request");
+        assert_eq!(captured.path, "/v1/audio/speech");
+        assert!(captured.body.contains(r#""input":"Delivered answer""#));
+        assert!(captured.body.contains(r#""voice":"alloy""#));
+        assert!(captured.body.contains(r#""response_format":"mp3""#));
+        assert!(captured.body.contains(OPENAI_AUDIO_SPEECH_MODEL));
+        assert!(!captured.body.contains("sk-test-secret"));
+        drop(requests);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test]
+    async fn unsupported_provider_fails_closed_before_speech_effect() {
+        let provider = build_model_provider(&ModelProviderConfig::default())
+            .expect("deterministic provider should build");
+
+        let error = provider
+            .synthesize_audio(AudioSynthesisRequest {
+                text: "Delivered answer".to_owned(),
+                voice: "alloy".to_owned(),
+                codec: "mp3".to_owned(),
+            })
+            .await
+            .expect_err("deterministic provider must not synthesize speech");
+
+        assert!(matches!(
+            error,
+            ProviderError::AudioSynthesisUnsupported { ref provider }
+                if provider == "deterministic"
+        ));
+        let failure = error.failure_snapshot();
+        assert_eq!(failure.recovery.action, "fail_closed");
+        assert_eq!(failure.provider_detail.as_deref(), Some("audio_synthesis_unsupported"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

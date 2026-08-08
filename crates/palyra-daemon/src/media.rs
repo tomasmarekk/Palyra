@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use palyra_common::netguard;
 use palyra_connectors::{AttachmentKind, AttachmentRef};
 
+use crate::application::audio_pipeline::AudioOutputArtifactV1;
 use crate::media_derived::{
     select_prompt_chunks, DerivedArtifactAnchor, DerivedArtifactContent, DerivedArtifactKind,
     DerivedArtifactWarning, DerivedSelectionCandidate,
@@ -369,6 +370,14 @@ pub struct MediaAudioJobEventRequest<'a> {
     pub session_bytes: u64,
     pub session_duration_ms: u64,
     pub active_jobs: u32,
+}
+
+/// Connector-neutral synthesized artifact awaiting content-addressed persistence.
+#[derive(Debug, Clone)]
+pub struct MediaAudioOutputStoreRequest<'a> {
+    pub artifact: &'a AudioOutputArtifactV1,
+    pub payload: &'a [u8],
+    pub session_id: &'a str,
 }
 
 /// Failure modes of the media store.
@@ -920,6 +929,142 @@ impl MediaArtifactStore {
             width_px: sniffed.width_px,
             height_px: sniffed.height_px,
             bytes: request.bytes.to_vec(),
+        })
+    }
+
+    /// Persists one validated synthesis payload under its artifact digest and retention deadline.
+    ///
+    /// Durable origin evidence contains only bounded scalar usage and hashes of
+    /// run, voice, model, delivery, and session identifiers.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::InvalidAttachment`] when metadata, codec
+    /// framing, digest, or size does not match the payload. Storage failures
+    /// propagate without changing the already-settled text run.
+    pub fn store_audio_output(
+        &self,
+        request: MediaAudioOutputStoreRequest<'_>,
+    ) -> Result<MediaArtifactPayload, MediaStoreError> {
+        let artifact = request.artifact;
+        if request.payload.is_empty()
+            || request.payload.len() > self.config.outbound_max_upload_bytes
+            || artifact.bytes != u64::try_from(request.payload.len()).unwrap_or(u64::MAX)
+            || artifact.sha256 != sha256_hex(request.payload)
+            || artifact.expires_at_unix_ms < artifact.created_at_unix_ms
+            || !valid_synthesized_audio_payload(
+                artifact.codec.as_str(),
+                artifact.content_type.as_str(),
+                request.payload,
+            )
+        {
+            return Err(MediaStoreError::InvalidAttachment(
+                "synthesized audio artifact does not match its bounded payload".to_owned(),
+            ));
+        }
+
+        let sha256 = artifact.sha256.clone();
+        let (storage_path, relative_path) =
+            prepare_content_storage_path(self.content_root.as_path(), sha256.as_str())?;
+        match fs::OpenOptions::new().write(true).create_new(true).open(storage_path.as_path()) {
+            Ok(mut file) => {
+                file.write_all(request.payload).map_err(|error| {
+                    MediaStoreError::Io(format!(
+                        "failed to persist synthesized media artifact '{}' : {error}",
+                        storage_path.display()
+                    ))
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(MediaStoreError::Io(format!(
+                    "failed to persist synthesized media artifact '{}' : {error}",
+                    storage_path.display()
+                )));
+            }
+        }
+
+        let created_at_unix_ms = i64::try_from(artifact.created_at_unix_ms).unwrap_or(i64::MAX);
+        let expires_at_unix_ms = i64::try_from(artifact.expires_at_unix_ms).unwrap_or(i64::MAX);
+        let filename =
+            sanitize_filename(artifact.delivery.file_name.as_str(), artifact.content_type.as_str());
+        let session_id_sha256 = sha256_hex(request.session_id.as_bytes());
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while storing synthesized audio".to_owned(),
+            )
+        })?;
+        let transaction = guard.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO media_contents (
+                content_sha256, storage_rel_path, size_bytes, created_at_unix_ms,
+                last_accessed_at_unix_ms, ref_count
+            )
+            VALUES (?1, ?2, ?3, ?4, ?4, 1)
+            ON CONFLICT(content_sha256) DO UPDATE SET
+                last_accessed_at_unix_ms = excluded.last_accessed_at_unix_ms,
+                ref_count = media_contents.ref_count + 1
+            "#,
+            params![
+                sha256,
+                relative_path,
+                i64::try_from(request.payload.len()).unwrap_or(i64::MAX),
+                created_at_unix_ms,
+            ],
+        )?;
+        transaction.execute(
+            r#"
+            INSERT INTO media_artifacts (
+                artifact_id, connector_id, direction, envelope_id, conversation_id,
+                adapter_message_id, attachment_id, kind, filename, declared_content_type,
+                content_type, source_url, content_sha256, size_bytes, width_px, height_px,
+                origin_json, policy_context_json, blocked_reason, created_at_unix_ms,
+                last_accessed_at_unix_ms, expires_at_unix_ms
+            )
+            VALUES (?1, 'audio_pipeline', 'outbound', ?2, ?2, NULL, ?1, 'audio',
+                ?3, ?4, ?4, NULL, ?5, ?6, NULL, NULL, ?7, ?8, NULL, ?9, ?9, ?10)
+            "#,
+            params![
+                artifact.artifact_id,
+                session_id_sha256,
+                filename,
+                artifact.content_type,
+                artifact.sha256,
+                i64::try_from(request.payload.len()).unwrap_or(i64::MAX),
+                json!({
+                    "schema_version": artifact.v,
+                    "source_run_id_sha256": sha256_hex(artifact.source_run_id.as_bytes()),
+                    "source_text_sha256": artifact.source_text_sha256,
+                    "model_name_sha256": sha256_hex(artifact.model_name.as_bytes()),
+                    "voice_id_sha256": sha256_hex(artifact.voice_id.as_bytes()),
+                    "delivery_key_sha256": sha256_hex(
+                        artifact.delivery.delivery_key.as_bytes()
+                    ),
+                    "destination_scope_sha256": artifact.delivery.destination_scope_sha256,
+                    "usage": artifact.usage,
+                })
+                .to_string(),
+                json!({
+                    "retention_expires_at_unix_ms": artifact.expires_at_unix_ms,
+                    "content_addressed": true,
+                })
+                .to_string(),
+                created_at_unix_ms,
+                expires_at_unix_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.run_retention_housekeeping_if_due(created_at_unix_ms)?;
+        Ok(MediaArtifactPayload {
+            artifact_id: artifact.artifact_id.clone(),
+            filename,
+            content_type: artifact.content_type.clone(),
+            size_bytes: artifact.bytes,
+            sha256: artifact.sha256.clone(),
+            width_px: None,
+            height_px: None,
+            bytes: request.payload.to_vec(),
         })
     }
 
@@ -1955,6 +2100,7 @@ impl MediaArtifactStore {
                 blocked_reason TEXT,
                 created_at_unix_ms INTEGER NOT NULL,
                 last_accessed_at_unix_ms INTEGER NOT NULL,
+                expires_at_unix_ms INTEGER,
                 FOREIGN KEY(content_sha256) REFERENCES media_contents(content_sha256)
             );
             CREATE INDEX IF NOT EXISTS idx_media_artifacts_connector_created
@@ -2020,6 +2166,7 @@ impl MediaArtifactStore {
                 ON media_derived_artifacts(state, recompute_required, updated_at_unix_ms DESC);
             "#,
         )?;
+        ensure_media_artifact_expiry_column(&guard)?;
         Ok(())
     }
 
@@ -2267,11 +2414,12 @@ impl MediaArtifactStore {
             SELECT artifact_id, content_sha256
             FROM media_artifacts
             WHERE created_at_unix_ms < ?1
+               OR (expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?2)
             ORDER BY created_at_unix_ms ASC
             "#,
         )?;
         let stale_rows = stale
-            .query_map(params![cutoff], |row| {
+            .query_map(params![cutoff, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2738,6 +2886,47 @@ fn sniff_content(bytes: &[u8]) -> Result<SniffedContent, MediaStoreError> {
     ))
 }
 
+fn valid_synthesized_audio_payload(codec: &str, content_type: &str, bytes: &[u8]) -> bool {
+    match codec {
+        "mp3" => {
+            content_type == "audio/mpeg"
+                && (bytes.starts_with(b"ID3")
+                    || bytes
+                        .get(..2)
+                        .is_some_and(|prefix| prefix[0] == 0xff && prefix[1] & 0xe0 == 0xe0))
+        }
+        "opus" => content_type == "audio/ogg" && bytes.starts_with(b"OggS"),
+        "aac" => {
+            content_type == "audio/aac"
+                && (bytes.starts_with(b"ADIF")
+                    || bytes
+                        .get(..2)
+                        .is_some_and(|prefix| prefix[0] == 0xff && prefix[1] & 0xf0 == 0xf0))
+        }
+        "flac" => content_type == "audio/flac" && bytes.starts_with(b"fLaC"),
+        "wav" => {
+            content_type == "audio/wav"
+                && bytes.starts_with(b"RIFF")
+                && bytes.get(8..12) == Some(b"WAVE".as_slice())
+        }
+        _ => false,
+    }
+}
+
+fn ensure_media_artifact_expiry_column(connection: &Connection) -> Result<(), MediaStoreError> {
+    let has_expiry = {
+        let mut columns = connection.prepare("PRAGMA table_info(media_artifacts)")?;
+        let column_names =
+            columns.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
+        column_names.iter().any(|column| column == "expires_at_unix_ms")
+    };
+    if !has_expiry {
+        connection
+            .execute("ALTER TABLE media_artifacts ADD COLUMN expires_at_unix_ms INTEGER", [])?;
+    }
+    Ok(())
+}
+
 fn is_png(bytes: &[u8]) -> bool {
     bytes.len() >= 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
 }
@@ -3088,15 +3277,19 @@ mod tests {
         net::TcpListener,
     };
 
-    use crate::media_derived::{DerivedArtifactContent, DerivedArtifactKind};
+    use crate::{
+        application::audio_pipeline::{AudioOutputArtifactV1, MediaDeliveryDescriptor, MediaUsage},
+        media_derived::{DerivedArtifactContent, DerivedArtifactKind},
+    };
 
     use super::{
         build_media_http_client_with_resolved_addresses, content_relative_path,
         read_response_body_with_limit, resolve_content_storage_path,
         should_prune_retention_after_ingest, sniff_content, ConsoleAttachmentStoreRequest,
         InboundAttachmentIngestRequest, MediaArtifactStore, MediaAudioJobEventRequest,
-        MediaDerivedArtifactUpsertRequest, MediaMaintenanceState, MediaRuntimeConfig,
-        MediaStoreError, RETENTION_PRUNE_MAX_DEFERRED_INGESTS, RETENTION_PRUNE_MIN_INTERVAL_MS,
+        MediaAudioOutputStoreRequest, MediaDerivedArtifactUpsertRequest, MediaMaintenanceState,
+        MediaRuntimeConfig, MediaStoreError, RETENTION_PRUNE_MAX_DEFERRED_INGESTS,
+        RETENTION_PRUNE_MIN_INTERVAL_MS,
     };
 
     #[test]
@@ -3261,6 +3454,81 @@ mod tests {
             )
             .expect("audio event count");
         assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn synthesized_audio_is_content_addressed_with_hashed_durable_origin() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let store = MediaArtifactStore::open(
+            tempdir.path().join("media.sqlite3"),
+            tempdir.path().join("media"),
+            MediaRuntimeConfig::default(),
+        )
+        .expect("media store should initialize");
+        let payload = b"ID3bounded-mock-audio";
+        let created_at_unix_ms = u64::try_from(super::current_unix_ms()).unwrap_or_default();
+        let artifact = AudioOutputArtifactV1 {
+            v: 1,
+            artifact_id: "audio-output-1".to_owned(),
+            source_run_id: "secret-run-id".to_owned(),
+            source_text_sha256: super::sha256_hex(b"delivered text"),
+            content_type: "audio/mpeg".to_owned(),
+            codec: "mp3".to_owned(),
+            bytes: u64::try_from(payload.len()).expect("payload size should fit u64"),
+            duration_ms: 0,
+            sha256: super::sha256_hex(payload),
+            model_name: "gpt-4o-mini-tts".to_owned(),
+            voice_id: "alloy".to_owned(),
+            usage: MediaUsage {
+                output_bytes: u64::try_from(payload.len()).expect("payload size should fit u64"),
+                billable_units: 14,
+                estimated_cost_microunits: 0,
+                ..MediaUsage::default()
+            },
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms.saturating_add(60_000),
+            delivery: MediaDeliveryDescriptor {
+                delivery_key: "tts:run".to_owned(),
+                destination_scope_sha256: super::sha256_hex(b"destination"),
+                content_type: "audio/mpeg".to_owned(),
+                file_name: "reply.mp3".to_owned(),
+            },
+        };
+        let stored = store
+            .store_audio_output(MediaAudioOutputStoreRequest {
+                artifact: &artifact,
+                payload,
+                session_id: "secret-session-id",
+            })
+            .expect("synthesized audio should persist");
+
+        assert_eq!(stored.sha256, artifact.sha256);
+        assert_eq!(
+            std::fs::read(
+                tempdir
+                    .path()
+                    .join("media")
+                    .join(super::content_relative_path(artifact.sha256.as_str()))
+            )
+            .expect("content-addressed payload should be readable"),
+            payload
+        );
+        let guard = store.connection.lock().expect("media connection");
+        let (origin_json, expires_at): (String, i64) = guard
+            .query_row(
+                "SELECT origin_json, expires_at_unix_ms FROM media_artifacts WHERE artifact_id = ?1",
+                params![artifact.artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("audio metadata row");
+        assert_eq!(
+            expires_at,
+            i64::try_from(artifact.expires_at_unix_ms).expect("expiry should fit i64")
+        );
+        assert!(!origin_json.contains("secret-run-id"));
+        assert!(!origin_json.contains("secret-session-id"));
+        assert!(!origin_json.contains("alloy"));
+        assert!(origin_json.contains(artifact.source_text_sha256.as_str()));
     }
 
     #[test]

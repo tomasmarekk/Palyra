@@ -285,6 +285,7 @@ pub(crate) async fn console_chat_message_stream_handler(
     Json(payload): Json<ConsoleChatMessageRequest>,
 ) -> Result<Response, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    let audio_output_request = payload.audio_output.clone();
     validate_canonical_id(session_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument(
             "session_id must be a canonical ULID",
@@ -331,6 +332,16 @@ pub(crate) async fn console_chat_message_stream_handler(
         )))
     })?;
     let run_id = Ulid::new().to_string();
+    let audio_rollout_enabled = state.runtime.config.feature_rollouts.audio_pipeline.enabled;
+    let audio_destination_scope_sha256 = crate::sha256_hex(
+        format!(
+            "{}\n{}\n{}",
+            session.context.principal,
+            session.context.device_id,
+            session.context.channel.as_deref().unwrap_or_default()
+        )
+        .as_bytes(),
+    );
 
     // Register the run before sending anything so queue/approval endpoints can
     // find it as soon as the client learns the run id from the "meta" line.
@@ -407,6 +418,10 @@ pub(crate) async fn console_chat_message_stream_handler(
     let state_for_task = state.clone();
     tokio::spawn(async move {
         let mut final_status = "unknown".to_owned();
+        let mut delivered_final_text = String::new();
+        let mut delivered_final_text_complete = false;
+        let mut delivered_final_text_overflowed = false;
+        let mut relay_delivery_intact = true;
         if !send_console_chat_line(
             &line_sender,
             json!({
@@ -555,8 +570,15 @@ pub(crate) async fn console_chat_message_stream_handler(
                     )
                     .await
                     {
+                        relay_delivery_intact = false;
                         break;
                     }
+                    observe_delivered_model_text(
+                        &event,
+                        &mut delivered_final_text,
+                        &mut delivered_final_text_complete,
+                        &mut delivered_final_text_overflowed,
+                    );
                 }
                 Err(error) => {
                     final_status = "failed".to_owned();
@@ -574,6 +596,33 @@ pub(crate) async fn console_chat_message_stream_handler(
             }
         }
 
+        if let Some(audio_output) = execute_console_post_delivery_audio(
+            &state_for_task,
+            ConsolePostDeliveryAudioContext {
+                session_id: session_id_for_task.as_str(),
+                run_id: run_id_for_task.as_str(),
+                destination_scope_sha256: audio_destination_scope_sha256.as_str(),
+                rollout_enabled: audio_rollout_enabled,
+                request: audio_output_request,
+                text_delivery_settled: final_status == "done"
+                    && relay_delivery_intact
+                    && delivered_final_text_complete
+                    && !delivered_final_text_overflowed,
+                final_text: delivered_final_text,
+            },
+        )
+        .await
+        {
+            let _ = send_console_chat_line(
+                &line_sender,
+                json!({
+                    "type": "audio_output",
+                    "run_id": run_id_for_task,
+                    "audio_output": audio_output,
+                }),
+            )
+            .await;
+        }
         let _ = send_console_chat_line(
             &line_sender,
             json!({
@@ -6274,6 +6323,251 @@ impl application::audio_pipeline::AudioTranscriptionBackend for GatewayAudioTran
     }
 }
 
+/// Bridges post-delivery speech jobs to the provider-health gateway.
+struct GatewayAudioSynthesisAdapter {
+    runtime: Arc<gateway::GatewayRuntimeState>,
+}
+
+#[async_trait]
+impl application::audio_pipeline::AudioSynthesisBackend for GatewayAudioSynthesisAdapter {
+    async fn synthesize(
+        &self,
+        request: application::audio_pipeline::AudioSynthesisJobRequest,
+    ) -> Result<
+        application::audio_pipeline::AudioSynthesisBackendResult,
+        application::audio_pipeline::AudioSynthesisBackendError,
+    > {
+        self.runtime
+            .execute_audio_synthesis(crate::model_provider::AudioSynthesisRequest {
+                text: request.text,
+                voice: request.voice_id,
+                codec: request.codec,
+            })
+            .await
+            .map(Into::into)
+            .map_err(|status| {
+                if status.code() == tonic::Code::Unimplemented {
+                    application::audio_pipeline::AudioSynthesisBackendError::UnsupportedProvider
+                } else {
+                    application::audio_pipeline::AudioSynthesisBackendError::Failed
+                }
+            })
+    }
+}
+
+enum ConsoleAudioOutputGate {
+    NotRequested,
+    Blocked(&'static str),
+    Ready(application::audio_pipeline::AudioOutputRequestV1),
+}
+
+fn console_audio_output_gate(
+    rollout_enabled: bool,
+    request: Option<ConsoleChatAudioOutputRequest>,
+    text_delivery_settled: bool,
+) -> ConsoleAudioOutputGate {
+    let Some(request) = request else {
+        return ConsoleAudioOutputGate::NotRequested;
+    };
+    if !rollout_enabled {
+        return ConsoleAudioOutputGate::Blocked("tts_rollout_disabled");
+    }
+    if !text_delivery_settled {
+        return ConsoleAudioOutputGate::Blocked("tts_text_delivery_not_successful");
+    }
+    if request.voice.trim().is_empty()
+        || request.voice.len() > 128
+        || !request
+            .voice
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+        || application::audio_pipeline::audio_output_content_type(request.codec.as_str()).is_none()
+        || application::audio_pipeline::audio_output_file_extension(request.codec.as_str())
+            .is_none()
+    {
+        return ConsoleAudioOutputGate::Blocked("tts_request_contract_invalid");
+    }
+    ConsoleAudioOutputGate::Ready(application::audio_pipeline::AudioOutputRequestV1 {
+        voice_id: request.voice,
+        codec: request.codec,
+    })
+}
+
+fn observe_delivered_model_text(
+    event: &common_v1::RunStreamEvent,
+    final_text: &mut String,
+    final_text_complete: &mut bool,
+    overflowed: &mut bool,
+) {
+    let Some(common_v1::run_stream_event::Body::ModelToken(token)) = event.body.as_ref() else {
+        return;
+    };
+    if *final_text_complete {
+        final_text.clear();
+        *final_text_complete = false;
+        *overflowed = false;
+    }
+    if !*overflowed {
+        if final_text.len().saturating_add(token.token.len())
+            > application::audio_pipeline::MAX_SYNTHESIS_TEXT_BYTES
+        {
+            final_text.clear();
+            *overflowed = true;
+        } else {
+            final_text.push_str(token.token.as_str());
+        }
+    }
+    if token.is_final {
+        *final_text_complete = true;
+    }
+}
+
+struct ConsolePostDeliveryAudioContext<'a> {
+    session_id: &'a str,
+    run_id: &'a str,
+    destination_scope_sha256: &'a str,
+    rollout_enabled: bool,
+    request: Option<ConsoleChatAudioOutputRequest>,
+    text_delivery_settled: bool,
+    final_text: String,
+}
+
+async fn execute_console_post_delivery_audio(
+    state: &AppState,
+    context: ConsolePostDeliveryAudioContext<'_>,
+) -> Option<Value> {
+    let output_request = match console_audio_output_gate(
+        context.rollout_enabled,
+        context.request,
+        context.text_delivery_settled,
+    ) {
+        ConsoleAudioOutputGate::NotRequested => return None,
+        ConsoleAudioOutputGate::Blocked(reason_code) => {
+            return Some(json!({
+                "state": "blocked",
+                "reason_code": reason_code,
+                "text_run_success": context.text_delivery_settled,
+                "artifact": Value::Null,
+            }));
+        }
+        ConsoleAudioOutputGate::Ready(request) => request,
+    };
+    let content_type =
+        application::audio_pipeline::audio_output_content_type(output_request.codec.as_str())
+            .expect("ready audio output gate validates the codec");
+    let extension =
+        application::audio_pipeline::audio_output_file_extension(output_request.codec.as_str())
+            .expect("ready audio output gate validates the codec");
+    let job_id = format!("tts:{}", context.run_id);
+    let mut job = match state.audio_sessions.begin_job(context.session_id, job_id.as_str()) {
+        Ok(job) => job,
+        Err(error) => {
+            return Some(json!({
+                "state": "blocked",
+                "reason_code": error.reason_code(),
+                "text_run_success": true,
+                "artifact": Value::Null,
+            }));
+        }
+    };
+    let cancellation = job.cancellation();
+    let receipt = application::audio_pipeline::TextDeliveryReceipt {
+        run_id: context.run_id.to_owned(),
+        text: context.final_text,
+        success: true,
+        delivered_at_unix_ms: u64::try_from(gateway::current_unix_ms()).unwrap_or_default(),
+    };
+    let source_text_sha256 = crate::sha256_hex(receipt.text.as_bytes());
+    let backend = GatewayAudioSynthesisAdapter { runtime: Arc::clone(&state.runtime) };
+    let mut outcome = job
+        .pipeline_mut()
+        .synthesize_after_delivery(
+            &receipt,
+            &output_request,
+            application::audio_pipeline::MediaDeliveryDescriptor {
+                delivery_key: job_id,
+                destination_scope_sha256: context.destination_scope_sha256.to_owned(),
+                content_type: content_type.to_owned(),
+                file_name: format!("reply-{}.{extension}", context.run_id),
+            },
+            &backend,
+            &cancellation,
+        )
+        .await;
+
+    let usage = outcome.artifact.as_ref().map(|artifact| artifact.usage).unwrap_or_default();
+    let mut output_sha256 = outcome.artifact.as_ref().map(|artifact| artifact.sha256.clone());
+    if outcome.state == application::audio_pipeline::MediaJobState::Succeeded {
+        let persistence = outcome
+            .artifact
+            .as_ref()
+            .zip(outcome.payload.as_deref())
+            .ok_or_else(|| "successful synthesis omitted its artifact payload".to_owned())
+            .and_then(|(artifact, payload)| {
+                state
+                    .channels
+                    .store_audio_output(media::MediaAudioOutputStoreRequest {
+                        artifact,
+                        payload,
+                        session_id: context.session_id,
+                    })
+                    .map_err(|_| "synthesized audio persistence failed".to_owned())
+            });
+        if persistence.is_err() {
+            outcome.state = application::audio_pipeline::MediaJobState::Failed;
+            outcome.reason_code = "tts_artifact_persistence_failed".to_owned();
+            outcome.artifact = None;
+            outcome.payload = None;
+            output_sha256 = None;
+        }
+    }
+    let diagnostics = state.audio_sessions.diagnostics(context.session_id);
+    let event_persisted = diagnostics.is_some_and(|diagnostics| {
+        state
+            .channels
+            .record_audio_job_event(media::MediaAudioJobEventRequest {
+                source_artifact_id: context.run_id,
+                source_artifact_sha256: source_text_sha256.as_str(),
+                session_id: context.session_id,
+                job_kind: "synthesis",
+                state: media_job_state_label(outcome.state),
+                reason_code: outcome.reason_code.as_str(),
+                derived_artifact_sha256: output_sha256.as_deref(),
+                input_bytes: usage.input_bytes,
+                output_bytes: usage.output_bytes,
+                audio_duration_ms: usage.audio_duration_ms,
+                billable_units: usage.billable_units,
+                estimated_cost_microunits: usage.estimated_cost_microunits,
+                session_bytes: diagnostics.usage.bytes,
+                session_duration_ms: diagnostics.usage.duration_ms,
+                active_jobs: diagnostics.active_jobs,
+            })
+            .is_ok()
+    });
+    if !event_persisted {
+        outcome.state = application::audio_pipeline::MediaJobState::Failed;
+        outcome.reason_code = "tts_event_persistence_failed".to_owned();
+        outcome.artifact = None;
+        outcome.payload = None;
+    }
+    Some(json!({
+        "state": media_job_state_label(outcome.state),
+        "reason_code": outcome.reason_code,
+        "text_run_success": outcome.text_run_success,
+        "artifact": outcome.artifact,
+    }))
+}
+
+const fn media_job_state_label(state: application::audio_pipeline::MediaJobState) -> &'static str {
+    match state {
+        application::audio_pipeline::MediaJobState::Succeeded => "succeeded",
+        application::audio_pipeline::MediaJobState::Failed => "failed",
+        application::audio_pipeline::MediaJobState::TimedOut => "timed_out",
+        application::audio_pipeline::MediaJobState::Cancelled => "cancelled",
+        application::audio_pipeline::MediaJobState::Blocked => "blocked",
+    }
+}
+
 fn record_console_audio_job_event(
     state: &AppState,
     session_id: &str,
@@ -6979,15 +7273,17 @@ mod tests {
         build_background_task_cancel_requested_result_json,
         build_background_task_cancel_requested_update, build_background_task_cancelled_result_json,
         build_background_task_cancelled_update, build_console_chat_message_envelope,
-        console_attachment_workspace_path, console_background_task_budget_tokens,
-        derive_canvas_transcript_reference, derived_artifact_index_content,
-        derived_artifact_matches_console_context, extract_canvas_id_from_frame_reference,
+        console_attachment_workspace_path, console_audio_output_gate,
+        console_background_task_budget_tokens, derive_canvas_transcript_reference,
+        derived_artifact_index_content, derived_artifact_matches_console_context,
+        extract_canvas_id_from_frame_reference, observe_delivered_model_text,
         resolve_console_background_task_kind, retry_parameter_delta_from_payload_or_run,
-        run_matches_console_context, should_transcribe_audio_attachment,
+        run_matches_console_context, should_transcribe_audio_attachment, ConsoleAudioOutputGate,
     };
     use crate::{
         app::state::ConsoleSession, domain::workspace::normalize_workspace_path, gateway, journal,
         media, transport::grpc::proto::palyra::common::v1 as common_v1,
+        ConsoleChatAudioOutputRequest,
     };
     use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
 
@@ -6996,6 +7292,84 @@ mod tests {
         assert!(!should_transcribe_audio_attachment(false, "audio/ogg"));
         assert!(should_transcribe_audio_attachment(true, "audio/ogg"));
         assert!(!should_transcribe_audio_attachment(true, "image/png"));
+    }
+
+    #[test]
+    fn post_delivery_speech_requires_rollout_and_explicit_request() {
+        assert!(matches!(
+            console_audio_output_gate(true, None, true),
+            ConsoleAudioOutputGate::NotRequested
+        ));
+        assert!(matches!(
+            console_audio_output_gate(
+                false,
+                Some(ConsoleChatAudioOutputRequest {
+                    voice: "alloy".to_owned(),
+                    codec: "mp3".to_owned(),
+                }),
+                true,
+            ),
+            ConsoleAudioOutputGate::Blocked("tts_rollout_disabled")
+        ));
+        assert!(matches!(
+            console_audio_output_gate(
+                true,
+                Some(ConsoleChatAudioOutputRequest {
+                    voice: "alloy".to_owned(),
+                    codec: "mp3".to_owned(),
+                }),
+                false,
+            ),
+            ConsoleAudioOutputGate::Blocked("tts_text_delivery_not_successful")
+        ));
+        assert!(matches!(
+            console_audio_output_gate(
+                true,
+                Some(ConsoleChatAudioOutputRequest {
+                    voice: "alloy".to_owned(),
+                    codec: "mp3".to_owned(),
+                }),
+                true,
+            ),
+            ConsoleAudioOutputGate::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn delivered_text_projection_keeps_only_the_last_completed_turn() {
+        let model_token = |token: &str, is_final: bool| common_v1::RunStreamEvent {
+            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+            run_id: None,
+            body: Some(common_v1::run_stream_event::Body::ModelToken(common_v1::ModelToken {
+                token: token.to_owned(),
+                is_final,
+            })),
+        };
+        let mut text = String::new();
+        let mut complete = false;
+        let mut overflowed = false;
+        observe_delivered_model_text(
+            &model_token("intermediate", true),
+            &mut text,
+            &mut complete,
+            &mut overflowed,
+        );
+        observe_delivered_model_text(
+            &model_token("final ", false),
+            &mut text,
+            &mut complete,
+            &mut overflowed,
+        );
+        observe_delivered_model_text(
+            &model_token("answer", true),
+            &mut text,
+            &mut complete,
+            &mut overflowed,
+        );
+
+        assert_eq!(text, "final answer");
+        assert!(complete);
+        assert!(!overflowed);
     }
 
     #[test]

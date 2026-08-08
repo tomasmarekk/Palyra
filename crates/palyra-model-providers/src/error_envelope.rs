@@ -409,7 +409,8 @@ fn provider_error_kind(
         ProviderError::MissingApiKey
         | ProviderError::MissingAnthropicApiKey
         | ProviderError::MissingEmbeddingsModel => ProviderErrorKind::MissingConfiguration,
-        ProviderError::VisionUnsupported { .. } => ProviderErrorKind::UnsupportedFeature,
+        ProviderError::VisionUnsupported { .. }
+        | ProviderError::AudioSynthesisUnsupported { .. } => ProviderErrorKind::UnsupportedFeature,
         ProviderError::InvalidEmbeddingsRequest { .. } => ProviderErrorKind::MalformedResponse,
         ProviderError::StatePoisoned => ProviderErrorKind::Internal,
         ProviderError::RequestFailed { .. } | ProviderError::InvalidResponse { .. } => {

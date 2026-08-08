@@ -1698,6 +1698,14 @@ struct ConsoleChatMessageRequest {
     queued_input_id: Option<String>,
     #[serde(default)]
     attachments: Vec<ConsoleChatAttachmentReference>,
+    #[serde(default)]
+    audio_output: Option<ConsoleChatAudioOutputRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsoleChatAudioOutputRequest {
+    voice: String,
+    codec: String,
 }
 
 #[derive(Debug, Deserialize)]

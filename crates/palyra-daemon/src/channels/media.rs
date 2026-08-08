@@ -30,6 +30,17 @@ impl ChannelPlatform {
         self.media_store.record_audio_job_event(request).map_err(ChannelPlatformError::from)
     }
 
+    /// Persists one synthesized payload in the connector-neutral media store.
+    ///
+    /// # Errors
+    /// Propagates media contract, retention, content-address, and IO failures.
+    pub fn store_audio_output(
+        &self,
+        request: MediaAudioOutputStoreRequest<'_>,
+    ) -> Result<MediaArtifactPayload, ChannelPlatformError> {
+        self.media_store.store_audio_output(request).map_err(ChannelPlatformError::from)
+    }
+
     /// Stores a console chat upload under a fresh attachment id, scoped to
     /// the session/principal/device identity in the request.
     ///

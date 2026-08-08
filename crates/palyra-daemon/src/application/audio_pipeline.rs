@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use palyra_model_providers::AudioTranscriptionResponse;
+use palyra_model_providers::{AudioSynthesisResponse, AudioTranscriptionResponse};
 use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +26,8 @@ const DEFAULT_MAX_AUDIO_DURATION_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_MAX_SESSION_MEDIA_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_MAX_SESSION_MEDIA_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
+/// Maximum final-text bytes admitted to one post-delivery speech job.
+pub const MAX_SYNTHESIS_TEXT_BYTES: usize = 32 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_TRACKED_MEDIA_SESSIONS: usize = 1_024;
 const MAX_ACTIVE_MEDIA_JOBS_PER_SESSION: usize = 32;
@@ -484,6 +486,13 @@ pub struct AudioSynthesisJobRequest {
     pub delivery: MediaDeliveryDescriptor,
 }
 
+/// Explicit caller opt-in for one bounded post-delivery speech transform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioOutputRequestV1 {
+    pub voice_id: String,
+    pub codec: String,
+}
+
 /// Ephemeral TTS payload plus the metadata needed for durable storage.
 #[derive(Debug, Clone)]
 pub struct AudioSynthesisBackendResult {
@@ -496,12 +505,38 @@ pub struct AudioSynthesisBackendResult {
     pub usage: MediaUsage,
 }
 
+impl From<AudioSynthesisResponse> for AudioSynthesisBackendResult {
+    fn from(response: AudioSynthesisResponse) -> Self {
+        Self {
+            bytes: response.bytes,
+            content_type: response.content_type,
+            codec: response.codec,
+            duration_ms: 0,
+            model_name: response.model_name,
+            voice_id: response.voice,
+            usage: MediaUsage {
+                billable_units: response.input_characters,
+                ..MediaUsage::default()
+            },
+        }
+    }
+}
+
+/// Provider-neutral synthesis failures that are safe to expose to the media lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AudioSynthesisBackendError {
+    #[error("audio synthesis is unsupported by the configured provider")]
+    UnsupportedProvider,
+    #[error("audio synthesis backend failed")]
+    Failed,
+}
+
 #[async_trait]
 pub trait AudioSynthesisBackend: Send + Sync {
     async fn synthesize(
         &self,
         request: AudioSynthesisJobRequest,
-    ) -> Result<AudioSynthesisBackendResult, String>;
+    ) -> Result<AudioSynthesisBackendResult, AudioSynthesisBackendError>;
 }
 
 /// Text delivery is immutable input to the optional post-transform.
@@ -646,6 +681,8 @@ impl AudioPipeline {
             backend.transcribe(request),
         );
         let result = tokio::select! {
+            // A reset cancellation must win when an immediately-ready backend races it.
+            biased;
             () = cancellation.cancelled() => return Err(AudioPipelineError::Cancelled),
             result = backend_future => result,
         };
@@ -711,8 +748,7 @@ impl AudioPipeline {
     pub async fn synthesize_after_delivery<B: AudioSynthesisBackend>(
         &mut self,
         receipt: &TextDeliveryReceipt,
-        voice_id: &str,
-        codec: &str,
+        output_request: &AudioOutputRequestV1,
         delivery: MediaDeliveryDescriptor,
         backend: &B,
         cancellation: &AudioJobCancellation,
@@ -728,10 +764,10 @@ impl AudioPipeline {
         }
         if validate_media_identity(receipt.run_id.as_str()).is_err()
             || receipt.text.trim().is_empty()
-            || receipt.text.len() > self.budget.max_transcript_bytes
+            || receipt.text.len() > MAX_SYNTHESIS_TEXT_BYTES
             || !valid_media_delivery_descriptor(&delivery)
-            || !valid_bounded_text(voice_id, 256)
-            || !valid_bounded_text(codec, 128)
+            || !valid_bounded_text(output_request.voice_id.as_str(), 128)
+            || audio_output_content_type(output_request.codec.as_str()).is_none()
         {
             return failed_tts_outcome(
                 true,
@@ -742,8 +778,8 @@ impl AudioPipeline {
         let request = AudioSynthesisJobRequest {
             source_run_id: receipt.run_id.clone(),
             text: receipt.text.clone(),
-            voice_id: voice_id.to_owned(),
-            codec: codec.to_owned(),
+            voice_id: output_request.voice_id.clone(),
+            codec: output_request.codec.clone(),
             delivery: delivery.clone(),
         };
         let backend_future = tokio::time::timeout(
@@ -751,6 +787,8 @@ impl AudioPipeline {
             backend.synthesize(request),
         );
         let response = tokio::select! {
+            // Preserve the reset fence even if a backend becomes ready in the same poll.
+            biased;
             () = cancellation.cancelled() => {
                 return failed_tts_outcome(true, MediaJobState::Cancelled, "tts_job_cancelled");
             }
@@ -760,7 +798,14 @@ impl AudioPipeline {
             Err(_) => {
                 return failed_tts_outcome(true, MediaJobState::TimedOut, "tts_job_timeout");
             }
-            Ok(Err(_)) => {
+            Ok(Err(AudioSynthesisBackendError::UnsupportedProvider)) => {
+                return failed_tts_outcome(
+                    true,
+                    MediaJobState::Blocked,
+                    "tts_provider_unsupported",
+                );
+            }
+            Ok(Err(AudioSynthesisBackendError::Failed)) => {
                 return failed_tts_outcome(true, MediaJobState::Failed, "tts_backend_failed");
             }
             Ok(Ok(response)) => response,
@@ -770,8 +815,8 @@ impl AudioPipeline {
             || output_bytes > DEFAULT_MAX_AUDIO_BYTES
             || response.duration_ms > DEFAULT_MAX_AUDIO_DURATION_MS
             || response.content_type != delivery.content_type
-            || response.codec != codec
-            || response.voice_id != voice_id
+            || response.codec != output_request.codec
+            || response.voice_id != output_request.voice_id
             || !valid_bounded_text(response.model_name.as_str(), 256)
         {
             return failed_tts_outcome(true, MediaJobState::Failed, "tts_backend_output_invalid");
@@ -839,6 +884,32 @@ impl AudioPipeline {
         session_usage.estimated_cost_microunits =
             session_usage.estimated_cost_microunits.saturating_add(usage.estimated_cost_microunits);
         Ok(())
+    }
+}
+
+/// Returns the media type for one supported post-delivery codec.
+#[must_use]
+pub fn audio_output_content_type(codec: &str) -> Option<&'static str> {
+    match codec {
+        "mp3" => Some("audio/mpeg"),
+        "opus" => Some("audio/ogg"),
+        "aac" => Some("audio/aac"),
+        "flac" => Some("audio/flac"),
+        "wav" => Some("audio/wav"),
+        _ => None,
+    }
+}
+
+/// Returns the safe filename extension for one supported post-delivery codec.
+#[must_use]
+pub fn audio_output_file_extension(codec: &str) -> Option<&'static str> {
+    match codec {
+        "mp3" => Some("mp3"),
+        "opus" => Some("ogg"),
+        "aac" => Some("aac"),
+        "flac" => Some("flac"),
+        "wav" => Some("wav"),
+        _ => None,
     }
 }
 
@@ -984,10 +1055,10 @@ mod tests {
         async fn synthesize(
             &self,
             request: AudioSynthesisJobRequest,
-        ) -> Result<AudioSynthesisBackendResult, String> {
+        ) -> Result<AudioSynthesisBackendResult, AudioSynthesisBackendError> {
             self.invoked.store(true, Ordering::SeqCst);
             if self.fail {
-                return Err("provider unavailable".to_owned());
+                return Err(AudioSynthesisBackendError::Failed);
             }
             Ok(AudioSynthesisBackendResult {
                 bytes: b"synthetic-audio".to_vec(),
@@ -1002,6 +1073,33 @@ mod tests {
                     ..MediaUsage::default()
                 },
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowTts;
+
+    #[async_trait]
+    impl AudioSynthesisBackend for SlowTts {
+        async fn synthesize(
+            &self,
+            _request: AudioSynthesisJobRequest,
+        ) -> Result<AudioSynthesisBackendResult, AudioSynthesisBackendError> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(AudioSynthesisBackendError::Failed)
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnsupportedTts;
+
+    #[async_trait]
+    impl AudioSynthesisBackend for UnsupportedTts {
+        async fn synthesize(
+            &self,
+            _request: AudioSynthesisJobRequest,
+        ) -> Result<AudioSynthesisBackendResult, AudioSynthesisBackendError> {
+            Err(AudioSynthesisBackendError::UnsupportedProvider)
         }
     }
 
@@ -1162,13 +1260,14 @@ mod tests {
         };
         let invoked = Arc::new(AtomicBool::new(false));
         let failing = StubTts { fail: true, invoked: Arc::clone(&invoked) };
+        let output_request =
+            AudioOutputRequestV1 { voice_id: "voice-a".to_owned(), codec: "opus".to_owned() };
         let mut pipeline =
             AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
         let failure = pipeline
             .synthesize_after_delivery(
                 &receipt,
-                "voice-a",
-                "opus",
+                &output_request,
                 delivery.clone(),
                 &failing,
                 &AudioJobCancellation::default(),
@@ -1184,8 +1283,7 @@ mod tests {
         let cancelled = pipeline
             .synthesize_after_delivery(
                 &receipt,
-                "voice-a",
-                "opus",
+                &output_request,
                 delivery.clone(),
                 &failing,
                 &cancellation,
@@ -1198,8 +1296,7 @@ mod tests {
         let success = pipeline
             .synthesize_after_delivery(
                 &receipt,
-                "voice-a",
-                "opus",
+                &output_request,
                 delivery.clone(),
                 &successful,
                 &AudioJobCancellation::default(),
@@ -1224,13 +1321,14 @@ mod tests {
         };
         let invoked = Arc::new(AtomicBool::new(false));
         let backend = StubTts { fail: false, invoked: Arc::clone(&invoked) };
+        let output_request =
+            AudioOutputRequestV1 { voice_id: "voice-a".to_owned(), codec: "opus".to_owned() };
         let mut pipeline =
             AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
         let outcome = pipeline
             .synthesize_after_delivery(
                 &receipt,
-                "voice-a",
-                "opus",
+                &output_request,
                 MediaDeliveryDescriptor {
                     delivery_key: "delivery-1".to_owned(),
                     destination_scope_sha256: sha256_hex(b"destination"),
@@ -1258,13 +1356,14 @@ mod tests {
         };
         let invoked = Arc::new(AtomicBool::new(false));
         let backend = StubTts { fail: false, invoked: Arc::clone(&invoked) };
+        let output_request =
+            AudioOutputRequestV1 { voice_id: "voice-a".to_owned(), codec: "opus".to_owned() };
         let mut pipeline =
             AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
         let outcome = pipeline
             .synthesize_after_delivery(
                 &receipt,
-                "voice-a",
-                "opus",
+                &output_request,
                 MediaDeliveryDescriptor {
                     delivery_key: "delivery-1".to_owned(),
                     destination_scope_sha256: sha256_hex(b"destination"),
@@ -1280,6 +1379,53 @@ mod tests {
         assert_eq!(outcome.state, MediaJobState::Blocked);
         assert_eq!(outcome.reason_code, "tts_request_contract_invalid");
         assert!(!invoked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tts_timeout_and_unsupported_provider_preserve_text_success() {
+        let receipt = TextDeliveryReceipt {
+            run_id: "run-1".to_owned(),
+            text: "Delivered text".to_owned(),
+            success: true,
+            delivered_at_unix_ms: unix_ms(),
+        };
+        let request =
+            AudioOutputRequestV1 { voice_id: "voice-a".to_owned(), codec: "mp3".to_owned() };
+        let delivery = MediaDeliveryDescriptor {
+            delivery_key: "delivery-1".to_owned(),
+            destination_scope_sha256: sha256_hex(b"destination"),
+            content_type: "audio/mpeg".to_owned(),
+            file_name: "reply.mp3".to_owned(),
+        };
+        let mut pipeline = AudioPipeline::new(
+            MediaSessionBudget { job_timeout_ms: 5, ..MediaSessionBudget::default() },
+            MediaRetentionPolicy::default(),
+        );
+        let timed_out = pipeline
+            .synthesize_after_delivery(
+                &receipt,
+                &request,
+                delivery.clone(),
+                &SlowTts,
+                &AudioJobCancellation::default(),
+            )
+            .await;
+        assert!(timed_out.text_run_success);
+        assert_eq!(timed_out.state, MediaJobState::TimedOut);
+        assert_eq!(timed_out.reason_code, "tts_job_timeout");
+
+        let unsupported = pipeline
+            .synthesize_after_delivery(
+                &receipt,
+                &request,
+                delivery,
+                &UnsupportedTts,
+                &AudioJobCancellation::default(),
+            )
+            .await;
+        assert!(unsupported.text_run_success);
+        assert_eq!(unsupported.state, MediaJobState::Blocked);
+        assert_eq!(unsupported.reason_code, "tts_provider_unsupported");
     }
 
     #[tokio::test]
@@ -1357,5 +1503,39 @@ mod tests {
             registry.begin_job("", "job-2"),
             Err(AudioPipelineError::InvalidMediaIdentity)
         ));
+    }
+
+    #[tokio::test]
+    async fn session_reset_cancels_registered_synthesis_before_provider_dispatch() {
+        let registry = Arc::new(AudioSessionRegistry::default());
+        let mut job = registry.begin_job("session-reset", "tts:run-1").expect("media job");
+        let cancellation = job.cancellation();
+        assert_eq!(registry.cancel_session("session-reset"), 1);
+        let invoked = Arc::new(AtomicBool::new(false));
+        let backend = StubTts { fail: false, invoked: Arc::clone(&invoked) };
+        let outcome = job
+            .pipeline_mut()
+            .synthesize_after_delivery(
+                &TextDeliveryReceipt {
+                    run_id: "run-1".to_owned(),
+                    text: "Delivered text".to_owned(),
+                    success: true,
+                    delivered_at_unix_ms: unix_ms(),
+                },
+                &AudioOutputRequestV1 { voice_id: "voice-a".to_owned(), codec: "mp3".to_owned() },
+                MediaDeliveryDescriptor {
+                    delivery_key: "tts:run-1".to_owned(),
+                    destination_scope_sha256: sha256_hex(b"destination"),
+                    content_type: "audio/mpeg".to_owned(),
+                    file_name: "reply.mp3".to_owned(),
+                },
+                &backend,
+                &cancellation,
+            )
+            .await;
+
+        assert_eq!(outcome.state, MediaJobState::Cancelled);
+        assert!(outcome.text_run_success);
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 }

@@ -31,6 +31,8 @@ pub enum ProviderError {
     MissingEmbeddingsModel,
     #[error("provider '{provider}' does not support vision inputs")]
     VisionUnsupported { provider: String },
+    #[error("provider '{provider}' does not support audio synthesis")]
+    AudioSynthesisUnsupported { provider: String },
     #[error("embeddings request is invalid: {message}")]
     InvalidEmbeddingsRequest { message: String },
     #[error(
@@ -101,6 +103,12 @@ impl ProviderError {
                 None,
                 Some("vision_unsupported".to_owned()),
             ),
+            Self::AudioSynthesisUnsupported { .. } => ProviderFailureClassification::new(
+                ProviderFailureClass::UnsupportedMultimodal,
+                ProviderFailureAction::FailClosedNoRetry,
+                None,
+                Some("audio_synthesis_unsupported".to_owned()),
+            ),
             Self::InvalidEmbeddingsRequest { .. } => ProviderFailureClassification::new(
                 ProviderFailureClass::MalformedResponse,
                 ProviderFailureAction::FailClosedNoRetry,
@@ -133,6 +141,9 @@ impl ProviderError {
             Self::MissingEmbeddingsModel => "model provider embeddings model is missing".to_owned(),
             Self::VisionUnsupported { provider } => {
                 format!("provider '{provider}' does not support vision inputs")
+            }
+            Self::AudioSynthesisUnsupported { provider } => {
+                format!("provider '{provider}' does not support audio synthesis")
             }
             Self::InvalidEmbeddingsRequest { message }
             | Self::RequestFailed { message, .. }
@@ -573,6 +584,11 @@ fn provider_recovery_plan(
         }
         ProviderFailureClass::MalformedStream | ProviderFailureClass::EmptyOutput => {
             (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::RetrySame)
+        }
+        ProviderFailureClass::UnsupportedMultimodal
+            if classification.recommended_action == ProviderFailureAction::FailClosedNoRetry =>
+        {
+            (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::FailClosed)
         }
         ProviderFailureClass::UnsupportedMultimodal => {
             (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::RetryTransformed)

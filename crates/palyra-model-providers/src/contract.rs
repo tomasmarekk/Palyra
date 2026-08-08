@@ -752,6 +752,26 @@ pub struct AudioTranscriptionResponse {
     pub segments: Vec<AudioTranscriptionSegment>,
 }
 
+/// Provider-neutral speech synthesis input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSynthesisRequest {
+    pub text: String,
+    pub voice: String,
+    pub codec: String,
+}
+
+/// Bounded synthesized payload returned by a supported audio backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSynthesisResponse {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub codec: String,
+    pub model_name: String,
+    pub voice: String,
+    pub input_characters: u64,
+    pub retry_count: u32,
+}
+
 /// One ordered block of a turn output: text or a proposed tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

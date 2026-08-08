@@ -40,8 +40,8 @@ use ulid::Ulid;
 
 use crate::media::{
     ConsoleAttachmentStoreRequest, MediaArtifactPayload, MediaArtifactStore,
-    MediaAudioJobEventRequest, MediaDerivedArtifactRecord, MediaDerivedArtifactSelection,
-    MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot,
+    MediaAudioJobEventRequest, MediaAudioOutputStoreRequest, MediaDerivedArtifactRecord,
+    MediaDerivedArtifactSelection, MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot,
     MediaFailedDerivedArtifactUpsertRequest, MediaRuntimeConfig,
 };
 use crate::transport::grpc::{

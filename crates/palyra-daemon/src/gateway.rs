@@ -114,8 +114,9 @@ use crate::{
     },
     media::MediaRuntimeConfig,
     model_provider::{
-        AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
-        ProviderRequest, ProviderStatusSnapshot,
+        AudioSynthesisRequest, AudioSynthesisResponse, AudioTranscriptionRequest,
+        AudioTranscriptionResponse, ModelProvider, ProviderError, ProviderRequest,
+        ProviderStatusSnapshot,
     },
     orchestrator::{RunLifecycleState, RunStateMachine},
     sandbox_runner::{
@@ -719,6 +720,9 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
         }
         ProviderError::VisionUnsupported { provider } => {
             Status::failed_precondition(format!("provider '{provider}' does not support vision"))
+        }
+        ProviderError::AudioSynthesisUnsupported { provider } => {
+            Status::unimplemented(format!("provider '{provider}' does not support audio synthesis"))
         }
         ProviderError::InvalidEmbeddingsRequest { message } => {
             Status::invalid_argument(format!("embeddings request invalid: {message}"))
