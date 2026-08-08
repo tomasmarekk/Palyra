@@ -1,0 +1,43 @@
+{
+  "schema_id": "palyra.docker-backend-support-matrix.v1",
+  "schema_version": 1,
+  "minimum_daemon_version": "24.0",
+  "minimum_api_version": "1.43",
+  "supported_profiles": [
+    {
+      "host_os": "linux",
+      "host_arch": "x86_64",
+      "daemon_os": "linux",
+      "daemon_arch": "amd64",
+      "qualification_lane": "CI / Docker backend live (ubuntu-latest)",
+      "rollout_posture": "gated_production"
+    }
+  ],
+  "unavailable_profiles": [
+    {
+      "host_os": "macos",
+      "reason_code": "docker.capability.platform_not_qualified"
+    },
+    {
+      "host_os": "windows",
+      "reason_code": "docker.capability.platform_not_qualified"
+    },
+    {
+      "host_arch": "aarch64",
+      "reason_code": "docker.capability.platform_not_qualified"
+    }
+  ],
+  "required_invariants": [
+    "immutable_image_digest",
+    "read_only_rootfs",
+    "explicit_non_root_user",
+    "workspace_scoped_mount",
+    "network_policy",
+    "bounded_resources",
+    "vault_env_file",
+    "resource_lease",
+    "verified_cleanup",
+    "reviewed_patch_bundle",
+    "no_host_fallback"
+  ]
+}

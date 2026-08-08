@@ -1327,8 +1327,9 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             context.execution_backend,
             ExecutionBackendPreference::Docker | ExecutionBackendPreference::SshTunnel
         ) {
-            match ExecutionBackendRunnerRegistry::from_execution_backend_profiles(
+            match ExecutionBackendRunnerRegistry::from_execution_backend_profiles_with_resource_governor(
                 &runtime_state.config.execution_backend_profiles,
+                runtime_state.mcp_resource_governor(),
             ) {
                 Ok(registry) => registry,
                 Err(error) => {

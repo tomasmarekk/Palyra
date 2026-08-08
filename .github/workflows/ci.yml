@@ -167,6 +167,36 @@ jobs:
       - name: Run deterministic core suite
         run: bash scripts/test/run-deterministic-core.sh
 
+  docker-backend-live:
+    name: Docker backend live (ubuntu-latest)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.95.0
+
+      - name: Run live Docker backend qualification
+        run: bash scripts/test/run-docker-backend-live.sh
+
+      - name: Upload Docker qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: docker-backend-live
+          path: |
+            target/qa-lab/docker-backend/**
+            infra/release/docker-backend-support-matrix.json
+          if-no-files-found: error
+          retention-days: 14
+
   deterministic-fault-smoke:
     name: QA / Deterministic fault smoke (${{ matrix.os }})
     strategy:

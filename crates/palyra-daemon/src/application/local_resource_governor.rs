@@ -85,6 +85,8 @@ impl ResourceUnitsV1 {
 pub enum ResourceServiceKind {
     /// Generic supervised child process.
     Process,
+    /// Container runtime process admitted through an isolated backend.
+    Container,
     /// Interactive pseudoterminal.
     Pty,
     /// Language server workspace.

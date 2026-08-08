@@ -17,8 +17,11 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{atomic::AtomicBool, Arc},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -53,6 +56,10 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
+    application::local_resource_governor::{
+        LocalResourceGovernor, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePriority,
+        ResourceServiceKind, ResourceUnitsV1,
+    },
     config::{
         ExecutionBackendContainerEnvBindingConfig, ExecutionBackendContainerProfileConfig,
         ExecutionBackendProfileConfig, ExecutionBackendProfilesConfig, FeatureRolloutsConfig,
@@ -1143,6 +1150,25 @@ impl ExecutionBackendRunnerRegistry {
     pub(crate) fn from_execution_backend_profiles(
         profiles: &ExecutionBackendProfilesConfig,
     ) -> Result<Self, String> {
+        Self::build_from_execution_backend_profiles(profiles, None)
+    }
+
+    /// Builds configured runners under the daemon-wide resource authority.
+    ///
+    /// # Errors
+    /// Returns profile validation failures using the same fail-closed contract
+    /// as [`Self::from_execution_backend_profiles`].
+    pub(crate) fn from_execution_backend_profiles_with_resource_governor(
+        profiles: &ExecutionBackendProfilesConfig,
+        resource_governor: LocalResourceGovernor,
+    ) -> Result<Self, String> {
+        Self::build_from_execution_backend_profiles(profiles, Some(resource_governor))
+    }
+
+    fn build_from_execution_backend_profiles(
+        profiles: &ExecutionBackendProfilesConfig,
+        resource_governor: Option<LocalResourceGovernor>,
+    ) -> Result<Self, String> {
         if profiles.mode == RuntimePreviewMode::Disabled {
             return Ok(Self::default());
         }
@@ -1165,13 +1191,16 @@ impl ExecutionBackendRunnerRegistry {
             [] => None,
             [profile] => {
                 let container_profile = container_backend_profile_from_config(profile)?;
-                let docker =
+                let mut docker =
                     DockerRunner::new(container_profile, DockerCliEngine).map_err(|error| {
                         format!(
                             "failed to build Docker execution backend profile '{}': {error}",
                             profile.id
                         )
                     })?;
+                if let Some(governor) = resource_governor.clone() {
+                    docker = docker.with_resource_governor(governor);
+                }
                 Some(Box::new(docker) as Box<dyn ExecutionBackendRunner>)
             }
             _ => unreachable!("multiple Docker profiles were rejected above"),
@@ -1845,6 +1874,103 @@ pub(crate) struct ContainerBackendProfile {
     pub(crate) cleanup_strategy: String,
 }
 
+/// Durable qualification evidence for one Docker profile and daemon handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DockerBackendCapabilityReport {
+    /// Contract schema version.
+    pub(crate) schema_version: u32,
+    /// Stable profile identity.
+    pub(crate) profile_id: String,
+    /// Host operating system running the Docker client.
+    pub(crate) host_os: String,
+    /// Host architecture running the Docker client.
+    pub(crate) host_arch: String,
+    /// Docker daemon operating system.
+    pub(crate) daemon_os: String,
+    /// Docker daemon architecture.
+    pub(crate) daemon_arch: String,
+    /// Docker daemon semantic version.
+    pub(crate) daemon_version: String,
+    /// Docker daemon API version.
+    pub(crate) daemon_api_version: String,
+    /// Whether the profile pins an immutable image digest.
+    pub(crate) image_digest_pinned: bool,
+    /// Whether the root filesystem is read-only.
+    pub(crate) readonly_rootfs: bool,
+    /// Whether the configured container user is explicitly non-root.
+    pub(crate) non_root_user: bool,
+    /// Whether every mount is workspace-scoped.
+    pub(crate) workspace_mounts_scoped: bool,
+    /// Stable network posture used by the container.
+    pub(crate) network_policy: String,
+    /// Whether every configured resource ceiling is positive.
+    pub(crate) resource_limits_bounded: bool,
+    /// Whether secret-shaped environment values are vault-backed.
+    pub(crate) vault_env_scoped: bool,
+    /// Whether the daemon and profile satisfy the supported production matrix.
+    pub(crate) qualified: bool,
+    /// Stable diagnostic reason for the qualification verdict.
+    pub(crate) reason_code: String,
+}
+
+impl DockerBackendCapabilityReport {
+    fn from_profile(
+        profile: &ContainerBackendProfile,
+        daemon_version: String,
+        daemon_api_version: String,
+        daemon_os: String,
+        daemon_arch: String,
+    ) -> Self {
+        let image_digest_pinned = docker_image_digest_sha256(profile.image.as_str()).is_some();
+        let non_root_user = !container_user_is_root(profile.user.as_str());
+        let workspace_mounts_scoped =
+            !profile.mounts.is_empty() && profile.mounts.iter().all(|mount| mount.workspace_scoped);
+        let resource_limits_bounded = profile.limits.cpu_time_limit_ms > 0
+            && profile.limits.memory_limit_bytes > 0
+            && profile.limits.max_output_bytes > 0;
+        let vault_env_scoped = profile.env.iter().all(|binding| {
+            !is_sensitive_key(binding.name.as_str())
+                || matches!(binding.source_kind, ContainerEnvSourceKind::VaultRef)
+        });
+        let daemon_supported = docker_version_at_least(daemon_version.as_str(), 24, 0)
+            && docker_version_at_least(daemon_api_version.as_str(), 1, 43);
+        let qualified = image_digest_pinned
+            && profile.readonly_rootfs
+            && non_root_user
+            && workspace_mounts_scoped
+            && resource_limits_bounded
+            && vault_env_scoped
+            && daemon_supported;
+        Self {
+            schema_version: 1,
+            profile_id: profile.profile_id.clone(),
+            host_os: env::consts::OS.to_owned(),
+            host_arch: env::consts::ARCH.to_owned(),
+            daemon_os,
+            daemon_arch,
+            daemon_version,
+            daemon_api_version,
+            image_digest_pinned,
+            readonly_rootfs: profile.readonly_rootfs,
+            non_root_user,
+            workspace_mounts_scoped,
+            network_policy: docker_egress_posture(profile.network).to_owned(),
+            resource_limits_bounded,
+            vault_env_scoped,
+            qualified,
+            reason_code: if qualified {
+                "docker.capability.qualified"
+            } else if !daemon_supported {
+                "docker.capability.daemon_unsupported"
+            } else {
+                "docker.capability.profile_unqualified"
+            }
+            .to_owned(),
+        }
+    }
+}
+
 impl ContainerBackendProfile {
     /// Validates the fail-closed container invariants: no privileged
     /// containers, explicit non-root user, positive resource limits,
@@ -2086,6 +2212,15 @@ fn normalize_docker_vault_ref(raw: &str) -> Result<String, DockerEngineError> {
 const DOCKER_WORKSPACE_ROOT: &str = "/workspace";
 const DOCKER_EGRESS_PROXY_NETWORK: &str = "palyra-egress-proxy";
 const DOCKER_CLEANUP_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1024;
+const DOCKER_DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerDaemonIdentity {
+    version: String,
+    api_version: String,
+    os: String,
+    arch: String,
+}
 
 /// Runtime plan passed to a Docker engine implementation.
 #[derive(Debug, Clone)]
@@ -2107,6 +2242,8 @@ pub(crate) struct DockerRunPlan {
     pub(crate) limits: ContainerResourceLimits,
     pub(crate) workspace_writeback: WorkspaceWritebackMode,
     pub(crate) cleanup_strategy: String,
+    pub(crate) execution_timeout_ms: u64,
+    pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
 }
 
 /// Temporary env-file containing resolved vault-backed Docker env values.
@@ -2129,22 +2266,27 @@ impl Drop for DockerEnvFileCleanupGuard {
     }
 }
 
-/// Container cleanup evidence emitted by a Docker engine.
+/// Container cleanup evidence emitted after engine and resource settlement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DockerCleanupAttestation {
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContainerCleanupAttestation {
     pub(crate) strategy: String,
     pub(crate) container_removed: bool,
     pub(crate) workspace_cleanup_required: bool,
     pub(crate) volume_removed: bool,
+    pub(crate) resource_lease_required: bool,
+    pub(crate) resource_lease_id_sha256: Option<String>,
+    pub(crate) resource_lease_released: bool,
     pub(crate) success: bool,
     pub(crate) reason_code: String,
 }
 
-impl DockerCleanupAttestation {
+impl ContainerCleanupAttestation {
     fn verified_success(&self) -> bool {
         self.success
             && self.container_removed
             && (!self.workspace_cleanup_required || self.volume_removed)
+            && (!self.resource_lease_required || self.resource_lease_released)
     }
 
     fn verified_reason_code(&self) -> &str {
@@ -2156,7 +2298,7 @@ impl DockerCleanupAttestation {
     }
 }
 
-fn docker_cleanup_evidence(cleanup: &DockerCleanupAttestation) -> ExecutionCleanupEvidence {
+fn docker_cleanup_evidence(cleanup: &ContainerCleanupAttestation) -> ExecutionCleanupEvidence {
     ExecutionCleanupEvidence {
         strategy: cleanup.strategy.clone(),
         success: cleanup.verified_success(),
@@ -2179,6 +2321,18 @@ fn docker_cleanup_evidence(cleanup: &DockerCleanupAttestation) -> ExecutionClean
                 },
                 cleanup.workspace_cleanup_required,
                 !cleanup.workspace_cleanup_required || cleanup.volume_removed,
+            ),
+            cleanup_resource(
+                "resource_lease",
+                if !cleanup.resource_lease_required {
+                    "not_required"
+                } else if cleanup.resource_lease_released {
+                    "released"
+                } else {
+                    "release_failed"
+                },
+                cleanup.resource_lease_required,
+                !cleanup.resource_lease_required || cleanup.resource_lease_released,
             ),
         ],
     }
@@ -2309,8 +2463,14 @@ pub(crate) struct DockerRunReport {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) resource_usage: DockerResourceUsage,
-    pub(crate) cleanup: DockerCleanupAttestation,
+    pub(crate) cleanup: ContainerCleanupAttestation,
     pub(crate) patch_bundle: Option<DockerPatchBundle>,
+    pub(crate) capability_report: DockerBackendCapabilityReport,
+    pub(crate) termination_reason_code: Option<String>,
+    pub(crate) stdout_original_bytes: usize,
+    pub(crate) stderr_original_bytes: usize,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
 }
 
 /// Classified Docker engine failure before a container result exists.
@@ -2332,14 +2492,141 @@ pub(crate) trait DockerEngine: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DockerCliEngine;
 
+async fn probe_docker_daemon() -> Result<DockerDaemonIdentity, DockerEngineError> {
+    let output = tokio::time::timeout(
+        DOCKER_DAEMON_PROBE_TIMEOUT,
+        tokio::process::Command::new("docker")
+            .args([
+                "version",
+                "--format",
+                "{{.Server.Version}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| DockerEngineError {
+        reason_code: "docker.daemon.probe_timeout".to_owned(),
+        message: "Docker daemon capability probe exceeded five seconds".to_owned(),
+    })?
+    .map_err(|error| DockerEngineError {
+        reason_code: "docker.daemon.probe_failed".to_owned(),
+        message: format!("failed to launch Docker daemon capability probe: {error}"),
+    })?;
+    if !output.status.success() {
+        return Err(DockerEngineError {
+            reason_code: "docker.daemon.unavailable".to_owned(),
+            message: format!(
+                "Docker daemon capability probe failed: {}",
+                redact_diagnostic_text(String::from_utf8_lossy(output.stderr.as_slice()).trim())
+            ),
+        });
+    }
+    let raw = String::from_utf8_lossy(output.stdout.as_slice());
+    let mut fields = raw.trim().split('|');
+    let identity = DockerDaemonIdentity {
+        version: fields.next().unwrap_or_default().trim().to_owned(),
+        api_version: fields.next().unwrap_or_default().trim().to_owned(),
+        os: fields.next().unwrap_or_default().trim().to_owned(),
+        arch: fields.next().unwrap_or_default().trim().to_owned(),
+    };
+    if fields.next().is_some()
+        || identity.version.is_empty()
+        || identity.api_version.is_empty()
+        || identity.os.is_empty()
+        || identity.arch.is_empty()
+    {
+        return Err(DockerEngineError {
+            reason_code: "docker.daemon.probe_invalid".to_owned(),
+            message: "Docker daemon capability probe returned an invalid identity".to_owned(),
+        });
+    }
+    Ok(identity)
+}
+
+async fn wait_for_docker_cancellation(cancellation: Option<Arc<AtomicBool>>) {
+    let Some(cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn docker_bound_streams(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    max_output_bytes: u64,
+) -> (Vec<u8>, Vec<u8>, usize, usize, bool, bool) {
+    let stdout_original_bytes = stdout.len();
+    let stderr_original_bytes = stderr.len();
+    let budget = usize::try_from(max_output_bytes).unwrap_or(usize::MAX);
+    let stdout_captured = stdout_original_bytes.min(budget);
+    let stderr_budget = budget.saturating_sub(stdout_captured);
+    let stderr_captured = stderr_original_bytes.min(stderr_budget);
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+    stdout.truncate(stdout_captured);
+    stderr.truncate(stderr_captured);
+    (
+        stdout,
+        stderr,
+        stdout_original_bytes,
+        stderr_original_bytes,
+        stdout_original_bytes > stdout_captured,
+        stderr_original_bytes > stderr_captured,
+    )
+}
+
 impl DockerEngine for DockerCliEngine {
     fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
         Box::pin(async move {
             let started = Instant::now();
+            let daemon = probe_docker_daemon().await?;
+            let profile = ContainerBackendProfile {
+                profile_id: plan.profile_id.clone(),
+                runtime: ContainerRuntimeKind::Docker,
+                image: plan.image.clone(),
+                mounts: plan.mounts.clone(),
+                network: plan.network,
+                user: plan.user.clone(),
+                readonly_rootfs: plan.readonly_rootfs,
+                privileged: false,
+                limits: plan.limits.clone(),
+                env: plan.env.clone(),
+                cleanup_strategy: plan.cleanup_strategy.clone(),
+            };
+            let capability_report = DockerBackendCapabilityReport::from_profile(
+                &profile,
+                daemon.version,
+                daemon.api_version,
+                daemon.os,
+                daemon.arch,
+            );
+            if !capability_report.qualified {
+                return Err(DockerEngineError {
+                    reason_code: capability_report.reason_code.clone(),
+                    message: format!(
+                        "Docker profile {} or daemon {} does not satisfy the supported production matrix",
+                        capability_report.profile_id, capability_report.daemon_version
+                    ),
+                });
+            }
             let (run_plan, writeback_capture) = prepare_docker_run_plan(&plan)?;
             let container_name = format!("palyra-{}", Ulid::new().to_string().to_ascii_lowercase());
             let mut command = tokio::process::Command::new("docker");
-            command.arg("run").arg("--rm").arg("--name").arg(container_name.as_str());
+            command
+                .arg("run")
+                .arg("--rm")
+                .arg("--name")
+                .arg(container_name.as_str())
+                .arg("--label")
+                .arg("palyra.managed=true")
+                .arg("--pids-limit")
+                .arg("128");
             if run_plan.readonly_rootfs {
                 command.arg("--read-only");
             }
@@ -2364,13 +2651,44 @@ impl DockerEngine for DockerCliEngine {
             command.arg(run_plan.image.as_str());
             command.arg(run_plan.command.as_str());
             command.args(run_plan.args.iter().map(String::as_str));
-            let output = command.output().await.map_err(|error| DockerEngineError {
-                reason_code: "docker.spawn_failed".to_owned(),
-                message: format!(
-                    "failed to launch Docker CLI for profile {}: {error}",
-                    run_plan.profile_id
+            command.kill_on_drop(true);
+            let output_future = command.output();
+            tokio::pin!(output_future);
+            let cancellation_future =
+                wait_for_docker_cancellation(run_plan.cancellation_requested.clone());
+            tokio::pin!(cancellation_future);
+            let timeout =
+                tokio::time::sleep(Duration::from_millis(run_plan.execution_timeout_ms.max(1)));
+            tokio::pin!(timeout);
+            let (exit_code, stdout, stderr, termination_reason_code) = tokio::select! {
+                output = &mut output_future => {
+                    let output = output.map_err(|error| DockerEngineError {
+                        reason_code: "docker.spawn_failed".to_owned(),
+                        message: format!(
+                            "failed to launch Docker CLI for profile {}: {error}",
+                            run_plan.profile_id
+                        ),
+                    })?;
+                    (
+                        output.status.code().unwrap_or(1),
+                        output.stdout,
+                        output.stderr,
+                        None,
+                    )
+                }
+                () = &mut cancellation_future => (
+                    130,
+                    Vec::new(),
+                    b"Docker execution cancelled by the owning run".to_vec(),
+                    Some("docker.execution.cancelled".to_owned()),
                 ),
-            })?;
+                () = &mut timeout => (
+                    124,
+                    Vec::new(),
+                    b"Docker execution exceeded its wall-time budget".to_vec(),
+                    Some("docker.execution.timeout".to_owned()),
+                ),
+            };
             let container_removed =
                 ensure_docker_container_removed(container_name.as_str()).await?;
             let workspace_cleanup_required = writeback_capture.is_some();
@@ -2380,20 +2698,31 @@ impl DockerEngine for DockerCliEngine {
             };
             let volume_removed = true;
             let cleanup_success = container_removed && volume_removed;
+            let (
+                stdout,
+                stderr,
+                stdout_original_bytes,
+                stderr_original_bytes,
+                stdout_truncated,
+                stderr_truncated,
+            ) = docker_bound_streams(stdout, stderr, run_plan.limits.max_output_bytes);
             Ok(DockerRunReport {
-                exit_code: output.status.code().unwrap_or(1),
-                stdout: output.stdout,
-                stderr: output.stderr,
+                exit_code,
+                stdout,
+                stderr,
                 resource_usage: DockerResourceUsage {
                     duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                     memory_limit_bytes: plan.limits.memory_limit_bytes,
                     cpu_time_limit_ms: plan.limits.cpu_time_limit_ms,
                 },
-                cleanup: DockerCleanupAttestation {
+                cleanup: ContainerCleanupAttestation {
                     strategy: plan.cleanup_strategy,
                     container_removed,
                     workspace_cleanup_required,
                     volume_removed,
+                    resource_lease_required: false,
+                    resource_lease_id_sha256: None,
+                    resource_lease_released: false,
                     success: cleanup_success,
                     reason_code: if cleanup_success {
                         "docker.cleanup.ok"
@@ -2403,6 +2732,12 @@ impl DockerEngine for DockerCliEngine {
                     .to_owned(),
                 },
                 patch_bundle,
+                capability_report,
+                termination_reason_code,
+                stdout_original_bytes,
+                stderr_original_bytes,
+                stdout_truncated,
+                stderr_truncated,
             })
         })
     }
@@ -3025,10 +3360,21 @@ fn docker_patch_line_is_unified_header(line: &str, prefix: &str) -> bool {
 }
 
 /// Docker runner adapter. Profile validation happens before any engine call.
-#[derive(Debug)]
 pub(crate) struct DockerRunner<E: DockerEngine> {
     profile: ContainerBackendProfile,
     engine: E,
+    resource_governor: Option<LocalResourceGovernor>,
+}
+
+impl<E: DockerEngine + std::fmt::Debug> std::fmt::Debug for DockerRunner<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DockerRunner")
+            .field("profile", &self.profile)
+            .field("engine", &self.engine)
+            .field("resource_governor_attached", &self.resource_governor.is_some())
+            .finish()
+    }
 }
 
 impl<E: DockerEngine> DockerRunner<E> {
@@ -3041,7 +3387,70 @@ impl<E: DockerEngine> DockerRunner<E> {
         if !matches!(profile.runtime, ContainerRuntimeKind::Docker) {
             return Err("DockerRunner requires a docker container profile".to_owned());
         }
-        Ok(Self { profile, engine })
+        Ok(Self { profile, engine, resource_governor: None })
+    }
+
+    /// Attaches the daemon-wide durable resource authority to container runs.
+    #[must_use]
+    pub(crate) fn with_resource_governor(
+        mut self,
+        resource_governor: LocalResourceGovernor,
+    ) -> Self {
+        self.resource_governor = Some(resource_governor);
+        self
+    }
+
+    fn acquire_resource_lease(
+        &self,
+        proposal_id: &str,
+        plan: &DockerRunPlan,
+    ) -> Result<Option<ResourceLeaseV1>, DockerEngineError> {
+        let Some(governor) = self.resource_governor.as_ref() else {
+            return Ok(None);
+        };
+        let digest = Sha256::digest(proposal_id.as_bytes());
+        let generation = u64::from_be_bytes(
+            digest[..8].try_into().expect("SHA-256 prefix always contains eight bytes"),
+        )
+        .max(1);
+        governor
+            .acquire(ResourceLeaseRequestV1 {
+                owner_id: format!("docker:{}", hex::encode(digest)),
+                generation,
+                service: ResourceServiceKind::Container,
+                priority: ResourcePriority::Foreground,
+                requested: ResourceUnitsV1 {
+                    processes: 1,
+                    memory_bytes: plan.limits.memory_limit_bytes,
+                    file_descriptors: 64,
+                    sockets: u64::from(matches!(plan.network, ContainerNetworkPolicy::EgressProxy)),
+                    spool_bytes: plan.limits.max_output_bytes,
+                    concurrency: 1,
+                },
+                duration: Duration::from_millis(plan.execution_timeout_ms.max(1)),
+            })
+            .map(Some)
+            .map_err(|error| DockerEngineError {
+                reason_code: "docker.resource_lease.admission_denied".to_owned(),
+                message: format!("Docker resource admission failed: {error}"),
+            })
+    }
+
+    fn release_resource_lease(
+        &self,
+        lease: &ResourceLeaseV1,
+    ) -> Result<ResourceLeaseV1, DockerEngineError> {
+        self.resource_governor
+            .as_ref()
+            .ok_or_else(|| DockerEngineError {
+                reason_code: "docker.resource_lease.authority_missing".to_owned(),
+                message: "Docker resource authority disappeared before release".to_owned(),
+            })?
+            .release(lease.lease_id.as_str(), lease.generation)
+            .map_err(|error| DockerEngineError {
+                reason_code: "docker.resource_lease.release_failed".to_owned(),
+                message: format!("Docker resource lease release failed: {error}"),
+            })
     }
 }
 
@@ -3080,6 +3489,7 @@ impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
                 request.config,
                 request.input_json,
                 request.vault,
+                request.cancellation_requested.clone(),
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -3092,8 +3502,44 @@ impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
                     );
                 }
             };
-            match self.engine.run(plan.clone()).await {
-                Ok(report) => {
+            if plan.cancellation_requested.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return docker_error_outcome(
+                    request.proposal_id,
+                    request.tool_name,
+                    request.input_json,
+                    "docker.execution.cancelled_before_start",
+                    "Docker execution was cancelled before resource admission".to_owned(),
+                );
+            }
+            let resource_lease = match self.acquire_resource_lease(request.proposal_id, &plan) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return docker_error_outcome(
+                        request.proposal_id,
+                        request.tool_name,
+                        request.input_json,
+                        error.reason_code.as_str(),
+                        error.message,
+                    );
+                }
+            };
+            let engine_result = self.engine.run(plan.clone()).await;
+            let resource_release =
+                resource_lease.as_ref().map(|lease| self.release_resource_lease(lease)).transpose();
+            match (engine_result, resource_release) {
+                (Ok(mut report), Ok(released_lease)) => {
+                    report.cleanup.resource_lease_required = resource_lease.is_some();
+                    report.cleanup.resource_lease_id_sha256 =
+                        resource_lease.as_ref().map(|lease| sha256_hex(lease.lease_id.as_bytes()));
+                    report.cleanup.resource_lease_released = released_lease.is_some();
+                    if report.cleanup.resource_lease_required
+                        && !report.cleanup.resource_lease_released
+                    {
+                        report.cleanup.success = false;
+                        report.cleanup.reason_code =
+                            "docker.resource_lease.release_failed".to_owned();
+                    }
                     let mut outcome = docker_process_run_outcome(
                         request.proposal_id,
                         request.tool_name,
@@ -3108,7 +3554,14 @@ impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
                     );
                     outcome
                 }
-                Err(error) => docker_error_outcome(
+                (Ok(_), Err(error)) | (Err(_), Err(error)) => docker_error_outcome(
+                    request.proposal_id,
+                    request.tool_name,
+                    request.input_json,
+                    error.reason_code.as_str(),
+                    error.message,
+                ),
+                (Err(error), Ok(_)) => docker_error_outcome(
                     request.proposal_id,
                     request.tool_name,
                     request.input_json,
@@ -3137,6 +3590,7 @@ fn docker_process_run_plan(
     config: &ToolCallConfig,
     input_json: &[u8],
     request_vault: Option<&Vault>,
+    cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> Result<DockerRunPlan, DockerEngineError> {
     profile.validate().map_err(|message| DockerEngineError {
         reason_code: "docker.profile.invalid".to_owned(),
@@ -3183,6 +3637,8 @@ fn docker_process_run_plan(
         limits: profile.limits.clone(),
         workspace_writeback: WorkspaceWritebackMode::PatchBundle,
         cleanup_strategy: profile.cleanup_strategy.clone(),
+        execution_timeout_ms: config.execution_timeout_ms,
+        cancellation_requested,
     })
 }
 
@@ -3245,7 +3701,8 @@ fn docker_process_run_outcome(
     let cleanup_reason_code = cleanup.verified_reason_code().to_owned();
     cleanup.success = cleanup_success;
     cleanup.reason_code = cleanup_reason_code;
-    let success = report.exit_code == 0 && cleanup_success;
+    let success =
+        report.exit_code == 0 && cleanup_success && report.termination_reason_code.is_none();
     let stdout_view = docker_stream_output_view(&report.stdout);
     let stderr_view = docker_stream_output_view(&report.stderr);
     let process_risk = parse_process_runner_tool_input(input_json)
@@ -3287,6 +3744,8 @@ fn docker_process_run_outcome(
             },
         },
         "cleanup_success": cleanup_success,
+        "capability_report": &report.capability_report,
+        "termination_reason_code": report.termination_reason_code.as_deref(),
         "patch_bundle_sha256": patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
         "patch_bundle": patch_bundle.as_ref().map(workspace_patch_bundle_manifest_projection),
     });
@@ -3297,12 +3756,12 @@ fn docker_process_run_outcome(
         "exit_code": report.exit_code,
         "stdout": stdout_view.model_text,
         "stderr": stderr_view.model_text,
-        "stdout_truncated": false,
-        "stderr_truncated": false,
+        "stdout_truncated": report.stdout_truncated,
+        "stderr_truncated": report.stderr_truncated,
         "stdout_redacted": stdout_view.redacted,
         "stderr_redacted": stderr_view.redacted,
-        "stdout_bytes": report.stdout.len(),
-        "stderr_bytes": report.stderr.len(),
+        "stdout_bytes": report.stdout_original_bytes,
+        "stderr_bytes": report.stderr_original_bytes,
         "duration_ms": report.resource_usage.duration_ms,
         "tier": "container_profile",
         "sandbox_backend": "docker",
@@ -3338,6 +3797,8 @@ fn docker_process_run_outcome(
         String::new()
     } else if !cleanup_success {
         "DockerRunner cleanup failed after container execution".to_owned()
+    } else if let Some(reason_code) = report.termination_reason_code.as_deref() {
+        format!("DockerRunner execution ended with {reason_code}")
     } else {
         format!("DockerRunner process exited unsuccessfully with code {}", report.exit_code)
     };
@@ -3503,6 +3964,17 @@ fn docker_image_digest_sha256(image: &str) -> Option<String> {
     let digest = digest.trim();
     (digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit()))
         .then(|| digest.to_ascii_lowercase())
+}
+
+fn docker_version_at_least(raw: &str, minimum_major: u64, minimum_minor: u64) -> bool {
+    let mut segments = raw.trim().trim_start_matches('v').split('.');
+    let Some(major) = segments.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(minor) = segments.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    (major, minor) >= (minimum_major, minimum_minor)
 }
 
 fn container_user_is_root(user: &str) -> bool {
@@ -5258,6 +5730,8 @@ fn aggregate_node_capabilities(nodes: &[&RegisteredNodeRecord]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::{
         fs,
         path::PathBuf,
@@ -5306,11 +5780,11 @@ mod tests {
         build_execution_backend_status_reports, parse_execution_backend_preference,
         plan_stuck_tool_job_recovery, prepare_docker_run_plan, resolve_execution_backend,
         resolve_execution_backend_for_request, sha256_hex, validate_execution_backend_selection,
-        ContainerBackendProfile, ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy,
-        ContainerNetworkPolicy, ContainerResourceLimits, ContainerRuntimeKind,
-        DockerCleanupAttestation, DockerEngine, DockerEngineError, DockerEngineFuture,
-        DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
-        ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        ContainerBackendProfile, ContainerCleanupAttestation, ContainerEnvBinding,
+        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
+        ContainerResourceLimits, ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine,
+        DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
+        DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
@@ -5412,6 +5886,41 @@ mod tests {
         (tempdir, vault)
     }
 
+    #[cfg(target_os = "linux")]
+    fn current_docker_user() -> String {
+        fn numeric_identity(flag: &str) -> String {
+            let output = std::process::Command::new("id")
+                .arg(flag)
+                .output()
+                .expect("id command should be available in the supported Linux matrix");
+            assert!(output.status.success(), "id command should succeed");
+            String::from_utf8(output.stdout).expect("id output should be UTF-8").trim().to_owned()
+        }
+        format!("{}:{}", numeric_identity("-u"), numeric_identity("-g"))
+    }
+
+    fn test_resource_governor(
+        root: &std::path::Path,
+    ) -> crate::application::local_resource_governor::LocalResourceGovernor {
+        let limits = crate::application::local_resource_governor::ResourceUnitsV1 {
+            processes: 8,
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+            file_descriptors: 1_024,
+            sockets: 32,
+            spool_bytes: 32 * 1024 * 1024,
+            concurrency: 16,
+        };
+        crate::application::local_resource_governor::LocalResourceGovernor::open(
+            crate::application::local_resource_governor::LocalResourceGovernorConfig {
+                registry_path: root.join("resource-leases.json"),
+                global_limit: limits,
+                per_owner_limit: limits,
+                max_records: 32,
+            },
+        )
+        .expect("resource governor should open")
+    }
+
     fn safe_container_profile_config(
         id: &str,
         workspace_mount_read_only: bool,
@@ -5494,15 +6003,30 @@ mod tests {
                 memory_limit_bytes: 128 * 1024 * 1024,
                 cpu_time_limit_ms: 1_000,
             },
-            cleanup: DockerCleanupAttestation {
+            cleanup: ContainerCleanupAttestation {
                 strategy: "remove_container_and_volume".to_owned(),
                 container_removed: true,
                 workspace_cleanup_required: true,
                 volume_removed: true,
+                resource_lease_required: false,
+                resource_lease_id_sha256: None,
+                resource_lease_released: false,
                 success: true,
                 reason_code: "docker.cleanup.ok".to_owned(),
             },
             patch_bundle: None,
+            capability_report: DockerBackendCapabilityReport::from_profile(
+                &safe_container_profile(),
+                "29.0.0".to_owned(),
+                "1.52".to_owned(),
+                "linux".to_owned(),
+                "amd64".to_owned(),
+            ),
+            termination_reason_code: None,
+            stdout_original_bytes: b"runner-ok\n".len(),
+            stderr_original_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -6113,6 +6637,8 @@ mod tests {
             limits: profile.limits,
             workspace_writeback: WorkspaceWritebackMode::PatchBundle,
             cleanup_strategy: profile.cleanup_strategy,
+            execution_timeout_ms: 1_000,
+            cancellation_requested: None,
         };
 
         let (run_plan, capture) = prepare_docker_run_plan(&plan)
@@ -6205,6 +6731,8 @@ mod tests {
             limits: profile.limits,
             workspace_writeback: WorkspaceWritebackMode::PatchBundle,
             cleanup_strategy: profile.cleanup_strategy,
+            execution_timeout_ms: 1_000,
+            cancellation_requested: None,
         };
 
         let error = prepare_docker_run_plan(&plan)
@@ -6295,6 +6823,46 @@ mod tests {
     }
 
     #[test]
+    fn docker_capability_report_enforces_supported_daemon_matrix() {
+        let profile = safe_container_profile();
+        let qualified = DockerBackendCapabilityReport::from_profile(
+            &profile,
+            "29.0.1".to_owned(),
+            "1.52".to_owned(),
+            "linux".to_owned(),
+            "amd64".to_owned(),
+        );
+        assert!(qualified.qualified);
+        assert_eq!(qualified.reason_code, "docker.capability.qualified");
+        assert!(qualified.image_digest_pinned);
+        assert!(qualified.workspace_mounts_scoped);
+        assert!(qualified.resource_limits_bounded);
+
+        let unsupported = DockerBackendCapabilityReport::from_profile(
+            &profile,
+            "23.0.6".to_owned(),
+            "1.42".to_owned(),
+            "linux".to_owned(),
+            "amd64".to_owned(),
+        );
+        assert!(!unsupported.qualified);
+        assert_eq!(unsupported.reason_code, "docker.capability.daemon_unsupported");
+    }
+
+    #[test]
+    fn docker_output_budget_is_shared_across_streams() {
+        let (stdout, stderr, stdout_bytes, stderr_bytes, stdout_truncated, stderr_truncated) =
+            super::docker_bound_streams(vec![b'a'; 6], vec![b'b'; 6], 8);
+
+        assert_eq!(stdout, vec![b'a'; 6]);
+        assert_eq!(stderr, vec![b'b'; 2]);
+        assert_eq!(stdout_bytes, 6);
+        assert_eq!(stderr_bytes, 6);
+        assert!(!stdout_truncated);
+        assert!(stderr_truncated);
+    }
+
+    #[test]
     fn docker_exact_name_probe_requires_an_empty_container_listing() {
         assert!(super::docker_exact_name_probe_is_empty(b"\r\n"));
         assert!(!super::docker_exact_name_probe_is_empty(b"7a31b6e86f15\n"));
@@ -6381,6 +6949,178 @@ mod tests {
             plan.image_digest_sha256,
             "1111111111111111111111111111111111111111111111111111111111111111"
         );
+    }
+
+    #[tokio::test]
+    async fn docker_runner_releases_durable_resource_lease_after_cleanup() {
+        let temporary = tempfile::tempdir().expect("resource registry root should exist");
+        let governor = test_resource_governor(temporary.path());
+        let (engine, _) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build")
+            .with_resource_governor(governor.clone());
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-resource-lease",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(payload["cleanup"]["resource_lease_required"], true);
+        assert_eq!(payload["cleanup"]["resource_lease_released"], true);
+        assert!(payload["cleanup"]["resource_lease_id_sha256"].as_str().is_some());
+        assert!(governor.active_leases().expect("leases should remain readable").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
+    async fn docker_live_e2e_qualifies_run_network_mount_vault_patch_and_cleanup() {
+        let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
+            .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
+        let report_path = std::env::var_os("PALYRA_DOCKER_LIVE_REPORT").map(PathBuf::from);
+        let temporary = tempfile::tempdir().expect("live Docker root should exist");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::write(workspace.join("seed.txt"), "seed\n").expect("seed file should exist");
+        let (_vault_root, vault) =
+            temp_vault_with_secret(VaultScope::Global, "live-token", b"live-secret");
+        let mut profile = safe_container_profile();
+        profile.profile_id = "docker-live-qualified".to_owned();
+        profile.image = image;
+        profile.mounts[0].host_path = workspace.to_string_lossy().into_owned();
+        profile.user = current_docker_user();
+        profile.limits.cpu_time_limit_ms = 10_000;
+        profile.limits.memory_limit_bytes = 64 * 1024 * 1024;
+        profile.env = vec![ContainerEnvBinding {
+            name: "API_TOKEN".to_owned(),
+            source_kind: ContainerEnvSourceKind::VaultRef,
+            value: "vault://global/live-token".to_owned(),
+        }];
+        let governor = test_resource_governor(temporary.path());
+        let runner = DockerRunner::new(profile, super::DockerCliEngine)
+            .expect("live Docker profile should validate")
+            .with_resource_governor(governor.clone());
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["sh".to_owned()];
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = 20_000;
+        let input = br#"{"command":"sh","args":["-c","test \"$API_TOKEN\" = live-secret && printf 'qualified\\n' > live.txt && if wget -q -T 2 -O - http://example.com; then exit 91; fi"]}"#;
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-live-qualified",
+                tool_name: "palyra.process.run",
+                input_json: input,
+                vault: Some(&vault),
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(
+            payload["output_manifest"]["capability_report"]["reason_code"],
+            "docker.capability.qualified"
+        );
+        assert_eq!(payload["cleanup"]["container_removed"], true);
+        assert_eq!(payload["cleanup"]["resource_lease_released"], true);
+        assert_eq!(payload["workspace_writeback"]["mode"], "patch_bundle");
+        assert!(
+            payload["workspace_writeback"]["patch_bundle"]["files"]
+                .as_array()
+                .is_some_and(|files| files.iter().any(|path| path == "live.txt")),
+            "live writeback should return a reviewed patch bundle"
+        );
+        assert!(
+            !workspace.join("live.txt").exists(),
+            "container writeback must not mutate the authoritative host workspace"
+        );
+        assert!(governor.active_leases().expect("leases should remain readable").is_empty());
+        if let Some(report_path) = report_path {
+            if let Some(parent) = report_path.parent() {
+                fs::create_dir_all(parent).expect("live report directory should exist");
+            }
+            fs::write(
+                report_path,
+                serde_json::to_vec_pretty(&payload).expect("live report should serialize"),
+            )
+            .expect("live report should be written");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
+    async fn docker_live_e2e_cancels_and_removes_container() {
+        let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
+            .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
+        let temporary = tempfile::tempdir().expect("live Docker root should exist");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        let mut profile = safe_container_profile();
+        profile.profile_id = "docker-live-cancel".to_owned();
+        profile.image = image;
+        profile.mounts[0].host_path = workspace.to_string_lossy().into_owned();
+        profile.user = current_docker_user();
+        profile.limits.cpu_time_limit_ms = 10_000;
+        profile.limits.memory_limit_bytes = 64 * 1024 * 1024;
+        let governor = test_resource_governor(temporary.path());
+        let runner = DockerRunner::new(profile, super::DockerCliEngine)
+            .expect("live Docker profile should validate")
+            .with_resource_governor(governor.clone());
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["sh".to_owned()];
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = 20_000;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_trigger = cancelled.clone();
+        let trigger = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            cancellation_trigger.store(true, Ordering::Release);
+        });
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-live-cancel",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"sh","args":["-c","sleep 30"]}"#,
+                vault: None,
+                cancellation_requested: Some(cancelled),
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        trigger.await.expect("cancellation trigger should finish");
+
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("docker.execution.cancelled"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(payload["cleanup"]["container_removed"], true);
+        assert_eq!(payload["cleanup"]["resource_lease_released"], true);
+        assert!(governor.active_leases().expect("leases should remain readable").is_empty());
     }
 
     #[cfg(feature = "qa-fault-injection")]
