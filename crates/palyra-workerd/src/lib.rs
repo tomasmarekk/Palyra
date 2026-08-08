@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
+pub mod computer_use;
 pub mod network_runtime;
 pub mod remote_protocol;
 pub mod transport_adapters;
@@ -280,6 +281,7 @@ pub const WORKER_REMOTE_TOOL_CAPABILITIES: &[&str] = &[
     "tool:palyra.fs.apply_patch",
     "tool:palyra.artifact.read",
     "tool:palyra.tool_program.run",
+    "tool:palyra.computer.use",
 ];
 
 /// Tool families a networked worker may execute through the remote RPC envelope.
@@ -293,6 +295,7 @@ pub enum WorkerRemoteToolKind {
     ApplyPatch,
     ArtifactRead,
     ToolProgramRun,
+    ComputerUse,
 }
 
 impl WorkerRemoteToolKind {
@@ -307,6 +310,7 @@ impl WorkerRemoteToolKind {
             Self::ApplyPatch => "apply_patch",
             Self::ArtifactRead => "artifact_read",
             Self::ToolProgramRun => "tool_program_run",
+            Self::ComputerUse => "computer_use",
         }
     }
 
@@ -321,6 +325,7 @@ impl WorkerRemoteToolKind {
             "palyra.fs.apply_patch" => Some(Self::ApplyPatch),
             "palyra.artifact.read" => Some(Self::ArtifactRead),
             "palyra.tool_program.run" => Some(Self::ToolProgramRun),
+            "palyra.computer.use" => Some(Self::ComputerUse),
             _ => None,
         }
     }
@@ -336,6 +341,7 @@ impl WorkerRemoteToolKind {
             Self::ApplyPatch => "palyra.fs.apply_patch",
             Self::ArtifactRead => "palyra.artifact.read",
             Self::ToolProgramRun => "palyra.tool_program.run",
+            Self::ComputerUse => "palyra.computer.use",
         }
     }
 
