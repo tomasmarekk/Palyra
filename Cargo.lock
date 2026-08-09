@@ -3260,6 +3260,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "windows-sys 0.61.2",
+ "zeroize",
  "zip",
 ]
 
@@ -3384,6 +3385,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "wasmtime",
+ "zeroize",
  "zip",
 ]
 

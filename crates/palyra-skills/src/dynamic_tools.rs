@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wasmtime::{Engine, Module};
+use zeroize::{Zeroize, Zeroizing};
 
 const DYNAMIC_TOOL_SCHEMA_VERSION: u32 = 1;
 const DYNAMIC_TOOL_SIGNATURE_ALGORITHM: &str = "ed25519";
@@ -26,7 +27,8 @@ const DYNAMIC_TOOL_ARTIFACT_DOMAIN: &[u8] = b"palyra.dynamic-tool.artifact.v1\0"
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 2_048;
 const MAX_CAPABILITIES: usize = 64;
-const MAX_IMPLEMENTATION_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum implementation payload accepted by the signed artifact contract.
+pub const MAX_DYNAMIC_TOOL_IMPLEMENTATION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECLARATIVE_STEPS: usize = 64;
 const MAX_SCHEMA_NODES: usize = 512;
 const MAX_SCHEMA_DEPTH: usize = 12;
@@ -222,7 +224,6 @@ pub struct SignedToolArtifact {
 }
 
 /// Private-key-bearing build input; intentionally not serializable or debuggable.
-#[derive(Clone)]
 pub struct DynamicToolBuildRequest {
     pub proposal: DynamicToolProposalV1,
     pub implementation_bytes: Vec<u8>,
@@ -316,6 +317,8 @@ struct UnsignedToolPayload<'a> {
 pub fn build_signed_dynamic_tool_artifact(
     mut request: DynamicToolBuildRequest,
 ) -> Result<SignedToolArtifact, DynamicToolError> {
+    let signing_seed = Zeroizing::new(request.signing_key);
+    request.signing_key.zeroize();
     canonicalize_proposal(&mut request.proposal);
     validate_proposal(&request.proposal)?;
     if request.builder_id.trim().is_empty()
@@ -353,7 +356,7 @@ pub fn build_signed_dynamic_tool_artifact(
         eval_pack: &eval_pack,
     };
     let payload_sha256 = sha256_domain_json(DYNAMIC_TOOL_SIGNATURE_DOMAIN, &payload)?;
-    let signing_key = SigningKey::from_bytes(&request.signing_key);
+    let signing_key = SigningKey::from_bytes(&signing_seed);
     let verifying_key = signing_key.verifying_key();
     let signature_bytes = signing_key.sign(payload_sha256.as_bytes());
     let signature = DynamicToolSignatureV1 {
@@ -607,7 +610,7 @@ fn static_scan_implementation(
     proposal: &DynamicToolProposalV1,
     bytes: &[u8],
 ) -> Result<(), DynamicToolError> {
-    if bytes.is_empty() || bytes.len() > MAX_IMPLEMENTATION_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_DYNAMIC_TOOL_IMPLEMENTATION_BYTES {
         return Err(DynamicToolError::ImplementationInvalid("implementation size"));
     }
     match proposal.implementation_type {

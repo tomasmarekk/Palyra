@@ -1549,11 +1549,27 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/console/v1/skills/dynamic-tools/proposals",
-            post(console::dynamic_tools::console_dynamic_tool_proposal_handler),
+            post(console::dynamic_tools::console_dynamic_tool_proposal_handler).layer(
+                DefaultBodyLimit::max(
+                    console::dynamic_tools::DYNAMIC_TOOL_ARTIFACT_MAX_REQUEST_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/console/v1/skills/dynamic-tools/build-and-propose",
+            post(console::dynamic_tools::console_dynamic_tool_host_build_handler).layer(
+                DefaultBodyLimit::max(
+                    console::dynamic_tools::DYNAMIC_TOOL_HOST_BUILD_MAX_REQUEST_BODY_BYTES,
+                ),
+            ),
         )
         .route(
             "/console/v1/skills/dynamic-tools/activate",
-            post(console::dynamic_tools::console_dynamic_tool_activation_handler),
+            post(console::dynamic_tools::console_dynamic_tool_activation_handler).layer(
+                DefaultBodyLimit::max(
+                    console::dynamic_tools::DYNAMIC_TOOL_ARTIFACT_MAX_REQUEST_BODY_BYTES,
+                ),
+            ),
         )
         .route("/console/v1/skills/install", post(console::skills::console_skills_install_handler))
         .route(

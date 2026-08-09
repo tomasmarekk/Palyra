@@ -73,6 +73,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ulid.workspace = true
 zip.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
