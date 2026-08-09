@@ -8,7 +8,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-artifact_root="target/qa-lab/docker-backend"
+artifact_root="$repo_root/target/qa-lab/docker-backend"
 mkdir -p "$artifact_root"
 
 cleanup_residual_containers() {
