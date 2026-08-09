@@ -17,7 +17,10 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{
-    process_runner_input::parse_process_runner_tool_input,
+    process_runner_input::{
+        interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
+        process_executable_is_interpreter,
+    },
     redaction::{redact_auth_error, redact_auth_error_strict, redact_url_segments_in_text},
     runtime_contracts::{
         ArtifactRetentionPolicy, RuntimeGeneration, RuntimeRunId, RuntimeSessionId,
@@ -954,6 +957,7 @@ async fn execute_networked_worker_tool_owned(
         tool_name,
         remote_input_json.as_slice(),
         runtime_state.config.tool_call.process_runner.allowed_executables.as_slice(),
+        runtime_state.config.tool_call.process_runner.allow_interpreters,
     ) {
         Ok(authority) => authority,
         Err(error) => {
@@ -2250,6 +2254,7 @@ fn networked_worker_process_executable_authority(
     tool_name: &str,
     input_json: &[u8],
     allowed_executables: &[String],
+    allow_interpreters: bool,
 ) -> Result<Vec<String>, String> {
     if tool_name != "palyra.process.run" {
         return Ok(Vec::new());
@@ -2264,6 +2269,18 @@ fn networked_worker_process_executable_authority(
         return Err(
             "networked worker process command is not an unambiguous executable token".to_owned()
         );
+    }
+    if process_executable_is_interpreter(command) {
+        if !allow_interpreters {
+            return Err(
+                "networked worker process interpreter requires explicit host policy".to_owned()
+            );
+        }
+        if interpreter_args_contain_blocked_eval_flag(command, input.args.as_slice()) {
+            return Err(
+                "networked worker process interpreter cannot use inline eval flags".to_owned()
+            );
+        }
     }
     if !allowed_executables.iter().any(|allowed| {
         let allowed = allowed.trim();
@@ -3332,6 +3349,7 @@ mod tests {
             "palyra.process.run",
             br#"{"command":"cargo","args":["check"]}"#,
             allowed.as_slice(),
+            false,
         )
         .expect("exact host policy should yield one task-bound executable");
         assert_eq!(authority, vec!["cargo".to_owned()]);
@@ -3347,6 +3365,7 @@ mod tests {
                     "palyra.process.run",
                     input,
                     policy.as_slice(),
+                    false,
                 )
                 .is_err(),
                 "wildcard, path alias, shell, and malformed authority must fail closed"
@@ -3356,9 +3375,40 @@ mod tests {
             "palyra.fs.read_file",
             br#"{"path":"src/lib.rs"}"#,
             allowed.as_slice(),
+            false,
         )
         .expect("non-process tools retain an empty compatibility authority")
         .is_empty());
+    }
+
+    #[test]
+    fn networked_worker_process_authority_enforces_interpreter_policy() {
+        let allowed = vec!["python".to_owned()];
+
+        assert!(networked_worker_process_executable_authority(
+            "palyra.process.run",
+            br#"{"command":"python","args":["scripts/check.py"]}"#,
+            allowed.as_slice(),
+            false,
+        )
+        .is_err());
+        assert!(networked_worker_process_executable_authority(
+            "palyra.process.run",
+            br#"{"command":"python","args":["-c","print('unsafe')"]}"#,
+            allowed.as_slice(),
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            networked_worker_process_executable_authority(
+                "palyra.process.run",
+                br#"{"command":"python","args":["scripts/check.py"]}"#,
+                allowed.as_slice(),
+                true,
+            )
+            .expect("explicit interpreter policy should admit a workspace script"),
+            allowed
+        );
     }
 
     #[test]

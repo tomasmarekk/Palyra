@@ -73,7 +73,8 @@ use palyra_common::{
         TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS,
     },
     process_runner_input::{
-        parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
+        interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
+        process_executable_is_interpreter, BackgroundLifetimeMode, ProcessRunnerToolInput,
         ProcessWatchStream,
     },
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
@@ -194,24 +195,6 @@ const SENSITIVE_URL_PATH_MARKERS: &[&str] =
     &["token", "secret", "key", "password", "credential", "session"];
 #[cfg(windows)]
 const WINDOWS_DEFAULT_PATH_EXTENSIONS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
-// Interpreters can execute arbitrary code regardless of argument scoping, so they require the
-// explicit `allow_interpreters` policy opt-in and get extra argument guardrails when allowed.
-const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
-    "bash",
-    "sh",
-    "zsh",
-    "fish",
-    "powershell",
-    "pwsh",
-    "cmd",
-    "python",
-    "python3",
-    "node",
-    "ruby",
-    "perl",
-    "deno",
-];
-
 /// How outbound network access requested by a process run is policed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressEnforcementMode {
@@ -6033,7 +6016,7 @@ fn validate_allowed_interpreter(
     command: &str,
     normalized: &str,
 ) -> Result<(), SandboxProcessRunError> {
-    if is_interpreter_executable(normalized) && !policy.allow_interpreters {
+    if process_executable_is_interpreter(normalized) && !policy.allow_interpreters {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
             message: format!(
@@ -6100,7 +6083,7 @@ fn validate_interpreter_argument_guardrails(
     command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
-    if !is_interpreter_executable(command.trim()) {
+    if !process_executable_is_interpreter(command.trim()) {
         return Ok(());
     }
 
@@ -6164,7 +6147,7 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     args: &[String],
     host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
-    if !is_interpreter_executable(command.trim()) {
+    if !process_executable_is_interpreter(command.trim()) {
         return Ok(());
     }
 
@@ -6373,12 +6356,6 @@ fn interpreter_path_list_components(raw: &str) -> Vec<&str> {
     raw.split(separator).map(str::trim).filter(|component| !component.is_empty()).collect()
 }
 
-fn is_interpreter_executable(command: &str) -> bool {
-    let normalized = normalize_process_executable_token(command);
-    INTERPRETER_EXECUTABLE_DENYLIST.contains(&normalized.as_str())
-        || normalized.starts_with("python3.")
-}
-
 fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError {
     SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -6387,59 +6364,6 @@ fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError 
             command
         ),
     }
-}
-
-fn is_blocked_eval_flag(command: &str, arg: &str) -> bool {
-    is_generic_blocked_eval_flag(arg) || node_eval_flag_is_blocked(command, arg)
-}
-
-fn is_generic_blocked_eval_flag(arg: &str) -> bool {
-    let normalized = arg.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
-}
-
-fn interpreter_args_contain_blocked_eval_flag(command: &str, args: &[String]) -> bool {
-    args.iter().enumerate().any(|(index, arg)| {
-        is_blocked_eval_flag(command, arg.as_str())
-            && !python_arg_is_after_execution_target(command, args, index)
-    })
-}
-
-fn python_arg_is_after_execution_target(command: &str, args: &[String], index: usize) -> bool {
-    if !is_python_interpreter_command(command) {
-        return false;
-    }
-    python_execution_target_index(args).is_some_and(|target_index| index > target_index)
-}
-
-fn is_python_interpreter_command(command: &str) -> bool {
-    let command = normalize_process_executable_token(command);
-    matches!(command.as_str(), "python" | "python3" | "py") || command.starts_with("python3.")
-}
-
-fn python_execution_target_index(args: &[String]) -> Option<usize> {
-    let mut index = 0;
-    while let Some(arg) = args.get(index).map(|arg| arg.trim()) {
-        if arg == "--" {
-            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
-        }
-        if arg.eq_ignore_ascii_case("-m") {
-            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
-        }
-        if is_generic_blocked_eval_flag(arg) {
-            return None;
-        }
-        if !arg.starts_with('-') {
-            return Some(index);
-        }
-        index = index.saturating_add(if python_option_consumes_next_value(arg) { 2 } else { 1 });
-    }
-    None
-}
-
-fn python_option_consumes_next_value(arg: &str) -> bool {
-    let trimmed = arg.trim();
-    matches!(trimmed, "-W" | "-X" | "-Q") || trimmed == "--check-hash-based-pycs"
 }
 
 // Splits on whitespace and common code punctuation so absolute paths quoted inside inline
@@ -6899,12 +6823,6 @@ fn command_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
     option_consumes_non_path_value(arg)
         || python_module_option_consumes_non_path_value(command, arg)
         || windows_acl_option_consumes_non_path_value(command, arg)
-}
-
-fn node_eval_flag_is_blocked(command: &str, arg: &str) -> bool {
-    let command = normalize_process_executable_token(command);
-    matches!(command.as_str(), "node" | "nodejs")
-        && matches!(arg.trim().to_ascii_lowercase().as_str(), "-e" | "-p")
 }
 
 fn python_module_option_consumes_non_path_value(command: &str, arg: &str) -> bool {

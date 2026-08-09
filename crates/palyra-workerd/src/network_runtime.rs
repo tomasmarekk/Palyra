@@ -16,7 +16,10 @@ use std::{
 };
 
 use palyra_common::{
-    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    process_runner_input::{
+        interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
+        process_executable_is_interpreter, ProcessRunnerToolInput,
+    },
     redaction::redact_diagnostic_text,
     workspace_patch::{
         apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
@@ -874,6 +877,11 @@ fn validate_process_input(
     if process_executable_is_raw_shell(input.command.as_str()) {
         return Err(NetworkWorkerRuntimeError::ProcessShellDenied);
     }
+    if process_executable_is_interpreter(input.command.as_str())
+        && interpreter_args_contain_blocked_eval_flag(input.command.as_str(), input.args.as_slice())
+    {
+        return Err(NetworkWorkerRuntimeError::ProcessInterpreterEvalDenied);
+    }
     if input.args.len() > MAX_PROCESS_ARGUMENTS
         || input
             .args
@@ -1163,6 +1171,9 @@ pub enum NetworkWorkerRuntimeError {
     /// Shell interpreters are outside the canonical process safe subset.
     #[error("network worker process shell execution is denied")]
     ProcessShellDenied,
+    /// Interpreter inline-eval flags are outside the canonical process safe subset.
+    #[error("network worker process interpreter inline eval is denied")]
+    ProcessInterpreterEvalDenied,
     /// Process arguments exceed their closed shape or byte bounds.
     #[error("network worker process arguments are invalid")]
     ProcessArgumentsInvalid,
@@ -1203,6 +1214,7 @@ impl NetworkWorkerRuntimeError {
             Self::SecretLeaseUnsupported => "worker.secret_lease.unsupported_by_safe_subset",
             Self::ProcessExecutableDenied => "worker.process.executable_denied",
             Self::ProcessShellDenied => "worker.process.shell_denied",
+            Self::ProcessInterpreterEvalDenied => "worker.process.interpreter_eval_denied",
             Self::ProcessArgumentsInvalid => "worker.process.arguments_invalid",
             Self::ProcessLifecycleDenied => "worker.process.lifecycle_denied",
             Self::ProcessEnvironmentDenied => "worker.process.environment_denied",
@@ -1461,6 +1473,13 @@ mod tests {
         assert!(matches!(
             ReferenceNetworkWorker::execute_remote_request(&shell, 60_000),
             Err(NetworkWorkerRuntimeError::ProcessShellDenied)
+        ));
+
+        let interpreter =
+            process_request(r#"{"command":"python","args":["-c","print('unsafe')"]}"#, "python");
+        assert!(matches!(
+            ReferenceNetworkWorker::execute_remote_request(&interpreter, 60_000),
+            Err(NetworkWorkerRuntimeError::ProcessInterpreterEvalDenied)
         ));
 
         let cwd_escape =

@@ -36,7 +36,10 @@ use palyra_common::{
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
     },
     process_risk::{classify_process_run, ProcessRiskContext},
-    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    process_runner_input::{
+        interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
+        process_executable_is_interpreter, ProcessRunnerToolInput,
+    },
     qa_fault_injection::{QaFaultAction, QaFaultActivationDirective, QaFaultDirective},
     redaction::{is_sensitive_key, redact_diagnostic_text},
     secret_refs::SecretRef,
@@ -5142,6 +5145,21 @@ fn validate_ssh_worker_process_input(
                 .to_owned(),
         });
     }
+    if process_executable_is_interpreter(command) {
+        if !config.process_runner.allow_interpreters {
+            return Err(SshWorkerTransportError {
+                reason_code: "ssh_worker.process.interpreter_denied".to_owned(),
+                message: "SshWorkerRunner requires explicit host policy for interpreter execution"
+                    .to_owned(),
+            });
+        }
+        if interpreter_args_contain_blocked_eval_flag(command, input.args.as_slice()) {
+            return Err(SshWorkerTransportError {
+                reason_code: "ssh_worker.process.interpreter_eval_denied".to_owned(),
+                message: "SshWorkerRunner refuses interpreter inline eval flags".to_owned(),
+            });
+        }
+    }
     if !config
         .process_runner
         .allowed_executables
@@ -9155,6 +9173,55 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&outcome.output_json).expect("SSH worker error should be JSON");
         assert_eq!(payload["reason_code"], "ssh_worker.process.raw_shell_denied");
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_enforces_interpreter_policy() {
+        let (transport, requests) =
+            FakeSshWorkerTransport::new(serde_json::json!({"exit_code": 0}));
+        let runner = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["python".to_owned()];
+        let mut config = test_tool_call_config(policy);
+
+        let denied = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-interpreter",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"python","args":["scripts/check.py"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        assert!(!denied.success);
+        let payload: serde_json::Value = serde_json::from_slice(&denied.output_json)
+            .expect("SSH worker interpreter denial should be JSON");
+        assert_eq!(payload["reason_code"], "ssh_worker.process.interpreter_denied");
+
+        config.process_runner.allow_interpreters = true;
+        let eval_denied = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-interpreter-eval",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"python","args":["-c","print('unsafe')"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        assert!(!eval_denied.success);
+        let payload: serde_json::Value = serde_json::from_slice(&eval_denied.output_json)
+            .expect("SSH worker eval denial should be JSON");
+        assert_eq!(payload["reason_code"], "ssh_worker.process.interpreter_eval_denied");
+        assert!(requests.lock().expect("fake SSH requests").is_empty());
     }
 
     #[tokio::test]

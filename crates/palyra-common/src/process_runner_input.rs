@@ -9,6 +9,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "deno",
+];
+
 /// Lifecycle policy for `background=true` process-runner invocations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +197,26 @@ pub fn parse_process_runner_tool_input(
     Ok(input)
 }
 
+/// Returns whether an executable token names an interpreter that requires explicit policy.
+#[must_use]
+pub fn process_executable_is_interpreter(command: &str) -> bool {
+    let normalized = normalize_executable_token(command);
+    INTERPRETER_EXECUTABLE_DENYLIST.contains(&normalized.as_str())
+        || normalized.starts_with("python3.")
+}
+
+/// Returns whether interpreter arguments request inline code evaluation.
+///
+/// Python options after a script or module target belong to that target and are not treated as
+/// interpreter flags.
+#[must_use]
+pub fn interpreter_args_contain_blocked_eval_flag(command: &str, args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        is_blocked_eval_flag(command, arg.as_str())
+            && !python_arg_is_after_execution_target(command, args, index)
+    })
+}
+
 fn normalize_leading_cwd_argument(input: &mut ProcessRunnerToolInput) {
     if input.cwd.is_some() || input.args.is_empty() {
         return;
@@ -236,11 +272,85 @@ fn normalize_executable_token(value: &str) -> String {
     file_name.strip_suffix(".exe").unwrap_or(file_name).to_ascii_lowercase()
 }
 
+fn is_blocked_eval_flag(command: &str, arg: &str) -> bool {
+    is_generic_blocked_eval_flag(arg) || node_eval_flag_is_blocked(command, arg)
+}
+
+fn is_generic_blocked_eval_flag(arg: &str) -> bool {
+    let normalized = arg.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
+}
+
+fn node_eval_flag_is_blocked(command: &str, arg: &str) -> bool {
+    let command = normalize_executable_token(command);
+    matches!(command.as_str(), "node" | "nodejs")
+        && matches!(arg.trim().to_ascii_lowercase().as_str(), "-e" | "-p")
+}
+
+fn python_arg_is_after_execution_target(command: &str, args: &[String], index: usize) -> bool {
+    if !is_python_interpreter_command(command) {
+        return false;
+    }
+    python_execution_target_index(args).is_some_and(|target_index| index > target_index)
+}
+
+fn is_python_interpreter_command(command: &str) -> bool {
+    let command = normalize_executable_token(command);
+    matches!(command.as_str(), "python" | "python3" | "py") || command.starts_with("python3.")
+}
+
+fn python_execution_target_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(|arg| arg.trim()) {
+        if arg == "--" {
+            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+        }
+        if arg.eq_ignore_ascii_case("-m") {
+            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+        }
+        if is_generic_blocked_eval_flag(arg) {
+            return None;
+        }
+        if !arg.starts_with('-') {
+            return Some(index);
+        }
+        index = index.saturating_add(if python_option_consumes_next_value(arg) { 2 } else { 1 });
+    }
+    None
+}
+
+fn python_option_consumes_next_value(arg: &str) -> bool {
+    let trimmed = arg.trim();
+    matches!(trimmed, "-W" | "-X" | "-Q") || trimmed == "--check-hash-based-pycs"
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInputParseError,
+        interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
+        process_executable_is_interpreter, BackgroundLifetimeMode,
+        ProcessRunnerToolInputParseError,
     };
+
+    #[test]
+    fn interpreter_policy_classifies_versioned_python_and_inline_eval_flags() {
+        assert!(process_executable_is_interpreter("/usr/bin/python3.12"));
+        assert!(process_executable_is_interpreter(r"C:\Tools\node.exe"));
+        assert!(!process_executable_is_interpreter("cargo"));
+
+        assert!(interpreter_args_contain_blocked_eval_flag(
+            "python",
+            &["-c".to_owned(), "print('unsafe')".to_owned()]
+        ));
+        assert!(interpreter_args_contain_blocked_eval_flag(
+            "node",
+            &["--eval".to_owned(), "process.exit()".to_owned()]
+        ));
+        assert!(!interpreter_args_contain_blocked_eval_flag(
+            "python",
+            &["scripts/check.py".to_owned(), "-c".to_owned()]
+        ));
+    }
 
     #[test]
     fn parse_process_runner_tool_input_accepts_valid_payload() {
