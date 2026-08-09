@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Qualifies the production Docker backend against a real Linux daemon.
-# The lane uses an immutable image digest and leaves no managed container behind.
+# The lane crosses a real runner-owner crash/restart boundary, uses an immutable
+# image digest, and leaves no managed container behind.
 
 set -euo pipefail
 
@@ -39,3 +40,4 @@ if [[ -n "$residual" ]]; then
   exit 1
 fi
 test -s "$PALYRA_DOCKER_LIVE_REPORT"
+test -s "$artifact_root/owner-crash-recovery-report.json"

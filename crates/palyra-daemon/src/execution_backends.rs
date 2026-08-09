@@ -6609,7 +6609,6 @@ mod tests {
         (tempdir, vault)
     }
 
-    #[cfg(target_os = "linux")]
     fn current_docker_user() -> String {
         fn numeric_identity(flag: &str) -> String {
             let output = std::process::Command::new("id")
@@ -6620,6 +6619,119 @@ mod tests {
             String::from_utf8(output.stdout).expect("id output should be UTF-8").trim().to_owned()
         }
         format!("{}:{}", numeric_identity("-u"), numeric_identity("-g"))
+    }
+
+    async fn live_managed_docker_container_names() -> BTreeSet<String> {
+        let output = tokio::process::Command::new("docker")
+            .args(["ps", "-a", "--filter", "label=palyra.managed=true", "--format", "{{.Names}}"])
+            .output()
+            .await
+            .expect("managed Docker container probe should launch");
+        assert!(
+            output.status.success(),
+            "managed Docker container probe failed: {}",
+            String::from_utf8_lossy(output.stderr.as_slice())
+        );
+        String::from_utf8(output.stdout)
+            .expect("managed Docker container names should be UTF-8")
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn live_docker_exact_container_id(container_name: &str) -> String {
+        let name_filter = format!("name=^/{container_name}$");
+        let output = tokio::process::Command::new("docker")
+            .args(["ps", "-a", "--filter", name_filter.as_str(), "--format", "{{.ID}}"])
+            .output()
+            .await
+            .expect("exact Docker container ID probe should launch");
+        assert!(
+            output.status.success(),
+            "exact Docker container ID probe failed: {}",
+            String::from_utf8_lossy(output.stderr.as_slice())
+        );
+        let container_ids = String::from_utf8(output.stdout)
+            .expect("exact Docker container ID should be UTF-8")
+            .lines()
+            .map(str::trim)
+            .filter(|container_id| !container_id.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            container_ids.len(),
+            1,
+            "the crash fixture must resolve to exactly one managed container"
+        );
+        container_ids.into_iter().next().expect("one exact container ID")
+    }
+
+    fn live_docker_test_process(test_name: &str) -> std::process::Command {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"));
+        command.arg(test_name).args(["--exact", "--ignored", "--nocapture", "--test-threads=1"]);
+        command
+    }
+
+    struct LiveDockerOwnerProcess {
+        child: Option<std::process::Child>,
+    }
+
+    impl LiveDockerOwnerProcess {
+        fn spawn(command: &mut std::process::Command) -> Self {
+            let child = command.spawn().expect("Docker runner owner process should launch");
+            Self { child: Some(child) }
+        }
+
+        fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+            self.child
+                .as_mut()
+                .expect("owner process should be present")
+                .try_wait()
+                .expect("owner process status should remain readable")
+        }
+
+        fn crash(mut self) -> std::process::ExitStatus {
+            let mut child = self.child.take().expect("owner process should be present");
+            child.kill().expect("Docker runner owner process should be killable");
+            child.wait().expect("crashed owner process should be reaped")
+        }
+    }
+
+    impl Drop for LiveDockerOwnerProcess {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    struct LiveDockerContainerCleanup {
+        container_name: String,
+        armed: bool,
+    }
+
+    impl LiveDockerContainerCleanup {
+        fn new(container_name: String) -> Self {
+            Self { container_name, armed: true }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for LiveDockerContainerCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", self.container_name.as_str()])
+                    .output();
+            }
+        }
     }
 
     fn test_resource_governor(
@@ -8026,6 +8138,181 @@ mod tests {
         assert!(governor.active_leases().expect("leases should remain readable").is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "launched only by the Docker owner-crash qualification test"]
+    async fn docker_crash_owner_fixture() {
+        assert!(cfg!(target_os = "linux"), "live Docker crash fixtures require Linux");
+        assert_eq!(
+            std::env::var("PALYRA_DOCKER_CRASH_FIXTURE").as_deref(),
+            Ok("owner"),
+            "the owner fixture must not run outside its bounded parent test"
+        );
+        let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
+            .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
+        let workspace = PathBuf::from(
+            std::env::var_os("PALYRA_DOCKER_CRASH_WORKSPACE")
+                .expect("owner fixture workspace must be provided"),
+        );
+        let mut profile = safe_container_profile();
+        profile.profile_id = "docker-live-owner-crash".to_owned();
+        profile.image = image;
+        profile.mounts[0].host_path = workspace.to_string_lossy().into_owned();
+        profile.user = current_docker_user();
+        profile.limits.cpu_time_limit_ms = 120_000;
+        let runner = DockerRunner::new(profile, super::DockerCliEngine)
+            .expect("live Docker crash profile should validate");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["sleep".to_owned()];
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = 120_000;
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-live-owner-crash",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"sleep","args":["120"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+                background_registration_fence: None,
+                fault_injection: crate::qa_fault_injection::QaFaultRuntime::default(),
+            })
+            .await;
+        panic!(
+            "Docker runner owner fixture completed before its parent crashed it: success={} error={}",
+            outcome.success, outcome.error
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "launched only by the Docker owner-crash qualification test"]
+    async fn docker_restart_reconciler_fixture() {
+        assert!(cfg!(target_os = "linux"), "live Docker crash fixtures require Linux");
+        assert_eq!(
+            std::env::var("PALYRA_DOCKER_CRASH_FIXTURE").as_deref(),
+            Ok("reconciler"),
+            "the restart fixture must not run outside its bounded parent test"
+        );
+        let container_name = std::env::var("PALYRA_DOCKER_CRASH_CONTAINER")
+            .expect("restart fixture container name must be provided");
+        let marker_path = PathBuf::from(
+            std::env::var_os("PALYRA_DOCKER_CRASH_RECONCILED_MARKER")
+                .expect("restart fixture marker path must be provided"),
+        );
+        let container_id = live_docker_exact_container_id(container_name.as_str()).await;
+
+        let reaped = super::reap_expired_docker_containers(i64::MAX)
+            .await
+            .expect("restart reconciliation should succeed");
+        assert!(
+            reaped.iter().any(|reaped_id| reaped_id == &container_id),
+            "restart reconciliation must reap the crashed owner's exact container"
+        );
+        assert!(
+            super::docker_exact_name_container_absent(container_name.as_str())
+                .await
+                .expect("reconciled container absence probe"),
+            "restart reconciliation must leave no crashed-owner container"
+        );
+        fs::write(marker_path, container_name).expect("restart evidence marker should be written");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
+    async fn docker_live_e2e_recovers_after_runner_owner_process_crash() {
+        assert!(cfg!(target_os = "linux"), "live Docker qualification requires Linux");
+        let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
+            .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
+        let temporary = tempfile::tempdir().expect("live Docker crash root should exist");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("crash fixture workspace should exist");
+        let baseline = live_managed_docker_container_names().await;
+        // A separate test process owns the real runner so SIGKILL bypasses its
+        // normal Rust cleanup path just as a daemon process crash would.
+        let mut owner_command =
+            live_docker_test_process("execution_backends::tests::docker_crash_owner_fixture");
+        owner_command
+            .env("PALYRA_DOCKER_CRASH_FIXTURE", "owner")
+            .env("PALYRA_DOCKER_LIVE_IMAGE", image)
+            .env("PALYRA_DOCKER_CRASH_WORKSPACE", workspace.as_os_str())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut owner = LiveDockerOwnerProcess::spawn(&mut owner_command);
+        let started = std::time::Instant::now();
+        let container_name = loop {
+            let owner_exit = owner.try_wait();
+            assert!(
+                owner_exit.is_none(),
+                "Docker runner owner exited before the crash boundary: {owner_exit:?}"
+            );
+            let names = live_managed_docker_container_names().await;
+            if let Some(name) = names.difference(&baseline).next() {
+                break name.clone();
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "Docker runner owner did not create a managed container before the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let mut container_cleanup = LiveDockerContainerCleanup::new(container_name.clone());
+        let owner_status = owner.crash();
+        assert!(!owner_status.success(), "the runner-owning process must terminate as a crash");
+        assert!(
+            !super::docker_exact_name_container_absent(container_name.as_str())
+                .await
+                .expect("post-crash container presence probe"),
+            "the real managed container must outlive its crashed owner before restart reconciliation"
+        );
+
+        let marker_path = temporary.path().join("restart-reconciled.txt");
+        // Recovery starts in a fresh process to prove it depends only on
+        // durable Docker labels, not state retained by the surviving test.
+        let mut reconciler_command = live_docker_test_process(
+            "execution_backends::tests::docker_restart_reconciler_fixture",
+        );
+        let reconciler = reconciler_command
+            .env("PALYRA_DOCKER_CRASH_FIXTURE", "reconciler")
+            .env("PALYRA_DOCKER_CRASH_CONTAINER", container_name.as_str())
+            .env("PALYRA_DOCKER_CRASH_RECONCILED_MARKER", marker_path.as_os_str())
+            .output()
+            .expect("restarted reconciler process should launch");
+        assert!(
+            reconciler.status.success(),
+            "restarted reconciler failed: stdout={} stderr={}",
+            String::from_utf8_lossy(reconciler.stdout.as_slice()),
+            String::from_utf8_lossy(reconciler.stderr.as_slice())
+        );
+        assert_eq!(
+            fs::read_to_string(marker_path).expect("restart evidence marker should exist"),
+            container_name
+        );
+        container_cleanup.disarm();
+
+        if let Some(report_path) = std::env::var_os("PALYRA_DOCKER_LIVE_REPORT").map(PathBuf::from)
+        {
+            let evidence_path = report_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("owner-crash-recovery-report.json");
+            let evidence = serde_json::json!({
+                "schema_version": 1,
+                "runner_owner_process_crashed": true,
+                "managed_container_survived_owner_crash": true,
+                "restart_reconciliation_process_started": true,
+                "exact_container_reaped_after_restart": true,
+                "remaining_managed_container": false,
+            });
+            fs::write(
+                evidence_path,
+                serde_json::to_vec_pretty(&evidence).expect("crash evidence should serialize"),
+            )
+            .expect("crash evidence should be written");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
@@ -8139,9 +8426,9 @@ mod tests {
         {
             let evidence_path = report_path
                 .parent()
-                .unwrap_or_else(|| Path::new("."))
+                .unwrap_or_else(|| std::path::Path::new("."))
                 .join("resource-and-orphan-report.json");
-            let evidence = json!({
+            let evidence = serde_json::json!({
                 "schema_version": 1,
                 "output_original_bytes": output_payload["stdout_bytes"],
                 "output_truncated": output_payload["stdout_truncated"],
