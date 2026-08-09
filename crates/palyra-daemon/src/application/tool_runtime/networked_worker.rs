@@ -2215,6 +2215,7 @@ fn build_worker_remote_tool_request(
     let input_json_text = std::str::from_utf8(input_json)
         .map_err(|error| format!("networked worker remote input is not UTF-8 JSON: {error}"))?
         .to_owned();
+    let issued_at_unix_ms = current_unix_ms();
     let mut request = WorkerRemoteToolRequestEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -2226,7 +2227,12 @@ fn build_worker_remote_tool_request(
         input_json_sha256: sha256_hex(input_json),
         lease: WorkerRemoteLeaseBinding {
             process_executable_allowlist,
-            ..WorkerRemoteLeaseBinding::from_lease(lease, session_id.to_owned(), run_generation)
+            ..WorkerRemoteLeaseBinding::from_lease(
+                lease,
+                session_id.to_owned(),
+                run_generation,
+                issued_at_unix_ms,
+            )
         },
         worker_identity: WorkerRemoteIdentity::from(worker_attestation),
         workspace_transfer,
@@ -2235,7 +2241,7 @@ fn build_worker_remote_tool_request(
     };
     request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
     request
-        .validate(current_unix_ms())
+        .validate(issued_at_unix_ms)
         .map_err(|error| format!("networked worker remote request validation failed: {error}"))?;
     Ok(request)
 }
@@ -3049,6 +3055,7 @@ mod tests {
                 run_generation: RuntimeGeneration::new(7).expect("test generation should be valid"),
                 grant_id: format!("grant-{}", tool_kind.as_str()),
                 grant_tool_name: tool_name.to_owned(),
+                issued_at_unix_ms: 2_000,
                 expires_at_unix_ms: 3_000,
                 required_capabilities: vec![tool_kind.required_capability()],
                 process_executable_allowlist: if matches!(

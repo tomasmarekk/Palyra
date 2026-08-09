@@ -165,6 +165,18 @@ fn dynamic_catalog_snapshot_preserves_exact_activation_provenance() {
         dynamic_tool_snapshot_provenance(&snapshot, "dynamic.missing"),
         Err("dynamic_tool.catalog_binding_missing")
     );
+
+    let mut conflicting = snapshot;
+    conflicting
+        .indexed_tools
+        .iter_mut()
+        .find(|tool| tool.name == "dynamic.echo")
+        .expect("dynamic tool should remain in the catalog index")
+        .provenance = format!("dynamic:{}:{}:7:11:14", "a".repeat(64), "b".repeat(64));
+    assert_eq!(
+        dynamic_tool_snapshot_provenance(&conflicting, "dynamic.echo"),
+        Err("dynamic_tool.catalog_binding_invalid")
+    );
 }
 
 #[test]

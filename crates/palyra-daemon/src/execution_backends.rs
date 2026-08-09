@@ -4454,7 +4454,6 @@ const DEFAULT_SSH_ATTEMPT_TIMEOUT_MS: u64 = 15_000;
 const MAX_SSH_RECONNECT_ATTEMPTS: u32 = 8;
 const MAX_SSH_ATTEMPT_TIMEOUT_MS: u64 = 30_000;
 const MAX_SSH_MATERIAL_BYTES: usize = 256 * 1024;
-const CANONICAL_SSH_LEASE_TTL_MAX_MS: u64 = 60_000;
 
 /// Production SSH transport using only operator-owned process and credential material.
 #[derive(Debug, Clone)]
@@ -4783,10 +4782,7 @@ fn build_canonical_ssh_worker_request(
                 message: format!("canonical SSH workspace transfer is invalid: {error}"),
             })?;
     let total_attempts = u64::from(transport_profile.max_reconnect_attempts).saturating_add(1);
-    // The canonical v2 projection derives issued_at from a fixed 60-second
-    // window, so a longer lease would appear future-issued and fail its clock fence.
-    let lease_ttl_ms =
-        attempt_timeout_ms.saturating_mul(total_attempts).min(CANONICAL_SSH_LEASE_TTL_MAX_MS);
+    let lease_ttl_ms = attempt_timeout_ms.saturating_mul(total_attempts);
     let expires_at_unix_ms =
         observed_at_unix_ms.saturating_add(i64::try_from(lease_ttl_ms).unwrap_or(i64::MAX));
     let worker_identity = WorkerRemoteIdentity {
@@ -4825,6 +4821,7 @@ fn build_canonical_ssh_worker_request(
             run_generation,
             grant_id,
             grant_tool_name: request.tool_name.clone(),
+            issued_at_unix_ms: observed_at_unix_ms,
             expires_at_unix_ms,
             required_capabilities: profile.capabilities.clone(),
             process_executable_allowlist: request.process_executable_allowlist.clone(),
@@ -7211,8 +7208,7 @@ mod tests {
             &ssh,
             &[
                 ExecutionBackendRunnerCapability::RunProcess,
-                ExecutionBackendRunnerCapability::RunToolProgram,
-                ExecutionBackendRunnerCapability::ReadArtifact,
+                ExecutionBackendRunnerCapability::HealthProbe,
                 ExecutionBackendRunnerCapability::AttestationManifest,
             ],
         );
@@ -7494,6 +7490,18 @@ mod tests {
         assert_eq!(
             prepared.request.lease.run_generation.get(),
             prepared.transport_profile.generation
+        );
+        assert_eq!(
+            prepared
+                .request
+                .lease
+                .expires_at_unix_ms
+                .saturating_sub(prepared.request.lease.issued_at_unix_ms),
+            i64::try_from(
+                super::MAX_SSH_ATTEMPT_TIMEOUT_MS
+                    .saturating_mul(u64::from(super::MAX_SSH_RECONNECT_ATTEMPTS) + 1)
+            )
+            .expect("bounded SSH reconnect budget should fit i64")
         );
         assert_eq!(prepared.request.lease.process_executable_allowlist, vec!["cargo".to_owned()]);
         assert_eq!(

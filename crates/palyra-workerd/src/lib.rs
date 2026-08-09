@@ -545,6 +545,8 @@ pub struct WorkerRemoteLeaseBinding {
     pub run_generation: RuntimeGeneration,
     pub grant_id: String,
     pub grant_tool_name: String,
+    /// Host-observed issuance time used by the canonical task clock fence.
+    pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
@@ -568,6 +570,7 @@ impl WorkerRemoteLeaseBinding {
         lease: &WorkerLease,
         session_id: String,
         run_generation: RuntimeGeneration,
+        issued_at_unix_ms: i64,
     ) -> Self {
         Self {
             lease_id: lease.lease_id.clone(),
@@ -577,6 +580,7 @@ impl WorkerRemoteLeaseBinding {
             run_generation,
             grant_id: lease.grant.grant_id.clone(),
             grant_tool_name: lease.grant.tool_name.clone(),
+            issued_at_unix_ms,
             expires_at_unix_ms: lease.expires_at_unix_ms,
             required_capabilities: lease.required_capabilities.clone(),
             process_executable_allowlist: Vec::new(),

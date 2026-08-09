@@ -1310,6 +1310,17 @@ fn default_test_tool_call_config() -> crate::tool_protocol::ToolCallConfig {
     }
 }
 
+fn build_networked_worker_runtime_test_state() -> Arc<GatewayRuntimeState> {
+    let workspace_root = unique_temp_test_root("palyra-networked-worker-workspace");
+    fs::create_dir_all(workspace_root.join("src"))
+        .expect("worker test source directory should exist");
+    fs::write(workspace_root.join("src").join("lib.rs"), b"pub fn remote_workspace_fixture() {}\n")
+        .expect("worker test source fixture should write");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.process_runner.workspace_root = workspace_root;
+    build_test_runtime_state_with_tool_call_config(false, tool_call)
+}
+
 pub(crate) fn build_test_runtime_state_with_runtime_overrides(
     hash_chain_enabled: bool,
     allow_private_targets: bool,
@@ -8109,7 +8120,7 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_cancellation_removes_queued_node_dispatch() {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-cancel-queued";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(
@@ -8911,7 +8922,7 @@ async fn dispatch_node_worker_failure_case(
     suffix: &str,
     response: NodeWorkerFailureResponse,
 ) -> (Arc<GatewayRuntimeState>, String, String, crate::tool_protocol::ToolExecutionOutcome) {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = format!("worker-runtime-{suffix}");
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(&state, "session-networked-worker-failure", suffix).await;
@@ -9124,7 +9135,7 @@ async fn networked_worker_inflight_timeout_returns_with_reconciliation_authority
     // can otherwise turn this state-transition test into a scheduler performance assertion.
     const IN_FLIGHT_DISPATCH_TIMEOUT_MS: u64 = 10_000;
 
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-inflight-timeout";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(
@@ -9399,7 +9410,7 @@ async fn networked_worker_v1_node_is_rejected_before_lease_assignment() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-01";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(
@@ -9764,7 +9775,7 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_foreground_drop_keeps_runtime_owned_result_settlement() {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-foreground-drop";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(
@@ -10362,7 +10373,7 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_artifact_journal_failure_rolls_back_receipt_and_cleans_lease() {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-artifact-atomic";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(
@@ -10460,7 +10471,7 @@ async fn networked_worker_invalid_remote_results_cannot_attest_or_release_author
         InvalidRemoteWorkerResult::InvalidCompletionTimestamp,
     ] {
         let suffix = mutation.suffix();
-        let state = build_test_runtime_state(false);
+        let state = build_networked_worker_runtime_test_state();
         let worker_id = format!("worker-runtime-{suffix}");
         let required_capability = "tool:palyra.fs.read_file";
         start_networked_worker_test_run(&state, "session-networked-worker-invalid-result", suffix)
@@ -10533,7 +10544,7 @@ async fn networked_worker_invalid_remote_results_cannot_attest_or_release_author
 
 #[tokio::test(flavor = "multi_thread")]
 async fn networked_worker_cleanup_gap_preserves_report_without_artifact_attestation() {
-    let state = build_test_runtime_state(false);
+    let state = build_networked_worker_runtime_test_state();
     let worker_id = "worker-runtime-cleanup-gap";
     let required_capability = "tool:palyra.fs.read_file";
     start_networked_worker_test_run(

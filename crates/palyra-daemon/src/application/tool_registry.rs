@@ -117,16 +117,27 @@ pub(crate) fn dynamic_tool_snapshot_provenance(
     if !tool_name.starts_with("dynamic.") {
         return Ok(None);
     }
-    let mut matches = snapshot
-        .tools
-        .iter()
-        .chain(snapshot.indexed_tools.iter())
-        .filter(|tool| tool.name == tool_name);
-    let Some(tool) = matches.next() else {
+    let exposed = unique_dynamic_tool_provenance(snapshot.tools.as_slice(), tool_name)?;
+    let indexed = unique_dynamic_tool_provenance(snapshot.indexed_tools.as_slice(), tool_name)?;
+    let Some(provenance) = exposed.or(indexed) else {
         return Err("dynamic_tool.catalog_binding_missing");
+    };
+    if exposed.zip(indexed).is_some_and(|(left, right)| left != right) {
+        return Err("dynamic_tool.catalog_binding_invalid");
+    }
+    Ok(Some(provenance.to_owned()))
+}
+
+fn unique_dynamic_tool_provenance<'a>(
+    tools: &'a [types::ModelVisibleTool],
+    tool_name: &str,
+) -> Result<Option<&'a str>, &'static str> {
+    let mut matches = tools.iter().filter(|tool| tool.name == tool_name);
+    let Some(tool) = matches.next() else {
+        return Ok(None);
     };
     if matches.next().is_some() || !tool.provenance.starts_with("dynamic:") {
         return Err("dynamic_tool.catalog_binding_invalid");
     }
-    Ok(Some(tool.provenance.clone()))
+    Ok(Some(tool.provenance.as_str()))
 }

@@ -300,7 +300,7 @@ impl WorkerTaskEnvelope {
                 request.lease.lease_id.as_str(),
                 request.request_id.as_str(),
             )),
-            issued_at_unix_ms: request.lease.expires_at_unix_ms.saturating_sub(60_000),
+            issued_at_unix_ms: request.lease.issued_at_unix_ms,
             deadline_unix_ms: request.lease.expires_at_unix_ms,
             policy_sha256,
             workspace_manifest_sha256: request.workspace_transfer.workspace_manifest_sha256.clone(),
@@ -1041,6 +1041,7 @@ mod tests {
                 run_generation: RuntimeGeneration::new(7).expect("generation"),
                 grant_id: "grant-1".to_owned(),
                 grant_tool_name: "palyra.fs.read_file".to_owned(),
+                issued_at_unix_ms: 60_000,
                 expires_at_unix_ms: 120_000,
                 required_capabilities: vec!["tool:palyra.fs.read_file".to_owned()],
                 process_executable_allowlist: Vec::new(),
@@ -1081,6 +1082,17 @@ mod tests {
         assert_eq!(protocol.task.run_generation.get(), protocol.task.fence_generation);
         assert_eq!(protocol.task.idempotency_key.len(), 64);
         assert_eq!(protocol.task.cancellation_id.len(), 64);
+    }
+
+    #[test]
+    fn canonical_task_uses_host_issuance_for_long_lease() {
+        let mut request = remote_request();
+        request.lease.expires_at_unix_ms = 15 * 60 * 1_000;
+        let protocol = RemoteWorkerProtocolV1::from_remote_request(&request);
+
+        protocol.validate(60_000).expect("long lease should not appear future-issued");
+        assert_eq!(protocol.task.issued_at_unix_ms, 60_000);
+        assert_eq!(protocol.task.deadline_unix_ms, 15 * 60 * 1_000);
     }
 
     #[test]

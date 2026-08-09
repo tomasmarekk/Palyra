@@ -1641,6 +1641,7 @@ mod tests {
                 run_generation: RuntimeGeneration::new(1).expect("generation"),
                 grant_id: "grant-network-1".to_owned(),
                 grant_tool_name: tool_name.to_owned(),
+                issued_at_unix_ms: 60_000,
                 expires_at_unix_ms: 120_000,
                 required_capabilities: vec![tool_kind.required_capability()],
                 process_executable_allowlist: if matches!(

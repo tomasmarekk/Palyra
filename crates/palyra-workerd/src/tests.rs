@@ -292,6 +292,7 @@ fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
             run_generation: RuntimeGeneration::new(7).expect("test generation should be valid"),
             grant_id: "grant-01".to_owned(),
             grant_tool_name: tool_name.to_owned(),
+            issued_at_unix_ms: 2_000,
             expires_at_unix_ms: 3_000,
             required_capabilities: vec![tool_kind.required_capability()],
             process_executable_allowlist: if matches!(tool_kind, WorkerRemoteToolKind::ProcessRun) {
