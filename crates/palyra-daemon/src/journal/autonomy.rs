@@ -915,6 +915,147 @@ fn load_terminal_subscription_tasks_tx(
         .collect()
 }
 
+#[derive(Debug)]
+struct ParentContinuationAuthority {
+    task_kind: String,
+    session_id: String,
+    child_session_id: Option<String>,
+    parent_run_id: Option<String>,
+    max_attempts: u64,
+    budget_tokens: u64,
+    delegation_json: Option<String>,
+    cancellation_context_json: Option<String>,
+    expires_at_unix_ms: Option<i64>,
+}
+
+fn load_parent_continuation_authority_tx(
+    connection: &Connection,
+    suspension: &ParentSuspensionRecord,
+    now: i64,
+) -> Result<ParentContinuationAuthority, JournalError> {
+    let origin_kind = connection
+        .query_row(
+            r#"
+                SELECT origin_kind
+                FROM orchestrator_runs
+                WHERE run_ulid = ?1 AND session_ulid = ?2
+            "#,
+            params![suspension.parent_run_id, suspension.parent_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            JournalError::InvalidArgument(
+                "parent suspension references a missing run authority".to_owned(),
+            )
+        })?;
+    if !origin_kind.trim().eq_ignore_ascii_case("delegation") {
+        return Ok(ParentContinuationAuthority {
+            task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+            session_id: suspension.parent_session_id.clone(),
+            child_session_id: None,
+            parent_run_id: Some(suspension.parent_run_id.clone()),
+            max_attempts: 3,
+            budget_tokens: PARENT_WAKE_BUDGET_TOKENS.unsigned_abs(),
+            delegation_json: None,
+            cancellation_context_json: None,
+            expires_at_unix_ms: None,
+        });
+    }
+
+    // The task that admitted the suspended run is the authority source. Deriving
+    // a fresh scope from run metadata could silently widen its bounded delegation.
+    let (authority_count, authority_task_id) = connection.query_row(
+        r#"
+            SELECT COUNT(*), MIN(task.task_ulid)
+            FROM orchestrator_background_tasks AS task
+            JOIN parent_suspensions_v1 AS suspension
+              ON suspension.suspension_ulid = ?1
+            WHERE (
+                    task.planned_child_run_ulid = suspension.parent_run_ulid
+                    OR task.target_run_ulid = suspension.parent_run_ulid
+                  )
+              AND task.child_session_ulid = suspension.parent_session_ulid
+              AND task.owner_principal = suspension.owner_principal
+              AND task.device_id = suspension.device_id
+              AND (
+                    task.channel = suspension.channel
+                    OR (task.channel IS NULL AND suspension.channel IS NULL)
+                  )
+        "#,
+        params![suspension.suspension_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    if authority_count != 1 {
+        return Err(JournalError::InvalidArgument(
+            "delegated parent continuation requires one exact durable task authority".to_owned(),
+        ));
+    }
+    let authority_task_id = authority_task_id.ok_or_else(|| {
+        JournalError::InvalidArgument(
+            "delegated parent continuation is missing durable task authority".to_owned(),
+        )
+    })?;
+    let authority_task = load_background_task_tx(connection, authority_task_id.as_str())?
+        .ok_or_else(|| JournalError::BackgroundTaskNotFound { task_id: authority_task_id })?;
+    if AuxiliaryTaskState::from_str(authority_task.state.as_str())
+        != Some(AuxiliaryTaskState::Running)
+    {
+        return Err(JournalError::InvalidArgument(
+            "delegated parent continuation requires active task authority".to_owned(),
+        ));
+    }
+    let parent_run_id = authority_task.parent_run_id.clone().ok_or_else(|| {
+        JournalError::InvalidArgument(
+            "delegated parent continuation is missing parent-run authority".to_owned(),
+        )
+    })?;
+    let cancellation_context = authority_task.cancellation_context.clone().ok_or_else(|| {
+        JournalError::InvalidArgument(
+            "delegated parent continuation is missing cancellation authority".to_owned(),
+        )
+    })?;
+    validate_delegated_run_admission_tx(
+        connection,
+        &OrchestratorRunStartRequest {
+            run_id: suspension.parent_run_id.clone(),
+            session_id: suspension.parent_session_id.clone(),
+            origin_kind: "delegation".to_owned(),
+            origin_run_id: Some(parent_run_id.clone()),
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+            delegated_admission: Some(DelegatedRunAdmissionV1 {
+                task_id: authority_task.task_id.clone(),
+                task_kind: authority_task.task_kind.clone(),
+                parent_session_id: authority_task.session_id.clone(),
+                child_session_id: suspension.parent_session_id.clone(),
+                parent_run_id,
+                cancellation_context: cancellation_context.clone(),
+            }),
+        },
+        now,
+    )?;
+    let delegation_json = authority_task
+        .delegation
+        .as_ref()
+        .map(|delegation| serialize_json_field(delegation, "delegation_json"))
+        .transpose()?;
+    let cancellation_context_json =
+        Some(serialize_json_field(&cancellation_context, "cancellation_context_json")?);
+
+    Ok(ParentContinuationAuthority {
+        task_kind: authority_task.task_kind,
+        session_id: authority_task.session_id,
+        child_session_id: authority_task.child_session_id,
+        parent_run_id: authority_task.parent_run_id,
+        max_attempts: authority_task.max_attempts,
+        budget_tokens: authority_task.budget_tokens,
+        delegation_json,
+        cancellation_context_json,
+        expires_at_unix_ms: authority_task.expires_at_unix_ms,
+    })
+}
+
 fn satisfy_parent_suspension_tx(
     connection: &Connection,
     suspension_id: &str,
@@ -961,6 +1102,8 @@ fn satisfy_parent_suspension_tx(
             remaining_children: remaining_children.max(0) as u64,
         });
     }
+    let continuation_authority =
+        load_parent_continuation_authority_tx(connection, &suspension, now)?;
 
     wait_coordinator::emit_wake_event_tx(
         connection,
@@ -1023,19 +1166,25 @@ fn satisfy_parent_suspension_tx(
                 updated_at_unix_ms, started_at_unix_ms, completed_at_unix_ms
             )
             SELECT
-                ?1, ?2, parent_session_ulid, NULL, parent_run_ulid, NULL, ?3,
-                NULL, owner_principal, device_id, channel, ?4, 100, 0, 0, 0,
-                3, ?5, NULL, NULL, NULL, NULL, NULL, ?6, ?7, NULL, NULL,
-                ?8, ?8, NULL, NULL
+                ?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, owner_principal,
+                device_id, channel, ?7, 100, 0, 0, 0, ?8, ?9, ?10, ?11,
+                NULL, ?12, NULL, ?13, ?14, NULL, NULL, ?15, ?15, NULL, NULL
             FROM parent_suspensions_v1
-            WHERE suspension_ulid = ?9 AND state = ?10
+            WHERE suspension_ulid = ?16 AND state = ?17
         "#,
         params![
             continuation_task_id,
-            AuxiliaryTaskKind::BackgroundPrompt.as_str(),
+            continuation_authority.task_kind,
+            continuation_authority.session_id,
+            continuation_authority.child_session_id,
+            continuation_authority.parent_run_id,
             continuation_run_id,
             AuxiliaryTaskState::Queued.as_str(),
-            PARENT_WAKE_BUDGET_TOKENS,
+            u64_to_sqlite(continuation_authority.max_attempts, "max_attempts")?,
+            u64_to_sqlite(continuation_authority.budget_tokens, "budget_tokens")?,
+            continuation_authority.delegation_json,
+            continuation_authority.cancellation_context_json,
+            continuation_authority.expires_at_unix_ms,
             "Continue the suspended parent objective using the durable child completion evidence.",
             json!({
                 "schema_version": PARENT_SUSPENSION_SCHEMA_VERSION,
@@ -1154,6 +1303,10 @@ fn load_existing_wake_outcome_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delegation::{
+        DelegationExecutionMode, DelegationMemoryScopeKind, DelegationMergeContract,
+        DelegationMergeStrategy, DelegationRole, DelegationRuntimeLimits,
+    };
 
     struct SuspensionFixture {
         _root: tempfile::TempDir,
@@ -1162,6 +1315,15 @@ mod tests {
         session_id: String,
         parent_run_id: String,
         task: OrchestratorBackgroundTaskRecord,
+    }
+
+    struct DelegatedSuspensionFixture {
+        suspension: SuspensionFixture,
+        authority_task: OrchestratorBackgroundTaskRecord,
+        delegation: DelegationSnapshot,
+        cancellation_context: CancellationContextV1,
+        root_session_id: String,
+        root_run_id: String,
     }
 
     fn suspension_fixture() -> SuspensionFixture {
@@ -1234,6 +1396,188 @@ mod tests {
         SuspensionFixture { _root: root, store, db_path, session_id, parent_run_id, task }
     }
 
+    fn delegated_suspension_fixture() -> DelegatedSuspensionFixture {
+        let root = tempfile::tempdir().expect("temporary journal root should create");
+        let db_path = root.path().join("journal.db");
+        let store = open_store(db_path.clone());
+        let root_session_id = Ulid::new().to_string();
+        let root_run_id = Ulid::new().to_string();
+        let child_session_id = Ulid::new().to_string();
+        let delegated_run_id = Ulid::new().to_string();
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: root_session_id.clone(),
+                session_key: root_session_id.clone(),
+                session_label: None,
+                principal: "user:delegation".to_owned(),
+                device_id: "device-delegation".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("delegation root session should create");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: root_run_id.clone(),
+                session_id: root_session_id.clone(),
+                origin_kind: "user".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:delegation".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .expect("delegation root run should start");
+        store
+            .update_orchestrator_run_state(
+                root_run_id.as_str(),
+                RunLifecycleState::InProgress,
+                None,
+            )
+            .expect("delegation root run should enter progress");
+
+        let delegation = DelegationSnapshot {
+            profile_id: "restricted-research".to_owned(),
+            display_name: "Restricted research".to_owned(),
+            description: None,
+            template_id: None,
+            role: DelegationRole::Research,
+            execution_mode: DelegationExecutionMode::Parallel,
+            group_id: "default".to_owned(),
+            model_profile: "deterministic".to_owned(),
+            tool_allowlist: vec!["palyra.memory.search".to_owned()],
+            skill_allowlist: vec!["research".to_owned()],
+            memory_scope: DelegationMemoryScopeKind::ParentSession,
+            budget_tokens: 512,
+            max_attempts: 2,
+            merge_contract: DelegationMergeContract {
+                strategy: DelegationMergeStrategy::Summarize,
+                approval_required: false,
+            },
+            runtime_limits: DelegationRuntimeLimits::default(),
+            agent_id: Some("researcher".to_owned()),
+        };
+        let cancellation_context = CancellationContextV1 {
+            schema_version: 1,
+            scope_id: RuntimeOperationId::parse("child_task:delegated_suspension")
+                .expect("child scope id should validate"),
+            scope: CancellationScopeKind::ChildTask,
+            generation: RuntimeGeneration::new(1).expect("root generation should validate"),
+            parent_scope_id: Some(
+                RuntimeOperationId::parse("run:delegated_suspension")
+                    .expect("parent scope id should validate"),
+            ),
+            reason: None,
+            deadline_unix_ms: Some(i64::MAX),
+            graceful_settle_ms: 500,
+            hard_abort_after_ms: 2_000,
+        };
+        let authority_task = store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: Ulid::new().to_string(),
+                task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+                session_id: root_session_id.clone(),
+                child_session_id: Some(child_session_id.clone()),
+                parent_run_id: Some(root_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: Some(delegated_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:delegation".to_owned(),
+                device_id: "device-delegation".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 2,
+                budget_tokens: 512,
+                delegation: Some(delegation.clone()),
+                cancellation_context: Some(cancellation_context.clone()),
+                not_before_unix_ms: None,
+                expires_at_unix_ms: Some(i64::MAX),
+                notification_target_json: None,
+                input_text: Some("delegated objective".to_owned()),
+                payload_json: None,
+            })
+            .expect("delegation task should create");
+        let authority_task = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: authority_task.task_id,
+                expected_revision: authority_task.revision,
+                started_at_unix_ms: current_unix_ms().expect("clock should be available"),
+            })
+            .expect("delegation task should be claimed");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: delegated_run_id.clone(),
+                session_id: child_session_id.clone(),
+                origin_kind: "delegation".to_owned(),
+                origin_run_id: Some(root_run_id.clone()),
+                triggered_by_principal: Some("user:delegation".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: Some(DelegatedRunAdmissionV1 {
+                    task_id: authority_task.task_id.clone(),
+                    task_kind: authority_task.task_kind.clone(),
+                    parent_session_id: root_session_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    parent_run_id: root_run_id.clone(),
+                    cancellation_context: cancellation_context.clone(),
+                }),
+            })
+            .expect("delegated parent run should start");
+        store
+            .update_orchestrator_run_state(
+                delegated_run_id.as_str(),
+                RunLifecycleState::InProgress,
+                None,
+            )
+            .expect("delegated parent run should enter progress");
+        let task = store
+            .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
+                task_id: Ulid::new().to_string(),
+                task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                session_id: child_session_id.clone(),
+                child_session_id: None,
+                parent_run_id: Some(delegated_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: None,
+                queued_input_id: None,
+                owner_principal: "user:delegation".to_owned(),
+                device_id: "device-delegation".to_owned(),
+                channel: Some("cli".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 0,
+                max_attempts: 3,
+                budget_tokens: 128,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("nested child work".to_owned()),
+                payload_json: None,
+            })
+            .expect("nested child task should create");
+        let task = store
+            .claim_orchestrator_background_task(&OrchestratorBackgroundTaskClaimRequest {
+                task_id: task.task_id,
+                expected_revision: task.revision,
+                started_at_unix_ms: current_unix_ms().expect("clock should be available"),
+            })
+            .expect("nested child task should be claimed");
+        let suspension = SuspensionFixture {
+            _root: root,
+            store,
+            db_path,
+            session_id: child_session_id,
+            parent_run_id: delegated_run_id,
+            task,
+        };
+        DelegatedSuspensionFixture {
+            suspension,
+            authority_task,
+            delegation,
+            cancellation_context,
+            root_session_id,
+            root_run_id,
+        }
+    }
+
     fn open_store(db_path: PathBuf) -> JournalStore {
         JournalStore::open(JournalConfig {
             db_path,
@@ -1248,9 +1592,9 @@ mod tests {
         ParentSuspensionCreateRequest {
             parent_run_id: fixture.parent_run_id.clone(),
             parent_session_id: fixture.session_id.clone(),
-            owner_principal: "user:phase-six".to_owned(),
-            device_id: "device-phase-six".to_owned(),
-            channel: Some("cli".to_owned()),
+            owner_principal: fixture.task.owner_principal.clone(),
+            device_id: fixture.task.device_id.clone(),
+            channel: fixture.task.channel.clone(),
             wait_policy: ParentWaitPolicy::All,
             timeout_ms: 30_000,
             children: vec![ChildWakeSubscriptionCreateRequest {
@@ -1344,6 +1688,118 @@ mod tests {
             )
             .expect("wake count should load");
         assert_eq!(queued_count, 1);
+    }
+
+    #[test]
+    fn delegated_suspension_continuation_preserves_exact_authority() {
+        let fixture = delegated_suspension_fixture();
+        fixture
+            .suspension
+            .store
+            .suspend_parent_for_children(&suspension_request(&fixture.suspension))
+            .expect("delegated parent should suspend");
+        complete_child(&fixture.suspension.store, &fixture.suspension.task);
+        let outcomes = fixture
+            .suspension
+            .store
+            .settle_parent_suspensions_for_child(fixture.suspension.task.task_id.as_str())
+            .expect("nested child should wake delegated parent");
+        let (continuation_task_id, continuation_run_id) = match outcomes.as_slice() {
+            [ParentSuspensionWakeOutcome::ContinuationQueued {
+                continuation_task_id,
+                continuation_run_id,
+                ..
+            }] => (continuation_task_id, continuation_run_id),
+            other => panic!("unexpected delegated wake outcomes: {other:?}"),
+        };
+        let continuation = fixture
+            .suspension
+            .store
+            .get_orchestrator_background_task(continuation_task_id)
+            .expect("continuation task should load")
+            .expect("continuation task should exist");
+        assert_eq!(continuation.task_kind, AuxiliaryTaskKind::DelegationPrompt.as_str());
+        assert_eq!(continuation.session_id, fixture.root_session_id);
+        assert_eq!(
+            continuation.child_session_id.as_deref(),
+            Some(fixture.suspension.session_id.as_str())
+        );
+        assert_eq!(continuation.parent_run_id.as_deref(), Some(fixture.root_run_id.as_str()));
+        assert_eq!(
+            continuation.planned_child_run_id.as_deref(),
+            Some(continuation_run_id.as_str())
+        );
+        assert_eq!(continuation.delegation.as_ref(), Some(&fixture.delegation));
+        assert_eq!(continuation.cancellation_context.as_ref(), Some(&fixture.cancellation_context));
+        assert_eq!(continuation.max_attempts, fixture.authority_task.max_attempts);
+        assert_eq!(continuation.budget_tokens, fixture.authority_task.budget_tokens);
+        assert_eq!(continuation.expires_at_unix_ms, fixture.authority_task.expires_at_unix_ms);
+
+        fixture
+            .suspension
+            .store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: continuation_run_id.clone(),
+                session_id: fixture.suspension.session_id.clone(),
+                origin_kind: "delegation".to_owned(),
+                origin_run_id: Some(fixture.root_run_id.clone()),
+                triggered_by_principal: Some("user:delegation".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: Some(DelegatedRunAdmissionV1 {
+                    task_id: continuation.task_id,
+                    task_kind: continuation.task_kind,
+                    parent_session_id: continuation.session_id,
+                    child_session_id: continuation
+                        .child_session_id
+                        .expect("continuation child session should persist"),
+                    parent_run_id: continuation
+                        .parent_run_id
+                        .expect("continuation parent run should persist"),
+                    cancellation_context: continuation
+                        .cancellation_context
+                        .expect("continuation cancellation authority should persist"),
+                }),
+            })
+            .expect("preserved delegation authority should admit the continuation run");
+    }
+
+    #[test]
+    fn delegated_suspension_missing_authority_fails_closed() {
+        let fixture = delegated_suspension_fixture();
+        fixture
+            .suspension
+            .store
+            .suspend_parent_for_children(&suspension_request(&fixture.suspension))
+            .expect("delegated parent should suspend");
+        fixture
+            .suspension
+            .store
+            .connection
+            .lock()
+            .expect("journal lock should be available")
+            .execute(
+                "UPDATE orchestrator_background_tasks SET delegation_json = NULL WHERE task_ulid = ?1",
+                params![fixture.authority_task.task_id],
+            )
+            .expect("test authority should be removed");
+        complete_child(&fixture.suspension.store, &fixture.suspension.task);
+        let error = fixture
+            .suspension
+            .store
+            .settle_parent_suspensions_for_child(fixture.suspension.task.task_id.as_str())
+            .expect_err("missing delegation authority must block wake admission");
+        assert!(error.to_string().contains("delegated run authority"));
+        let wake_count = fixture
+            .suspension
+            .store
+            .connection
+            .lock()
+            .expect("journal lock should be available")
+            .query_row("SELECT COUNT(*) FROM parent_wake_intents_v1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("wake count should load");
+        assert_eq!(wake_count, 0);
     }
 
     #[test]
