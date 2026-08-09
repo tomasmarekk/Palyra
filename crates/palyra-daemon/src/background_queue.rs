@@ -3536,6 +3536,19 @@ fn delivery_holds_merge_result(decision: &DeliveryDecision) -> bool {
     matches!(decision.action, DeliveryDecisionAction::HoldForReview)
 }
 
+/// Evaluates whether a delegated merge is still behind the same final-review
+/// gate that controls parent delivery.
+pub(crate) async fn delegation_merge_is_held_for_review(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    run: &crate::journal::OrchestratorRunStatusSnapshot,
+    merge_result: &DelegationMergeResult,
+) -> Result<bool, Status> {
+    let (_, decision) =
+        evaluate_delivery_arbitration_for_merge(runtime, task, run, merge_result).await?;
+    Ok(delivery_holds_merge_result(&decision))
+}
+
 /// Shared inputs for building the bounded child-lifecycle merge payload.
 struct MergeDeliveryPayloadContext<'a> {
     legacy_event_type: &'a str,

@@ -22,9 +22,11 @@ use ulid::Ulid;
 
 use crate::{
     agents::AgentResolveRequest,
+    background_queue::delegation_merge_is_held_for_review,
     delegation::{
         resolve_delegation_request, DelegationExecutionMode, DelegationManifestInput,
-        DelegationMemoryScopeKind, DelegationParentContext, DelegationRequestInput,
+        DelegationMemoryScopeKind, DelegationMergeResult, DelegationParentContext,
+        DelegationRequestInput,
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext,
@@ -808,8 +810,26 @@ async fn sessions_yield_snapshot(
             BackgroundTaskChildResolution::Resolved { task, run, .. } => {
                 matched_child_run_ids.insert(run.run_id.clone());
                 let terminal = sessions_yield_task_terminal(&task, Some(&run));
-                let projected =
-                    sessions_yield_task_projection(&task, Some(&run), return_mode, terminal);
+                let merge_held = if return_mode == SessionsYieldReturnMode::IdsOnly {
+                    false
+                } else {
+                    match task_merge_result_for_delivery_arbitration(&task, Some(&run)) {
+                        Ok(Some(merge_result)) => {
+                            delegation_merge_is_held_for_review(runtime, &task, &run, &merge_result)
+                                .await?
+                        }
+                        Ok(None) => false,
+                        // An unparseable archived merge cannot be proven releasable.
+                        Err(_) => true,
+                    }
+                };
+                let projected = sessions_yield_task_projection(
+                    &task,
+                    Some(&run),
+                    return_mode,
+                    terminal,
+                    merge_held,
+                );
                 if terminal {
                     completions.push(projected);
                 } else {
@@ -899,6 +919,7 @@ fn sessions_yield_task_projection(
     run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
     return_mode: SessionsYieldReturnMode,
     terminal: bool,
+    merge_held: bool,
 ) -> Value {
     let child_run_id = task
         .target_run_id
@@ -923,6 +944,24 @@ fn sessions_yield_task_projection(
         })),
     });
     if return_mode == SessionsYieldReturnMode::IdsOnly {
+        return output;
+    }
+
+    if merge_held {
+        // Approval of sessions_yield is not authority to release a child result held by
+        // final-review arbitration, so no merge-derived field may cross this boundary.
+        if let Some(object) = output.as_object_mut() {
+            object.insert("summary".to_owned(), json!("child output is held for final review"));
+            object.insert("artifact_refs".to_owned(), json!([]));
+            object.insert("evidence_refs".to_owned(), json!([]));
+            object.insert("verification_state".to_owned(), json!("review_required"));
+            object.insert("merge_held".to_owned(), json!(true));
+            if return_mode == SessionsYieldReturnMode::Full {
+                object.insert("task".to_owned(), task_safe_json(task));
+                object
+                    .insert("child_run".to_owned(), run.map(run_safe_json).unwrap_or(Value::Null));
+            }
+        }
         return output;
     }
 
@@ -975,9 +1014,6 @@ fn sessions_yield_verification_state(
     }
     if matches!(child_state, "failed" | "cancelled" | "canceled" | "timed_out" | "rejected") {
         return "failed";
-    }
-    if merge_preview.get("approval_required").and_then(Value::as_bool).unwrap_or(false) {
-        return "review_required";
     }
     if merge_preview.get("ready").and_then(Value::as_bool).unwrap_or(false) {
         return "verified";
@@ -1412,6 +1448,21 @@ fn task_merge_preview(
     })
 }
 
+fn task_merge_result_for_delivery_arbitration(
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+) -> Result<Option<DelegationMergeResult>, serde_json::Error> {
+    if let Some(merge_result) = run.and_then(|snapshot| snapshot.merge_result.as_ref()) {
+        return Ok(Some(merge_result.clone()));
+    }
+    let merge_result = task
+        .result_json
+        .as_deref()
+        .and_then(parse_json_object)
+        .and_then(|value| value.get("merge_result").cloned());
+    merge_result.map(serde_json::from_value).transpose()
+}
+
 fn parse_json_object(value: &str) -> Option<Value> {
     serde_json::from_str::<Value>(value).ok().filter(Value::is_object)
 }
@@ -1781,8 +1832,13 @@ mod tests {
             .to_string(),
         );
 
-        let value =
-            sessions_yield_task_projection(&task, None, SessionsYieldReturnMode::Summary, true);
+        let value = sessions_yield_task_projection(
+            &task,
+            None,
+            SessionsYieldReturnMode::Summary,
+            true,
+            false,
+        );
         let text = value.to_string();
 
         assert_eq!(value["task_id"], "task-1");
@@ -1798,6 +1854,40 @@ mod tests {
             .starts_with("subagent_completion:task-1:child-run"));
         assert!(!text.contains("secret"));
         assert!(!text.contains("access_token=secret"));
+    }
+
+    #[test]
+    fn sessions_yield_withholds_review_held_merge_output() {
+        let mut task = sample_task();
+        task.state = AuxiliaryTaskState::Succeeded.as_str().to_owned();
+        task.completed_at_unix_ms = Some(20);
+        task.result_json = Some(
+            serde_json::json!({
+                "merge_result": {
+                    "summary_text": "review-held secret summary",
+                    "approval_required": true,
+                    "provenance": [{"kind":"message","label":"secret evidence"}],
+                    "artifact_references": [{"artifact_id":"secret-artifact","label":"secret label"}],
+                    "warnings": ["secret warning"]
+                }
+            })
+            .to_string(),
+        );
+
+        let value =
+            sessions_yield_task_projection(&task, None, SessionsYieldReturnMode::Full, true, true);
+        let text = value.to_string();
+
+        assert_eq!(value["merge_held"], true);
+        assert_eq!(value["verification_state"], "review_required");
+        assert_eq!(value["summary"], "child output is held for final review");
+        assert!(value["artifact_refs"].as_array().is_some_and(Vec::is_empty));
+        assert!(value["evidence_refs"].as_array().is_some_and(Vec::is_empty));
+        assert!(value.get("merge_preview").is_none());
+        assert!(!text.contains("review-held secret"));
+        assert!(!text.contains("secret-artifact"));
+        assert!(!text.contains("secret evidence"));
+        assert!(!text.contains("secret warning"));
     }
 
     #[test]
