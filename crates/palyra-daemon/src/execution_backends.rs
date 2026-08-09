@@ -6477,6 +6477,8 @@ mod tests {
     use palyra_workerd::{
         WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
     };
+    #[cfg(target_os = "linux")]
+    use ulid::Ulid;
 
     use crate::config::{
         ExecutionBackendContainerEnvBindingConfig, ExecutionBackendContainerProfileConfig,
