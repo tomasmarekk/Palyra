@@ -1094,6 +1094,15 @@ mod live_owner_tests {
     }
 
     #[test]
+    fn mcp_tools_remain_behind_canonical_backend_dispatch() {
+        assert!(
+            TOOL_FLOW_SOURCE
+                .contains("execute_tool_with_runtime_dispatch_with_cancellation_and_progress(")
+        );
+        assert!(!TOOL_FLOW_SOURCE.contains("execute_persistent_mcp_tool("));
+    }
+
+    #[test]
     fn stale_generation_is_rejected_before_stage_dispatch() {
         assert!(OWNER_SOURCE.contains("tool_flow.stale_or_cross_run_authority"));
         assert!(OWNER_SOURCE.contains("observed != &self.lane_authority"));
