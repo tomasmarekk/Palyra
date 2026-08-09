@@ -414,16 +414,25 @@ pub(crate) fn profile_matches_filter(
         }
     }
     if let Some(scope) = filter.scope.as_ref() {
-        match (scope, &profile.scope) {
-            (AuthScopeFilter::Global, AuthProfileScope::Global) => {}
-            (
-                AuthScopeFilter::Agent { agent_id: left },
-                AuthProfileScope::Agent { agent_id: right },
-            ) if left.eq_ignore_ascii_case(right) => {}
-            _ => return false,
+        if !profile_scope_matches_filter(&profile.scope, scope) {
+            return false;
         }
     }
     true
+}
+
+pub(crate) fn profile_scope_matches_filter(
+    profile_scope: &AuthProfileScope,
+    filter: &AuthScopeFilter,
+) -> bool {
+    match (filter, profile_scope) {
+        (AuthScopeFilter::Global, AuthProfileScope::Global) => true,
+        (
+            AuthScopeFilter::Agent { agent_id: left },
+            AuthProfileScope::Agent { agent_id: right },
+        ) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
 }
 
 /// Returns the provider+name key under which agent-scoped profiles shadow global ones

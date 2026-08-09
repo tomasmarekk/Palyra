@@ -31,8 +31,8 @@ use std::sync::OnceLock;
 
 use palyra_auth::{
     AuthCredential, AuthCredentialType, AuthProfileEligibility, AuthProfileRecord,
-    AuthProfileScope, AuthProfileSelectionRequest, AuthTokenExpiryState, CredentialAttemptBinding,
-    CredentialSelectionReport, OAuthRefreshOutcomeKind,
+    AuthProfileScope, AuthProfileSelectionRequest, AuthScopeFilter, AuthTokenExpiryState,
+    CredentialAttemptBinding, CredentialSelectionReport, OAuthRefreshOutcomeKind,
 };
 use palyra_common::runtime_contracts::{
     RuntimeCausalLink, RuntimeCausalLinkKind, RuntimeIdentityKind, RuntimeIdentityRef,
@@ -1582,15 +1582,18 @@ impl CredentialAvailabilityService {
             )
         })?;
 
-        let agent_id = match &configured_profile.scope {
-            AuthProfileScope::Global => None,
-            AuthProfileScope::Agent { agent_id } => Some(agent_id.clone()),
+        let (agent_id, required_scope) = match &configured_profile.scope {
+            AuthProfileScope::Global => (None, AuthScopeFilter::Global),
+            AuthProfileScope::Agent { agent_id } => {
+                (Some(agent_id.clone()), AuthScopeFilter::Agent { agent_id: agent_id.clone() })
+            }
         };
         let request = AuthProfileSelectionRequest {
             provider: Some(configured_profile.provider.clone()),
             agent_id,
+            required_scope: Some(required_scope),
             explicit_profile_order: Vec::new(),
-            allowed_credential_types: Vec::new(),
+            allowed_credential_types: vec![configured_profile.credential.credential_type()],
             policy_denied_profile_ids: excluded_profile_ids,
         };
         let mut selection = self.select_profiles(request.clone()).await?;
@@ -21359,6 +21362,90 @@ pub(crate) mod tests {
             panic!("credential exhaustion should use a health-blocked admission error");
         };
         assert_eq!(reason_code, "credential_selection_exhausted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_availability_stays_within_configured_scope_and_class() {
+        let state_root = unique_runtime_test_root("palyra-credential-isolation");
+        let identity_root = state_root.join("identity");
+        std::fs::create_dir_all(identity_root.as_path())
+            .expect("test identity root should initialize");
+        let registry = Arc::new(
+            AuthProfileRegistry::open(identity_root.as_path())
+                .expect("test auth profile registry should initialize"),
+        );
+        let state = test_runtime_state();
+        let scope = "global".parse::<VaultScope>().expect("test vault scope should parse");
+        for (key, secret) in [
+            ("agent_key", b"agent-secret".as_slice()),
+            ("oauth_access", b"oauth-access".as_slice()),
+            ("oauth_refresh", b"oauth-refresh".as_slice()),
+            ("configured_key", b"configured-secret".as_slice()),
+        ] {
+            state.vault.put_secret(&scope, key, secret).expect("test credential should persist");
+        }
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "a-agent-key".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "agent key".to_owned(),
+                scope: AuthProfileScope::Agent { agent_id: "private-agent".to_owned() },
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/agent_key".to_owned(),
+                },
+            })
+            .expect("agent profile should persist");
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "b-global-oauth".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "global OAuth".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/oauth_access".to_owned(),
+                    refresh_token_vault_ref: "global/oauth_refresh".to_owned(),
+                    token_endpoint: "https://example.test/oauth/token".to_owned(),
+                    client_id: None,
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: OAuthRefreshState::default(),
+                },
+            })
+            .expect("global OAuth profile should persist");
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "z-global-key".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "configured key".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/configured_key".to_owned(),
+                },
+            })
+            .expect("configured global profile should persist");
+        let adapter: Arc<dyn OAuthRefreshAdapter> = Arc::new(SingleFlightRefreshAdapter::default());
+        let auth_runtime = Arc::new(AuthRuntimeState::new(registry, adapter));
+        let service = CredentialAvailabilityService::new(auth_runtime, Arc::clone(&state.vault));
+
+        let (_, binding, report) = service
+            .select_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:z-global-key",
+                Vec::new(),
+            )
+            .await
+            .expect("credential selection should succeed")
+            .expect("configured auth profile should use dynamic selection");
+        let lease = service
+            .materialize(binding.clone())
+            .await
+            .expect("selected credential should materialize");
+
+        assert_eq!(binding.profile_id, "z-global-key");
+        assert_eq!(binding.auth_class, AuthCredentialType::ApiKey);
+        assert_eq!(lease.auth_class(), AuthCredentialType::ApiKey);
+        assert_eq!(report.considered_profile_hashes.len(), 3);
     }
 
     #[test]

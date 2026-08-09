@@ -659,6 +659,7 @@ pub(crate) async fn console_auth_selection_explain_handler(
     let request = palyra_auth::AuthProfileSelectionRequest {
         provider,
         agent_id,
+        required_scope: None,
         explicit_profile_order: payload.explicit_profile_order,
         allowed_credential_types,
         policy_denied_profile_ids: payload.policy_denied_profile_ids,

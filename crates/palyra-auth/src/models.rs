@@ -176,7 +176,7 @@ pub struct AuthProfileSetRequest {
     pub credential: AuthCredential,
 }
 
-/// Scope predicate for listing profiles.
+/// Scope predicate for profile queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthScopeFilter {
     Global,
@@ -414,10 +414,12 @@ pub struct AuthProfileOrderRecord {
 ///
 /// Empty collections mean "no restriction": an empty `explicit_profile_order` falls back
 /// to the persisted order record, and empty `allowed_credential_types` permits all kinds.
+/// `required_scope` is an exact scope boundary when present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthProfileSelectionRequest {
     pub provider: Option<AuthProvider>,
     pub agent_id: Option<String>,
+    pub required_scope: Option<AuthScopeFilter>,
     pub explicit_profile_order: Vec<String>,
     pub allowed_credential_types: Vec<AuthCredentialType>,
     pub policy_denied_profile_ids: Vec<String>,

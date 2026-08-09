@@ -10,8 +10,9 @@ use crate::{
     AuthCredentialType, AuthFailureClass, AuthProfileEligibility, AuthProfileError,
     AuthProfileFailureKind, AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope,
     AuthProfileSelectionRequest, AuthProfileSetRequest, AuthProvider, AuthProviderKind,
-    AuthTokenExpiryState, HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError,
-    OAuthRefreshOutcomeKind, OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
+    AuthScopeFilter, AuthTokenExpiryState, HttpOAuthRefreshAdapter, OAuthRefreshAdapter,
+    OAuthRefreshError, OAuthRefreshOutcomeKind, OAuthRefreshRequest, OAuthRefreshResponse,
+    OAuthRefreshState,
 };
 use palyra_vault::Vault;
 use palyra_vault::{
@@ -1222,6 +1223,7 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: Vec::new(),
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1237,6 +1239,7 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1255,6 +1258,7 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1272,6 +1276,7 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1280,6 +1285,91 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
         )
         .expect("selector should restore a profile after cooldown expiry");
     assert_eq!(after_cooldown.selected_profile_id.as_deref(), Some("openai-a"));
+}
+
+#[test]
+fn selector_enforces_exact_scope_and_credential_type() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    for (key, secret) in [
+        ("global/agent_key", "agent-secret"),
+        ("global/oauth_access", "oauth-access"),
+        ("global/oauth_refresh", "oauth-refresh"),
+        ("global/configured_key", "configured-secret"),
+    ] {
+        persist_secret_utf8(&vault, key, secret).expect("test credential should persist");
+    }
+    registry
+        .set_profile(AuthProfileSetRequest {
+            profile_id: "a-agent-key".to_owned(),
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            profile_name: "agent key".to_owned(),
+            scope: AuthProfileScope::Agent { agent_id: "private-agent".to_owned() },
+            credential: AuthCredential::ApiKey { api_key_vault_ref: "global/agent_key".to_owned() },
+        })
+        .expect("agent profile should persist");
+    registry
+        .set_profile(AuthProfileSetRequest {
+            profile_id: "b-global-oauth".to_owned(),
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            profile_name: "global OAuth".to_owned(),
+            scope: AuthProfileScope::Global,
+            credential: AuthCredential::Oauth {
+                access_token_vault_ref: "global/oauth_access".to_owned(),
+                refresh_token_vault_ref: "global/oauth_refresh".to_owned(),
+                token_endpoint: "https://example.test/oauth/token".to_owned(),
+                client_id: None,
+                client_secret_vault_ref: None,
+                scopes: Vec::new(),
+                expires_at_unix_ms: None,
+                refresh_state: OAuthRefreshState::default(),
+            },
+        })
+        .expect("global OAuth profile should persist");
+    registry
+        .set_profile(AuthProfileSetRequest {
+            profile_id: "z-global-key".to_owned(),
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            profile_name: "configured key".to_owned(),
+            scope: AuthProfileScope::Global,
+            credential: AuthCredential::ApiKey {
+                api_key_vault_ref: "global/configured_key".to_owned(),
+            },
+        })
+        .expect("global API key profile should persist");
+
+    let selection = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                required_scope: Some(AuthScopeFilter::Global),
+                explicit_profile_order: Vec::new(),
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            1_730_000_000_000,
+        )
+        .expect("selector should enforce security boundaries");
+
+    assert_eq!(selection.selected_profile_id.as_deref(), Some("z-global-key"));
+    let agent_candidate = selection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.profile_id == "a-agent-key")
+        .expect("agent candidate should be reported");
+    assert_eq!(agent_candidate.reason_code, "scope_restricted");
+    let oauth_candidate = selection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.profile_id == "b-global-oauth")
+        .expect("OAuth candidate should be reported");
+    assert_eq!(oauth_candidate.reason_code, "credential_mode_restricted");
 }
 
 #[test]
@@ -1328,6 +1418,7 @@ fn run_credential_report_redacts_material_and_includes_doctor_action() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1393,6 +1484,7 @@ fn persisted_profile_order_drives_selector_without_explicit_order() {
             AuthProfileSelectionRequest {
                 provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
                 agent_id: None,
+                required_scope: None,
                 explicit_profile_order: Vec::new(),
                 allowed_credential_types: vec![AuthCredentialType::ApiKey],
                 policy_denied_profile_ids: Vec::new(),
@@ -1486,6 +1578,7 @@ fn readonly_selection_explain_does_not_persist_runtime_materialization() {
     let request = AuthProfileSelectionRequest {
         provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
         agent_id: None,
+        required_scope: None,
         explicit_profile_order: Vec::new(),
         allowed_credential_types: vec![AuthCredentialType::ApiKey],
         policy_denied_profile_ids: Vec::new(),

@@ -42,6 +42,7 @@ use crate::{
     validation::{
         next_profile_updated_at, normalize_agent_id, normalize_document, normalize_profile_id,
         normalize_set_request, profile_matches_filter, profile_merge_key,
+        profile_scope_matches_filter,
     },
 };
 
@@ -830,6 +831,10 @@ impl AuthProfileRegistry {
             let provider_matches = request.provider.as_ref().is_none_or(|provider| {
                 provider.canonical_key() == profile.provider.canonical_key()
             });
+            let scope_matches = request
+                .required_scope
+                .as_ref()
+                .is_none_or(|scope| profile_scope_matches_filter(&profile.scope, scope));
             let credential_allowed = allowed_credentials.is_empty()
                 || allowed_credentials.contains(&profile.credential.credential_type());
             let in_explicit_order = explicit_positions.is_empty()
@@ -837,6 +842,7 @@ impl AuthProfileRegistry {
             let policy_denied = denied.contains(profile.profile_id.as_str());
             let reason_code = selection_reason_code(
                 provider_matches,
+                scope_matches,
                 credential_allowed,
                 in_explicit_order,
                 policy_denied,
@@ -1636,6 +1642,7 @@ fn run_credential_report_from_selection(
 /// stable reason code; only `eligible` candidates may be selected.
 fn selection_reason_code(
     provider_matches: bool,
+    scope_matches: bool,
     credential_allowed: bool,
     in_explicit_order: bool,
     policy_denied: bool,
@@ -1643,6 +1650,9 @@ fn selection_reason_code(
 ) -> String {
     if !provider_matches {
         return "provider_mismatch".to_owned();
+    }
+    if !scope_matches {
+        return "scope_restricted".to_owned();
     }
     if !credential_allowed {
         return "credential_mode_restricted".to_owned();
