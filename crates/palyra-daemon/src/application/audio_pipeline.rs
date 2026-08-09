@@ -1148,7 +1148,7 @@ mod tests {
         let bytes = b"audio";
         let artifact = input(bytes, 1_250, None);
         let backend =
-            StubStt { delay: Duration::ZERO, result: Ok(stt_result("Dobry den", Some("cs"))) };
+            StubStt { delay: Duration::ZERO, result: Ok(stt_result("Good morning", Some("en"))) };
         let mut pipeline =
             AudioPipeline::new(MediaSessionBudget::default(), MediaRetentionPolicy::default());
         let transcript = pipeline
@@ -1156,7 +1156,7 @@ mod tests {
             .await
             .expect("STT should succeed");
 
-        assert_eq!(transcript.detected_language.as_deref(), Some("cs"));
+        assert_eq!(transcript.detected_language.as_deref(), Some("en"));
         assert_eq!(transcript.context_segment.trust_label, "external_untrusted");
         assert!(!transcript.context_segment.instruction_authority);
         assert!(transcript.context_segment.artifact_citation.starts_with("artifact://"));
