@@ -6621,6 +6621,14 @@ mod tests {
         format!("{}:{}", numeric_identity("-u"), numeric_identity("-g"))
     }
 
+    #[cfg(target_os = "linux")]
+    fn require_live_docker_linux_host(_fixture: &str) {}
+
+    #[cfg(not(target_os = "linux"))]
+    fn require_live_docker_linux_host(fixture: &str) {
+        panic!("{fixture} requires Linux");
+    }
+
     async fn live_managed_docker_container_names() -> BTreeSet<String> {
         let output = tokio::process::Command::new("docker")
             .args(["ps", "-a", "--filter", "label=palyra.managed=true", "--format", "{{.Names}}"])
@@ -8141,7 +8149,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "launched only by the Docker owner-crash qualification test"]
     async fn docker_crash_owner_fixture() {
-        assert!(cfg!(target_os = "linux"), "live Docker crash fixtures require Linux");
+        require_live_docker_linux_host("live Docker crash fixtures");
         assert_eq!(
             std::env::var("PALYRA_DOCKER_CRASH_FIXTURE").as_deref(),
             Ok("owner"),
@@ -8188,7 +8196,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "launched only by the Docker owner-crash qualification test"]
     async fn docker_restart_reconciler_fixture() {
-        assert!(cfg!(target_os = "linux"), "live Docker crash fixtures require Linux");
+        require_live_docker_linux_host("live Docker crash fixtures");
         assert_eq!(
             std::env::var("PALYRA_DOCKER_CRASH_FIXTURE").as_deref(),
             Ok("reconciler"),
@@ -8221,7 +8229,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a supported live Docker daemon and PALYRA_DOCKER_LIVE_IMAGE"]
     async fn docker_live_e2e_recovers_after_runner_owner_process_crash() {
-        assert!(cfg!(target_os = "linux"), "live Docker qualification requires Linux");
+        require_live_docker_linux_host("live Docker qualification");
         let image = std::env::var("PALYRA_DOCKER_LIVE_IMAGE")
             .expect("PALYRA_DOCKER_LIVE_IMAGE must contain an immutable repo digest");
         let temporary = tempfile::tempdir().expect("live Docker crash root should exist");
