@@ -344,7 +344,8 @@ impl ToolCatalogExposureMode {
 /// and extra grants. `palyra.process.run` expands to its lifecycle/input
 /// companions before disables are applied so operators can still remove a
 /// companion by name. `palyra.exec.run` is a model-facing compatibility
-/// facade for the same process runner and expands identically.
+/// facade for the same process runner and expands identically. Disabling
+/// either run facade disables both names.
 ///
 /// # Errors
 /// Returns [`ToolsetProfileError`] when a profile name is not built in.
@@ -383,7 +384,7 @@ pub fn expand_toolset_profiles(
     }
 
     let disabled_tools = normalize_configured_tool_names(disabled_tools);
-    let disabled = disabled_tools.iter().cloned().collect::<BTreeSet<_>>();
+    let disabled = expand_disabled_tool_aliases(disabled_tools.as_slice());
     effective.retain(|tool| !disabled.contains(tool));
 
     Ok(ToolsetProfileExpansionReport {
@@ -394,6 +395,17 @@ pub fn expand_toolset_profiles(
         disabled_tools,
         effective_allowed_tools: effective,
     })
+}
+
+fn expand_disabled_tool_aliases(disabled_tools: &[String]) -> BTreeSet<String> {
+    let mut disabled = disabled_tools.iter().cloned().collect::<BTreeSet<_>>();
+    if disabled.contains("palyra.process.run") || disabled.contains("palyra.exec.run") {
+        // These are two names for one execution authority, so an operator deny must
+        // close both entry points before the effective catalog reaches policy expansion.
+        disabled.insert("palyra.process.run".to_owned());
+        disabled.insert("palyra.exec.run".to_owned());
+    }
+    disabled
 }
 
 /// Returns normalized unique tool/profile identifiers from config input.
@@ -813,6 +825,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn disabling_either_process_run_facade_removes_both() {
+        for disabled_tool in ["palyra.process.run", "palyra.exec.run"] {
+            let report =
+                expand_toolset_profiles(&[String::from("code")], &[], &[], &[disabled_tool.into()])
+                    .expect("code profile should be valid");
+
+            for run_facade in ["palyra.process.run", "palyra.exec.run"] {
+                assert!(
+                    !report.effective_allowed_tools.iter().any(|tool| tool == run_facade),
+                    "disabling {disabled_tool} must also remove {run_facade}"
+                );
+            }
+            assert_eq!(report.disabled_tools, vec![disabled_tool]);
+        }
     }
 
     #[test]
