@@ -16,8 +16,22 @@ resolve_cargo() {
   exit 1
 }
 
+resolve_pwsh() {
+  if command -v pwsh >/dev/null 2>&1; then
+    command -v pwsh
+    return 0
+  fi
+  if command -v pwsh.exe >/dev/null 2>&1; then
+    command -v pwsh.exe
+    return 0
+  fi
+  echo "PowerShell 7 is required for runtime contract snapshot checks." >&2
+  exit 1
+}
+
 cd "$ROOT_DIR"
 CARGO_BIN="$(resolve_cargo)"
+PWSH_BIN="$(resolve_pwsh)"
 
 print_snapshot_failure_guidance() {
   cat >&2 <<'EOF'
@@ -125,4 +139,4 @@ run_contract_check \
   "$CARGO_BIN" test -p palyra-daemon --lib application::core_stability::stable::tests --locked
 run_contract_check \
   "release dashboard, runbook drill, and support redaction" \
-  pwsh -NoLogo -NoProfile -File scripts/ci/check-release-dashboard.ps1
+  "$PWSH_BIN" -NoLogo -NoProfile -File scripts/ci/check-release-dashboard.ps1
