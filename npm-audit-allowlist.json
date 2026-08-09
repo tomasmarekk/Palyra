@@ -1,13 +1,5 @@
 {
   "version": 2,
-  "updated_at": "2026-07-26",
-  "entries": [
-    {
-      "id": "GHSA-qwww-vcr4-c8h2",
-      "scope": "runtime",
-      "expires_on": "2026-08-09",
-      "owner": "@tomasmarekk",
-      "reason": "Palyra web uses only client-side React Router APIs, while this advisory affects unstable RSC APIs; no patched 7.x release is available. Remove when a patched compatible release ships."
-    }
-  ]
+  "updated_at": "2026-08-09",
+  "entries": []
 }
