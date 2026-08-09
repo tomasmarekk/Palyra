@@ -2227,7 +2227,9 @@ fn verify_macos_zombie_ownership_anchor(pid: u32) -> io::Result<()> {
     // retains its exact zombie record. Successful spawn already proves the pre-exec setsid call;
     // require that same reserved PID to remain its process-group leader before accepting it. The
     // live-to-zombie libproc projection can briefly expose an intermediate record, so retry only
-    // complete mismatching snapshots and never relax the exact identity checks.
+    // complete mismatching snapshots and never relax the exact identity checks. Admission also
+    // requires a zombie-only group because reaping the leader would release the PID before later
+    // cleanup could safely signal any surviving descendants.
     for attempt in 0..MAX_MACOS_ZOMBIE_ANCHOR_SNAPSHOT_ATTEMPTS {
         let mut information = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
         // SAFETY: `information` is the fixed writable PROC_PIDTBSDINFO ABI buffer.
@@ -2252,7 +2254,7 @@ fn verify_macos_zombie_ownership_anchor(pid: u32) -> io::Result<()> {
             && information.pbi_pid == pid
             && information.pbi_pgid == pid
         {
-            return Ok(());
+            return verify_macos_zombie_group_is_quiescent(pid, unix_process_group_is_alive(pid)?);
         }
         if attempt + 1 == MAX_MACOS_ZOMBIE_ANCHOR_SNAPSHOT_ATTEMPTS {
             return Err(io::Error::other(format!(
@@ -2263,6 +2265,22 @@ fn verify_macos_zombie_ownership_anchor(pid: u32) -> io::Result<()> {
         thread::sleep(Duration::from_millis(1));
     }
     Err(io::Error::other("macOS zombie ownership snapshot attempts are disabled"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_macos_zombie_group_is_quiescent(
+    pid: u32,
+    process_group_is_alive: bool,
+) -> io::Result<()> {
+    if process_group_is_alive {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "macOS pid {pid} retains live process-group members after its ownership anchor exited"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -17554,6 +17572,16 @@ mod tests {
             .expect_err("a full libproc buffer must remain ambiguous")
             .to_string()
             .contains("capacity"));
+    }
+
+    #[test]
+    fn macos_zombie_anchor_requires_a_quiescent_process_group() {
+        super::verify_macos_zombie_group_is_quiescent(41, false)
+            .expect("a zombie-only process group should remain admissible");
+        let error = super::verify_macos_zombie_group_is_quiescent(41, true)
+            .expect_err("a live process-group member must deny zombie admission");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("pid 41"));
     }
 
     #[cfg(target_os = "macos")]
