@@ -14,15 +14,15 @@
   ],
   "drift_buckets": {
     "feature_rollouts": {
-      "disabled": 35,
+      "disabled": 39,
       "enabled": 0
     },
     "feature_rollout_maturity": {
-      "blocked": 5,
+      "blocked": 0,
       "deprecated": 1,
-      "gated_production": 1,
-      "preview_only": 27,
-      "scaffold": 1,
+      "gated_production": 2,
+      "preview_only": 36,
+      "scaffold": 0,
       "stable": 0
     },
     "runtime_controls": {

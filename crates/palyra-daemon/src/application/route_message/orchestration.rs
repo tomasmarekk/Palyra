@@ -61,9 +61,10 @@ use crate::{
         service_authorization::authorize_message_action,
         session_queue::SessionQueueSafeBoundary,
         tool_registry::{
+            active_dynamic_tool_registry_entries,
             build_model_visible_tool_catalog_snapshot_with_external_records,
-            dynamic_tool_registry_entry, tool_catalog_tape_payload,
-            ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolExposureSurface,
+            tool_catalog_tape_payload, ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest,
+            ToolExposureSurface,
         },
     },
     channel_router::{
@@ -254,17 +255,8 @@ async fn build_and_record_route_tool_catalog_snapshot(
         remaining_tool_budget: None,
         created_at_unix_ms: current_unix_ms(),
     };
-    let dynamic_tools = if runtime_state.config.feature_rollouts.dynamic_tool_builder.enabled {
-        runtime_state
-            .journal_store
-            .active_dynamic_tools()
-            .map_err(|_| Status::internal("dynamic_tool.registry_unavailable"))?
-            .iter()
-            .map(dynamic_tool_registry_entry)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let dynamic_tools = active_dynamic_tool_registry_entries(runtime_state)
+        .map_err(|_| Status::internal("dynamic_tool.registry_unavailable"))?;
     let snapshot = if let Some(runtime) = runtime_state.mcp_runtime() {
         runtime.build_tool_catalog_snapshot_with_external_tools(request, dynamic_tools.as_slice())
     } else {

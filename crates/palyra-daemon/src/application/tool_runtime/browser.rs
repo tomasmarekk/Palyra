@@ -1528,6 +1528,24 @@ pub(crate) async fn execute_browser_tool(
         runtime_state.config.browser_service.auth_token.as_deref(),
     )
     .await;
+    if browser_resilience_rollout_mismatch(
+        runtime_state.config.feature_rollouts.browser_resilience.enabled,
+        &browser_runtime_capabilities,
+    ) {
+        let output = json!({
+            "success": false,
+            "error": "browser_resilience_rollout_mismatch",
+            "reason_code": "browser.resilience.rollout_mismatch",
+            "browser_runtime": browser_runtime_capabilities.to_json(),
+        });
+        return browser_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+            "browserd automatic reconnect requires feature_rollouts.browser_resilience".to_owned(),
+        );
+    }
 
     // Every arm evaluates to (success, output_json, error); shared
     // post-processing below the match attaches capabilities, recovery hints,
@@ -4919,6 +4937,13 @@ async fn fetch_browser_runtime_capabilities(
     }
 }
 
+fn browser_resilience_rollout_mismatch(
+    rollout_enabled: bool,
+    capabilities: &BrowserRuntimeCapabilities,
+) -> bool {
+    capabilities.automatic_reconnect == Some(true) && !rollout_enabled
+}
+
 /// Extracts and validates the mandatory `session_id` payload field.
 fn parse_browser_tool_session_id(
     payload: &serde_json::Map<String, Value>,
@@ -6030,21 +6055,21 @@ mod tests {
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
         browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
-        browser_rescue_trace_payload, browser_screenshot_image_observation_hint,
-        browser_session_closed_error_message, browser_session_closed_output_json,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_storage_origin_to_json, browser_tool_execution_outcome,
-        browser_tool_reports_missing_session, browser_tool_requires_open_session,
-        browser_url_targets_loopback, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        default_browser_session_persistence_id, evaluate_browser_rescue_trigger,
-        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
-        write_browser_output_file, BrowserRescueTriggerKind, BrowserRuntimeCapabilities,
-        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
-        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_rescue_trace_payload, browser_resilience_rollout_mismatch,
+        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
+        browser_session_closed_output_json, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
+        browser_tool_execution_outcome, browser_tool_reports_missing_session,
+        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
+        evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_file_url_path_scope,
+        validate_browser_workspace_relative_path, write_browser_output_file,
+        BrowserRescueTriggerKind, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
+        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -6315,6 +6340,37 @@ mod tests {
         assert_eq!(capabilities.resilience_profile, "disabled");
         assert_eq!(capabilities.automatic_reconnect, Some(false));
         assert!(capabilities.warning.is_some_and(|warning| warning.contains("static_html_only")));
+    }
+
+    #[test]
+    fn browser_resilience_requires_both_product_and_browserd_gates() {
+        let capabilities =
+            BrowserRuntimeCapabilities::from_health(&browser_v1::BrowserHealthResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                status: "ok".to_owned(),
+                uptime_seconds: 12,
+                active_sessions: 1,
+                engine_mode: "chromium".to_owned(),
+                javascript_execution_enabled: true,
+                subresource_loading_enabled: true,
+                dom_interaction_enabled: true,
+                resilience_profile: "resilient".to_owned(),
+                automatic_reconnect_enabled: true,
+                healthy_sessions: 1,
+                degraded_sessions: 0,
+                reconnecting_sessions: 0,
+                blocked_sessions: 0,
+                process_reconnect_count: 0,
+                target_reconnect_count: 0,
+                dialog_timeout_count: 0,
+            });
+
+        assert!(browser_resilience_rollout_mismatch(false, &capabilities));
+        assert!(!browser_resilience_rollout_mismatch(true, &capabilities));
+        assert!(!browser_resilience_rollout_mismatch(
+            false,
+            &BrowserRuntimeCapabilities::unknown("test", None)
+        ));
     }
 
     #[test]

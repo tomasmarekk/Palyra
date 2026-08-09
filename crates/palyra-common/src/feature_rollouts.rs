@@ -62,6 +62,15 @@ pub const PROVIDER_RECOVERY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_PROVIDER_RE
 pub const TERMINAL_SESSIONS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS";
 /// Env toggle for the experimental browser rescue toolchain.
 pub const BROWSER_RESCUE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_BROWSER_RESCUE";
+/// Env toggle for automatic browser process and target recovery.
+pub const BROWSER_RESILIENCE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_BROWSER_RESILIENCE";
+/// Env toggle for connector-neutral audio transcription and synthesis.
+pub const AUDIO_PIPELINE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_AUDIO_PIPELINE";
+/// Env toggle for isolated remote computer-use execution.
+pub const COMPUTER_USE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_COMPUTER_USE";
+/// Env toggle for evidence-based semantic-memory consolidation.
+pub const SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_ENV: &str =
+    "PALYRA_EXPERIMENTAL_SEMANTIC_MEMORY_CONSOLIDATION";
 /// Env toggle for the experimental LSP service lifecycle.
 pub const LSP_SERVICE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_LSP_SERVICE";
 /// Env toggle for the experimental advisor fanout runtime.
@@ -143,6 +152,15 @@ pub const PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.provid
 pub const TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.terminal_sessions";
 /// Config path for [`BROWSER_RESCUE_ROLLOUT_ENV`].
 pub const BROWSER_RESCUE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.browser_rescue";
+/// Config path for [`BROWSER_RESILIENCE_ROLLOUT_ENV`].
+pub const BROWSER_RESILIENCE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.browser_resilience";
+/// Config path for [`AUDIO_PIPELINE_ROLLOUT_ENV`].
+pub const AUDIO_PIPELINE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.audio_pipeline";
+/// Config path for [`COMPUTER_USE_ROLLOUT_ENV`].
+pub const COMPUTER_USE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.computer_use";
+/// Config path for [`SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_ENV`].
+pub const SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.semantic_memory_consolidation";
 /// Config path for [`LSP_SERVICE_ROLLOUT_ENV`].
 pub const LSP_SERVICE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.lsp_service";
 /// Config path for [`ADVISOR_FANOUT_ROLLOUT_ENV`].

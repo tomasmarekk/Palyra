@@ -81,6 +81,20 @@ pub(crate) fn dynamic_tool_registry_entry(
     }
 }
 
+/// Keeps dynamic-tool rollout authority inside the registry seam instead of
+/// adding feature branches to frozen orchestration call sites.
+pub(crate) fn active_dynamic_tool_registry_entries(
+    runtime_state: &crate::gateway::GatewayRuntimeState,
+) -> Result<Vec<ToolRegistryEntry>, crate::journal::JournalError> {
+    if !runtime_state.config.feature_rollouts.dynamic_tool_builder.enabled {
+        return Ok(Vec::new());
+    }
+    runtime_state
+        .journal_store
+        .active_dynamic_tools()
+        .map(|records| records.iter().map(dynamic_tool_registry_entry).collect())
+}
+
 /// Returns the exact digest/generation fence embedded in a catalog snapshot.
 pub(crate) fn dynamic_tool_record_provenance(
     record: &crate::journal::dynamic_tools::DynamicToolActiveRecord,

@@ -114,6 +114,10 @@ enum FeatureRolloutFlag {
     ProviderRecovery,
     TerminalSessions,
     BrowserRescue,
+    BrowserResilience,
+    AudioPipeline,
+    ComputerUse,
+    SemanticMemoryConsolidation,
     LspService,
     AdvisorFanout,
     AcpRuntime,
@@ -154,6 +158,10 @@ impl FeatureRolloutFlag {
             Self::ProviderRecovery => "provider_recovery",
             Self::TerminalSessions => "terminal_sessions",
             Self::BrowserRescue => "browser_rescue",
+            Self::BrowserResilience => "browser_resilience",
+            Self::AudioPipeline => "audio_pipeline",
+            Self::ComputerUse => "computer_use",
+            Self::SemanticMemoryConsolidation => "semantic_memory_consolidation",
             Self::LspService => "lsp_service",
             Self::AdvisorFanout => "advisor_fanout",
             Self::AcpRuntime => "acp_runtime",
@@ -212,6 +220,12 @@ impl FeatureRolloutFlag {
             Self::ProviderRecovery => feature_rollouts::PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH,
             Self::TerminalSessions => feature_rollouts::TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH,
             Self::BrowserRescue => feature_rollouts::BROWSER_RESCUE_ROLLOUT_CONFIG_PATH,
+            Self::BrowserResilience => feature_rollouts::BROWSER_RESILIENCE_ROLLOUT_CONFIG_PATH,
+            Self::AudioPipeline => feature_rollouts::AUDIO_PIPELINE_ROLLOUT_CONFIG_PATH,
+            Self::ComputerUse => feature_rollouts::COMPUTER_USE_ROLLOUT_CONFIG_PATH,
+            Self::SemanticMemoryConsolidation => {
+                feature_rollouts::SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_CONFIG_PATH
+            }
             Self::LspService => feature_rollouts::LSP_SERVICE_ROLLOUT_CONFIG_PATH,
             Self::AdvisorFanout => feature_rollouts::ADVISOR_FANOUT_ROLLOUT_CONFIG_PATH,
             Self::AcpRuntime => feature_rollouts::ACP_RUNTIME_ROLLOUT_CONFIG_PATH,
@@ -264,6 +278,12 @@ impl FeatureRolloutFlag {
             Self::ProviderRecovery => feature_rollouts::PROVIDER_RECOVERY_ROLLOUT_ENV,
             Self::TerminalSessions => feature_rollouts::TERMINAL_SESSIONS_ROLLOUT_ENV,
             Self::BrowserRescue => feature_rollouts::BROWSER_RESCUE_ROLLOUT_ENV,
+            Self::BrowserResilience => feature_rollouts::BROWSER_RESILIENCE_ROLLOUT_ENV,
+            Self::AudioPipeline => feature_rollouts::AUDIO_PIPELINE_ROLLOUT_ENV,
+            Self::ComputerUse => feature_rollouts::COMPUTER_USE_ROLLOUT_ENV,
+            Self::SemanticMemoryConsolidation => {
+                feature_rollouts::SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_ENV
+            }
             Self::LspService => feature_rollouts::LSP_SERVICE_ROLLOUT_ENV,
             Self::AdvisorFanout => feature_rollouts::ADVISOR_FANOUT_ROLLOUT_ENV,
             Self::AcpRuntime => feature_rollouts::ACP_RUNTIME_ROLLOUT_ENV,
@@ -306,6 +326,10 @@ impl FeatureRolloutFlag {
             Self::ProviderRecovery => config.provider_recovery,
             Self::TerminalSessions => config.terminal_sessions,
             Self::BrowserRescue => config.browser_rescue,
+            Self::BrowserResilience => config.browser_resilience,
+            Self::AudioPipeline => config.audio_pipeline,
+            Self::ComputerUse => config.computer_use,
+            Self::SemanticMemoryConsolidation => config.semantic_memory_consolidation,
             Self::LspService => config.lsp_service,
             Self::AdvisorFanout => config.advisor_fanout,
             Self::AcpRuntime => config.acp_runtime,
@@ -792,11 +816,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::DynamicToolBuilder,
         owner_component: "skills/tool runtime",
-        maturity: FeatureRolloutMaturity::Scaffold,
+        maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: CORE_VISIBILITY_TESTS,
-        public_api_exposure: INTERNAL_EXPOSURE,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
         activation_blockers: &[
-            "builder output is not yet covered by signed skill artifact compatibility tests",
+            "stable promotion requires qualified host-publisher activation, key-rotation, and rollback history",
         ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -820,11 +844,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::ExecutionBackendRemoteNode,
         owner_component: "execution backends",
-        maturity: FeatureRolloutMaturity::Blocked,
+        maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: EXECUTION_BACKEND_TESTS,
-        public_api_exposure: INTERNAL_EXPOSURE,
+        public_api_exposure: RUNTIME_PREVIEW_EXPOSURE,
         activation_blockers: &[
-            "remote-node runner contract is not production-backed by attestation and cleanup evidence",
+            "stable promotion requires paired-node process qualification with attestation, revoke, late-result, and cleanup evidence",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -834,11 +858,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::ExecutionBackendNetworkedWorker,
         owner_component: "workerd/execution backends",
-        maturity: FeatureRolloutMaturity::Blocked,
+        maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: EXECUTION_BACKEND_TESTS,
         public_api_exposure: RUNTIME_PREVIEW_EXPOSURE,
         activation_blockers: &[
-            "networked worker execution requires worker attestation and policy-bound remote tool subsets",
+            "stable promotion requires qualified remote-node fleets with continuous attestation, reconciliation, and cleanup evidence",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -848,11 +872,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::ExecutionBackendDocker,
         owner_component: "execution backends",
-        maturity: FeatureRolloutMaturity::Blocked,
+        maturity: FeatureRolloutMaturity::GatedProduction,
         required_tests: EXECUTION_BACKEND_TESTS,
         public_api_exposure: INTERNAL_EXPOSURE,
         activation_blockers: &[
-            "real Docker execution still needs operator-enabled runtime coverage before production promotion",
+            "activation requires the docker_backend_live qualification profile on the release candidate",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -862,11 +886,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::ExecutionBackendSshTunnel,
         owner_component: "execution backends",
-        maturity: FeatureRolloutMaturity::Blocked,
+        maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: EXECUTION_BACKEND_TESTS,
-        public_api_exposure: INTERNAL_EXPOSURE,
+        public_api_exposure: RUNTIME_PREVIEW_EXPOSURE,
         activation_blockers: &[
-            "SSH worker RPC transport trust chain still needs live tunnel coverage before production promotion",
+            "stable promotion requires live SSH matrix qualification with pinned host keys and verified remote cleanup",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -1038,11 +1062,11 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
     FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::NetworkedWorkers,
         owner_component: "workerd/execution backends",
-        maturity: FeatureRolloutMaturity::Blocked,
+        maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: EXECUTION_BACKEND_TESTS,
         public_api_exposure: RUNTIME_PREVIEW_EXPOSURE,
         activation_blockers: &[
-            "networked workers also require feature_rollouts.execution_backend_networked_worker",
+            "activation also requires feature_rollouts.execution_backend_networked_worker; stable promotion requires qualified fleet evidence",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -1121,6 +1145,62 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         public_api_exposure: OBSERVABILITY_EXPOSURE,
         activation_blockers: &[
             "browser rescue must stay policy-gated and must not export raw screenshots or CDP payloads without redaction",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::BrowserResilience,
+        owner_component: "browserd/session recovery",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "daemon rollout and PALYRA_BROWSERD_RESILIENCE_PROFILE=resilient must both be enabled",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::AudioPipeline,
+        owner_component: "application/audio pipeline",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "provider audio capability, session budget, and connector media delivery must all be available",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::ComputerUse,
+        owner_component: "workerd/computer use",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: EXECUTION_BACKEND_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "activation requires a remote isolated desktop worker and explicit high-risk approval policy",
+        ],
+        acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: &[FeatureRolloutFlag::ExecutionBackendNetworkedWorker],
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::SemanticMemoryConsolidation,
+        owner_component: "memory/semantic consolidation",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "activation requires evidence-backed candidates, operator review, and a passing quality baseline",
         ],
         acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -2178,7 +2258,7 @@ mod tests {
     fn builtin_maturity_matrix_has_one_descriptor_per_rollout_flag() {
         validate_feature_rollout_maturity_descriptors(FEATURE_ROLLOUT_DESCRIPTORS)
             .expect("builtin feature rollout maturity matrix should validate");
-        assert_eq!(FEATURE_ROLLOUT_DESCRIPTORS.len(), 35);
+        assert_eq!(FEATURE_ROLLOUT_DESCRIPTORS.len(), 39);
     }
 
     #[test]
@@ -2564,7 +2644,7 @@ mod tests {
         let legacy: BTreeMap<String, LegacyRolloutEntry> =
             serde_json::from_value(diagnostics).expect("v1 rollout projection should deserialize");
 
-        assert_eq!(legacy.len(), 35);
+        assert_eq!(legacy.len(), 39);
         let compaction = legacy
             .get("compaction_safeguard")
             .expect("legacy client should retain compaction rollout");
@@ -2599,9 +2679,9 @@ mod tests {
         let v2 = build_feature_rollout_maturity_summary_v2(&config, &usage);
 
         assert_eq!(legacy.schema_version, 1);
-        assert_eq!(legacy.flag_count, 35);
+        assert_eq!(legacy.flag_count, 39);
         assert_eq!(legacy.enabled_flags + legacy.inactive_flags, legacy.flag_count);
-        assert_eq!(legacy.blocked_flags, 5);
+        assert_eq!(legacy.blocked_flags, 0);
         assert_eq!(legacy.maturity_counts.values().sum::<usize>(), legacy.flag_count);
         assert!(!legacy.deprecated_alias_policy.is_empty());
         assert!(!legacy.migration_note.is_empty());

@@ -41,10 +41,10 @@ use palyra_common::{
     feature_rollouts::{
         parse_boolish_feature_rollout, FeatureRolloutSetting, ACP_RUNTIME_ROLLOUT_ENV,
         ADVISOR_FANOUT_ROLLOUT_ENV, AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
-        AGENT_PLAN_STATE_ROLLOUT_ENV, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
-        AUXILIARY_EXECUTOR_ROLLOUT_ENV, BROWSER_RESCUE_ROLLOUT_ENV,
+        AGENT_PLAN_STATE_ROLLOUT_ENV, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV, AUDIO_PIPELINE_ROLLOUT_ENV,
+        AUXILIARY_EXECUTOR_ROLLOUT_ENV, BROWSER_RESCUE_ROLLOUT_ENV, BROWSER_RESILIENCE_ROLLOUT_ENV,
         CHANNEL_TURN_KERNEL_ROLLOUT_ENV, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
-        CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
+        COMPUTER_USE_ROLLOUT_ENV, CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
         DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
         EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
@@ -53,8 +53,9 @@ use palyra_common::{
         PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV, PROVIDER_RECOVERY_ROLLOUT_ENV,
         PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
         REPLAY_CAPTURE_ROLLOUT_ENV, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
-        SESSION_QUEUE_POLICY_ROLLOUT_ENV, TERMINAL_SESSIONS_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV,
-        TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV, VERIFICATION_RUNTIME_ROLLOUT_ENV,
+        SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_ENV, SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+        TERMINAL_SESSIONS_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV, TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV,
+        VERIFICATION_RUNTIME_ROLLOUT_ENV,
     },
     parse_config_path,
     runtime_preview::{parse_runtime_preview_mode as parse_preview_mode_value, RuntimePreviewMode},
@@ -356,6 +357,19 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             }
             if let Some(enabled) = file_feature_rollouts.browser_rescue {
                 feature_rollouts.browser_rescue = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.browser_resilience {
+                feature_rollouts.browser_resilience = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.audio_pipeline {
+                feature_rollouts.audio_pipeline = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.computer_use {
+                feature_rollouts.computer_use = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.semantic_memory_consolidation {
+                feature_rollouts.semantic_memory_consolidation =
+                    FeatureRolloutSetting::from_config(enabled);
             }
             if let Some(enabled) = file_feature_rollouts.lsp_service {
                 feature_rollouts.lsp_service = FeatureRolloutSetting::from_config(enabled);
@@ -2547,6 +2561,26 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         BROWSER_RESCUE_ROLLOUT_ENV,
         &mut source,
     )?;
+    feature_rollouts.browser_resilience = apply_feature_rollout_env_override(
+        feature_rollouts.browser_resilience,
+        BROWSER_RESILIENCE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.audio_pipeline = apply_feature_rollout_env_override(
+        feature_rollouts.audio_pipeline,
+        AUDIO_PIPELINE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.computer_use = apply_feature_rollout_env_override(
+        feature_rollouts.computer_use,
+        COMPUTER_USE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.semantic_memory_consolidation = apply_feature_rollout_env_override(
+        feature_rollouts.semantic_memory_consolidation,
+        SEMANTIC_MEMORY_CONSOLIDATION_ROLLOUT_ENV,
+        &mut source,
+    )?;
     feature_rollouts.lsp_service = apply_feature_rollout_env_override(
         feature_rollouts.lsp_service,
         LSP_SERVICE_ROLLOUT_ENV,
@@ -2659,6 +2693,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         &replay_capture,
         &networked_workers,
     )?;
+    validate_optional_capability_dependencies(&feature_rollouts)?;
     crate::feature_rollout_maturity::validate_builtin_feature_rollout_maturity_matrix()?;
     if !process_runner_path_access_mode_explicit {
         tool_call.process_runner.path_access_mode =
@@ -2788,7 +2823,7 @@ fn apply_acp_runtime_env(config: &mut AcpRuntimeConfig, source: &mut String) -> 
         )?,
         Err(env::VarError::NotPresent) => Vec::new(),
         Err(error) => {
-            return Err(anyhow::anyhow!("PALYRA_ACP_RUNTIME_ARGS_JSON is invalid: {error}"))
+            return Err(anyhow::anyhow!("PALYRA_ACP_RUNTIME_ARGS_JSON is invalid: {error}"));
         }
     };
     let fallback_backend_ids = match env::var("PALYRA_ACP_RUNTIME_FALLBACK_IDS_JSON") {
@@ -4007,6 +4042,30 @@ fn validate_runtime_preview_config(
         anyhow::bail!("networked_workers.lease_ttl_ms must be in range 60000..=3600000");
     }
 
+    Ok(())
+}
+
+fn validate_optional_capability_dependencies(
+    feature_rollouts: &FeatureRolloutsConfig,
+) -> Result<()> {
+    if feature_rollouts.networked_workers.enabled
+        && !feature_rollouts.execution_backend_networked_worker.enabled
+    {
+        anyhow::bail!(
+            "feature_rollouts.networked_workers=true requires \
+             feature_rollouts.execution_backend_networked_worker=true"
+        );
+    }
+    if feature_rollouts.computer_use.enabled
+        && (!feature_rollouts.networked_workers.enabled
+            || !feature_rollouts.execution_backend_networked_worker.enabled)
+    {
+        anyhow::bail!(
+            "feature_rollouts.computer_use=true requires \
+             feature_rollouts.networked_workers=true and \
+             feature_rollouts.execution_backend_networked_worker=true"
+        );
+    }
     Ok(())
 }
 
@@ -5922,7 +5981,8 @@ mod tests {
         parse_promoted_runtime_mode, parse_provider_reasoning_effort, parse_provider_service_tier,
         parse_root_file_config, parse_runtime_preview_mode, parse_storage_prefix_allowlist,
         parse_structured_secret_ref_field, parse_tool_allowlist, parse_vault_dir,
-        parse_vault_ref_allowlist, validate_acp_runtime_registry, validate_runtime_preview_config,
+        parse_vault_ref_allowlist, validate_acp_runtime_registry,
+        validate_optional_capability_dependencies, validate_runtime_preview_config,
         AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig,
         BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
         DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig,
@@ -6168,6 +6228,10 @@ mod tests {
             provider_recovery = true
             terminal_sessions = false
             browser_rescue = true
+            browser_resilience = false
+            audio_pipeline = true
+            computer_use = false
+            semantic_memory_consolidation = true
             lsp_service = false
             advisor_fanout = true
             acp_runtime = false
@@ -6208,6 +6272,10 @@ mod tests {
         assert_eq!(feature_rollouts.provider_recovery, Some(true));
         assert_eq!(feature_rollouts.terminal_sessions, Some(false));
         assert_eq!(feature_rollouts.browser_rescue, Some(true));
+        assert_eq!(feature_rollouts.browser_resilience, Some(false));
+        assert_eq!(feature_rollouts.audio_pipeline, Some(true));
+        assert_eq!(feature_rollouts.computer_use, Some(false));
+        assert_eq!(feature_rollouts.semantic_memory_consolidation, Some(true));
         assert_eq!(feature_rollouts.lsp_service, Some(false));
         assert_eq!(feature_rollouts.advisor_fanout, Some(true));
         assert_eq!(feature_rollouts.acp_runtime, Some(false));
@@ -6306,6 +6374,37 @@ mod tests {
             &NetworkedWorkersConfig::default(),
         )
         .expect("preview defaults should validate");
+    }
+
+    #[test]
+    fn optional_capability_dependencies_fail_closed() {
+        let network_only = crate::config::FeatureRolloutsConfig {
+            networked_workers: FeatureRolloutSetting::from_config(true),
+            ..crate::config::FeatureRolloutsConfig::default()
+        };
+        let error = validate_optional_capability_dependencies(&network_only)
+            .expect_err("networked workers require their execution backend");
+        assert!(error.to_string().contains("execution_backend_networked_worker"));
+
+        let computer_use_without_worker = crate::config::FeatureRolloutsConfig {
+            computer_use: FeatureRolloutSetting::from_config(true),
+            ..crate::config::FeatureRolloutsConfig::default()
+        };
+        let error = validate_optional_capability_dependencies(&computer_use_without_worker)
+            .expect_err("computer use requires the isolated network-worker path");
+        assert!(error.to_string().contains("feature_rollouts.computer_use"));
+    }
+
+    #[test]
+    fn optional_capability_dependencies_accept_complete_worker_chain() {
+        let feature_rollouts = crate::config::FeatureRolloutsConfig {
+            execution_backend_networked_worker: FeatureRolloutSetting::from_config(true),
+            networked_workers: FeatureRolloutSetting::from_config(true),
+            computer_use: FeatureRolloutSetting::from_config(true),
+            ..crate::config::FeatureRolloutsConfig::default()
+        };
+        validate_optional_capability_dependencies(&feature_rollouts)
+            .expect("complete worker dependency chain should validate");
     }
 
     #[test]

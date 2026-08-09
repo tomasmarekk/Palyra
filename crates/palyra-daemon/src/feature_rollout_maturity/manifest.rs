@@ -18,7 +18,7 @@ use state_validation::validate_promotion_state_matrix;
 
 pub(super) const FEATURE_ROLLOUT_PROMOTION_SCHEMA_VERSION: u32 = 1;
 pub(super) const FEATURE_ROLLOUT_PROMOTION_SCHEMA_ID: &str = "palyra.feature-rollout-promotions.v1";
-const BUILTIN_ROLLOUT_COUNT: usize = 35;
+const BUILTIN_ROLLOUT_COUNT: usize = 39;
 const MAX_EVIDENCE_PROFILES: usize = 64;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_IDENTIFIER_BYTES: usize = 96;
@@ -884,6 +884,10 @@ mod tests {
         ("provider_recovery", "model provider recovery"),
         ("terminal_sessions", "process runtime"),
         ("browser_rescue", "browserd/browser rescue"),
+        ("browser_resilience", "browserd/session recovery"),
+        ("audio_pipeline", "application/audio pipeline"),
+        ("computer_use", "workerd/computer use"),
+        ("semantic_memory_consolidation", "memory/semantic consolidation"),
         ("lsp_service", "code intelligence"),
         ("advisor_fanout", "advisors"),
         ("acp_runtime", "acp runtime"),
@@ -903,7 +907,7 @@ mod tests {
             .expect("built-in manifest must satisfy its release contract");
 
         assert_eq!(manifest.rollouts.len(), EXPECTED_ROLLOUTS.len());
-        assert_eq!(manifest.resolved_rollouts().expect("evidence must resolve").len(), 35);
+        assert_eq!(manifest.resolved_rollouts().expect("evidence must resolve").len(), 39);
         for promotion in manifest.resolved_rollouts().expect("evidence must resolve") {
             if !matches!(
                 promotion.rollout.promotion_state,

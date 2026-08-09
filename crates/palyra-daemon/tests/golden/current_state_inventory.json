@@ -743,27 +743,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.dynamic_tool_builder",
       "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
         "config_path": "feature_rollouts.dynamic_tool_builder",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER and remove or set feature_rollouts.dynamic_tool_builder = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "scaffold",
-      "contract_availability": "descriptor_only",
-      "execution_completeness": "not_implemented",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -793,11 +793,11 @@
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "cargo test -p palyra-daemon --test admin_surface --locked"
       ],
-      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
       "activation_blockers": [
-        "dynamic_tool_builder is contract_only; feature_rollouts.dynamic_tool_builder and PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER are accepted for compatibility but cannot activate runtime behavior.",
-        "builder output is not yet covered by signed skill artifact compatibility tests",
-        "builder execution and production policy boundaries are not implemented"
+        "Enable feature_rollouts.dynamic_tool_builder or PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER after required tests and owner acceptance pass.",
+        "stable promotion requires qualified host-publisher activation, key-rotation, and rollback history",
+        "stable promotion requires qualified host-publisher activation, key-rotation, and rollback history"
       ],
       "acceptance_criteria": [
         "rollout appears in /console/v1/diagnostics with maturity metadata",
@@ -809,39 +809,39 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "keep default-off; add diagnostics, fixtures, owner, rollback, and required tests before preview",
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "descriptor_only",
+        "evidence_profile": "runtime_canary",
         "required_test_refs": [
-          "cargo test -p palyra-daemon --test current_state_inventory --locked",
-          "cargo test -p palyra-daemon --test admin_surface --locked"
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
         ],
         "sli": {
-          "indicator": "registered descriptor inventory coverage",
-          "objective": "100 percent of registered descriptors expose owner and lifecycle metadata",
-          "window": "each runtime-contract CI run"
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
         },
         "rollback": {
-          "mechanism": "revert promotion metadata while preserving accepted rollout configuration keys",
-          "verification": "runtime-contract snapshots pass with the prior compatible maturity projection"
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
         },
-        "compatibility_commitment": "Existing configuration keys and the legacy maturity projection remain accepted through the documented retirement gate.",
-        "legacy_removal_condition": "Remove a legacy descriptor only after its configuration key completes one compatibility window and inventory no longer advertises it.",
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
         "direct_hot_path_test_ref": null,
         "no_hidden_fallback_test_ref": null,
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a supported replacement or the descriptor is formally abandoned",
+        "removal_condition": "remove the disabled dynamic-tool path only after stable qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "dynamic_tool_builder is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "dynamic_tool_builder is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "context_engine": {
       "enabled": false,
@@ -958,27 +958,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.execution_backend_remote_node",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
         "config_path": "feature_rollouts.execution_backend_remote_node",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE and remove or set feature_rollouts.execution_backend_remote_node = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "blocked",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -1011,11 +1011,11 @@
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
-      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
       "activation_blockers": [
-        "execution_backend_remote_node is contract_only; feature_rollouts.execution_backend_remote_node and PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE are accepted for compatibility but cannot activate runtime behavior.",
-        "remote-node runner contract is not production-backed by attestation and cleanup evidence",
-        "remote attestation and cleanup parity are incomplete"
+        "Enable feature_rollouts.execution_backend_remote_node or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE after required tests and owner acceptance pass.",
+        "stable promotion requires paired-node process qualification with attestation, revoke, late-result, and cleanup evidence",
+        "stable promotion requires paired-node process qualification with attestation, revoke, late-result, and cleanup evidence"
       ],
       "acceptance_criteria": [
         "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
@@ -1027,40 +1027,39 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "execution_backend_blocked",
+        "evidence_profile": "runtime_canary",
         "required_test_refs": [
-          "cargo test -p palyra-daemon execution_backend_parity --locked",
-          "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
-          "bash scripts/test/run-critical-attack-scenarios.sh"
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
         ],
         "sli": {
-          "indicator": "backend parity scenario completion",
-          "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
-          "window": "each execution-backend release qualification run"
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
         },
         "rollback": {
-          "mechanism": "retain the backend in blocked posture and route only to established local execution",
-          "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
         },
-        "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
-        "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses.",
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
         "direct_hot_path_test_ref": null,
         "no_hidden_fallback_test_ref": null,
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a qualified execution backend",
+        "removal_condition": "remove the disabled remote-node path only after stable qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "execution_backend_remote_node is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "execution_backend_remote_node is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_networked_worker": {
       "enabled": false,
@@ -1068,27 +1067,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.execution_backend_networked_worker",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
         "config_path": "feature_rollouts.execution_backend_networked_worker",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER and remove or set feature_rollouts.execution_backend_networked_worker = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "blocked",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -1123,9 +1122,9 @@
       ],
       "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
       "activation_blockers": [
-        "execution_backend_networked_worker is contract_only; feature_rollouts.execution_backend_networked_worker and PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER are accepted for compatibility but cannot activate runtime behavior.",
-        "networked worker execution requires worker attestation and policy-bound remote tool subsets",
-        "worker transport attestation and failure cleanup are incomplete"
+        "Enable feature_rollouts.execution_backend_networked_worker or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER after required tests and owner acceptance pass.",
+        "stable promotion requires qualified remote-node fleets with continuous attestation, reconciliation, and cleanup evidence",
+        "stable promotion requires qualified remote fleets with continuous attestation, reconciliation, and cleanup evidence"
       ],
       "acceptance_criteria": [
         "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
@@ -1137,40 +1136,39 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "execution_backend_blocked",
+        "evidence_profile": "runtime_canary",
         "required_test_refs": [
-          "cargo test -p palyra-daemon execution_backend_parity --locked",
-          "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
-          "bash scripts/test/run-critical-attack-scenarios.sh"
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
         ],
         "sli": {
-          "indicator": "backend parity scenario completion",
-          "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
-          "window": "each execution-backend release qualification run"
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
         },
         "rollback": {
-          "mechanism": "retain the backend in blocked posture and route only to established local execution",
-          "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
         },
-        "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
-        "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses.",
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
         "direct_hot_path_test_ref": null,
         "no_hidden_fallback_test_ref": null,
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a qualified execution backend",
+        "removal_condition": "remove the disabled network-worker path only after stable qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "execution_backend_networked_worker is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "execution_backend_networked_worker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_docker": {
       "enabled": false,
@@ -1178,27 +1176,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.execution_backend_docker",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
         "config_path": "feature_rollouts.execution_backend_docker",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER and remove or set feature_rollouts.execution_backend_docker = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "blocked",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "gated_production",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "gated_production",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -1233,9 +1231,9 @@
       ],
       "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
       "activation_blockers": [
-        "execution_backend_docker is contract_only; feature_rollouts.execution_backend_docker and PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER are accepted for compatibility but cannot activate runtime behavior.",
-        "real Docker execution still needs operator-enabled runtime coverage before production promotion",
-        "container policy, attestation, and cleanup parity are incomplete"
+        "Enable feature_rollouts.execution_backend_docker or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER after required tests and owner acceptance pass.",
+        "activation requires the docker_backend_live qualification profile on the release candidate",
+        "stable promotion requires qualified production-window usage evidence on the supported Linux matrix"
       ],
       "acceptance_criteria": [
         "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
@@ -1247,40 +1245,42 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "transition_criteria": "keep explicit gate; require green release hardening evidence before stable promotion",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "execution_backend_blocked",
+        "evidence_profile": "docker_backend_live",
         "required_test_refs": [
-          "cargo test -p palyra-daemon execution_backend_parity --locked",
-          "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+          "cargo test -p palyra-daemon --lib docker_ --locked",
+          "cargo test -p palyra-daemon gateway::tests::docker_runtime_selects_container_process_path --locked -- --exact",
+          "cargo test -p palyra-daemon gateway::tests::docker_runtime_fails_closed_without_host_fallback --locked -- --exact",
+          "bash scripts/test/run-docker-backend-live.sh",
           "bash scripts/test/run-critical-attack-scenarios.sh"
         ],
         "sli": {
-          "indicator": "backend parity scenario completion",
-          "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
-          "window": "each execution-backend release qualification run"
+          "indicator": "qualified Docker execution and cleanup settlement rate",
+          "objective": "all admitted runs enforce resource, network, mount, output, and cleanup policy with zero residual managed containers",
+          "window": "each Docker backend live qualification run and supported Linux release candidate"
         },
         "rollback": {
-          "mechanism": "retain the backend in blocked posture and route only to established local execution",
-          "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+          "mechanism": "disable execution_backend_docker without routing the request to a weaker backend",
+          "verification": "Docker requests return an explicit unavailable outcome and residual-container reconciliation remains green"
         },
-        "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
-        "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses.",
-        "direct_hot_path_test_ref": null,
-        "no_hidden_fallback_test_ref": null,
+        "compatibility_commitment": "Docker execution remains opt-in and preserves the canonical execution result, patch bundle, and cleanup evidence contracts.",
+        "legacy_removal_condition": "Remove a lower-security alternative only after stable Docker qualification and one supported compatibility window.",
+        "direct_hot_path_test_ref": "cargo test -p palyra-daemon gateway::tests::docker_runtime_selects_container_process_path --locked -- --exact",
+        "no_hidden_fallback_test_ref": "cargo test -p palyra-daemon gateway::tests::docker_runtime_fails_closed_without_host_fallback --locked -- --exact",
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a qualified execution backend",
+        "removal_condition": "remove the local sandbox alternative only after stable Docker qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "execution_backend_docker is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "execution_backend_docker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_ssh_tunnel": {
       "enabled": false,
@@ -1288,27 +1288,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
         "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL and remove or set feature_rollouts.execution_backend_ssh_tunnel = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "blocked",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -1341,11 +1341,11 @@
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
-      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
       "activation_blockers": [
-        "execution_backend_ssh_tunnel is contract_only; feature_rollouts.execution_backend_ssh_tunnel and PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL are accepted for compatibility but cannot activate runtime behavior.",
-        "SSH worker RPC transport trust chain still needs live tunnel coverage before production promotion",
-        "SSH identity, host verification, and cleanup parity are incomplete"
+        "Enable feature_rollouts.execution_backend_ssh_tunnel or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL after required tests and owner acceptance pass.",
+        "stable promotion requires live SSH matrix qualification with pinned host keys and verified remote cleanup",
+        "stable promotion requires live SSH matrix qualification with pinned host keys and verified remote cleanup"
       ],
       "acceptance_criteria": [
         "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
@@ -1357,40 +1357,39 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "execution_backend_blocked",
+        "evidence_profile": "runtime_canary",
         "required_test_refs": [
-          "cargo test -p palyra-daemon execution_backend_parity --locked",
-          "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
-          "bash scripts/test/run-critical-attack-scenarios.sh"
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
         ],
         "sli": {
-          "indicator": "backend parity scenario completion",
-          "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
-          "window": "each execution-backend release qualification run"
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
         },
         "rollback": {
-          "mechanism": "retain the backend in blocked posture and route only to established local execution",
-          "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
         },
-        "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
-        "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses.",
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
         "direct_hot_path_test_ref": null,
         "no_hidden_fallback_test_ref": null,
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a qualified execution backend",
+        "removal_condition": "remove the disabled SSH path only after stable qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "execution_backend_ssh_tunnel is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "execution_backend_ssh_tunnel is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "safety_boundary": {
       "enabled": false,
@@ -2670,27 +2669,27 @@
       "rollout_activation": {
         "configured_enabled": false,
         "source": "default",
-        "authoritative": false,
-        "effective_enabled": null,
-        "effective_posture": "not_authoritative",
-        "reason_code": "feature_rollout.activation_not_authoritative"
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
       },
       "config_path": "feature_rollouts.networked_workers",
       "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
       "default_posture": "default_off",
       "rollback_knob": {
-        "applicable": false,
+        "applicable": true,
         "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
         "config_path": "feature_rollouts.networked_workers",
         "safe_default": "disabled",
-        "operator_action": "the accepted rollout setting does not control runtime behavior; roll back the runtime implementation independently",
-        "reason_code": "feature_rollout.rollback_not_authoritative"
+        "operator_action": "unset PALYRA_EXPERIMENTAL_NETWORKED_WORKERS and remove or set feature_rollouts.networked_workers = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
       },
-      "maturity": "blocked",
-      "contract_availability": "blocked",
-      "execution_completeness": "partial",
-      "promotion_state": "contract_only",
-      "support_maturity": "unsupported",
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
       "lifecycle": "active",
       "runtime_usage": {
         "instrumented": false,
@@ -2725,9 +2724,9 @@
       ],
       "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
       "activation_blockers": [
-        "networked_workers is contract_only; feature_rollouts.networked_workers and PALYRA_EXPERIMENTAL_NETWORKED_WORKERS are accepted for compatibility but cannot activate runtime behavior.",
-        "networked workers also require feature_rollouts.execution_backend_networked_worker",
-        "networked worker execution backend qualification is incomplete"
+        "Enable feature_rollouts.networked_workers or PALYRA_EXPERIMENTAL_NETWORKED_WORKERS after required tests and owner acceptance pass.",
+        "activation also requires feature_rollouts.execution_backend_networked_worker; stable promotion requires qualified fleet evidence",
+        "activation requires the networked-worker backend gate; stable promotion requires qualified fleet evidence"
       ],
       "acceptance_criteria": [
         "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
@@ -2739,40 +2738,39 @@
         "default_enable_blockers": [
           "maturity state does not allow default-on production rollout"
         ],
-        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
         "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
         "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
       },
       "promotion_manifest": {
         "schema_version": 1,
         "schema_id": "palyra.feature-rollout-promotions.v1",
-        "evidence_profile": "execution_backend_blocked",
+        "evidence_profile": "runtime_canary",
         "required_test_refs": [
-          "cargo test -p palyra-daemon execution_backend_parity --locked",
-          "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
-          "bash scripts/test/run-critical-attack-scenarios.sh"
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
         ],
         "sli": {
-          "indicator": "backend parity scenario completion",
-          "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
-          "window": "each execution-backend release qualification run"
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
         },
         "rollback": {
-          "mechanism": "retain the backend in blocked posture and route only to established local execution",
-          "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
         },
-        "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
-        "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses.",
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
         "direct_hot_path_test_ref": null,
         "no_hidden_fallback_test_ref": null,
         "replacement": null,
         "removal_date": null,
-        "removal_condition": "remove only after callers migrate to a qualified execution backend",
+        "removal_condition": "remove the disabled worker-fleet path only after stable qualification and one supported compatibility window",
         "shadow_side_effect_posture": "not_applicable"
       },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
-      "inactive_reason": "networked_workers is contract_only; its accepted rollout setting is non-authoritative until a reviewed runtime activation boundary is wired"
+      "inactive_reason": "networked_workers is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "tool_repair": {
       "enabled": false,
@@ -3311,6 +3309,433 @@
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "browser_rescue is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "browser_resilience": {
+      "enabled": false,
+      "source": "default",
+      "rollout_activation": {
+        "configured_enabled": false,
+        "source": "default",
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
+      },
+      "config_path": "feature_rollouts.browser_resilience",
+      "env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESILIENCE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "applicable": true,
+        "env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESILIENCE",
+        "config_path": "feature_rollouts.browser_resilience",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_BROWSER_RESILIENCE and remove or set feature_rollouts.browser_resilience = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
+      },
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "runtime_usage": {
+        "instrumented": false,
+        "observation_scope": "process_local_retained_run_window",
+        "resets_on_restart": true,
+        "retained_run_capacity": 4096,
+        "window_truncated": false,
+        "evicted_run_count": 0,
+        "dropped_observation_count": 0,
+        "dropped_observation_reason_counts": {},
+        "terminal_fence_window_truncated": false,
+        "evicted_terminal_fence_count": 0,
+        "observed_unique_runs": null,
+        "direct_unique_runs": null,
+        "fallback_unique_runs": null,
+        "mixed_path_unique_runs": null,
+        "terminal_observed_unique_runs": null,
+        "terminal_direct_unique_runs": null,
+        "terminal_fallback_unique_runs": null,
+        "terminal_mixed_path_unique_runs": null,
+        "fallback_reason_counts": null,
+        "qualified_hot_path": false,
+        "qualification_reason_code": "feature_usage.not_instrumented"
+      },
+      "owner_component": "browserd/session recovery",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.browser_resilience or PALYRA_EXPERIMENTAL_BROWSER_RESILIENCE after required tests and owner acceptance pass.",
+        "daemon rollout and PALYRA_BROWSERD_RESILIENCE_PROFILE=resilient must both be enabled",
+        "stable promotion requires qualified reconnect usage and zero hidden downgrade across the supported Chromium matrix"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
+      "promotion_manifest": {
+        "schema_version": 1,
+        "schema_id": "palyra.feature-rollout-promotions.v1",
+        "evidence_profile": "runtime_canary",
+        "required_test_refs": [
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
+        ],
+        "sli": {
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
+        },
+        "rollback": {
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
+        },
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
+        "direct_hot_path_test_ref": null,
+        "no_hidden_fallback_test_ref": null,
+        "replacement": null,
+        "removal_date": null,
+        "removal_condition": "remove the disabled recovery profile only after stable qualification and one supported compatibility window",
+        "shadow_side_effect_posture": "not_applicable"
+      },
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "browser_resilience is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "audio_pipeline": {
+      "enabled": false,
+      "source": "default",
+      "rollout_activation": {
+        "configured_enabled": false,
+        "source": "default",
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
+      },
+      "config_path": "feature_rollouts.audio_pipeline",
+      "env_var": "PALYRA_EXPERIMENTAL_AUDIO_PIPELINE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "applicable": true,
+        "env_var": "PALYRA_EXPERIMENTAL_AUDIO_PIPELINE",
+        "config_path": "feature_rollouts.audio_pipeline",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_AUDIO_PIPELINE and remove or set feature_rollouts.audio_pipeline = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
+      },
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "runtime_usage": {
+        "instrumented": false,
+        "observation_scope": "process_local_retained_run_window",
+        "resets_on_restart": true,
+        "retained_run_capacity": 4096,
+        "window_truncated": false,
+        "evicted_run_count": 0,
+        "dropped_observation_count": 0,
+        "dropped_observation_reason_counts": {},
+        "terminal_fence_window_truncated": false,
+        "evicted_terminal_fence_count": 0,
+        "observed_unique_runs": null,
+        "direct_unique_runs": null,
+        "fallback_unique_runs": null,
+        "mixed_path_unique_runs": null,
+        "terminal_observed_unique_runs": null,
+        "terminal_direct_unique_runs": null,
+        "terminal_fallback_unique_runs": null,
+        "terminal_mixed_path_unique_runs": null,
+        "fallback_reason_counts": null,
+        "qualified_hot_path": false,
+        "qualification_reason_code": "feature_usage.not_instrumented"
+      },
+      "owner_component": "application/audio pipeline",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.audio_pipeline or PALYRA_EXPERIMENTAL_AUDIO_PIPELINE after required tests and owner acceptance pass.",
+        "provider audio capability, session budget, and connector media delivery must all be available",
+        "stable promotion requires provider and connector qualification with bounded per-session usage evidence"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
+      "promotion_manifest": {
+        "schema_version": 1,
+        "schema_id": "palyra.feature-rollout-promotions.v1",
+        "evidence_profile": "runtime_canary",
+        "required_test_refs": [
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
+        ],
+        "sli": {
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
+        },
+        "rollback": {
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
+        },
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
+        "direct_hot_path_test_ref": null,
+        "no_hidden_fallback_test_ref": null,
+        "replacement": null,
+        "removal_date": null,
+        "removal_condition": "remove the non-audio path only after stable qualification and one supported compatibility window",
+        "shadow_side_effect_posture": "not_applicable"
+      },
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "audio_pipeline is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "computer_use": {
+      "enabled": false,
+      "source": "default",
+      "rollout_activation": {
+        "configured_enabled": false,
+        "source": "default",
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
+      },
+      "config_path": "feature_rollouts.computer_use",
+      "env_var": "PALYRA_EXPERIMENTAL_COMPUTER_USE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "applicable": true,
+        "env_var": "PALYRA_EXPERIMENTAL_COMPUTER_USE",
+        "config_path": "feature_rollouts.computer_use",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_COMPUTER_USE and remove or set feature_rollouts.computer_use = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
+      },
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "runtime_usage": {
+        "instrumented": false,
+        "observation_scope": "process_local_retained_run_window",
+        "resets_on_restart": true,
+        "retained_run_capacity": 4096,
+        "window_truncated": false,
+        "evicted_run_count": 0,
+        "dropped_observation_count": 0,
+        "dropped_observation_reason_counts": {},
+        "terminal_fence_window_truncated": false,
+        "evicted_terminal_fence_count": 0,
+        "observed_unique_runs": null,
+        "direct_unique_runs": null,
+        "fallback_unique_runs": null,
+        "mixed_path_unique_runs": null,
+        "terminal_observed_unique_runs": null,
+        "terminal_direct_unique_runs": null,
+        "terminal_fallback_unique_runs": null,
+        "terminal_mixed_path_unique_runs": null,
+        "fallback_reason_counts": null,
+        "qualified_hot_path": false,
+        "qualification_reason_code": "feature_usage.not_instrumented"
+      },
+      "owner_component": "workerd/computer use",
+      "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.computer_use or PALYRA_EXPERIMENTAL_COMPUTER_USE after required tests and owner acceptance pass.",
+        "activation requires a remote isolated desktop worker and explicit high-risk approval policy",
+        "stable promotion requires isolated desktop-worker qualification and zero unapproved high-risk actions"
+      ],
+      "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
+      "promotion_manifest": {
+        "schema_version": 1,
+        "schema_id": "palyra.feature-rollout-promotions.v1",
+        "evidence_profile": "runtime_canary",
+        "required_test_refs": [
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
+        ],
+        "sli": {
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
+        },
+        "rollback": {
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
+        },
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
+        "direct_hot_path_test_ref": null,
+        "no_hidden_fallback_test_ref": null,
+        "replacement": null,
+        "removal_date": null,
+        "removal_condition": "remove the disabled path only after stable isolated-worker qualification and one supported compatibility window",
+        "shadow_side_effect_posture": "not_applicable"
+      },
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "computer_use is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "semantic_memory_consolidation": {
+      "enabled": false,
+      "source": "default",
+      "rollout_activation": {
+        "configured_enabled": false,
+        "source": "default",
+        "authoritative": true,
+        "effective_enabled": false,
+        "effective_posture": "default_off",
+        "reason_code": "feature_rollout.activation_disabled"
+      },
+      "config_path": "feature_rollouts.semantic_memory_consolidation",
+      "env_var": "PALYRA_EXPERIMENTAL_SEMANTIC_MEMORY_CONSOLIDATION",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "applicable": true,
+        "env_var": "PALYRA_EXPERIMENTAL_SEMANTIC_MEMORY_CONSOLIDATION",
+        "config_path": "feature_rollouts.semantic_memory_consolidation",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_SEMANTIC_MEMORY_CONSOLIDATION and remove or set feature_rollouts.semantic_memory_consolidation = false",
+        "reason_code": "feature_rollout.rollback_by_disable"
+      },
+      "maturity": "preview_only",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "runtime_usage": {
+        "instrumented": false,
+        "observation_scope": "process_local_retained_run_window",
+        "resets_on_restart": true,
+        "retained_run_capacity": 4096,
+        "window_truncated": false,
+        "evicted_run_count": 0,
+        "dropped_observation_count": 0,
+        "dropped_observation_reason_counts": {},
+        "terminal_fence_window_truncated": false,
+        "evicted_terminal_fence_count": 0,
+        "observed_unique_runs": null,
+        "direct_unique_runs": null,
+        "fallback_unique_runs": null,
+        "mixed_path_unique_runs": null,
+        "terminal_observed_unique_runs": null,
+        "terminal_direct_unique_runs": null,
+        "terminal_fallback_unique_runs": null,
+        "terminal_mixed_path_unique_runs": null,
+        "fallback_reason_counts": null,
+        "qualified_hot_path": false,
+        "qualification_reason_code": "feature_usage.not_instrumented"
+      },
+      "owner_component": "memory/semantic consolidation",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.semantic_memory_consolidation or PALYRA_EXPERIMENTAL_SEMANTIC_MEMORY_CONSOLIDATION after required tests and owner acceptance pass.",
+        "activation requires evidence-backed candidates, operator review, and a passing quality baseline",
+        "stable promotion requires a passing quality baseline and reviewed evidence-backed activation history"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
+      "promotion_manifest": {
+        "schema_version": 1,
+        "schema_id": "palyra.feature-rollout-promotions.v1",
+        "evidence_profile": "runtime_canary",
+        "required_test_refs": [
+          "cargo test -p palyra-daemon runtime_preview --locked",
+          "cargo test -p palyra-daemon --test current_state_inventory --locked"
+        ],
+        "sli": {
+          "indicator": "canary terminal error and degraded-outcome rate",
+          "objective": "no unclassified terminal errors and no regression from the disabled control path",
+          "window": "each targeted canary suite and release candidate"
+        },
+        "rollback": {
+          "mechanism": "disable the canonical feature rollout setting",
+          "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
+        },
+        "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+        "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window.",
+        "direct_hot_path_test_ref": null,
+        "no_hidden_fallback_test_ref": null,
+        "replacement": null,
+        "removal_date": null,
+        "removal_condition": "remove the established retrieval path only after stable quality qualification and one supported compatibility window",
+        "shadow_side_effect_posture": "not_applicable"
+      },
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "semantic_memory_consolidation is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "lsp_service": {
       "enabled": false,
@@ -4512,16 +4937,16 @@
   },
   "feature_rollout_maturity": {
     "schema_version": 1,
-    "flag_count": 35,
+    "flag_count": 39,
     "enabled_flags": 0,
-    "inactive_flags": 35,
-    "blocked_flags": 5,
+    "inactive_flags": 39,
+    "blocked_flags": 0,
     "maturity_counts": {
-      "blocked": 5,
+      "blocked": 0,
       "deprecated": 1,
-      "gated_production": 1,
-      "preview_only": 27,
-      "scaffold": 1,
+      "gated_production": 2,
+      "preview_only": 36,
+      "scaffold": 0,
       "stable": 0
     },
     "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
@@ -4835,16 +5260,16 @@
       ],
       "maturity_summary": {
         "schema_version": 1,
-        "flag_count": 35,
+        "flag_count": 39,
         "enabled_flags": 0,
-        "inactive_flags": 35,
-        "blocked_flags": 5,
+        "inactive_flags": 39,
+        "blocked_flags": 0,
         "maturity_counts": {
-          "blocked": 5,
+          "blocked": 0,
           "deprecated": 1,
-          "gated_production": 1,
-          "preview_only": 27,
-          "scaffold": 1,
+          "gated_production": 2,
+          "preview_only": 36,
+          "scaffold": 0,
           "stable": 0
         },
         "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
@@ -4857,49 +5282,49 @@
   "feature_rollout_maturity_v2": {
     "schema_version": 2,
     "legacy_schema_version": 1,
-    "flag_count": 35,
+    "flag_count": 39,
     "enabled_flags": 0,
-    "inactive_flags": 35,
-    "blocked_flags": 5,
-    "authoritative_rollout_flags": 18,
-    "non_authoritative_rollout_flags": 17,
+    "inactive_flags": 39,
+    "blocked_flags": 0,
+    "authoritative_rollout_flags": 28,
+    "non_authoritative_rollout_flags": 11,
     "effectively_enabled_rollouts": 0,
     "maturity_counts": {
-      "blocked": 5,
+      "blocked": 0,
       "deprecated": 1,
-      "gated_production": 1,
-      "preview_only": 27,
-      "scaffold": 1,
+      "gated_production": 2,
+      "preview_only": 36,
+      "scaffold": 0,
       "stable": 0
     },
     "contract_availability_counts": {
       "api_available": 4,
-      "blocked": 5,
-      "descriptor_only": 2,
-      "runtime_available": 24
+      "blocked": 0,
+      "descriptor_only": 1,
+      "runtime_available": 34
     },
     "execution_completeness_counts": {
-      "complete": 2,
-      "not_implemented": 2,
-      "partial": 31
+      "complete": 12,
+      "not_implemented": 1,
+      "partial": 26
     },
     "promotion_state_counts": {
-      "canary": 17,
-      "contract_only": 17,
-      "gated_production": 1,
+      "canary": 26,
+      "contract_only": 11,
+      "gated_production": 2,
       "shadow": 0,
       "stable": 0
     },
     "support_maturity_counts": {
       "deprecated": 1,
       "experimental": 4,
-      "preview": 24,
+      "preview": 34,
       "retired": 0,
       "supported": 0,
-      "unsupported": 6
+      "unsupported": 0
     },
     "lifecycle_counts": {
-      "active": 34,
+      "active": 38,
       "deprecated": 1,
       "retired": 0
     },
@@ -4924,21 +5349,21 @@
       "schema_version": 1,
       "schema_id": "palyra.feature-rollout-promotions.v1",
       "schema_sha256": "98fc09a7db5f2249867e6925707273a5ed6e0980dc6732c23de463f7d067f1aa",
-      "evidence_profile_count": 10,
-      "rollout_count": 35
+      "evidence_profile_count": 11,
+      "rollout_count": 39
     },
     "v1_compatibility_projection": {
       "schema_version": 1,
-      "flag_count": 35,
+      "flag_count": 39,
       "enabled_flags": 0,
-      "inactive_flags": 35,
-      "blocked_flags": 5,
+      "inactive_flags": 39,
+      "blocked_flags": 0,
       "maturity_counts": {
-        "blocked": 5,
+        "blocked": 0,
         "deprecated": 1,
-        "gated_production": 1,
-        "preview_only": 27,
-        "scaffold": 1,
+        "gated_production": 2,
+        "preview_only": 36,
+        "scaffold": 0,
         "stable": 0
       },
       "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
@@ -5401,16 +5826,16 @@
       ],
       "maturity_summary": {
         "schema_version": 1,
-        "flag_count": 35,
+        "flag_count": 39,
         "enabled_flags": 0,
-        "inactive_flags": 35,
-        "blocked_flags": 5,
+        "inactive_flags": 39,
+        "blocked_flags": 0,
         "maturity_counts": {
-          "blocked": 5,
+          "blocked": 0,
           "deprecated": 1,
-          "gated_production": 1,
-          "preview_only": 27,
-          "scaffold": 1,
+          "gated_production": 2,
+          "preview_only": 36,
+          "scaffold": 0,
           "stable": 0
         },
         "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
@@ -10722,6 +11147,146 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/memory/semantic/activate",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.activate",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.activate.request.method-registry.v1",
+        "request_schema_hash": "aab7944394257ae180f57c6a147dfc319df16e3441989c0ee963072fb0af5f12",
+        "response_schema_id": "console.post.console.v1.memory.semantic.activate.response.method-registry.v1",
+        "response_schema_hash": "09cbc96c745a33687ca5fc1e8ec859b1213591b35112bc963ced8474c84b79c3",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/diagnostics",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.memory.semantic.diagnostics",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.memory.semantic.diagnostics.request.method-registry.v1",
+        "request_schema_hash": "6a96e1feb018f2cb44ab256ec091175cd917d9157de0869f9be33ed81ab4d156",
+        "response_schema_id": "console.get.console.v1.memory.semantic.diagnostics.response.method-registry.v1",
+        "response_schema_hash": "a54f9ce6bea3db9d116c5a74b9693eda73e2084032f4fb7054740d9b82f5df89",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/proposals",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.proposals",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.proposals.request.method-registry.v1",
+        "request_schema_hash": "77b00068eb5698732df13c8e49a00ce07f4d20968ddfb7f69050d319cff5d1f1",
+        "response_schema_id": "console.post.console.v1.memory.semantic.proposals.response.method-registry.v1",
+        "response_schema_hash": "a482812b310c787272b0822f113fd0896ab96673c736ae684ce47198606d5bc9",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/proposals/{candidate_id}",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.memory.semantic.proposals.by_candidate_id",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.memory.semantic.proposals.by_candidate_id.request.method-registry.v1",
+        "request_schema_hash": "083495520c23c03fe6e37557949ecdf399f3fc28b88cd6a15963fceb62596bca",
+        "response_schema_id": "console.get.console.v1.memory.semantic.proposals.by_candidate_id.response.method-registry.v1",
+        "response_schema_hash": "481a9037584ff9449ee3cf15bfa3170f36c9725036bc7d8089371d6395d6385f",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/rollback",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.rollback",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.rollback.request.method-registry.v1",
+        "request_schema_hash": "a98f4d2c7c7602e60cd51bc56db9395ed1bfd76f8077d616b012f0c908a22d87",
+        "response_schema_id": "console.post.console.v1.memory.semantic.rollback.response.method-registry.v1",
+        "response_schema_hash": "78b4f3571edbcdeb5dee25c5c3b0dec7f5fa1d007c1b13f21e8407abacaa2938",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/rollback/proposals",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.rollback.proposals",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.rollback.proposals.request.method-registry.v1",
+        "request_schema_hash": "0c96ab863aef510c0fcac35e55aa38692c37b9bb5a5faecda2ba2235f0dfeb81",
+        "response_schema_id": "console.post.console.v1.memory.semantic.rollback.proposals.response.method-registry.v1",
+        "response_schema_hash": "26d8008378ae7a847c4233a2778d816e93785ec52fd5772ac5ee8d71576eaeb5",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/search",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.memory.semantic.search",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.memory.semantic.search.request.method-registry.v1",
+        "request_schema_hash": "22a0d9f1d9ac43730c8aa51c0d7ecad5a10b65f3ab059a6166d267eca835f786",
+        "response_schema_id": "console.get.console.v1.memory.semantic.search.response.method-registry.v1",
+        "response_schema_hash": "862c44d20bec1ff64e573d28e3a318d39591b361562b0d657a01737df546e511",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/{memory_id}/archive",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.by_memory_id.archive",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.archive.request.method-registry.v1",
+        "request_schema_hash": "4c7d71fe7418fa70a2b4edcee43ec51f8ca1ef8d7a7f6d8a6e5e68184e34a4f6",
+        "response_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.archive.response.method-registry.v1",
+        "response_schema_hash": "7e278a950d09c6cd825a523ae2f6993dfffed11f94cbded586374a7781cd96c3",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/{memory_id}/feedback",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.by_memory_id.feedback",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.feedback.request.method-registry.v1",
+        "request_schema_hash": "696f859fc73c39c45e1845a5a8ce1e6b2e956a3f2c1389d0186d2bc2ac4b337f",
+        "response_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.feedback.response.method-registry.v1",
+        "response_schema_hash": "27549defc942976ad8075aec3254f421615c8c7b04469dceab6ef40419a1a71e",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/memory/semantic/{memory_id}/stale",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.memory.semantic.by_memory_id.stale",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.stale.request.method-registry.v1",
+        "request_schema_hash": "3d942d6e8a4effbcacb44be7094fc1064d7255ded420d58ed4ca770b0fac79a6",
+        "response_schema_id": "console.post.console.v1.memory.semantic.by_memory_id.stale.response.method-registry.v1",
+        "response_schema_hash": "c2089dd197a6ea96d69754a7c7682327a67a6e294131a785d1fa1e7636521ddc",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/memory/session-search",
         "http_method": "GET",
         "method_name": "console.get.console.v1.memory.session_search",
@@ -12024,6 +12589,48 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/skills/dynamic-tools/activate",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.skills.dynamic_tools.activate",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.skills.dynamic_tools.activate.request.method-registry.v1",
+        "request_schema_hash": "08913f8f5b32010220b7bddb0043499b3a49998bdc5153153cd635ebbe372462",
+        "response_schema_id": "console.post.console.v1.skills.dynamic_tools.activate.response.method-registry.v1",
+        "response_schema_hash": "f33523601b6a8c842e0bfaa7229d5b82cd813a4e14cb48a22716147fb48a7491",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/skills/dynamic-tools/build-and-propose",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.skills.dynamic_tools.build_and_propose",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.skills.dynamic_tools.build_and_propose.request.method-registry.v1",
+        "request_schema_hash": "002ce0a23385b93e4fb624d1f83fd05a297202f483b0bc5d21f8dae8b95185d5",
+        "response_schema_id": "console.post.console.v1.skills.dynamic_tools.build_and_propose.response.method-registry.v1",
+        "response_schema_hash": "cfe7a6e495994a3429fbae3cbd561e759c0aa0a758a09ccdd7dce7022f316f18",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/skills/dynamic-tools/proposals",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.skills.dynamic_tools.proposals",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.skills.dynamic_tools.proposals.request.method-registry.v1",
+        "request_schema_hash": "29ad53d2276c900bbb9a9a821ce4e554fe8bd33906803ff44fcfafc7a7017173",
+        "response_schema_id": "console.post.console.v1.skills.dynamic_tools.proposals.response.method-registry.v1",
+        "response_schema_hash": "f6838829f7a2aeec3b0460012fd1e332421ba2f91fee2730c170bb7cb06ba7c0",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/skills/install",
         "http_method": "POST",
         "method_name": "console.post.console.v1.skills.install",
@@ -13087,7 +13694,7 @@
       "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
       "rollout_enabled": false,
       "tradeoffs": [
-        "Uses only the palyra-worker-rpc/v1 envelope over an operator-managed tunnel",
+        "Uses only the canonical palyra-worker-rpc/v2 envelope over pinned SSH",
         "Requires vault-backed SSH identity handles and explicit tunnel health negotiation"
       ],
       "requires_attestation": true,
@@ -13412,8 +14019,8 @@
       "registered_compat_routes": 16,
       "diagnostics_sections": 61,
       "execution_backends": 5,
-      "feature_rollout_flags": 35,
-      "method_registry_methods": 527,
+      "feature_rollout_flags": 39,
+      "method_registry_methods": 540,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -13423,17 +14030,17 @@
       "scaffold": 2
     },
     "feature_rollout_counts": {
-      "disabled": 35,
+      "disabled": 39,
       "enabled": 0
     },
     "feature_rollout_maturity": {
       "schema_version": 2,
       "maturity_counts": {
-        "blocked": 5,
+        "blocked": 0,
         "deprecated": 1,
-        "gated_production": 1,
-        "preview_only": 27,
-        "scaffold": 1,
+        "gated_production": 2,
+        "preview_only": 36,
+        "scaffold": 0,
         "stable": 0
       },
       "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
@@ -13445,7 +14052,7 @@
         "admin": 60,
         "canvas": 5,
         "compat": 16,
-        "console": 443,
+        "console": 456,
         "public": 2,
         "realtime": 1
       }

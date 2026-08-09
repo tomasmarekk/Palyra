@@ -913,6 +913,10 @@ pub struct FileFeatureRolloutsConfig {
     pub provider_recovery: Option<bool>,
     pub terminal_sessions: Option<bool>,
     pub browser_rescue: Option<bool>,
+    pub browser_resilience: Option<bool>,
+    pub audio_pipeline: Option<bool>,
+    pub computer_use: Option<bool>,
+    pub semantic_memory_consolidation: Option<bool>,
     pub lsp_service: Option<bool>,
     pub advisor_fanout: Option<bool>,
     pub acp_runtime: Option<bool>,
@@ -1940,6 +1944,10 @@ mod tests {
             provider_recovery = true
             terminal_sessions = false
             browser_rescue = true
+            browser_resilience = false
+            audio_pipeline = true
+            computer_use = false
+            semantic_memory_consolidation = true
             lsp_service = false
             advisor_fanout = true
             acp_runtime = false
@@ -1981,6 +1989,10 @@ mod tests {
         assert_eq!(feature_rollouts.provider_recovery, Some(true));
         assert_eq!(feature_rollouts.terminal_sessions, Some(false));
         assert_eq!(feature_rollouts.browser_rescue, Some(true));
+        assert_eq!(feature_rollouts.browser_resilience, Some(false));
+        assert_eq!(feature_rollouts.audio_pipeline, Some(true));
+        assert_eq!(feature_rollouts.computer_use, Some(false));
+        assert_eq!(feature_rollouts.semantic_memory_consolidation, Some(true));
         assert_eq!(feature_rollouts.lsp_service, Some(false));
         assert_eq!(feature_rollouts.advisor_fanout, Some(true));
         assert_eq!(feature_rollouts.acp_runtime, Some(false));
