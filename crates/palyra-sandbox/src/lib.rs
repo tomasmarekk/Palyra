@@ -185,6 +185,9 @@ mod platform {
             let cwd = policy.cwd.to_string_lossy().into_owned();
             let mut args = vec![
                 "--die-with-parent".to_owned(),
+                // Namespace isolation does not detach the sandbox from its controlling terminal.
+                // A new session prevents terminal ioctls from reaching the operator's session.
+                "--new-session".to_owned(),
                 "--unshare-pid".to_owned(),
                 "--proc".to_owned(),
                 "/proc".to_owned(),
@@ -541,7 +544,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_backend_never_starts_a_new_session() {
+    fn linux_backend_starts_a_new_terminal_session() {
         let backend = LinuxBubblewrapBackend;
         let policy = sample_policy();
         let request = TierCCommandRequest { command: "uname".to_owned(), args: Vec::new() };
@@ -550,8 +553,8 @@ mod tests {
             .expect("Linux argv rendering should not depend on bwrap being installed");
 
         assert!(
-            !plan.args.iter().any(|arg| arg == "--new-session"),
-            "linux tier-c commands must remain in the durable supervisor process group"
+            plan.args.iter().any(|arg| arg == "--new-session"),
+            "linux tier-c commands must detach from the operator's controlling terminal"
         );
     }
 
