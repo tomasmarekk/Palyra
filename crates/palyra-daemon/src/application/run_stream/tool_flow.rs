@@ -4532,7 +4532,7 @@ async fn workspace_spill_projection_for_artifact(
     content: &[u8],
 ) -> Value {
     let full_read_requires_gate = artifact.sensitivity.requires_full_read_gate();
-    if full_read_requires_gate && !workspace_spill_policy_grants_sensitivity(artifact.sensitivity) {
+    if !workspace_spill_policy_grants_sensitivity(artifact.sensitivity) {
         return workspace_spill_unavailable_projection(
             artifact,
             "workspace_spill.sensitive_output_requires_policy_grant",
@@ -4562,7 +4562,9 @@ async fn workspace_spill_projection_for_artifact(
 }
 
 fn workspace_spill_policy_grants_sensitivity(sensitivity: ToolResultSensitivity) -> bool {
-    matches!(sensitivity, ToolResultSensitivity::Public | ToolResultSensitivity::StdoutStderr)
+    // Workspace reads do not enforce the journal artifact gate, so only payloads already
+    // classified as public may be duplicated outside the canonical artifact store.
+    matches!(sensitivity, ToolResultSensitivity::Public)
 }
 
 fn workspace_spill_unavailable_projection(
@@ -6533,10 +6535,10 @@ mod tests {
             digest_sha256: "a".repeat(64),
             mime_type: "application/json".to_owned(),
             size_bytes: 1024,
-            sensitivity: ToolResultSensitivity::Secret,
+            sensitivity: ToolResultSensitivity::StdoutStderr,
             retention: ArtifactRetentionPolicy::keep(),
-            origin_tool_call_id: "call-secret".to_owned(),
-            tool_name: "palyra.browser.click".to_owned(),
+            origin_tool_call_id: "call-process".to_owned(),
+            tool_name: crate::gateway::PROCESS_RUNNER_TOOL_NAME.to_owned(),
             run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAF".to_owned(),
             session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAG".to_owned(),
             storage_backend: "journal".to_owned(),
@@ -6549,8 +6551,17 @@ mod tests {
             "workspace_spill.sensitive_output_requires_policy_grant",
         );
 
-        assert!(!workspace_spill_policy_grants_sensitivity(ToolResultSensitivity::Secret));
-        assert!(workspace_spill_policy_grants_sensitivity(ToolResultSensitivity::StdoutStderr));
+        assert!(workspace_spill_policy_grants_sensitivity(ToolResultSensitivity::Public));
+        for sensitivity in [
+            ToolResultSensitivity::InternalPath,
+            ToolResultSensitivity::StdoutStderr,
+            ToolResultSensitivity::PersonalData,
+            ToolResultSensitivity::Secret,
+            ToolResultSensitivity::ProviderRawPayload,
+            ToolResultSensitivity::ApprovalRiskData,
+        ] {
+            assert!(!workspace_spill_policy_grants_sensitivity(sensitivity));
+        }
         assert_eq!(spill.pointer("/created").and_then(Value::as_bool), Some(false));
         assert_eq!(
             spill.pointer("/reason_code").and_then(Value::as_str),
