@@ -150,6 +150,9 @@ pub enum ManagedWorktreeExecutorError {
     /// Source path is not an existing canonical Git repository.
     #[error("managed worktree source repository is invalid")]
     InvalidSourceRepository,
+    /// Effective repository configuration could execute code during checkout.
+    #[error("managed worktree source repository contains executable Git configuration")]
+    ExecutableRepositoryConfig,
     /// Managed root or target crosses a symlink, junction, or source boundary.
     #[error("managed worktree path violates containment policy")]
     UnsafePath,
@@ -310,15 +313,50 @@ impl ManagedWorktreeExecutor {
             disabled_hooks_config(),
             "-c".to_owned(),
             "protocol.file.allow=never".to_owned(),
+            "-c".to_owned(),
+            "core.fsmonitor=false".to_owned(),
             "worktree".to_owned(),
             "add".to_owned(),
+            "--no-checkout".to_owned(),
             "--no-track".to_owned(),
             "-b".to_owned(),
             branch.clone(),
             git_path_argument(worktree_path.as_path()),
             record.base_ref.clone(),
         ];
-        match self.run_git(args, source_repo.as_path(), worktree_id.as_str(), record.generation) {
+        // Defer materialization until the effective config for the new gitdir has been inspected;
+        // conditional includes can differ from the source worktree and may define executable filters.
+        let create_result = self
+            .run_git(args, source_repo.as_path(), worktree_id.as_str(), record.generation)
+            .and_then(|_| {
+                self.validate_checkout_git_config(
+                    worktree_path.as_path(),
+                    worktree_id.as_str(),
+                    record.generation,
+                )
+            })
+            .and_then(|_| {
+                self.run_git(
+                    vec![
+                        "-C".to_owned(),
+                        git_path_argument(worktree_path.as_path()),
+                        "-c".to_owned(),
+                        disabled_hooks_config(),
+                        "-c".to_owned(),
+                        "protocol.file.allow=never".to_owned(),
+                        "-c".to_owned(),
+                        "core.fsmonitor=false".to_owned(),
+                        "reset".to_owned(),
+                        "--hard".to_owned(),
+                        "HEAD".to_owned(),
+                    ],
+                    worktree_path.as_path(),
+                    worktree_id.as_str(),
+                    record.generation,
+                )
+                .map(|_| ())
+            });
+        match create_result {
             Ok(_) => match canonical_managed_target(
                 self.config.managed_root.as_path(),
                 worktree_path.as_path(),
@@ -728,6 +766,32 @@ impl ManagedWorktreeExecutor {
         Ok(stdout)
     }
 
+    fn validate_checkout_git_config(
+        &self,
+        worktree_path: &Path,
+        worktree_id: &str,
+        generation: u64,
+    ) -> Result<(), ManagedWorktreeExecutorError> {
+        let keys = self.run_git(
+            vec![
+                "-C".to_owned(),
+                git_path_argument(worktree_path),
+                "config".to_owned(),
+                "--includes".to_owned(),
+                "--name-only".to_owned(),
+                "--null".to_owned(),
+                "--list".to_owned(),
+            ],
+            worktree_path,
+            worktree_id,
+            generation,
+        )?;
+        if keys.split('\0').any(git_config_key_can_execute_during_checkout) {
+            return Err(ManagedWorktreeExecutorError::ExecutableRepositoryConfig);
+        }
+        Ok(())
+    }
+
     fn lock_registry(
         &self,
     ) -> Result<MutexGuard<'_, ManagedWorktreeRegistryV2>, ManagedWorktreeExecutorError> {
@@ -907,9 +971,28 @@ fn git_environment() -> BTreeMap<String, String> {
             env.insert(key.to_owned(), value);
         }
     }
+    env.insert("GIT_ATTR_NOSYSTEM".to_owned(), "1".to_owned());
+    env.insert("GIT_CONFIG_GLOBAL".to_owned(), git_null_device().to_owned());
     env.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
     env.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
     env
+}
+
+#[cfg(windows)]
+const fn git_null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+const fn git_null_device() -> &'static str {
+    "/dev/null"
+}
+
+fn git_config_key_can_execute_during_checkout(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    key == "core.fsmonitor"
+        || (key.starts_with("filter.")
+            && [".clean", ".smudge", ".process"].iter().any(|suffix| key.ends_with(suffix)))
 }
 
 fn bounded_git_detail(value: &str) -> String {
@@ -1034,6 +1117,52 @@ mod tests {
         let status = fixture.executor.status("primary").expect("worktree status");
         assert!(status.record.dirty);
         assert!(!status.porcelain_v2.is_empty());
+    }
+
+    #[test]
+    fn create_rejects_checkout_filters_before_they_execute() {
+        let fixture = ManagedWorktreeTestFixture::new();
+        let marker_path = fixture.source_repo.join("filter-executed");
+        let marker_argument = git_path_argument(marker_path.as_path()).replace('\'', "'\\''");
+        let filter_command = format!("printf executed > '{marker_argument}' && cat");
+        fs::write(fixture.source_repo.join(".gitattributes"), b"tracked.txt filter=palyra-audit\n")
+            .expect("write filter attributes");
+        fixture.git(
+            fixture.source_repo.as_path(),
+            &["config", "filter.palyra-audit.smudge", filter_command.as_str()],
+        );
+        fixture.git(fixture.source_repo.as_path(), &["add", ".gitattributes"]);
+        fixture.git(fixture.source_repo.as_path(), &["commit", "-m", "add checkout filter"]);
+
+        let error = fixture
+            .executor
+            .create(ManagedWorktreeCreateRequestV2 {
+                worktree_id: "filtered".to_owned(),
+                source_repo: fixture.source_repo.clone(),
+                branch_slug: "filtered".to_owned(),
+                base_ref: "HEAD".to_owned(),
+            })
+            .expect_err("executable checkout config must fail closed");
+
+        assert!(matches!(error, ManagedWorktreeExecutorError::ExecutableRepositoryConfig));
+        assert!(!marker_path.exists(), "checkout filter must never execute");
+        assert!(!fixture.managed_root.join("filtered").exists());
+    }
+
+    #[test]
+    fn executable_checkout_config_classifier_is_narrow_and_case_insensitive() {
+        for key in [
+            "core.fsmonitor",
+            "filter.audit.clean",
+            "filter.audit.smudge",
+            "filter.audit.process",
+            "FILTER.AUDIT.PROCESS",
+        ] {
+            assert!(git_config_key_can_execute_during_checkout(key), "{key}");
+        }
+        for key in ["core.repositoryformatversion", "filter.audit.required", "remote.origin.url"] {
+            assert!(!git_config_key_can_execute_during_checkout(key), "{key}");
+        }
     }
 
     #[test]
