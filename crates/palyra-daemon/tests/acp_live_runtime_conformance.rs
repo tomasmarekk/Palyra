@@ -50,6 +50,30 @@ fn selected_acp_backend_executes_through_managed_child() -> Result<()> {
         }),
     )?;
     assert!(created["ok"].as_bool().unwrap_or(false), "session.new failed: {created}");
+    let binding_id = created
+        .pointer("/result/binding/binding_id")
+        .and_then(Value::as_str)
+        .context("session.new must return the live binding id")?;
+
+    let mut foreign_client = client.clone();
+    foreign_client["client_id"] = Value::String("acp-live-foreign".to_owned());
+    let denied = post_acp(
+        &harness,
+        &session,
+        &foreign_client,
+        "request-foreign-run",
+        "run.create",
+        json!({
+            "binding_id": binding_id,
+            "run_id": "foreign-live-run",
+            "prompt": "must not reach the managed child",
+        }),
+    )?;
+    assert_eq!(denied["ok"], Value::Bool(false));
+    assert_eq!(
+        denied.pointer("/error/code").and_then(Value::as_str),
+        Some("acp/permission_denied")
+    );
 
     let executed = post_acp(
         &harness,

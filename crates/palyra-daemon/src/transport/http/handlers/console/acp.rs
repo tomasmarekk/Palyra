@@ -259,12 +259,29 @@ fn selected_live_runtime_binding(
     let Some(binding) = binding else {
         return Ok(None);
     };
+    ensure_live_binding_matches_client(client, &binding)?;
     state
         .acp_runtime
         .live_manager()
         .selected_backend(&binding)
         .map(|selection| selection.map(|_| binding))
         .map_err(|error| AcpDispatchError::Stable(error.to_stable_error()))
+}
+
+fn ensure_live_binding_matches_client(
+    client: &AcpClientContext,
+    binding: &AcpSessionBindingRecord,
+) -> Result<(), AcpDispatchError> {
+    if binding.acp_client_id == client.client_id
+        && binding.owner_principal == client.owner_principal
+        && binding.device_id == client.device_id
+        && binding.channel == client.channel
+    {
+        return Ok(());
+    }
+    Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
+        message: "ACP live runtime binding belongs to a different client context".to_owned(),
+    }))
 }
 
 async fn dispatch_live_runtime_command(
