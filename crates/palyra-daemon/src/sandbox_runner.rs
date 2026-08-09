@@ -13136,21 +13136,22 @@ mod tests {
         let marker_root = unique_temp_dir("managed-child-guard");
         fs::create_dir_all(marker_root.as_path()).expect("marker root should be created");
         let marker = marker_root.join("completed.txt");
-        let child = Command::new(
-            std::env::current_exe().expect("current test executable should resolve"),
-        )
-        .args([
-            "--exact",
-            "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
-            "--nocapture",
-        ])
-        .env(MANAGED_CHILD_GUARD_TEST_ENV, "sleep")
-        .env(MANAGED_CHILD_GUARD_MARKER_ENV, marker.as_os_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("managed child should spawn");
+        let mut command =
+            Command::new(std::env::current_exe().expect("current test executable should resolve"));
+        command
+            .args([
+                "--exact",
+                "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
+                "--nocapture",
+            ])
+            .env(MANAGED_CHILD_GUARD_TEST_ENV, "sleep")
+            .env(MANAGED_CHILD_GUARD_MARKER_ENV, marker.as_os_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        super::configure_child_process_group(&mut command);
+        let child = command.spawn().expect("managed child should spawn");
+        let child_pid = child.id();
         let termination_probe = Arc::new(AtomicUsize::new(0));
         let started_at = Instant::now();
 
@@ -13161,6 +13162,10 @@ mod tests {
             "guard drop waited for the child's natural completion instead of terminating it"
         );
         assert_eq!(termination_probe.load(Ordering::SeqCst), 1);
+        assert!(
+            super::wait_for_process_not_alive(child_pid, Duration::from_secs(1)),
+            "guard drop must leave no live child process"
+        );
         assert!(!marker.exists(), "terminated child must not reach its completion marker");
         fs::remove_dir_all(marker_root).expect("marker root should be removable after reap");
     }
@@ -13304,20 +13309,20 @@ mod tests {
 
     #[test]
     fn managed_child_guard_never_terminates_after_observing_direct_exit() {
-        let child = Command::new(
-            std::env::current_exe().expect("current test executable should resolve"),
-        )
-        .args([
-            "--exact",
-            "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
-            "--nocapture",
-        ])
-        .env(MANAGED_CHILD_GUARD_TEST_ENV, "exit")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("short managed child should spawn");
+        let mut command =
+            Command::new(std::env::current_exe().expect("current test executable should resolve"));
+        command
+            .args([
+                "--exact",
+                "sandbox_runner::tests::managed_child_guard_drop_terminates_and_reaps_the_child",
+                "--nocapture",
+            ])
+            .env(MANAGED_CHILD_GUARD_TEST_ENV, "exit")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        super::configure_child_process_group(&mut command);
+        let child = command.spawn().expect("short managed child should spawn");
         let termination_probe = Arc::new(AtomicUsize::new(0));
         let mut child =
             ManagedChildGuard::with_termination_probe(child, Arc::clone(&termination_probe));
