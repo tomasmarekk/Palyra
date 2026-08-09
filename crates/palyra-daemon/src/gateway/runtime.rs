@@ -17761,6 +17761,7 @@ impl GatewayRuntimeState {
     }
 
     /// Applies provider observations to the code-intelligence runtime read model.
+    #[cfg(test)]
     pub(crate) fn observe_code_intel_runtime(
         &self,
         workspace_root: Option<&str>,

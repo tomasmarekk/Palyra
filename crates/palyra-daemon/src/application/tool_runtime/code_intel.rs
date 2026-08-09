@@ -73,6 +73,8 @@ const CODE_INTEL_SKIPPED_DIRS: &[&str] =
 const CODE_INTEL_MANIFEST_NAMES: &[&str] =
     &["Cargo.toml", "package.json", "pyproject.toml", "tsconfig.json", "jsconfig.json"];
 const LSP_REGISTRY_ONLY_FALLBACK: &str = "registry_only_lexical_fallback";
+const CODE_INTEL_READ_ONLY_DIAGNOSTICS_REASON: &str =
+    "code_intel.diagnostics.provider_execution_blocked";
 pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.rust.snapshot_captured";
 pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
@@ -1096,7 +1098,7 @@ pub(crate) async fn execute_code_intel_tool(
     let result = match tool_name {
         CODE_HEALTH_TOOL_NAME => code_intel_health_output(runtime_state, &workspace),
         CODE_DIAGNOSTICS_TOOL_NAME => {
-            code_intel_diagnostics_output(runtime_state, &workspace, &input).await
+            code_intel_diagnostics_output(runtime_state, &workspace, &input)
         }
         CODE_SYMBOLS_TOOL_NAME | CODE_OUTLINE_TOOL_NAME => {
             code_intel_symbols_output(tool_name, &workspace, &input)
@@ -1478,7 +1480,7 @@ fn code_intel_health_output(
     }))
 }
 
-async fn code_intel_diagnostics_output(
+fn code_intel_diagnostics_output(
     runtime_state: &Arc<GatewayRuntimeState>,
     workspace: &CodeIntelWorkspace,
     input: &CodeIntelToolInput,
@@ -1498,25 +1500,49 @@ async fn code_intel_diagnostics_output(
     } else {
         Vec::new()
     };
-    let snapshot = capture_diagnostic_snapshot_with_managed_health(
-        runtime_state,
+    let snapshot = capture_read_only_diagnostic_snapshot(
         &runtime_state.config.code_intel,
         std::slice::from_ref(&workspace.primary_root),
         touched_files.as_slice(),
-    )
-    .await;
-    let observations = provider_runtime_observations(&snapshot);
-    let runtime = runtime_state.observe_code_intel_runtime(
-        snapshot.workspace_root.as_deref(),
-        observations.as_slice(),
-        &["tool:palyra.code.diagnostics".to_owned()],
     );
     Ok(project_code_intel_diagnostics_output(
         snapshot,
-        runtime.snapshot,
-        &runtime.provider_snapshot_authority,
+        runtime_state.code_intel_runtime_snapshot(),
+        &BTreeMap::new(),
         &workspace.runtime_cwd_hints,
     ))
+}
+
+fn capture_read_only_diagnostic_snapshot(
+    config: &CodeIntelConfig,
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+) -> DiagnosticSnapshot {
+    let mut snapshot = capture_diagnostic_snapshot(config, workspace_roots, files_touched);
+    if !snapshot.enabled || snapshot.files.is_empty() {
+        return snapshot;
+    }
+
+    let touched_languages = snapshot
+        .files
+        .iter()
+        .filter_map(|path| CodeIntelLanguage::from_path(path))
+        .collect::<BTreeSet<_>>();
+    for language in touched_languages {
+        if provider_ready(&snapshot, language) {
+            // Provider availability is safe to inspect, but launching it would turn this
+            // filesystem-read tool into an unapproved process-execution path.
+            mark_provider_degraded(
+                &mut snapshot,
+                language,
+                CODE_INTEL_READ_ONLY_DIAGNOSTICS_REASON,
+                "Run active diagnostics only through an explicitly approved sandboxed process tool.",
+            );
+        }
+    }
+    snapshot.degraded = true;
+    snapshot.reason_codes.push(CODE_INTEL_READ_ONLY_DIAGNOSTICS_REASON.to_owned());
+    finish_diagnostic_snapshot(snapshot)
 }
 
 fn project_code_intel_diagnostics_output(
@@ -1530,6 +1556,7 @@ fn project_code_intel_diagnostics_output(
     let snapshot = project_authoritative_diagnostic_snapshot(snapshot, &authority);
     json!({
         "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "execution_mode": "passive",
         "snapshot": snapshot,
         "runtime": runtime_snapshot,
         "runtime_cwd_hints": runtime_cwd_hints,
@@ -4293,6 +4320,43 @@ mod tests {
     }
 
     #[test]
+    fn read_only_diagnostics_never_admit_provider_execution() {
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let source_dir = workspace.path().join("src");
+        std::fs::create_dir_all(source_dir.as_path()).expect("source directory should be created");
+        std::fs::write(source_dir.join("lib.rs"), "pub fn value() -> u8 { 1 }\n")
+            .expect("source file should be written");
+        let config = CodeIntelConfig {
+            enabled: true,
+            rust_analyzer_binary: std::env::current_exe()
+                .expect("test executable path should resolve")
+                .to_string_lossy()
+                .into_owned(),
+            ..CodeIntelConfig::default()
+        };
+
+        let snapshot = capture_read_only_diagnostic_snapshot(
+            &config,
+            &[workspace.path().to_path_buf()],
+            &[touched("src/lib.rs")],
+        );
+
+        let rust_status = snapshot
+            .provider_status
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::Rust)
+            .expect("rust provider status should be present");
+        assert_eq!(rust_status.status, "degraded");
+        assert_eq!(rust_status.reason_code, CODE_INTEL_READ_ONLY_DIAGNOSTICS_REASON);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.degraded);
+        assert!(snapshot
+            .reason_codes
+            .iter()
+            .any(|reason| { reason.as_str() == CODE_INTEL_READ_ONLY_DIAGNOSTICS_REASON }));
+    }
+
+    #[test]
     fn direct_diagnostics_late_generation_suppresses_raw_provider_data() {
         let snapshot = DiagnosticSnapshot {
             schema_version: CODE_INTEL_SCHEMA_VERSION,
@@ -4378,6 +4442,7 @@ mod tests {
             &[],
         );
 
+        assert_eq!(output["execution_mode"], "passive");
         assert_eq!(output["snapshot"]["provider_status"].as_array().map(Vec::len), Some(1));
         assert_eq!(output["snapshot"]["provider_status"][0]["language"], "type_script");
         assert_eq!(output["snapshot"]["items"].as_array().map(Vec::len), Some(1));

@@ -1015,13 +1015,13 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.code.diagnostics",
-            "Return bounded code diagnostics and code-intelligence runtime status for a workspace file or the current workspace health scope.",
+            "Return bounded passive diagnostic metadata and code-intelligence runtime status without starting provider processes.",
             object_schema(
                 &[],
                 vec![
                     (
                         "path",
-                        json!({"type":"string","description":"Optional workspace-relative source file path. When omitted, provider health is returned without running file-specific diagnostics."}),
+                        json!({"type":"string","description":"Optional workspace-relative source file path. Provider availability is inspected without executing file-specific diagnostics."}),
                     ),
                     (
                         "workspace_root",
