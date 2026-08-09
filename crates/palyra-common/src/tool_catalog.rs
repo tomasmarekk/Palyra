@@ -148,6 +148,8 @@ const HTTP_FETCH_TOOL_CAPABILITIES: &[ToolCapability] =
 const COMPUTER_USE_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::FilesystemRead, ToolCapability::Network, ToolCapability::SecretsRead];
 const ARTIFACT_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ArtifactsRead];
+const IMAGE_OBSERVE_CAPABILITIES: &[ToolCapability] =
+    &[ToolCapability::ArtifactsRead, ToolCapability::Network];
 const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
 
@@ -538,10 +540,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
                 default_sensitive: false,
             })
         }
-        "palyra.image.observe" => Some(ToolMetadata {
-            capabilities: ARTIFACT_READ_CAPABILITIES,
-            default_sensitive: false,
-        }),
+        "palyra.image.observe" => {
+            Some(ToolMetadata { capabilities: IMAGE_OBSERVE_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.web.search" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
@@ -882,9 +883,14 @@ mod tests {
     }
 
     #[test]
-    fn image_observe_is_read_only_without_approval() {
-        assert!(!tool_requires_approval("palyra.image.observe"));
-        assert_eq!(tool_policy_capability_names("palyra.image.observe"), vec!["artifacts_read"]);
+    fn image_observe_requires_approval_for_provider_egress() {
+        assert!(tool_requires_approval("palyra.image.observe"));
+        assert_eq!(
+            tool_policy_capability_names("palyra.image.observe"),
+            vec!["artifacts_read", "network"]
+        );
+        assert!(tool_metadata("palyra.image.observe")
+            .is_some_and(|metadata| metadata.default_sensitive));
     }
 
     #[test]
