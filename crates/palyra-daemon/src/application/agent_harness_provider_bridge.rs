@@ -89,8 +89,6 @@ pub(crate) async fn execute_external_harness_provider_turn(
         .ok_or_else(|| Status::internal("failed to project external harness transcript"))?;
     let context_token_budget =
         turn.provider_request.max_output_tokens.unwrap_or(8_192).saturating_mul(4).max(8_192);
-    let workspace_root =
-        std::env::current_dir().ok().map(|path| path.to_string_lossy().into_owned());
     let request = AgentHarnessAttemptRequestV2 {
         run_id: turn.run_id,
         session_id: turn.session_id,
@@ -108,7 +106,8 @@ pub(crate) async fn execute_external_harness_provider_turn(
         sanitized_transcript,
         tool_surface: tool_surface.clone(),
         tool_catalog_epoch: turn.generation,
-        workspace_root,
+        // External runtimes receive no implicit capability to the daemon working directory.
+        workspace_root: None,
         sandbox: "host_owned".to_owned(),
         trace_context: turn.trace_context,
         host_capability: capability,

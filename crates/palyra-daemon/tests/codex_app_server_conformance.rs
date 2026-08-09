@@ -227,7 +227,7 @@ async fn unsupported_codex_version_fails_before_runtime_acceptance() {
     let (_cancel, cancellation) = HarnessCancellationContext::channel();
     let request = request("text-only", generation, handle, cancellation);
     let mut codex_env = BTreeMap::new();
-    codex_env.insert("PALYRA_FAKE_CODEX_VERSION".to_owned(), "codex-cli/9.0.0".to_owned());
+    codex_env.insert("PALYRA_FAKE_CODEX_VERSION".to_owned(), "codex-cli/0.146.9".to_owned());
     let (harness, transport) = codex_harness_with_env(codex_env);
 
     let error = execute_agent_harness_v2(&harness, &request, &host, CodexSink::default())

@@ -40,18 +40,26 @@ fn main() -> io::Result<()> {
                 request_id,
                 json!({
                     "userAgent": env::var("PALYRA_FAKE_CODEX_VERSION")
-                        .unwrap_or_else(|_| "codex-cli/0.145.0".to_owned()),
+                        .unwrap_or_else(|_| "codex-cli/0.147.0".to_owned()),
                     "codexHome": "fixture",
                     "platformFamily": "fixture",
                     "platformOs": "fixture"
                 }),
             )?,
             "initialized" => {}
-            "thread/start" | "thread/resume" => write_response(
+            "thread/start" => {
+                validate_host_owned_tool_boundary(&message, "/params/sandbox")?;
+                write_response(
+                    request_id,
+                    json!({"thread": {"id": "codex-thread-fixture", "turns": []}}),
+                )?;
+            }
+            "thread/resume" => write_response(
                 request_id,
                 json!({"thread": {"id": "codex-thread-fixture", "turns": []}}),
             )?,
             "turn/start" => {
+                validate_host_owned_tool_boundary(&message, "/params/sandboxPolicy/type")?;
                 let thread_id = message
                     .pointer("/params/threadId")
                     .and_then(Value::as_str)
@@ -155,6 +163,21 @@ fn main() -> io::Result<()> {
     }
     if waiting_for_tool {
         return Err(io::Error::other("fixture closed while waiting for host tool result"));
+    }
+    Ok(())
+}
+
+fn validate_host_owned_tool_boundary(message: &Value, sandbox_pointer: &str) -> io::Result<()> {
+    let environments = message
+        .pointer("/params/environments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::other("Codex request omitted environment isolation"))?;
+    let sandbox = message.pointer(sandbox_pointer).and_then(Value::as_str);
+    if !environments.is_empty()
+        || message.pointer("/params/cwd").is_some()
+        || !matches!(sandbox, Some("read-only" | "readOnly"))
+    {
+        return Err(io::Error::other("Codex request exposed native environment access"));
     }
     Ok(())
 }

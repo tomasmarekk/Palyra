@@ -58,7 +58,7 @@ pub struct CodexAppServerVersionPolicy {
 
 impl Default for CodexAppServerVersionPolicy {
     fn default() -> Self {
-        Self { required_major: 0, minimum_minor: 120, maximum_minor_exclusive: 1_000 }
+        Self { required_major: 0, minimum_minor: 147, maximum_minor_exclusive: 1_000 }
     }
 }
 
@@ -494,8 +494,6 @@ impl CodexBridge {
         }
         self.write_accepted(command.command_id.as_str(), command.generation)?;
         let model = required_payload_string(&command.payload, "model_id")?;
-        let workspace_root =
-            command.payload.get("workspace_root").and_then(Value::as_str).map(str::to_owned);
         let tool_catalog_epoch = command
             .payload
             .get("tool_catalog_epoch")
@@ -525,9 +523,10 @@ impl CodexBridge {
                 "thread/start",
                 json!({
                     "model": model,
-                    "cwd": workspace_root,
                     "approvalPolicy": "never",
                     "sandbox": "read-only",
+                    // Empty environments prevent Codex from registering native filesystem tools.
+                    "environments": [],
                     "dynamicTools": dynamic_tools,
                     "ephemeral": true,
                 }),
@@ -563,9 +562,10 @@ impl CodexBridge {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": prompt}],
                 "model": model,
-                "cwd": workspace_root,
                 "approvalPolicy": "never",
                 "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+                // Reassert the boundary so resumed threads cannot retain environment access.
+                "environments": [],
             }),
         )?;
         let turn_id = required_pointer_string(&result, "/turn/id")?;
@@ -1375,6 +1375,14 @@ mod tests {
         );
         assert_eq!(parse_codex_version("codex-cli/0.146.1"), Some((0, 146, 1)));
         assert_eq!(parse_codex_version("codex-without-version"), None);
+    }
+
+    #[test]
+    fn default_version_policy_requires_environmentless_turn_support() {
+        let policy = CodexAppServerVersionPolicy::default();
+
+        assert!(!policy.accepts(0, 146));
+        assert!(policy.accepts(0, 147));
     }
 
     #[test]
