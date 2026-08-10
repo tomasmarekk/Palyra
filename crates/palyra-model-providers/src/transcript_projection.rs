@@ -12,6 +12,10 @@ use crate::{ProviderMessage, ProviderMessageRole};
 pub const MAX_PROVIDER_TRANSCRIPT_MESSAGES: usize = 512;
 /// Maximum text retained in one replayed tool result.
 pub const MAX_PROVIDER_TRANSCRIPT_TOOL_RESULT_CHARS: usize = 16 * 1024;
+/// Maximum serialized JSON retained for one replayed tool call.
+pub const MAX_PROVIDER_TRANSCRIPT_TOOL_INPUT_BYTES: usize = 8 * 1024;
+/// Maximum serialized provider transcript reconstructed from a prior run.
+pub const MAX_PROVIDER_TRANSCRIPT_REPLAY_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_TOOL_CALL_ID_CHARS: usize = 64;
 const SYNTHETIC_TOOL_FAILURE: &str =
     r#"{"error":"tool result unavailable during transcript repair","success":false}"#;
@@ -189,7 +193,7 @@ pub fn project_provider_transcript(
     let dialect = request.dialect;
     let projection_epoch = request.projection_epoch;
     let model_id_sha256 = sha256_hex(request.model_id.as_bytes());
-    let outcome = repair_provider_messages(request.messages, dialect);
+    let outcome = repair_provider_messages(request.messages, dialect, true);
     let hash_input = serde_json::to_vec(&(
         1_u16,
         projection_epoch,
@@ -227,12 +231,13 @@ pub fn project_provider_request_messages(
             source_tape_refs: vec![format!("request_message:{index}")],
         })
         .collect();
-    repair_provider_messages(sources, dialect).messages
+    repair_provider_messages(sources, dialect, false).messages
 }
 
 fn repair_provider_messages(
     mut source_messages: Vec<ProviderTranscriptSourceMessage>,
     dialect: ProviderTranscriptDialect,
+    enforce_replay_byte_limits: bool,
 ) -> RepairOutcome {
     let mut repairs = Vec::new();
     if source_messages.len() > MAX_PROVIDER_TRANSCRIPT_MESSAGES {
@@ -245,6 +250,15 @@ fn repair_provider_messages(
         source_messages.drain(0..dropped);
         repairs.push(repair_record("provider.transcript.message_limit_applied", dropped_refs));
     }
+    if enforce_replay_byte_limits {
+        bound_replayed_tool_inputs(&mut source_messages, &mut repairs);
+    }
+    let replay_source_refs = enforce_replay_byte_limits.then(|| {
+        source_messages
+            .iter()
+            .flat_map(|source| source.source_tape_refs.iter().cloned())
+            .collect::<Vec<_>>()
+    });
 
     let tool_calls = normalize_tool_call_ids(&mut source_messages, dialect, &mut repairs);
     let result_indexes_by_raw_id = tool_result_indexes(&source_messages);
@@ -309,6 +323,9 @@ fn repair_provider_messages(
         }
         projected.push(source.message.clone());
     }
+    if let Some(source_refs) = replay_source_refs {
+        enforce_replay_byte_limit(&mut projected, source_refs, &mut repairs);
+    }
 
     RepairOutcome {
         messages: projected,
@@ -322,6 +339,61 @@ fn repair_provider_messages(
             repairs,
         },
     }
+}
+
+fn bound_replayed_tool_inputs(
+    sources: &mut [ProviderTranscriptSourceMessage],
+    repairs: &mut Vec<TranscriptRepairRecord>,
+) {
+    for source in sources {
+        for tool_call in &mut source.message.tool_calls {
+            let serialized = serde_json::to_vec(&tool_call.input_json).unwrap_or_default();
+            if serialized.len() <= MAX_PROVIDER_TRANSCRIPT_TOOL_INPUT_BYTES {
+                continue;
+            }
+            tool_call.input_json = serde_json::json!({
+                "truncated": true,
+                "sha256": sha256_hex(serialized.as_slice()),
+            });
+            repairs.push(repair_record(
+                "provider.transcript.tool_input_truncated",
+                source.source_tape_refs.clone(),
+            ));
+        }
+    }
+}
+
+fn enforce_replay_byte_limit(
+    messages: &mut Vec<ProviderMessage>,
+    source_refs: Vec<String>,
+    repairs: &mut Vec<TranscriptRepairRecord>,
+) {
+    let mut limited = false;
+    while serialized_messages_len(messages) > MAX_PROVIDER_TRANSCRIPT_REPLAY_BYTES {
+        let remove_count = first_projection_unit_len(messages);
+        if remove_count == 0 {
+            break;
+        }
+        messages.drain(0..remove_count);
+        limited = true;
+    }
+    if limited {
+        repairs.push(repair_record("provider.transcript.byte_limit_applied", source_refs));
+    }
+}
+
+fn serialized_messages_len(messages: &[ProviderMessage]) -> usize {
+    serde_json::to_vec(messages).map_or(usize::MAX, |serialized| serialized.len())
+}
+
+fn first_projection_unit_len(messages: &[ProviderMessage]) -> usize {
+    let Some(first) = messages.first() else {
+        return 0;
+    };
+    if first.role != ProviderMessageRole::Assistant || first.tool_calls.is_empty() {
+        return 1;
+    }
+    1 + messages[1..].iter().take_while(|message| message.role == ProviderMessageRole::Tool).count()
 }
 
 fn normalize_tool_call_ids(
@@ -596,6 +668,64 @@ mod tests {
         assert_eq!(projection.messages.len(), 2);
         assert_eq!(projection.repair_report.reason_code, "provider.transcript.valid");
         assert!(projection.repair_report.repairs.is_empty());
+    }
+
+    #[test]
+    fn replay_bounds_tool_inputs_and_aggregate_bytes() {
+        let mut messages = (0..20)
+            .map(|index| {
+                source(
+                    ProviderMessage::user_text("context".repeat(3_000)),
+                    format!("tape_seq:{index}").as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        messages.push(source(
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "large_input".to_owned(),
+                    tool_name: "palyra.echo".to_owned(),
+                    input_json: json!({"text": "x".repeat(
+                        MAX_PROVIDER_TRANSCRIPT_TOOL_INPUT_BYTES * 2
+                    )}),
+                }],
+            },
+            "tape_seq:20",
+        ));
+        messages.push(source(ProviderMessage::tool_result("large_input", "ok"), "tape_seq:21"));
+
+        let projection = project(messages);
+        let reason_codes = projection
+            .repair_report
+            .repairs
+            .iter()
+            .map(|repair| repair.reason_code.as_str())
+            .collect::<BTreeSet<_>>();
+        let retained_call = projection
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| call.proposal_id == "large_input")
+            .expect("the newest bounded tool call should remain");
+
+        assert!(
+            serde_json::to_vec(&projection.messages)
+                .expect("projected messages should serialize")
+                .len()
+                <= MAX_PROVIDER_TRANSCRIPT_REPLAY_BYTES
+        );
+        assert!(
+            serde_json::to_vec(&retained_call.input_json)
+                .expect("bounded tool input should serialize")
+                .len()
+                <= MAX_PROVIDER_TRANSCRIPT_TOOL_INPUT_BYTES
+        );
+        assert!(reason_codes.contains("provider.transcript.tool_input_truncated"));
+        assert!(reason_codes.contains("provider.transcript.byte_limit_applied"));
     }
 
     #[test]
