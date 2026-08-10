@@ -9,6 +9,7 @@ use palyra_workerd::{
         ComputerUseAction, ComputerUseActionRequest, ComputerUseBackendKind,
         ComputerUseCapabilityProfile, ComputerUseTaskContract, ComputerUseWorkerOutput,
     },
+    remote_protocol::RemoteWorkerProtocolV1,
     transport_adapters::{CanonicalWorkerStdioAdapter, DesktopNodeBindingV2},
     WorkerArtifactTransport, WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolKind,
     WorkerRemoteToolRequestEnvelope, WorkerRemoteWorkspaceEntry, WorkerRemoteWorkspaceEntryKind,
