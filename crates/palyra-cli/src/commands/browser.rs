@@ -881,7 +881,13 @@ fn configure_browser_setup(
 
     let existing_state_key_ref =
         document_string(Some(&document), "tool_call.browser_service.state_key_vault_ref");
-    let should_write_state_key = force || existing_state_key_ref.is_none();
+    let existing_state_key_secret_ref =
+        document_value_present(Some(&document), "tool_call.browser_service.state_key_secret_ref");
+    let should_write_state_key = should_write_browser_setup_state_key(
+        force,
+        existing_state_key_ref.as_deref(),
+        existing_state_key_secret_ref,
+    );
     let state_key_vault_ref = if should_write_state_key {
         let state_key = generate_browser_state_key()?;
         validate_browserd_state_encryption_key(state_key.as_str(), "generated browser state key")?;
@@ -900,7 +906,7 @@ fn configure_browser_setup(
         )?;
         vault_ref
     } else {
-        existing_state_key_ref.unwrap_or_else(|| "global/browser_state_key".to_owned())
+        existing_state_key_ref.unwrap_or_else(|| "configured-via-secret-ref".to_owned())
     };
 
     let allowed_tools_added = ensure_browser_gateway_tools_allowed(&mut document)?;
@@ -935,6 +941,14 @@ fn should_write_browser_setup_auth_token(
     existing_auth_token_secret_ref: bool,
 ) -> bool {
     force || explicit_token || (existing_auth_token.is_none() && !existing_auth_token_secret_ref)
+}
+
+fn should_write_browser_setup_state_key(
+    force: bool,
+    existing_state_key_vault_ref: Option<&str>,
+    existing_state_key_secret_ref: bool,
+) -> bool {
+    force || (existing_state_key_vault_ref.is_none() && !existing_state_key_secret_ref)
 }
 
 /// Applies the non-interactive `browser setup` defaults to the config at `path`.
@@ -5234,8 +5248,9 @@ mod tests {
         ensure_browser_gateway_auth_token_alignment, ensure_browser_service_enabled,
         ensure_browser_start_preflight, ensure_browser_value_success, format_browser_console_text,
         format_browser_session_summary_text, normalize_session_scoped_output,
-        redact_browser_output_value, session_summary_value, BrowserControlPlaneSnapshot,
-        BrowserOutputMode, BrowserPolicySnapshot, BrowserResolvedConfig, BrowserServiceConnection,
+        redact_browser_output_value, session_summary_value, should_write_browser_setup_auth_token,
+        should_write_browser_setup_state_key, BrowserControlPlaneSnapshot, BrowserOutputMode,
+        BrowserPolicySnapshot, BrowserResolvedConfig, BrowserServiceConnection,
         BrowserServiceMetadata,
     };
     use crate::{args::BrowserCommand, browser_v1, common_v1};
@@ -5365,6 +5380,14 @@ mod tests {
                 "browser setup/status allowlist should include registered agent tool {expected}"
             );
         }
+    }
+
+    #[test]
+    fn browser_setup_preserves_structured_secret_references_without_force() {
+        assert!(!should_write_browser_setup_auth_token(false, false, None, true));
+        assert!(!should_write_browser_setup_state_key(false, None, true));
+        assert!(should_write_browser_setup_auth_token(true, false, None, true));
+        assert!(should_write_browser_setup_state_key(true, None, true));
     }
 
     #[test]

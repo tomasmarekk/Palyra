@@ -1029,12 +1029,10 @@ fn browser_prerequisites_status(document: &toml::Value) -> (bool, String) {
     let enabled = get_bool_at_path(document, "tool_call.browser_service.enabled").unwrap_or(false);
     let auth_configured = get_string_at_path(document, "tool_call.browser_service.auth_token")
         .is_some()
-        || get_string_at_path(document, "tool_call.browser_service.auth_token_secret_ref")
-            .is_some();
+        || value_present_at_path(document, "tool_call.browser_service.auth_token_secret_ref");
     let state_key_configured =
         get_string_at_path(document, "tool_call.browser_service.state_key_vault_ref").is_some()
-            || get_string_at_path(document, "tool_call.browser_service.state_key_secret_ref")
-                .is_some();
+            || value_present_at_path(document, "tool_call.browser_service.state_key_secret_ref");
 
     if enabled && auth_configured && state_key_configured {
         return (
@@ -1061,6 +1059,10 @@ fn browser_prerequisites_status(document: &toml::Value) -> (bool, String) {
             missing.join(", ")
         ),
     )
+}
+
+fn value_present_at_path(document: &toml::Value, key: &str) -> bool {
+    get_value_at_path(document, key).ok().flatten().is_some()
 }
 
 /// Probes browserd reachability: an authenticated gRPC call when the token is inline
@@ -1527,12 +1529,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        browser_runtime_status, build_onboarding_counts, build_onboarding_steps,
-        cli_contract_descriptor, collect_onboarding_signals, default_agent_create_command,
-        default_agent_status_from_agent_ids, derive_posture_status, diagnostic_endpoint_url,
-        load_onboarding_document, onboarding_prerequisites_ready, onboarding_status_summary_line,
-        powershell_invocation_script, quote_cli_arg, recommended_onboarding_step_id,
-        record_cli_first_success, tcp_url_reachable, OnboardingSignals, OnboardingVariant,
+        browser_prerequisites_status, browser_runtime_status, build_onboarding_counts,
+        build_onboarding_steps, cli_contract_descriptor, collect_onboarding_signals,
+        default_agent_create_command, default_agent_status_from_agent_ids, derive_posture_status,
+        diagnostic_endpoint_url, load_onboarding_document, onboarding_prerequisites_ready,
+        onboarding_status_summary_line, powershell_invocation_script, quote_cli_arg,
+        recommended_onboarding_step_id, record_cli_first_success, tcp_url_reachable,
+        OnboardingSignals, OnboardingVariant,
     };
     use crate::{app, args::RootOptions};
 
@@ -1942,6 +1945,30 @@ auth_token = "browser-token"
 
         assert!(!reachable);
         assert!(message.contains("failed authenticated readiness probe"));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_prerequisites_accept_structured_secret_references() -> Result<()> {
+        let document: toml::Value = toml::from_str(
+            r#"
+[tool_call.browser_service]
+enabled = true
+
+[tool_call.browser_service.auth_token_secret_ref]
+kind = "env"
+variable = "PALYRA_BROWSER_SERVICE_AUTH_TOKEN"
+
+[tool_call.browser_service.state_key_secret_ref]
+kind = "file"
+path = "secrets/browserd.key"
+trusted_dirs = ["secrets"]
+"#,
+        )?;
+
+        let (configured, message) = browser_prerequisites_status(&document);
+
+        assert!(configured, "{message}");
         Ok(())
     }
 
