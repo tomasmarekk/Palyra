@@ -4598,11 +4598,9 @@ export class ConsoleApiClient {
   }
 
   async getUsageInsights(params?: URLSearchParams): Promise<UsageInsightsEnvelope> {
-    return this.request(
-      buildPathWithQuery("/console/v1/usage/insights", params),
-      undefined,
-      { csrf: true },
-    );
+    return this.request(buildPathWithQuery("/console/v1/usage/insights", params), undefined, {
+      csrf: true,
+    });
   }
 
   async requestUsageBudgetOverride(
