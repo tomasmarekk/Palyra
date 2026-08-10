@@ -675,8 +675,14 @@ fn workspace_patch_policy_hooks(patch: &str) -> Vec<&'static str> {
 // unified diffs. Capped at 16 paths: the approval prompt needs the blast
 // radius, not an exhaustive listing of an attacker-sized patch.
 fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
-    const PATH_PREFIXES: &[&str] =
-        &["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
+    const PATH_PREFIXES: &[&str] = &[
+        "*** Add File: ",
+        "*** Replace File: ",
+        "*** Replace Line: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
     let mut paths = Vec::new();
     let lines = patch.lines().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -1514,5 +1520,27 @@ mod tests {
             hooks.iter().any(|hook| hook.as_str() == Some("config")),
             "toml files should trigger config policy hook"
         );
+    }
+
+    #[test]
+    fn workspace_patch_approval_extracts_replace_operation_paths() {
+        let safety = workspace_patch_approval_context(
+            br#"{"patch":"*** Begin Patch\n*** Replace File: config/runtime.toml\n+api_url = \"https://example.test\"\n*** Replace Line: docs/guide.md\n-old\n+new\n*** End Patch\n"}"#,
+        );
+        let paths = safety
+            .get("paths")
+            .and_then(Value::as_array)
+            .expect("workspace safety context should include paths");
+
+        assert_eq!(
+            paths.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            vec!["config/runtime.toml", "docs/guide.md"]
+        );
+        let hooks = safety
+            .get("policy_hooks")
+            .and_then(Value::as_array)
+            .expect("workspace safety context should include hooks");
+        assert!(hooks.iter().any(|hook| hook.as_str() == Some("config")));
+        assert!(hooks.iter().any(|hook| hook.as_str() == Some("docs")));
     }
 }
