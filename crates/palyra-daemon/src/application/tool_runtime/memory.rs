@@ -37,12 +37,12 @@ use crate::{
     application::{
         memory::{
             classify_memory_write, enforce_memory_item_delete_scope, enforce_memory_item_scope,
-            lifecycle_tags, normalize_lifecycle_content, redact_memory_text_for_output,
-            reflect_memory_candidates, ttl_unix_ms_from_input, MemoryLifecycleProvider,
-            MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest, MemoryLifecycleScope,
-            MemoryLifecycleStatus, MemoryReflectionCategory, MemoryReflectionOutcome,
-            MemoryReflectionRequest, MemoryWriteApprovalState, MemoryWriteCategory,
-            MemoryWriteClassificationInput, MEMORY_CONTEXT_FENCE_VERSION,
+            lifecycle_item_write_category, lifecycle_tags, normalize_lifecycle_content,
+            redact_memory_text_for_output, reflect_memory_candidates, ttl_unix_ms_from_input,
+            MemoryLifecycleProvider, MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest,
+            MemoryLifecycleScope, MemoryLifecycleStatus, MemoryReflectionCategory,
+            MemoryReflectionOutcome, MemoryReflectionRequest, MemoryWriteApprovalState,
+            MemoryWriteCategory, MemoryWriteClassificationInput, MEMORY_CONTEXT_FENCE_VERSION,
             MEMORY_TRUST_LABEL_RETRIEVED,
         },
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
@@ -2072,7 +2072,7 @@ pub(crate) async fn execute_memory_replace_tool(
             .unwrap_or_else(|| context.session_id.to_owned()),
         scope,
         content_text: content_text.clone(),
-        category_hint: memory_write_category_from_lifecycle_tags(existing_item.tags.as_slice()),
+        category_hint: Some(lifecycle_item_write_category(&existing_item)),
         confidence: effective_confidence,
         ttl_unix_ms,
         provenance: provenance.clone(),
@@ -2185,12 +2185,6 @@ fn memory_item_lifecycle_scope(item: &MemoryItemRecord) -> MemoryLifecycleScope 
     } else {
         MemoryLifecycleScope::Principal
     }
-}
-
-fn memory_write_category_from_lifecycle_tags(tags: &[String]) -> Option<MemoryWriteCategory> {
-    tags.iter()
-        .find_map(|tag| tag.strip_prefix("memory_write:"))
-        .and_then(MemoryWriteCategory::parse)
 }
 
 fn replace_tool_provenance(

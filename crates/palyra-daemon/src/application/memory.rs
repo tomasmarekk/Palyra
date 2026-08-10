@@ -473,7 +473,6 @@ async fn retain_memory_candidate(
     mut request: MemoryLifecycleRetainRequest,
 ) -> Result<MemoryLifecycleRetainOutcome, Status> {
     request.content_text = normalize_lifecycle_content(request.content_text.as_str());
-    request.tags = lifecycle_tags(request.tags.as_slice(), request.scope);
     let confidence = request.confidence.unwrap_or(0.75);
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
         return Err(Status::invalid_argument(
@@ -500,23 +499,19 @@ async fn retain_memory_candidate(
         session_id: request.session_id.clone(),
         scope: request.scope,
         content_text: request.content_text.clone(),
-        category_hint: request
-            .category_hint
-            .or_else(|| memory_write_category_from_tags(request.tags.as_slice())),
+        category_hint: request.category_hint,
         confidence,
         ttl_unix_ms: request.ttl_unix_ms,
         provenance: request.provenance.clone(),
         now_unix_ms: current_unix_ms_status()?,
     });
     request.ttl_unix_ms = classification.ttl_unix_ms;
-    // The memory_write:<category> tag is the durable category marker that
-    // lifecycle_item_write_category reads back during later dedupe scans.
-    request.tags.push(format!("memory_write:{}", classification.category.as_str()));
-    request
-        .tags
-        .push(format!("source_hash:{}", classification.source_hash.get(..16).unwrap_or("short")));
-    // Re-normalize after appending classification tags (dedupe + tag cap).
-    request.tags = lifecycle_tags(request.tags.as_slice(), request.scope);
+    request.tags = lifecycle_write_tags(
+        request.tags.as_slice(),
+        request.scope,
+        classification.category,
+        classification.source_hash.as_str(),
+    );
     request.provenance = memory_write_provenance(request.provenance, &classification);
 
     if classification.approval_state == MemoryWriteApprovalState::Required
@@ -560,12 +555,28 @@ async fn retain_memory_candidate(
             && classification.category == MemoryWriteCategory::Correction;
         let updates_preference_content = replacement_content.is_some()
             && classification.category == MemoryWriteCategory::Preference;
+        let durable_category = if replacement_content.is_some() {
+            classification.category
+        } else {
+            lifecycle_item_write_category(&duplicate.item)
+        };
         // A correction supersedes the old value, so its tags replace the
         // existing ones; plain merges keep the union of both tag sets.
         let tags = if replaces_with_correction {
-            normalize_lifecycle_tags(request.tags.as_slice())
+            lifecycle_write_tags(
+                request.tags.as_slice(),
+                request.scope,
+                durable_category,
+                classification.source_hash.as_str(),
+            )
         } else {
-            merge_memory_tags(duplicate.item.tags.as_slice(), request.tags.as_slice())
+            merge_memory_tags(
+                duplicate.item.tags.as_slice(),
+                request.tags.as_slice(),
+                request.scope,
+                durable_category,
+                classification.source_hash.as_str(),
+            )
         };
         let updated = runtime_state
             .update_memory_item_lifecycle(MemoryItemLifecycleUpdateRequest {
@@ -941,10 +952,13 @@ fn lifecycle_conflict_overlap_count(candidate_content: &str, existing_content: &
 }
 
 /// Reads the durable category marker written at retain time; untagged
-/// (legacy) items default to `Fact`.
-fn lifecycle_item_write_category(item: &MemoryItemRecord) -> MemoryWriteCategory {
+/// (legacy) items default to `Fact`. Historical writers appended the
+/// authoritative marker after caller tags, so reverse traversal also
+/// recovers records that contain an older forged prefix marker.
+pub(crate) fn lifecycle_item_write_category(item: &MemoryItemRecord) -> MemoryWriteCategory {
     item.tags
         .iter()
+        .rev()
         .find_map(|tag| tag.strip_prefix("memory_write:"))
         .and_then(MemoryWriteCategory::from_tag_value)
         .unwrap_or(MemoryWriteCategory::Fact)
@@ -981,12 +995,6 @@ fn lifecycle_near_duplicate_texts_compatible(
     }
 
     intersection_count * 100 >= smaller_count * 75 && intersection_count * 100 >= larger_count * 60
-}
-
-fn memory_write_category_from_tags(tags: &[String]) -> Option<MemoryWriteCategory> {
-    tags.iter()
-        .find_map(|tag| tag.strip_prefix("memory_write:"))
-        .and_then(MemoryWriteCategory::from_tag_value)
 }
 
 fn lifecycle_replacement_terms_reference_existing_value(
@@ -1723,6 +1731,28 @@ pub(crate) fn lifecycle_tags(raw: &[String], scope: MemoryLifecycleScope) -> Vec
     normalize_lifecycle_tags(tags.as_slice())
 }
 
+/// Adds host-owned classification metadata ahead of caller tags so the tag
+/// cap cannot discard it. Caller values in either reserved namespace are
+/// removed before the canonical markers are written.
+fn lifecycle_write_tags(
+    raw: &[String],
+    scope: MemoryLifecycleScope,
+    category: MemoryWriteCategory,
+    source_hash: &str,
+) -> Vec<String> {
+    let mut tags = vec![
+        format!("memory_write:{}", category.as_str()),
+        format!("source_hash:{}", source_hash.get(..16).unwrap_or("short")),
+    ];
+    tags.extend(raw.iter().filter(|tag| !is_reserved_lifecycle_metadata_tag(tag)).cloned());
+    lifecycle_tags(tags.as_slice(), scope)
+}
+
+fn is_reserved_lifecycle_metadata_tag(tag: &str) -> bool {
+    let normalized = tag.trim().to_ascii_lowercase();
+    normalized.starts_with("memory_write:") || normalized.starts_with("source_hash:")
+}
+
 /// Lowercases, restricts to a safe tag charset, deduplicates preserving
 /// first occurrence, and caps at [`MAX_MEMORY_TOOL_TAGS`].
 fn normalize_lifecycle_tags(raw: &[String]) -> Vec<String> {
@@ -1747,10 +1777,16 @@ fn normalize_lifecycle_tags(raw: &[String]) -> Vec<String> {
     normalized
 }
 
-fn merge_memory_tags(existing: &[String], requested: &[String]) -> Vec<String> {
+fn merge_memory_tags(
+    existing: &[String],
+    requested: &[String],
+    scope: MemoryLifecycleScope,
+    category: MemoryWriteCategory,
+    source_hash: &str,
+) -> Vec<String> {
     let mut merged = existing.to_vec();
     merged.extend(requested.iter().cloned());
-    normalize_lifecycle_tags(merged.as_slice())
+    lifecycle_write_tags(merged.as_slice(), scope, category, source_hash)
 }
 
 /// Resolves a caller-provided TTL into an absolute expiry timestamp.
@@ -2111,6 +2147,38 @@ mod tests {
             MemoryWriteCategory::Preference,
             &item
         ));
+    }
+
+    #[test]
+    fn lifecycle_write_tags_replace_reserved_caller_metadata_before_the_tag_cap() {
+        let mut raw = vec!["memory_write:preference".to_owned(), "source_hash:forged".to_owned()];
+        raw.extend((0..MAX_MEMORY_TOOL_TAGS).map(|index| format!("caller:{index}")));
+
+        let tags = lifecycle_write_tags(
+            raw.as_slice(),
+            MemoryLifecycleScope::Principal,
+            MemoryWriteCategory::Fact,
+            "0123456789abcdef0123456789abcdef",
+        );
+
+        assert!(tags.iter().any(|tag| tag == "memory_write:fact"));
+        assert!(tags.iter().any(|tag| tag == "source_hash:0123456789abcdef"));
+        assert!(!tags.iter().any(|tag| tag == "memory_write:preference"));
+        assert!(!tags.iter().any(|tag| tag == "source_hash:forged"));
+        assert!(tags.len() <= MAX_MEMORY_TOOL_TAGS);
+    }
+
+    #[test]
+    fn lifecycle_category_recovers_the_last_historical_authoritative_marker() {
+        let mut item = lifecycle_test_memory_item(
+            "01ARZ3NDEKTSV4RRFFQ69G5W07",
+            None,
+            None,
+            "Project status note: release validation is pending.",
+        );
+        item.tags = vec!["memory_write:preference".to_owned(), "memory_write:fact".to_owned()];
+
+        assert_eq!(lifecycle_item_write_category(&item), MemoryWriteCategory::Fact);
     }
 
     #[test]
