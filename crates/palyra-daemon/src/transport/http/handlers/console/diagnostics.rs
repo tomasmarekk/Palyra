@@ -5021,6 +5021,13 @@ pub(crate) fn create_doctor_job(
     context: &gateway::RequestContext,
     payload: control_plane::DoctorRecoveryCreateRequest,
 ) -> Result<control_plane::DoctorRecoveryJob, Response> {
+    if let Some(run_id) = payload.rollback_run.as_deref().filter(|value| !value.is_empty()) {
+        if !is_canonical_doctor_recovery_run_id(run_id) {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "rollback_run must be a canonical ULID",
+            )));
+        }
+    }
     let idempotency_key_digest = payload
         .idempotency_key
         .as_deref()
@@ -5177,6 +5184,10 @@ fn doctor_job_is_terminal(job: &control_plane::DoctorRecoveryJob) -> bool {
         control_plane::DoctorRecoveryJobState::Succeeded
             | control_plane::DoctorRecoveryJobState::Failed
     )
+}
+
+fn is_canonical_doctor_recovery_run_id(run_id: &str) -> bool {
+    Ulid::from_string(run_id).is_ok_and(|parsed| parsed.to_string() == run_id)
 }
 
 /// Builds the doctor CLI argv from the typed request; only known flags are
@@ -6760,6 +6771,16 @@ mod doctor_job_security_tests {
         assert!(digest.starts_with("sha256:"));
         assert_eq!(digest.len(), "sha256:".len() + 64);
         assert_eq!(digest, doctor_idempotency_key_digest(raw_key));
+    }
+
+    #[test]
+    fn doctor_rollback_run_id_accepts_only_canonical_ulids() {
+        let run_id = Ulid::new().to_string();
+
+        assert!(is_canonical_doctor_recovery_run_id(run_id.as_str()));
+        assert!(!is_canonical_doctor_recovery_run_id(run_id.to_ascii_lowercase().as_str()));
+        assert!(!is_canonical_doctor_recovery_run_id("../recovery/run"));
+        assert!(!is_canonical_doctor_recovery_run_id("C:\\temp\\run"));
     }
 
     #[test]

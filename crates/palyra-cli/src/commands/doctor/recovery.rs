@@ -497,12 +497,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     };
 
     let mode = if let Some(run_id) = request.rollback_run.as_deref() {
-        let rollback = execute_rollback(
-            environment.state_root.as_path(),
-            run_id,
-            request.force,
-            request.dry_run,
-        )?;
+        let rollback = execute_rollback(&environment, run_id, request.force, request.dry_run)?;
         recovery.applied_steps = rollback.applied_steps;
         recovery.backup_manifest_path = rollback.manifest_path;
         recovery.next_steps = rollback.next_steps;
@@ -2020,6 +2015,12 @@ struct DoctorRollbackResult {
     next_steps: Vec<String>,
 }
 
+struct ValidatedDoctorRollbackEntry {
+    entry: DoctorRecoveryManifestEntry,
+    target: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
 fn apply_repair_plans(
     environment: &DoctorEnvironment,
     plans: &[DoctorRepairPlan],
@@ -2438,29 +2439,53 @@ fn applied_step_ok(plan: &DoctorRepairPlan, message: String) -> DoctorAppliedSte
 }
 
 fn execute_rollback(
-    state_root: &Path,
+    environment: &DoctorEnvironment,
     run_id: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<DoctorRollbackResult> {
-    let manifest_path = state_root
-        .join(DOCTOR_RECOVERY_RUNS_RELATIVE_DIR)
-        .join(run_id)
-        .join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME);
+    let run_id = canonical_doctor_recovery_run_id(run_id)?;
+    let runs_root =
+        fs::canonicalize(environment.state_root.join(DOCTOR_RECOVERY_RUNS_RELATIVE_DIR))
+            .context("failed to resolve doctor recovery runs directory")?;
+    let run_dir = fs::canonicalize(runs_root.join(run_id.as_str()))
+        .with_context(|| format!("failed to resolve doctor recovery run {run_id}"))?;
+    if run_dir.parent() != Some(runs_root.as_path()) {
+        anyhow::bail!("doctor recovery run directory escaped the recovery runs root");
+    }
+    let manifest_path = fs::canonicalize(run_dir.join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME))
+        .with_context(|| format!("failed to resolve doctor recovery manifest for run {run_id}"))?;
+    if manifest_path.parent() != Some(run_dir.as_path()) {
+        anyhow::bail!("doctor recovery manifest escaped its recovery run directory");
+    }
     let raw = fs::read_to_string(manifest_path.as_path())
         .with_context(|| format!("failed to read recovery manifest {}", manifest_path.display()))?;
     let manifest =
         serde_json::from_str::<DoctorRecoveryManifest>(raw.as_str()).with_context(|| {
             format!("failed to parse recovery manifest {}", manifest_path.display())
         })?;
+    validate_doctor_recovery_manifest_identity(&manifest, environment, run_id.as_str())?;
+    let entries = manifest
+        .entries
+        .into_iter()
+        .map(|entry| {
+            validate_doctor_rollback_entry(
+                entry,
+                environment,
+                runs_root.as_path(),
+                run_dir.as_path(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut applied_steps = Vec::new();
     if dry_run {
-        for entry in manifest.entries {
+        for validated in entries {
+            let entry = validated.entry;
             applied_steps.push(DoctorAppliedStep {
                 id: format!("rollback:{}", entry.step_id),
                 outcome: "planned".to_owned(),
-                message: format!("Would restore '{}'.", entry.target_path),
-                changed_objects: vec![entry.target_path],
+                message: format!("Would restore '{}'.", display_path(validated.target.as_path())),
+                changed_objects: vec![display_path(validated.target.as_path())],
                 warnings: Vec::new(),
             });
         }
@@ -2471,8 +2496,9 @@ fn execute_rollback(
         });
     }
 
-    for entry in manifest.entries {
-        let target = PathBuf::from(entry.target_path.as_str());
+    for validated in entries {
+        let entry = validated.entry;
+        let target = validated.target;
         let current_hash = if target.exists() { Some(hash_file(target.as_path())?) } else { None };
         if !force && current_hash != entry.after_sha256 {
             applied_steps.push(DoctorAppliedStep {
@@ -2498,17 +2524,17 @@ fn execute_rollback(
                     })?;
                 }
             }
-            _ => {
-                let backup_path = entry
+            "modified" => {
+                let backup_path = validated
                     .backup_path
-                    .as_deref()
-                    .map(PathBuf::from)
                     .ok_or_else(|| anyhow::anyhow!("rollback entry missing backup_path"))?;
                 let bytes = fs::read(backup_path.as_path()).with_context(|| {
                     format!("failed to read rollback backup {}", backup_path.display())
                 })?;
                 write_bytes_atomic(target.as_path(), bytes.as_slice(), entry.secret_aware)?;
             }
+            "noop" => {}
+            _ => unreachable!("rollback change type was validated before applying entries"),
         }
         applied_steps.push(DoctorAppliedStep {
             id: format!("rollback:{}", entry.step_id),
@@ -2523,6 +2549,133 @@ fn execute_rollback(
         manifest_path: Some(display_path(manifest_path.as_path())),
         next_steps: vec!["palyra doctor --repair --dry-run --json".to_owned()],
     })
+}
+
+fn canonical_doctor_recovery_run_id(run_id: &str) -> Result<String> {
+    let parsed =
+        Ulid::from_string(run_id).context("doctor rollback run ID must be a canonical ULID")?;
+    let canonical = parsed.to_string();
+    if run_id != canonical {
+        anyhow::bail!("doctor rollback run ID must be a canonical ULID");
+    }
+    Ok(canonical)
+}
+
+fn validate_doctor_recovery_manifest_identity(
+    manifest: &DoctorRecoveryManifest,
+    environment: &DoctorEnvironment,
+    run_id: &str,
+) -> Result<()> {
+    if manifest.schema_version != DOCTOR_RECOVERY_MANIFEST_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported doctor recovery manifest schema version {}",
+            manifest.schema_version
+        );
+    }
+    if manifest.run_id != run_id {
+        anyhow::bail!("doctor recovery manifest run ID does not match the requested run");
+    }
+
+    let current_state_root =
+        resolve_doctor_boundary_path(environment.state_root.as_path(), "state root")?;
+    let manifest_state_root = resolve_doctor_boundary_path(
+        Path::new(manifest.state_root.as_str()),
+        "manifest state root",
+    )?;
+    if manifest_state_root != current_state_root {
+        anyhow::bail!("doctor recovery manifest belongs to a different state root");
+    }
+
+    match (manifest.config_path.as_deref(), environment.config_path.as_deref()) {
+        (None, None) => {}
+        (Some(manifest_path), Some(current_path)) => {
+            let manifest_path =
+                resolve_doctor_boundary_path(Path::new(manifest_path), "manifest config path")?;
+            let current_path = resolve_doctor_boundary_path(current_path, "current config path")?;
+            if manifest_path != current_path {
+                anyhow::bail!("doctor recovery manifest belongs to a different config path");
+            }
+        }
+        _ => {
+            anyhow::bail!("doctor recovery manifest config path no longer matches the environment")
+        }
+    }
+    Ok(())
+}
+
+fn validate_doctor_rollback_entry(
+    entry: DoctorRecoveryManifestEntry,
+    environment: &DoctorEnvironment,
+    runs_root: &Path,
+    run_dir: &Path,
+) -> Result<ValidatedDoctorRollbackEntry> {
+    if !matches!(entry.change_type.as_str(), "created" | "deleted" | "modified" | "noop") {
+        anyhow::bail!("doctor recovery manifest contains an unsupported change type");
+    }
+
+    let target =
+        resolve_doctor_boundary_path(Path::new(entry.target_path.as_str()), "rollback target")?;
+    let state_root = resolve_doctor_boundary_path(environment.state_root.as_path(), "state root")?;
+    let browser_state_root = resolve_browser_state_dir(environment.state_root.as_path())
+        .ok()
+        .and_then(|path| resolve_doctor_boundary_path(path.as_path(), "browser state root").ok());
+    let config_path = environment
+        .config_path
+        .as_deref()
+        .map(|path| resolve_doctor_boundary_path(path, "config path"))
+        .transpose()?;
+    let auth_registry_path = resolve_doctor_boundary_path(
+        resolve_auth_registry_path(environment).as_path(),
+        "auth registry path",
+    )
+    .ok();
+    let target_is_allowed = target.starts_with(state_root.as_path())
+        || browser_state_root.as_ref().is_some_and(|path| target.starts_with(path))
+        || config_path.as_ref().is_some_and(|path| target.as_path() == path.as_path())
+        || auth_registry_path.as_ref().is_some_and(|path| target.as_path() == path.as_path());
+    if !target_is_allowed || target.starts_with(runs_root) {
+        anyhow::bail!("doctor recovery manifest contains a target outside doctor-managed paths");
+    }
+
+    let backup_path = entry
+        .backup_path
+        .as_deref()
+        .map(|path| resolve_doctor_existing_path(Path::new(path), "rollback backup"))
+        .transpose()?;
+    if let Some(backup_path) = backup_path.as_ref() {
+        let backup_root = fs::canonicalize(run_dir.join("backups"))
+            .context("failed to resolve doctor recovery backup directory")?;
+        if backup_path.parent() != Some(backup_root.as_path()) {
+            anyhow::bail!("doctor recovery backup escaped its recovery run directory");
+        }
+    }
+    if entry.change_type == "modified" && backup_path.is_none() {
+        anyhow::bail!("modified rollback entry is missing its recovery backup");
+    }
+
+    Ok(ValidatedDoctorRollbackEntry { entry, target, backup_path })
+}
+
+fn resolve_doctor_existing_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute path");
+    }
+    fs::canonicalize(path).with_context(|| format!("failed to resolve {label} {}", path.display()))
+}
+
+fn resolve_doctor_boundary_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute path");
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        return resolve_doctor_existing_path(path, label);
+    }
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("{label} has no parent directory"))?;
+    let file_name =
+        path.file_name().ok_or_else(|| anyhow::anyhow!("{label} has no final component"))?;
+    let parent = fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve parent for {label} {}", path.display()))?;
+    Ok(parent.join(file_name))
 }
 
 /// Journals every file change of a repair run into a recovery manifest with
@@ -3794,6 +3947,97 @@ remote_base_url = "https://dashboard.example.test/"
         assert!(ids.contains("gateway_access.remote_verification"));
         assert!(ids.contains("node_runtime.normalize"));
         assert!(ids.contains("access_registry.reinitialize"));
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_rejects_noncanonical_run_ids_before_path_resolution() -> Result<()> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root)?;
+        let environment =
+            DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
+
+        let error = execute_rollback(&environment, "../outside", true, true)
+            .err()
+            .expect("path-like run IDs must be rejected");
+
+        assert!(error.to_string().contains("canonical ULID"));
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_rejects_manifest_targets_outside_doctor_managed_paths() -> Result<()> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root)?;
+        let environment =
+            DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
+        let run_id = Ulid::new().to_string();
+        let writer = DoctorRecoveryRunWriter::new(&environment, run_id.as_str())?;
+        let outside_target = temp.path().join("outside.txt");
+        fs::write(&outside_target, b"outside")?;
+        {
+            let mut manifest =
+                writer.manifest.lock().expect("recovery manifest mutex should be available");
+            manifest.entries.push(DoctorRecoveryManifestEntry {
+                step_id: "forged.step".to_owned(),
+                target_path: display_path(outside_target.as_path()),
+                change_type: "created".to_owned(),
+                backup_path: None,
+                before_sha256: None,
+                after_sha256: Some(sha256_hex(b"outside")),
+                secret_aware: false,
+            });
+        }
+        writer.persist()?;
+
+        let error = execute_rollback(&environment, run_id.as_str(), true, true)
+            .err()
+            .expect("out-of-bound rollback targets must be rejected");
+
+        assert!(error.to_string().contains("outside doctor-managed paths"));
+        assert_eq!(fs::read(&outside_target)?, b"outside");
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_rejects_backups_outside_the_selected_run() -> Result<()> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root)?;
+        let environment = DoctorEnvironment {
+            state_root: state_root.clone(),
+            config_path: None,
+            generated_at_unix_ms: 100,
+        };
+        let run_id = Ulid::new().to_string();
+        let writer = DoctorRecoveryRunWriter::new(&environment, run_id.as_str())?;
+        let target = state_root.join("target.txt");
+        let outside_backup = temp.path().join("outside-backup.txt");
+        fs::write(&target, b"after")?;
+        fs::write(&outside_backup, b"before")?;
+        {
+            let mut manifest =
+                writer.manifest.lock().expect("recovery manifest mutex should be available");
+            manifest.entries.push(DoctorRecoveryManifestEntry {
+                step_id: "forged.step".to_owned(),
+                target_path: display_path(target.as_path()),
+                change_type: "modified".to_owned(),
+                backup_path: Some(display_path(outside_backup.as_path())),
+                before_sha256: Some(sha256_hex(b"before")),
+                after_sha256: Some(sha256_hex(b"after")),
+                secret_aware: false,
+            });
+        }
+        writer.persist()?;
+
+        let error = execute_rollback(&environment, run_id.as_str(), true, true)
+            .err()
+            .expect("out-of-bound rollback backups must be rejected");
+
+        assert!(error.to_string().contains("escaped its recovery run directory"));
+        assert_eq!(fs::read(&target)?, b"after");
         Ok(())
     }
 
