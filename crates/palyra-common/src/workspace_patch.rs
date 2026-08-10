@@ -2362,6 +2362,44 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkspacePatchErro
         source,
     })?;
 
+    #[cfg(windows)]
+    if path.exists() {
+        // Replacing a file would replace its security descriptor as well.
+        // In-place writes preserve the target ACL; plan rollback covers write failures.
+        let mut file =
+            fs::OpenOptions::new().write(true).truncate(true).open(path).map_err(|source| {
+                WorkspacePatchError::Io {
+                    operation: "open",
+                    path: path.display().to_string(),
+                    source,
+                }
+            })?;
+        file.write_all(bytes).map_err(|source| WorkspacePatchError::Io {
+            operation: "write",
+            path: path.display().to_string(),
+            source,
+        })?;
+        file.flush().map_err(|source| WorkspacePatchError::Io {
+            operation: "flush",
+            path: path.display().to_string(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    let target_permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(WorkspacePatchError::Io {
+                operation: "metadata",
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+
     let temp_name = format!(".palyra-patch-{}.tmp", unique_suffix());
     let temp_path = parent.join(temp_name);
     let mut file =
@@ -2372,6 +2410,19 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkspacePatchErro
                 source,
             },
         )?;
+
+    #[cfg(unix)]
+    if let Some(permissions) = target_permissions {
+        if let Err(source) = fs::set_permissions(temp_path.as_path(), permissions) {
+            drop(file);
+            let _ = fs::remove_file(temp_path.as_path());
+            return Err(WorkspacePatchError::Io {
+                operation: "set_permissions",
+                path: temp_path.display().to_string(),
+                source,
+            });
+        }
+    }
 
     file.write_all(bytes).map_err(|source| WorkspacePatchError::Io {
         operation: "write",
@@ -2531,6 +2582,34 @@ mod tests {
             fs::read_to_string(workspace.join("notes.txt")).expect("updated file should read"),
             "alpha\nbeta-updated\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_workspace_patch_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let target = workspace.join(".env");
+        fs::write(&target, "TOKEN=old\n").expect("seed file should exist");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("seed permissions should be restricted");
+
+        let patch =
+            "*** Begin Patch\n*** Update File: .env\n@@\n-TOKEN=old\n+TOKEN=new\n*** End Patch\n";
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("patch should apply");
+
+        let mode =
+            fs::metadata(&target).expect("updated file metadata should load").permissions().mode()
+                & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
