@@ -124,7 +124,6 @@ const PROCESS_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
 const PROCESS_STREAM_INLINE_TEXT_BYTES: usize = 8 * 1024;
 const PROCESS_STREAM_HEAD_BYTES: usize = 4 * 1024;
 const PROCESS_STREAM_TAIL_BYTES: usize = 4 * 1024;
-const PROCESS_STREAM_HEX_PREVIEW_BYTES: usize = 64;
 const PROCESS_PROGRESS_MIN_ELAPSED_MS: u64 = 5_000;
 const PROCESS_PROGRESS_INTERVAL_MS: u64 = 2_000;
 const PROCESS_PROGRESS_TAIL_BYTES: usize = 1024;
@@ -2983,10 +2982,9 @@ fn process_progress_tail(stream_name: &str, output: &[u8]) -> String {
     }
     if process_output_looks_binary(output) {
         return format!(
-            "<binary {stream_name} tail omitted: size_bytes={} sha256={} tail_hex={}>",
+            "<binary {stream_name} tail omitted: size_bytes={} sha256={}>",
             output.len(),
-            sha256_hex(output),
-            process_bytes_tail_hex(output)
+            sha256_hex(output)
         );
     }
     let decoded = decode_process_output_text(output);
@@ -3608,8 +3606,6 @@ fn process_stream_output_view(
                 "encoding": null,
                 "decode_replacement_count": 0,
                 "sha256": sha256,
-                "head_hex": process_bytes_head_hex(stream.bytes.as_slice()),
-                "tail_hex": process_bytes_tail_hex(stream.bytes.as_slice()),
             }),
         };
     }
@@ -3946,16 +3942,6 @@ fn osc_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
-}
-
-fn process_bytes_head_hex(bytes: &[u8]) -> String {
-    let end = bytes.len().min(PROCESS_STREAM_HEX_PREVIEW_BYTES);
-    hex::encode(&bytes[..end])
-}
-
-fn process_bytes_tail_hex(bytes: &[u8]) -> String {
-    let start = bytes.len().saturating_sub(PROCESS_STREAM_HEX_PREVIEW_BYTES);
-    hex::encode(&bytes[start..])
 }
 
 fn process_text_prefix(text: &str, max_bytes: usize) -> String {
@@ -19602,9 +19588,10 @@ mod tests {
 
     #[test]
     fn process_success_output_omits_binary_stdout() {
-        let mut binary = b"\x7fELF".to_vec();
+        let mut binary = b"API_KEY=secret-value\x00\x7fELF".to_vec();
         binary.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         binary.extend_from_slice(&[0; 256]);
+        let raw_hex = hex::encode(binary.as_slice());
         let stdout = StreamCapture { bytes: binary, truncated: false, read_error: None };
         let stderr = StreamCapture::default();
 
@@ -19630,13 +19617,21 @@ mod tests {
             parsed.pointer("/streams/stdout/binary_output_omitted").and_then(|v| v.as_bool()),
             Some(true)
         );
-        assert!(
-            parsed
-                .pointer("/streams/stdout/head_hex")
-                .and_then(|v| v.as_str())
-                .is_some_and(|value| value.starts_with("7f454c4600010203040506070809")),
-            "binary summary should expose hex metadata without raw control escapes"
-        );
+        assert!(parsed.pointer("/streams/stdout/head_hex").is_none());
+        assert!(parsed.pointer("/streams/stdout/tail_hex").is_none());
+        assert!(!rendered.contains(raw_hex.as_str()), "{rendered}");
+        assert!(!rendered.contains("7365637265742d76616c7565"), "{rendered}");
+    }
+
+    #[test]
+    fn process_progress_omits_binary_tail_bytes() {
+        let binary = b"API_KEY=secret-value\x00remaining-binary";
+
+        let tail = process_progress_tail("stdout", binary);
+
+        assert!(tail.contains("binary stdout tail omitted"), "{tail}");
+        assert!(!tail.contains("tail_hex"), "{tail}");
+        assert!(!tail.contains("7365637265742d76616c7565"), "{tail}");
     }
 
     #[test]
