@@ -596,6 +596,38 @@ fn verify_hash_chain(
         });
     }
 
+    if matches!(scope, HashVerificationScope::Full) {
+        let first_row = &rows[0];
+        if first_row.seq != 1 {
+            return Ok(hash_mismatch_report(HashMismatchReportInput {
+                scope,
+                checked_events: rows.len(),
+                total_events,
+                row: first_row,
+                code: "journal.hash_chain.missing_genesis",
+                expected_hash: None,
+                found_hash: first_row.hash.clone(),
+                expected_prev_hash: None,
+                found_prev_hash: first_row.prev_hash.clone(),
+                safe_summary: "full journal hash chain does not start at sequence 1",
+            }));
+        }
+        if first_row.prev_hash.is_some() {
+            return Ok(hash_mismatch_report(HashMismatchReportInput {
+                scope,
+                checked_events: rows.len(),
+                total_events,
+                row: first_row,
+                code: "journal.hash_chain.genesis_prev_hash_mismatch",
+                expected_hash: None,
+                found_hash: first_row.hash.clone(),
+                expected_prev_hash: None,
+                found_prev_hash: first_row.prev_hash.clone(),
+                safe_summary: "full journal hash chain genesis row has a previous hash",
+            }));
+        }
+    }
+
     let mut previous_seq = None;
     let mut previous_hash = rows.first().and_then(|row| row.prev_hash.clone());
     for row in &rows {

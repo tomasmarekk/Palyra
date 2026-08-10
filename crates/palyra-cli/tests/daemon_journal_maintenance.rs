@@ -145,7 +145,14 @@ fn palyra_state_verify_hash_chain_supports_json_output() -> Result<()> {
     seed_hash_chained_journal_db(db_path.as_path())?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .args(["state", "verify-hash-chain", "--db-path", &db_path.to_string_lossy(), "--json"])
+        .args([
+            "state",
+            "verify-hash-chain",
+            "--db-path",
+            &db_path.to_string_lossy(),
+            "--full",
+            "--json",
+        ])
         .output()
         .context("failed to execute palyra state verify-hash-chain")?;
 
@@ -158,6 +165,48 @@ fn palyra_state_verify_hash_chain_supports_json_output() -> Result<()> {
     let payload: Value = serde_json::from_str(stdout.as_str()).context("stdout was not JSON")?;
     assert_eq!(payload.get("status").and_then(Value::as_str), Some("ok"));
     assert_eq!(payload.get("checked_events").and_then(Value::as_u64), Some(2));
+    Ok(())
+}
+
+#[test]
+fn palyra_state_full_hash_verification_rejects_deleted_prefix() -> Result<()> {
+    let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
+    let db_path = tempdir.path().join("journal.sqlite3");
+    seed_hash_chained_journal_db(db_path.as_path())?;
+    Connection::open(db_path.as_path())
+        .context("failed to reopen seeded journal database")?
+        .execute("DELETE FROM journal_events WHERE seq = 1", [])
+        .context("failed to delete journal hash-chain prefix")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "state",
+            "verify-hash-chain",
+            "--db-path",
+            &db_path.to_string_lossy(),
+            "--full",
+            "--json",
+        ])
+        .output()
+        .context("failed to execute palyra state verify-hash-chain")?;
+
+    assert!(
+        output.status.success(),
+        "state verify-hash-chain should report the mismatch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
+    let payload: Value = serde_json::from_str(stdout.as_str()).context("stdout was not JSON")?;
+    assert_eq!(payload.get("scope").and_then(Value::as_str), Some("full"));
+    assert_eq!(payload.get("status").and_then(Value::as_str), Some("mismatch"));
+    assert_eq!(
+        payload.get("mismatch").and_then(|mismatch| mismatch.get("code")).and_then(Value::as_str),
+        Some("journal.hash_chain.missing_genesis")
+    );
+    assert_eq!(
+        payload.get("mismatch").and_then(|mismatch| mismatch.get("seq")).and_then(Value::as_i64),
+        Some(2)
+    );
     Ok(())
 }
 
