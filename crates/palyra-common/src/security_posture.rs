@@ -1019,7 +1019,7 @@ fn redact_stack_trace_lines(text: &str) -> String {
 }
 
 fn redact_provider_error_lines(text: &str) -> String {
-    redact_matching_lines(
+    redact_from_matching_line(
         text,
         |line| {
             let lowered = line.to_ascii_lowercase();
@@ -1032,7 +1032,7 @@ fn redact_provider_error_lines(text: &str) -> String {
 }
 
 fn redact_stderr_lines(text: &str) -> String {
-    redact_matching_lines(
+    redact_from_matching_line(
         text,
         |line| {
             let lowered = line.trim_start().to_ascii_lowercase();
@@ -1040,6 +1040,24 @@ fn redact_stderr_lines(text: &str) -> String {
         },
         STDERR_REDACTION,
     )
+}
+
+fn redact_from_matching_line(
+    text: &str,
+    matches_line: impl Fn(&str) -> bool,
+    replacement: &str,
+) -> String {
+    let mut retained = Vec::new();
+    for line in text.lines() {
+        if matches_line(line) {
+            // Provider bodies and stderr have no trusted terminator, so the
+            // complete suffix must be treated as part of the untrusted block.
+            retained.push(replacement);
+            return retained.join("\n");
+        }
+        retained.push(line);
+    }
+    text.to_owned()
 }
 
 fn redact_matching_lines(
@@ -1403,9 +1421,40 @@ mod tests {
         assert!(!report.sanitized_text.contains("run_0123456789abcdef"));
         assert!(!report.sanitized_text.contains("policy/denied"));
         assert!(report.sanitized_text.contains(PROVIDER_ERROR_REDACTION));
-        assert!(report.sanitized_text.contains(STDERR_REDACTION));
-        assert!(report.audit_event.reason_codes.contains(&"file_paths_removed".to_owned()));
+        assert!(report
+            .audit_event
+            .reason_codes
+            .contains(&"provider_error_body_removed".to_owned()));
         assert_eq!(report.audit_event.event_type, OUTBOUND_SANITIZED_EVENT_TYPE);
+    }
+
+    #[test]
+    fn outbound_sanitizer_removes_complete_multiline_provider_and_stderr_blocks() {
+        for (label, body, replacement, reason) in [
+            (
+                "provider body:",
+                "upstream customer payload\n\nsecond secret paragraph",
+                PROVIDER_ERROR_REDACTION,
+                "provider_error_body_removed",
+            ),
+            (
+                "stderr:",
+                "first raw process line\n\nsecond raw process paragraph",
+                STDERR_REDACTION,
+                "tool_stderr_removed",
+            ),
+        ] {
+            let message = OutboundMessage {
+                surface: SurfaceKind::DiscordHumanChannel,
+                text: format!("safe prefix\n{label}\n{body}"),
+            };
+
+            let report = sanitize_outbound_message(&message);
+
+            assert_eq!(report.sanitized_text, format!("safe prefix\n{replacement}"));
+            assert!(!report.sanitized_text.contains(body));
+            assert!(report.audit_event.reason_codes.contains(&reason.to_owned()));
+        }
     }
 
     #[test]
