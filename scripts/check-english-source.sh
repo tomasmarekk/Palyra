@@ -6,7 +6,8 @@ cd "$ROOT_DIR"
 
 source_roots=(.github apps crates fixtures fuzz infra schemas scripts)
 
-if ! git ls-files -- "${source_roots[@]}" | grep -q .; then
+tracked_source_files="$(git ls-files -- "${source_roots[@]}")"
+if [[ -z "$tracked_source_files" ]]; then
   echo "English source scan skipped; no tracked source files found."
   exit 0
 fi
