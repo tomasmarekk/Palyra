@@ -644,7 +644,7 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
         return false;
     }
     if strictness == RedactionStrictness::Heuristic
-        && is_sensitive_key_name_reference(sensitive_key, value)
+        && is_public_e2e_key_name_reference(sensitive_key, value)
     {
         return false;
     }
@@ -660,35 +660,10 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     true
 }
 
-fn is_sensitive_key_name_reference(key: &str, value: &str) -> bool {
-    let normalized_key = normalize_key(key);
-    if !normalized_key.ends_with("_name") {
-        return false;
-    }
-
-    let normalized_value =
-        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
-    if normalized_value.is_empty() || normalized_value.len() > 128 {
-        return false;
-    }
-    let lowered = normalized_value.to_ascii_lowercase();
-    if lowered.starts_with("http://")
-        || lowered.starts_with("https://")
-        || lowered.starts_with("bearer ")
-        || lowered.starts_with("sk-")
-        || lowered.starts_with("ghp_")
-        || lowered.starts_with("github_pat_")
-        || lowered.starts_with("xox")
-        || normalized_value.contains('/')
-        || normalized_value.contains('\\')
-    {
-        return false;
-    }
-
-    normalized_value.chars().any(|ch| ch.is_ascii_alphabetic())
-        && normalized_value.chars().all(|ch| {
-            ch.is_ascii_uppercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.')
-        })
+fn is_public_e2e_key_name_reference(key: &str, value: &str) -> bool {
+    normalize_key(key) == "api_key_name"
+        && value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`'])
+            == "PALYRA_E2E_API_KEY"
 }
 
 fn assignment_key_is_sensitive(key: &str) -> bool {
@@ -1143,6 +1118,18 @@ mod tests {
         let strict = redact_diagnostic_text(source);
         assert!(strict.contains(r#"api_key_name = "<redacted>""#), "{strict}");
         assert!(!strict.contains("PALYRA_E2E_API_KEY"), "{strict}");
+    }
+
+    #[test]
+    fn auth_error_redacts_secret_shaped_sensitive_key_names() {
+        let redacted = redact_auth_error(
+            "secret_name=DEADBEEFDEADBEEFDEADBEEFDEADBEEF api_key_name=JBSWY3DPEHPK3PXP",
+        );
+
+        assert!(redacted.contains("secret_name=<redacted>"), "{redacted}");
+        assert!(redacted.contains("api_key_name=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("DEADBEEF"), "{redacted}");
+        assert!(!redacted.contains("JBSWY3DPEHPK3PXP"), "{redacted}");
     }
 
     #[test]
