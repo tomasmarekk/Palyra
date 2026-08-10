@@ -1458,6 +1458,62 @@ fn provider_request_hash_tracks_transformed_schema_payload() {
     assert_ne!(request_hash, stable_hash_value(&mutated_payload));
 }
 
+#[test]
+fn runtime_intake_enforces_transformed_composition_schema() {
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "allOf": [{
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["safe"]}
+            },
+            "required": ["mode"],
+            "additionalProperties": false
+        }]
+    });
+    let tool_name = "palyra.test.composed_schema";
+    let config = config(&[tool_name]);
+    let snapshot = super::build_model_visible_tool_catalog_snapshot_with_external_tools(
+        ToolCatalogBuildRequest {
+            config: &config,
+            catalog_policy: &catalog_policy(&config),
+            browser_service_enabled: false,
+            browser_service_configured: false,
+            request_context: &request_context(),
+            provider_kind: "openai_compatible",
+            provider_model_id: Some("gpt-test"),
+            surface: ToolExposureSurface::RunStream,
+            remaining_tool_budget: None,
+            created_at_unix_ms: 42,
+        },
+        &[schema_transform_test_tool(tool_name, input_schema)],
+    );
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .expect("composed schema tool should be visible");
+
+    assert_eq!(tool.schema, tool.provider_schema);
+    assert!(tool.schema.get("allOf").is_none());
+    assert_eq!(tool.schema["additionalProperties"], serde_json::Value::Bool(false));
+
+    let rejection = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        tool_name,
+        br#"{"mode":"unsafe","extra":true}"#,
+    )
+    .expect_err("runtime intake must enforce the provider-normalized restrictions");
+    assert_eq!(rejection.reason_code, "tool_call.arguments.schema_mismatch");
+
+    let accepted =
+        validate_tool_call_against_catalog_snapshot(&snapshot, tool_name, br#"{"mode":"safe"}"#)
+            .expect("arguments matching the transformed schema should pass");
+    assert_eq!(accepted.input_json, br#"{"mode":"safe"}"#);
+}
+
 fn schema_transform_test_tool(
     tool_name: &str,
     input_schema: serde_json::Value,

@@ -700,7 +700,9 @@ fn visible_tool_from_entry(
         provider_schema_hash: stable_hash_value(&provider_schema),
         provider_schema_transform,
         internal_schema_hash: entry.schema_hash,
-        schema: entry.input_schema,
+        // Runtime intake must enforce the exact normalized schema advertised
+        // to the provider; the original schema remains hash-only audit input.
+        schema: provider_schema.clone(),
         provider_schema,
         capabilities: entry.capabilities,
         approval_posture: entry.approval_posture,
