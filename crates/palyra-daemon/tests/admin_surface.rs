@@ -801,8 +801,8 @@ fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
         .context("failed to call admin status with valid token after auth limit")?;
     assert_eq!(
         valid_after_limit.status().as_u16(),
-        429,
-        "exhausted auth-failure bucket must block even correct tokens before validation"
+        200,
+        "failed requests from a shared IP must not lock out valid credentials"
     );
     assert_admin_console_security_headers(valid_after_limit.headers())?;
     Ok(())
