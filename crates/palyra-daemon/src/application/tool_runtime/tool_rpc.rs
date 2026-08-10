@@ -10,8 +10,13 @@ use std::{
     collections::BTreeMap,
     collections::BTreeSet,
     fs,
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -422,6 +427,7 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     }
 
     let timeout = request.timeout_ms.map(Duration::from_millis);
+    let timeout_cancellation = timeout.map(|_| Arc::new(AtomicBool::new(false)));
     let child_context = ToolRuntimeExecutionContext {
         execution_backend: backend_selection.resolution.resolved,
         backend_reason_code: backend_selection.resolution.reason_code.as_str(),
@@ -437,36 +443,39 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         input_bytes.as_slice(),
         ToolRuntimeDispatchControls {
             remaining_tool_budget: remaining_tool_budget.clone(),
-            cancellation_requested: None,
+            cancellation_requested: timeout_cancellation.clone(),
             process_progress_sink: None,
             cancellation_context: None,
             child_task_parent_context: child_task_parent_context.cloned(),
             expected_dynamic_provenance: None,
         },
     ));
-    let outcome = match timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, execution).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                return (
-                    ToolRpcResponse {
-                        schema_version: TOOL_RPC_SCHEMA_VERSION,
-                        call_id: request.call_id,
-                        tool_name: request.tool_name,
-                        status: ToolRpcStatus::TimedOut,
-                        success: false,
-                        decision_reason: execution_decision.reason,
-                        approval_required: execution_decision.approval_required,
-                        output: json!({}),
-                        error: "tool rpc call timed out".to_owned(),
-                        redacted_preview: String::new(),
-                        attestation: None,
-                    },
-                    1,
-                );
-            }
-        },
-        None => execution.await,
+    let outcome = match settle_tool_rpc_execution(
+        execution,
+        timeout,
+        timeout_cancellation.as_deref(),
+    )
+    .await
+    {
+        ToolRpcExecutionSettlement::Completed(outcome) => outcome,
+        ToolRpcExecutionSettlement::TimedOut(outcome) => {
+            return (
+                ToolRpcResponse {
+                    schema_version: TOOL_RPC_SCHEMA_VERSION,
+                    call_id: request.call_id,
+                    tool_name: request.tool_name,
+                    status: ToolRpcStatus::TimedOut,
+                    success: false,
+                    decision_reason: execution_decision.reason,
+                    approval_required: execution_decision.approval_required,
+                    output: json!({}),
+                    error: "tool rpc call timed out after child execution settled".to_owned(),
+                    redacted_preview: String::new(),
+                    attestation: Some(ToolRpcAttestation::from(&outcome.attestation)),
+                },
+                1,
+            );
+        }
     };
 
     let redacted_preview = summarize_rpc_output(outcome.output_json.as_slice(), 1024);
@@ -490,6 +499,36 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         },
         1,
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolRpcExecutionSettlement<T> {
+    Completed(T),
+    TimedOut(T),
+}
+
+/// Requests cooperative cancellation at the deadline and keeps ownership of
+/// the execution future until every child action has settled.
+async fn settle_tool_rpc_execution<F>(
+    mut execution: Pin<Box<F>>,
+    timeout: Option<Duration>,
+    cancellation_requested: Option<&AtomicBool>,
+) -> ToolRpcExecutionSettlement<F::Output>
+where
+    F: Future,
+{
+    let Some(timeout) = timeout else {
+        return ToolRpcExecutionSettlement::Completed(execution.await);
+    };
+    match tokio::time::timeout(timeout, execution.as_mut()).await {
+        Ok(outcome) => ToolRpcExecutionSettlement::Completed(outcome),
+        Err(_) => {
+            if let Some(cancellation_requested) = cancellation_requested {
+                cancellation_requested.store(true, Ordering::Release);
+            }
+            ToolRpcExecutionSettlement::TimedOut(execution.await)
+        }
+    }
 }
 
 /// Processes one batch of file-backed RPC requests for remote script runtimes.
@@ -1075,14 +1114,50 @@ fn summarize_rpc_output(output_json: &[u8], max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use super::{
         build_python_tool_rpc_bridge_context_with_transports,
         child_tool_may_inherit_parent_approval, python_tool_rpc_sdk_source,
-        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers, summarize_rpc_output,
-        PythonToolRpcTransportDescriptor, ToolRpcTransportKind, TOOL_RPC_SCHEMA_VERSION,
+        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers,
+        settle_tool_rpc_execution, summarize_rpc_output, PythonToolRpcTransportDescriptor,
+        ToolRpcExecutionSettlement, ToolRpcTransportKind, TOOL_RPC_SCHEMA_VERSION,
     };
+
+    #[tokio::test]
+    async fn timeout_waits_for_child_execution_to_settle() {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let child_observed_cancellation = Arc::new(AtomicBool::new(false));
+        let child_cancellation_requested = Arc::clone(&cancellation_requested);
+        let child_observed = Arc::clone(&child_observed_cancellation);
+        let execution = Box::pin(async move {
+            loop {
+                if child_cancellation_requested.load(Ordering::Acquire) {
+                    child_observed.store(true, Ordering::Release);
+                    return "settled";
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let settlement = settle_tool_rpc_execution(
+            execution,
+            Some(Duration::from_millis(1)),
+            Some(cancellation_requested.as_ref()),
+        )
+        .await;
+
+        assert_eq!(settlement, ToolRpcExecutionSettlement::TimedOut("settled"));
+        assert!(cancellation_requested.load(Ordering::Acquire));
+        assert!(child_observed_cancellation.load(Ordering::Acquire));
+    }
 
     #[test]
     fn python_bridge_context_exports_only_scoped_handles() {
