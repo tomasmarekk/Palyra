@@ -3444,7 +3444,7 @@ async fn browser_service_chromium_network_log_includes_same_origin_fetch_failure
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn browser_service_chromium_preserves_navigated_private_origin_for_user_fetches() {
+async fn browser_service_chromium_blocks_unapproved_private_same_origin_fetches() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;
     };
@@ -3528,62 +3528,29 @@ async fn browser_service_chromium_preserves_navigated_private_origin_for_user_fe
             v: 1,
             session_id: Some(session_id.clone()),
             selector: String::new(),
-            text: "Atlas".to_owned(),
+            text: "fetch failed".to_owned(),
             timeout_ms: 5_000,
             poll_interval_ms: 50,
             capture_failure_screenshot: true,
             max_failure_screenshot_bytes: 16 * 1024,
         }))
         .await
-        .expect("wait_for same-origin fetch result should execute")
+        .expect("wait_for blocked same-origin fetch result should execute")
         .into_inner();
     assert!(
         waited.success,
-        "same-origin local fetch after navigation should render fetched data: {}",
+        "unapproved same-origin private fetch should fail in page JS: {}",
         waited.error
     );
 
-    let network_log_deadline = Instant::now() + Duration::from_secs(5);
-    let network_log = loop {
-        let mut network_log_request = Request::new(browser_v1::NetworkLogRequest {
-            v: 1,
-            session_id: Some(session_id.clone()),
-            limit: 20,
-            include_headers: false,
-            max_payload_bytes: 32 * 1024,
-        });
-        insert_principal(&mut network_log_request, "user:ops");
-        let network_log = service
-            .network_log(network_log_request)
-            .await
-            .expect("network_log should execute")
-            .into_inner();
-        assert!(network_log.success, "network log call should succeed: {}", network_log.error);
-        // Chromium can report status 0 for a same-origin fetch after page JS has
-        // consumed the 200 response; `wait_for` above proves the data rendered.
-        let has_completed_json_fetch = network_log.entries.iter().any(|entry| {
-            entry.request_url.ends_with("/mock-data.json")
-                && (entry.status_code == 200 || entry.status_code == 0)
-        });
-        if has_completed_json_fetch || Instant::now() >= network_log_deadline {
-            break network_log;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
     assert!(
-        network_log.entries.iter().any(|entry| {
-            entry.request_url.ends_with("/mock-data.json")
-                && (entry.status_code == 200 || entry.status_code == 0)
-        }),
-        "network log should include same-origin JSON fetch entries: {:?}",
-        network_log.entries
+        !handle.join().expect("test server thread should exit"),
+        "exact private URL scope must not reach a sibling JSON path"
     );
-
-    handle.join().expect("test server thread should exit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn browser_service_chromium_allows_initial_private_css_subresource() {
+async fn browser_service_chromium_blocks_unapproved_initial_private_css_subresource() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;
     };
@@ -3647,7 +3614,7 @@ async fn browser_service_chromium_allows_initial_private_css_subresource() {
         .into_inner();
     assert!(
         navigate.success,
-        "chromium navigate should allow initial stylesheet load: {}",
+        "chromium navigate should allow the exact main document: {}",
         navigate.error
     );
 
@@ -3686,30 +3653,12 @@ async fn browser_service_chromium_allows_initial_private_css_subresource() {
             .find(|style| style.name == name)
             .map(|style| style.value.as_str())
     };
-    assert_eq!(style_value("display"), Some("block"));
-    assert_eq!(style_value("padding-top"), Some("14px"));
-    assert_eq!(style_value("background-color"), Some("rgb(31, 77, 255)"));
+    assert_eq!(style_value("display"), Some("inline"));
 
-    let mut network_log_request = Request::new(browser_v1::NetworkLogRequest {
-        v: 1,
-        session_id: Some(session_id),
-        limit: 20,
-        include_headers: false,
-        max_payload_bytes: 32 * 1024,
-    });
-    insert_principal(&mut network_log_request, "user:ops");
-    let network_log = service
-        .network_log(network_log_request)
-        .await
-        .expect("network_log should execute")
-        .into_inner();
     assert!(
-        network_log.entries.iter().any(|entry| entry.request_url.ends_with("/styles.css")),
-        "network log should include the initial stylesheet request: {:?}",
-        network_log.entries
+        !handle.join().expect("test server thread should exit"),
+        "exact private URL scope must not reach a sibling stylesheet path"
     );
-
-    handle.join().expect("test server thread should exit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3746,7 +3695,7 @@ async fn browser_service_chromium_salvages_timeout_when_dom_is_reached() {
             principal: "user:ops".to_owned(),
             idle_ttl_ms: 10_000,
             budget: None,
-            allow_private_targets: false,
+            allow_private_targets: true,
             allow_downloads: false,
             action_allowed_domains: Vec::new(),
             persistence_enabled: false,
@@ -8321,7 +8270,7 @@ fn spawn_fetch_failure_http_server() -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}/"), handle)
 }
 
-fn spawn_click_fetch_http_server() -> (String, thread::JoinHandle<()>) {
+fn spawn_click_fetch_http_server() -> (String, thread::JoinHandle<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     listener.set_nonblocking(true).expect("listener should become nonblocking");
     let address = listener.local_addr().expect("listener local address should resolve");
@@ -8329,7 +8278,7 @@ fn spawn_click_fetch_http_server() -> (String, thread::JoinHandle<()>) {
         let started_at = std::time::Instant::now();
         let mut root_seen = false;
         let mut data_seen = false;
-        while started_at.elapsed() < Duration::from_secs(20) && !(root_seen && data_seen) {
+        while started_at.elapsed() < Duration::from_secs(5) && !data_seen {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).expect("accepted stream should become blocking");
@@ -8394,15 +8343,12 @@ document.getElementById("loadData").addEventListener("click", async () => {
             }
         }
         assert!(root_seen, "fixture should receive the initial page request before shutdown");
-        assert!(
-            data_seen,
-            "fixture should receive the click-triggered JSON request before shutdown"
-        );
+        data_seen
     });
     (format!("http://{address}/"), handle)
 }
 
-fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<()>) {
+fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     listener.set_nonblocking(true).expect("listener should become nonblocking");
     let address = listener.local_addr().expect("listener local address should resolve");
@@ -8410,7 +8356,7 @@ fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<()>) {
         let started_at = std::time::Instant::now();
         let mut root_requests = 0usize;
         let mut css_seen = false;
-        while started_at.elapsed() < Duration::from_secs(20) && !(css_seen && root_requests >= 2) {
+        while started_at.elapsed() < Duration::from_secs(5) && !css_seen {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).expect("accepted stream should become blocking");
@@ -8459,7 +8405,8 @@ fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<()>) {
                 Err(error) => panic!("listener accept failed: {error}"),
             }
         }
-        assert!(css_seen, "fixture should receive the initial stylesheet request before shutdown");
+        assert!(root_requests > 0, "fixture should receive the main document request");
+        css_seen
     });
     (format!("http://{address}/index.html"), handle)
 }
