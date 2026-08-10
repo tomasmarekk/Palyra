@@ -71,6 +71,10 @@
     "unknown"
   ],
   "format": "palyra-qa-mock-provider-fixture",
+  "limits": {
+    "max_fixture_bytes": 4194304,
+    "max_tool_argument_bytes": 524288
+  },
   "matcher_contract": {
     "tool_result": {
       "call_id_field": "tool_result_call_id",

@@ -22,6 +22,7 @@ use std::{
     fs,
     future::Future,
     hash::{Hash, Hasher},
+    io::Read,
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -96,7 +97,8 @@ use palyra_model_providers::{
     qa_mock_provider_output_for_attempt, qa_mock_provider_turn_for_request,
     retry_provider_classification, retryable_invalid_response_classification,
     user_action_provider_classification, ANTHROPIC_API_VERSION, MAX_QA_MOCK_PROVIDER_ATTEMPTS,
-    MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS, MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
+    MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS, MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES,
+    MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
     OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
 };
 #[allow(unused_imports)]
@@ -3374,8 +3376,23 @@ fn load_qa_mock_provider_fixture(
             "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
         );
     }
-    let bytes = fs::read(path)
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open QA mock-provider fixture {}", path.display()))?;
+    let mut bytes = Vec::new();
+    // Reading one byte beyond the cap detects oversize fixtures without buffering the rest.
+    file.by_ref()
+        .take(
+            u64::try_from(MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES.saturating_add(1)).unwrap_or(u64::MAX),
+        )
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read QA mock-provider fixture {}", path.display()))?;
+    if bytes.len() > MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES {
+        anyhow::bail!(
+            "QA mock-provider fixture {} exceeds the {}-byte size limit",
+            path.display(),
+            MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES
+        );
+    }
     let text = std::str::from_utf8(bytes.as_slice()).with_context(|| {
         format!("QA mock-provider fixture {} is not valid UTF-8", path.display())
     })?;
@@ -7285,6 +7302,7 @@ mod tests {
     };
     use palyra_model_providers::{
         classify_transport_provider_failure, parse_qa_mock_provider_fixture_yaml,
+        MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES,
     };
     use palyra_vault::SensitiveBytes;
     use ulid::Ulid;
@@ -8487,6 +8505,31 @@ mod tests {
             .expect_err("malformed fixture turn should fail");
         assert!(matches!(error, ProviderError::InvalidResponse { .. }));
         assert_eq!(error.classification().class, ProviderFailureClass::MalformedResponse);
+    }
+
+    #[test]
+    fn deterministic_provider_rejects_oversized_qa_mock_fixture_before_parsing() {
+        let mut fixture_file =
+            tempfile::NamedTempFile::new().expect("temporary QA fixture file should be created");
+        std::io::copy(
+            &mut std::io::repeat(b' ')
+                .take(u64::try_from(MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES + 1).unwrap_or(u64::MAX)),
+            &mut fixture_file,
+        )
+        .expect("oversized fixture should be written");
+        let config = ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(fixture_file.path().to_path_buf()),
+            ..ModelProviderConfig::default()
+        };
+
+        let error = match super::load_qa_mock_provider_fixture(&config) {
+            Ok(_) => panic!("oversized QA fixture must fail before parsing"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("exceeds the"));
+        assert!(error.to_string().contains("size limit"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

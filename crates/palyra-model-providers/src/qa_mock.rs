@@ -10,11 +10,12 @@ use serde_json::{json, Value};
 
 use crate::{
     errors::provider_failure_classification, invalid_response_classification,
-    provider_events_from_output, redact_remote_secret_fragments, retry_provider_classification,
-    retryable_invalid_response_classification, sanitize_remote_error, ProviderError, ProviderEvent,
-    ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderMessageRole,
-    ProviderRawProviderRefs, ProviderRequest, ProviderStreamAccumulator, ProviderStreamEvent,
-    ProviderTurnOutput,
+    normalize_tool_input_value, provider_events_from_output, redact_remote_secret_fragments,
+    retry_provider_classification, retryable_invalid_response_classification,
+    sanitize_remote_error, ProviderError, ProviderEvent, ProviderFailureAction,
+    ProviderFailureClass, ProviderFinishReason, ProviderMessageRole, ProviderRawProviderRefs,
+    ProviderRequest, ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput,
+    MAX_TOOL_ARGUMENT_BYTES,
 };
 
 /// Current QA mock-provider fixture schema version.
@@ -40,6 +41,9 @@ pub const MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS: u64 = 5_000;
 
 /// Maximum cumulative deterministic latency assigned to one fixture turn.
 pub const MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS: u64 = 10_000;
+
+/// Maximum accepted serialized QA mock-provider fixture size.
+pub const MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES: usize = 4 * 1024 * 1024;
 
 const BEHAVIOR_KIND_VALUES: &[&str] = &[
     "text",
@@ -489,6 +493,21 @@ struct QaMockProviderToolCallWire {
 pub fn parse_qa_mock_provider_fixture_yaml(
     text: &str,
 ) -> Result<QaMockProviderFixture, QaMockProviderFixtureError> {
+    if text.len() > MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES {
+        let mut issues = Vec::with_capacity(1);
+        push_issue(
+            &mut issues,
+            "fixture_size_exceeded",
+            "$",
+            format!(
+                "fixture exceeds the {MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES}-byte serialized size limit"
+            ),
+            "Reduce the fixture before loading it.",
+        );
+        return Err(QaMockProviderFixtureError::Invalid(QaMockProviderValidationError::new(
+            issues,
+        )));
+    }
     let wire = yaml_serde::from_str::<QaMockProviderFixtureWire>(text)
         .map_err(|source| QaMockProviderFixtureError::Parse { source })?;
     build_validated_fixture(wire)
@@ -510,6 +529,10 @@ pub fn qa_mock_provider_fixture_schema_snapshot() -> Value {
             "turns"
         ],
         "supported_schema_versions": SUPPORTED_FIXTURE_SCHEMA_VERSIONS,
+        "limits": {
+            "max_fixture_bytes": MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES,
+            "max_tool_argument_bytes": MAX_TOOL_ARGUMENT_BYTES
+        },
         "capture_provenance_contract": {
             "required_from_schema_version": 2,
             "schema_v1_serialization": "omitted",
@@ -1429,12 +1452,19 @@ fn validate_tool_calls(
             "tool name",
             issues,
         );
+        let input_json = tool_call.input_json.unwrap_or_else(|| json!({}));
+        if normalize_tool_input_value(&input_json).is_err() {
+            push_issue(
+                issues,
+                "tool_call_input_too_large",
+                format!("{call_path}.input_json"),
+                format!("tool input exceeds the {MAX_TOOL_ARGUMENT_BYTES}-byte serialized limit"),
+                "Reduce the fixture tool input.",
+            );
+            continue;
+        }
         if let (Some(proposal_id), Some(tool_name)) = (proposal_id, tool_name) {
-            tool_calls.push(QaMockProviderToolCall {
-                proposal_id,
-                tool_name,
-                input_json: tool_call.input_json.unwrap_or_else(|| json!({})),
-            });
+            tool_calls.push(QaMockProviderToolCall { proposal_id, tool_name, input_json });
         }
     }
     tool_calls
@@ -2190,6 +2220,34 @@ turns:
             serde_json::from_str(SCHEMA_GOLDEN).expect("schema golden should parse");
 
         assert_eq!(qa_mock_provider_fixture_schema_snapshot(), expected);
+    }
+
+    #[test]
+    fn rejects_oversized_fixture_documents_and_tool_inputs() {
+        let oversized_document = " ".repeat(MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES + 1);
+        assert_fixture_issue(oversized_document.as_str(), "$", "fixture_size_exceeded");
+
+        let oversized_tool_input = format!(
+            r#"
+schema_version: 1
+id: qa.mock.oversized-tool-input
+turns:
+  - id: invalid
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-tool
+          tool_name: palyra.echo
+          input_json:
+            text: "{}"
+"#,
+            "a".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)
+        );
+        assert_fixture_issue(
+            oversized_tool_input.as_str(),
+            "$.turns[0].behavior.tool_calls[0].input_json",
+            "tool_call_input_too_large",
+        );
     }
 
     #[test]
