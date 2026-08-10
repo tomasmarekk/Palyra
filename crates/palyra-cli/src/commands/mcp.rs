@@ -30,6 +30,7 @@ use crate::*;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const JSONRPC_VERSION: &str = "2.0";
+const MCP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 const TOOL_SESSIONS_LIST: &str = "sessions_list";
 const TOOL_SESSION_TRANSCRIPT_READ: &str = "session_transcript_read";
@@ -2117,7 +2118,7 @@ fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Op
 ///
 /// # Errors
 /// Returns a validation error for malformed headers, a missing Content-Length,
-/// a truncated body, or an unparsable JSON payload.
+/// an oversized or truncated body, or an unparsable JSON payload.
 fn read_mcp_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
     let mut content_length = None::<usize>;
     loop {
@@ -2141,6 +2142,9 @@ fn read_mcp_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
     }
     let content_length =
         content_length.context("invalid MCP input: missing Content-Length header")?;
+    if content_length > MCP_MAX_FRAME_BYTES {
+        anyhow::bail!("invalid MCP input: Content-Length exceeds {MCP_MAX_FRAME_BYTES} byte limit");
+    }
     let mut payload = vec![0_u8; content_length];
     reader
         .read_exact(payload.as_mut_slice())
@@ -3348,5 +3352,18 @@ mod tests {
         assert_eq!(classify_error(&error), CliExitCode::Validation);
         assert!(message.contains("invalid MCP input"));
         assert!(message.contains("missing Content-Length header"));
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_before_body_allocation() {
+        let frame = format!("Content-Length: {}\r\n\r\n", MCP_MAX_FRAME_BYTES + 1);
+        let mut cursor = std::io::Cursor::new(frame.into_bytes());
+
+        let error = read_mcp_message(&mut cursor).expect_err("oversized frame must fail closed");
+        let message = error.to_string();
+
+        assert_eq!(classify_error(&error), CliExitCode::Validation);
+        assert!(message.contains("Content-Length exceeds"));
+        assert!(message.contains("byte limit"));
     }
 }
