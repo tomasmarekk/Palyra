@@ -718,6 +718,7 @@ async fn resolve_workspace_file_roots(
     if let Some(workspace_root) = workspace_root {
         let workspace_root = workspace_root.trim();
         if !workspace_root.is_empty() {
+            validate_workspace_root_override_is_relative(tool_name, workspace_root)?;
             if let Some(active_root) =
                 session_active_workspace_root(runtime_state, session_id, agent_workspace_roots)
                     .await?
@@ -821,6 +822,7 @@ fn resolve_workspace_root_override(
     if workspace_root.chars().any(char::is_control) {
         return Err(format!("{tool_name} workspace_root contains unsupported characters"));
     }
+    validate_workspace_root_override_is_relative(tool_name, workspace_root)?;
 
     let canonical_roots = canonicalize_workspace_roots(agent_workspace_roots, tool_name)?;
     if canonical_roots.is_empty() {
@@ -828,14 +830,6 @@ fn resolve_workspace_root_override(
     }
 
     let requested = Path::new(workspace_root);
-    if requested.is_absolute() {
-        return canonicalize_workspace_root_override(
-            tool_name,
-            requested,
-            &canonical_roots,
-            workspace_root,
-        );
-    }
     validate_relative_workspace_root_override(tool_name, requested, workspace_root)?;
     if let Some(root) = workspace_root_override_matching_existing_root_basename(
         requested,
@@ -859,6 +853,28 @@ fn resolve_workspace_root_override(
     Err(format!(
         "{tool_name} workspace_root does not exist inside agent workspace roots: {workspace_root}"
     ))
+}
+
+fn validate_workspace_root_override_is_relative(
+    tool_name: &str,
+    workspace_root: &str,
+) -> Result<(), String> {
+    let bytes = workspace_root.as_bytes();
+    let windows_drive_qualified =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let has_root_or_prefix = Path::new(workspace_root)
+        .components()
+        .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)));
+    if has_root_or_prefix
+        || Path::new(workspace_root).is_absolute()
+        || windows_drive_qualified
+        || workspace_root.starts_with(r"\\")
+    {
+        return Err(format!(
+            "{tool_name} workspace_root must be relative to an agent workspace root"
+        ));
+    }
+    Ok(())
 }
 
 /// Matches a single-component override against the basename of an existing
@@ -3812,29 +3828,35 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_rejects_workspace_root_override_outside_agent_roots() {
+    fn read_workspace_file_rejects_absolute_workspace_roots_without_host_metadata() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");
         let outside = tempdir.path().join("outside");
+        let outside_file = tempdir.path().join("outside.txt");
+        let missing = tempdir.path().join("missing");
         fs::create_dir_all(&workspace).expect("workspace dir should exist");
         fs::create_dir_all(&outside).expect("outside dir should exist");
-        let input = parse_workspace_read_file_input(
+        fs::write(&outside_file, "not a directory").expect("outside file should exist");
+
+        let errors = [&outside, &outside_file, &missing]
+            .into_iter()
+            .map(|candidate| {
+                resolve_workspace_file_roots_for_override(
+                    WORKSPACE_READ_FILE_TOOL_NAME,
+                    std::slice::from_ref(&workspace),
+                    candidate.to_str(),
+                )
+                .expect_err("absolute workspace_root should be rejected before host inspection")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(errors.windows(2).all(|pair| pair[0] == pair[1]), "{errors:?}");
+        assert_eq!(
+            errors[0],
             format!(
-                r#"{{"path":"notes.txt","workspace_root":"{}"}}"#,
-                outside.to_string_lossy().replace('\\', "\\\\")
+                "{WORKSPACE_READ_FILE_TOOL_NAME} workspace_root must be relative to an agent workspace root"
             )
-            .as_bytes(),
-        )
-        .expect("absolute workspace_root should parse");
-
-        let error = resolve_workspace_file_roots_for_override(
-            WORKSPACE_READ_FILE_TOOL_NAME,
-            std::slice::from_ref(&workspace),
-            input.workspace_root.as_deref(),
-        )
-        .expect_err("outside workspace_root should be rejected");
-
-        assert!(error.contains("escapes agent workspace roots"), "unexpected error: {error}");
+        );
     }
 
     #[test]
