@@ -4070,6 +4070,22 @@ fn docker_process_run_plan(
         request_vault,
         Path::new(workspace_mount.host_path.as_str()),
     )?;
+    let execution_timeout_ms =
+        input.timeout_ms.unwrap_or(config.execution_timeout_ms).min(config.execution_timeout_ms);
+    let limits = ContainerResourceLimits {
+        cpu_time_limit_ms: profile
+            .limits
+            .cpu_time_limit_ms
+            .min(config.process_runner.cpu_time_limit_ms),
+        memory_limit_bytes: profile
+            .limits
+            .memory_limit_bytes
+            .min(config.process_runner.memory_limit_bytes),
+        max_output_bytes: profile
+            .limits
+            .max_output_bytes
+            .min(config.process_runner.max_output_bytes),
+    };
     Ok(DockerRunPlan {
         profile_id: profile.profile_id.clone(),
         image: profile.image.clone(),
@@ -4086,10 +4102,10 @@ fn docker_process_run_plan(
         command: input.command,
         args: input.args,
         working_dir: docker_container_working_dir(input.cwd.as_deref())?,
-        limits: profile.limits.clone(),
+        limits,
         workspace_writeback: WorkspaceWritebackMode::PatchBundle,
         cleanup_strategy: profile.cleanup_strategy.clone(),
-        execution_timeout_ms: config.execution_timeout_ms,
+        execution_timeout_ms,
         cancellation_requested,
     })
 }
@@ -4112,24 +4128,68 @@ fn validate_docker_process_input(
     config: &ToolCallConfig,
     input: &ProcessRunnerToolInput,
 ) -> Result<(), DockerEngineError> {
+    if input.background
+        || input.keep_running_after_run
+        || input.interactive
+        || input.stdin
+        || input.pty
+        || input.notify_on_complete
+        || !input.watch_patterns.is_empty()
+        || !input.port_hints.is_empty()
+        || input.elevated_intent
+        || input.effective_lifetime_mode().is_detached_handoff()
+    {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.lifecycle_unsupported".to_owned(),
+            message: "DockerRunner accepts only bounded foreground process execution".to_owned(),
+        });
+    }
     if !input.prepend_path.is_empty() {
         return Err(DockerEngineError {
             reason_code: "docker.process.prepend_path_unsupported".to_owned(),
             message: "DockerRunner does not accept host PATH injection".to_owned(),
         });
     }
-    if input.env.keys().any(|name| is_sensitive_key(name.as_str())) {
+    if !input.env.is_empty() || input.env_profile_id.is_some() {
         return Err(DockerEngineError {
-            reason_code: "docker.process.secret_env_denied".to_owned(),
-            message: "DockerRunner rejects sensitive env names in tool input".to_owned(),
+            reason_code: "docker.process.task_env_denied".to_owned(),
+            message: "DockerRunner uses profile-owned environment bindings and rejects task env"
+                .to_owned(),
+        });
+    }
+    if !input.requested_egress_hosts.is_empty() {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.egress_denied".to_owned(),
+            message: "DockerRunner requires profile-owned OS-enforced network isolation".to_owned(),
+        });
+    }
+    if input.timeout_ms == Some(0) {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.timeout_invalid".to_owned(),
+            message: "DockerRunner timeout_ms must be greater than zero".to_owned(),
         });
     }
     let command = input.command.trim();
-    if command.is_empty() || command.chars().any(char::is_whitespace) {
+    if command != input.command || !docker_command_is_unambiguous(command) {
         return Err(DockerEngineError {
             reason_code: "docker.process.invalid_command".to_owned(),
-            message: "DockerRunner requires a single executable token in command".to_owned(),
+            message: "DockerRunner requires one unambiguous bare executable token".to_owned(),
         });
+    }
+    if process_executable_is_interpreter(command) {
+        if !config.process_runner.allow_interpreters {
+            return Err(DockerEngineError {
+                reason_code: "docker.process.interpreter_denied".to_owned(),
+                message: "DockerRunner requires explicit host policy for interpreter execution"
+                    .to_owned(),
+            });
+        }
+        if interpreter_args_contain_blocked_eval_flag(command, input.args.as_slice()) {
+            return Err(DockerEngineError {
+                reason_code: "docker.process.interpreter_eval_denied".to_owned(),
+                message: "DockerRunner refuses interpreter inline eval flags".to_owned(),
+            });
+        }
     }
     let allowed = &config.process_runner.allowed_executables;
     if !allowed.iter().any(|entry| docker_command_allowlist_matches(entry, command)) {
@@ -4139,6 +4199,16 @@ fn validate_docker_process_input(
         });
     }
     Ok(())
+}
+
+fn docker_command_is_unambiguous(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= 256
+        && !command.contains('/')
+        && !command.contains('\\')
+        && !command.bytes().any(|byte| {
+            byte.is_ascii_whitespace() || byte == b'\0' || b"*;&|><`$'\"()".contains(&byte)
+        })
 }
 
 fn docker_process_run_outcome(
@@ -4403,12 +4473,7 @@ fn docker_container_working_dir(cwd: Option<&str>) -> Result<String, DockerEngin
 
 fn docker_command_allowlist_matches(allowed: &str, command: &str) -> bool {
     let allowed = allowed.trim();
-    if allowed == "*" {
-        return true;
-    }
-    let command_name =
-        Path::new(command).file_name().and_then(|name| name.to_str()).unwrap_or(command);
-    allowed.eq_ignore_ascii_case(command) || allowed.eq_ignore_ascii_case(command_name)
+    allowed == "*" || allowed.eq_ignore_ascii_case(command)
 }
 
 fn docker_image_digest_sha256(image: &str) -> Option<String> {
@@ -6894,6 +6959,7 @@ mod tests {
     };
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
+    use palyra_common::process_runner_input::parse_process_runner_tool_input;
     #[cfg(feature = "qa-fault-injection")]
     use palyra_common::qa_fault_injection::{
         parse_qa_fault_evidence_sidecar_ndjson, QaFaultAction, QaFaultActivation, QaFaultDirective,
@@ -6937,9 +7003,9 @@ mod tests {
         build_execution_backend_status_reports, collect_workspace_file_snapshots,
         docker_process_run_plan, parse_execution_backend_preference, plan_stuck_tool_job_recovery,
         prepare_docker_run_plan, resolve_execution_backend, resolve_execution_backend_for_request,
-        sha256_hex, validate_execution_backend_selection, CanonicalSshWorkerTransport,
-        ContainerBackendProfile, ContainerCleanupAttestation, ContainerEnvBinding,
-        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
+        sha256_hex, validate_docker_process_input, validate_execution_backend_selection,
+        CanonicalSshWorkerTransport, ContainerBackendProfile, ContainerCleanupAttestation,
+        ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
         ContainerResourceLimits, ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine,
         DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
         DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
@@ -8467,6 +8533,52 @@ mod tests {
     }
 
     #[test]
+    fn docker_process_validation_rejects_path_aliases_and_interpreters() {
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["ls".to_owned(), "python".to_owned()];
+        let config = test_tool_call_config(policy);
+        let path_alias = parse_process_runner_tool_input(br#"{"command":"/workspace/ls"}"#)
+            .expect("path alias input should parse");
+        let interpreter =
+            parse_process_runner_tool_input(br#"{"command":"python","args":["script.py"]}"#)
+                .expect("interpreter input should parse");
+
+        let path_error = validate_docker_process_input(&config, &path_alias)
+            .expect_err("workspace executable paths must not satisfy basename allowlists");
+        let interpreter_error = validate_docker_process_input(&config, &interpreter)
+            .expect_err("interpreters require explicit host policy");
+
+        assert_eq!(path_error.reason_code, "docker.process.invalid_command");
+        assert_eq!(interpreter_error.reason_code, "docker.process.interpreter_denied");
+    }
+
+    #[test]
+    fn docker_process_plan_clamps_every_host_resource_limit() {
+        let profile = safe_container_profile();
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["cargo".to_owned()];
+        policy.cpu_time_limit_ms = 250;
+        policy.memory_limit_bytes = 512 * 1024;
+        policy.max_output_bytes = 4 * 1024;
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = 750;
+
+        let plan = docker_process_run_plan(
+            &profile,
+            &config,
+            br#"{"command":"cargo","args":["--version"],"timeout_ms":125}"#,
+            None,
+            None,
+        )
+        .expect("bounded Docker process plan should build");
+
+        assert_eq!(plan.execution_timeout_ms, 125);
+        assert_eq!(plan.limits.cpu_time_limit_ms, 250);
+        assert_eq!(plan.limits.memory_limit_bytes, 512 * 1024);
+        assert_eq!(plan.limits.max_output_bytes, 4 * 1024);
+    }
+
+    #[test]
     fn docker_capability_report_enforces_supported_daemon_matrix() {
         let profile = safe_container_profile();
         let qualified = DockerBackendCapabilityReport::from_profile_for_platform(
@@ -9436,7 +9548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_runner_background_request_returns_attached_handle_metadata() {
+    async fn docker_runner_rejects_background_lifecycle_requests() {
         let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
         let runner = DockerRunner::new(safe_container_profile(), engine)
             .expect("safe Docker profile should build runner");
@@ -9458,14 +9570,11 @@ mod tests {
             })
             .await;
 
-        assert!(outcome.success, "{}", outcome.error);
-        let plans = plans.lock().expect("fake Docker plans");
-        assert!(plans.first().expect("plan should be recorded").background);
+        assert!(!outcome.success);
+        assert!(plans.lock().expect("fake Docker plans").is_empty());
         let payload: serde_json::Value =
-            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
-        assert_eq!(payload["background_handle"]["requested"], true);
-        assert_eq!(payload["background_handle"]["handle_kind"], "docker_attached_run");
-        assert_eq!(payload["background_handle"]["cleanup_registered"], false);
+            serde_json::from_slice(&outcome.output_json).expect("Docker error should be JSON");
+        assert_eq!(payload["reason_code"], "docker.process.lifecycle_unsupported");
     }
 
     #[tokio::test]
