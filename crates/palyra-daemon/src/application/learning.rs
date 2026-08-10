@@ -32,6 +32,7 @@ use palyra_common::workspace_patch::{
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
 };
+use palyra_vault::{ensure_owner_only_dir, ensure_owner_only_file};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Status;
@@ -3355,6 +3356,25 @@ fn collect_patch_base_conflicts(
     Ok(conflicts)
 }
 
+/// Creates the temp staging boundary with owner-only permissions from its first filesystem state.
+fn create_patch_learning_staging_root(path: &Path) -> Result<(), Status> {
+    #[cfg(unix)]
+    let create_result = {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        fs::DirBuilder::new().mode(0o700).create(path)
+    };
+    #[cfg(not(unix))]
+    let create_result = fs::create_dir(path);
+
+    create_result.map_err(|error| {
+        Status::internal(format!("failed to create staging root {}: {error}", path.display()))
+    })?;
+    ensure_owner_only_dir(path).map_err(|error| {
+        Status::internal(format!("failed to secure staging root {}: {error}", path.display()))
+    })
+}
+
 /// Dry-runs the patch in a throwaway temp copy of just its base files so a
 /// patch that fails validation never touches the real workspace roots.
 fn stage_patch_candidate(
@@ -3365,12 +3385,7 @@ fn stage_patch_candidate(
 ) -> Result<Value, Status> {
     let staging_root = std::env::temp_dir()
         .join(format!("palyra-learning-stage-{}", Ulid::new().to_string().to_ascii_lowercase()));
-    fs::create_dir_all(staging_root.as_path()).map_err(|error| {
-        Status::internal(format!(
-            "failed to create staging root {}: {error}",
-            staging_root.display()
-        ))
-    })?;
+    create_patch_learning_staging_root(staging_root.as_path())?;
     let response = (|| {
         let max_root_index = files
             .iter()
@@ -3380,9 +3395,9 @@ fn stage_patch_candidate(
         let mut staged_roots = Vec::new();
         for index in 0..=max_root_index {
             let root = staging_root.join(format!("root-{index}"));
-            fs::create_dir_all(root.as_path()).map_err(|error| {
+            ensure_owner_only_dir(root.as_path()).map_err(|error| {
                 Status::internal(format!(
-                    "failed to create staging root {}: {error}",
+                    "failed to secure staging workspace root {}: {error}",
                     root.display()
                 ))
             })?;
@@ -3418,9 +3433,9 @@ fn stage_patch_candidate(
             let relative_source = patch_learning_relative_path(source_path)?;
             let absolute_target = staged_root.join(relative_source.as_path());
             if let Some(parent) = absolute_target.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
+                ensure_owner_only_dir(parent).map_err(|error| {
                     Status::internal(format!(
-                        "failed to create staging parent {}: {error}",
+                        "failed to secure staging parent {}: {error}",
                         parent.display()
                     ))
                 })?;
@@ -3428,6 +3443,12 @@ fn stage_patch_candidate(
             fs::write(absolute_target.as_path(), source_bytes).map_err(|error| {
                 Status::internal(format!(
                     "failed to write staged patch base {}: {error}",
+                    absolute_target.display()
+                ))
+            })?;
+            ensure_owner_only_file(absolute_target.as_path()).map_err(|error| {
+                Status::internal(format!(
+                    "failed to secure staged patch base {}: {error}",
                     absolute_target.display()
                 ))
             })?;
@@ -4615,6 +4636,25 @@ mod tests {
         .expect_err("staging must not copy oversized source files");
 
         assert!(error.message().contains("max_file_bytes=8"), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_learning_staging_root_is_owner_only_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let staging_root = temp.path().join("stage");
+
+        create_patch_learning_staging_root(staging_root.as_path())
+            .expect("staging root should be created securely");
+
+        let mode = fs::metadata(staging_root)
+            .expect("staging root metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]
