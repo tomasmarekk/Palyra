@@ -16,6 +16,7 @@ use crate::contract::{
 pub(crate) const PROVIDER_ID: &str = "anthropic-primary";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 4_096;
+const JSON_MODE_SYSTEM_INSTRUCTION: &str = "Return valid JSON only.";
 
 pub(crate) fn chat_capabilities() -> ProviderCapabilitiesSnapshot {
     ProviderCapabilitiesSnapshot {
@@ -83,7 +84,13 @@ pub fn anthropic_compatible_uses_anthropic_oauth_headers(
 /// while centralizing the Anthropic-compatible wire shape here.
 #[must_use]
 pub fn messages_payload(request: &ProviderRequest, model_name: &str, tools: Vec<Value>) -> Value {
-    let (messages, system) = build_anthropic_messages_and_system(request);
+    let (messages, mut system) = build_anthropic_messages_and_system(request);
+    if request.json_mode {
+        system = Some(match system {
+            Some(system) => format!("{system}\n\n{JSON_MODE_SYSTEM_INSTRUCTION}"),
+            None => JSON_MODE_SYSTEM_INSTRUCTION.to_owned(),
+        });
+    }
     let max_tokens =
         request.max_output_tokens.unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS).max(1);
     let mut body = json!({
@@ -463,6 +470,28 @@ mod tests {
         let payload = messages_payload(&prompt_cache_request(false), "claude-test", Vec::new());
 
         assert_eq!(payload["system"], "stable system prompt");
+    }
+
+    #[test]
+    fn anthropic_payload_adds_json_mode_system_instruction() {
+        let request = ProviderRequest::from_input_text("hello".to_owned(), true, Vec::new(), None);
+
+        let payload = messages_payload(&request, "claude-test", Vec::new());
+
+        assert_eq!(payload["system"], JSON_MODE_SYSTEM_INSTRUCTION);
+    }
+
+    #[test]
+    fn anthropic_json_mode_preserves_existing_system_prompt() {
+        let mut request = prompt_cache_request(false);
+        request.json_mode = true;
+
+        let payload = messages_payload(&request, "claude-test", Vec::new());
+
+        assert_eq!(
+            payload["system"],
+            format!("stable system prompt\n\n{JSON_MODE_SYSTEM_INSTRUCTION}")
+        );
     }
 
     #[test]
