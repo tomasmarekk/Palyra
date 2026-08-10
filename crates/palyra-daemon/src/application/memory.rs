@@ -1245,8 +1245,9 @@ fn classify_memory_write_sensitivity(
 /// Heuristic for "this text probably carries a secret value" (vs. merely
 /// talking about secrets). Layered: assignment-like forms always match;
 /// otherwise a sensitive keyword must pair with store/remember intent or
-/// value-talk, while purely defensive phrasing ("never log ...") is allowed
-/// through as normal.
+/// value-talk. Negating a persistence verb does not make an accompanying
+/// secret value safe to retain; purely defensive phrasing without such a
+/// verb ("never log ...") remains normal.
 fn contains_secret_value_like_memory_write(lowered: &str) -> bool {
     if contains_any(
         lowered,
@@ -1277,9 +1278,9 @@ fn contains_secret_value_like_memory_write(lowered: &str) -> bool {
         return false;
     }
     if contains_any(lowered, &["equals", " is "])
-        || contains_unnegated_memory_write_word(lowered, "remember")
-        || contains_unnegated_memory_write_word(lowered, "save")
-        || contains_unnegated_memory_write_word(lowered, "store")
+        || contains_memory_write_word(lowered, "remember")
+        || contains_memory_write_word(lowered, "save")
+        || contains_memory_write_word(lowered, "store")
     {
         return true;
     }
@@ -1307,32 +1308,8 @@ fn contains_secret_value_like_memory_write(lowered: &str) -> bool {
     contains_any(lowered, &["actual", "value"])
 }
 
-/// True when `word` appears as a whole word that is not negated earlier in
-/// the same clause -- "store the token" matches, "never store the token"
-/// does not.
-fn contains_unnegated_memory_write_word(lowered: &str, word: &str) -> bool {
-    lowered.match_indices(word).any(|(index, _)| {
-        let clause_prefix = current_clause_prefix(lowered, index);
-        has_word_boundaries(lowered, index, word.len())
-            && !memory_write_word_is_negated(clause_prefix)
-    })
-}
-
-/// Returns the clause text preceding `index` (back to the nearest sentence
-/// or clause delimiter). `index` comes from `match_indices`, so the slice
-/// boundaries are valid char boundaries.
-fn current_clause_prefix(text: &str, index: usize) -> &str {
-    let prefix = &text[..index];
-    let clause_start =
-        prefix.rfind(['.', '!', '?', ';', ',', '\n']).map(|offset| offset + 1).unwrap_or(0);
-    &text[clause_start..index]
-}
-
-fn memory_write_word_is_negated(clause_prefix: &str) -> bool {
-    let compact = clause_prefix.split_whitespace().collect::<Vec<_>>().join(" ");
-    ["do not", "don't", "must not", "never", "no", "no need to", "no need for", "without"]
-        .iter()
-        .any(|negation| compact.ends_with(negation))
+fn contains_memory_write_word(lowered: &str, word: &str) -> bool {
+    lowered.match_indices(word).any(|(index, _)| has_word_boundaries(lowered, index, word.len()))
 }
 
 fn has_word_boundaries(text: &str, index: usize, len: usize) -> bool {
@@ -1999,16 +1976,25 @@ mod tests {
     }
 
     #[test]
-    fn write_classifier_allows_negated_secret_storage_instruction() {
-        let classification =
-            classify_memory_write(classification_input("Do not store the admin token abc123."));
+    fn write_classifier_marks_negated_secret_storage_instructions_for_review() {
+        for source in [
+            "Do not store the admin token abc123.",
+            "Do not save the admin token abc123.",
+            "Do not remember the password abc123.",
+        ] {
+            let classification = classify_memory_write(classification_input(source));
 
-        assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Normal);
-        assert_eq!(classification.approval_state, MemoryWriteApprovalState::NotRequired);
-        assert!(!classification
-            .reason_codes
-            .iter()
-            .any(|reason| reason == "sensitivity:sensitive"));
+            assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Sensitive, "{source}");
+            assert_eq!(
+                classification.approval_state,
+                MemoryWriteApprovalState::Required,
+                "{source}"
+            );
+            assert!(
+                classification.reason_codes.iter().any(|reason| reason == "sensitivity:sensitive"),
+                "{source}"
+            );
+        }
     }
 
     #[test]
