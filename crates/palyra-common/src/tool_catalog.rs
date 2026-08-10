@@ -304,7 +304,7 @@ const OPS_PROFILE_TOOLS: &[&str] = &[
 
 /// Policy names of the capabilities that always force approval gating.
 pub const SENSITIVE_CAPABILITY_POLICY_NAMES: &[&str] =
-    &["process_exec", "network", "secrets_read", "filesystem_write"];
+    &["process_exec", "network", "secrets_read", "filesystem_read", "filesystem_write"];
 
 /// Catalog exposure mode used when projecting an authorized tool catalog to a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -720,6 +720,7 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
                 ToolCapability::ProcessExec
                     | ToolCapability::Network
                     | ToolCapability::SecretsRead
+                    | ToolCapability::FilesystemRead
                     | ToolCapability::FilesystemWrite
             )
         })
@@ -892,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_read_tools_are_not_approval_required_by_default() {
+    fn workspace_read_tools_require_approval_by_default() {
         for tool_name in [
             "palyra.fs.read_file",
             "palyra.fs.list_dir",
@@ -906,7 +907,7 @@ mod tests {
             "palyra.code.workspace_symbols",
             "palyra.code.outline",
         ] {
-            assert!(!tool_requires_approval(tool_name), "{tool_name} should be read-only");
+            assert!(tool_requires_approval(tool_name), "{tool_name} should require approval");
             assert_eq!(tool_policy_capability_names(tool_name), vec!["filesystem_read"]);
         }
     }
