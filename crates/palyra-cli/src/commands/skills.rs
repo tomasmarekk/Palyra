@@ -3043,6 +3043,32 @@ mod tests {
     }
 
     #[test]
+    fn seed_e2e_skill_fixtures_rejects_parent_traversal_into_production_state() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
+        let tempdir = tempfile::tempdir()?;
+        let _vault_env = E2eFixtureVaultEnv::new(tempdir.path());
+        let marker = tempdir.path().join("Palyra-TestHarness");
+        let production_state = tempdir.path().join("production-state");
+        fs::create_dir_all(marker.as_path())?;
+        fs::create_dir_all(production_state.as_path())?;
+        let deceptive_state_root = marker.join("..").join("production-state");
+
+        let error = seed_e2e_skill_fixtures(deceptive_state_root.as_path())
+            .expect_err("a lexical harness marker removed by traversal must not authorize seeding");
+
+        assert!(
+            error.to_string().contains("restricted to Palyra-TestHarness state roots"),
+            "error should explain canonical harness restriction: {error}"
+        );
+        assert!(
+            !production_state.join("skills").exists()
+                && !production_state.join(DEFAULT_JOURNAL_DB_PATH).exists(),
+            "rejected seeding must not modify the production state root"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn seed_e2e_skill_fixtures_rejects_tampered_trust_store() -> Result<()> {
         let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
