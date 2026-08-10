@@ -21,6 +21,9 @@ use crate::channel_router::InboundCoalescingPolicy;
 const INBOUND_COALESCING_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
 const CONSUMED_MESSAGE_TTL_MS: i64 = 5 * 60_000;
+const MAX_MESSAGES_PER_BUCKET: usize = 32;
+const MAX_BUCKET_LIFETIME_MS: i64 = 30_000;
+const MAX_CONSUMED_MESSAGE_RECORDS: usize = 32 * 1_024;
 
 pub(crate) const INBOUND_COALESCING_PENDING_EVENT: &str = "inbound.coalescing.pending";
 pub(crate) const INBOUND_COALESCING_READY_EVENT: &str = "inbound.coalescing.ready";
@@ -175,6 +178,7 @@ pub(crate) struct InboundCoalescingRequest {
     pub(crate) thread_id: Option<String>,
     pub(crate) sender_identity: Option<String>,
     pub(crate) text: String,
+    pub(crate) max_coalesced_text_bytes: usize,
     pub(crate) received_at_unix_ms: i64,
     pub(crate) has_media: bool,
     pub(crate) is_command: bool,
@@ -235,7 +239,8 @@ impl InboundCoalescer {
     /// # Errors
     /// Returns `inbound_coalescing/state_unavailable` when the state lock is
     /// poisoned and `inbound_coalescing/max_tracked_keys_exceeded` when a
-    /// new key would exceed the policy key limit.
+    /// new key would exceed the policy key limit. A bucket also fails closed
+    /// when its message-count or aggregate-text limit would be exceeded.
     pub(crate) fn submit_deferred(
         &self,
         request: InboundCoalescingRequest,
@@ -292,9 +297,10 @@ impl InboundCoalescer {
                 )
             });
             // push() slides ready_at forward: every new message restarts the
-            // debounce window from its own arrival time. Retries for a
-            // message already in the bucket are idempotent and do not slide.
+            // debounce window up to the bucket's fixed lifetime deadline.
+            // Retries for a message already in the bucket are idempotent.
             if !bucket.contains_message_id(message_id.as_str()) {
+                bucket.ensure_request_fits(&request)?;
                 bucket.push(request, self.policy.debounce_ms);
             }
             bucket.ready_at_unix_ms
@@ -306,7 +312,12 @@ impl InboundCoalescer {
                 .remove(&key)
                 .expect("bucket inserted above cannot vanish while the lock is held");
             let coalesced = bucket.coalesced();
-            remember_consumed_messages(&mut guard, &coalesced, ready_at_unix_ms);
+            remember_consumed_messages(
+                &mut guard,
+                &coalesced,
+                ready_at_unix_ms,
+                self.max_consumed_message_records(),
+            );
             return Ok(InboundCoalescingDecision {
                 kind: InboundCoalescingDecisionKind::Ready,
                 reason: "debounce_window_elapsed".to_owned(),
@@ -434,7 +445,12 @@ impl InboundCoalescer {
                 continue;
             };
             let coalesced = bucket.coalesced();
-            remember_consumed_messages(&mut guard, &coalesced, now_unix_ms);
+            remember_consumed_messages(
+                &mut guard,
+                &coalesced,
+                now_unix_ms,
+                self.max_consumed_message_records(),
+            );
             decisions.push(InboundCoalescingDecision {
                 kind: InboundCoalescingDecisionKind::Ready,
                 reason: "debounce_window_elapsed".to_owned(),
@@ -472,6 +488,13 @@ impl InboundCoalescer {
             tracked_key_count: self.state.lock().map_or(0, |guard| guard.pending.len()),
         }
     }
+
+    fn max_consumed_message_records(&self) -> usize {
+        self.policy
+            .max_tracked_keys
+            .saturating_mul(MAX_MESSAGES_PER_BUCKET)
+            .clamp(1, MAX_CONSUMED_MESSAGE_RECORDS)
+    }
 }
 
 impl InboundCoalescingRequest {
@@ -492,7 +515,10 @@ struct PendingCoalescingBucket {
     coalescing_id: String,
     key: InboundCoalescingKey,
     messages: Vec<PendingCoalescingMessage>,
+    aggregate_text_bytes: usize,
+    max_coalesced_text_bytes: usize,
     first_received_at_unix_ms: i64,
+    hard_deadline_unix_ms: i64,
     ready_at_unix_ms: i64,
 }
 
@@ -503,12 +529,20 @@ impl PendingCoalescingBucket {
         first_received_at_unix_ms: i64,
         debounce_ms: u64,
     ) -> Self {
+        let hard_deadline_unix_ms =
+            first_received_at_unix_ms.saturating_add(MAX_BUCKET_LIFETIME_MS);
+        let debounce_ms = i64::try_from(debounce_ms).unwrap_or(i64::MAX);
         Self {
             coalescing_id: build_coalescing_id(&key, first_message_id),
             key,
             messages: Vec::new(),
+            aggregate_text_bytes: 0,
+            max_coalesced_text_bytes: usize::MAX,
             first_received_at_unix_ms,
-            ready_at_unix_ms: first_received_at_unix_ms.saturating_add(debounce_ms as i64),
+            hard_deadline_unix_ms,
+            ready_at_unix_ms: first_received_at_unix_ms
+                .saturating_add(debounce_ms)
+                .min(hard_deadline_unix_ms),
         }
     }
 
@@ -516,11 +550,53 @@ impl PendingCoalescingBucket {
         self.messages.iter().any(|message| message.provenance.message_id.as_str() == message_id)
     }
 
+    fn ensure_request_fits(
+        &self,
+        request: &InboundCoalescingRequest,
+    ) -> Result<(), InboundCoalescingError> {
+        if self.messages.len() >= MAX_MESSAGES_PER_BUCKET {
+            return Err(InboundCoalescingError {
+                code: "inbound_coalescing/max_bucket_messages_exceeded",
+                message: format!(
+                    "inbound coalescing bucket reached max_messages={MAX_MESSAGES_PER_BUCKET}"
+                ),
+            });
+        }
+        let separator_bytes = usize::from(!self.messages.is_empty()) * 2;
+        let next_bytes = self
+            .aggregate_text_bytes
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(request.text.len()))
+            .ok_or_else(|| InboundCoalescingError {
+                code: "inbound_coalescing/max_bucket_bytes_exceeded",
+                message: "inbound coalescing bucket byte count overflowed".to_owned(),
+            })?;
+        let max_coalesced_text_bytes =
+            self.max_coalesced_text_bytes.min(request.max_coalesced_text_bytes);
+        if next_bytes > max_coalesced_text_bytes {
+            return Err(InboundCoalescingError {
+                code: "inbound_coalescing/max_bucket_bytes_exceeded",
+                message: format!(
+                    "inbound coalescing bucket would use {next_bytes} bytes, max_coalesced_text_bytes={}",
+                    max_coalesced_text_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn push(&mut self, request: InboundCoalescingRequest, debounce_ms: u64) {
         let order = u32::try_from(self.messages.len()).unwrap_or(u32::MAX);
-        // Sliding window: each message restarts the debounce from its own
-        // arrival. The as-cast is safe for any realistic config value.
-        self.ready_at_unix_ms = request.received_at_unix_ms.saturating_add(debounce_ms as i64);
+        let debounce_ms = i64::try_from(debounce_ms).unwrap_or(i64::MAX);
+        let separator_bytes = usize::from(!self.messages.is_empty()) * 2;
+        self.aggregate_text_bytes = self
+            .aggregate_text_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(request.text.len());
+        self.max_coalesced_text_bytes =
+            self.max_coalesced_text_bytes.min(request.max_coalesced_text_bytes);
+        self.ready_at_unix_ms =
+            request.received_at_unix_ms.saturating_add(debounce_ms).min(self.hard_deadline_unix_ms);
         self.messages.push(PendingCoalescingMessage {
             provenance: InboundMessageProvenance {
                 message_id: normalize_required_component(request.message_id.as_str(), "unknown"),
@@ -576,6 +652,12 @@ fn policy_snapshot_json(policy: &InboundCoalescingPolicy) -> Value {
         "enabled": policy.enabled,
         "debounce_ms": policy.debounce_ms,
         "max_tracked_keys": policy.max_tracked_keys,
+        "max_messages_per_bucket": MAX_MESSAGES_PER_BUCKET,
+        "max_bucket_lifetime_ms": MAX_BUCKET_LIFETIME_MS,
+        "max_consumed_message_records": policy
+            .max_tracked_keys
+            .saturating_mul(MAX_MESSAGES_PER_BUCKET)
+            .clamp(1, MAX_CONSUMED_MESSAGE_RECORDS),
         "bypass_commands": policy.bypass_commands,
         "bypass_media": policy.bypass_media,
     })
@@ -623,6 +705,7 @@ fn remember_consumed_messages(
     state: &mut InboundCoalescerState,
     coalesced: &InboundCoalescedInput,
     ready_at_unix_ms: i64,
+    max_records: usize,
 ) {
     let expires_at_unix_ms = ready_at_unix_ms.saturating_add(CONSUMED_MESSAGE_TTL_MS);
     for provenance in &coalesced.provenance {
@@ -634,6 +717,9 @@ fn remember_consumed_messages(
                 expires_at_unix_ms,
             },
         );
+    }
+    while state.consumed_messages.len() > max_records {
+        state.consumed_messages.pop_first();
     }
 }
 
@@ -675,6 +761,7 @@ mod tests {
             thread_id: Some("thread-1".to_owned()),
             sender_identity: Some("discord:user:1".to_owned()),
             text: text.to_owned(),
+            max_coalesced_text_bytes: 32 * 1_024,
             received_at_unix_ms,
             has_media: false,
             is_command: false,
@@ -704,6 +791,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("m-1", 1_000, 0), ("m-2", 1_050, 1)]
         );
+    }
+
+    #[test]
+    fn deferred_bucket_rejects_message_and_byte_growth_beyond_hard_limits() {
+        let coalescer = InboundCoalescer::new(policy());
+        for index in 0..MAX_MESSAGES_PER_BUCKET {
+            coalescer
+                .submit(request(
+                    format!("m-{index}").as_str(),
+                    "x",
+                    1_000 + i64::try_from(index).unwrap_or_default(),
+                ))
+                .expect("bounded message should be accepted");
+        }
+        let count_error = coalescer
+            .submit(request("m-overflow", "x", 1_050))
+            .expect_err("bucket message count must be bounded");
+        assert_eq!(count_error.code(), "inbound_coalescing/max_bucket_messages_exceeded");
+
+        let byte_limited = InboundCoalescer::new(policy());
+        let mut first = request("b-1", "1234", 2_000);
+        first.max_coalesced_text_bytes = 10;
+        byte_limited.submit(first).expect("first bytes should fit");
+        let mut second = request("b-2", "5678", 2_010);
+        second.max_coalesced_text_bytes = 10;
+        byte_limited.submit(second).expect("separator and second text should exactly fit");
+        let mut third = request("b-3", "x", 2_020);
+        third.max_coalesced_text_bytes = 10;
+        let byte_error =
+            byte_limited.submit(third).expect_err("aggregate byte limit must be enforced");
+        assert_eq!(byte_error.code(), "inbound_coalescing/max_bucket_bytes_exceeded");
+    }
+
+    #[test]
+    fn deferred_bucket_deadline_and_consumed_cache_are_hard_bounded() {
+        let deadline_coalescer = InboundCoalescer::new(InboundCoalescingPolicy {
+            debounce_ms: 60_000,
+            max_tracked_keys: 1,
+            ..policy()
+        });
+        deadline_coalescer.submit(request("m-1", "first", 1_000)).expect("first submit");
+        let ready = deadline_coalescer
+            .submit(request("m-2", "second", 1_000 + MAX_BUCKET_LIFETIME_MS))
+            .expect("hard deadline should flush the bucket");
+        assert_eq!(ready.kind, InboundCoalescingDecisionKind::Ready);
+        assert_eq!(ready.ready_at_unix_ms, Some(1_000 + MAX_BUCKET_LIFETIME_MS));
+
+        let cache_coalescer =
+            InboundCoalescer::new(InboundCoalescingPolicy { max_tracked_keys: 1, ..policy() });
+        for index in 0..40 {
+            let received_at = 100_000 + i64::from(index) * 101;
+            let mut item = request(format!("cache-{index}").as_str(), "x", received_at);
+            item.thread_id = Some(format!("thread-{index}"));
+            cache_coalescer.submit(item).expect("cache item should enter a bucket");
+            cache_coalescer.drain_ready(received_at + 100).expect("cache item should drain");
+        }
+        let guard = cache_coalescer.state.lock().expect("coalescer state should lock");
+        assert_eq!(guard.consumed_messages.len(), MAX_MESSAGES_PER_BUCKET);
     }
 
     #[test]

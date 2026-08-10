@@ -491,6 +491,10 @@ pub(crate) async fn handle_routed_route_message(
         thread_id: plan.reply_thread_id.clone().or_else(|| input.adapter_thread_id.clone()),
         sender_identity: plan.sender_identity.clone(),
         text: input.text.clone(),
+        max_coalesced_text_bytes: usize::try_from(input.max_payload_bytes)
+            .unwrap_or(usize::MAX)
+            .max(input.text.len())
+            .max(1),
         received_at_unix_ms: current_unix_ms(),
         has_media: !content.attachments.is_empty(),
         is_command: input_is_command,
