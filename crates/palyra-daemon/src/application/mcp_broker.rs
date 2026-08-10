@@ -10,12 +10,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
+    net::IpAddr,
     sync::{mpsc, Arc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(test)]
-use std::{env, io::Read, net::IpAddr, process::Stdio};
+use std::{env, io::Read, process::Stdio};
 
 use palyra_common::{
     qa_runtime_path::McpTransportInvocationMode,
@@ -31,8 +32,9 @@ use palyra_egress_proxy::{EgressProxyPolicyService, EgressProxyRequest};
 use palyra_safety::{
     transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
 };
+use reqwest::Url;
 #[cfg(test)]
-use reqwest::{blocking::Response, redirect::Policy, Url};
+use reqwest::{blocking::Response, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -2829,10 +2831,7 @@ fn validate_transport(
             }
         }
         McpTransportManifest::Http { url } | McpTransportManifest::Sse { url } => {
-            if !url.starts_with("https://")
-                && !url.starts_with("http://127.0.0.1")
-                && !url.starts_with("http://localhost")
-            {
+            if !remote_mcp_transport_url_allowed(url) {
                 findings.push(finding(
                     McpFindingSeverity::Error,
                     "mcp.remote_transport_url_rejected",
@@ -2841,6 +2840,30 @@ fn validate_transport(
                 ));
             }
         }
+    }
+}
+
+fn remote_mcp_transport_url_allowed(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            let host =
+                host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+            host.eq_ignore_ascii_case("localhost")
+                || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+        }),
+        _ => false,
     }
 }
 
@@ -4320,6 +4343,34 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == "mcp.stdio_command_not_allowlisted"));
+    }
+
+    #[test]
+    fn remote_transport_url_validation_uses_the_effective_host() {
+        for allowed in [
+            "https://mcp.example.test/v1",
+            "http://localhost:3030/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.42.0.7/mcp",
+            "http://[::1]/mcp",
+        ] {
+            assert!(remote_mcp_transport_url_allowed(allowed), "should allow {allowed}");
+        }
+        for rejected in [
+            "http://mcp.example.test/mcp",
+            "http://localhost@evil.example/mcp",
+            "http://localhost.evil.example/mcp",
+            "http://127.0.0.1@evil.example/mcp",
+            "http://127.0.0.1.evil.example/mcp",
+            "http://user@localhost/mcp",
+            "https://user:secret@mcp.example.test/mcp",
+            "https://mcp.example.test/mcp?token=secret",
+            "https://mcp.example.test/mcp#fragment",
+            "ftp://localhost/mcp",
+            "not-a-url",
+        ] {
+            assert!(!remote_mcp_transport_url_allowed(rejected), "should reject {rejected}");
+        }
     }
 
     #[test]
