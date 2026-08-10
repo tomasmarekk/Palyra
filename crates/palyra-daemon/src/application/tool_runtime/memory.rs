@@ -2271,6 +2271,9 @@ async fn maybe_replace_workspace_document_by_id(
             ));
         }
     };
+    if !is_workspace_memory_document_path(document.path.as_str()) {
+        return None;
+    }
     if let Err(error) = enforce_workspace_document_mutation_scope(
         &document,
         context.principal,
@@ -2358,6 +2361,13 @@ async fn maybe_replace_workspace_document_by_id(
             format!("palyra.memory.replace failed to serialize workspace output: {error}"),
         ),
     })
+}
+
+fn is_workspace_memory_document_path(path: &str) -> bool {
+    path == "MEMORY.md"
+        || path.strip_prefix("projects/").is_some_and(|project_path| {
+            project_path.contains('/') && project_path.ends_with("/MEMORY.md")
+        })
 }
 
 #[allow(clippy::result_large_err)]
@@ -5556,6 +5566,25 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("replaced in place"));
+    }
+
+    #[test]
+    fn workspace_memory_replace_targets_only_memory_documents() {
+        for allowed in
+            ["MEMORY.md", "projects/palyra/MEMORY.md", "projects/clients/palyra/MEMORY.md"]
+        {
+            assert!(is_workspace_memory_document_path(allowed), "{allowed}");
+        }
+        for denied in [
+            "README.md",
+            "HEARTBEAT.md",
+            "context/notes.md",
+            "daily/2026-08-10.md",
+            "projects/palyra/README.md",
+            "projects/MEMORY.md",
+        ] {
+            assert!(!is_workspace_memory_document_path(denied), "{denied}");
+        }
     }
 
     #[test]
