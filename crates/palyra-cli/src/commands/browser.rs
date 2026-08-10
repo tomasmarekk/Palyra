@@ -1726,14 +1726,14 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 "browser.profiles.list principal={} count={} active_profile_id={}",
                 envelope.principal,
                 envelope.profiles.len(),
-                browser_session_handle_text(envelope.active_profile_id.as_deref()),
+                redacted_browser_identifier_text(envelope.active_profile_id.as_deref(), "profile"),
             );
             for profile in &envelope.profiles {
                 text.push('\n');
                 text.push_str(
                     format!(
                         "profile id={} name={} private={} persistence={} active={}",
-                        browser_session_handle_text(profile.profile_id.as_deref()),
+                        redacted_browser_identifier_text(profile.profile_id.as_deref(), "profile"),
                         profile.name,
                         profile.private_profile,
                         profile.persistence_enabled,
@@ -1774,7 +1774,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.create profile_id={} name={} private={} active={}",
-                    browser_session_handle_text(envelope.profile.profile_id.as_deref()),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile"
+                    ),
                     envelope.profile.name,
                     envelope.profile.private_profile,
                     envelope.profile.active,
@@ -1798,7 +1801,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.rename profile_id={} name={}",
-                    browser_session_handle_text(envelope.profile.profile_id.as_deref()),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile"
+                    ),
                     envelope.profile.name,
                 ),
                 "failed to encode browser profile rename output",
@@ -1819,9 +1825,12 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.delete profile_id={} deleted={} active_profile_id={}",
-                    browser_session_handle_text(Some(envelope.profile_id.as_str())),
+                    redacted_browser_identifier_text(Some(envelope.profile_id.as_str()), "profile"),
                     envelope.deleted,
-                    browser_session_handle_text(envelope.active_profile_id.as_deref()),
+                    redacted_browser_identifier_text(
+                        envelope.active_profile_id.as_deref(),
+                        "profile"
+                    ),
                 ),
                 "failed to encode browser profile delete output",
             )
@@ -1841,7 +1850,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.activate profile_id={} name={} active={}",
-                    browser_session_handle_text(envelope.profile.profile_id.as_deref()),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile"
+                    ),
                     envelope.profile.name,
                     envelope.profile.active,
                 ),
@@ -4842,11 +4854,7 @@ fn browser_identifier_json_value(value: Option<&str>) -> Value {
 }
 
 fn browser_session_handle_text(value: Option<&str>) -> String {
-    value
-        .map(str::trim)
-        .filter(|candidate| !candidate.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "-".to_owned())
+    redacted_browser_identifier_text(value.map(str::trim), "session")
 }
 
 /// Keeps the operator-supplied id in `session_id` so output stays reusable in
@@ -5819,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_list_text_preserves_reusable_session_id() {
+    fn browser_session_list_text_redacts_reusable_session_id() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let line = format_browser_session_summary_text(&browser_v1::BrowserSessionSummary {
             session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
@@ -5830,9 +5838,10 @@ mod tests {
         });
 
         assert!(
-            line.contains("session_id=01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-            "session list text should preserve the canonical reusable session handle: {line}"
+            line.contains("session_id=session-"),
+            "session list text should use a redacted session handle: {line}"
         );
+        assert!(!line.contains(session_id), "{line}");
     }
 
     #[test]
@@ -5862,7 +5871,8 @@ mod tests {
             None,
         );
 
-        assert!(text.contains("browser.console session_id=01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(text.contains("browser.console session_id=session-"));
+        assert!(!text.contains(session_id), "{text}");
         assert!(text.contains("entries=2"));
         assert!(text.contains("severity=info"));
         assert!(text.contains("source=\"console.log\""));
@@ -5901,14 +5911,15 @@ mod tests {
     }
 
     #[test]
-    fn session_scoped_text_preserves_requested_session_id() {
+    fn session_scoped_text_redacts_requested_session_id() {
         let requested = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let text = format!(
             "browser.screenshot session_id={}",
             browser_session_handle_text(Some(requested))
         );
 
-        assert!(text.contains("session_id=01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{text}");
+        assert!(text.contains("session_id=session-"), "{text}");
+        assert!(!text.contains(requested), "{text}");
         assert!(!text.contains("runtime_session_id="), "{text}");
     }
 
