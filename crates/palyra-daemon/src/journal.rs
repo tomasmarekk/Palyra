@@ -254,6 +254,7 @@ const MAX_MEMORY_VECTOR_SCAN_CANDIDATES: usize = 1_024;
 const MEMORY_FTS_SPARSE_PAIR_MIN_CHARS: usize = 4;
 const MEMORY_FTS_SPARSE_SINGLE_MIN_CHARS: usize = 8;
 const MEMORY_FTS_MAX_SPARSE_FALLBACKS: usize = 8;
+const MEMORY_TAG_QUERY_MAX_TERMS: usize = 8;
 // Vector-only recall has no lexical seed, so require an absolute semantic signal
 // before relative score normalization can promote the candidate.
 const MIN_VECTOR_ONLY_COSINE_SIMILARITY: f64 = 0.25;
@@ -34362,6 +34363,9 @@ fn memory_tag_query_terms(query: &str) -> Vec<String> {
             && valid_memory_tag_query_term(term.as_str())
         {
             push_unique_fts_query(&mut terms, term);
+            if terms.len() >= MEMORY_TAG_QUERY_MAX_TERMS {
+                break;
+            }
         }
     }
     terms
@@ -35414,19 +35418,19 @@ mod tests {
 
     use super::{
         acquire_session_write_lease_tx, build_fts_query, build_memory_fts_queries, current_unix_ms,
-        encode_vector_blob, memory_query_embedding_cache_scope, query_embedding_cache_key,
-        release_session_write_lease_tx, session_search_source_refs_projection,
-        session_search_window_source_ref, sha256_hex, workspace_query_embedding_cache_scope,
-        AgentPlanCreateRequest, AgentPlanListFilter, AgentPlanUpdateRequest, ApprovalCreateRequest,
-        ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
-        ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType,
-        ApprovalsListFilter, BackgroundTaskChildResolution, CanvasStateTransitionRequest,
-        CommitmentCandidateSensitivity, CommitmentCandidateV2, CommitmentCreateRequest,
-        CommitmentDeliveryAttemptCreateRequest, CommitmentEvidenceSpanV2, CommitmentListFilter,
-        CommitmentUpdateRequest, CompatResponseUpsertRequest, CronConcurrencyPolicy,
-        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
-        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
-        CronScheduleType, DelegatedRunAdmissionV1, FlowCreateRequest,
+        encode_vector_blob, memory_query_embedding_cache_scope, memory_tag_query_terms,
+        query_embedding_cache_key, release_session_write_lease_tx,
+        session_search_source_refs_projection, session_search_window_source_ref, sha256_hex,
+        workspace_query_embedding_cache_scope, AgentPlanCreateRequest, AgentPlanListFilter,
+        AgentPlanUpdateRequest, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
+        ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, BackgroundTaskChildResolution,
+        CanvasStateTransitionRequest, CommitmentCandidateSensitivity, CommitmentCandidateV2,
+        CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentEvidenceSpanV2,
+        CommitmentListFilter, CommitmentUpdateRequest, CompatResponseUpsertRequest,
+        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
+        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
+        CronRunsListFilter, CronScheduleType, DelegatedRunAdmissionV1, FlowCreateRequest,
         FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest, FlowStepCreateRequest,
         FlowStepDependenciesReplacement, FlowStepUpdateRequest, FlowTransitionRequest,
         HashMemoryEmbeddingProvider, IdempotencyBeginRequest, IdempotencyCompleteRequest,
@@ -35471,8 +35475,8 @@ mod tests {
         WorkItemUpdateRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
         WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest,
         WorkspaceSearchRequest, COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
-        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
-        MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
+        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MEMORY_TAG_QUERY_MAX_TERMS,
+        MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
         NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
         NETWORKED_WORKER_EXPIRY_MAX_ENTRIES, NETWORKED_WORKER_FLEET_MAX_ENTRIES,
         RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
@@ -54722,6 +54726,20 @@ mod tests {
             queries.iter().any(|query| query == "regression testing"),
             "adjacent sparse pairs should remain available for follow-up recall: {queries:?}"
         );
+    }
+
+    #[test]
+    fn memory_tag_query_terms_are_bounded() {
+        let query = (0..64)
+            .map(|index| format!("distinct_memory_tag_{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let terms = memory_tag_query_terms(query.as_str());
+
+        assert_eq!(terms.len(), MEMORY_TAG_QUERY_MAX_TERMS);
+        assert_eq!(terms.first().map(String::as_str), Some("distinct_memory_tag_00"));
+        assert_eq!(terms.last().map(String::as_str), Some("distinct_memory_tag_07"));
     }
 
     #[test]
