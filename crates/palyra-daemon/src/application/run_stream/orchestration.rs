@@ -4979,6 +4979,7 @@ async fn process_run_stream_message_inner(
         *remaining_tool_budget,
         DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
     );
+    loop_state.set_direct_user_input(input_text.clone());
     append_agent_loop_tape_event(
         runtime_state,
         run_id.as_str(),
@@ -8289,7 +8290,7 @@ fn is_browser_tool_name(tool_name: &str) -> bool {
 
 fn incomplete_final_answer_without_tools(
     text: Option<&str>,
-    messages: &[ProviderMessage],
+    direct_user_input: Option<&str>,
 ) -> Option<String> {
     let text = text.unwrap_or_default().trim();
     if text.is_empty() {
@@ -8297,7 +8298,9 @@ fn incomplete_final_answer_without_tools(
             "model returned an empty final answer without executing any requested tools".to_owned(),
         );
     }
-    if final_answer_is_minimal_ack(text) && !user_requested_exact_minimal_answer(text, messages) {
+    if final_answer_is_minimal_ack(text)
+        && !user_requested_exact_minimal_answer(text, direct_user_input)
+    {
         return Some("model returned a bare acknowledgement as the final answer".to_owned());
     }
     if final_answer_is_deferred_tool_work(text) {
@@ -8360,7 +8363,7 @@ fn incomplete_terminal_final_answer(
 ) -> Option<String> {
     let messages = loop_state.messages();
     if loop_state.completed_tool_calls() == 0 {
-        return incomplete_final_answer_without_tools(text, messages.as_slice());
+        return incomplete_final_answer_without_tools(text, loop_state.direct_user_input());
     }
 
     let text = text.unwrap_or_default().trim();
@@ -8369,7 +8372,7 @@ fn incomplete_terminal_final_answer(
     }
 
     if final_answer_is_minimal_ack(text)
-        && !user_requested_exact_minimal_answer(text, messages.as_slice())
+        && !user_requested_exact_minimal_answer(text, loop_state.direct_user_input())
     {
         return Some(
             "model returned a bare acknowledgement instead of a final answer with tool evidence"
@@ -8442,28 +8445,14 @@ fn is_ack_sentinel_token(normalized: &str) -> bool {
         && suffix.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
 }
 
-fn user_requested_exact_minimal_answer(answer: &str, messages: &[ProviderMessage]) -> bool {
+fn user_requested_exact_minimal_answer(answer: &str, direct_user_input: Option<&str>) -> bool {
     let normalized_answer = normalize_final_answer_text(answer);
     if !final_answer_is_minimal_ack(normalized_answer.as_str()) {
         return false;
     }
 
-    current_user_message_for_exact_answer(messages).is_some_and(|message| {
-        user_message_requests_exact_answer(
-            message.text_content().as_str(),
-            normalized_answer.as_str(),
-        )
-    })
-}
-
-fn current_user_message_for_exact_answer(messages: &[ProviderMessage]) -> Option<&ProviderMessage> {
-    messages
-        .iter()
-        .take_while(|message| {
-            !matches!(message.role, ProviderMessageRole::Assistant | ProviderMessageRole::Tool)
-        })
-        .filter(|message| message.role == ProviderMessageRole::User)
-        .last()
+    direct_user_input
+        .is_some_and(|input| user_message_requests_exact_answer(input, normalized_answer.as_str()))
 }
 
 fn user_message_requests_exact_answer(text: &str, normalized_answer: &str) -> bool {

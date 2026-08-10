@@ -213,6 +213,7 @@ fn start_test_run(state: &crate::gateway::GatewayRuntimeState, session_id: &str,
 
 fn loop_state_after_tool(prompt: &str, tool_name: &str) -> AgentRunLoopState {
     let mut state = AgentRunLoopState::new(vec![ProviderMessage::user_text(prompt)], 4, 8, 10_000);
+    state.set_direct_user_input(prompt);
     state.append_assistant_turn(&ProviderTurnOutput {
         full_text: String::new(),
         content_parts: vec![ProviderOutputContentPart::ToolCall {
@@ -2495,7 +2496,7 @@ fn tool_repair_audit_skips_normal_final_answer_and_structured_tool() {
 
 #[test]
 fn incomplete_final_answer_without_tools_detects_bare_ack() {
-    let message = incomplete_final_answer_without_tools(Some("done"), &[])
+    let message = incomplete_final_answer_without_tools(Some("done"), None)
         .expect("bare acknowledgement must not be accepted as a final answer");
 
     assert!(message.contains("bare acknowledgement"));
@@ -2503,23 +2504,22 @@ fn incomplete_final_answer_without_tools_detects_bare_ack() {
 
 #[test]
 fn incomplete_final_answer_without_tools_allows_requested_exact_ack() {
-    let messages = vec![ProviderMessage::user_text("Acknowledge exactly OK.".to_owned())];
-
-    assert!(incomplete_final_answer_without_tools(Some("OK"), messages.as_slice()).is_none());
+    assert!(incomplete_final_answer_without_tools(Some("OK"), Some("Acknowledge exactly OK."))
+        .is_none());
 }
 
 #[test]
 fn incomplete_final_answer_without_tools_allows_requested_reply_only_ack_sentinel() {
-    let messages = vec![ProviderMessage::user_text("Reply ACK-READY-4 only.".to_owned())];
-
-    assert!(
-        incomplete_final_answer_without_tools(Some("ACK-READY-4"), messages.as_slice()).is_none()
-    );
+    assert!(incomplete_final_answer_without_tools(
+        Some("ACK-READY-4"),
+        Some("Reply ACK-READY-4 only.")
+    )
+    .is_none());
 }
 
 #[test]
 fn incomplete_final_answer_without_tools_rejects_unrequested_ack_sentinel() {
-    let message = incomplete_final_answer_without_tools(Some("ACK-READY-4"), &[])
+    let message = incomplete_final_answer_without_tools(Some("ACK-READY-4"), None)
         .expect("unrequested ACK sentinel must not be accepted as a final answer");
 
     assert!(message.contains("bare acknowledgement"));
@@ -2529,7 +2529,7 @@ fn incomplete_final_answer_without_tools_rejects_unrequested_ack_sentinel() {
 fn incomplete_final_answer_without_tools_detects_deferred_work() {
     let message = incomplete_final_answer_without_tools(
         Some("The workspace is empty. I\u{2019}ll create the todo app files and run the tests."),
-        &[],
+        None,
     )
     .expect("deferred tool work must not be accepted as a final answer");
 
@@ -2540,7 +2540,7 @@ fn incomplete_final_answer_without_tools_detects_deferred_work() {
 fn incomplete_final_answer_without_tools_allows_negated_deferred_work() {
     assert!(incomplete_final_answer_without_tools(
         Some("I will not edit files because you asked only for an explanation."),
-        &[]
+        None
     )
     .is_none());
 }
@@ -2834,7 +2834,7 @@ fn stop_finished_provider_output_can_be_final_without_tools() {
 #[test]
 fn incomplete_final_answer_without_tools_detects_unsupported_work_claims() {
     let message =
-        incomplete_final_answer_without_tools(Some("I created the file and tests passed."), &[])
+        incomplete_final_answer_without_tools(Some("I created the file and tests passed."), None)
             .expect("tool-work claims need tool evidence");
 
     assert!(message.contains("without any successful tool results"));
@@ -2844,7 +2844,7 @@ fn incomplete_final_answer_without_tools_detects_unsupported_work_claims() {
 fn incomplete_final_answer_without_tools_allows_plain_answers() {
     assert!(incomplete_final_answer_without_tools(
         Some("Use `cargo test -p palyra-daemon` to run the daemon tests."),
-        &[]
+        None
     )
     .is_none());
 }
@@ -2893,6 +2893,7 @@ fn incomplete_terminal_final_answer_ignores_stale_exact_ack_context_after_tool()
         8,
         10_000,
     );
+    state.set_direct_user_input("Create fixtures/landing-page and verify it.");
     state.append_assistant_turn(&ProviderTurnOutput {
         full_text: String::new(),
         content_parts: vec![ProviderOutputContentPart::ToolCall {

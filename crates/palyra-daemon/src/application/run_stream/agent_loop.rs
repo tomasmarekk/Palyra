@@ -829,6 +829,7 @@ pub(crate) struct RunProgressProcessSummary {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunLoopState {
     messages: Vec<ProviderMessage>,
+    direct_user_input: Option<String>,
     max_model_turns: Option<u32>,
     remaining_model_turns: Option<u32>,
     max_tool_calls: Option<u32>,
@@ -856,6 +857,7 @@ impl AgentRunLoopState {
     ) -> Self {
         Self {
             messages,
+            direct_user_input: None,
             max_model_turns: None,
             remaining_model_turns: None,
             max_tool_calls: None,
@@ -908,6 +910,17 @@ impl AgentRunLoopState {
     /// Returns an owned copy of the message history for the next provider request.
     pub(crate) fn messages(&self) -> Vec<ProviderMessage> {
         self.messages.clone()
+    }
+
+    /// Pins the current direct operator input separately from augmented provider context.
+    pub(crate) fn set_direct_user_input(&mut self, input: impl Into<String>) {
+        let input = input.into();
+        self.direct_user_input = (!input.trim().is_empty()).then_some(input);
+    }
+
+    /// Returns the direct operator input that admitted this run, when present.
+    pub(crate) fn direct_user_input(&self) -> Option<&str> {
+        self.direct_user_input.as_deref()
     }
 
     /// Replaces only the provider projection after a preflight context
