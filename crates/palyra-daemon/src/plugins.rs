@@ -572,6 +572,9 @@ fn normalize_registry_identifier(raw: &str, field_name: &'static str) -> Result<
     if trimmed.is_empty() {
         bail!("{field_name} cannot be empty");
     }
+    if matches!(trimmed.as_str(), "." | "..") {
+        bail!("{field_name} must not be a filesystem dot segment");
+    }
     if trimmed.len() > 128
         || !trimmed.chars().all(|ch| {
             ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
@@ -3176,12 +3179,14 @@ redacted = true
     #[test]
     fn inspect_plugin_filesystem_safety_rejects_invalid_plugin_identifiers() {
         let tempdir = tempdir().expect("temporary directory should be created");
-        let snapshot = inspect_plugin_filesystem_safety(tempdir.path(), "../escape");
-        assert!(!snapshot.safe);
-        assert!(snapshot
-            .issues
-            .iter()
-            .any(|issue| issue.code == "invalid_plugin_id" && issue.severity == "error"));
+        for plugin_id in ["../escape", ".", ".."] {
+            let snapshot = inspect_plugin_filesystem_safety(tempdir.path(), plugin_id);
+            assert!(!snapshot.safe, "{plugin_id:?} must fail closed");
+            assert!(snapshot
+                .issues
+                .iter()
+                .any(|issue| issue.code == "invalid_plugin_id" && issue.severity == "error"));
+        }
     }
 
     #[cfg(unix)]
