@@ -490,6 +490,8 @@ pub(crate) fn memory_session_search_v2_tool_output_payload(
     outcome: &SessionSearchOutcomeV2,
     session_hits: &[OrchestratorSessionRecord],
 ) -> Value {
+    let session_hits: &[OrchestratorSessionRecord] =
+        if session_search_v2_needs_metadata_fallback(outcome) { session_hits } else { &[] };
     let labels = session_search_v2_output_labels(outcome, session_hits);
     let bookend_count = outcome.hits.iter().map(|hit| hit.bookends.len()).sum::<usize>();
     let artifact_count = outcome.hits.iter().map(|hit| hit.artifacts.len()).sum::<usize>();
@@ -958,11 +960,6 @@ fn session_search_session_hit_payload(
         "source_type": "session",
         "session_id": labels.session_label(session.session_id.as_str()),
         "session_search_label": labels.session_label(session.session_id.as_str()),
-        "title": session.title.as_str(),
-        "preview": session.preview.as_deref(),
-        "last_intent": session.last_intent.as_deref(),
-        "last_summary": session.last_summary.as_deref(),
-        "match_snippet": session.match_snippet.as_deref(),
         "last_run_state": session.last_run_state.as_deref(),
         "updated_at_unix_ms": session.updated_at_unix_ms,
         "lineage": {
@@ -971,6 +968,11 @@ fn session_search_session_hit_payload(
             "branch_origin_run_id": labels.optional_run_label(session.branch_origin_run_id.as_deref()),
         },
     })
+}
+
+fn session_search_v2_needs_metadata_fallback(outcome: &SessionSearchOutcomeV2) -> bool {
+    outcome.operation == SessionSearchOperationV2::Search
+        && outcome.hits.iter().all(|hit| hit.bookends.is_empty())
 }
 
 /// Picks the present/absent claim-boundary string for a memory result set.
@@ -3582,7 +3584,6 @@ pub(crate) async fn execute_memory_session_search_tool(
         }
     };
     let session_fallback_channel = channel.clone();
-    let use_session_fallback = operation == SessionSearchOperationV2::Search;
 
     let request = SessionSearchRequestV2 {
         schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
@@ -3630,6 +3631,7 @@ pub(crate) async fn execute_memory_session_search_tool(
             );
         }
     };
+    let use_session_fallback = session_search_v2_needs_metadata_fallback(&outcome);
     let mut session_hits = if use_session_fallback {
         // Fetch one extra candidate when the current session will be filtered
         // out below, so the compatibility fallback can still reach top_k.
@@ -5381,8 +5383,14 @@ mod tests {
         assert!(!serialized.contains(origin_run_id), "{serialized}");
         assert!(!serialized.contains(session_key), "{serialized}");
         assert!(payload["session_hits"][0].get("session_key").is_none());
+        for content_field in ["title", "preview", "last_intent", "last_summary", "match_snippet"] {
+            assert!(
+                payload["session_hits"][0].get(content_field).is_none(),
+                "fallback metadata must omit conversational field {content_field}"
+            );
+        }
 
-        let v2_outcome = SessionSearchOutcomeV2 {
+        let mut v2_outcome = SessionSearchOutcomeV2 {
             schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
             operation: SessionSearchOperationV2::Search,
             query: "feature flag".to_owned(),
@@ -5432,7 +5440,29 @@ mod tests {
         assert!(!v2_serialized.contains(run_id), "{v2_serialized}");
         assert!(!v2_serialized.contains(session_key), "{v2_serialized}");
         assert!(!v2_serialized.contains("RAW_ARTIFACT_ID"), "{v2_serialized}");
-        assert!(v2_payload["session_hits"][0].get("session_key").is_none());
+        assert_eq!(v2_payload["session_hit_count"], 0);
+        assert!(v2_payload["session_hits"].as_array().is_some_and(Vec::is_empty));
+        assert!(
+            !session_search_v2_needs_metadata_fallback(&v2_outcome),
+            "a transcript bookend must suppress metadata fallback"
+        );
+        v2_outcome.hits[0].bookends.clear();
+        let fallback_payload = memory_session_search_v2_tool_output_payload(
+            &v2_outcome,
+            std::slice::from_ref(&session),
+        );
+        assert_eq!(fallback_payload["session_hit_count"], 1);
+        assert!(fallback_payload["session_hits"][0].get("session_key").is_none());
+        for content_field in ["title", "preview", "last_intent", "last_summary", "match_snippet"] {
+            assert!(
+                fallback_payload["session_hits"][0].get(content_field).is_none(),
+                "fallback metadata must omit conversational field {content_field}"
+            );
+        }
+        assert!(
+            session_search_v2_needs_metadata_fallback(&v2_outcome),
+            "metadata fallback is reserved for searches with no transcript bookends"
+        );
     }
 
     #[test]
