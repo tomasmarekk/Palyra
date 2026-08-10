@@ -83,7 +83,6 @@ pub(crate) async fn normalized_workspace_patch_approval_input_json(
     let parsed = serde_json::from_slice::<Value>(input_json).ok()?;
     let parsed = parsed.as_object()?;
     let patch = parsed.get("patch").and_then(Value::as_str)?;
-    let dry_run = parsed.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
     let resolved_workspace_roots =
         resolve_workspace_patch_roots_for_context(WorkspacePatchRootResolveRequest {
             runtime_state,
@@ -93,7 +92,7 @@ pub(crate) async fn normalized_workspace_patch_approval_input_json(
             run_id,
             parsed,
             patch,
-            dry_run,
+            purpose: WorkspacePatchRootResolvePurpose::ApprovalPreview,
         })
         .await
         .ok()?;
@@ -108,7 +107,19 @@ struct WorkspacePatchRootResolveRequest<'a> {
     run_id: &'a str,
     parsed: &'a Map<String, Value>,
     patch: &'a str,
-    dry_run: bool,
+    purpose: WorkspacePatchRootResolvePurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspacePatchRootResolvePurpose {
+    ApprovalPreview,
+    Execution { dry_run: bool },
+}
+
+impl WorkspacePatchRootResolvePurpose {
+    fn create_missing_relative(self) -> bool {
+        matches!(self, Self::Execution { dry_run: false })
+    }
 }
 
 /// Scoping decision for one patch application.
@@ -286,7 +297,7 @@ pub(crate) async fn execute_workspace_patch_tool(
             run_id,
             parsed: &parsed,
             patch: patch.as_str(),
-            dry_run,
+            purpose: WorkspacePatchRootResolvePurpose::Execution { dry_run },
         })
         .await
         {
@@ -499,7 +510,7 @@ async fn resolve_workspace_patch_roots_for_context(
         request.session_id,
         request.parsed,
         request.patch,
-        request.dry_run,
+        request.purpose.create_missing_relative(),
         agent_workspace_roots.as_slice(),
     )
     .await
@@ -554,7 +565,7 @@ async fn resolve_workspace_patch_roots(
     session_id: &str,
     parsed: &serde_json::Map<String, Value>,
     patch: &str,
-    dry_run: bool,
+    create_missing_relative: bool,
     agent_workspace_roots: &[PathBuf],
 ) -> Result<ResolvedWorkspacePatchRoots, String> {
     if let Some(value) = parsed.get("workspace_root") {
@@ -577,7 +588,7 @@ async fn resolve_workspace_patch_roots(
             return resolve_workspace_root_override(
                 agent_workspace_roots,
                 workspace_root,
-                !dry_run,
+                create_missing_relative,
             );
         }
     }
@@ -1605,7 +1616,8 @@ mod tests {
         reject_env_prefixed_workspace_patch_paths, resolve_workspace_root_override,
         serialize_workspace_patch_success, workspace_patch_error_outcome,
         workspace_patch_planning_request, workspace_patch_recovery_hint,
-        workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
+        workspace_patch_tool_execution_outcome, WorkspacePatchRootResolvePurpose,
+        WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
@@ -1848,6 +1860,18 @@ mod tests {
             !workspace.join("web-research-smoke").exists(),
             "dry-run resolution must not mutate the filesystem"
         );
+    }
+
+    #[test]
+    fn approval_preview_never_enables_missing_workspace_creation() {
+        assert!(
+            !WorkspacePatchRootResolvePurpose::ApprovalPreview.create_missing_relative(),
+            "approval prompt construction must remain side-effect free"
+        );
+        assert!(!WorkspacePatchRootResolvePurpose::Execution { dry_run: true }
+            .create_missing_relative());
+        assert!(WorkspacePatchRootResolvePurpose::Execution { dry_run: false }
+            .create_missing_relative());
     }
 
     #[test]
