@@ -13,6 +13,7 @@ use palyra_common::replay_bundle::{
 use serde_json::{json, Value};
 
 const RUN_TRAJECTORY_JSONL_FORMAT: &str = "palyra-run-trajectory-jsonl";
+const RUN_TRAJECTORY_JSONL_SCHEMA_VERSION: u64 = 2;
 const LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES: usize = 1024;
 
 /// Runs a `palyra run` subcommand.
@@ -349,8 +350,9 @@ fn build_run_trajectory_jsonl(
         })
         .collect::<Vec<_>>();
     let events = build_run_trajectory_events(bundle, &mut artifact_index)?;
+    let events_sha256 = sha256_trajectory_events(events.as_slice())?;
     let mut manifest_line = json!({
-        "schema_version": 1,
+        "schema_version": RUN_TRAJECTORY_JSONL_SCHEMA_VERSION,
         "line_type": "manifest",
         "format": RUN_TRAJECTORY_JSONL_FORMAT,
         "requested_format": format.as_str(),
@@ -359,6 +361,7 @@ fn build_run_trajectory_jsonl(
         "session_id": bundle.source.session_id,
         "manifest": export_manifest,
         "event_count": events.len(),
+        "events_sha256": events_sha256,
         "artifact_index": artifact_index,
         "large_output_projection": {
             "threshold_bytes": LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES,
@@ -1170,7 +1173,24 @@ fn parse_run_trajectory_jsonl(bytes: &[u8]) -> Result<RunTrajectoryDocument> {
     if manifest.get("format").and_then(Value::as_str) != Some(RUN_TRAJECTORY_JSONL_FORMAT) {
         anyhow::bail!("trajectory manifest format must be {}", RUN_TRAJECTORY_JSONL_FORMAT);
     }
+    if manifest.get("schema_version").and_then(Value::as_u64)
+        != Some(RUN_TRAJECTORY_JSONL_SCHEMA_VERSION)
+    {
+        anyhow::bail!(
+            "trajectory manifest schema_version must be {}",
+            RUN_TRAJECTORY_JSONL_SCHEMA_VERSION
+        );
+    }
     verify_trajectory_manifest_hash(&manifest)?;
+    let expected_event_count = manifest
+        .get("event_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .context("trajectory manifest has invalid event_count")?;
+    let expected_events_sha256 = manifest
+        .get("events_sha256")
+        .and_then(Value::as_str)
+        .context("trajectory manifest is missing events_sha256")?;
     let mut events = Vec::new();
     for row in rows {
         let row = row?;
@@ -1178,6 +1198,16 @@ fn parse_run_trajectory_jsonl(bytes: &[u8]) -> Result<RunTrajectoryDocument> {
             anyhow::bail!("trajectory JSONL contains non-event row after manifest");
         }
         events.push(row);
+    }
+    if events.len() != expected_event_count {
+        anyhow::bail!(
+            "trajectory event count mismatch: expected {expected_event_count}, found {}",
+            events.len()
+        );
+    }
+    let actual_events_sha256 = sha256_trajectory_events(events.as_slice())?;
+    if actual_events_sha256 != expected_events_sha256 {
+        anyhow::bail!("trajectory event stream hash mismatch");
     }
     Ok(RunTrajectoryDocument { manifest, events })
 }
@@ -1196,6 +1226,12 @@ fn verify_trajectory_manifest_hash(manifest: &Value) -> Result<()> {
         anyhow::bail!("trajectory manifest hash mismatch");
     }
     Ok(())
+}
+
+fn sha256_trajectory_events(events: &[Value]) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(events).context("failed to encode trajectory events for hashing")?;
+    Ok(crate::sha256_hex(bytes.as_slice()))
 }
 
 fn replay_trajectory_document(
@@ -2018,6 +2054,14 @@ mod tests {
             manifest.get("manifest_hash_sha256").and_then(Value::as_str),
             Some(manifest_hash.as_str())
         );
+        assert_eq!(
+            manifest.get("schema_version").and_then(Value::as_u64),
+            Some(RUN_TRAJECTORY_JSONL_SCHEMA_VERSION)
+        );
+        assert!(manifest
+            .get("events_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| digest.len() == 64));
         assert!(lines.iter().skip(1).any(|line| {
             let event = serde_json::from_str::<Value>(line).expect("event line should parse");
             event.get("category").and_then(Value::as_str) == Some("tool_output")
@@ -2038,6 +2082,31 @@ mod tests {
             "trajectory JSONL should export backend execution manifests"
         );
         assert!(!text.contains("secret-token"));
+    }
+
+    #[test]
+    fn trajectory_jsonl_rejects_removed_or_modified_events() {
+        let bundle = fixture_bundle();
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let text = String::from_utf8(bytes).expect("trajectory should be UTF-8");
+        let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        assert!(lines.len() > 2, "fixture should produce multiple trajectory events");
+
+        let removed = format!("{}\n", lines[..lines.len() - 1].join("\n"));
+        let error = parse_run_trajectory_jsonl(removed.as_bytes())
+            .expect_err("removing an event must invalidate the trajectory");
+        assert!(error.to_string().contains("event count mismatch"));
+
+        let mut modified = lines;
+        let mut event: Value =
+            serde_json::from_str(&modified[1]).expect("first event row should parse");
+        event["category"] = Value::String("tampered".to_owned());
+        modified[1] = serde_json::to_string(&event).expect("modified event should encode");
+        let modified = format!("{}\n", modified.join("\n"));
+        let error = parse_run_trajectory_jsonl(modified.as_bytes())
+            .expect_err("modifying an event must invalidate the trajectory");
+        assert!(error.to_string().contains("event stream hash mismatch"));
     }
 
     #[test]

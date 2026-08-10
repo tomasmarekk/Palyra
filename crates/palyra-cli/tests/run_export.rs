@@ -45,6 +45,7 @@ fn run_export_writes_redacted_trajectory_jsonl_from_journal() -> Result<()> {
     let manifest = rows.first().context("trajectory should contain manifest row")?;
     assert_eq!(manifest.get("format").and_then(Value::as_str), Some("palyra-run-trajectory-jsonl"));
     assert!(manifest.get("manifest_hash_sha256").and_then(Value::as_str).is_some());
+    assert!(manifest.get("events_sha256").and_then(Value::as_str).is_some());
     assert!(rows
         .iter()
         .skip(1)
