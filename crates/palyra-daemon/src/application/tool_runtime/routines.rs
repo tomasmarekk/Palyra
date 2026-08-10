@@ -1023,18 +1023,11 @@ async fn upsert_routine(
                 approval_mode_was_requested,
                 execution_posture_was_requested,
             );
-            if trigger_kind == RoutineTriggerKind::FileWatch {
-                // File-watch routines run on a synthesized poll schedule that
-                // would always look high-frequency to the schedule-shaped
-                // auto-enable guard, so the guard is skipped for them.
-                approval_policy
-            } else {
-                routine_approval_policy_with_auto_enable_guard(
-                    schedule.schedule_type,
-                    schedule.schedule_payload_json.as_str(),
-                    approval_policy,
-                )
-            }
+            routine_approval_policy_with_auto_enable_guard(
+                schedule.schedule_type,
+                schedule.schedule_payload_json.as_str(),
+                approval_policy,
+            )
         }
     };
     let concurrency_policy =
@@ -3521,6 +3514,16 @@ mod tests {
         assert_eq!(schedule_payload["interval_ms"], 30_000);
         assert_eq!(schedule_payload["max_runs"], 2);
         assert_eq!(trigger_payload["last_observed"]["exists"], true);
+        assert_eq!(
+            routine_approval_policy_with_auto_enable_guard(
+                schedule.schedule_type,
+                schedule.schedule_payload_json.as_str(),
+                RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
+            )
+            .mode,
+            RoutineApprovalMode::BeforeEnable,
+            "file-watch poll schedules below the auto-enable floor require approval"
+        );
 
         let _ = fs::remove_file(watched_path);
     }

@@ -416,7 +416,6 @@ pub(crate) async fn console_routine_import_handler(
         ensure_job_owner(job, session.context.principal.as_str())?;
     }
     let approval_policy = approval_policy_for_requested_schedule(
-        bundle.routine.trigger_kind,
         bundle.job.schedule_type,
         bundle.job.schedule_payload_json.as_str(),
         bundle.routine.approval_policy.clone(),
@@ -584,7 +583,6 @@ pub(crate) async fn console_routine_upsert_handler(
         execution_posture_was_requested,
     );
     let approval_policy = approval_policy_for_requested_schedule(
-        trigger_kind,
         schedule.schedule_type,
         schedule.schedule_payload_json.as_str(),
         approval_policy,
@@ -729,7 +727,6 @@ pub(crate) async fn console_routine_set_enabled_handler(
     )
     .await?;
     let approval_policy = approval_policy_for_requested_schedule(
-        routine.metadata.trigger_kind,
         routine.job.schedule_type,
         routine.job.schedule_payload_json.as_str(),
         routine.metadata.approval_policy.clone(),
@@ -3171,18 +3168,13 @@ fn default_approval_policy_for_execution(
     approval_policy
 }
 
-// Fast-recurring schedules always get a before-enable approval injected. The
-// file-watch poll schedule is internal bookkeeping and does not make the file
-// watch trigger itself a fast recurring routine.
+// Fast-recurring schedules always get a before-enable approval injected,
+// including file-watch poll schedules that can dispatch durable work.
 fn approval_policy_for_requested_schedule(
-    trigger_kind: RoutineTriggerKind,
     schedule_type: CronScheduleType,
     schedule_payload_json: &str,
     approval_policy: RoutineApprovalPolicy,
 ) -> RoutineApprovalPolicy {
-    if trigger_kind == RoutineTriggerKind::FileWatch {
-        return approval_policy;
-    }
     routine_approval_policy_with_auto_enable_guard(
         schedule_type,
         schedule_payload_json,
@@ -4053,7 +4045,6 @@ mod tests {
     #[test]
     fn requested_schedule_approval_policy_guards_default_none_for_fast_recurring_jobs() {
         let approval_policy = approval_policy_for_requested_schedule(
-            RoutineTriggerKind::Schedule,
             CronScheduleType::Every,
             json!({ "interval_ms": 1_000_u64 }).to_string().as_str(),
             RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
@@ -4065,7 +4056,6 @@ mod tests {
     #[test]
     fn requested_schedule_approval_policy_guards_first_run_for_fast_recurring_jobs() {
         let approval_policy = approval_policy_for_requested_schedule(
-            RoutineTriggerKind::Schedule,
             CronScheduleType::Every,
             json!({ "interval_ms": 1_000_u64 }).to_string().as_str(),
             RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
@@ -4077,7 +4067,6 @@ mod tests {
     #[test]
     fn requested_schedule_approval_policy_guards_implicit_none_for_fast_recurring_jobs() {
         let approval_policy = approval_policy_for_requested_schedule(
-            RoutineTriggerKind::Schedule,
             CronScheduleType::Every,
             json!({ "interval_ms": 1_000_u64 }).to_string().as_str(),
             RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
@@ -4087,15 +4076,14 @@ mod tests {
     }
 
     #[test]
-    fn requested_schedule_approval_policy_preserves_file_watch_poll_policy() {
+    fn requested_schedule_approval_policy_guards_file_watch_poll_schedule() {
         let approval_policy = approval_policy_for_requested_schedule(
-            RoutineTriggerKind::FileWatch,
             CronScheduleType::Every,
-            json!({ "interval_ms": 1_000_u64 }).to_string().as_str(),
+            json!({ "interval_ms": 30_000_u64 }).to_string().as_str(),
             RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
         );
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeEnable);
     }
 
     #[test]
