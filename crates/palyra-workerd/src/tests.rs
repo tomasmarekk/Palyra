@@ -633,6 +633,25 @@ fn worker_lifecycle_supports_successful_handshake_assignment_and_cleanup() {
 }
 
 #[test]
+fn worker_lease_cannot_outlive_its_run_grant() {
+    let mut manager = WorkerFleetManager::default();
+    let policy = WorkerFleetPolicy::default();
+    manager.register_worker(attestation("worker-grant-bound"), &policy, 2_000).unwrap();
+    let mut request = lease_request("run-grant-bound", 501);
+    request.grant.expires_at_unix_ms = 3_000;
+
+    let error = manager
+        .assign_work("worker-grant-bound", request, &policy, 2_500)
+        .expect_err("a lease extending past its grant must fail closed");
+
+    assert_eq!(
+        error,
+        WorkerLifecycleError::InvalidLeaseRequest("lease ttl exceeds grant lifetime".to_owned())
+    );
+    assert_eq!(manager.snapshot().active_leases, 0);
+}
+
+#[test]
 fn worker_fault_probe_is_disabled_by_default() {
     let manager = WorkerFleetManager::default();
     assert!(manager.qa_fault_probe.records().unwrap().is_empty());

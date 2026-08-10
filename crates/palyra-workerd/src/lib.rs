@@ -1897,13 +1897,20 @@ impl WorkerFleetManager {
         policy: &WorkerFleetPolicy,
         now_unix_ms: i64,
     ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
-        validate_lease_request(&request, policy, now_unix_ms)?;
+        let expires_at_unix_ms = validate_lease_request(&request, policy, now_unix_ms)?;
         self.reject_activated_qa_fault("worker.claim.before_effect", request.run_id.as_str())?;
         let worker = self
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
-        let (lease, event) = assign_worker_record(worker_id, worker, request, policy, now_unix_ms)?;
+        let (lease, event) = assign_worker_record(
+            worker_id,
+            worker,
+            request,
+            policy,
+            now_unix_ms,
+            expires_at_unix_ms,
+        )?;
         self.push_recent_event(event.clone());
         Ok((lease, event))
     }
@@ -1953,7 +1960,7 @@ impl WorkerFleetManager {
         now_unix_ms: i64,
         candidate_worker_ids: Option<&BTreeSet<String>>,
     ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
-        validate_lease_request(&request, policy, now_unix_ms)?;
+        let expires_at_unix_ms = validate_lease_request(&request, policy, now_unix_ms)?;
         // A released barrier participant must durably consume its release before
         // another participant's winning lease changes worker availability.
         self.reject_activated_qa_fault("worker.claim.before_effect", request.run_id.as_str())?;
@@ -1970,8 +1977,14 @@ impl WorkerFleetManager {
             .workers
             .get_mut(worker_id.as_str())
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.clone()))?;
-        let (lease, event) =
-            assign_worker_record(worker_id.as_str(), worker, request, policy, now_unix_ms)?;
+        let (lease, event) = assign_worker_record(
+            worker_id.as_str(),
+            worker,
+            request,
+            policy,
+            now_unix_ms,
+            expires_at_unix_ms,
+        )?;
         self.push_recent_event(event.clone());
         Ok((lease, event))
     }
@@ -2780,7 +2793,7 @@ fn validate_lease_request(
     request: &WorkerLeaseRequest,
     policy: &WorkerFleetPolicy,
     now_unix_ms: i64,
-) -> Result<(), WorkerLifecycleError> {
+) -> Result<i64, WorkerLifecycleError> {
     if request.run_id.trim().is_empty() {
         return Err(WorkerLifecycleError::InvalidLeaseRequest(
             "run_id must not be empty".to_owned(),
@@ -2808,7 +2821,15 @@ fn validate_lease_request(
     if request.grant.expires_at_unix_ms <= now_unix_ms {
         return Err(WorkerLifecycleError::InvalidLeaseRequest("grant is expired".to_owned()));
     }
-    Ok(())
+    let ttl_ms = i64::try_from(request.ttl_ms).map_err(|_| WorkerLifecycleError::TtlExceeded)?;
+    let expires_at_unix_ms =
+        now_unix_ms.checked_add(ttl_ms).ok_or(WorkerLifecycleError::TtlExceeded)?;
+    if expires_at_unix_ms > request.grant.expires_at_unix_ms {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "lease ttl exceeds grant lifetime".to_owned(),
+        ));
+    }
+    Ok(expires_at_unix_ms)
 }
 
 /// Checks the policy-required capability authority, SDK protocol, and WIT ABI pins.
@@ -2950,6 +2971,7 @@ fn assign_worker_record(
     request: WorkerLeaseRequest,
     policy: &WorkerFleetPolicy,
     now_unix_ms: i64,
+    expires_at_unix_ms: i64,
 ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
     worker.attestation.validate(&policy.attestation, now_unix_ms)?;
     validate_worker_compatibility(&worker.attestation, policy)?;
@@ -2973,11 +2995,7 @@ fn assign_worker_record(
         lease_id: Ulid::new().to_string(),
         worker_id: worker_id.to_owned(),
         run_id: request.run_id.clone(),
-        // NOTE: `ttl_ms as i64` can wrap only when `policy.max_ttl_ms` is
-        // configured above i64::MAX milliseconds; the wrapped (negative) ttl yields an
-        // already-expired lease that fails closed at the next reap, rather than
-        // granting unbounded time, so the cast is kept as-is.
-        expires_at_unix_ms: now_unix_ms.saturating_add(request.ttl_ms as i64),
+        expires_at_unix_ms,
         required_capabilities: request.required_capabilities,
         workspace_scope: request.workspace_scope,
         artifact_transport: request.artifact_transport,
