@@ -1465,43 +1465,66 @@ fn collect_mcp_tool_names_from_value(value: &Value, names: &mut BTreeSet<String>
 
 fn replay_safety_class_for_tool(tool_name: &str, payload: &Value) -> String {
     let input = payload.get("input").unwrap_or(&Value::Null);
-    if let Some(explicit_class) = payload
-        .get("replay_safety_class")
-        .and_then(Value::as_str)
-        .and_then(normalize_replay_safety_class)
-        .or_else(|| {
-            input
-                .get("replay_safety_class")
-                .and_then(Value::as_str)
-                .and_then(normalize_replay_safety_class)
-        })
-    {
-        return explicit_class.to_owned();
-    }
-    replay_safety_class_for_tool_input(tool_name, input)
+    let mut safety_class = replay_safety_class_for_tool_input(tool_name, input);
+    strengthen_replay_safety_class(
+        &mut safety_class,
+        payload
+            .get("replay_safety_class")
+            .and_then(Value::as_str)
+            .and_then(normalize_replay_safety_class),
+    );
+    safety_class
 }
 
 fn replay_safety_class_for_tool_input(tool_name: &str, input: &Value) -> String {
-    if let Some(explicit_class) =
-        input.get("mutation_class").and_then(Value::as_str).and_then(normalize_replay_safety_class)
-    {
-        return explicit_class.to_owned();
-    }
     let normalized = tool_name.to_ascii_lowercase();
-    if normalized.contains("browser.")
+    let mut safety_class = if normalized.contains("browser.")
         || normalized.contains("process.")
         || normalized.contains("shell")
         || normalized.contains("exec")
     {
-        return "external_side_effect".to_owned();
-    }
-    if ["write", "patch", "delete", "remove", "move", "rename", "shell", "exec"]
+        "external_side_effect"
+    } else if ["write", "patch", "delete", "remove", "move", "rename", "shell", "exec"]
         .iter()
         .any(|needle| normalized.contains(needle))
     {
-        "non_idempotent_write".to_owned()
+        "non_idempotent_write"
     } else {
-        "read_only".to_owned()
+        "read_only"
+    }
+    .to_owned();
+
+    // Trajectory fields are untrusted evidence. They may strengthen the
+    // tool-name safety floor, but must never downgrade it.
+    for explicit_class in [
+        input
+            .get("replay_safety_class")
+            .and_then(Value::as_str)
+            .and_then(normalize_replay_safety_class),
+        input.get("mutation_class").and_then(Value::as_str).and_then(normalize_replay_safety_class),
+    ] {
+        strengthen_replay_safety_class(&mut safety_class, explicit_class);
+    }
+    safety_class
+}
+
+fn strengthen_replay_safety_class(current: &mut String, candidate: Option<&str>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if replay_safety_class_rank(candidate) > replay_safety_class_rank(current.as_str()) {
+        *current = candidate.to_owned();
+    }
+}
+
+fn replay_safety_class_rank(value: &str) -> u8 {
+    match value {
+        "read_only" => 0,
+        "idempotent_write" => 1,
+        "non_idempotent_write" => 2,
+        "external_side_effect" => 3,
+        "requires_human_confirmation" => 4,
+        _ => 4,
     }
 }
 
@@ -2266,6 +2289,58 @@ mod tests {
         assert_eq!(report.summary.tool_proposals[0].mutation_class, "non_idempotent");
         assert_eq!(report.unsafe_mutations[0].proposal_id, "proposal-side-effect");
         assert!(report.unsafe_mutations[0].reason.contains("external_side_effect"));
+    }
+
+    #[test]
+    fn replay_payload_cannot_downgrade_dangerous_tool_safety() {
+        let document = RunTrajectoryDocument {
+            manifest: json!({ "artifact_index": [] }),
+            events: vec![
+                json!({
+                    "schema_version": 1,
+                    "line_type": "event",
+                    "seq": 0,
+                    "event_type": "tool_proposal",
+                    "category": "tool_proposal",
+                    "payload": {
+                        "proposal_id": "proposal-process",
+                        "tool_name": "palyra.process.run",
+                        "replay_safety_class": "read_only",
+                        "input": {
+                            "command": "echo",
+                            "mutation_class": "replay_safe",
+                            "replay_safety_class": "idempotent"
+                        },
+                    },
+                }),
+                json!({
+                    "schema_version": 1,
+                    "line_type": "event",
+                    "seq": 1,
+                    "event_type": "tool_proposal",
+                    "category": "tool_proposal",
+                    "payload": {
+                        "proposal_id": "proposal-browser",
+                        "tool_name": "palyra.browser.click",
+                        "replay_safety_class": "idempotent_write",
+                        "input": {
+                            "selector": "#submit",
+                            "mutation_class": "read_only"
+                        },
+                    },
+                }),
+            ],
+        };
+
+        let report = replay_trajectory_document(&document, None).unwrap();
+
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.unsafe_mutations.len(), 2);
+        assert!(report.summary.tool_proposals.iter().all(|proposal| {
+            proposal.replay_safety_class == "external_side_effect"
+                && proposal.mutation_class == "non_idempotent"
+                && !proposal.recorded_output
+        }));
     }
 
     #[test]
