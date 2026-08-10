@@ -16,9 +16,9 @@ use std::sync::Arc;
 use palyra_common::{
     daemon_config_schema::{is_secret_config_path, SECRET_CONFIG_PATHS},
     runtime_contracts::{
-        IdempotencyRecordSnapshot, IdempotencyReplayDecision, RealtimeCommand,
+        IdempotencyRecordSnapshot, IdempotencyReplayDecision, RealtimeCapability, RealtimeCommand,
         RealtimeCommandEnvelope, RealtimeCommandResultEnvelope, RealtimeEventEnvelope,
-        RealtimeEventSensitivity, RealtimeEventTopic, RealtimeNodePresence,
+        RealtimeEventSensitivity, RealtimeEventTopic, RealtimeNodePresence, RealtimeScope,
         RuntimeConfigSchemaField, StableErrorEnvelope, ToolResultSensitivity,
         REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
     },
@@ -276,11 +276,20 @@ async fn run_get(
 ) -> Result<Value, StableErrorEnvelope> {
     let run_id = required_run_id(&envelope.params)?;
     let run = load_owned_run(state, &context.request_context, run_id).await?;
-    let verification_summary = collect_run_verification_summary_for_command(state, &run).await;
+    let verification_summary = if can_read_run_verification_evidence(&context.realtime) {
+        collect_run_verification_summary_for_command(state, &run).await
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "run": run,
         "verification_summary": verification_summary,
     }))
+}
+
+fn can_read_run_verification_evidence(context: &RealtimeConnectionContext) -> bool {
+    context.has_scope(RealtimeScope::EventsRead)
+        && context.has_capability(RealtimeCapability::EventStream)
 }
 
 async fn collect_run_verification_summary_for_command(
@@ -1388,6 +1397,19 @@ mod tests {
             ensure_approval_not_racing_abort(true, true).expect_err("abort race should fail");
         assert_eq!(race_error.code, "approval/abort_race");
         assert!(ensure_approval_not_racing_abort(false, true).is_ok());
+    }
+
+    #[test]
+    fn run_verification_evidence_requires_event_scope_and_capability() {
+        let mut context =
+            test_router_context("user:alpha", "01ARZ3NDEKTSV4RRFFQ69G5FAV", Some("cli"));
+        assert!(!can_read_run_verification_evidence(&context.realtime));
+
+        context.realtime.scopes.insert(RealtimeScope::EventsRead);
+        assert!(!can_read_run_verification_evidence(&context.realtime));
+
+        context.realtime.capabilities.insert(RealtimeCapability::EventStream);
+        assert!(can_read_run_verification_evidence(&context.realtime));
     }
 
     fn test_router_context(
