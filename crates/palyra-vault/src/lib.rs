@@ -29,4 +29,6 @@ pub use secret_resolver::{
 };
 
 pub(crate) use crypto::{build_aad, current_unix_ms, normalize_storage_object_id, object_id_for};
-pub(crate) use filesystem::{canonicalize_existing_dir, ensure_path_within_root};
+pub(crate) use filesystem::{
+    canonicalize_existing_dir, ensure_path_within_root, write_new_owner_only_file,
+};

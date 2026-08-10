@@ -12,7 +12,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -190,6 +191,36 @@ pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
                 ))
             },
         )?;
+    }
+    Ok(())
+}
+
+/// Creates a new owner-only regular file and writes `contents` only after its
+/// permissions have been hardened.
+pub(crate) fn write_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<(), VaultError> {
+    validate_no_parent_components(path, "owner-only file path")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        VaultError::Io(format!("failed to create owner-only file {}: {error}", path.display()))
+    })?;
+    if let Err(error) = ensure_owner_only_file(path) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    if let Err(error) = file.write_all(contents) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(VaultError::Io(format!(
+            "failed to write owner-only file {}: {error}",
+            path.display()
+        )));
     }
     Ok(())
 }

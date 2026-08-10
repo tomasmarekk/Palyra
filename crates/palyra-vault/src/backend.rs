@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 use crate::{
     canonicalize_existing_dir, ensure_owner_only_dir, ensure_owner_only_file,
-    ensure_path_within_root, normalize_storage_object_id, VaultError,
+    ensure_path_within_root, normalize_storage_object_id, write_new_owner_only_file, VaultError,
 };
 
 const BACKEND_MARKER_FILE: &str = "backend.kind";
@@ -356,13 +356,12 @@ impl EncryptedFileBackend {
             tmp_path.as_path(),
             "encrypted-file temporary objects store path",
         )?;
-        fs::write(&tmp_path, payload).map_err(|error| {
+        write_new_owner_only_file(&tmp_path, payload.as_slice()).map_err(|error| {
             VaultError::Io(format!(
                 "failed to write encrypted-file temporary objects store {}: {error}",
                 tmp_path.display()
             ))
         })?;
-        ensure_owner_only_file(&tmp_path)?;
         fs::rename(&tmp_path, &store_path).map_err(|error| {
             VaultError::Io(format!(
                 "failed to finalize encrypted-file objects store {}: {error}",
@@ -984,6 +983,27 @@ mod tests {
             matches!(result, Err(VaultError::Io(ref message)) if message.contains("exceeds max size after update")),
             "unexpected result: {result:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_file_store_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir should be created");
+        let backend =
+            EncryptedFileBackend::new(temp.path()).expect("backend should initialize cleanly");
+
+        backend
+            .put_blob(TEST_OBJECT_ID, b"encrypted-secret")
+            .expect("encrypted store write should succeed");
+
+        let mode = fs::metadata(backend.objects_root.join(OBJECTS_STORE_FILE))
+            .expect("objects store metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
