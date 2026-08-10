@@ -45,7 +45,7 @@ pub(crate) use base64::Engine as _;
 pub(crate) use clap::Parser;
 pub(crate) use headless_chrome::{
     browser::tab::RequestPausedDecision,
-    protocol::cdp::{Fetch, Network, Page},
+    protocol::cdp::{Fetch, Network},
     Browser as HeadlessBrowser, LaunchOptionsBuilder, Tab as HeadlessTab,
 };
 pub(crate) use palyra_common::{
