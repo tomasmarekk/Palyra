@@ -176,7 +176,9 @@ fn resolve_web_ui_asset_path(root: &Path, request_path: &str) -> Result<PathBuf,
         if segment.is_empty() {
             continue;
         }
-        if segment == "." || segment == ".." || segment.contains('\\') {
+        // Keep validation platform-neutral: colons introduce drive prefixes
+        // or alternate data streams when the same request reaches Windows.
+        if segment == "." || segment == ".." || segment.contains('\\') || segment.contains(':') {
             return Err(WebUiLoadError::InvalidPath);
         }
         relative.push(segment);
@@ -283,6 +285,8 @@ mod tests {
         let fixture = create_fixture();
         assert!(resolve_web_ui_asset_path(fixture.path(), "/../secrets").is_err());
         assert!(resolve_web_ui_asset_path(fixture.path(), "/assets\\app.js").is_err());
+        assert!(resolve_web_ui_asset_path(fixture.path(), "/C:/Windows/system.ini").is_err());
+        assert!(resolve_web_ui_asset_path(fixture.path(), "/assets/app.js:metadata").is_err());
     }
 
     #[test]
