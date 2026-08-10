@@ -19243,7 +19243,7 @@ async fn workspace_patch_tool_preserves_subdirectory_path_under_active_scenario_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn workspace_patch_tool_workspace_alias_uses_launch_root_outside_state_workspace() {
+async fn workspace_patch_tool_ignores_launch_root_outside_agent_workspace() {
     let state = build_test_runtime_state(false);
     let harness_root = gateway_tempdir("gateway-");
     let configured = harness_root.path().join("state").join("workspace");
@@ -19318,14 +19318,18 @@ async fn workspace_patch_tool_workspace_alias_uses_launch_root_outside_state_wor
     )
     .await;
 
-    assert!(outcome.success, "patch tool should apply at launch workspace root: {}", outcome.error);
     assert!(
-        scenario_workspace.join("reports").join("workspace-report.md").exists(),
-        "patch should create the report below the launch scenario workspace"
+        outcome.success,
+        "patch tool should apply at the configured workspace: {}",
+        outcome.error
     );
     assert!(
-        !configured.join("reports").join("workspace-report.md").exists(),
-        "patch must not fall back to the configured state workspace for /workspace"
+        !scenario_workspace.join("reports").join("workspace-report.md").exists(),
+        "caller-supplied launch metadata must not extend the agent workspace boundary"
+    );
+    assert!(
+        configured.join("reports").join("workspace-report.md").exists(),
+        "/workspace must stay bound to the configured agent workspace"
     );
 }
 

@@ -7,13 +7,13 @@
 //! delta) and the session's project focus (the directory the operator is
 //! currently working in, resolved from stored focus paths).
 //!
-//! Every dynamic root is canonicalized and validated before use: `launch_cwd`
-//! must be an existing absolute directory outside the OS deny-list in
-//! `protected_launch_workspace_root`, explicit extra launch roots must remain
-//! inside configured agent roots, and focus directories must resolve (symlinks
-//! included) to a strict descendant of a configured root. The containment
-//! decisions made here feed the security checks in `workspace_file` and
-//! `workspace_patch`; treat any semantic change as a security change.
+//! Every dynamic root is canonicalized and validated before use: launch roots
+//! must be existing absolute directories outside the OS deny-list in
+//! `protected_launch_workspace_root` and must remain inside configured agent
+//! roots, while focus directories must resolve (symlinks included) to a strict
+//! descendant of a configured root. The containment decisions made here feed
+//! the security checks in `workspace_file` and `workspace_patch`; treat any
+//! semantic change as a security change.
 
 use std::{
     collections::BTreeMap,
@@ -327,19 +327,18 @@ fn filter_launch_workspace_roots(
     workspace_roots: &[PathBuf],
 ) -> RunLaunchWorkspaceRoots {
     let canonical_workspace_roots = canonicalize_workspace_roots(workspace_roots);
+    if canonical_workspace_roots.is_empty() {
+        return RunLaunchWorkspaceRoots::default();
+    }
     RunLaunchWorkspaceRoots {
-        launch_cwd: launch_roots.launch_cwd,
-        extra_roots: if canonical_workspace_roots.is_empty() {
-            Vec::new()
-        } else {
-            launch_roots
-                .extra_roots
-                .into_iter()
-                .filter(|root| {
-                    launch_path_is_within_workspace_roots(root, &canonical_workspace_roots)
-                })
-                .collect()
-        },
+        launch_cwd: launch_roots
+            .launch_cwd
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots)),
+        extra_roots: launch_roots
+            .extra_roots
+            .into_iter()
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots))
+            .collect(),
     }
 }
 
@@ -899,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_cwd_may_extend_roots_but_extra_roots_stay_inside_agent_roots() {
+    fn launch_roots_outside_agent_workspace_roots_are_ignored() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let agent_root = tempdir.path().join("agent");
         let launch_cwd = tempdir.path().join("scenario");
@@ -920,7 +919,7 @@ mod tests {
         });
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&agent_root), launch_roots);
 
-        assert_eq!(roots, vec![launch_cwd, agent_root]);
+        assert_eq!(roots, vec![agent_root]);
     }
 
     #[test]
