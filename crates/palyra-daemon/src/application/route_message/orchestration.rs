@@ -26,7 +26,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
-    agents::AgentResolveRequest,
+    agents::{AgentResolutionSource, AgentResolveRequest},
     application::{
         channel_commands::{
             ChannelCommandName, ChannelCommandParseOutcome, ChannelCommandRegistry,
@@ -817,10 +817,38 @@ pub(crate) async fn handle_routed_route_message(
             channel: Some(plan.channel.clone()),
             session_id: Some(session_id.clone()),
             preferred_agent_id: preferred_route_agent_id.clone(),
-            persist_session_binding: true,
+            // Route targets are authorized for one message. Persisting the
+            // choice would turn that decision into an unscoped session grant.
+            persist_session_binding: preferred_route_agent_id.is_none(),
         })
         .await
     {
+        Ok(outcome)
+            if preferred_route_agent_id.is_none()
+                && outcome.source == AgentResolutionSource::SessionBinding
+                && runtime_state.channel_router.agent_has_role_scoped_route_target(
+                    plan.channel.as_str(),
+                    outcome.agent.agent_id.as_str(),
+                ) =>
+        {
+            warn!(
+                session_id = %session_id,
+                principal = %route_request_context.principal,
+                channel = %plan.channel,
+                agent_id = %outcome.agent.agent_id,
+                "ignored session binding to a sender-role scoped route target"
+            );
+            runtime_state
+                .resolve_agent_for_context(AgentResolveRequest {
+                    principal: route_request_context.principal.clone(),
+                    channel: Some(plan.channel.clone()),
+                    session_id: None,
+                    preferred_agent_id: None,
+                    persist_session_binding: false,
+                })
+                .await
+                .ok()
+        }
         Ok(outcome) => Some(outcome),
         Err(error) if preferred_route_agent_id.is_some() => {
             runtime_state.record_denied();

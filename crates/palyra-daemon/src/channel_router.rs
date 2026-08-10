@@ -607,6 +607,26 @@ impl ChannelRouter {
         warnings
     }
 
+    /// Reports whether `agent_id` is protected by at least one sender-role
+    /// scoped route target on `channel`.
+    ///
+    /// Callers use this to reject sticky session bindings that predate the
+    /// per-message route-target authorization boundary.
+    #[must_use]
+    pub fn agent_has_role_scoped_route_target(&self, channel: &str, agent_id: &str) -> bool {
+        let Some(channel) = normalize_non_empty(channel) else {
+            return false;
+        };
+        let Some(agent_id) = normalize_route_target_agent_id(agent_id) else {
+            return false;
+        };
+        self.resolve_rule(channel.as_str()).route_targets.iter().any(|target| {
+            normalize_route_target_agent_id(target.agent_id.as_str()).as_deref()
+                == Some(agent_id.as_str())
+                && !normalized_role_labels(target.required_sender_roles.as_slice()).is_empty()
+        })
+    }
+
     /// Evaluates the full routing policy without consuming a concurrency
     /// slot, touching the retry queue, or quarantining anything.
     #[must_use]
@@ -1303,7 +1323,18 @@ impl ChannelRouter {
             sender_identity.as_deref().unwrap_or(FALLBACK_SENDER_COMPONENT),
         );
         let route_key = format!("channel:{channel}:conversation:{conversation_component}");
-        let session_key = if rule.isolate_session_by_sender {
+        let role_scoped_route_target_agent = route_target
+            .as_ref()
+            .filter(|target| !target.required_sender_roles.is_empty())
+            .and_then(|target| target.agent_id.as_deref());
+        // A role-scoped target is authorized for this sender and message
+        // only. A target-specific session prevents another sender, or the
+        // same sender after role revocation, from inheriting its active run
+        // or conversation history before agent resolution runs.
+        let session_key = if let Some(target_agent_id) = role_scoped_route_target_agent {
+            let target_component = normalize_session_component(target_agent_id);
+            format!("{route_key}:sender:{sender_component}:target:{target_component}")
+        } else if rule.isolate_session_by_sender {
             format!("{route_key}:sender:{sender_component}")
         } else {
             route_key.clone()
@@ -1872,12 +1903,45 @@ mod tests {
         let RouteOutcome::Routed(routed) = outcome else {
             panic!("target alias with role scope should route");
         };
+        assert_eq!(
+            routed.plan.session_key,
+            "channel:slack:conversation:C01TEAM:sender:U123:target:incident"
+        );
         let route_target = routed.plan.route_target.expect("route plan should carry target");
         assert_eq!(route_target.agent_id.as_deref(), Some("incident"));
         assert_eq!(route_target.matched_patterns, vec!["@incident".to_owned()]);
         assert_eq!(route_target.matched_sender_roles, vec!["discord_role:incident".to_owned()]);
         assert!(route_target.missing_sender_roles.is_empty());
         routed.lease.release();
+
+        let default_outcome = router.begin_route(&inbound("hello @palyra"));
+        let RouteOutcome::Routed(default_routed) = default_outcome else {
+            panic!("ordinary mention should continue to use the channel route");
+        };
+        assert_eq!(default_routed.plan.session_key, "channel:slack:conversation:C01TEAM");
+        default_routed.lease.release();
+    }
+
+    #[test]
+    fn role_scoped_route_target_agents_are_identified_for_binding_validation() {
+        let mut config = baseline_config();
+        config.channels[0].route_targets = vec![
+            ChannelRouteTargetRule {
+                agent_id: "Incident".to_owned(),
+                mention_patterns: vec!["@incident".to_owned()],
+                required_sender_roles: vec!["discord_role:incident".to_owned()],
+            },
+            ChannelRouteTargetRule {
+                agent_id: "public".to_owned(),
+                mention_patterns: vec!["@public".to_owned()],
+                required_sender_roles: Vec::new(),
+            },
+        ];
+        let router = ChannelRouter::new(config);
+
+        assert!(router.agent_has_role_scoped_route_target("SLACK", "incident"));
+        assert!(!router.agent_has_role_scoped_route_target("slack", "public"));
+        assert!(!router.agent_has_role_scoped_route_target("slack", "missing"));
     }
 
     #[test]

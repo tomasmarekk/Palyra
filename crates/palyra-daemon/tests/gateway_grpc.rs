@@ -34,6 +34,7 @@ const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const RUN_ID_THIRD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const ENVELOPE_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
+const ENVELOPE_ID_THIRD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB2";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 const OPENAI_TEST_MODEL: &str = "openai-test-model";
 // Legacy-authoritative integration tests assert retained compatibility behavior.
@@ -619,11 +620,16 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_route_target_requires_role_scope_and_selects_agent() -> Result<()> {
-    let (openai_base_url, request_count, server_handle) =
-        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(
             200,
             r#"{"choices":[{"message":{"content":"incident agent reply"}}]}"#.to_owned(),
-        )])?;
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"default agent reply"}}]}"#.to_owned(),
+        ),
+    ])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_and_channel_router_with_route_targets(
             openai_base_url.as_str(),
@@ -693,6 +699,29 @@ async fn grpc_route_message_route_target_requires_role_scope_and_selects_agent()
     assert!(accepted.accepted, "route target should route once the sender role is present");
     assert_eq!(request_count.load(Ordering::Relaxed), 1);
 
+    let ordinary = adapter
+        .inject_message_with_envelope_id_attachments_payload_limit_and_security_labels(
+            &mut client,
+            "hello @palyra after the incident",
+            false,
+            false,
+            ENVELOPE_ID_THIRD,
+            Vec::new(),
+            4096,
+            Vec::new(),
+        )
+        .await?;
+    assert!(ordinary.accepted, "ordinary route should remain available without target roles");
+    assert_ne!(
+        accepted.session_id, ordinary.session_id,
+        "role-scoped target and ordinary route must not share a session"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        2,
+        "ordinary message should dispatch through the default agent"
+    );
+
     let message_events = load_message_router_journal_events(&journal_db_path)?;
     let rejected = message_events
         .iter()
@@ -723,6 +752,23 @@ async fn grpc_route_message_route_target_requires_role_scope_and_selects_agent()
         Some("route_target_selected")
     );
     assert_eq!(routed.pointer("/route_target/agent_id").and_then(Value::as_str), Some("incident"));
+
+    let ordinary_routed = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("message.routed")
+                && payload.get("envelope_id").and_then(Value::as_str) == Some(ENVELOPE_ID_THIRD)
+        })
+        .context("ordinary route should be journaled independently")?;
+    assert_eq!(
+        ordinary_routed.get("agent_id").and_then(Value::as_str),
+        Some("route"),
+        "route-target authorization must not persist as an ordinary session binding"
+    );
+    assert!(
+        ordinary_routed.get("route_target").is_some_and(Value::is_null),
+        "ordinary route must not inherit target authorization metadata"
+    );
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
