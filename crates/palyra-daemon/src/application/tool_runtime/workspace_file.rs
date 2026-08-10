@@ -27,7 +27,6 @@ use std::{
     sync::Arc,
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
 };
@@ -69,7 +68,7 @@ const WORKSPACE_SEARCH_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES: usize = 160;
 const WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES: usize = 8 * 1024;
 const WORKSPACE_READ_LINE_SCAN_MAX_BYTES: u64 = WORKSPACE_SEARCH_MAX_FILE_BYTES;
-const WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES: usize = 96;
+const WORKSPACE_READ_SECRET_SCAN_MAX_BYTES: u64 = WORKSPACE_SEARCH_MAX_FILE_BYTES;
 // Well-known dependency/build directories whose contents are noise for search.
 const WORKSPACE_SEARCH_SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
@@ -115,8 +114,8 @@ struct WorkspaceSearchInput {
     max_matches: Option<u64>,
 }
 
-/// Read-file tool output. Text reads set `text`; binary reads set metadata,
-/// digest, and a short base64 prefix only. When `redacted` is true,
+/// Read-file tool output. Text reads set `text`; binary reads expose metadata
+/// only. When `redacted` is true,
 /// `text_authoritative` and `redaction_notice` warn the caller not to write the
 /// placeholder text back.
 #[derive(Debug, Serialize)]
@@ -2087,27 +2086,52 @@ fn read_workspace_file_chunk(
     let read_limit = usize::try_from(max_bytes.min(MAX_WORKSPACE_READ_FILE_BYTES))
         .expect("workspace read cap must fit usize");
     let read_window = workspace_read_window_for_input(&mut file, input, size_bytes, read_limit)?;
-    file.seek(SeekFrom::Start(read_window.offset_bytes)).map_err(|error| {
+    if size_bytes > WORKSPACE_READ_SECRET_SCAN_MAX_BYTES {
+        return Err(format!(
+            "{WORKSPACE_READ_FILE_TOOL_NAME} file exceeds the {WORKSPACE_READ_SECRET_SCAN_MAX_BYTES}-byte secret-scan limit"
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
         format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} failed to seek workspace file {}: {error}",
             input.path
         )
     })?;
-    let mut buffer = Vec::with_capacity(read_window.read_limit.min(8192));
-    file.take(read_window.read_limit as u64).read_to_end(&mut buffer).map_err(|error| {
+    let snapshot_len =
+        usize::try_from(size_bytes).expect("workspace secret-scan cap must fit usize");
+    let mut snapshot = vec![0; snapshot_len];
+    file.read_exact(snapshot.as_mut_slice()).map_err(|error| {
         format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} failed to read workspace file {}: {error}",
             input.path
         )
     })?;
+    if file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "{WORKSPACE_READ_FILE_TOOL_NAME} failed to re-inspect workspace file {}: {error}",
+                input.path
+            )
+        })?
+        .len()
+        != size_bytes
+    {
+        return Err(format!(
+            "{WORKSPACE_READ_FILE_TOOL_NAME} workspace file changed while it was being read"
+        ));
+    }
 
+    let chunk_start = usize::try_from(read_window.offset_bytes.min(size_bytes))
+        .expect("bounded workspace offset must fit usize");
+    let chunk_end = chunk_start.saturating_add(read_window.read_limit).min(snapshot.len());
+    let buffer = &snapshot[chunk_start..chunk_end];
     let returned_bytes =
         u64::try_from(buffer.len()).expect("returned workspace file chunk size must fit u64");
     let eof = read_window.offset_bytes.saturating_add(returned_bytes) >= size_bytes;
-    let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
-    // Redaction policy: only a confirmed secret-leak finding replaces the
-    // text, and redacted text is marked non-authoritative so callers do not
-    // write the placeholder markers back into the workspace.
+    // Scan the bounded whole-file snapshot before releasing any caller-chosen
+    // range. Otherwise tiny ranges can split every secret below detector
+    // thresholds and reconstruct it from individually clean responses.
     let (
         text,
         bytes_base64,
@@ -2116,40 +2140,35 @@ fn read_workspace_file_chunk(
         binary_output_omitted,
         redacted,
         redaction_reasons,
-    ) = match String::from_utf8(buffer) {
-        Ok(text) => {
+    ) = match std::str::from_utf8(snapshot.as_slice()) {
+        Ok(full_text) => {
             let redaction = redact_text_for_export(
-                text.as_str(),
+                full_text,
                 SafetySourceKind::Workspace,
                 SafetyContentKind::WorkspaceDocument,
                 TrustLabel::TrustedLocal,
             );
             let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
             let redaction_reasons = secret_redaction_reason_codes(&redaction);
-            let visible_text = if redacted { redaction.redacted_text } else { text };
-            (
-                Some(visible_text),
-                None,
-                None,
-                false,
-                false,
-                redacted,
-                if redacted { redaction_reasons } else { Vec::new() },
-            )
+            if redacted {
+                let visible_text = if chunk_start == 0 && chunk_end == snapshot.len() {
+                    redaction.redacted_text
+                } else {
+                    "[REDACTED_SECRET]".to_owned()
+                };
+                (Some(visible_text), None, None, false, false, true, redaction_reasons)
+            } else {
+                match std::str::from_utf8(buffer) {
+                    Ok(text) => {
+                        (Some(text.to_owned()), None, None, false, false, false, Vec::new())
+                    }
+                    Err(_) => (None, None, None, true, true, false, Vec::new()),
+                }
+            }
         }
-        Err(error) => {
-            let bytes = error.into_bytes();
-            (
-                None,
-                None,
-                workspace_binary_base64_prefix(bytes.as_slice()),
-                true,
-                true,
-                false,
-                Vec::new(),
-            )
-        }
+        Err(_) => (None, None, None, true, true, false, Vec::new()),
     };
+    let chunk_sha256 = hex::encode(Sha256::digest(text.as_deref().unwrap_or_default().as_bytes()));
     let text_authoritative = redacted.then_some(false);
     let redaction_notice = redacted.then(|| {
         "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
@@ -2280,14 +2299,6 @@ fn workspace_line_read_window(
         line_start: Some(line_start),
         line_end: requested_line_end,
     })
-}
-
-fn workspace_binary_base64_prefix(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    let prefix_len = bytes.len().min(WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES);
-    Some(BASE64_STANDARD.encode(&bytes[..prefix_len]))
 }
 
 /// Pre-canonicalization containment check for untrusted requested paths.
@@ -2988,6 +2999,35 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_rejects_files_above_secret_scan_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("large.log");
+        fs::write(
+            file_path,
+            vec![
+                b'x';
+                usize::try_from(WORKSPACE_READ_SECRET_SCAN_MAX_BYTES)
+                    .expect("scan limit should fit usize")
+                    + 1
+            ],
+        )
+        .expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "large.log".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: Some(1),
+            line_start: None,
+            line_count: None,
+        };
+
+        let error = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect_err("files above the bounded secret scan must fail closed");
+
+        assert!(error.contains("1048576-byte secret-scan limit"), "{error}");
+    }
+
+    #[test]
     fn read_workspace_file_returns_ansi_diagnostics_as_text() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("typecheck.txt");
@@ -3016,7 +3056,7 @@ mod tests {
     fn read_workspace_file_returns_metadata_for_non_utf8_binary() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.wasm");
-        let contents = b"\0asm\xff\0\0\0\x01\x04\x01`\0\0";
+        let contents = b"API_KEY=should_not_leak_from_binary\0\xff";
         fs::write(file_path, contents).expect("workspace binary file should be written");
         let input = WorkspaceReadFileInput {
             path: "app.wasm".to_owned(),
@@ -3032,7 +3072,8 @@ mod tests {
 
         assert_eq!(output.text, None);
         assert_eq!(output.bytes_base64, None);
-        assert_eq!(output.bytes_base64_prefix, Some(BASE64_STANDARD.encode(contents)));
+        assert_eq!(output.bytes_base64_prefix, None);
+        assert_eq!(output.chunk_sha256, hex::encode(Sha256::digest([])));
         assert!(output.binary);
         assert!(output.binary_output_omitted);
         assert!(!output.redacted);
@@ -3526,6 +3567,34 @@ mod tests {
         assert_eq!(output.text.as_deref(), Some("cde"));
         assert_eq!(output.returned_bytes, 3);
         assert!(!output.eof);
+    }
+
+    #[test]
+    fn read_workspace_file_tiny_chunks_cannot_reconstruct_a_secret() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let contents = b"API_KEY=verylongrandomsecretvalue\n";
+        fs::write(tempdir.path().join(".env"), contents).expect("workspace file should exist");
+        let redacted_chunk_hash = hex::encode(Sha256::digest(b"[REDACTED_SECRET]"));
+
+        for offset_bytes in 0..contents.len() {
+            let input = WorkspaceReadFileInput {
+                path: ".env".to_owned(),
+                workspace_root: None,
+                offset_bytes: offset_bytes as u64,
+                max_bytes: Some(1),
+                line_start: None,
+                line_count: None,
+            };
+
+            let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+                .expect("workspace file chunk should be safely classified");
+
+            assert!(output.redacted);
+            assert_eq!(output.text.as_deref(), Some("[REDACTED_SECRET]"));
+            assert_eq!(output.chunk_sha256, redacted_chunk_hash);
+            assert_eq!(output.bytes_base64, None);
+            assert_eq!(output.bytes_base64_prefix, None);
+        }
     }
 
     #[test]
