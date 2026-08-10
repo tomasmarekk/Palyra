@@ -6909,7 +6909,7 @@
         "http_method": "POST",
         "method_name": "compat.post.v1.runs.by_run_id.approval",
         "stability": "stable",
-        "required_scope": "compat.responses.create",
+        "required_scope": "compat.runs.approve",
         "request_schema_id": "compat.post.v1.runs.by_run_id.approval.request.method-registry.v1",
         "request_schema_hash": "6b3106124423dfb76e5db79371de7e33d2094a3c0551ad2793581e8d52580492",
         "response_schema_id": "compat.post.v1.runs.by_run_id.approval.response.method-registry.v1",
@@ -6923,7 +6923,7 @@
         "http_method": "POST",
         "method_name": "compat.post.v1.runs.by_run_id.detach",
         "stability": "stable",
-        "required_scope": "compat.responses.create",
+        "required_scope": "compat.runs.control",
         "request_schema_id": "compat.post.v1.runs.by_run_id.detach.request.method-registry.v1",
         "request_schema_hash": "5d483fd7cd05a6507b2d650867d4cd7d7e49665958fda616ad6c4317eef52a32",
         "response_schema_id": "compat.post.v1.runs.by_run_id.detach.response.method-registry.v1",
@@ -6951,7 +6951,7 @@
         "http_method": "POST",
         "method_name": "compat.post.v1.runs.by_run_id.stop",
         "stability": "stable",
-        "required_scope": "compat.responses.create",
+        "required_scope": "compat.runs.control",
         "request_schema_id": "compat.post.v1.runs.by_run_id.stop.request.method-registry.v1",
         "request_schema_hash": "683ad70e4f44bcb6ab43642f310f7941d8e16262dbf1ba0d9f7dd95e291911ea",
         "response_schema_id": "compat.post.v1.runs.by_run_id.stop.response.method-registry.v1",
@@ -13526,6 +13526,22 @@
         ]
       },
       {
+        "scope": "compat.runs.control",
+        "category": "write",
+        "description": "Stop or detach OpenAI-compatible runs.",
+        "grants": [
+          "compat.runs.control"
+        ]
+      },
+      {
+        "scope": "compat.runs.approve",
+        "category": "approval",
+        "description": "Submit approval decisions for OpenAI-compatible runs.",
+        "grants": [
+          "compat.runs.approve"
+        ]
+      },
+      {
         "scope": "compat.tools.invoke",
         "category": "write",
         "description": "Invoke the conservative OpenAI-compatible tool-call boundary.",
@@ -14021,7 +14037,7 @@
       "execution_backends": 5,
       "feature_rollout_flags": 39,
       "method_registry_methods": 540,
-      "method_registry_scopes": 18,
+      "method_registry_scopes": 20,
       "runtime_control_capabilities": 8
     },
     "product_area_status_counts": {

@@ -54,6 +54,8 @@ pub(crate) const PERMISSION_COMPAT_MODELS_READ: &str = "compat.models.read";
 pub(crate) const PERMISSION_COMPAT_CHAT_CREATE: &str = "compat.chat.create";
 pub(crate) const PERMISSION_COMPAT_EMBEDDINGS_CREATE: &str = "compat.embeddings.create";
 pub(crate) const PERMISSION_COMPAT_RESPONSES_CREATE: &str = "compat.responses.create";
+pub(crate) const PERMISSION_COMPAT_RUNS_CONTROL: &str = "compat.runs.control";
+pub(crate) const PERMISSION_COMPAT_RUNS_APPROVE: &str = "compat.runs.approve";
 pub(crate) const PERMISSION_COMPAT_TOOLS_INVOKE: &str = "compat.tools.invoke";
 pub(crate) const PERMISSION_API_TOKENS_MANAGE: &str = "api_tokens.manage";
 pub(crate) const PERMISSION_WORKSPACE_MANAGE: &str = "workspace.manage";
@@ -154,6 +156,8 @@ impl WorkspaceRole {
             PERMISSION_COMPAT_CHAT_CREATE.to_owned(),
             PERMISSION_COMPAT_EMBEDDINGS_CREATE.to_owned(),
             PERMISSION_COMPAT_RESPONSES_CREATE.to_owned(),
+            PERMISSION_COMPAT_RUNS_CONTROL.to_owned(),
+            PERMISSION_COMPAT_RUNS_APPROVE.to_owned(),
             PERMISSION_COMPAT_TOOLS_INVOKE.to_owned(),
             PERMISSION_SESSION_USE.to_owned(),
             PERMISSION_MEMORY_USE.to_owned(),
@@ -2530,6 +2534,67 @@ mod tests {
             rotated.token_record.rotated_from_token_id.as_deref(),
             Some(created.token_record.token_id.as_str())
         );
+    }
+
+    #[test]
+    fn response_creation_scope_cannot_control_or_approve_compat_runs() {
+        let temp = tempdir().expect("tempdir should exist");
+        let mut registry = AccessRegistry::open(temp.path()).expect("registry should open");
+        registry
+            .set_feature_flag(
+                FEATURE_COMPAT_API,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                1,
+            )
+            .expect("compat api should enable");
+        registry
+            .set_feature_flag(
+                FEATURE_API_TOKENS,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                2,
+            )
+            .expect("api tokens should enable");
+        let created = registry
+            .create_api_token(
+                "user:ops",
+                ApiTokenCreateRequest {
+                    label: "Compat responses".to_owned(),
+                    scopes: vec![PERMISSION_COMPAT_RESPONSES_CREATE.to_owned()],
+                    principal: "user:ops".to_owned(),
+                    workspace_id: None,
+                    role: "operator".to_owned(),
+                    expires_at_unix_ms: None,
+                    rate_limit_per_minute: Some(50),
+                },
+                3,
+            )
+            .expect("token should be created");
+
+        registry
+            .authenticate_api_token(created.token.as_str(), PERMISSION_COMPAT_RESPONSES_CREATE, 4)
+            .expect("response creation scope should remain valid");
+        assert!(matches!(
+            registry.authenticate_api_token(
+                created.token.as_str(),
+                PERMISSION_COMPAT_RUNS_CONTROL,
+                4,
+            ),
+            Err(AccessRegistryError::MissingScope(scope))
+                if scope == PERMISSION_COMPAT_RUNS_CONTROL
+        ));
+        assert!(matches!(
+            registry.authenticate_api_token(
+                created.token.as_str(),
+                PERMISSION_COMPAT_RUNS_APPROVE,
+                4,
+            ),
+            Err(AccessRegistryError::MissingScope(scope))
+                if scope == PERMISSION_COMPAT_RUNS_APPROVE
+        ));
     }
 
     #[test]

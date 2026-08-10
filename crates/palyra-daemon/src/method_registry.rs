@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::access_control::{
     PERMISSION_COMPAT_CHAT_CREATE, PERMISSION_COMPAT_EMBEDDINGS_CREATE,
     PERMISSION_COMPAT_MODELS_READ, PERMISSION_COMPAT_RESPONSES_CREATE,
-    PERMISSION_COMPAT_TOOLS_INVOKE,
+    PERMISSION_COMPAT_RUNS_APPROVE, PERMISSION_COMPAT_RUNS_CONTROL, PERMISSION_COMPAT_TOOLS_INVOKE,
 };
 
 const METHOD_REGISTRY_SCHEMA_VERSION: u32 = 1;
@@ -223,10 +223,11 @@ fn required_scope_for_route(method: &str, path: &str) -> &'static str {
         | ("POST", "/v1/runs")
         | ("GET", "/v1/runs/{run_id}")
         | ("GET", "/v1/runs/{run_id}/events")
-        | ("POST", "/v1/runs/{run_id}/wait")
-        | ("POST", "/v1/runs/{run_id}/stop")
-        | ("POST", "/v1/runs/{run_id}/detach")
-        | ("POST", "/v1/runs/{run_id}/approval") => PERMISSION_COMPAT_RESPONSES_CREATE,
+        | ("POST", "/v1/runs/{run_id}/wait") => PERMISSION_COMPAT_RESPONSES_CREATE,
+        ("POST", "/v1/runs/{run_id}/stop") | ("POST", "/v1/runs/{run_id}/detach") => {
+            PERMISSION_COMPAT_RUNS_CONTROL
+        }
+        ("POST", "/v1/runs/{run_id}/approval") => PERMISSION_COMPAT_RUNS_APPROVE,
         ("POST", "/v1/tools/invoke") => PERMISSION_COMPAT_TOOLS_INVOKE,
         _ if path.starts_with("/healthz") || path == "/runtime" => "public.read",
         _ if path.contains("/realtime/ws") => "realtime.stream",
@@ -362,6 +363,18 @@ fn scope_registry() -> Vec<ScopeDescriptor> {
             &[PERMISSION_COMPAT_RESPONSES_CREATE],
         ),
         scope(
+            PERMISSION_COMPAT_RUNS_CONTROL,
+            "write",
+            "Stop or detach OpenAI-compatible runs.",
+            &[PERMISSION_COMPAT_RUNS_CONTROL],
+        ),
+        scope(
+            PERMISSION_COMPAT_RUNS_APPROVE,
+            "approval",
+            "Submit approval decisions for OpenAI-compatible runs.",
+            &[PERMISSION_COMPAT_RUNS_APPROVE],
+        ),
+        scope(
             PERMISSION_COMPAT_TOOLS_INVOKE,
             "write",
             "Invoke the conservative OpenAI-compatible tool-call boundary.",
@@ -481,5 +494,21 @@ mod tests {
             assert_eq!(descriptor.stability, "gated_production");
             assert!(!descriptor.streaming_supported);
         }
+    }
+
+    #[test]
+    fn compat_run_mutations_use_dedicated_scopes() {
+        assert_eq!(
+            required_scope_for_route("POST", "/v1/runs/{run_id}/stop"),
+            PERMISSION_COMPAT_RUNS_CONTROL
+        );
+        assert_eq!(
+            required_scope_for_route("POST", "/v1/runs/{run_id}/detach"),
+            PERMISSION_COMPAT_RUNS_CONTROL
+        );
+        assert_eq!(
+            required_scope_for_route("POST", "/v1/runs/{run_id}/approval"),
+            PERMISSION_COMPAT_RUNS_APPROVE
+        );
     }
 }

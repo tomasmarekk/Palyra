@@ -11,7 +11,8 @@ use crate::{
         FEATURE_API_TOKENS, FEATURE_COMPAT_API, FEATURE_COMPAT_EMBEDDINGS_API,
         FEATURE_COMPAT_TOOLS_INVOKE, PERMISSION_COMPAT_CHAT_CREATE,
         PERMISSION_COMPAT_EMBEDDINGS_CREATE, PERMISSION_COMPAT_MODELS_READ,
-        PERMISSION_COMPAT_RESPONSES_CREATE, PERMISSION_COMPAT_TOOLS_INVOKE,
+        PERMISSION_COMPAT_RESPONSES_CREATE, PERMISSION_COMPAT_RUNS_APPROVE,
+        PERMISSION_COMPAT_RUNS_CONTROL, PERMISSION_COMPAT_TOOLS_INVOKE,
     },
     app::state::CompatApiRateLimitEntry,
     *,
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 
 const COMPAT_API_CHANNEL: &str = "compat-api";
+const COMPAT_API_ORIGIN_KIND: &str = "compat_api";
 const COMPAT_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const COMPAT_RESPONSE_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMPAT_RESPONSE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -1000,7 +1002,8 @@ pub(crate) async fn compat_run_events_handler(
     Query(query): Query<CompatRunEventsQuery>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let (token, owner_principal, device_id) =
+        authorize_compat_run_access(&state, &headers, PERMISSION_COMPAT_RESPONSES_CREATE, now)?;
     let snapshot =
         load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
             .await?;
@@ -1045,7 +1048,8 @@ pub(crate) async fn compat_run_wait_handler(
     payload: Option<Json<CompatRunWaitRequest>>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal, _device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let (token, owner_principal, _device_id) =
+        authorize_compat_run_access(&state, &headers, PERMISSION_COMPAT_RESPONSES_CREATE, now)?;
     let request = payload.map(|Json(payload)| payload).unwrap_or_default();
     let timeout_ms = compat_run_wait_timeout_ms(request.timeout_ms);
     let return_on_waiting = request.return_on_waiting.unwrap_or(false);
@@ -1118,7 +1122,8 @@ pub(crate) async fn compat_run_stop_handler(
     Json(payload): Json<CompatRunStopRequest>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal, _device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let (token, owner_principal, _device_id) =
+        authorize_compat_run_access(&state, &headers, PERMISSION_COMPAT_RUNS_CONTROL, now)?;
     let snapshot =
         load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
             .await?;
@@ -1223,7 +1228,8 @@ pub(crate) async fn compat_run_detach_handler(
     Json(payload): Json<CompatRunDetachRequest>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let (token, owner_principal, device_id) =
+        authorize_compat_run_access(&state, &headers, PERMISSION_COMPAT_RUNS_CONTROL, now)?;
     let snapshot =
         load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
             .await?;
@@ -1277,7 +1283,8 @@ pub(crate) async fn compat_run_approval_handler(
     Json(payload): Json<CompatRunApprovalRequest>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let (token, owner_principal, device_id) =
+        authorize_compat_run_access(&state, &headers, PERMISSION_COMPAT_RUNS_APPROVE, now)?;
     let snapshot =
         load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
             .await?;
@@ -1438,20 +1445,20 @@ fn authorize_compat_response_record_access(
     headers: &HeaderMap,
     now: i64,
 ) -> CompatHttpResult<(AuthenticatedApiToken, String)> {
-    let (token, principal, _) = authorize_compat_run_access(state, headers, now)?;
+    let (token, principal, _) =
+        authorize_compat_run_access(state, headers, PERMISSION_COMPAT_RESPONSES_CREATE, now)?;
     Ok((token, principal))
 }
 
 fn authorize_compat_run_access(
     state: &AppState,
     headers: &HeaderMap,
+    required_scope: &str,
     now: i64,
 ) -> CompatHttpResult<(AuthenticatedApiToken, String, String)> {
-    let token =
-        authorize_compat_api_token(state, headers, PERMISSION_COMPAT_RESPONSES_CREATE, None, now)?;
+    let token = authorize_compat_api_token(state, headers, required_scope, None, now)?;
     enforce_compat_rate_limit(state, token.token_id.as_str(), token.rate_limit_per_minute)?;
-    let (principal, device_id) =
-        resolve_compat_runtime_identity(state, &token, PERMISSION_COMPAT_RESPONSES_CREATE)?;
+    let (principal, device_id) = resolve_compat_runtime_identity(state, &token, required_scope)?;
     Ok((token, principal, device_id))
 }
 
@@ -1951,10 +1958,22 @@ async fn load_compat_run_snapshot_for_owner(
         .await
         .map_err(runtime_status_response)?
         .ok_or_else(|| compat_run_not_found_response(run_id))?;
-    if snapshot.principal != owner_principal {
+    if !compat_run_access_matches(&snapshot, owner_principal) {
         return Err(compat_run_not_found_response(run_id));
     }
     Ok(snapshot)
+}
+
+fn compat_run_access_matches(
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+    owner_principal: &str,
+) -> bool {
+    snapshot.principal == owner_principal
+        && compat_run_origin_matches(snapshot.channel.as_deref(), snapshot.origin_kind.as_str())
+}
+
+fn compat_run_origin_matches(channel: Option<&str>, origin_kind: &str) -> bool {
+    channel == Some(COMPAT_API_CHANNEL) && origin_kind == COMPAT_API_ORIGIN_KIND
 }
 
 async fn load_compat_pending_approval_for_run(
@@ -3242,7 +3261,7 @@ async fn prepare_compat_run_from_context(
             reset_session: false,
             require_existing: true,
             tool_approval_response: None,
-            origin_kind: "compat_api".to_owned(),
+            origin_kind: COMPAT_API_ORIGIN_KIND.to_owned(),
             origin_run_id: None,
             parameter_delta_json: Vec::new(),
             queued_input_id: None,
@@ -6219,6 +6238,14 @@ mod tests {
         let mut invalid_headers = HeaderMap::new();
         invalid_headers.insert("authorization", HeaderValue::from_static("Basic abc"));
         assert!(extract_bearer_token(&invalid_headers).is_err());
+    }
+
+    #[test]
+    fn compat_run_access_rejects_non_compat_origins() {
+        assert!(compat_run_origin_matches(Some(COMPAT_API_CHANNEL), COMPAT_API_ORIGIN_KIND));
+        assert!(!compat_run_origin_matches(Some("console"), COMPAT_API_ORIGIN_KIND));
+        assert!(!compat_run_origin_matches(Some(COMPAT_API_CHANNEL), "console"));
+        assert!(!compat_run_origin_matches(None, COMPAT_API_ORIGIN_KIND));
     }
 
     #[tokio::test]

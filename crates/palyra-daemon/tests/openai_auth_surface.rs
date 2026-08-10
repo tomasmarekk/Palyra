@@ -1531,6 +1531,14 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         &cookie,
         &csrf_token,
         "Compat runs token",
+        &["compat.responses.create", "compat.runs.control", "compat.runs.approve"],
+    )?;
+    let responses_only_token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat responses-only token",
         &["compat.responses.create"],
     )?;
     let unauthorized_token = create_personal_api_token(
@@ -1736,6 +1744,21 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         approval_missing_response.pointer("/error/code").and_then(Value::as_str),
         Some("approval_not_found")
     );
+    let (narrow_approval_status, narrow_approval_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/approval").as_str(),
+        responses_only_token.as_str(),
+        &json!({ "action": "approve" }),
+    )?;
+    assert_eq!(
+        narrow_approval_status, 403,
+        "response creation scope must not submit approvals: {narrow_approval_response}"
+    );
+    assert_eq!(
+        narrow_approval_response.pointer("/error/code").and_then(Value::as_str),
+        Some("missing_scope")
+    );
 
     let (modify_status, modify_response) = compat_post_json(
         &client,
@@ -1769,6 +1792,21 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         .to_owned();
     let _visible_stop_run =
         wait_for_compat_run_visible(&client, admin_port, token.as_str(), stop_run_id.as_str())?;
+    let (narrow_stop_status, narrow_stop_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{stop_run_id}/stop").as_str(),
+        responses_only_token.as_str(),
+        &json!({ "reason": "scope probe" }),
+    )?;
+    assert_eq!(
+        narrow_stop_status, 403,
+        "response creation scope must not stop runs: {narrow_stop_response}"
+    );
+    assert_eq!(
+        narrow_stop_response.pointer("/error/code").and_then(Value::as_str),
+        Some("missing_scope")
+    );
     let (stop_status, stop_response) = compat_post_json(
         &client,
         admin_port,
