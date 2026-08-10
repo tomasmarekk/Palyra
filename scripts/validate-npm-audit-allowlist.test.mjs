@@ -23,11 +23,12 @@ function writeJsonFile(baseDir, fileName, payload) {
 }
 
 function emptyAuditReport() {
-  return { vulnerabilities: {} };
+  return { auditReportVersion: 2, vulnerabilities: {} };
 }
 
 function auditWithAdvisory(id, packageName = "eslint") {
   return {
+    auditReportVersion: 2,
     vulnerabilities: {
       [packageName]: {
         via: [
@@ -65,6 +66,58 @@ function runValidator({ full, runtime, allowlist, summary }) {
     { encoding: "utf8" },
   );
 }
+
+test("rejects npm audit operational error payloads", (t) => {
+  const tmpDir = createTempFixtureDir("allowlist-audit-error");
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const fullPath = writeJsonFile(tmpDir, "full.json", emptyAuditReport());
+  const runtimePath = writeJsonFile(tmpDir, "runtime.json", {
+    message: "registry audit endpoint unavailable",
+    statusCode: 503,
+    error: { code: "E503" },
+  });
+  const allowlistPath = writeJsonFile(tmpDir, "allowlist.json", {
+    version: 2,
+    entries: [],
+  });
+  const summaryPath = path.join(tmpDir, "summary.json");
+
+  const result = runValidator({
+    full: fullPath,
+    runtime: runtimePath,
+    allowlist: allowlistPath,
+    summary: summaryPath,
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /runtime npm audit report contains an operational error/);
+  assert.equal(fs.existsSync(summaryPath), false);
+});
+
+test("rejects npm audit reports without a vulnerabilities object", (t) => {
+  const tmpDir = createTempFixtureDir("allowlist-audit-malformed");
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const fullPath = writeJsonFile(tmpDir, "full.json", { auditReportVersion: 2 });
+  const runtimePath = writeJsonFile(tmpDir, "runtime.json", emptyAuditReport());
+  const allowlistPath = writeJsonFile(tmpDir, "allowlist.json", {
+    version: 2,
+    entries: [],
+  });
+  const summaryPath = path.join(tmpDir, "summary.json");
+
+  const result = runValidator({
+    full: fullPath,
+    runtime: runtimePath,
+    allowlist: allowlistPath,
+    summary: summaryPath,
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /full npm audit report must contain a vulnerabilities object/);
+  assert.equal(fs.existsSync(summaryPath), false);
+});
 
 test("fails when allowlist contains stale expired entry", (t) => {
   const tmpDir = createTempFixtureDir("allowlist-expired-stale");

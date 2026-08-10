@@ -43,6 +43,31 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(absolutePath, "utf8"));
 }
 
+function validateAuditReport(report, label) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) {
+    throw new Error(`${label} npm audit report must be a JSON object`);
+  }
+  if (
+    Object.hasOwn(report, "error") ||
+    Object.hasOwn(report, "message") ||
+    Object.hasOwn(report, "statusCode")
+  ) {
+    throw new Error(`${label} npm audit report contains an operational error`);
+  }
+  if (report.auditReportVersion !== 2) {
+    throw new Error(`${label} npm audit report version must be 2`);
+  }
+  if (
+    !Object.hasOwn(report, "vulnerabilities") ||
+    !report.vulnerabilities ||
+    typeof report.vulnerabilities !== "object" ||
+    Array.isArray(report.vulnerabilities)
+  ) {
+    throw new Error(`${label} npm audit report must contain a vulnerabilities object`);
+  }
+  return report;
+}
+
 function normalizeSeverity(input) {
   if (typeof input !== "string") {
     return "unknown";
@@ -73,8 +98,7 @@ function advisoryIdFromVia(via) {
 }
 
 function collectAdvisories(report) {
-  const vulnerabilities =
-    report && typeof report === "object" && report.vulnerabilities ? report.vulnerabilities : {};
+  const vulnerabilities = report.vulnerabilities;
   const advisories = new Map();
 
   function ensureEntry(id, data) {
@@ -206,8 +230,8 @@ function main() {
   const thresholdRank = SEVERITY_ORDER.get(threshold) ?? 3;
 
   const now = new Date();
-  const fullReport = readJson(fullPath);
-  const runtimeReport = readJson(runtimePath);
+  const fullReport = validateAuditReport(readJson(fullPath), "full");
+  const runtimeReport = validateAuditReport(readJson(runtimePath), "runtime");
   const allowlist = readJson(allowlistPath);
 
   if (allowlist.version !== 2) {
