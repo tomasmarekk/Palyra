@@ -32,6 +32,9 @@ const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 const ANTHROPIC_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const XAI_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const XAI_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const XAI_OAUTH_CALLBACK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const XAI_OAUTH_CALLBACK_MAX_LINE_BYTES: usize = 8 * 1024;
+const XAI_OAUTH_CALLBACK_MAX_REQUEST_BYTES: usize = 32 * 1024;
 const XAI_OAUTH_USER_AGENT: &str = "palyra-cli/0.1.0";
 const XAI_DEVICE_CODE_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const XAI_DEVICE_CODE_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -2366,16 +2369,21 @@ fn wait_for_xai_loopback_callback(
 ) -> Result<XaiOAuthCallback> {
     let deadline = std::time::Instant::now() + XAI_OAUTH_CALLBACK_TIMEOUT;
     loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("timed out waiting for xAI OAuth callback");
+        }
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(callback) = handle_xai_callback_stream(stream, expected_state)? {
+                let connection_timeout =
+                    XAI_OAUTH_CALLBACK_CONNECTION_TIMEOUT.min(deadline.duration_since(now));
+                if let Ok(Some(callback)) =
+                    handle_xai_callback_stream(stream, expected_state, connection_timeout)
+                {
                     return Ok(callback);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for xAI OAuth callback");
-                }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(error) => return Err(error).context("failed to accept xAI OAuth callback"),
@@ -2386,16 +2394,23 @@ fn wait_for_xai_loopback_callback(
 fn handle_xai_callback_stream(
     stream: std::net::TcpStream,
     expected_state: &str,
+    connection_timeout: Duration,
 ) -> Result<Option<XaiOAuthCallback>> {
+    stream
+        .set_read_timeout(Some(connection_timeout))
+        .context("failed to bound xAI OAuth callback reads")?;
+    stream
+        .set_write_timeout(Some(connection_timeout))
+        .context("failed to bound xAI OAuth callback writes")?;
     let mut reader = std::io::BufReader::new(stream);
+    let mut remaining_bytes = XAI_OAUTH_CALLBACK_MAX_REQUEST_BYTES;
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).context("failed to read xAI OAuth callback request")?;
+    read_xai_callback_line(&mut reader, &mut request_line, &mut remaining_bytes)
+        .context("failed to read xAI OAuth callback request")?;
     let mut header_line = String::new();
     let mut origin_header = None;
     loop {
-        header_line.clear();
-        if reader
-            .read_line(&mut header_line)
+        if read_xai_callback_line(&mut reader, &mut header_line, &mut remaining_bytes)
             .context("failed to read xAI OAuth callback headers")?
             == 0
         {
@@ -2444,16 +2459,40 @@ fn handle_xai_callback_stream(
             );
             Ok(Some(callback))
         }
-        Err(error) => {
+        Err(_) => {
             write_xai_callback_response_best_effort(
                 &mut stream,
                 "HTTP/1.1 400 Bad Request",
                 "xAI authentication did not complete.",
                 None,
             );
-            Err(error)
+            Ok(None)
         }
     }
+}
+
+fn read_xai_callback_line(
+    reader: &mut impl std::io::BufRead,
+    line: &mut String,
+    remaining_bytes: &mut usize,
+) -> std::io::Result<usize> {
+    line.clear();
+    if *remaining_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "xAI OAuth callback request exceeds the byte limit",
+        ));
+    }
+    let line_limit = XAI_OAUTH_CALLBACK_MAX_LINE_BYTES.min(*remaining_bytes);
+    let read = (&mut *reader).take((line_limit + 1) as u64).read_line(line)?;
+    if read > line_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "xAI OAuth callback line exceeds the byte limit",
+        ));
+    }
+    *remaining_bytes -= read;
+    Ok(read)
 }
 
 fn allowed_xai_callback_cors_origin(origin: Option<&str>) -> Option<String> {
@@ -3422,6 +3461,40 @@ mod tests {
             "xAI authentication completed. You can close this window.",
             None,
         );
+    }
+
+    #[test]
+    fn malformed_xai_loopback_request_does_not_complete_or_abort_callback_wait() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("ephemeral callback listener should bind");
+        let address = listener.local_addr().expect("callback listener address should resolve");
+        let mut client =
+            std::net::TcpStream::connect(address).expect("callback client should connect");
+        client
+            .write_all(
+                b"GET /callback?code=attacker&state=wrong HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .expect("malformed callback request should write");
+        let (server, _) = listener.accept().expect("callback server should accept");
+
+        let callback = handle_xai_callback_stream(server, "expected", Duration::from_millis(100))
+            .expect("malformed callback should be ignored after the response");
+
+        assert!(callback.is_none());
+    }
+
+    #[test]
+    fn xai_loopback_request_lines_are_bounded_before_allocation_growth() {
+        let input = vec![b'a'; XAI_OAUTH_CALLBACK_MAX_LINE_BYTES + 1];
+        let mut reader = std::io::Cursor::new(input);
+        let mut line = String::new();
+        let mut remaining_bytes = XAI_OAUTH_CALLBACK_MAX_REQUEST_BYTES;
+
+        let error = read_xai_callback_line(&mut reader, &mut line, &mut remaining_bytes)
+            .expect_err("oversized callback line must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(line.len() <= XAI_OAUTH_CALLBACK_MAX_LINE_BYTES + 1);
     }
 
     #[test]
