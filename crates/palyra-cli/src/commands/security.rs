@@ -502,7 +502,7 @@ fn build_security_findings(
         });
     }
 
-    if let Some(provider_kind) = missing_model_auth_kind(local_config) {
+    if let Some(provider_kind) = missing_model_auth_kind(local_config, secrets) {
         findings.push(SecurityFinding {
             severity: "blocking".to_owned(),
             code: "model_provider_missing_auth".to_owned(),
@@ -714,7 +714,10 @@ fn build_security_findings(
     findings
 }
 
-fn missing_model_auth_kind(local_config: &LocalSecurityConfigSnapshot) -> Option<&'static str> {
+fn missing_model_auth_kind(
+    local_config: &LocalSecurityConfigSnapshot,
+    secrets: &SecretAuditPayload,
+) -> Option<&'static str> {
     let effective_provider_kind = local_config
         .effective_provider_kind
         .as_deref()
@@ -725,7 +728,7 @@ fn missing_model_auth_kind(local_config: &LocalSecurityConfigSnapshot) -> Option
         "anthropic" => "anthropic",
         _ => return None,
     };
-    if model_provider_auth_configured(local_config, provider_kind) {
+    if model_provider_auth_configured(local_config, provider_kind, secrets) {
         return None;
     }
     Some(provider_kind)
@@ -738,6 +741,7 @@ fn normalize_provider_kind(kind: &str) -> String {
 fn model_provider_auth_configured(
     local_config: &LocalSecurityConfigSnapshot,
     provider_kind: &str,
+    secrets: &SecretAuditPayload,
 ) -> bool {
     if local_config.auth_profile_id.is_some() {
         return true;
@@ -745,16 +749,30 @@ fn model_provider_auth_configured(
     match provider_kind {
         "openai_compatible" => {
             local_config.openai_api_key_vault_ref.is_some()
-                || local_config.openai_api_key_secret_ref_configured
+                || (local_config.openai_api_key_secret_ref_configured
+                    && structured_model_secret_resolved(
+                        secrets,
+                        "model_provider_openai_api_key_structured",
+                    ))
                 || local_config.openai_inline_api_key
         }
         "anthropic" => {
             local_config.anthropic_api_key_vault_ref.is_some()
-                || local_config.anthropic_api_key_secret_ref_configured
+                || (local_config.anthropic_api_key_secret_ref_configured
+                    && structured_model_secret_resolved(
+                        secrets,
+                        "model_provider_anthropic_api_key_structured",
+                    ))
                 || local_config.anthropic_inline_api_key
         }
         _ => true,
     }
+}
+
+fn structured_model_secret_resolved(secrets: &SecretAuditPayload, reference_kind: &str) -> bool {
+    secrets.references.iter().any(|reference| {
+        reference.reference_kind == reference_kind && reference.status == "resolved"
+    })
 }
 
 fn missing_model_auth_message(provider_kind: &str) -> String {
@@ -1467,14 +1485,14 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
 
         assert_eq!(snapshot.provider_kind, "anthropic");
         assert_eq!(snapshot.anthropic_api_key_vault_ref.as_deref(), Some("global/minimax_api_key"));
-        assert_eq!(missing_model_auth_kind(&snapshot), None);
+        assert_eq!(missing_model_auth_kind(&snapshot, &minimal_secrets()), None);
 
         app::clear_root_context_for_tests();
         Ok(())
     }
 
     #[test]
-    fn local_security_snapshot_accepts_anthropic_structured_secret_ref_auth() -> Result<()> {
+    fn local_security_snapshot_rejects_unresolved_structured_secret_ref_auth() -> Result<()> {
         let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
         app::clear_root_context_for_tests();
 
@@ -1492,7 +1510,7 @@ anthropic_base_url = "https://api.minimax.io/anthropic"
 anthropic_model = "MiniMax-M2.7"
 [model_provider.anthropic_api_key_secret_ref]
 kind = "env"
-variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
+variable = "PALYRA_TEST_MISSING_STRUCTURED_SECRET_235"
 "#,
         )?;
         let state_root = temp.path().join("state");
@@ -1503,10 +1521,14 @@ variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
         })?;
 
         let snapshot = load_local_security_config_snapshot(None)?;
+        let secrets = build_secrets_audit_payload(None, true)?;
 
         assert_eq!(snapshot.provider_kind, "anthropic");
         assert!(snapshot.anthropic_api_key_secret_ref_configured);
-        assert_eq!(missing_model_auth_kind(&snapshot), None);
+        assert_eq!(missing_model_auth_kind(&snapshot, &secrets), Some("anthropic"));
+        assert!(secrets.findings.iter().any(|finding| {
+            finding.severity == "blocking" && finding.code == "unresolved_secret_ref"
+        }));
 
         app::clear_root_context_for_tests();
         Ok(())

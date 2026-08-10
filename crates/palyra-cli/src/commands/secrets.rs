@@ -8,8 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{args::SecretsConfigureCommand, *};
+use palyra_common::secret_refs::{SecretRef, SecretSource};
 use palyra_control_plane as control_plane;
-use palyra_vault::SecretMetadata;
+use palyra_vault::{SecretMetadata, SecretResolveErrorKind, SecretResolver};
 use serde_json::Value;
 
 /// Full result of a secrets audit: every discovered vault reference, the findings
@@ -110,6 +111,13 @@ struct SecretReferenceCandidate {
     component: String,
     reference_kind: String,
     reference: String,
+}
+
+struct StructuredSecretReferenceCandidate {
+    component: String,
+    reference_kind: String,
+    config_path: String,
+    secret_ref: Result<SecretRef, ()>,
 }
 
 /// Dispatches a `palyra secrets` subcommand.
@@ -357,7 +365,25 @@ pub(crate) fn build_secrets_audit_payload(
     let runtime_profiles = load_runtime_auth_profiles(offline)?;
     let runtime_webhooks = load_runtime_webhooks(offline)?;
     let mut candidates = Vec::<SecretReferenceCandidate>::new();
+    let mut structured_candidates = Vec::<StructuredSecretReferenceCandidate>::new();
     let mut findings = Vec::<SecretAuditFinding>::new();
+
+    for (config_path, reference_kind) in [
+        ("model_provider.openai_api_key_secret_ref", "model_provider_openai_api_key_structured"),
+        (
+            "model_provider.anthropic_api_key_secret_ref",
+            "model_provider_anthropic_api_key_structured",
+        ),
+    ] {
+        if let Some(value) = get_value_at_path(&document, config_path)? {
+            structured_candidates.push(StructuredSecretReferenceCandidate {
+                component: "model_provider".to_owned(),
+                reference_kind: reference_kind.to_owned(),
+                config_path: config_path.to_owned(),
+                secret_ref: value.clone().try_into::<SecretRef>().map_err(|_| ()),
+            });
+        }
+    }
 
     if let Some(reference) =
         get_string_value_at_path(&document, "model_provider.openai_api_key_vault_ref")?
@@ -494,6 +520,98 @@ pub(crate) fn build_secrets_audit_payload(
 
     let mut references = Vec::<SecretReferenceAudit>::new();
     let mut used_refs_by_scope = BTreeMap::<String, BTreeSet<String>>::new();
+    let audit_working_dir = Path::new(path.as_str())
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or(
+            std::env::current_dir()
+                .context("failed to resolve working directory for structured secret audit")?,
+        );
+    let resolver = SecretResolver::with_working_dir(Some(&vault), audit_working_dir);
+
+    for candidate in structured_candidates {
+        let Ok(secret_ref) = candidate.secret_ref else {
+            references.push(SecretReferenceAudit {
+                component: candidate.component.clone(),
+                reference_kind: candidate.reference_kind,
+                reference: candidate.config_path.clone(),
+                scope: "invalid".to_owned(),
+                key: String::new(),
+                status: "invalid".to_owned(),
+                detail: "structured secret reference could not be parsed".to_owned(),
+            });
+            findings.push(SecretAuditFinding {
+                severity: "blocking".to_owned(),
+                code: "invalid_secret_ref".to_owned(),
+                component: candidate.component,
+                reference: Some(candidate.config_path),
+                message: "structured model-provider secret reference is invalid.".to_owned(),
+                remediation:
+                    "Use a valid structured secret reference and verify it with `palyra secrets audit --strict`."
+                        .to_owned(),
+            });
+            continue;
+        };
+        let source_kind = secret_ref.source_kind().to_owned();
+        let fingerprint = secret_ref.fingerprint();
+        if let SecretSource::Vault { vault_ref } = &secret_ref.source {
+            if let Ok(parsed) = VaultRef::parse(vault_ref.as_str()) {
+                used_refs_by_scope.entry(parsed.scope.to_string()).or_default().insert(parsed.key);
+            }
+        }
+        match resolver.resolve(&secret_ref) {
+            Ok(resolution) if resolution.value.is_some() => {
+                references.push(SecretReferenceAudit {
+                    component: candidate.component,
+                    reference_kind: candidate.reference_kind,
+                    reference: candidate.config_path,
+                    scope: source_kind,
+                    key: fingerprint,
+                    status: "resolved".to_owned(),
+                    detail: "structured secret value is readable".to_owned(),
+                });
+            }
+            result => {
+                let (status, code, detail) = match result {
+                    Ok(_) => (
+                        "missing",
+                        "unresolved_secret_ref",
+                        "structured secret resolved without a value".to_owned(),
+                    ),
+                    Err(error) if error.kind == SecretResolveErrorKind::InvalidReference => (
+                        "invalid",
+                        "invalid_secret_ref",
+                        sanitize_secret_error(error.to_string().as_str()),
+                    ),
+                    Err(error) => (
+                        "missing",
+                        "unresolved_secret_ref",
+                        sanitize_secret_error(error.to_string().as_str()),
+                    ),
+                };
+                references.push(SecretReferenceAudit {
+                    component: candidate.component.clone(),
+                    reference_kind: candidate.reference_kind,
+                    reference: candidate.config_path.clone(),
+                    scope: source_kind,
+                    key: fingerprint,
+                    status: status.to_owned(),
+                    detail,
+                });
+                findings.push(SecretAuditFinding {
+                    severity: "blocking".to_owned(),
+                    code: code.to_owned(),
+                    component: candidate.component,
+                    reference: Some(candidate.config_path),
+                    message: "structured model-provider secret reference is unresolved.".to_owned(),
+                    remediation:
+                        "Repair the configured secret source or select a resolvable auth profile before relying on the provider."
+                            .to_owned(),
+                });
+            }
+        }
+    }
 
     for candidate in candidates {
         match VaultRef::parse(candidate.reference.as_str()) {
