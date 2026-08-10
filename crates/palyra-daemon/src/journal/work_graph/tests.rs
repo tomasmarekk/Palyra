@@ -586,6 +586,42 @@ fn side_effect_fence_and_claim_diagnostics_are_generation_fenced() {
 }
 
 #[test]
+fn no_op_transition_cannot_preseed_success_verification() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    store.create_work_graph(&request()).expect("graph should be created");
+    let grant = claim(&store, "a", 1);
+    let running = start_claim(&store, &grant);
+    assert_ne!(running.verification_state, WorkVerificationState::Verified);
+
+    let preseed = store
+        .transition_work_graph_item(&WorkItemTransitionRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            expected_revision: running.revision,
+            target_state: WorkItemState::Running,
+            verification_state: Some(WorkVerificationState::Verified),
+            reason_code: "work_graph.test.preseed_verification".to_owned(),
+            actor_principal: "worker-1".to_owned(),
+        })
+        .expect_err("no-op transition must not change verification");
+    assert!(matches!(preseed, JournalError::InvalidWorkGraph { .. }));
+
+    let success = store
+        .transition_work_graph_item(&WorkItemTransitionRequest {
+            graph_id: "graph-1".to_owned(),
+            work_item_id: "a".to_owned(),
+            expected_revision: running.revision,
+            target_state: WorkItemState::Succeeded,
+            verification_state: None,
+            reason_code: "work_graph.test.unverified_success".to_owned(),
+            actor_principal: "worker-1".to_owned(),
+        })
+        .expect_err("unverified success must remain denied");
+    assert!(matches!(success, JournalError::InvalidWorkGraph { .. }));
+}
+
+#[test]
 fn expired_claim_cannot_update_side_effect_fence_or_settle() {
     let directory = tempfile::tempdir().expect("tempdir should exist");
     let store = store(directory.path().join("journal.sqlite3"));

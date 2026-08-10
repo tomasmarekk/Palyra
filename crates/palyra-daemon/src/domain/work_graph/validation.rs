@@ -309,17 +309,25 @@ fn validate_acyclic(items: &[WorkItemSpecV1]) -> Result<(), WorkGraphValidationE
 
 /// Enforces the host state machine and verification gate.
 pub(crate) fn validate_transition(
-    current: WorkItemState,
-    target: WorkItemState,
-    verification: WorkVerificationState,
+    current_state: WorkItemState,
+    current_verification: WorkVerificationState,
+    target_state: WorkItemState,
+    target_verification: WorkVerificationState,
 ) -> Result<(), WorkGraphValidationError> {
-    if current == target {
-        return Ok(());
+    if current_state == target_state {
+        return if current_verification == target_verification {
+            Ok(())
+        } else {
+            Err(WorkGraphValidationError::new(
+                reason::INVALID_TRANSITION,
+                "a no-op state transition cannot change verification state",
+            ))
+        };
     }
-    let allowed = match current {
+    let allowed = match current_state {
         WorkItemState::Draft => {
             matches!(
-                target,
+                target_state,
                 WorkItemState::BlockedByDependencies
                     | WorkItemState::Ready
                     | WorkItemState::Cancelled
@@ -327,19 +335,21 @@ pub(crate) fn validate_transition(
         }
         WorkItemState::BlockedByDependencies => {
             matches!(
-                target,
+                target_state,
                 WorkItemState::Ready | WorkItemState::Failed | WorkItemState::Cancelled
             )
         }
-        WorkItemState::Ready => matches!(target, WorkItemState::Claimed | WorkItemState::Cancelled),
+        WorkItemState::Ready => {
+            matches!(target_state, WorkItemState::Claimed | WorkItemState::Cancelled)
+        }
         WorkItemState::Claimed => {
             matches!(
-                target,
+                target_state,
                 WorkItemState::Running | WorkItemState::Stale | WorkItemState::Cancelled
             )
         }
         WorkItemState::Running => matches!(
-            target,
+            target_state,
             WorkItemState::Waiting
                 | WorkItemState::Review
                 | WorkItemState::Succeeded
@@ -348,7 +358,7 @@ pub(crate) fn validate_transition(
                 | WorkItemState::Stale
         ),
         WorkItemState::Waiting => matches!(
-            target,
+            target_state,
             WorkItemState::Running
                 | WorkItemState::Review
                 | WorkItemState::Failed
@@ -356,7 +366,7 @@ pub(crate) fn validate_transition(
                 | WorkItemState::Stale
         ),
         WorkItemState::Review => matches!(
-            target,
+            target_state,
             WorkItemState::Ready
                 | WorkItemState::Succeeded
                 | WorkItemState::Failed
@@ -364,19 +374,25 @@ pub(crate) fn validate_transition(
         ),
         WorkItemState::Stale => {
             matches!(
-                target,
+                target_state,
                 WorkItemState::Ready | WorkItemState::Review | WorkItemState::Cancelled
             )
         }
         WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled => {
-            target == WorkItemState::Archived
+            target_state == WorkItemState::Archived
         }
         WorkItemState::Archived => false,
     };
-    if !allowed || (target == WorkItemState::Succeeded && !verification.permits_success()) {
+    if !allowed
+        || (target_state == WorkItemState::Succeeded && !target_verification.permits_success())
+    {
         return Err(WorkGraphValidationError::new(
             reason::INVALID_TRANSITION,
-            format!("transition {} -> {} is not permitted", current.as_str(), target.as_str()),
+            format!(
+                "transition {} -> {} is not permitted",
+                current_state.as_str(),
+                target_state.as_str()
+            ),
         ));
     }
     Ok(())

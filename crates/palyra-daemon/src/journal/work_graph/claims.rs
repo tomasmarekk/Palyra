@@ -626,8 +626,13 @@ impl JournalStore {
                 actual_revision: item.revision,
             });
         }
-        validate_transition(item.state, request.target_state, request.verification_state)
-            .map_err(validation_error)?;
+        validate_transition(
+            item.state,
+            item.verification_state,
+            request.target_state,
+            request.verification_state,
+        )
+        .map_err(validation_error)?;
         let failure_count = if request.target_state == WorkItemState::Failed {
             item.failure_circuit.consecutive_failures.saturating_add(1)
         } else {

@@ -75,6 +75,7 @@ fn unbounded_child_cannot_escape_a_bounded_parent() {
 fn success_requires_host_verification() {
     let error = validate_transition(
         WorkItemState::Running,
+        WorkVerificationState::Pending,
         WorkItemState::Succeeded,
         WorkVerificationState::Pending,
     )
@@ -83,8 +84,29 @@ fn success_requires_host_verification() {
     assert_eq!(
         validate_transition(
             WorkItemState::Running,
+            WorkVerificationState::Pending,
             WorkItemState::Succeeded,
             WorkVerificationState::Verified,
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn no_op_transition_cannot_change_verification_state() {
+    assert!(validate_transition(
+        WorkItemState::Running,
+        WorkVerificationState::Pending,
+        WorkItemState::Running,
+        WorkVerificationState::Verified,
+    )
+    .is_err());
+    assert_eq!(
+        validate_transition(
+            WorkItemState::Running,
+            WorkVerificationState::Pending,
+            WorkItemState::Running,
+            WorkVerificationState::Pending,
         ),
         Ok(())
     );
@@ -94,6 +116,7 @@ fn success_requires_host_verification() {
 fn terminal_items_only_transition_to_archived() {
     assert!(validate_transition(
         WorkItemState::Failed,
+        WorkVerificationState::Unverified,
         WorkItemState::Ready,
         WorkVerificationState::Unverified,
     )
@@ -101,6 +124,7 @@ fn terminal_items_only_transition_to_archived() {
     assert_eq!(
         validate_transition(
             WorkItemState::Failed,
+            WorkVerificationState::Unverified,
             WorkItemState::Archived,
             WorkVerificationState::Unverified,
         ),

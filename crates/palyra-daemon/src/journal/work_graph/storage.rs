@@ -246,8 +246,13 @@ impl JournalStore {
             });
         }
         let verification = request.verification_state.unwrap_or(current.verification_state);
-        validate_transition(current.state, request.target_state, verification)
-            .map_err(validation_error)?;
+        validate_transition(
+            current.state,
+            current.verification_state,
+            request.target_state,
+            verification,
+        )
+        .map_err(validation_error)?;
         ensure_dependencies_allow_target(current, snapshot.items.as_slice(), request.target_state)?;
 
         let next_item_revision = current.revision.saturating_add(1);

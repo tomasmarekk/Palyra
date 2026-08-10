@@ -361,7 +361,7 @@ impl JournalStore {
             WorkGraphReviewDecision::Approve => WorkVerificationState::Verified,
             WorkGraphReviewDecision::Reject => WorkVerificationState::Rejected,
         };
-        validate_transition(item.state, target_state, verification_state)
+        validate_transition(item.state, item.verification_state, target_state, verification_state)
             .map_err(validation_error)?;
         let stable_reason = match request.decision {
             WorkGraphReviewDecision::Approve => REVIEW_APPROVED_REASON,
