@@ -16,7 +16,6 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -60,7 +59,6 @@ use crate::{
         BROWSER_VIEWPORT_TOOL_NAME, BROWSER_VISION_TOOL_NAME, BROWSER_WAIT_FOR_TOOL_NAME,
         IMAGE_OBSERVE_TOOL_NAME, MAX_BROWSER_TOOL_INPUT_BYTES,
     },
-    sandbox_runner::process_runner_allows_host_access,
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::proto::palyra::{browser::v1 as browser_v1, common::v1 as common_v1},
 };
@@ -373,41 +371,13 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
     )
 }
 
-/// Whether runtime policy permits navigation to a private network target.
+/// Resolves the browserd private-target flag after URL-specific validation.
 ///
-/// Loopback URLs are auto-allowed only when the process-runner policy already
-/// grants host access, keeping browser reach aligned with the sandbox posture
-/// (an agent that can run servers locally may also browse them). Model tool
-/// payloads cannot relax this decision; browserd still enforces its own
-/// private-target policy on top of the runtime-derived flag.
-fn browser_tool_allows_private_targets_for_url(
-    runtime_state: &GatewayRuntimeState,
-    url: &str,
-) -> bool {
-    process_runner_allows_host_access(&runtime_state.config.tool_call.process_runner)
-        && browser_url_targets_loopback(url)
-}
-
-/// Returns `true` only for http(s) URLs whose host is `localhost` or a
-/// loopback IP (IPv6 brackets stripped); unparsable URLs are not loopback.
-fn browser_url_targets_loopback(raw_url: &str) -> bool {
-    let Ok(parsed) = Url::parse(raw_url.trim()) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = parsed.host_str().map(str::trim).filter(|host| !host.is_empty()) else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+/// Network targets always stay under browserd's default private-address block.
+/// A `file://` target reaches this helper only after the caller has confined
+/// the canonical file to an active workspace root.
+fn browser_private_target_flag_for_validated_url(url: &str) -> bool {
+    browser_url_uses_file_scheme(url)
 }
 
 fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
@@ -1823,12 +1793,7 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            // file:// URLs were already workspace-scoped above, so they get
-            // the private-target flag implicitly (browserd would otherwise
-            // refuse non-network schemes as private).
-            let allow_private_targets =
-                browser_tool_allows_private_targets_for_url(runtime_state, url)
-                    || browser_url_uses_file_scheme(url);
+            let allow_private_targets = browser_private_target_flag_for_validated_url(url);
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -2027,8 +1992,7 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
             let allow_private_targets =
-                browser_tool_allows_private_targets_for_url(runtime_state, current_url.as_str())
-                    || browser_url_uses_file_scheme(current_url.as_str());
+                browser_private_target_flag_for_validated_url(current_url.as_str());
             let requested_url = redact_url(current_url.as_str());
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -4163,9 +4127,7 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            let allow_private_targets =
-                browser_tool_allows_private_targets_for_url(runtime_state, url)
-                    || browser_url_uses_file_scheme(url);
+            let allow_private_targets = browser_private_target_flag_for_validated_url(url);
             let mut request = Request::new(browser_v1::OpenTabRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -6030,13 +5992,13 @@ mod tests {
         browser_file_url_to_path, browser_image_tags_from_dom_snapshot,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
-        browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
-        browser_rescue_trace_payload, browser_resilience_rollout_mismatch,
-        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
-        browser_session_closed_output_json, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
-        browser_tool_execution_outcome, browser_tool_reports_missing_session,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_private_target_flag_for_validated_url, browser_reload_expected_url_from_payload,
+        browser_rescue_rollout_disabled_output, browser_rescue_trace_payload,
+        browser_resilience_rollout_mismatch, browser_screenshot_image_observation_hint,
+        browser_session_closed_error_message, browser_session_closed_output_json,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_storage_origin_to_json, browser_tool_execution_outcome,
+        browser_tool_reports_missing_session, browser_tool_requires_open_session,
         browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
         canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
         evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
@@ -7316,13 +7278,13 @@ mod tests {
     }
 
     #[test]
-    fn browser_url_targets_loopback_only_for_http_loopback_hosts() {
-        assert!(browser_url_targets_loopback("http://localhost:8899/"));
-        assert!(browser_url_targets_loopback("http://127.0.0.1:8899/"));
-        assert!(browser_url_targets_loopback("http://[::1]:8899/"));
-        assert!(!browser_url_targets_loopback("http://192.168.1.10/"));
-        assert!(!browser_url_targets_loopback("https://example.com/"));
-        assert!(!browser_url_targets_loopback("file:///tmp/index.html"));
+    fn browser_private_target_flag_never_implicitly_allows_loopback() {
+        assert!(!browser_private_target_flag_for_validated_url("http://localhost:8899/"));
+        assert!(!browser_private_target_flag_for_validated_url("http://127.0.0.1:8899/"));
+        assert!(!browser_private_target_flag_for_validated_url("http://[::1]:8899/"));
+        assert!(!browser_private_target_flag_for_validated_url("http://192.168.1.10/"));
+        assert!(!browser_private_target_flag_for_validated_url("https://example.com/"));
+        assert!(browser_private_target_flag_for_validated_url("file:///workspace/index.html"));
     }
 
     #[test]

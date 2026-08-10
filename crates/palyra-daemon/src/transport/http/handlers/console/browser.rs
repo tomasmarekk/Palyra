@@ -18,41 +18,12 @@ use crate::*;
 /// per-principal scoping of session-derived data (downloads, network log).
 const BROWSER_CALLER_PRINCIPAL_HEADER: &str = "x-palyra-principal";
 
-/// Resolves the effective `allow_private_targets` flag for a navigation.
+/// Maps an authorized console request into browserd's private-target flag.
 ///
-/// On a `local_desktop` deployment, loopback URLs are implicitly allowed even
-/// without an explicit opt-in so operators can drive locally hosted apps
-/// (e.g. the canvas host) without weakening the private-target guard for any
-/// other destination.
-fn console_browser_allows_private_targets_for_url(
-    state: &AppState,
-    allow_private_targets: Option<bool>,
-    url: &str,
-) -> bool {
-    allow_private_targets.unwrap_or(false)
-        || (state.deployment.mode == "local_desktop" && console_browser_url_targets_loopback(url))
-}
-
-/// Returns `true` only for `http`/`https` URLs whose host is `localhost` or a
-/// loopback IP; unparseable URLs and every other scheme are non-loopback.
-fn console_browser_url_targets_loopback(raw_url: &str) -> bool {
-    let Ok(parsed) = Url::parse(raw_url.trim()) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = parsed.host_str().map(str::trim).filter(|host| !host.is_empty()) else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+/// URL shape and deployment mode are deliberately absent: localhost and
+/// `local_desktop` must not create an implicit private-network exception.
+fn console_browser_private_target_flag(requested: Option<bool>) -> bool {
+    requested.unwrap_or(false)
 }
 
 /// `GET /console/v1/browser/profiles` — lists browser profiles for the
@@ -381,7 +352,7 @@ pub(crate) async fn console_browser_session_create_handler(
         principal: principal.clone(),
         idle_ttl_ms: payload.idle_ttl_ms.unwrap_or(0),
         budget: payload.budget.as_ref().map(console_browser_session_budget_to_proto),
-        allow_private_targets: payload.allow_private_targets.unwrap_or(false),
+        allow_private_targets: console_browser_private_target_flag(payload.allow_private_targets),
         allow_downloads: payload.allow_downloads.unwrap_or(false),
         action_allowed_domains,
         persistence_enabled: payload.persistence_enabled.unwrap_or(false),
@@ -612,11 +583,7 @@ pub(crate) async fn console_browser_navigate_handler(
         timeout_ms: payload.timeout_ms.unwrap_or(0),
         allow_redirects: payload.allow_redirects.unwrap_or(true),
         max_redirects: payload.max_redirects.unwrap_or(3),
-        allow_private_targets: console_browser_allows_private_targets_for_url(
-            &state,
-            payload.allow_private_targets,
-            url,
-        ),
+        allow_private_targets: console_browser_private_target_flag(payload.allow_private_targets),
     });
     apply_browser_service_auth(&state, request.metadata_mut())?;
     let response = client.navigate(request).await.map_err(runtime_status_response)?.into_inner();
@@ -1516,11 +1483,7 @@ pub(crate) async fn console_browser_tab_open_handler(
         timeout_ms: payload.timeout_ms.unwrap_or(0),
         allow_redirects: payload.allow_redirects.unwrap_or(true),
         max_redirects: payload.max_redirects.unwrap_or(3),
-        allow_private_targets: console_browser_allows_private_targets_for_url(
-            &state,
-            payload.allow_private_targets,
-            url,
-        ),
+        allow_private_targets: console_browser_private_target_flag(payload.allow_private_targets),
     });
     apply_browser_service_auth(&state, request.metadata_mut())?;
     let response = client.open_tab(request).await.map_err(runtime_status_response)?.into_inner();
@@ -2928,6 +2891,13 @@ mod tests {
     }
 
     #[test]
+    fn console_browser_private_targets_require_explicit_opt_in() {
+        assert!(!console_browser_private_target_flag(None));
+        assert!(!console_browser_private_target_flag(Some(false)));
+        assert!(console_browser_private_target_flag(Some(true)));
+    }
+
+    #[test]
     fn browser_network_log_metadata_includes_caller_principal() {
         let mut metadata = tonic::metadata::MetadataMap::new();
 
@@ -2954,16 +2924,6 @@ mod tests {
             control_plane_browser_permission_setting(2),
             control_plane::BrowserPermissionSetting::Allow
         );
-    }
-
-    #[test]
-    fn console_browser_url_targets_loopback_only_for_http_loopback_hosts() {
-        assert!(console_browser_url_targets_loopback("http://localhost:8899/"));
-        assert!(console_browser_url_targets_loopback("http://127.0.0.1:8899/"));
-        assert!(console_browser_url_targets_loopback("http://[::1]:8899/"));
-        assert!(!console_browser_url_targets_loopback("http://10.0.0.5/"));
-        assert!(!console_browser_url_targets_loopback("https://example.test/"));
-        assert!(!console_browser_url_targets_loopback("file:///tmp/index.html"));
     }
 
     #[test]
