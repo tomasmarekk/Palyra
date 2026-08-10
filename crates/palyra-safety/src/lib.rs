@@ -3422,7 +3422,8 @@ mod tests {
 
     #[test]
     fn segmented_auth_session_key_values_with_random_segments_are_redacted() {
-        let source = "sessionKey = \"prod-auth-6f4e2d9a0b7c8e1f\";\n\
+        let source = "sessionKey = \"prod-auth-7fG9hK2mN8pQ4rSx\";\n\
+                      sessionToken = \"auth-prod-4rSx7fG9hK2mN8pQ\";\n\
                       token = \"live-auth-8b6f3dbd9287c1ea\";\n\
                       appKey = \"app-session-abcdef1234567890\";\n\
                       stateKey = \"state_8b6f3dbd9287c1ea\";\n\
@@ -3436,12 +3437,14 @@ mod tests {
 
         assert!(outcome.redacted);
         assert!(outcome.redacted_text.contains("sessionKey = \"[REDACTED_SECRET]\";"));
+        assert!(outcome.redacted_text.contains("sessionToken = \"[REDACTED_SECRET]\";"));
         assert!(outcome.redacted_text.contains("token = \"[REDACTED_SECRET]\";"));
         assert!(outcome.redacted_text.contains("appKey = \"[REDACTED_SECRET]\";"));
         assert!(outcome.redacted_text.contains("stateKey = \"[REDACTED_SECRET]\";"));
         assert!(outcome.redacted_text.contains("storageKey = \"[REDACTED_SECRET]\";"));
         for leaked in [
-            "prod-auth-6f4e2d9a0b7c8e1f",
+            "prod-auth-7fG9hK2mN8pQ4rSx",
+            "auth-prod-4rSx7fG9hK2mN8pQ",
             "live-auth-8b6f3dbd9287c1ea",
             "app-session-abcdef1234567890",
             "state_8b6f3dbd9287c1ea",
