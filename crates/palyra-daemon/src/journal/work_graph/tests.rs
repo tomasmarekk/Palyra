@@ -586,6 +586,47 @@ fn side_effect_fence_and_claim_diagnostics_are_generation_fenced() {
 }
 
 #[test]
+fn expired_claim_cannot_update_side_effect_fence_or_settle() {
+    let directory = tempfile::tempdir().expect("tempdir should exist");
+    let store = store(directory.path().join("journal.sqlite3"));
+    store.create_work_graph(&request()).expect("graph should be created");
+    let grant = claim(&store, "a", 1);
+    let running = start_claim(&store, &grant);
+    expire_claim(&store, "a");
+
+    let fence = store
+        .record_work_item_side_effect_fence(&WorkItemSideEffectFenceRequest {
+            authority: authority(&grant),
+            expected_item_revision: running.revision,
+            state: WorkSideEffectFenceState::InFlight,
+            actor_principal: "worker-1".to_owned(),
+        })
+        .expect("expired side-effect authority should be rejected");
+    assert!(matches!(fence, WorkItemSideEffectFenceOutcome::StaleAuthority { .. }));
+
+    let settlement = store
+        .settle_work_item_claim(&WorkClaimSettlementRequest {
+            authority: authority(&grant),
+            expected_item_revision: running.revision,
+            target_state: WorkItemState::Succeeded,
+            verification_state: WorkVerificationState::Verified,
+            result_sha256: "ab".repeat(32),
+            reason_code: "work_graph.test.expired_result".to_owned(),
+            actor_principal: "worker-1".to_owned(),
+        })
+        .expect("expired result should be orphaned");
+    assert!(matches!(settlement, WorkClaimSettlementOutcome::Orphaned { .. }));
+
+    let current = store.work_graph_snapshot("graph-1").unwrap().unwrap().items.remove(0);
+    assert_eq!(current.state, WorkItemState::Running);
+    assert_eq!(current.revision, running.revision);
+    assert_eq!(
+        current.claim.expect("expired claim remains reclaimable").side_effect_fence,
+        WorkSideEffectFenceState::Clear
+    );
+}
+
+#[test]
 fn global_and_profile_caps_throttle_visible_claim_admission() {
     let directory = tempfile::tempdir().expect("tempdir should exist");
     let store = store(directory.path().join("journal.sqlite3"));

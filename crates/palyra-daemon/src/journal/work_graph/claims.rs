@@ -359,6 +359,7 @@ impl JournalStore {
         };
         if item.revision != request.expected_item_revision
             || !authority_matches(&request.authority, claim)
+            || claim.expires_at_unix_ms <= now
         {
             return Ok(WorkItemSideEffectFenceOutcome::StaleAuthority {
                 reason_code: claim_reason::SIDE_EFFECT_FENCE_STALE,
@@ -383,6 +384,7 @@ impl JournalStore {
                   AND claim_token_sha256 = ?8
                   AND claim_worker_id = ?9
                   AND claim_generation = ?10
+                  AND claim_expires_at_unix_ms > ?11
             "#,
             params![
                 request.authority.graph_id,
@@ -395,6 +397,7 @@ impl JournalStore {
                 request.authority.token.sha256_hex(),
                 request.authority.worker_id,
                 u64_to_sqlite(request.authority.generation, "claim_generation")?,
+                now,
             ],
         )?;
         if updated != 1 {
@@ -605,8 +608,9 @@ impl JournalStore {
                 work_item_id: request.authority.work_item_id.clone(),
             });
         };
-        let authority_current =
-            item.claim.as_ref().is_some_and(|claim| authority_matches(&request.authority, claim));
+        let authority_current = item.claim.as_ref().is_some_and(|claim| {
+            authority_matches(&request.authority, claim) && claim.expires_at_unix_ms > now
+        });
         if !authority_current {
             record_orphan_result(&transaction, request, item.claim.as_ref(), now)?;
             transaction.commit()?;
@@ -679,6 +683,7 @@ impl JournalStore {
                   AND revision = ?14
                   AND claim_token_sha256 = ?15
                   AND claim_generation = ?16
+                  AND claim_expires_at_unix_ms > ?17
             "#,
             params![
                 request.authority.graph_id,
@@ -697,6 +702,7 @@ impl JournalStore {
                 u64_to_sqlite(request.expected_item_revision, "expected_item_revision")?,
                 request.authority.token.sha256_hex(),
                 u64_to_sqlite(request.authority.generation, "claim_generation")?,
+                now,
             ],
         )?;
         if updated != 1 {
