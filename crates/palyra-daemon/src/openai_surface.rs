@@ -4182,6 +4182,7 @@ async fn validate_anthropic_api_key(
         if base.ends_with("/v1") { format!("{base}/models") } else { format!("{base}/v1/models") };
     let client = ReqwestClient::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| AnthropicCredentialValidationError::Unexpected(error.to_string()))?;
 
@@ -4652,6 +4653,12 @@ fn fail_openai_oauth_attempt(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        time::Instant,
+    };
+
     use axum::http::{header::HOST, HeaderMap, HeaderValue, StatusCode};
 
     use super::*;
@@ -4693,6 +4700,57 @@ mod tests {
 
         assert_eq!(console, "https://console.anthropic.com/v1/oauth/token");
         assert_eq!(platform, "https://platform.claude.com/v1/oauth/token");
+    }
+
+    #[tokio::test]
+    async fn anthropic_api_key_validation_does_not_follow_redirects() {
+        let redirect_target =
+            TcpListener::bind("127.0.0.1:0").expect("redirect target should bind");
+        redirect_target.set_nonblocking(true).expect("redirect target should become nonblocking");
+        let redirect_target_url = format!(
+            "http://{}/capture",
+            redirect_target.local_addr().expect("redirect target address should resolve")
+        );
+        let source = TcpListener::bind("127.0.0.1:0").expect("source server should bind");
+        source.set_nonblocking(true).expect("source server should become nonblocking");
+        let source_url =
+            format!("http://{}", source.local_addr().expect("source address should resolve"));
+        let source_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match source.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "validation request should connect");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("source server accept failed: {error}"),
+                }
+            };
+            let mut request = [0_u8; 4_096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {redirect_target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("redirect response should be written");
+        });
+
+        let error = validate_anthropic_api_key(
+            source_url.as_str(),
+            "anthropic-test-secret",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("redirect response must not be followed");
+        source_thread.join().expect("source server should stop");
+
+        assert!(matches!(error, AnthropicCredentialValidationError::Unexpected(_)));
+        match redirect_target.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("redirect target must not receive the credential-bearing request"),
+            Err(error) => panic!("redirect target accept failed unexpectedly: {error}"),
+        }
     }
 
     #[test]
