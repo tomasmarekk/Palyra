@@ -7,13 +7,21 @@
 //! access to a root. Every requested path must be absolute, free of `.`/`..`
 //! components, canonicalized (or resolved through its nearest existing
 //! ancestor for new targets), and outside protected OS paths before I/O.
-//! Treat any change to that pipeline as a security change.
+//! Opened file handles are re-resolved and authorized before reads, writes,
+//! truncation, or copies. Treat any change to that pipeline as a security
+//! change.
 //!
 //! Reads stay model-visible even when the safety scanner finds secrets: the
 //! text is replaced with redacted placeholders and flagged via
 //! `text_authoritative`/`redaction_notice` instead of failing the call. All
 //! operations are bounded by the `MAX_OS_FILE_*` constants below.
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -249,11 +257,11 @@ fn stat_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 }
 
 fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(policy, input.path.as_str())?;
+    let mut path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
-    let mut file = File::open(path.resolved_path.as_path()).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to open {}: {error}", input.path.trim())
-    })?;
+    let (mut file, opened_path) =
+        open_os_file_for_read(policy, path.resolved_path.as_path(), input.path.trim())?;
+    path.resolved_path = opened_path;
     let size_bytes = file
         .metadata()
         .map_err(|error| {
@@ -306,7 +314,7 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 
 fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
     let bytes = input_write_bytes(input)?;
-    let path = resolve_target_os_path(policy, input.path.as_str())?;
+    let mut path = resolve_target_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let dry_run = input.dry_run.unwrap_or(false);
     let create_parent_dirs = input.create_parent_dirs.unwrap_or(true);
@@ -314,7 +322,7 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
     let parent = path.resolved_path.parent().ok_or_else(|| {
         format!("{OS_FILE_TOOL_NAME} write target has no parent: {}", input.path.trim())
     })?;
-    let existed_before = path.resolved_path.exists();
+    let mut existed_before = path.existed;
     let parent_existed_before = parent.exists();
     if existed_before && !overwrite {
         return Err(format!(
@@ -322,21 +330,6 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
             input.path.trim()
         ));
     }
-    let existing_size_bytes = if existed_before {
-        Some(
-            fs::metadata(path.resolved_path.as_path())
-                .map_err(|error| {
-                    format!(
-                        "{OS_FILE_TOOL_NAME} failed to inspect write target {}: {error}",
-                        input.path.trim()
-                    )
-                })?
-                .len(),
-        )
-    } else {
-        None
-    };
-    guard_existing_file_write_intent(input, existing_size_bytes, bytes.len())?;
     if !parent_existed_before && !create_parent_dirs {
         return Err(format!(
             "{OS_FILE_TOOL_NAME} parent directory does not exist for {}",
@@ -344,7 +337,25 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
         ));
     }
     let content_sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
-    if !dry_run {
+    let existing_size_bytes = if dry_run {
+        if existed_before {
+            let (file, opened_path) =
+                open_os_file_for_read(policy, path.resolved_path.as_path(), input.path.trim())?;
+            path.resolved_path = opened_path;
+            Some(
+                file.metadata()
+                    .map_err(|error| {
+                        format!(
+                            "{OS_FILE_TOOL_NAME} failed to inspect write target {}: {error}",
+                            input.path.trim()
+                        )
+                    })?
+                    .len(),
+            )
+        } else {
+            None
+        }
+    } else {
         if create_parent_dirs {
             fs::create_dir_all(parent).map_err(|error| {
                 format!(
@@ -353,23 +364,31 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
                 )
             })?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path.resolved_path.as_path())
-            .map_err(|error| {
-                format!(
-                    "{OS_FILE_TOOL_NAME} failed to open write target {}: {error}",
-                    input.path.trim()
-                )
-            })?;
+        let (mut file, opened_path, opened_existing_size) = open_os_file_for_write(
+            policy,
+            path.resolved_path.as_path(),
+            input.path.trim(),
+            overwrite,
+        )?;
+        path.resolved_path = opened_path;
+        existed_before = opened_existing_size.is_some();
+        guard_existing_file_write_intent(input, opened_existing_size, bytes.len())?;
+        file.set_len(0).map_err(|error| {
+            format!(
+                "{OS_FILE_TOOL_NAME} failed to truncate write target {}: {error}",
+                input.path.trim()
+            )
+        })?;
         file.write_all(bytes.as_slice()).map_err(|error| {
             format!("{OS_FILE_TOOL_NAME} failed to write {}: {error}", input.path.trim())
         })?;
         file.sync_all().map_err(|error| {
             format!("{OS_FILE_TOOL_NAME} failed to sync {}: {error}", input.path.trim())
         })?;
+        opened_existing_size
+    };
+    if dry_run {
+        guard_existing_file_write_intent(input, existing_size_bytes, bytes.len())?;
     }
     Ok(json!({
         "operation": "write",
@@ -410,21 +429,40 @@ fn guard_existing_file_write_intent(
 }
 
 fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let source = resolve_existing_os_path(policy, input.path.as_str())?;
-    let target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
+    let mut source = resolve_existing_os_path(policy, input.path.as_str())?;
+    let mut target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
     ensure_os_path_allowed(policy, &source)?;
     ensure_os_path_allowed(policy, &target)?;
     let dry_run = input.dry_run.unwrap_or(false);
     let create_parent_dirs = input.create_parent_dirs.unwrap_or(true);
     let overwrite = input.overwrite.unwrap_or(true);
     prepare_target_parent(&target, create_parent_dirs, overwrite, dry_run, "copy")?;
-    let source_size = fs::metadata(source.resolved_path.as_path())
+    let (mut source_file, opened_source_path) =
+        open_os_file_for_read(policy, source.resolved_path.as_path(), input.path.trim())?;
+    source.resolved_path = opened_source_path;
+    let source_size = source_file
+        .metadata()
         .map_err(|error| format!("{OS_FILE_TOOL_NAME} failed to inspect source: {error}"))?
         .len();
     if !dry_run {
-        fs::copy(source.resolved_path.as_path(), target.resolved_path.as_path()).map_err(
-            |error| format!("{OS_FILE_TOOL_NAME} failed to copy {}: {error}", input.path.trim()),
+        let target_input = required_target_path(input)?;
+        let (mut target_file, opened_target_path, target_existing_size) = open_os_file_for_write(
+            policy,
+            target.resolved_path.as_path(),
+            target_input,
+            overwrite,
         )?;
+        target.resolved_path = opened_target_path;
+        target.existed = target_existing_size.is_some();
+        target_file.set_len(0).map_err(|error| {
+            format!("{OS_FILE_TOOL_NAME} failed to truncate copy target {target_input}: {error}")
+        })?;
+        std::io::copy(&mut source_file, &mut target_file).map_err(|error| {
+            format!("{OS_FILE_TOOL_NAME} failed to copy {}: {error}", input.path.trim())
+        })?;
+        target_file.sync_all().map_err(|error| {
+            format!("{OS_FILE_TOOL_NAME} failed to sync copy target {target_input}: {error}")
+        })?;
     }
     Ok(json!({
         "operation": "copy",
@@ -1295,6 +1333,202 @@ fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> 
     Ok((cursor, suffix.to_path_buf()))
 }
 
+fn open_os_file_for_read(
+    policy: &OsFilePolicy,
+    path: &Path,
+    input_path: &str,
+) -> Result<(File, PathBuf), String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_os_file_no_follow(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("{OS_FILE_TOOL_NAME} failed to open {input_path}: {error}"))?;
+    let opened_path = ensure_open_os_file_allowed(policy, &file, input_path)?;
+    Ok((file, opened_path))
+}
+
+fn open_os_file_for_write(
+    policy: &OsFilePolicy,
+    path: &Path,
+    input_path: &str,
+    overwrite: bool,
+) -> Result<(File, PathBuf, Option<u64>), String> {
+    let (file, existed_before) = if overwrite {
+        let mut existing_options = OpenOptions::new();
+        existing_options.write(true);
+        configure_os_file_no_follow(&mut existing_options);
+        match existing_options.open(path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut create_options = OpenOptions::new();
+                create_options.write(true).create_new(true);
+                configure_os_file_no_follow(&mut create_options);
+                (
+                    create_options.open(path).map_err(|error| {
+                        format!(
+                            "{OS_FILE_TOOL_NAME} failed to create write target {input_path}: {error}"
+                        )
+                    })?,
+                    false,
+                )
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{OS_FILE_TOOL_NAME} failed to open write target {input_path}: {error}"
+                ));
+            }
+        }
+    } else {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_os_file_no_follow(&mut options);
+        (
+            options.open(path).map_err(|error| {
+                format!("{OS_FILE_TOOL_NAME} failed to create write target {input_path}: {error}")
+            })?,
+            false,
+        )
+    };
+    let opened_path = ensure_open_os_file_allowed(policy, &file, input_path)?;
+    let existing_size = existed_before.then(|| {
+        file.metadata().map(|metadata| metadata.len()).map_err(|error| {
+            format!("{OS_FILE_TOOL_NAME} failed to inspect write target {input_path}: {error}")
+        })
+    });
+    let existing_size = existing_size.transpose()?;
+    Ok((file, opened_path, existing_size))
+}
+
+fn ensure_open_os_file_allowed(
+    policy: &OsFilePolicy,
+    file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
+    let metadata = file.metadata().map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to inspect opened file {input_path}: {error}")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{OS_FILE_TOOL_NAME} refused symlink target {input_path}"));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{OS_FILE_TOOL_NAME} target is not a regular file: {input_path}"));
+    }
+    let opened_path = canonicalize_open_os_file_path(file, input_path)?;
+    ensure_os_path_allowed(
+        policy,
+        &ResolvedOsPath {
+            requested_path: PathBuf::from(input_path),
+            resolved_path: opened_path.clone(),
+            existed: true,
+        },
+    )?;
+    Ok(opened_path)
+}
+
+#[cfg(unix)]
+fn configure_os_file_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn configure_os_file_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_os_file_no_follow(_options: &mut OpenOptions) {}
+
+/// Resolves the actual target held by an open descriptor rather than trusting
+/// a path that may have changed since its pre-open policy check.
+#[cfg(target_os = "linux")]
+fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+    let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    fs::canonicalize(fd_path).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+    let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+    let result = unsafe {
+        // SAFETY: The descriptor is borrowed from a live File and the buffer
+        // is writable storage sized for macOS F_GETPATH.
+        libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr())
+    };
+    if result == -1 {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let opened_path = unsafe {
+        // SAFETY: A successful F_GETPATH call writes a nul-terminated path.
+        std::ffi::CStr::from_ptr(buffer.as_ptr())
+    };
+    let opened_path = PathBuf::from(std::ffi::OsString::from_vec(opened_path.to_bytes().to_vec()));
+    fs::canonicalize(opened_path).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+    let fd_path = format!("/dev/fd/{}", file.as_raw_fd());
+    fs::canonicalize(fd_path).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
+    })
+}
+
+#[cfg(windows)]
+fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let length = unsafe {
+            // SAFETY: The handle is borrowed from a live File and buffer is a
+            // valid writable UTF-16 slice with the supplied length.
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 {
+            return Err(format!(
+                "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let length = usize::try_from(length).map_err(|_| {
+            format!(
+                "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: path length exceeds platform limits"
+            )
+        })?;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(String::from_utf16_lossy(buffer.as_slice())));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn canonicalize_open_os_file_path(_file: &File, input_path: &str) -> Result<PathBuf, String> {
+    Err(format!(
+        "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: unsupported platform"
+    ))
+}
+
 /// Central containment gate: every operation must pass its resolved path
 /// through this before any I/O.
 ///
@@ -1415,8 +1649,8 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        let path = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        let root = root.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let path = windows_os_file_path_key(path);
+        let root = windows_os_file_path_key(root);
         path == root || path.starts_with(format!("{root}/").as_str())
     }
     #[cfg(not(windows))]
@@ -1428,14 +1662,26 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.to_string_lossy()
-            .replace('\\', "/")
-            .eq_ignore_ascii_case(&right.to_string_lossy().replace('\\', "/"))
+        windows_os_file_path_key(left) == windows_os_file_path_key(right)
     }
     #[cfg(not(windows))]
     {
         left == right
     }
+}
+
+#[cfg(windows)]
+fn windows_os_file_path_key(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    if let Some(suffix) = key.strip_prefix("//?/unc/") {
+        key = format!("//{suffix}");
+    } else if let Some(suffix) = key.strip_prefix("//?/") {
+        key = suffix.to_owned();
+    }
+    while key.ends_with('/') && key.len() > 3 {
+        key.pop();
+    }
+    key
 }
 
 fn metadata_kind(metadata: &fs::Metadata) -> &'static str {
@@ -1571,6 +1817,42 @@ mod tests {
             user_os_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
             path_env: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn opened_os_file_handle_is_reauthorized_against_policy() {
+        let allowed = os_file_tempdir();
+        let outside = os_file_tempdir();
+        let policy = test_policy(allowed.path());
+        let outside_path = outside.path().join("outside.txt");
+        fs::write(outside_path.as_path(), "outside\n").expect("outside fixture should exist");
+        let file = File::open(outside_path.as_path()).expect("outside fixture should open");
+
+        let error = ensure_open_os_file_allowed(&policy, &file, "allowed/raced.txt")
+            .expect_err("opened handle outside policy must be rejected");
+
+        assert!(error.contains("outside agent workspace roots"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_file_write_open_refuses_raced_symlink_target() {
+        let allowed = os_file_tempdir();
+        let outside = os_file_tempdir();
+        let policy = test_policy(allowed.path());
+        let outside_path = outside.path().join("outside.txt");
+        let raced_path = allowed.path().join("raced.txt");
+        fs::write(outside_path.as_path(), "preserve\n").expect("outside fixture should exist");
+        std::os::unix::fs::symlink(outside_path.as_path(), raced_path.as_path())
+            .expect("raced symlink should exist");
+
+        open_os_file_for_write(&policy, raced_path.as_path(), "raced.txt", true)
+            .expect_err("no-follow open must reject the raced symlink");
+
+        assert_eq!(
+            fs::read_to_string(outside_path).expect("outside fixture should remain readable"),
+            "preserve\n"
+        );
     }
 
     #[test]
