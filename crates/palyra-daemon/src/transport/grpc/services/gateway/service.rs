@@ -306,10 +306,14 @@ fn channel_bot_loop_decision(
     input: &ChannelInboundMessage,
     envelope: &ChannelTurnEnvelope,
     command_parse_outcome: &ChannelCommandParseOutcome,
+    bot: ChannelTurnBotFacts,
     actor_connector: &str,
     actor_gateway_principal: &str,
     actor_gateway_device_id: &str,
 ) -> BotLoopDecision {
+    if !channel_bot_loop_guard_eligible(bot) {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.sender_not_verified_bot");
+    }
     if !matches!(command_parse_outcome, ChannelCommandParseOutcome::NotCommand) {
         return BotLoopDecision::bypassed("channel.bot_loop.bypassed.channel_command");
     }
@@ -334,6 +338,27 @@ fn channel_bot_loop_decision(
     state.channel_bot_loop_guard.observe(key, envelope.received_at_unix_ms)
 }
 
+fn channel_bot_loop_guard_eligible(bot: ChannelTurnBotFacts) -> bool {
+    bot.sender_is_bot && !bot.sender_is_self
+}
+
+#[cfg(test)]
+#[test]
+fn channel_bot_loop_guard_requires_external_verified_bot_facts() {
+    assert!(!channel_bot_loop_guard_eligible(ChannelTurnBotFacts {
+        sender_is_self: false,
+        sender_is_bot: false,
+    }));
+    assert!(!channel_bot_loop_guard_eligible(ChannelTurnBotFacts {
+        sender_is_self: true,
+        sender_is_bot: true,
+    }));
+    assert!(channel_bot_loop_guard_eligible(ChannelTurnBotFacts {
+        sender_is_self: false,
+        sender_is_bot: true,
+    }));
+}
+
 fn bot_loop_route_decision_reason(admission_reason: ChannelAdmissionReason) -> String {
     if admission_reason == ChannelAdmissionReason::DropBotLoopProtection {
         "bot_loop_protection".to_owned()
@@ -353,12 +378,13 @@ fn build_channel_turn_admission_input(
     router_reason: Option<&str>,
     queued_for_retry: bool,
     ambient_context_enabled: bool,
+    bot: ChannelTurnBotFacts,
     bot_loop: BotLoopDecision,
 ) -> ChannelTurnAdmissionInput {
     let (is_channel_command, urgent_command) = channel_turn_command_facts(command_parse_outcome);
     ChannelTurnAdmissionInput {
         mention: channel_turn_mention_state(input, router_outcome, router_reason),
-        bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+        bot,
         bot_loop,
         policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
         binding: ChannelTurnBindingFacts {
@@ -921,6 +947,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             actor_gateway_device_id.as_str(),
             observed_at_unix_ms,
         );
+        // RouteMessage currently has no host-authenticated binding from the
+        // envelope sender to a bot identity, so ordinary sender claims must
+        // not activate bot-loop suppression.
+        let channel_turn_bot_facts =
+            ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false };
 
         if input.is_direct_message {
             if let Some(pairing_code) = extract_pairing_code_command(input.text.as_str()) {
@@ -1199,6 +1230,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Some(rejection_reason.as_str()),
                     false,
                     ambient_context_enabled,
+                    channel_turn_bot_facts,
                     BotLoopDecision::bypassed("channel.bot_loop.bypassed.router_rejected"),
                 );
                 record_channel_turn_intake_events(
@@ -1288,6 +1320,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Some(queue_reason.as_str()),
                     true,
                     false,
+                    channel_turn_bot_facts,
                     BotLoopDecision::bypassed("channel.bot_loop.bypassed.router_queued"),
                 );
                 record_channel_turn_intake_events(
@@ -1376,6 +1409,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &input,
                     &channel_turn_envelope,
                     &command_parse_outcome,
+                    channel_turn_bot_facts,
                     actor_connector.as_str(),
                     actor_gateway_principal.as_str(),
                     actor_gateway_device_id.as_str(),
@@ -1390,6 +1424,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     None,
                     false,
                     false,
+                    channel_turn_bot_facts,
                     bot_loop_decision,
                 );
                 match command_parse_outcome {
