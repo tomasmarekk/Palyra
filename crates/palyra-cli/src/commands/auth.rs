@@ -1742,12 +1742,14 @@ fn provider_console_unavailable_status_payload(
     provider_key: &str,
     error: impl std::fmt::Display,
 ) -> OpenAiAuthStatusPayload {
+    let error = error.to_string();
+    let redacted = redact_auth_error(redact_url_segments_in_text(error.as_str()).as_str());
     OpenAiAuthStatusPayload {
         provider: provider_key.to_owned(),
         provider_state: "console_unavailable".to_owned(),
         note: Some(format!(
             "Local Palyra console is unavailable: {}. Run `palyra health --json`; if the console is not healthy, run `palyra gateway restart` and retry this status command.",
-            sanitize_auth_message(error.to_string().as_str())
+            sanitize_auth_message(redacted.as_str())
         )),
         default_profile_id: None,
         summary: OpenAiAuthHealthSummary::default(),
@@ -3234,6 +3236,23 @@ mod tests {
             "degraded status should include recovery guidance: {:?}",
             payload.note
         );
+    }
+
+    #[test]
+    fn provider_status_payload_redacts_console_error_diagnostics() {
+        let payload = provider_console_unavailable_status_payload(
+            "openai",
+            anyhow::anyhow!(
+                "request to https://operator:secret@example.test/admin?token=sk-test-secret failed; authorization=Bearer sk-test-secret"
+            ),
+        );
+        let note = payload.note.expect("degraded status should include a note");
+
+        assert!(!note.contains("operator"));
+        assert!(!note.contains("secret"));
+        assert!(!note.contains("sk-test-secret"));
+        assert!(!note.contains("Bearer"));
+        assert!(note.contains("<redacted>"));
     }
 
     #[test]
