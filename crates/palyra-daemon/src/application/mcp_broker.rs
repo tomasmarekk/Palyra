@@ -408,6 +408,7 @@ struct McpRuntimeServerRecord {
     namespace: String,
     transport: McpServerTransport,
     enabled: bool,
+    source_config: McpServerConfig,
     state: McpServerLifecycleState,
     consecutive_failures: u32,
     total_failures: u64,
@@ -822,6 +823,7 @@ impl McpRuntimeServerRecord {
             namespace: config.namespace.clone(),
             transport: config.transport,
             enabled,
+            source_config: config.clone(),
             state: if enabled {
                 McpServerLifecycleState::Stopped
             } else {
@@ -846,7 +848,7 @@ impl McpRuntimeServerRecord {
     }
 
     fn apply_reload_evidence(&mut self, existing: &Self, now_unix_ms: i64) {
-        if !(self.enabled && existing.enabled && self.transport == existing.transport) {
+        if !(self.enabled && existing.enabled && self.source_config == existing.source_config) {
             return;
         }
         self.state = existing.state;
@@ -4143,6 +4145,27 @@ mod tests {
         let error =
             supervisor.start_server("docs", 201).expect_err("reload must not clear quarantine");
         assert_eq!(error.reason_code, "mcp.server_quarantined");
+    }
+
+    #[test]
+    fn runtime_supervisor_reload_drops_health_when_server_config_changes() {
+        let config = runtime_config(vec![runtime_server("docs", true)]);
+        let mut supervisor = McpRuntimeSupervisor::from_config(&config);
+        let attempt = supervisor.start_server("docs", 100).expect("server should start");
+        supervisor
+            .record_start_success("docs", attempt.expected_generation, 110)
+            .expect("server should become healthy");
+        let mut changed = runtime_server("docs", true);
+        changed.command = Some(vec!["node".to_owned(), "replacement-server.js".to_owned()]);
+
+        supervisor.reload_from_config(&runtime_config(vec![changed]), 200);
+
+        let snapshot = supervisor.snapshot(200);
+        let server = runtime_server_snapshot(&snapshot, "docs");
+        assert_eq!(server.state, McpServerLifecycleState::Stopped);
+        assert_eq!(server.last_successful_probe_at_unix_ms, None);
+        assert_eq!(server.active_generation, None);
+        assert!(!server.catalog_available);
     }
 
     #[test]
