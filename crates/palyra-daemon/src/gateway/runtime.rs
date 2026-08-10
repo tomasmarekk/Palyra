@@ -15165,15 +15165,23 @@ impl GatewayRuntimeState {
     fn work_item_handoff_blocking(
         &self,
         owner_principal: &str,
+        owner_device_id: &str,
+        owner_session_id: &str,
         graph_id: &str,
         handoff_id: &str,
     ) -> Result<Option<WorkItemHandoffEnvelopeV1>, Status> {
         self.journal_store
-            .work_item_handoff(owner_principal, graph_id, handoff_id)
+            .work_item_handoff(
+                owner_principal,
+                owner_device_id,
+                owner_session_id,
+                graph_id,
+                handoff_id,
+            )
             .map_err(|error| map_orchestrator_store_error("load work item handoff", error))
     }
 
-    /// Retrieves one owner-scoped handoff without loading child transcripts.
+    /// Retrieves one owner/session-scoped handoff without loading child transcripts.
     ///
     /// # Errors
     /// Returns the mapped journal error, or `internal` if the blocking worker panicked.
@@ -15181,6 +15189,8 @@ impl GatewayRuntimeState {
     pub(crate) async fn work_item_handoff(
         self: &Arc<Self>,
         owner_principal: String,
+        owner_device_id: String,
+        owner_session_id: String,
         graph_id: String,
         handoff_id: String,
     ) -> Result<Option<WorkItemHandoffEnvelopeV1>, Status> {
@@ -15188,6 +15198,8 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || {
             state.work_item_handoff_blocking(
                 owner_principal.as_str(),
+                owner_device_id.as_str(),
+                owner_session_id.as_str(),
                 graph_id.as_str(),
                 handoff_id.as_str(),
             )

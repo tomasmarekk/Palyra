@@ -184,9 +184,17 @@ async fn retrieve_handoff(
     let graph_id = required(request.graph_id.as_deref(), "graph_id")?;
     let handoff_id = required(request.handoff_id.as_deref(), "handoff_id")?;
     let handoff = runtime
-        .work_item_handoff(context.principal.to_owned(), graph_id.clone(), handoff_id.clone())
+        .work_item_handoff(
+            context.principal.to_owned(),
+            context.device_id.to_owned(),
+            context.session_id.to_owned(),
+            graph_id.clone(),
+            handoff_id.clone(),
+        )
         .await?
-        .ok_or_else(|| Status::not_found("WorkGraph handoff is unavailable in this owner scope"))?;
+        .ok_or_else(|| {
+            Status::not_found("WorkGraph handoff is unavailable in this owner/session scope")
+        })?;
     Ok(json!({
         "schema_version": WORK_GRAPH_SCHEMA_VERSION,
         "operation": "retrieve",

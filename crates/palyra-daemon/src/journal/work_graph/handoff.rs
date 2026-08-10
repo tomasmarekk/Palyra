@@ -497,25 +497,36 @@ impl JournalStore {
         })
     }
 
-    /// Retrieves one owner-scoped handoff without exposing a child transcript.
+    /// Retrieves one owner/session-scoped handoff without exposing a child transcript.
     pub(crate) fn work_item_handoff(
         &self,
         owner_principal: &str,
+        owner_device_id: &str,
+        owner_session_id: &str,
         graph_id: &str,
         handoff_id: &str,
     ) -> Result<Option<WorkItemHandoffEnvelopeV1>, JournalError> {
         ensure_nonempty_field(owner_principal, "owner_principal")?;
+        ensure_nonempty_field(owner_device_id, "owner_device_id")?;
+        ensure_nonempty_field(owner_session_id, "owner_session_id")?;
         ensure_nonempty_field(graph_id, "graph_id")?;
         ensure_nonempty_field(handoff_id, "handoff_id")?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let owner = guard
+        let owned_graph = guard
             .query_row(
-                "SELECT owner_principal FROM work_graphs WHERE graph_ulid = ?1",
-                params![graph_id],
+                r#"
+                    SELECT graph_ulid
+                    FROM work_graphs
+                    WHERE graph_ulid = ?1
+                      AND owner_principal = ?2
+                      AND device_id = ?3
+                      AND session_ulid = ?4
+                "#,
+                params![graph_id, owner_principal, owner_device_id, owner_session_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if owner.as_deref() != Some(owner_principal) {
+        if owned_graph.is_none() {
             return Ok(None);
         }
         Ok(query_handoff_by_id(&guard, handoff_id)?.filter(|handoff| handoff.graph_id == graph_id))

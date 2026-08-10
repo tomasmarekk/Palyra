@@ -842,7 +842,13 @@ fn parallel_handoffs_commit_distinct_generation_bound_results() {
     assert_ne!(first.handoff.provenance_sha256, second.handoff.provenance_sha256);
     assert_eq!(
         store
-            .work_item_handoff("principal-1", "graph-1", first.handoff.handoff_id.as_str())
+            .work_item_handoff(
+                "principal-1",
+                "device-1",
+                "session-1",
+                "graph-1",
+                first.handoff.handoff_id.as_str(),
+            )
             .expect("first handoff should load")
             .expect("first handoff should exist")
             .structured_result["worker"],
@@ -850,7 +856,13 @@ fn parallel_handoffs_commit_distinct_generation_bound_results() {
     );
     assert_eq!(
         store
-            .work_item_handoff("principal-1", "graph-1", second.handoff.handoff_id.as_str())
+            .work_item_handoff(
+                "principal-1",
+                "device-1",
+                "session-1",
+                "graph-1",
+                second.handoff.handoff_id.as_str(),
+            )
             .expect("second handoff should load")
             .expect("second handoff should exist")
             .structured_result["worker"],
@@ -898,7 +910,13 @@ fn review_rejection_reopens_item_and_restart_restores_handoff_comments_and_evide
 
     let reopened = store(path);
     let restored = reopened
-        .work_item_handoff("principal-1", "graph-1", handoff.handoff.handoff_id.as_str())
+        .work_item_handoff(
+            "principal-1",
+            "device-1",
+            "session-1",
+            "graph-1",
+            handoff.handoff.handoff_id.as_str(),
+        )
         .expect("handoff replay should load")
         .expect("handoff should survive restart");
     assert_eq!(restored.evidence_refs, vec!["evidence:a"]);
@@ -928,7 +946,7 @@ fn review_rejection_reopens_item_and_restart_restores_handoff_comments_and_evide
 }
 
 #[test]
-fn terminal_summary_bounds_parent_context_and_retrieval_enforces_owner_acl() {
+fn terminal_summary_bounds_parent_context_and_retrieval_enforces_owner_session_acl() {
     let directory = tempfile::tempdir().expect("tempdir should exist");
     let store = store(directory.path().join("journal.sqlite3"));
     let mut create = request();
@@ -965,7 +983,13 @@ fn terminal_summary_bounds_parent_context_and_retrieval_enforces_owner_acl() {
     assert!(serde_json::to_vec(&terminal).unwrap().len() < 16 * 1024);
     assert!(
         store
-            .work_item_handoff("principal-1", "graph-1", handoff.handoff.handoff_id.as_str(),)
+            .work_item_handoff(
+                "principal-1",
+                "device-1",
+                "session-1",
+                "graph-1",
+                handoff.handoff.handoff_id.as_str(),
+            )
             .unwrap()
             .unwrap()
             .structured_result["large_child_output"]
@@ -975,7 +999,33 @@ fn terminal_summary_bounds_parent_context_and_retrieval_enforces_owner_acl() {
             > 32 * 1024
     );
     assert!(store
-        .work_item_handoff("principal-2", "graph-1", handoff.handoff.handoff_id.as_str(),)
+        .work_item_handoff(
+            "principal-2",
+            "device-1",
+            "session-1",
+            "graph-1",
+            handoff.handoff.handoff_id.as_str(),
+        )
+        .unwrap()
+        .is_none());
+    assert!(store
+        .work_item_handoff(
+            "principal-1",
+            "device-2",
+            "session-1",
+            "graph-1",
+            handoff.handoff.handoff_id.as_str(),
+        )
+        .unwrap()
+        .is_none());
+    assert!(store
+        .work_item_handoff(
+            "principal-1",
+            "device-1",
+            "session-2",
+            "graph-1",
+            handoff.handoff.handoff_id.as_str(),
+        )
         .unwrap()
         .is_none());
 }
