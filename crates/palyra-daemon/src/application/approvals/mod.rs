@@ -484,13 +484,20 @@ fn os_file_approval_fingerprint_payload(payload: &Map<String, Value>) -> Value {
 }
 
 fn os_file_content_fingerprint(payload: &Map<String, Value>) -> Value {
-    if let Some(content_text) = payload.get("content_text").and_then(Value::as_str) {
-        return json!({ "kind": "content_text", "sha256": sha256_hex(content_text.as_bytes()) });
+    let content_text = payload.get("content_text").and_then(Value::as_str);
+    let bytes_base64 = payload.get("bytes_base64").and_then(Value::as_str);
+    match (content_text, bytes_base64) {
+        (Some(""), Some(bytes_base64)) if !bytes_base64.is_empty() => {
+            json!({ "kind": "bytes_base64", "sha256": sha256_hex(bytes_base64.as_bytes()) })
+        }
+        (Some(content_text), _) => {
+            json!({ "kind": "content_text", "sha256": sha256_hex(content_text.as_bytes()) })
+        }
+        (None, Some(bytes_base64)) => {
+            json!({ "kind": "bytes_base64", "sha256": sha256_hex(bytes_base64.as_bytes()) })
+        }
+        (None, None) => Value::Null,
     }
-    if let Some(bytes_base64) = payload.get("bytes_base64").and_then(Value::as_str) {
-        return json!({ "kind": "bytes_base64", "sha256": sha256_hex(bytes_base64.as_bytes()) });
-    }
-    Value::Null
 }
 
 fn normalized_string_field(payload: &Map<String, Value>, field: &str) -> Value {
@@ -1065,6 +1072,25 @@ mod tests {
         assert_ne!(
             first_write, second_write,
             "session-scoped write approval must be bound to the approved content hash"
+        );
+    }
+
+    #[test]
+    fn os_file_approval_subject_hashes_effective_base64_content() {
+        let first_write = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"write","path":"/tmp/palyra/config.bin","content_text":"","bytes_base64":"Zmlyc3Q="}"#,
+        );
+        let second_write = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"write","path":"/tmp/palyra/config.bin","content_text":"","bytes_base64":"c2Vjb25k"}"#,
+        );
+
+        assert_ne!(
+            first_write, second_write,
+            "session approval must be bound to the base64 content selected by the write runtime"
         );
     }
 
