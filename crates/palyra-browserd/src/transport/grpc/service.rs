@@ -380,26 +380,13 @@ async fn browser_session_health_to_proto(
     }
 }
 
-/// Resolves the include flags: all-false (the proto3 default) means the
-/// caller selected nothing, so everything is included; any explicit selection
-/// is honored as-is.
+/// Preserves every caller-selected observe inclusion bit, including all-false.
 fn resolve_observe_inclusions(
     include_dom_snapshot: bool,
     include_accessibility_tree: bool,
     include_visible_text: bool,
 ) -> ObserveInclusions {
-    if include_dom_snapshot || include_accessibility_tree || include_visible_text {
-        return ObserveInclusions {
-            include_dom_snapshot,
-            include_accessibility_tree,
-            include_visible_text,
-        };
-    }
-    ObserveInclusions {
-        include_dom_snapshot: true,
-        include_accessibility_tree: true,
-        include_visible_text: true,
-    }
+    ObserveInclusions { include_dom_snapshot, include_accessibility_tree, include_visible_text }
 }
 
 #[tonic::async_trait]
@@ -4853,13 +4840,13 @@ mod tests {
     }
 
     #[test]
-    fn observe_defaults_include_visible_text_for_bare_snapshot() {
+    fn observe_inclusions_preserve_all_false_selection() {
         assert_eq!(
             resolve_observe_inclusions(false, false, false),
             ObserveInclusions {
-                include_dom_snapshot: true,
-                include_accessibility_tree: true,
-                include_visible_text: true,
+                include_dom_snapshot: false,
+                include_accessibility_tree: false,
+                include_visible_text: false,
             }
         );
     }
