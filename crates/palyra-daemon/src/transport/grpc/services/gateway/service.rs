@@ -414,7 +414,7 @@ async fn record_channel_turn_record(
     record: ChannelTurnJournalRecord,
 ) {
     let event_type = record.event_type.clone();
-    let _ = record_message_router_journal_event(
+    if let Err(error) = record_message_router_journal_event(
         state,
         context,
         session_id,
@@ -423,7 +423,14 @@ async fn record_channel_turn_record(
         actor,
         record.payload_json(),
     )
-    .await;
+    .await
+    {
+        warn!(
+            event_type = %event_type,
+            error = %error,
+            "channel-turn audit append failed"
+        );
+    }
 }
 
 async fn record_channel_turn_intake_events(

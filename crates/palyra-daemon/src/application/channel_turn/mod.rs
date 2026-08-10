@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 const CHANNEL_TURN_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
+const MAX_CHANNEL_TURN_METADATA_BYTES: usize = 256;
 const DEFAULT_CHANNEL_HISTORY_MAX_RECORDS: usize = 512;
 const DEFAULT_CHANNEL_BOT_LOOP_THRESHOLD: u32 = 2;
 const DEFAULT_CHANNEL_BOT_LOOP_WINDOW_MS: u64 = 30_000;
@@ -114,23 +115,24 @@ impl ChannelTurnEnvelope {
     /// Builds a journal-safe envelope from route-message boundary data.
     #[must_use]
     pub(crate) fn from_input(input: ChannelTurnEnvelopeInput) -> Self {
-        let correlation_id = format!("channel_turn:{}", input.envelope_id);
+        let envelope_id = normalize_bounded_required(input.envelope_id);
+        let correlation_id = format!("channel_turn:{envelope_id}");
         let has_media = input.attachment_count > 0;
         Self {
             schema_version: CHANNEL_TURN_SCHEMA_VERSION,
             correlation_id,
-            envelope_id: input.envelope_id,
+            envelope_id,
             sender: ChannelTurnSender {
-                handle: normalize_optional(input.sender_handle),
-                display: normalize_optional(input.sender_display),
+                handle: normalize_bounded_optional(input.sender_handle),
+                display: normalize_bounded_optional(input.sender_display),
                 verified: input.sender_verified,
-                gateway_principal: input.gateway_principal,
-                gateway_device_id: input.gateway_device_id,
+                gateway_principal: normalize_bounded_required(input.gateway_principal),
+                gateway_device_id: normalize_bounded_required(input.gateway_device_id),
             },
             receiver: ChannelTurnReceiver {
-                channel: input.channel,
-                conversation_id: normalize_optional(input.conversation_id),
-                thread_id: normalize_optional(input.thread_id),
+                channel: normalize_bounded_required(input.channel),
+                conversation_id: normalize_bounded_optional(input.conversation_id),
+                thread_id: normalize_bounded_optional(input.thread_id),
                 direct_message: input.is_direct_message,
             },
             message: ChannelTurnMessage {
@@ -141,11 +143,11 @@ impl ChannelTurnEnvelope {
                 requested_broadcast: input.requested_broadcast,
             },
             route_hints: ChannelTurnRouteHints {
-                adapter_message_id: normalize_optional(input.adapter_message_id),
+                adapter_message_id: normalize_bounded_optional(input.adapter_message_id),
                 retry_attempt: input.retry_attempt,
                 max_payload_bytes: input.max_payload_bytes,
                 json_mode_requested: input.json_mode_requested,
-                route_config_hash: input.route_config_hash,
+                route_config_hash: normalize_bounded_required(input.route_config_hash),
             },
             received_at_unix_ms: input.received_at_unix_ms,
             redaction_level: "redacted_text_preview".to_owned(),
@@ -1388,6 +1390,20 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+fn normalize_bounded_required(value: String) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= MAX_CHANNEL_TURN_METADATA_BYTES {
+        return trimmed.to_owned();
+    }
+    // Preserve stable equality for oversized routing identities without
+    // copying attacker-controlled metadata into every lifecycle projection.
+    format!("oversize-sha256:{}", crate::sha256_hex(trimmed.as_bytes()))
+}
+
+fn normalize_bounded_optional(value: Option<String>) -> Option<String> {
+    normalize_optional(value).map(normalize_bounded_required)
+}
+
 fn normalize_required_identity(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -1526,6 +1542,48 @@ mod tests {
         assert_eq!(payload["event"], CHANNEL_TURN_RECEIVED_EVENT);
         assert_eq!(payload["reason_code"], "channel.turn.received");
         assert_eq!(payload["payload"]["envelope"]["redaction_level"], "redacted_text_preview");
+    }
+
+    #[test]
+    fn envelope_bounds_connector_metadata_before_journal_projection() {
+        let oversized = "x".repeat(64 * 1_024);
+        let envelope = ChannelTurnEnvelope::from_input(ChannelTurnEnvelopeInput {
+            envelope_id: oversized.clone(),
+            channel: oversized.clone(),
+            conversation_id: Some(oversized.clone()),
+            thread_id: Some(oversized.clone()),
+            sender_handle: Some(oversized.clone()),
+            sender_display: Some(oversized.clone()),
+            sender_verified: true,
+            gateway_principal: oversized.clone(),
+            gateway_device_id: oversized.clone(),
+            text: "bounded body".to_owned(),
+            max_payload_bytes: 4_096,
+            is_direct_message: false,
+            requested_broadcast: false,
+            adapter_message_id: Some(oversized.clone()),
+            retry_attempt: 0,
+            attachment_count: 0,
+            json_mode_requested: false,
+            route_config_hash: oversized,
+            received_at_unix_ms: 10,
+        });
+
+        assert!(envelope.envelope_id.starts_with("oversize-sha256:"));
+        assert!(envelope.sender.handle.as_deref().is_some_and(|value| {
+            value.starts_with("oversize-sha256:") && value.len() <= MAX_CHANNEL_TURN_METADATA_BYTES
+        }));
+        assert!(envelope.receiver.conversation_id.as_deref().is_some_and(|value| {
+            value.starts_with("oversize-sha256:") && value.len() <= MAX_CHANNEL_TURN_METADATA_BYTES
+        }));
+        assert!(envelope.route_hints.adapter_message_id.as_deref().is_some_and(|value| {
+            value.starts_with("oversize-sha256:") && value.len() <= MAX_CHANNEL_TURN_METADATA_BYTES
+        }));
+
+        let payload = channel_turn_received_record(&envelope, Some("session-1"), Some("run-1"))
+            .payload_json()
+            .to_string();
+        assert!(payload.len() < 16 * 1_024);
     }
 
     #[test]
