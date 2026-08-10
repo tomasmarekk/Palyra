@@ -61,6 +61,14 @@ use crate::{
 
 use super::{workspace_patch_error_outcome, workspace_patch_tool_execution_outcome};
 
+/// Maps one effective patch root back to the stable agent root used by
+/// checkpoint restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkspacePatchCheckpointRootMapping {
+    pub(super) root_index: usize,
+    pub(super) path_prefix: String,
+}
+
 /// Borrowed inputs for one checkpointed patch mutation; the planned outcome
 /// is included so risk is assessed before any write happens.
 pub(super) struct WorkspacePatchMutationRequest<'a> {
@@ -77,6 +85,8 @@ pub(super) struct WorkspacePatchMutationRequest<'a> {
     pub(super) workspace_roots: &'a [PathBuf],
     pub(super) canonical_constraint_roots: &'a [PathBuf],
     pub(super) risk_path_prefixes: &'a [String],
+    pub(super) checkpoint_roots: &'a [PathBuf],
+    pub(super) checkpoint_root_mappings: &'a [WorkspacePatchCheckpointRootMapping],
     pub(super) planned_outcome: WorkspacePatchOutcome,
 }
 
@@ -105,6 +115,8 @@ pub(super) async fn execute_workspace_patch_mutation(
         workspace_roots,
         canonical_constraint_roots,
         risk_path_prefixes,
+        checkpoint_roots,
+        checkpoint_root_mappings,
         planned_outcome,
     } = request;
     let mutation_id = Ulid::new().to_string();
@@ -114,6 +126,21 @@ pub(super) async fn execute_workspace_patch_mutation(
     );
     let mut preflight_checkpoint = None;
     let mut preflight_error = None;
+    let checkpoint_planned_files = match rebase_workspace_checkpoint_attestations(
+        planned_outcome.files_touched.as_slice(),
+        checkpoint_root_mappings,
+    ) {
+        Ok(files) => files,
+        Err(error) => {
+            return workspace_patch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.fs.apply_patch failed to anchor checkpoint paths: {error}"),
+            );
+        }
+    };
 
     if let Err(error) =
         validate_patch_roots_against_constraints(workspace_roots, canonical_constraint_roots)
@@ -145,8 +172,8 @@ pub(super) async fn execute_workspace_patch_mutation(
             compare_summary_json: "{}",
             risk_level: risk.level.as_str(),
             review_posture: risk.review_posture,
-            workspace_roots,
-            files_touched: planned_outcome.files_touched.as_slice(),
+            workspace_roots: checkpoint_roots,
+            files_touched: checkpoint_planned_files.as_slice(),
         },
     )
     .await
@@ -239,45 +266,62 @@ pub(super) async fn execute_workspace_patch_mutation(
 
     let mut post_change_checkpoint = None;
     let mut post_change_error = None;
-    match capture_workspace_patch_checkpoint(
-        runtime_state,
-        WorkspacePatchCheckpointCapture {
-            principal,
-            device_id,
-            channel,
-            session_id,
-            run_id,
-            tool_name: "palyra.fs.apply_patch",
-            proposal_id,
-            checkpoint_stage: WorkspacePatchCheckpointStage::PostChange,
-            mutation_id: Some(mutation_id.as_str()),
-            paired_checkpoint_id: preflight_checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.checkpoint_id.as_str()),
-            compare_summary_json: "{}",
-            risk_level: risk.level.as_str(),
-            review_posture: risk.review_posture,
-            workspace_roots,
-            files_touched: outcome.files_touched.as_slice(),
-        },
-    )
-    .await
-    {
-        Ok(checkpoint) => {
-            post_change_checkpoint = checkpoint;
-            if let Some(checkpoint) = post_change_checkpoint.as_ref() {
-                record_workspace_checkpoint_created_event(runtime_state, checkpoint).await;
+    match rebase_workspace_checkpoint_attestations(
+        outcome.files_touched.as_slice(),
+        checkpoint_root_mappings,
+    ) {
+        Ok(checkpoint_outcome_files) => {
+            match capture_workspace_patch_checkpoint(
+                runtime_state,
+                WorkspacePatchCheckpointCapture {
+                    principal,
+                    device_id,
+                    channel,
+                    session_id,
+                    run_id,
+                    tool_name: "palyra.fs.apply_patch",
+                    proposal_id,
+                    checkpoint_stage: WorkspacePatchCheckpointStage::PostChange,
+                    mutation_id: Some(mutation_id.as_str()),
+                    paired_checkpoint_id: preflight_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.checkpoint_id.as_str()),
+                    compare_summary_json: "{}",
+                    risk_level: risk.level.as_str(),
+                    review_posture: risk.review_posture,
+                    workspace_roots: checkpoint_roots,
+                    files_touched: checkpoint_outcome_files.as_slice(),
+                },
+            )
+            .await
+            {
+                Ok(checkpoint) => {
+                    post_change_checkpoint = checkpoint;
+                    if let Some(checkpoint) = post_change_checkpoint.as_ref() {
+                        record_workspace_checkpoint_created_event(runtime_state, checkpoint).await;
+                    }
+                }
+                Err(status) => {
+                    error!(
+                        proposal_id = %proposal_id,
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        error = %status,
+                        "workspace post-change checkpoint capture failed after patch apply"
+                    );
+                    post_change_error = Some(status.message().to_owned());
+                }
             }
         }
-        Err(status) => {
+        Err(error) => {
             error!(
                 proposal_id = %proposal_id,
                 session_id = %session_id,
                 run_id = %run_id,
-                error = %status,
-                "workspace post-change checkpoint capture failed after patch apply"
+                error = %error,
+                "workspace post-change checkpoint path anchoring failed after patch apply"
             );
-            post_change_error = Some(status.message().to_owned());
+            post_change_error = Some(format!("failed to anchor checkpoint paths: {error}"));
         }
     }
 
@@ -1145,6 +1189,42 @@ struct WorkspaceMutationRisk {
     fail_closed_without_preflight: bool,
 }
 
+/// Rewrites effective-root-relative attestations into durable paths relative
+/// to the original agent roots that restore resolves later.
+fn rebase_workspace_checkpoint_attestations(
+    files_touched: &[WorkspacePatchFileAttestation],
+    root_mappings: &[WorkspacePatchCheckpointRootMapping],
+) -> Result<Vec<WorkspacePatchFileAttestation>, String> {
+    files_touched
+        .iter()
+        .map(|file| {
+            let mapping = root_mappings.get(file.workspace_root_index).ok_or_else(|| {
+                format!("effective root index {} is out of range", file.workspace_root_index)
+            })?;
+            let mut rebased = file.clone();
+            rebased.path =
+                rebase_workspace_checkpoint_path(mapping.path_prefix.as_str(), file.path.as_str())?;
+            rebased.moved_from = file
+                .moved_from
+                .as_deref()
+                .map(|path| rebase_workspace_checkpoint_path(mapping.path_prefix.as_str(), path))
+                .transpose()?;
+            rebased.workspace_root_index = mapping.root_index;
+            Ok(rebased)
+        })
+        .collect()
+}
+
+fn rebase_workspace_checkpoint_path(prefix: &str, path: &str) -> Result<String, String> {
+    let mut rebased = PathBuf::new();
+    if !prefix.is_empty() {
+        rebased.push(prefix);
+    }
+    rebased.push(path);
+    super::normalized_relative_path_display(rebased.as_path())
+        .ok_or_else(|| format!("checkpoint path is not a normalized relative path: {path}"))
+}
+
 /// Classifies a planned mutation: file count escalates Low -> Medium (>4)
 /// -> High (>8); any delete/move or high-risk path (including `moved_from`
 /// sources) forces High, which requires review and fails closed without a
@@ -1528,9 +1608,10 @@ mod tests {
 
     use super::{
         append_apply_patch_verification_status_output, assess_workspace_mutation_risk,
-        code_intel_language_snapshot_is_recordable, select_project_facts_workspace_root,
-        verification_states_for_project_facts, ApplyPatchVerificationStatusContext,
-        WorkspaceMutationRiskLevel,
+        code_intel_language_snapshot_is_recordable, rebase_workspace_checkpoint_attestations,
+        select_project_facts_workspace_root, verification_states_for_project_facts,
+        ApplyPatchVerificationStatusContext, WorkspaceMutationRiskLevel,
+        WorkspacePatchCheckpointRootMapping,
     };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
     use serde_json::json;
@@ -1643,6 +1724,23 @@ mod tests {
 
         assert_eq!(risk.level, WorkspaceMutationRiskLevel::High);
         assert!(risk.fail_closed_without_preflight);
+    }
+
+    #[test]
+    fn checkpoint_attestations_are_rebased_to_original_agent_roots() {
+        let mut file = attestation("config.toml", "move");
+        file.moved_from = Some("old-config.toml".to_owned());
+        let mappings = vec![WorkspacePatchCheckpointRootMapping {
+            root_index: 1,
+            path_prefix: "nested/project".to_owned(),
+        }];
+
+        let rebased = rebase_workspace_checkpoint_attestations(&[file], mappings.as_slice())
+            .expect("checkpoint paths should rebase");
+
+        assert_eq!(rebased[0].workspace_root_index, 1);
+        assert_eq!(rebased[0].path, "nested/project/config.toml");
+        assert_eq!(rebased[0].moved_from.as_deref(), Some("nested/project/old-config.toml"));
     }
 
     #[test]

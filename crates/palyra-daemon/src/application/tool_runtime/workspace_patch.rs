@@ -52,7 +52,7 @@ use crate::{
     },
 };
 
-use checkpoint_flow::WorkspacePatchMutationRequest;
+use checkpoint_flow::{WorkspacePatchCheckpointRootMapping, WorkspacePatchMutationRequest};
 
 /// Model-facing patch grammar primer attached to every failure payload so
 /// the model can self-repair; pinned verbatim by tests.
@@ -136,6 +136,10 @@ struct ResolvedWorkspacePatchRoots {
     /// touched paths during risk assessment so prefix rules match as if the
     /// patch ran from the agent root.
     risk_path_prefixes: Vec<String>,
+    /// Stable agent roots used by checkpoint restore.
+    checkpoint_roots: Vec<PathBuf>,
+    /// Translation from each effective patch root to its checkpoint root.
+    checkpoint_root_mappings: Vec<WorkspacePatchCheckpointRootMapping>,
 }
 
 impl<'a> WorkspacePatchToolRequest<'a> {
@@ -316,6 +320,8 @@ pub(crate) async fn execute_workspace_patch_tool(
     let workspace_roots = resolved_workspace_roots.roots;
     let canonical_constraint_roots = resolved_workspace_roots.canonical_constraint_roots;
     let risk_path_prefixes = resolved_workspace_roots.risk_path_prefixes;
+    let checkpoint_roots = resolved_workspace_roots.checkpoint_roots;
+    let checkpoint_root_mappings = resolved_workspace_roots.checkpoint_root_mappings;
     let limits = WorkspacePatchLimits::default();
     let (patch, planning_request) = workspace_patch_planning_request(
         patch.as_str(),
@@ -400,6 +406,8 @@ pub(crate) async fn execute_workspace_patch_tool(
             workspace_roots: workspace_roots.as_slice(),
             canonical_constraint_roots: canonical_constraint_roots.as_slice(),
             risk_path_prefixes: risk_path_prefixes.as_slice(),
+            checkpoint_roots: checkpoint_roots.as_slice(),
+            checkpoint_root_mappings: checkpoint_root_mappings.as_slice(),
             planned_outcome,
         },
     )
@@ -602,6 +610,15 @@ async fn resolve_workspace_patch_roots(
         roots: agent_workspace_roots.to_vec(),
         canonical_constraint_roots: Vec::new(),
         risk_path_prefixes: Vec::new(),
+        checkpoint_roots: agent_workspace_roots.to_vec(),
+        checkpoint_root_mappings: agent_workspace_roots
+            .iter()
+            .enumerate()
+            .map(|(root_index, _)| WorkspacePatchCheckpointRootMapping {
+                root_index,
+                path_prefix: String::new(),
+            })
+            .collect(),
     })
 }
 
@@ -900,26 +917,22 @@ fn resolve_workspace_root_override(
     if requested.is_absolute() {
         let root =
             canonicalize_workspace_root_override(requested, &canonical_roots, workspace_root)?;
-        let risk_path_prefixes =
-            workspace_root_risk_path_prefixes_from_canonical(root.as_path(), &canonical_roots);
-        return Ok(ResolvedWorkspacePatchRoots {
-            roots: vec![root],
-            canonical_constraint_roots: canonical_roots,
-            risk_path_prefixes,
-        });
+        return resolved_narrowed_workspace_patch_roots(
+            root,
+            agent_workspace_roots,
+            canonical_roots,
+        );
     }
     validate_relative_workspace_root_override(requested, workspace_root)?;
     if let Some(root) = workspace_root_override_matching_existing_root_basename(
         requested,
         canonical_roots.as_slice(),
     ) {
-        let risk_path_prefixes =
-            workspace_root_risk_path_prefixes_from_canonical(root.as_path(), &canonical_roots);
-        return Ok(ResolvedWorkspacePatchRoots {
-            roots: vec![root],
-            canonical_constraint_roots: canonical_roots,
-            risk_path_prefixes,
-        });
+        return resolved_narrowed_workspace_patch_roots(
+            root,
+            agent_workspace_roots,
+            canonical_roots,
+        );
     }
     for canonical_root in &canonical_roots {
         let candidate = canonical_root.join(requested);
@@ -929,15 +942,11 @@ fn resolve_workspace_root_override(
             workspace_root,
         ) {
             Ok(root) => {
-                let risk_path_prefixes = workspace_root_risk_path_prefixes_from_canonical(
-                    root.as_path(),
-                    &canonical_roots,
+                return resolved_narrowed_workspace_patch_roots(
+                    root,
+                    agent_workspace_roots,
+                    canonical_roots.clone(),
                 );
-                return Ok(ResolvedWorkspacePatchRoots {
-                    roots: vec![root],
-                    canonical_constraint_roots: canonical_roots.clone(),
-                    risk_path_prefixes,
-                });
             }
             Err(error) if error.contains("does not exist") => {}
             Err(error) => return Err(error),
@@ -953,13 +962,11 @@ fn resolve_workspace_root_override(
             &canonical_roots,
             workspace_root,
         )?;
-        let risk_path_prefixes =
-            workspace_root_risk_path_prefixes_from_canonical(created.as_path(), &canonical_roots);
-        return Ok(ResolvedWorkspacePatchRoots {
-            roots: vec![created],
-            canonical_constraint_roots: canonical_roots,
-            risk_path_prefixes,
-        });
+        return resolved_narrowed_workspace_patch_roots(
+            created,
+            agent_workspace_roots,
+            canonical_roots,
+        );
     }
     Err(format!(
         "palyra.fs.apply_patch workspace_root does not exist inside agent workspace roots: {workspace_root}"
@@ -1025,15 +1032,62 @@ fn resolved_active_workspace_patch_roots(
     let active_root = fs::canonicalize(active_root).map_err(|error| {
         format!("palyra.fs.apply_patch failed to resolve active workspace root: {error}")
     })?;
+    resolved_narrowed_workspace_patch_roots(
+        active_root,
+        agent_workspace_roots,
+        canonical_constraint_roots,
+    )
+}
+
+/// Keeps checkpoint paths anchored to the original agent root even when the
+/// patch engine runs inside a narrower subdirectory.
+fn resolved_narrowed_workspace_patch_roots(
+    root: PathBuf,
+    agent_workspace_roots: &[PathBuf],
+    canonical_constraint_roots: Vec<PathBuf>,
+) -> Result<ResolvedWorkspacePatchRoots, String> {
     let risk_path_prefixes = workspace_root_risk_path_prefixes_from_canonical(
-        active_root.as_path(),
+        root.as_path(),
         canonical_constraint_roots.as_slice(),
     );
+    let checkpoint_root_mapping =
+        workspace_patch_checkpoint_root_mapping(root.as_path(), agent_workspace_roots)?;
     Ok(ResolvedWorkspacePatchRoots {
-        roots: vec![active_root],
+        roots: vec![root],
         canonical_constraint_roots,
         risk_path_prefixes,
+        checkpoint_roots: agent_workspace_roots.to_vec(),
+        checkpoint_root_mappings: vec![checkpoint_root_mapping],
     })
+}
+
+/// Chooses the most specific original agent root containing the effective
+/// patch root and records the relative prefix needed for durable restore.
+fn workspace_patch_checkpoint_root_mapping(
+    effective_root: &Path,
+    agent_workspace_roots: &[PathBuf],
+) -> Result<WorkspacePatchCheckpointRootMapping, String> {
+    let mut selected: Option<(usize, usize, String)> = None;
+    for (root_index, agent_root) in agent_workspace_roots.iter().enumerate() {
+        let Ok(canonical_root) = fs::canonicalize(agent_root) else {
+            continue;
+        };
+        let Ok(relative) = effective_root.strip_prefix(canonical_root.as_path()) else {
+            continue;
+        };
+        let depth = relative.components().count();
+        let path_prefix = normalized_relative_path_display(relative).unwrap_or_default();
+        if selected.as_ref().is_none_or(|(_, selected_depth, _)| depth < *selected_depth) {
+            selected = Some((root_index, depth, path_prefix));
+        }
+    }
+    let Some((root_index, _, path_prefix)) = selected else {
+        return Err(
+            "palyra.fs.apply_patch could not anchor workspace_root to an agent workspace root"
+                .to_owned(),
+        );
+    };
+    Ok(WorkspacePatchCheckpointRootMapping { root_index, path_prefix })
 }
 
 /// Computes the chosen root's path relative to each agent root; risk
@@ -1550,9 +1604,10 @@ mod tests {
         normalize_workspace_patch_header_paths, normalize_workspace_patch_input_json,
         patch_operation_paths, patch_should_use_active_root,
         reject_env_prefixed_workspace_patch_paths, resolve_workspace_root_override,
-        serialize_workspace_patch_success, workspace_patch_error_outcome,
-        workspace_patch_planning_request, workspace_patch_recovery_hint,
-        workspace_patch_tool_execution_outcome, WorkspacePatchRootResolvePurpose,
+        serialize_workspace_patch_success, workspace_patch_checkpoint_root_mapping,
+        workspace_patch_error_outcome, workspace_patch_planning_request,
+        workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
+        WorkspacePatchCheckpointRootMapping, WorkspacePatchRootResolvePurpose,
         WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
@@ -1653,6 +1708,14 @@ mod tests {
             roots.canonical_constraint_roots,
             vec![std::fs::canonicalize(&workspace).expect("workspace should canonicalize")]
         );
+        assert_eq!(roots.checkpoint_roots, vec![workspace.clone()]);
+        assert_eq!(
+            roots.checkpoint_root_mappings,
+            vec![WorkspacePatchCheckpointRootMapping {
+                root_index: 0,
+                path_prefix: "e2e-cli/file-tool-smoke".to_owned(),
+            }]
+        );
         let patch = "*** Begin Patch\n*** Add File: calc.js\n+export const add = (a, b) => a + b;\n*** End Patch\n";
 
         apply_workspace_patch_with_canonical_root_constraints(
@@ -1669,6 +1732,23 @@ mod tests {
 
         assert!(project.join("calc.js").is_file());
         assert!(!workspace.join("calc.js").exists());
+    }
+
+    #[test]
+    fn checkpoint_mapping_prefers_the_most_specific_agent_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).expect("project directory should exist");
+
+        let mapping = workspace_patch_checkpoint_root_mapping(
+            std::fs::canonicalize(&project).expect("project should canonicalize").as_path(),
+            &[workspace, project],
+        )
+        .expect("effective root should map to an agent root");
+
+        assert_eq!(mapping.root_index, 1);
+        assert!(mapping.path_prefix.is_empty());
     }
 
     #[test]
