@@ -6289,11 +6289,10 @@ fn interpreter_path_list_argument_stays_in_host_scope(
 }
 
 fn interpreter_path_list_components(raw: &str) -> Vec<&str> {
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    if !raw.contains(separator) {
-        return Vec::new();
-    }
-    raw.split(separator).map(str::trim).filter(|component| !component.is_empty()).collect()
+    raw.split(|ch| interpreter_embedded_path_delimiter(ch) || (!cfg!(windows) && ch == ':'))
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .collect()
 }
 
 fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError {
@@ -6309,11 +6308,12 @@ fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError 
 // Splits on whitespace and common code punctuation so absolute paths quoted inside inline
 // source (open('/etc/passwd'), require("/x"), arrays, blocks) still surface as tokens.
 fn contains_embedded_absolute_path(raw: &str) -> bool {
-    raw.split(|ch: char| {
-        ch.is_whitespace()
-            || matches!(ch, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
-    })
-    .any(token_or_path_list_contains_absolute_path)
+    raw.split(interpreter_embedded_path_delimiter).any(token_or_path_list_contains_absolute_path)
+}
+
+fn interpreter_embedded_path_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(ch, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 fn token_or_path_list_contains_absolute_path(raw: &str) -> bool {
@@ -20135,6 +20135,67 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_guardrails_reject_comma_separated_option_paths_outside_workspace() {
+        let workspace = unique_temp_dir("workspace-interpreter-comma-list-deny");
+        let outside = unique_temp_dir("outside-interpreter-comma-list-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let inside_component = workspace_root.join("missing");
+        let args =
+            vec![format!("--allow-read={},{}", inside_component.display(), outside.display())];
+
+        let error = validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "deno",
+            args.as_slice(),
+        )
+        .expect_err("comma-separated interpreter paths must be checked independently");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("absolute path-like substring"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
+    fn host_interpreter_guardrails_reject_comma_separated_paths_outside_approved_roots() {
+        let workspace = unique_temp_dir("workspace-host-interpreter-comma-list-deny");
+        let approved = unique_temp_dir("approved-host-interpreter-comma-list-deny");
+        let outside = unique_temp_dir("outside-host-interpreter-comma-list-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(approved.as_path()).expect("approved directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let approved_root = approved.canonicalize().expect("approved root should canonicalize");
+        let args = vec![format!(
+            "--allow-read={},{}",
+            approved_root.join("missing").display(),
+            outside.display()
+        )];
+
+        let error = validate_host_interpreter_argument_guardrails_with_roots(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "deno",
+            args.as_slice(),
+            &[approved_root],
+        )
+        .expect_err("comma-separated host paths must stay within approved roots");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("outside approved host roots"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(approved.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
     fn interpreter_guardrails_allow_path_list_inside_workspace() {
         let workspace = unique_temp_dir("workspace-interpreter-path-list-allow");
         let inside_one = workspace.join("lib");
@@ -20153,6 +20214,28 @@ mod tests {
             args.as_slice(),
         )
         .expect("path-list args whose absolute components stay inside workspace should be allowed");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn interpreter_guardrails_allow_comma_separated_option_paths_inside_workspace() {
+        let workspace = unique_temp_dir("workspace-interpreter-comma-list-allow");
+        let inside_one = workspace.join("src");
+        let inside_two = workspace.join("fixtures");
+        fs::create_dir_all(inside_one.as_path()).expect("first workspace directory should exist");
+        fs::create_dir_all(inside_two.as_path()).expect("second workspace directory should exist");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec![format!("--allow-read={},{}", inside_one.display(), inside_two.display())];
+
+        validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "deno",
+            args.as_slice(),
+        )
+        .expect("comma-separated paths inside the workspace should remain allowed");
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
