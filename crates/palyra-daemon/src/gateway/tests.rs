@@ -11893,38 +11893,6 @@ async fn rejected_workspace_patch_does_not_record_verification_usage() {
     assert_feature_usage_window_empty(&state);
 }
 
-#[test]
-fn cleanup_stale_pid_files_removes_only_matching_pid_artifacts() {
-    let tempdir = gateway_tempdir("gateway-");
-    let root = tempdir.path().join("os-root");
-    let pid_dir = root.join("pids");
-    let log_dir = root.join("logs");
-    fs::create_dir_all(pid_dir.as_path()).expect("pid dir should exist");
-    fs::create_dir_all(log_dir.as_path()).expect("log dir should exist");
-
-    let matching_pid = pid_dir.join("preview.pid");
-    let unrelated_pid = pid_dir.join("worker.pid");
-    let log_file = log_dir.join("preview.log");
-    fs::write(matching_pid.as_path(), "4242\n").expect("matching pid file should be written");
-    fs::write(unrelated_pid.as_path(), "7777\n").expect("unrelated pid file should be written");
-    fs::write(log_file.as_path(), "started\n").expect("log file should be written");
-
-    let outcomes = super::cleanup_stale_pid_files_in_roots(&[root], 4242);
-
-    assert_eq!(outcomes.len(), 1);
-    assert!(outcomes[0].removed);
-    assert!(
-        outcomes[0].path.as_deref().is_some_and(|path| path.ends_with("preview.pid")),
-        "matching PID cleanup should report the removed path: {outcomes:?}"
-    );
-    assert!(
-        !matching_pid.exists(),
-        "PID file containing the terminated process id should be removed"
-    );
-    assert!(unrelated_pid.exists(), "different PID files must not be removed");
-    assert!(log_file.exists(), "logs are not inferred PID artifacts");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn run_cleanup_tape_event_records_background_process_outcomes() {
     let state = build_test_runtime_state(false);
@@ -11965,11 +11933,6 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
                     process_tree_alive: false,
                     tracked_process_count: Some(0),
                 }),
-                pid_artifact_outcomes: vec![super::PidArtifactCleanupOutcome {
-                    path: Some("C:/palyra/e2e/os-root/pids/preview.pid".to_owned()),
-                    removed: true,
-                    error: None,
-                }],
                 error: None,
             }],
             detached_background_process_outcomes: &[],
@@ -12028,9 +11991,10 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
     );
     assert_eq!(
         payload
-            .pointer("/background_processes/outcomes/0/pid_artifacts/outcomes/0/removed")
-            .and_then(Value::as_bool),
-        Some(true)
+            .pointer("/background_processes/outcomes/0/pid_artifacts/outcomes")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
     );
     assert_eq!(
         payload.pointer("/background_resources/run_owned_stopped/0/pid").and_then(Value::as_u64),
@@ -12045,16 +12009,16 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
     );
     assert_eq!(
         payload
-            .pointer("/background_processes/outcomes/0/pid_artifacts/outcomes/0/path")
+            .pointer("/background_processes/outcomes/0/pid_artifacts/cleanup_policy")
             .and_then(Value::as_str),
-        Some("C:/palyra/e2e/os-root/pids/preview.pid")
+        Some("not_removed_without_explicit_run_owned_provenance")
     );
     assert!(
         payload
             .pointer("/background_processes/outcomes/0/process_artifact_note")
             .and_then(Value::as_str)
-            .is_some_and(|note| note.contains("PID files")),
-        "cleanup event should explain process-owned artifacts may remain: {payload}"
+            .is_some_and(|note| note.contains("does not infer ownership of PID files")),
+        "cleanup event should explain why PID artifacts remain: {payload}"
     );
 }
 
