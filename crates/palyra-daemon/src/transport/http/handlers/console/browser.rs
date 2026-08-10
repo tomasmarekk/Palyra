@@ -304,7 +304,11 @@ pub(crate) async fn console_browser_sessions_list_handler(
         principal: principal.clone(),
         limit,
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.list_sessions(request).await.map_err(runtime_status_response)?.into_inner();
     let sessions = response.sessions.iter().map(session_summary_to_value).collect::<Vec<_>>();
@@ -369,7 +373,11 @@ pub(crate) async fn console_browser_session_create_handler(
         )?,
         private_profile: payload.private_profile.unwrap_or(false),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.create_session(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserSessionCreateEnvelope {
@@ -420,7 +428,7 @@ pub(crate) async fn console_browser_session_show_handler(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -428,7 +436,11 @@ pub(crate) async fn console_browser_session_show_handler(
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.get_session(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(json!({
         "contract": contract_descriptor(),
@@ -452,7 +464,7 @@ pub(crate) async fn console_browser_session_inspect_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserInspectSessionQuery>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -476,7 +488,11 @@ pub(crate) async fn console_browser_session_inspect_handler(
         max_console_log_entries: query.max_console_log_entries.unwrap_or(0),
         max_console_log_bytes: query.max_console_log_bytes.unwrap_or(0),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.inspect_session(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(json!({
@@ -525,7 +541,11 @@ pub(crate) async fn console_browser_session_close_handler(
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.close_session(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserSessionCloseEnvelope {
@@ -585,7 +605,11 @@ pub(crate) async fn console_browser_navigate_handler(
         max_redirects: payload.max_redirects.unwrap_or(3),
         allow_private_targets: console_browser_private_target_flag(payload.allow_private_targets),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.navigate(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserNavigateEnvelope {
         contract: contract_descriptor(),
@@ -653,7 +677,11 @@ pub(crate) async fn console_browser_click_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.click(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserClickEnvelope {
@@ -724,7 +752,11 @@ pub(crate) async fn console_browser_type_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.r#type(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserTypeEnvelope {
@@ -793,7 +825,11 @@ pub(crate) async fn console_browser_press_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.press(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserPressEnvelope {
@@ -868,7 +904,11 @@ pub(crate) async fn console_browser_select_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.select(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserSelectEnvelope {
@@ -939,7 +979,11 @@ pub(crate) async fn console_browser_highlight_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.highlight(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserHighlightEnvelope {
@@ -1002,7 +1046,11 @@ pub(crate) async fn console_browser_scroll_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.scroll(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserScrollEnvelope {
@@ -1072,7 +1120,11 @@ pub(crate) async fn console_browser_wait_for_handler(
             payload.max_failure_screenshot_bytes,
         ),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.wait_for(request).await.map_err(runtime_status_response)?.into_inner();
     let action_log = response.action_log.map(control_plane_browser_action_log);
     let envelope = control_plane::BrowserWaitForEnvelope {
@@ -1121,7 +1173,7 @@ pub(crate) async fn console_browser_title_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserTitleQuery>,
 ) -> Result<Json<control_plane::BrowserTitleEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1130,7 +1182,11 @@ pub(crate) async fn console_browser_title_handler(
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
         max_title_bytes: clamp_console_browser_max_title_bytes(&state, query.max_title_bytes),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.get_title(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(control_plane::BrowserTitleEnvelope {
         contract: contract_descriptor(),
@@ -1154,7 +1210,7 @@ pub(crate) async fn console_browser_screenshot_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserScreenshotQuery>,
 ) -> Result<Json<control_plane::BrowserScreenshotEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1170,7 +1226,11 @@ pub(crate) async fn console_browser_screenshot_handler(
             .unwrap_or("png")
             .to_owned(),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.screenshot(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(control_plane::BrowserScreenshotEnvelope {
         contract: contract_descriptor(),
@@ -1194,7 +1254,7 @@ pub(crate) async fn console_browser_pdf_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserPdfQuery>,
 ) -> Result<Json<control_plane::BrowserPdfEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1203,7 +1263,11 @@ pub(crate) async fn console_browser_pdf_handler(
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
         max_bytes: query.max_bytes.unwrap_or(0),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.export_pdf(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(control_plane::BrowserPdfEnvelope {
         contract: contract_descriptor(),
@@ -1231,7 +1295,7 @@ pub(crate) async fn console_browser_observe_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserObserveQuery>,
 ) -> Result<Json<control_plane::BrowserObserveEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1250,7 +1314,11 @@ pub(crate) async fn console_browser_observe_handler(
         computed_style_properties: Vec::new(),
         max_capture_text_bytes: 0,
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.observe(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(control_plane::BrowserObserveEnvelope {
         contract: contract_descriptor(),
@@ -1293,8 +1361,8 @@ pub(crate) async fn console_browser_network_log_handler(
         include_headers: query.include_headers.unwrap_or(false),
         max_payload_bytes: query.max_payload_bytes.unwrap_or(0),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
-    apply_browser_caller_principal_metadata(
+    apply_browser_service_session_auth(
+        &state,
         session.context.principal.as_str(),
         request.metadata_mut(),
     )?;
@@ -1328,7 +1396,7 @@ pub(crate) async fn console_browser_console_log_handler(
     Path(session_id): Path<String>,
     Query(query): Query<ConsoleBrowserConsoleLogQuery>,
 ) -> Result<Json<control_plane::BrowserConsoleLogEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
     let limit = query.limit.unwrap_or(50).clamp(1, 250);
 
@@ -1341,7 +1409,11 @@ pub(crate) async fn console_browser_console_log_handler(
         include_page_diagnostics: query.include_page_diagnostics.unwrap_or(false),
         max_payload_bytes: query.max_payload_bytes.unwrap_or(0),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.console_log(request).await.map_err(runtime_status_response)?.into_inner();
     let entries =
         response.entries.into_iter().map(control_plane_browser_console_entry).collect::<Vec<_>>();
@@ -1384,8 +1456,8 @@ pub(crate) async fn console_browser_reset_state_handler(
         reset_tabs: payload.reset_tabs.unwrap_or(false),
         reset_permissions: payload.reset_permissions.unwrap_or(false),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
-    apply_browser_caller_principal_metadata(
+    apply_browser_service_session_auth(
+        &state,
         session.context.principal.as_str(),
         request.metadata_mut(),
     )?;
@@ -1430,7 +1502,7 @@ pub(crate) async fn console_browser_tabs_list_handler(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<control_plane::BrowserTabListEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1438,7 +1510,11 @@ pub(crate) async fn console_browser_tabs_list_handler(
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.list_tabs(request).await.map_err(runtime_status_response)?.into_inner();
     let tabs = response.tabs.into_iter().map(control_plane_browser_tab).collect::<Vec<_>>();
     Ok(Json(control_plane::BrowserTabListEnvelope {
@@ -1485,7 +1561,11 @@ pub(crate) async fn console_browser_tab_open_handler(
         max_redirects: payload.max_redirects.unwrap_or(3),
         allow_private_targets: console_browser_private_target_flag(payload.allow_private_targets),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.open_tab(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserOpenTabEnvelope {
         contract: contract_descriptor(),
@@ -1538,7 +1618,11 @@ pub(crate) async fn console_browser_tab_switch_handler(
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
         tab_id: Some(common_v1::CanonicalId { ulid: tab_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.switch_tab(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserSwitchTabEnvelope {
         contract: contract_descriptor(),
@@ -1589,7 +1673,11 @@ pub(crate) async fn console_browser_tab_close_handler(
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
         tab_id,
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.close_tab(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserCloseTabEnvelope {
         contract: contract_descriptor(),
@@ -1631,7 +1719,7 @@ pub(crate) async fn console_browser_permissions_get_handler(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<control_plane::BrowserPermissionsEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_console_browser_canonical_id(session_id.as_str(), "session_id")?;
 
     let mut client = build_console_browser_client(&state).await?;
@@ -1639,7 +1727,11 @@ pub(crate) async fn console_browser_permissions_get_handler(
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.get_permissions(request).await.map_err(runtime_status_response)?.into_inner();
     Ok(Json(control_plane::BrowserPermissionsEnvelope {
@@ -1677,7 +1769,11 @@ pub(crate) async fn console_browser_permissions_set_handler(
         location: browser_permission_setting_to_proto(payload.location),
         reset_to_default: payload.reset_to_default.unwrap_or(false),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(
+        &state,
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response =
         client.set_permissions(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserPermissionsEnvelope {
@@ -1730,8 +1826,8 @@ pub(crate) async fn console_browser_downloads_list_handler(
         limit,
         quarantined_only: query.quarantined_only.unwrap_or(false),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
-    apply_browser_caller_principal_metadata(
+    apply_browser_service_session_auth(
+        &state,
         session.context.principal.as_str(),
         request.metadata_mut(),
     )?;
@@ -2842,6 +2938,18 @@ pub(crate) fn apply_browser_service_auth(
         metadata.insert("authorization", bearer);
     }
     Ok(())
+}
+
+/// Attaches service authentication and the authorized console principal to a
+/// browserd request that can observe or mutate principal-owned state.
+#[allow(clippy::result_large_err)]
+fn apply_browser_service_session_auth(
+    state: &AppState,
+    principal: &str,
+    metadata: &mut tonic::metadata::MetadataMap,
+) -> Result<(), Response> {
+    apply_browser_service_auth(state, metadata)?;
+    apply_browser_caller_principal_metadata(principal, metadata)
 }
 
 /// Forwards the console caller's principal to browserd via

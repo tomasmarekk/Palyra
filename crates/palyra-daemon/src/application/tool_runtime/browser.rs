@@ -1457,8 +1457,8 @@ pub(crate) async fn execute_browser_tool(
         }
     }
 
-    let mut client =
-        match connect_browser_service(runtime_state.config.browser_service.clone()).await {
+    let browser_service_channel =
+        match connect_browser_service_channel(runtime_state.config.browser_service.clone()).await {
             Ok(value) => value,
             Err(error) => {
                 return browser_tool_execution_outcome(
@@ -1470,11 +1470,14 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
         };
+    let mut capability_client = browser_v1::browser_service_client::BrowserServiceClient::new(
+        browser_service_channel.clone(),
+    );
     // One extra health RPC per tool call is accepted so each outcome reports
     // the engine that actually served it (browserd may restart or change
     // engine mode between calls).
     let browser_runtime_capabilities = fetch_browser_runtime_capabilities(
-        &mut client,
+        &mut capability_client,
         runtime_state.config.browser_service.auth_token.as_deref(),
     )
     .await;
@@ -1496,6 +1499,22 @@ pub(crate) async fn execute_browser_tool(
             "browserd automatic reconnect requires feature_rollouts.browser_resilience".to_owned(),
         );
     }
+    let caller_principal_interceptor = match browser_caller_principal_interceptor(principal) {
+        Ok(interceptor) => interceptor,
+        Err(error) => {
+            return browser_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    let mut client = browser_v1::browser_service_client::BrowserServiceClient::with_interceptor(
+        browser_service_channel,
+        caller_principal_interceptor,
+    );
 
     // Every arm evaluates to (success, output_json, error); shared
     // post-processing below the match attaches capabilities, recovery hints,
@@ -4812,7 +4831,9 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
         format!("palyra.browser.session cleanup session_id is invalid: {error}")
     })?;
 
-    let mut client = connect_browser_service(runtime_state.config.browser_service.clone()).await?;
+    let channel =
+        connect_browser_service_channel(runtime_state.config.browser_service.clone()).await?;
+    let mut client = browser_v1::browser_service_client::BrowserServiceClient::new(channel);
     let mut request = Request::new(browser_v1::CloseSessionRequest {
         v: CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
@@ -4831,18 +4852,15 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
 
 /// Dials the configured browserd gRPC endpoint.
 ///
-/// Connect and per-request timeouts come from runtime config, so every RPC
-/// issued through the returned client carries a deadline.
+/// Connect and per-request timeouts come from runtime config, so every client
+/// built from the returned channel carries the configured deadline.
 ///
 /// # Errors
 /// Returns a tool-facing message when the endpoint URI is invalid or the
 /// connection cannot be established.
-async fn connect_browser_service(
+async fn connect_browser_service_channel(
     config: BrowserServiceRuntimeConfig,
-) -> Result<
-    browser_v1::browser_service_client::BrowserServiceClient<tonic::transport::Channel>,
-    String,
-> {
+) -> Result<tonic::transport::Channel, String> {
     let endpoint = tonic::transport::Endpoint::from_shared(config.endpoint.clone())
         .map_err(|error| {
             format!("invalid browser service endpoint '{}': {error}", config.endpoint)
@@ -4852,7 +4870,7 @@ async fn connect_browser_service(
     let channel = endpoint.connect().await.map_err(|error| {
         format!("failed to connect to browser service '{}': {error}", config.endpoint)
     })?;
-    Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
+    Ok(channel)
 }
 
 /// Best-effort capability probe: health-RPC failures degrade to an
@@ -5058,14 +5076,30 @@ fn attach_browser_caller_principal_metadata<T>(
     request: &mut Request<T>,
     caller_principal: &str,
 ) -> Result<(), String> {
+    let value = browser_caller_principal_metadata_value(caller_principal)?;
+    request.metadata_mut().insert(BROWSER_CALLER_PRINCIPAL_HEADER, value);
+    Ok(())
+}
+
+fn browser_caller_principal_metadata_value(
+    caller_principal: &str,
+) -> Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, String> {
     let caller_principal = caller_principal.trim();
     if caller_principal.is_empty() {
         return Err("browser caller principal must not be empty".to_owned());
     }
-    let value = tonic::metadata::MetadataValue::try_from(caller_principal)
-        .map_err(|error| format!("invalid browser caller principal metadata: {error}"))?;
-    request.metadata_mut().insert(BROWSER_CALLER_PRINCIPAL_HEADER, value);
-    Ok(())
+    tonic::metadata::MetadataValue::try_from(caller_principal)
+        .map_err(|error| format!("invalid browser caller principal metadata: {error}"))
+}
+
+fn browser_caller_principal_interceptor(
+    caller_principal: &str,
+) -> Result<impl tonic::service::Interceptor + Clone, String> {
+    let metadata_value = browser_caller_principal_metadata_value(caller_principal)?;
+    Ok(move |mut request: Request<()>| {
+        request.metadata_mut().insert(BROWSER_CALLER_PRINCIPAL_HEADER, metadata_value.clone());
+        Ok(request)
+    })
 }
 
 /// Renders a gRPC status as a bounded, single-string error message (512
@@ -5986,8 +6020,8 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{
-        attach_browser_caller_principal_metadata, browser_cdp_method_allowed,
-        browser_console_entry_to_json, browser_cookie_domain_to_json,
+        attach_browser_caller_principal_metadata, browser_caller_principal_interceptor,
+        browser_cdp_method_allowed, browser_console_entry_to_json, browser_cookie_domain_to_json,
         browser_element_captures_to_json, browser_failure_screenshot_metadata,
         browser_file_url_to_path, browser_image_tags_from_dom_snapshot,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
@@ -7150,6 +7184,24 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("user:local")
         );
+    }
+
+    #[test]
+    fn browser_client_interceptor_includes_caller_principal_on_every_request() {
+        let mut interceptor = browser_caller_principal_interceptor(" user:local ")
+            .expect("principal interceptor should construct");
+
+        for _ in 0..2 {
+            let request = tonic::service::Interceptor::call(&mut interceptor, Request::new(()))
+                .expect("principal interceptor should accept a request");
+            assert_eq!(
+                request
+                    .metadata()
+                    .get(BROWSER_CALLER_PRINCIPAL_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("user:local")
+            );
+        }
     }
 
     #[test]

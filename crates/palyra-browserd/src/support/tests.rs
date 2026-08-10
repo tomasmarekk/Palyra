@@ -7613,6 +7613,52 @@ async fn browser_service_session_diagnostics_require_matching_principal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_session_actions_require_matching_principal() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:alpha").await;
+    let session_id = created.session_id.expect("session id should be present");
+
+    let mut mismatched_navigate = Request::new(browser_v1::NavigateRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        url: "https://example.com".to_owned(),
+        timeout_ms: 1_000,
+        allow_redirects: false,
+        max_redirects: 0,
+        allow_private_targets: false,
+    });
+    insert_principal(&mut mismatched_navigate, "user:beta");
+    let navigate_status = service
+        .navigate(mismatched_navigate)
+        .await
+        .expect_err("navigate should hide cross-principal sessions");
+    assert_eq!(navigate_status.code(), tonic::Code::NotFound);
+
+    let mut mismatched_close = Request::new(browser_v1::CloseSessionRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+    });
+    insert_principal(&mut mismatched_close, "user:beta");
+    let close_status = service
+        .close_session(mismatched_close)
+        .await
+        .expect_err("close_session should hide cross-principal sessions");
+    assert_eq!(close_status.code(), tonic::Code::NotFound);
+    assert!(
+        runtime.sessions.lock().await.contains_key(session_id.ulid.as_str()),
+        "rejected close must preserve the owner's session"
+    );
+
+    let mut owner_close =
+        Request::new(browser_v1::CloseSessionRequest { v: 1, session_id: Some(session_id) });
+    insert_principal(&mut owner_close, "user:alpha");
+    let response =
+        service.close_session(owner_close).await.expect("owner close should execute").into_inner();
+    assert!(response.closed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_reset_state_requires_matching_principal() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };

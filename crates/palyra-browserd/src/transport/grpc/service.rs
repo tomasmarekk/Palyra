@@ -718,8 +718,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CloseSessionRequest>,
     ) -> Result<Response<browser_v1::CloseSessionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let session_id = parse_session_id_from_proto(request.into_inner().session_id)
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
         self.runtime.chromium_sessions.lock().await.remove(session_id.as_str());
         self.runtime.browser_session_health.lock().await.remove(session_id.as_str());
@@ -1386,9 +1393,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::NavigateRequest>,
     ) -> Result<Response<browser_v1::NavigateResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let url = payload.url.trim().to_owned();
         if url.is_empty() {
             return Err(Status::invalid_argument("navigate requires non-empty url"));
@@ -1572,9 +1586,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ClickRequest>,
     ) -> Result<Response<browser_v1::ClickResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim();
         if selector.is_empty() {
             return Err(Status::invalid_argument("click requires non-empty selector"));
@@ -1756,9 +1777,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::TypeRequest>,
     ) -> Result<Response<browser_v1::TypeResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim();
         if selector.is_empty() {
             return Err(Status::invalid_argument("type requires non-empty selector"));
@@ -1925,9 +1953,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SetFileInputRequest>,
     ) -> Result<Response<browser_v1::SetFileInputResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim();
         if selector.is_empty() {
             return Err(Status::invalid_argument("set_file_input requires non-empty selector"));
@@ -2091,9 +2126,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::PressRequest>,
     ) -> Result<Response<browser_v1::PressResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let key = normalize_press_key_input(payload.key.as_str());
         if key.is_empty() {
             return Err(Status::invalid_argument("press requires non-empty key"));
@@ -2178,9 +2220,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SelectRequest>,
     ) -> Result<Response<browser_v1::SelectResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim().to_owned();
         let value = payload.value.trim().to_owned();
         if selector.is_empty() {
@@ -2312,9 +2361,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SetViewportRequest>,
     ) -> Result<Response<browser_v1::SetViewportResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         if !(MIN_VIEWPORT_WIDTH..=MAX_VIEWPORT_WIDTH).contains(&payload.width) {
             return Err(Status::invalid_argument(format!(
                 "viewport width must be between {MIN_VIEWPORT_WIDTH} and {MAX_VIEWPORT_WIDTH}"
@@ -2450,9 +2506,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::HighlightRequest>,
     ) -> Result<Response<browser_v1::HighlightResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim().to_owned();
         if selector.is_empty() {
             return Err(Status::invalid_argument("highlight requires non-empty selector"));
@@ -2549,9 +2612,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ScrollRequest>,
     ) -> Result<Response<browser_v1::ScrollResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
 
         let _context = match consume_action_budget_and_snapshot(
             self.runtime.as_ref(),
@@ -2646,9 +2716,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::WaitForRequest>,
     ) -> Result<Response<browser_v1::WaitForResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let selector = payload.selector.trim().to_owned();
         let text = payload.text;
         if selector.is_empty() && text.trim().is_empty() {
@@ -2791,9 +2868,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::GetTitleRequest>,
     ) -> Result<Response<browser_v1::GetTitleResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let max_title_bytes = usize::try_from(payload.max_title_bytes)
             .ok()
             .filter(|value| *value > 0)
@@ -2856,9 +2940,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::HandleDialogRequest>,
     ) -> Result<Response<browser_v1::HandleDialogResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let action = match browser_v1::BrowserDialogAction::try_from(payload.action)
             .unwrap_or(browser_v1::BrowserDialogAction::Unspecified)
         {
@@ -2933,9 +3024,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ScreenshotRequest>,
     ) -> Result<Response<browser_v1::ScreenshotResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         if !payload.format.trim().is_empty() && !payload.format.trim().eq_ignore_ascii_case("png") {
             return Err(Status::invalid_argument("screenshot format must be empty or 'png'"));
         }
@@ -3007,9 +3105,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ObserveRequest>,
     ) -> Result<Response<browser_v1::ObserveResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let inclusions = resolve_observe_inclusions(
             payload.include_dom_snapshot,
             payload.include_accessibility_tree,
@@ -3685,9 +3790,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ListTabsRequest>,
     ) -> Result<Response<browser_v1::ListTabsResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let mut sessions = self.runtime.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id.as_str()) else {
             return Ok(Response::new(browser_v1::ListTabsResponse {
@@ -3717,9 +3829,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let relay_private_target_block =
             request.extensions().get::<RelayPrivateTargetBlock>().is_some();
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let url = payload.url.trim().to_owned();
         let (created_tab_id, timeout_ms, max_response_bytes, allow_private_targets, cookie_header) = {
             let mut sessions = self.runtime.sessions.lock().await;
@@ -3907,9 +4026,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SwitchTabRequest>,
     ) -> Result<Response<browser_v1::SwitchTabResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let tab_id =
             parse_tab_id_from_proto(payload.tab_id.take()).map_err(Status::invalid_argument)?;
         let mut session_for_persist = None;
@@ -3955,9 +4081,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CloseTabRequest>,
     ) -> Result<Response<browser_v1::CloseTabResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let requested_tab_id = match payload.tab_id.take() {
             Some(value) if !value.ulid.trim().is_empty() => {
                 parse_tab_id(Some(value.ulid.trim())).map_err(Status::invalid_argument)?
@@ -4030,9 +4163,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::GetPermissionsRequest>,
     ) -> Result<Response<browser_v1::GetPermissionsResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let mut sessions = self.runtime.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id.as_str()) else {
             return Ok(Response::new(browser_v1::GetPermissionsResponse {
@@ -4056,9 +4196,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SetPermissionsRequest>,
     ) -> Result<Response<browser_v1::SetPermissionsResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let mut session_for_persist = None;
         let updated_permissions = {
             let mut sessions = self.runtime.sessions.lock().await;
@@ -4461,6 +4608,39 @@ fn request_principal(metadata: &tonic::metadata::MetadataMap) -> Result<&str, St
         return Err(Status::unauthenticated("missing caller principal"));
     }
     Ok(principal)
+}
+
+/// Reads an optional caller binding for session operations.
+///
+/// Daemon and console clients always attach this header. Its absence is kept
+/// only for service-authenticated internal cleanup and legacy administrative
+/// callers; when present, ownership is mandatory and foreign IDs are hidden
+/// behind the same not-found response as unknown sessions.
+fn optional_request_principal(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<&str>, Status> {
+    if metadata.get(PRINCIPAL_HEADER).is_none() {
+        return Ok(None);
+    }
+    request_principal(metadata).map(Some)
+}
+
+async fn enforce_session_owner_if_present(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    caller_principal: Option<&str>,
+) -> Result<(), Status> {
+    let Some(caller_principal) = caller_principal else {
+        return Ok(());
+    };
+    let sessions = runtime.sessions.lock().await;
+    let Some(session) = sessions.get(session_id) else {
+        return Err(Status::not_found("browser session not found"));
+    };
+    if session.principal != caller_principal {
+        return Err(Status::not_found("browser session not found"));
+    }
+    Ok(())
 }
 
 fn viewport_css_pixels(width: u32, height: u32) -> u64 {
