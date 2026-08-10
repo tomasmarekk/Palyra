@@ -1788,16 +1788,27 @@ impl DesktopInstanceLock {
     /// Acquires the single-instance lock, recovering stale locks when possible.
     pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("instance.lock");
-        let mut file = match create_instance_lock_file(path.as_path()) {
-            Ok(file) => file,
+        match publish_initialized_instance_lock(path.as_path()) {
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if recover_stale_instance_lock(path.as_path())? {
-                    create_instance_lock_file(path.as_path()).with_context(|| {
-                        format!(
-                            "failed to recreate desktop instance lock {} after stale recovery",
-                            path.display()
-                        )
-                    })?
+                    match publish_initialized_instance_lock(path.as_path()) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            bail!(
+                                "desktop control center is already running for state root {}",
+                                state_dir.display()
+                            );
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "failed to recreate desktop instance lock {} after stale recovery",
+                                    path.display()
+                                )
+                            });
+                        }
+                    }
                 } else {
                     bail!(
                         "desktop control center is already running for state root {}",
@@ -1808,17 +1819,38 @@ impl DesktopInstanceLock {
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to create {}", path.display()));
             }
-        };
-        writeln!(file, "pid={}\nstarted_at_unix_ms={}", std::process::id(), unix_ms_now())
-            .with_context(|| format!("failed to write desktop instance lock {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush desktop instance lock {}", path.display()))?;
+        }
         Ok(Self { path })
     }
 }
 
-fn create_instance_lock_file(path: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new().write(true).create_new(true).open(path)
+fn publish_initialized_instance_lock(path: &Path) -> std::io::Result<()> {
+    let staging_path = path.with_file_name(format!(".instance.lock.{}.tmp", ulid::Ulid::new()));
+    let mut staging_file =
+        fs::OpenOptions::new().write(true).create_new(true).open(staging_path.as_path())?;
+    let initialization =
+        writeln!(staging_file, "pid={}\nstarted_at_unix_ms={}", std::process::id(), unix_ms_now())
+            .and_then(|()| staging_file.sync_all());
+    drop(staging_file);
+    if let Err(error) = initialization {
+        let _ = fs::remove_file(staging_path.as_path());
+        return Err(error);
+    }
+
+    // Linking publishes a fully initialized inode without ever exposing an
+    // empty destination and fails atomically when another instance won.
+    let publish_result = fs::hard_link(staging_path.as_path(), path);
+    let cleanup_result = fs::remove_file(staging_path.as_path());
+    match publish_result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            if let Err(error) = cleanup_result {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn recover_stale_instance_lock(path: &Path) -> Result<bool> {
@@ -1892,7 +1924,7 @@ impl Drop for DesktopInstanceLock {
 
 #[cfg(test)]
 mod instance_lock_tests {
-    use super::DesktopInstanceLock;
+    use super::{publish_initialized_instance_lock, DesktopInstanceLock};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -1953,6 +1985,30 @@ mod instance_lock_tests {
             contents.contains(format!("pid={}", std::process::id()).as_str()),
             "recovered desktop instance lock should be rewritten for the current process: {contents}"
         );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn instance_lock_publication_never_overwrites_an_existing_owner() {
+        let state_dir = temp_state_dir();
+        let lock_path = state_dir.join("instance.lock");
+        fs::write(lock_path.as_path(), "pid=42\nstarted_at_unix_ms=1\n")
+            .expect("existing lock should be written");
+
+        let error = publish_initialized_instance_lock(lock_path.as_path())
+            .expect_err("atomic publication must not replace an existing lock");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(lock_path.as_path()).expect("existing lock should remain readable"),
+            "pid=42\nstarted_at_unix_ms=1\n"
+        );
+        let staging_entries = fs::read_dir(state_dir.as_path())
+            .expect("state directory should remain readable")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".instance.lock."))
+            .count();
+        assert_eq!(staging_entries, 0);
         let _ = fs::remove_dir_all(state_dir);
     }
 }
