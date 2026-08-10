@@ -95,7 +95,7 @@ pub enum SecretsConfigureCommand {
         value_stdin: bool,
         #[arg(long)]
         path: Option<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 0)]
         backups: usize,
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -108,7 +108,7 @@ pub enum SecretsConfigureCommand {
         value_stdin: bool,
         #[arg(long)]
         path: Option<String>,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 0)]
         backups: usize,
         #[arg(long, default_value_t = false)]
         json: bool,

@@ -855,6 +855,7 @@ fn configure_secret_backed_setting<F>(
 where
     F: FnOnce(&mut toml::Value, &str) -> Result<()>,
 {
+    validate_secret_configure_backups(backups)?;
     let vault = open_cli_vault().context("failed to initialize vault runtime")?;
     let value = read_secret_bytes_from_stdin(value_stdin)?;
     if let Some(validate_value) = validate_value {
@@ -876,6 +877,14 @@ where
     write_document_with_backups(path_ref, &document, backups)
         .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
 
+    Ok(())
+}
+
+fn validate_secret_configure_backups(backups: usize) -> Result<()> {
+    anyhow::ensure!(
+        backups == 0,
+        "secrets configure requires --backups 0 because the previous config may contain plaintext secrets"
+    );
     Ok(())
 }
 
@@ -1541,6 +1550,12 @@ mod tests {
         .expect("serialize");
         assert!(output.contains("\"vault_ref_configured\":true"));
         assert!(!output.contains("global/openai"));
+    }
+
+    #[test]
+    fn secret_configure_rejects_backup_retention() {
+        assert!(validate_secret_configure_backups(0).is_ok());
+        assert!(validate_secret_configure_backups(1).is_err());
     }
 
     #[test]

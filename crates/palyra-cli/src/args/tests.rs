@@ -7611,6 +7611,43 @@ fn parse_secrets_configure_browser_state_key() {
 }
 
 #[test]
+fn secrets_configure_defaults_to_no_backups() {
+    let openai = Cli::parse_from([
+        "palyra",
+        "secrets",
+        "configure",
+        "openai-api-key",
+        "global",
+        "openai_api_key",
+        "--value-stdin",
+    ]);
+    let browser = Cli::parse_from([
+        "palyra",
+        "secrets",
+        "configure",
+        "browser-state-key",
+        "global",
+        "browser_state_key",
+        "--value-stdin",
+    ]);
+
+    for parsed in [openai, browser] {
+        let Command::Secrets {
+            command:
+                SecretsCommand::Configure {
+                    command:
+                        SecretsConfigureCommand::OpenaiApiKey { backups, .. }
+                        | SecretsConfigureCommand::BrowserStateKey { backups, .. },
+                },
+        } = parsed.command
+        else {
+            panic!("expected secrets configure command");
+        };
+        assert_eq!(backups, 0);
+    }
+}
+
+#[test]
 fn parse_webhooks_add_and_test() {
     let add = Cli::parse_from([
         "palyra",
