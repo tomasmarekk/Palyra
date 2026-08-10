@@ -553,8 +553,11 @@ pub(crate) fn build_accessibility_tree_snapshot(
     page_body: &str,
     max_bytes: usize,
 ) -> (String, bool) {
+    let max_candidates = max_bytes.saturating_add(1).clamp(1, MAX_ACCESSIBILITY_CANDIDATES);
+    let (candidates, candidate_budget_exhausted) =
+        collect_accessibility_candidates(page_body, max_candidates);
     let mut lines = Vec::new();
-    for (index, candidate) in collect_accessibility_candidates(page_body).iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate() {
         if let Some(line) = build_accessibility_line(
             index + 1,
             candidate.tag.as_str(),
@@ -564,8 +567,13 @@ pub(crate) fn build_accessibility_tree_snapshot(
         }
     }
     let content = lines.join("\n");
-    truncate_utf8_bytes_with_flag(content.as_str(), max_bytes)
+    let (content, byte_budget_exhausted) =
+        truncate_utf8_bytes_with_flag(content.as_str(), max_bytes);
+    (content, candidate_budget_exhausted || byte_budget_exhausted)
 }
+
+const MAX_ACCESSIBILITY_CANDIDATES: usize = 4_096;
+const MAX_ACCESSIBILITY_INNER_TEXT_SCAN_BYTES: usize = 4_096;
 
 struct AccessibilityCandidate {
     tag: String,
@@ -735,7 +743,10 @@ pub(crate) fn build_visible_text_snapshot(page_body: &str, max_bytes: usize) -> 
     truncate_utf8_bytes_with_flag(collapsed.as_str(), max_bytes)
 }
 
-fn collect_accessibility_candidates(html: &str) -> Vec<AccessibilityCandidate> {
+fn collect_accessibility_candidates(
+    html: &str,
+    max_candidates: usize,
+) -> (Vec<AccessibilityCandidate>, bool) {
     let mut candidates = Vec::new();
     let lower = html.to_ascii_lowercase();
     let mut cursor = 0usize;
@@ -759,13 +770,22 @@ fn collect_accessibility_candidates(html: &str) -> Vec<AccessibilityCandidate> {
             cursor = end.saturating_add(1);
             continue;
         }
-        candidates.push(AccessibilityCandidate {
-            tag: tag.to_owned(),
-            inner_text: accessibility_inner_text_for_tag(html, lower.as_str(), end + 1, tag_name),
-        });
+        if accessibility_role_for_tag(tag, tag_lower.as_str()).is_none() {
+            cursor = end.saturating_add(1);
+            continue;
+        }
+        if candidates.len() >= max_candidates {
+            return (candidates, true);
+        }
+        let inner_text = if accessibility_name_can_use_inner_text(tag_name) {
+            accessibility_inner_text_for_tag(html, lower.as_str(), end + 1, tag_name)
+        } else {
+            String::new()
+        };
+        candidates.push(AccessibilityCandidate { tag: tag.to_owned(), inner_text });
         cursor = end.saturating_add(1);
     }
-    candidates
+    (candidates, false)
 }
 
 fn accessibility_inner_text_for_tag(
@@ -778,10 +798,14 @@ fn accessibility_inner_text_for_tag(
         return String::new();
     }
     let close_pattern = format!("</{tag_name}>");
-    let Some(rel_close) = lower_html[content_start..].find(close_pattern.as_str()) else {
-        return String::new();
-    };
-    let close = content_start + rel_close;
+    let mut scan_end =
+        content_start.saturating_add(MAX_ACCESSIBILITY_INNER_TEXT_SCAN_BYTES).min(html.len());
+    while !html.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+    let close = lower_html[content_start..scan_end]
+        .find(close_pattern.as_str())
+        .map_or(scan_end, |rel_close| content_start + rel_close);
     let (text, _) = build_visible_text_snapshot(&html[content_start..close], 128);
     text
 }
@@ -853,7 +877,10 @@ fn collect_opening_tags(html: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_accessibility_tree_snapshot, build_visible_text_snapshot};
+    use super::{
+        build_accessibility_tree_snapshot, build_visible_text_snapshot,
+        MAX_ACCESSIBILITY_CANDIDATES,
+    };
 
     #[test]
     fn visible_text_snapshot_extracts_page_text() {
@@ -887,5 +914,27 @@ mod tests {
         );
         assert!(!accessibility_tree.contains("name=main-title"), "{accessibility_tree}");
         assert!(!accessibility_tree.contains("name=action"), "{accessibility_tree}");
+    }
+
+    #[test]
+    fn accessibility_tree_skips_deep_non_accessible_markup_before_extracting_names() {
+        let depth = 20_000;
+        let html =
+            format!("{}<button>Ready</button>{}", "<div>".repeat(depth), "</div>".repeat(depth));
+
+        let (accessibility_tree, truncated) = build_accessibility_tree_snapshot(&html, 4096);
+
+        assert!(!truncated);
+        assert!(accessibility_tree.contains("role=button; name=Ready"), "{accessibility_tree}");
+    }
+
+    #[test]
+    fn accessibility_tree_caps_candidate_processing() {
+        let html = "<button>Ready</button>".repeat(MAX_ACCESSIBILITY_CANDIDATES + 1);
+
+        let (accessibility_tree, truncated) = build_accessibility_tree_snapshot(&html, usize::MAX);
+
+        assert!(truncated);
+        assert_eq!(accessibility_tree.lines().count(), MAX_ACCESSIBILITY_CANDIDATES);
     }
 }
