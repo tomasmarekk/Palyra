@@ -44,9 +44,10 @@ use palyra_common::{
     redaction::{is_sensitive_key, redact_diagnostic_text},
     secret_refs::SecretRef,
     workspace_patch::{
-        apply_workspace_patch, compute_patch_sha256, redact_patch_preview,
-        WorkspacePatchFileAttestation, WorkspacePatchLimits, WorkspacePatchOutcome,
-        WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
+        apply_workspace_patch, compute_patch_sha256, normalized_workspace_patch_operation_paths,
+        redact_patch_preview, validate_workspace_patch_document, WorkspacePatchFileAttestation,
+        WorkspacePatchLimits, WorkspacePatchOutcome, WorkspacePatchRedactionPolicy,
+        WorkspacePatchRequest,
     },
 };
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
@@ -5662,18 +5663,60 @@ fn validate_remote_workspace_patch_bundle(
     if !bundle.symlink_guard_result.checked || bundle.symlink_guard_result.status != "passed" {
         return Err("remote patch bundle symlink guard did not pass".to_owned());
     }
+    if !bundle.symlink_guard_result.rejected_paths.is_empty() {
+        return Err("remote patch bundle symlink guard reported rejected paths".to_owned());
+    }
     if !bundle.binary_file_policy.text_only || !bundle.binary_file_policy.rejected_paths.is_empty()
     {
         return Err("remote patch bundle contains unsupported binary file changes".to_owned());
     }
-    if bundle.conflict_summary.status != "clean" || bundle.conflict_summary.stale_view_possible {
+    if bundle.conflict_summary.status != "clean"
+        || bundle.conflict_summary.stale_view_possible
+        || !bundle.conflict_summary.conflicting_paths.is_empty()
+    {
         return Err("remote patch bundle conflict summary is not clean".to_owned());
+    }
+    if bundle.patch_document.is_empty() {
+        return Err("remote patch bundle patch_document must not be empty".to_owned());
+    }
+    let limits = WorkspacePatchLimits::default();
+    validate_workspace_patch_document(bundle.patch_document.as_str(), &limits)
+        .map_err(|error| format!("remote patch bundle document is invalid: {error}"))?;
+    let computed_patch_sha256 = compute_patch_sha256(bundle.patch_document.as_str());
+    if !valid_sha256_hex(bundle.patch_sha256.as_str())
+        || bundle.patch_sha256 != computed_patch_sha256
+    {
+        return Err("remote patch bundle patch hash does not match patch_document".to_owned());
     }
     if bundle.patch_sha256 != bundle.merge_preview.patch_sha256 {
         return Err("remote patch bundle merge preview hash does not match patch hash".to_owned());
     }
+    if !bundle.merge_preview.dry_run_success
+        || bundle.merge_preview.mode != "dry_run_apply_patch"
+        || bundle.merge_preview.apply_tool != "palyra.fs.apply_patch"
+    {
+        return Err(
+            "remote patch bundle merge preview is not a successful apply_patch dry run".to_owned()
+        );
+    }
     if bundle.file_count != bundle.files.len() {
         return Err("remote patch bundle file_count does not match file list".to_owned());
+    }
+    if bundle.merge_preview.files_changed != bundle.file_count {
+        return Err("remote patch bundle merge preview file count does not match bundle".to_owned());
+    }
+    validate_remote_workspace_patch_paths(bundle)?;
+    let expected_preview = redact_patch_preview(
+        bundle.patch_document.as_str(),
+        &WorkspacePatchRedactionPolicy::default(),
+        limits.max_preview_bytes,
+    );
+    if bundle.redacted_preview != expected_preview
+        || bundle.merge_preview.redacted_preview != expected_preview
+    {
+        return Err(
+            "remote patch bundle preview does not match the validated patch document".to_owned()
+        );
     }
     if !bundle.rollback_plan.checkpoint_pair_required
         || !bundle.rollback_plan.preflight_checkpoint_required
@@ -5681,6 +5724,99 @@ fn validate_remote_workspace_patch_bundle(
     {
         return Err("remote patch bundle rollback plan must require checkpoint restore".to_owned());
     }
+    Ok(())
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_remote_workspace_patch_paths(bundle: &WorkspacePatchBundle) -> Result<(), String> {
+    let files = validated_remote_path_set(bundle.files.as_slice(), "file list")?;
+    let mut touched = BTreeSet::new();
+    for path in &bundle.touched_paths {
+        if path.workspace_root_index != 0 {
+            return Err(
+                "remote patch bundle path references an unsupported workspace root".to_owned()
+            );
+        }
+        if !matches!(
+            path.operation.as_str(),
+            "create"
+                | "create_idempotent"
+                | "replace"
+                | "line_replace"
+                | "update"
+                | "move"
+                | "delete"
+                | "no_op"
+        ) {
+            return Err("remote patch bundle contains an unsupported patch operation".to_owned());
+        }
+        insert_validated_remote_path(&mut touched, path.path.as_str(), "touched path")?;
+        if let Some(moved_from) = path.moved_from.as_deref() {
+            insert_validated_remote_path(&mut touched, moved_from, "move source")?;
+        }
+    }
+    if files != touched {
+        return Err("remote patch bundle file list does not match touched paths".to_owned());
+    }
+
+    let mut document_paths =
+        normalized_workspace_patch_operation_paths(bundle.patch_document.as_str());
+    document_paths.extend(bundle.patch_document.lines().filter_map(|line| {
+        line.strip_prefix("*** Move to:").map(str::trim).map(ToOwned::to_owned)
+    }));
+    let document_paths = validated_remote_path_set(document_paths.as_slice(), "patch document")?;
+    if document_paths != touched {
+        return Err("remote patch bundle touched paths do not match patch_document".to_owned());
+    }
+
+    let rollback =
+        validated_remote_path_set(bundle.rollback_plan.target_paths.as_slice(), "rollback plan")?;
+    let verification = validated_remote_path_set(
+        bundle.verification_stale_state.changed_paths.as_slice(),
+        "verification state",
+    )?;
+    if rollback != files || verification != files {
+        return Err(
+            "remote patch bundle rollback or verification paths do not match file list".to_owned()
+        );
+    }
+    Ok(())
+}
+
+fn validated_remote_path_set(paths: &[String], context: &str) -> Result<BTreeSet<String>, String> {
+    let mut validated = BTreeSet::new();
+    for path in paths {
+        insert_validated_remote_path(&mut validated, path.as_str(), context)?;
+    }
+    if validated.len() != paths.len() {
+        return Err(format!("remote patch bundle {context} contains duplicate paths"));
+    }
+    Ok(validated)
+}
+
+fn insert_validated_remote_path(
+    paths: &mut BTreeSet<String>,
+    path: &str,
+    context: &str,
+) -> Result<(), String> {
+    let valid = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !path.contains(':')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..");
+    if !valid {
+        return Err(format!(
+            "remote patch bundle {context} contains a non-workspace-relative path"
+        ));
+    }
+    paths.insert(path.to_owned());
     Ok(())
 }
 
@@ -7179,8 +7315,15 @@ mod tests {
         backend_id: &str,
         workspace_strategy_digest: String,
     ) -> WorkspacePatchBundle {
-        let patch_sha256 =
-            "2222222222222222222222222222222222222222222222222222222222222222".to_owned();
+        let patch_document =
+            "*** Begin Patch\n*** Add File: a.txt\n+a\n*** Add File: b.txt\n+b\n*** End Patch\n"
+                .to_owned();
+        let patch_sha256 = compute_patch_sha256(patch_document.as_str());
+        let redacted_preview = redact_patch_preview(
+            patch_document.as_str(),
+            &WorkspacePatchRedactionPolicy::default(),
+            WorkspacePatchLimits::default().max_preview_bytes,
+        );
         WorkspacePatchBundle {
             schema_version: 2,
             backend_id: backend_id.to_owned(),
@@ -7202,7 +7345,7 @@ mod tests {
                 WorkspacePatchBundleTouchedPath {
                     path: "a.txt".to_owned(),
                     workspace_root_index: 0,
-                    operation: "replace".to_owned(),
+                    operation: "create".to_owned(),
                     moved_from: None,
                 },
                 WorkspacePatchBundleTouchedPath {
@@ -7240,7 +7383,7 @@ mod tests {
                 authoritative_workspace_mutation: false,
                 files_changed: 2,
                 patch_sha256: patch_sha256.clone(),
-                redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
+                redacted_preview: redacted_preview.clone(),
             },
             rollback_plan: WorkspacePatchBundleRollbackPlan {
                 mode: "workspace_checkpoint_restore".to_owned(),
@@ -7258,9 +7401,99 @@ mod tests {
                 post_change_checkpoint_id: None,
                 restore_report_id: None,
             },
-            redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
-            patch_document: String::new(),
+            redacted_preview,
+            patch_document,
         }
+    }
+
+    fn test_ssh_worker_patch_request(
+        workspace_strategy_digest: String,
+    ) -> SshWorkerRpcRequestEnvelope {
+        SshWorkerRpcRequestEnvelope {
+            protocol: SSH_WORKER_RPC_PROTOCOL.to_owned(),
+            schema_version: SSH_WORKER_RPC_SCHEMA_VERSION,
+            request_id: "request-test".to_owned(),
+            proposal_id: "proposal-test".to_owned(),
+            profile_id: "ssh-worker".to_owned(),
+            tunnel_endpoint_sha256: "1".repeat(64),
+            tool_name: "palyra.process.run".to_owned(),
+            tool_kind: WorkerRemoteToolKind::ProcessRun,
+            input_json: "{}".to_owned(),
+            input_json_sha256: sha256_hex(b"{}"),
+            worker_protocol: SSH_WORKER_RPC_PROTOCOL.to_owned(),
+            health_probe: "palyra-workerd --stdio".to_owned(),
+            negotiated_capabilities: vec!["tool:palyra.process.run".to_owned()],
+            process_executable_allowlist: vec!["echo".to_owned()],
+            workspace_strategy_digest,
+            artifact_transport: "ssh_worker_rpc_manifest_bundle_transfer".to_owned(),
+            writeback_mode: WorkspaceWritebackMode::PatchBundle.as_str().to_owned(),
+        }
+    }
+
+    #[test]
+    fn remote_patch_bundle_validation_binds_patch_content_and_paths() {
+        let workspace_strategy_digest =
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256();
+        let request = test_ssh_worker_patch_request(workspace_strategy_digest.clone());
+        let bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            workspace_strategy_digest,
+        );
+
+        validate_remote_workspace_patch_bundle(&bundle, &request)
+            .expect("locally validated patch bundle should pass");
+    }
+
+    #[test]
+    fn remote_patch_bundle_validation_rejects_forged_content_hash() {
+        let workspace_strategy_digest =
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256();
+        let request = test_ssh_worker_patch_request(workspace_strategy_digest.clone());
+        let mut bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            workspace_strategy_digest,
+        );
+        bundle.patch_sha256 = "2".repeat(64);
+        bundle.merge_preview.patch_sha256.clone_from(&bundle.patch_sha256);
+
+        let error = validate_remote_workspace_patch_bundle(&bundle, &request)
+            .expect_err("forged patch hash must fail");
+
+        assert!(error.contains("patch hash does not match"));
+    }
+
+    #[test]
+    fn remote_patch_bundle_validation_rejects_unconfined_metadata_paths() {
+        let workspace_strategy_digest =
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256();
+        let request = test_ssh_worker_patch_request(workspace_strategy_digest.clone());
+        let mut bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            workspace_strategy_digest,
+        );
+        bundle.rollback_plan.target_paths[0] = "../a.txt".to_owned();
+
+        let error = validate_remote_workspace_patch_bundle(&bundle, &request)
+            .expect_err("traversal-bearing rollback paths must fail");
+
+        assert!(error.contains("non-workspace-relative"));
+    }
+
+    #[test]
+    fn remote_patch_bundle_validation_requires_successful_dry_run() {
+        let workspace_strategy_digest =
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256();
+        let request = test_ssh_worker_patch_request(workspace_strategy_digest.clone());
+        let mut bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            workspace_strategy_digest,
+        );
+        bundle.merge_preview.dry_run_success = false;
+
+        let error = validate_remote_workspace_patch_bundle(&bundle, &request)
+            .expect_err("unsuccessful remote dry-run evidence must fail");
+
+        assert!(error.contains("successful apply_patch dry run"));
     }
 
     #[derive(Debug, Clone)]
