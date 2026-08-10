@@ -6515,6 +6515,12 @@ impl GatewayRuntimeState {
         if records.contains_key(canvas_id.as_str()) {
             return Err(Status::already_exists(format!("canvas already exists: {canvas_id}")));
         }
+        records.retain(|_, record| !record.closed && record.expires_at_unix_ms > now_unix_ms);
+        if records.len() >= MAX_CANVAS_IN_MEMORY_RECORDS {
+            return Err(Status::resource_exhausted(format!(
+                "canvas registry reached active record limit ({MAX_CANVAS_IN_MEMORY_RECORDS})"
+            )));
+        }
 
         let record = CanvasRecord {
             canvas_id: canvas_id.clone(),

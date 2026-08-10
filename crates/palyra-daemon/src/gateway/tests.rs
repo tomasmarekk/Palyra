@@ -21250,6 +21250,66 @@ fn canvas_rejects_out_of_bounds_payloads() {
 }
 
 #[test]
+fn canvas_registry_caps_active_records_and_reclaims_closed_entries() {
+    let state = build_test_runtime_state(false);
+    let context = canvas_test_context();
+    let mut first_canvas_id = None;
+
+    for _ in 0..super::MAX_CANVAS_IN_MEMORY_RECORDS {
+        let (record, _) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+                br#"{}"#,
+                1,
+                None,
+                canvas_test_bundle(b""),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("canvas below the registry cap should be created");
+        first_canvas_id.get_or_insert(record.canvas_id);
+    }
+
+    let saturated = state
+        .create_canvas(
+            &context,
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+            br#"{}"#,
+            1,
+            None,
+            canvas_test_bundle(b""),
+            vec!["https://console.example.com".to_owned()],
+            Some(600),
+        )
+        .expect_err("active canvas registry cap should fail closed");
+    assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+    state
+        .close_canvas(
+            &context,
+            first_canvas_id.as_deref().expect("first canvas id should be recorded"),
+            Some("capacity-test".to_owned()),
+        )
+        .expect("canvas close should succeed");
+    state
+        .create_canvas(
+            &context,
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+            br#"{}"#,
+            1,
+            None,
+            canvas_test_bundle(b""),
+            vec!["https://console.example.com".to_owned()],
+            Some(600),
+        )
+        .expect("closed canvas should be reclaimed for the next admission");
+}
+
+#[test]
 fn canvas_rejects_version_values_above_i64_max() {
     let state = build_test_runtime_state(false);
     let context = canvas_test_context();
