@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    contains_remote_secret_fragments, ProviderFailureClass, ProviderFailureClassification,
-    ProviderFailureClassifier, ProviderRecoveryDecisionKind, QaMockProviderBehaviorKind,
+    contains_remote_secret_fragments, sanitize_remote_error, ProviderFailureClass,
+    ProviderFailureClassification, ProviderFailureClassifier, ProviderRecoveryDecisionKind,
+    QaMockProviderBehaviorKind,
 };
 
 /// Current provider compatibility fixture pack schema version.
