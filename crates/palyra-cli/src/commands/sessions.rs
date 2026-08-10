@@ -100,7 +100,7 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.list count={} next_after={} include_archived={}",
                     response.sessions.len(),
-                    empty_to_none(response.next_after_session_key.as_str()),
+                    redacted_text_or_none(!response.next_after_session_key.trim().is_empty()),
                     include_archived
                 );
                 for session in &response.sessions {
@@ -109,11 +109,11 @@ pub(crate) async fn run_sessions_async(
                         session_title_for_output(session),
                         empty_to_none(session.title_source.as_str()),
                         empty_to_none(session.preview.as_str()),
-                        empty_to_none(session.session_key.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
                         redacted_text_or_none(!session.session_label.trim().is_empty()),
                         session.updated_at_unix_ms,
                         empty_to_none(session.last_run_state.as_str()),
-                        optional_canonical_id_text(&session.last_run_id),
+                        redacted_canonical_id_text(&session.last_run_id),
                         optional_unix_ms_text(session.archived_at_unix_ms)
                     );
                 }
@@ -178,7 +178,7 @@ pub(crate) async fn run_sessions_async(
                         first.preview.as_deref().unwrap_or("none"),
                         first.archived,
                         REDACTED,
-                        empty_to_none(first.session_key.as_str())
+                        redacted_text_or_none(!first.session_key.trim().is_empty())
                     );
                 }
             } else if json {
@@ -229,12 +229,12 @@ pub(crate) async fn run_sessions_async(
                     session_title_for_output(&session),
                     empty_to_none(session.title_source.as_str()),
                     empty_to_none(session.preview.as_str()),
-                    empty_to_none(session.session_key.as_str()),
+                    redacted_text_or_none(!session.session_key.trim().is_empty()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     session.created_at_unix_ms,
                     session.updated_at_unix_ms,
                     empty_to_none(session.last_run_state.as_str()),
-                    optional_canonical_id_text(&session.last_run_id),
+                    redacted_canonical_id_text(&session.last_run_id),
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
             }
@@ -292,7 +292,7 @@ pub(crate) async fn run_sessions_async(
                     session_title_for_output(&session),
                     empty_to_none(session.title_source.as_str()),
                     empty_to_none(session.preview.as_str()),
-                    empty_to_none(session.session_key.as_str()),
+                    redacted_text_or_none(!session.session_key.trim().is_empty()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     response.created,
                     response.reset_applied,
@@ -386,7 +386,7 @@ pub(crate) async fn run_sessions_async(
                 } else {
                     println!(
                         "sessions.cleanup.dry_run key={} archived_at_unix_ms={} would_archive={}",
-                        empty_to_none(session.session_key.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
                         optional_unix_ms_text(session.archived_at_unix_ms),
                         session.archived_at_unix_ms == 0
                     );
@@ -1232,17 +1232,14 @@ fn optional_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> V
         .unwrap_or(Value::Null)
 }
 
-fn optional_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String {
-    value
-        .as_ref()
-        .map(|id| id.ulid.trim())
-        .filter(|ulid| !ulid.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "none".to_owned())
+fn redacted_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String {
+    redacted_presence_for_output(
+        value.as_ref().map(|id| id.ulid.trim()).is_some_and(|ulid| !ulid.is_empty()),
+    )
 }
 
-// Free-form labels and reasons may carry user-identifying content, so text
-// renderers print only `<redacted>`/`none` presence markers for those fields.
+// Identifiers, labels, and reasons can all carry user-routing content, so
+// human-facing renderers expose only presence while structured output stays explicit.
 fn redacted_text_or_none(present: bool) -> String {
     redacted_presence_for_output(present)
 }
@@ -1700,7 +1697,7 @@ mod render_tests {
 mod tests {
     use super::{
         build_cleanup_session_request, build_resolve_session_request,
-        build_session_retry_agent_run_input, optional_canonical_id_text,
+        build_session_retry_agent_run_input, redacted_canonical_id_text,
         redacted_cleanup_warning_json, redacted_cleanup_warning_text, session_to_json,
     };
     use crate::args::AgentApprovalModeArg;
@@ -1813,16 +1810,16 @@ mod tests {
     }
 
     #[test]
-    fn text_identifier_renderer_preserves_resume_ids() {
+    fn text_identifier_renderer_reveals_only_presence() {
         assert_eq!(
-            optional_canonical_id_text(&Some(common_v1::CanonicalId {
+            redacted_canonical_id_text(&Some(common_v1::CanonicalId {
                 ulid: " 01ARZ3NDEKTSV4RRFFQ69G5FAX ".to_owned(),
             })),
-            "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+            "<redacted>"
         );
-        assert_eq!(optional_canonical_id_text(&None), "none");
+        assert_eq!(redacted_canonical_id_text(&None), "none");
         assert_eq!(
-            optional_canonical_id_text(&Some(common_v1::CanonicalId { ulid: " ".to_owned() })),
+            redacted_canonical_id_text(&Some(common_v1::CanonicalId { ulid: " ".to_owned() })),
             "none"
         );
     }
