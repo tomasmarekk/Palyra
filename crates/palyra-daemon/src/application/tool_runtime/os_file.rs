@@ -49,6 +49,8 @@ const MAX_OS_FILE_SEARCH_MATCHES: usize = 100;
 const MAX_OS_FILE_SEARCH_FILES: usize = 10_000;
 const MAX_OS_FILE_SEARCH_DEPTH: usize = 8;
 const MAX_OS_FILE_SEARCH_FILE_BYTES: u64 = 128 * 1024;
+const MAX_OS_FILE_SEARCH_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OS_FILE_SEARCH_ENTRIES: usize = 20_000;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
@@ -628,8 +630,11 @@ struct OsFileSearchState {
     matches: Vec<Value>,
     files_scanned: usize,
     dirs_scanned: usize,
+    entries_scanned: usize,
+    bytes_read: u64,
     skipped_files: usize,
     skipped_dirs: usize,
+    resource_budget_exhausted: bool,
     truncated: bool,
 }
 
@@ -644,14 +649,27 @@ impl OsFileSearchState {
             matches: Vec::new(),
             files_scanned: 0,
             dirs_scanned: 0,
+            entries_scanned: 0,
+            bytes_read: 0,
             skipped_files: 0,
             skipped_dirs: 0,
+            resource_budget_exhausted: false,
             truncated: false,
         }
     }
 
     fn has_capacity(&self) -> bool {
-        self.matches.len() < self.max_matches
+        self.matches.len() < self.max_matches && !self.resource_budget_exhausted
+    }
+
+    fn admit_file_read(&mut self, size_bytes: u64) -> bool {
+        let remaining_bytes = MAX_OS_FILE_SEARCH_TOTAL_BYTES.saturating_sub(self.bytes_read);
+        if size_bytes <= remaining_bytes {
+            return true;
+        }
+        self.resource_budget_exhausted = true;
+        self.truncated = true;
+        false
     }
 
     fn push_match(&mut self, value: Value) {
@@ -696,6 +714,8 @@ fn search_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Stri
         matches,
         files_scanned,
         dirs_scanned,
+        entries_scanned,
+        bytes_read,
         skipped_files,
         skipped_dirs,
         truncated,
@@ -712,6 +732,8 @@ fn search_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Stri
         "match_count": match_count,
         "files_scanned": files_scanned,
         "dirs_scanned": dirs_scanned,
+        "entries_scanned": entries_scanned,
+        "bytes_read": bytes_read,
         "skipped_files": skipped_files,
         "skipped_dirs": skipped_dirs,
         "truncated": truncated,
@@ -768,10 +790,16 @@ fn search_directory(
         format!("{OS_FILE_TOOL_NAME} failed to search directory {}: {error}", display_path(path))
     })?;
     for entry in entries {
+        if state.entries_scanned >= MAX_OS_FILE_SEARCH_ENTRIES {
+            state.resource_budget_exhausted = true;
+            state.truncated = true;
+            break;
+        }
         if !state.has_capacity() {
             state.truncated = true;
             break;
         }
+        state.entries_scanned = state.entries_scanned.saturating_add(1);
         let Ok(entry) = entry else {
             state.skipped_files = state.skipped_files.saturating_add(1);
             continue;
@@ -806,9 +834,17 @@ fn search_file(path: &Path, size_bytes: u64, state: &mut OsFileSearchState) -> R
         }
         return Ok(());
     }
-    let bytes = fs::read(path).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to read search file {display}: {error}")
-    })?;
+    if !state.admit_file_read(size_bytes) {
+        state.skipped_files = state.skipped_files.saturating_add(1);
+        return Ok(());
+    }
+    let remaining_bytes = MAX_OS_FILE_SEARCH_TOTAL_BYTES.saturating_sub(state.bytes_read);
+    let max_read_bytes = MAX_OS_FILE_SEARCH_FILE_BYTES.min(remaining_bytes);
+    let mut bytes = Vec::with_capacity(size_bytes.min(max_read_bytes) as usize);
+    File::open(path).and_then(|file| file.take(max_read_bytes).read_to_end(&mut bytes)).map_err(
+        |error| format!("{OS_FILE_TOOL_NAME} failed to read search file {display}: {error}"),
+    )?;
+    state.bytes_read = state.bytes_read.saturating_add(bytes.len() as u64);
     let Ok(text) = String::from_utf8(bytes) else {
         state.skipped_files = state.skipped_files.saturating_add(1);
         return Ok(());
@@ -2454,6 +2490,19 @@ mod tests {
                 .any(|value| value.get("kind").and_then(Value::as_str) == Some("content")),
             "search should find matching cache contents: {searched}"
         );
+    }
+
+    #[test]
+    fn os_file_search_aggregate_read_budget_fails_closed() {
+        let mut state = OsFileSearchState::new("needle".to_owned(), false, 10);
+        state.bytes_read = MAX_OS_FILE_SEARCH_TOTAL_BYTES - 1;
+
+        assert!(state.admit_file_read(1));
+        state.bytes_read = state.bytes_read.saturating_add(1);
+        assert!(!state.admit_file_read(1));
+        assert!(state.resource_budget_exhausted);
+        assert!(state.truncated);
+        assert!(!state.has_capacity());
     }
 
     #[test]
