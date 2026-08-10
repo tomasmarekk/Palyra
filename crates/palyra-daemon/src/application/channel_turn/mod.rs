@@ -618,7 +618,10 @@ impl ChannelTurnAdmission {
 pub(crate) fn decide_channel_turn_admission(
     input: &ChannelTurnAdmissionInput,
 ) -> ChannelTurnAdmission {
-    if input.bot_loop.kind == BotLoopDecisionKind::Dropped {
+    if input.bot_loop.kind == BotLoopDecisionKind::Dropped
+        && input.bot.sender_is_bot
+        && !input.bot.sender_is_self
+    {
         return ChannelTurnAdmission::new(ChannelAdmissionReason::DropBotLoopProtection);
     }
     if input.bot.sender_is_self {
@@ -1719,6 +1722,7 @@ mod tests {
     #[test]
     fn admission_drops_when_bot_loop_guard_enforces_protection() {
         let mut input = admission_input();
+        input.bot.sender_is_bot = true;
         let key = BotPairKey::new("discord", "discord:ops", None, None, "bot-a", "palyra")
             .expect("valid bot loop key");
         let guard = ChannelBotLoopGuard::new(ChannelBotLoopGuardConfig {
@@ -1736,6 +1740,28 @@ mod tests {
         assert_eq!(admission.reason_code, "channel.admission.drop.bot_loop_protection");
         assert!(!admission.model_request_permitted);
         assert!(!admission.durable_history_permitted);
+    }
+
+    #[test]
+    fn admission_never_applies_bot_loop_drop_to_a_human_sender() {
+        let mut input = admission_input();
+        let key = BotPairKey::new("discord", "discord:ops", None, None, "human-a", "palyra")
+            .expect("valid pair key");
+        let guard = ChannelBotLoopGuard::new(ChannelBotLoopGuardConfig {
+            threshold: 1,
+            window_ms: 1_000,
+            cooldown_ms: 5_000,
+            max_tracked_pairs: 4,
+        });
+        guard.observe(key.clone(), 10);
+        input.bot_loop = guard.observe(key, 20);
+
+        let admission = decide_channel_turn_admission(&input);
+
+        assert_eq!(input.bot_loop.kind, BotLoopDecisionKind::Dropped);
+        assert_eq!(admission.kind, ChannelTurnAdmissionKind::Dispatch);
+        assert_eq!(admission.reason_code, "channel.admission.dispatch.mention");
+        assert!(admission.model_request_permitted);
     }
 
     #[test]
