@@ -9,8 +9,9 @@
 use std::{
     collections::BTreeMap,
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
     future::Future,
+    io::{Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -19,6 +20,11 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use palyra_common::runtime_contracts::CancellationContextV1;
 use serde::{Deserialize, Serialize};
@@ -44,6 +50,9 @@ use crate::{
 /// Wire schema version for tool RPC requests and responses; any mismatch
 /// fails closed in [`execute_granted_tool_rpc_call`].
 pub(crate) const TOOL_RPC_SCHEMA_VERSION: u32 = 1;
+const MAX_TOOL_RPC_FILE_REQUEST_BYTES: u64 = 1024 * 1024;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// One child tool call requested by a tool program step or bridge client.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -570,7 +579,11 @@ pub(crate) async fn process_tool_rpc_file_transport_once(
             continue;
         };
         let response_path = response_dir.join(format!("{correlation_id}.response.json"));
-        if rpc_request_is_orphaned(request_path.as_path(), config.orphan_timeout) {
+        let (input_json, request_metadata) = read_file_rpc_request(request_path.as_path())
+            .map_err(|error| {
+                format!("failed to read tool rpc request file {}: {error}", request_path.display())
+            })?;
+        if rpc_request_is_orphaned(&request_metadata, config.orphan_timeout) {
             write_orphaned_file_rpc_response(
                 request_path.as_path(),
                 response_path.as_path(),
@@ -580,9 +593,6 @@ pub(crate) async fn process_tool_rpc_file_transport_once(
             continue;
         }
 
-        let input_json = fs::read(request_path.as_path()).map_err(|error| {
-            format!("failed to read tool rpc request file {}: {error}", request_path.display())
-        })?;
         let request = match serde_json::from_slice::<ToolRpcRequest>(input_json.as_slice()) {
             Ok(request) => request,
             Err(error) => {
@@ -914,14 +924,45 @@ fn is_safe_rpc_file_id(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn rpc_request_is_orphaned(path: &Path, orphan_timeout: Duration) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
+fn rpc_request_is_orphaned(metadata: &fs::Metadata, orphan_timeout: Duration) -> bool {
     let Ok(modified) = metadata.modified() else {
         return false;
     };
     modified.elapsed().is_ok_and(|age| age >= orphan_timeout)
+}
+
+fn read_file_rpc_request(path: &Path) -> Result<(Vec<u8>, fs::Metadata), String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("request must be an unlinked regular file: {error}"))?;
+    let metadata =
+        file.metadata().map_err(|error| format!("failed to inspect opened request: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("request must be a regular file and must not be a symlink".to_owned());
+    }
+    if metadata.len() > MAX_TOOL_RPC_FILE_REQUEST_BYTES {
+        return Err(format!(
+            "request exceeds the {MAX_TOOL_RPC_FILE_REQUEST_BYTES}-byte file transport limit"
+        ));
+    }
+    let mut input_json = Vec::with_capacity(
+        usize::try_from(metadata.len()).unwrap_or(MAX_TOOL_RPC_FILE_REQUEST_BYTES as usize),
+    );
+    file.take(MAX_TOOL_RPC_FILE_REQUEST_BYTES.saturating_add(1))
+        .read_to_end(&mut input_json)
+        .map_err(|error| format!("failed to read bounded request: {error}"))?;
+    if u64::try_from(input_json.len()).unwrap_or(u64::MAX) > MAX_TOOL_RPC_FILE_REQUEST_BYTES {
+        return Err(format!(
+            "request exceeds the {MAX_TOOL_RPC_FILE_REQUEST_BYTES}-byte file transport limit"
+        ));
+    }
+    Ok((input_json, metadata))
 }
 
 fn write_orphaned_file_rpc_response(
@@ -994,7 +1035,12 @@ fn write_file_rpc_response(
 ) -> Result<(), String> {
     let response_json = serde_json::to_vec_pretty(envelope)
         .map_err(|error| format!("failed to serialize tool rpc file response: {error}"))?;
-    fs::write(response_path, response_json)
+    let mut response =
+        OpenOptions::new().write(true).create_new(true).open(response_path).map_err(|error| {
+            format!("tool rpc response path must be a new regular file: {error}")
+        })?;
+    response
+        .write_all(response_json.as_slice())
         .map_err(|error| format!("failed to write tool rpc file response: {error}"))
 }
 
@@ -1116,6 +1162,7 @@ fn summarize_rpc_output(output_json: &[u8], max_bytes: usize) -> String {
 mod tests {
     use std::{
         collections::BTreeSet,
+        fs,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -1126,10 +1173,72 @@ mod tests {
     use super::{
         build_python_tool_rpc_bridge_context_with_transports,
         child_tool_may_inherit_parent_approval, python_tool_rpc_sdk_source,
-        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers,
-        settle_tool_rpc_execution, summarize_rpc_output, PythonToolRpcTransportDescriptor,
-        ToolRpcExecutionSettlement, ToolRpcTransportKind, TOOL_RPC_SCHEMA_VERSION,
+        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers, read_file_rpc_request,
+        settle_tool_rpc_execution, summarize_rpc_output, write_file_rpc_response,
+        PythonToolRpcTransportDescriptor, ToolRpcExecutionSettlement, ToolRpcFileResponseEnvelope,
+        ToolRpcTransportKind, MAX_TOOL_RPC_FILE_REQUEST_BYTES, TOOL_RPC_SCHEMA_VERSION,
     };
+
+    #[test]
+    fn file_rpc_request_read_is_bounded() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let request_path = temp.path().join("large.request.json");
+        fs::write(
+            request_path.as_path(),
+            vec![
+                b'x';
+                usize::try_from(MAX_TOOL_RPC_FILE_REQUEST_BYTES)
+                    .expect("request limit should fit usize")
+                    + 1
+            ],
+        )
+        .expect("oversized request fixture should be written");
+
+        let error = read_file_rpc_request(request_path.as_path())
+            .expect_err("oversized request must fail before parsing");
+
+        assert!(error.contains("file transport limit"));
+    }
+
+    #[test]
+    fn file_rpc_response_never_overwrites_existing_entries() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let response_path = temp.path().join("call.response.json");
+        fs::write(response_path.as_path(), b"sentinel")
+            .expect("existing response fixture should be written");
+        let envelope = ToolRpcFileResponseEnvelope {
+            schema_version: TOOL_RPC_SCHEMA_VERSION,
+            correlation_id: "call".to_owned(),
+            status: "completed".to_owned(),
+            success: true,
+            error: String::new(),
+            response: None,
+        };
+
+        write_file_rpc_response(response_path.as_path(), &envelope)
+            .expect_err("existing response entries must not be followed or overwritten");
+
+        assert_eq!(
+            fs::read(response_path).expect("existing response should remain readable"),
+            b"sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_rpc_request_read_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let target = temp.path().join("target.json");
+        let request_path = temp.path().join("call.request.json");
+        fs::write(target.as_path(), b"{}").expect("target fixture should be written");
+        symlink(target.as_path(), request_path.as_path())
+            .expect("request symlink should be created");
+
+        read_file_rpc_request(request_path.as_path())
+            .expect_err("request symlinks must be rejected without following them");
+    }
 
     #[tokio::test]
     async fn timeout_waits_for_child_execution_to_settle() {
