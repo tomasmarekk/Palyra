@@ -1570,8 +1570,19 @@ fn stale_requirements_from_patch_output(
 }
 
 fn process_run_verification_result_passed(raw_output: &Value, output: &Value) -> bool {
+    let background = ["background", "auto_backgrounded", "foreground_request_backgrounded"]
+        .into_iter()
+        .any(|field| output.get(field).and_then(Value::as_bool) == Some(true));
+    let completed = output.get("completed").and_then(Value::as_bool).unwrap_or(!background);
+    let terminal_process_state = output
+        .get("process_state")
+        .and_then(Value::as_str)
+        .is_none_or(|state| matches!(state, "completed" | "exited"));
     model_visible_tool_result_succeeded(raw_output)
-        && output.get("exit_code").and_then(Value::as_i64).is_none_or(|code| code == 0)
+        && !background
+        && completed
+        && terminal_process_state
+        && output.get("exit_code").and_then(Value::as_i64) == Some(0)
 }
 
 fn verification_kind_from_str(value: &str) -> Option<VerificationKind> {
@@ -3215,6 +3226,42 @@ mod tests {
         assert_eq!(report.pending_requirement_count, 0);
         assert_eq!(report.satisfied_requirement_count, 1);
         assert!(report.evidence_refs.iter().any(|reference| reference == "tool_call:call-test"));
+    }
+
+    #[test]
+    fn process_verification_requires_a_terminal_foreground_zero_exit() {
+        let raw_output = json!({"success": true});
+
+        assert!(process_run_verification_result_passed(
+            &raw_output,
+            &json!({"exit_code": 0, "background": false})
+        ));
+        for output in [
+            json!({
+                "exit_code": null,
+                "background": true,
+                "completed": false,
+                "process_state": "running",
+                "startup_success": true
+            }),
+            json!({
+                "exit_code": 0,
+                "background": true,
+                "completed": true,
+                "process_state": "completed"
+            }),
+            json!({"exit_code": 0, "auto_backgrounded": true}),
+            json!({"exit_code": 0, "foreground_request_backgrounded": true}),
+            json!({"exit_code": 0, "background": false, "completed": false}),
+            json!({"exit_code": 0, "background": false, "process_state": "running"}),
+            json!({"background": false, "completed": true}),
+            json!({"exit_code": 1, "background": false, "completed": true}),
+        ] {
+            assert!(
+                !process_run_verification_result_passed(&raw_output, &output),
+                "non-terminal or unsuccessful process output must not verify: {output}"
+            );
+        }
     }
 
     #[test]
