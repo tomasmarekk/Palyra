@@ -7283,10 +7283,11 @@ mod tests {
 
     #[test]
     fn browser_element_captures_to_json_redacts_untrusted_text_and_styles() {
+        let naked_token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
         let (captures, scans, redacted) =
             browser_element_captures_to_json(&[browser_v1::BrowserElementCapture {
                 v: CANONICAL_PROTOCOL_MAJOR,
-                selector: "#token".to_owned(),
+                selector: format!("#{naked_token}"),
                 found: true,
                 bounding_rect: Some(browser_v1::BrowserRect {
                     v: CANONICAL_PROTOCOL_MAJOR,
@@ -7300,21 +7301,23 @@ mod tests {
                     left: 1.0,
                 }),
                 visible: true,
-                tag_name: "div".to_owned(),
+                tag_name: format!("div-{naked_token}"),
                 id: "token=super-secret-token-value".to_owned(),
                 class_name: "Authorization: Bearer super-secret-token-value".to_owned(),
                 text: "Authorization: Bearer super-secret-token-value".to_owned(),
                 text_truncated: false,
                 computed_styles: vec![browser_v1::BrowserComputedStyle {
                     v: CANONICAL_PROTOCOL_MAJOR,
-                    name: "content".to_owned(),
+                    name: format!("content-{naked_token}"),
                     value: "token=super-secret-token-value".to_owned(),
                 }],
-                error: String::new(),
+                error: format!("capture failed for {naked_token}"),
             }]);
 
         assert!(redacted);
         assert!(!scans.is_empty());
+        let serialized = serde_json::to_string(&captures).expect("captures should serialize");
+        assert!(!serialized.contains(naked_token), "{serialized}");
         assert_eq!(captures[0]["bounding_rect"]["width"], 3.0);
         assert_eq!(captures[0]["id"], "token=[REDACTED_SECRET]");
         assert_eq!(captures[0]["class_name"], "Authorization: [REDACTED_SECRET]");
