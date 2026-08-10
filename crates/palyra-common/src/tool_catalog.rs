@@ -134,6 +134,15 @@ impl Error for ToolsetProfileError {}
 
 const EMPTY_TOOL_CAPABILITIES: &[ToolCapability] = &[];
 const PROCESS_RUNNER_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ProcessExec];
+const PROCESS_EXECUTION_TOOL_FAMILY: &[&str] = &[
+    "palyra.process.run",
+    "palyra.exec.run",
+    "palyra.process.input",
+    "palyra.process.send_keys",
+    "palyra.process.stop",
+    "palyra.process.status",
+    "palyra.process.list",
+];
 const WORKSPACE_FILE_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::FilesystemRead];
 const WORKSPACE_PATCH_CAPABILITIES: &[ToolCapability] = &[ToolCapability::FilesystemWrite];
 const OS_FILE_CAPABILITIES: &[ToolCapability] =
@@ -400,10 +409,9 @@ pub fn expand_toolset_profiles(
 fn expand_disabled_tool_aliases(disabled_tools: &[String]) -> BTreeSet<String> {
     let mut disabled = disabled_tools.iter().cloned().collect::<BTreeSet<_>>();
     if disabled.contains("palyra.process.run") || disabled.contains("palyra.exec.run") {
-        // These are two names for one execution authority, so an operator deny must
-        // close both entry points before the effective catalog reaches policy expansion.
-        disabled.insert("palyra.process.run".to_owned());
-        disabled.insert("palyra.exec.run".to_owned());
+        // Lifecycle tools derive their authority from the run facade, so denying
+        // that facade must also remove every companion before catalog publication.
+        disabled.extend(PROCESS_EXECUTION_TOOL_FAMILY.iter().map(|tool| (*tool).to_owned()));
     }
     disabled
 }
@@ -438,21 +446,9 @@ fn push_effective_tool(tool: &str, tools: &mut Vec<String>, seen: &mut BTreeSet<
         return;
     }
     if matches!(tool.as_str(), "palyra.process.run" | "palyra.exec.run") {
-        if seen.insert("palyra.process.run".to_owned()) {
-            tools.push("palyra.process.run".to_owned());
-        }
-        if seen.insert("palyra.exec.run".to_owned()) {
-            tools.push("palyra.exec.run".to_owned());
-        }
-        for companion in [
-            "palyra.process.input",
-            "palyra.process.send_keys",
-            "palyra.process.stop",
-            "palyra.process.status",
-            "palyra.process.list",
-        ] {
-            if seen.insert(companion.to_owned()) {
-                tools.push(companion.to_owned());
+        for family_tool in PROCESS_EXECUTION_TOOL_FAMILY {
+            if seen.insert((*family_tool).to_owned()) {
+                tools.push((*family_tool).to_owned());
             }
         }
     }
@@ -832,16 +828,16 @@ mod tests {
     }
 
     #[test]
-    fn disabling_either_process_run_facade_removes_both() {
+    fn disabling_either_process_run_facade_removes_execution_family() {
         for disabled_tool in ["palyra.process.run", "palyra.exec.run"] {
             let report =
                 expand_toolset_profiles(&[String::from("code")], &[], &[], &[disabled_tool.into()])
                     .expect("code profile should be valid");
 
-            for run_facade in ["palyra.process.run", "palyra.exec.run"] {
+            for family_tool in PROCESS_EXECUTION_TOOL_FAMILY {
                 assert!(
-                    !report.effective_allowed_tools.iter().any(|tool| tool == run_facade),
-                    "disabling {disabled_tool} must also remove {run_facade}"
+                    !report.effective_allowed_tools.iter().any(|tool| tool == *family_tool),
+                    "disabling {disabled_tool} must also remove {family_tool}"
                 );
             }
             assert_eq!(report.disabled_tools, vec![disabled_tool]);
