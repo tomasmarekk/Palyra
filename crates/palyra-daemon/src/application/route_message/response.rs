@@ -18,6 +18,7 @@ use crate::{
         process_provider_event_for_surface, ProviderEventSurface, RouteMessageProviderEventSurface,
         RunStreamProviderEventOutcome,
     },
+    application::provider_output::provider_turn_output_tape_payload,
     application::tool_registry::ModelVisibleToolCatalogSnapshot,
     gateway::GatewayRuntimeState,
     journal::OrchestratorTapeAppendRequest,
@@ -286,12 +287,10 @@ async fn persist_route_provider_turn_output(
     tape_seq: &mut i64,
     output: &ProviderTurnOutput,
 ) -> Result<(), Status> {
-    let bounded_output = bounded_provider_turn_output_for_persistence(output);
-    let payload_json = serde_json::to_string(&bounded_output).map_err(|error| {
-        Status::internal(format!("failed to serialize provider turn output: {error}"))
-    })?;
-    let payload_json =
-        crate::journal::redact_payload_json(payload_json.as_bytes()).unwrap_or(payload_json);
+    let payload_json = provider_turn_output_tape_payload(
+        output,
+        runtime_state.orchestrator_tape_max_payload_bytes(),
+    )?;
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),

@@ -70,6 +70,7 @@ pub mod project_context_summary;
 pub mod project_facts;
 pub mod provider_events;
 pub mod provider_input;
+pub(crate) mod provider_output;
 pub mod provider_turn_recovery;
 pub mod pty_backend;
 pub mod recall;

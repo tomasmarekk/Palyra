@@ -85,6 +85,7 @@ use crate::{
         build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
         PrepareModelProviderInputRequest,
     },
+    application::provider_output::provider_turn_output_tape_payload,
     application::provider_turn_recovery::{
         anomaly_from_terminal_outcome, anomaly_from_terminal_validation, cancellation_closure,
         ContextPressureInput, ContextPressureReport, ProviderAttemptPlan,
@@ -8726,12 +8727,10 @@ async fn persist_run_stream_provider_turn_output(
     tape_seq: &mut i64,
     output: &ProviderTurnOutput,
 ) -> Result<(), Status> {
-    let bounded_output = bounded_provider_turn_output_for_persistence(output);
-    let payload_json = serde_json::to_string(&bounded_output).map_err(|error| {
-        Status::internal(format!("failed to serialize provider turn output: {error}"))
-    })?;
-    let payload_json =
-        crate::journal::redact_payload_json(payload_json.as_bytes()).unwrap_or(payload_json);
+    let payload_json = provider_turn_output_tape_payload(
+        output,
+        runtime_state.orchestrator_tape_max_payload_bytes(),
+    )?;
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),

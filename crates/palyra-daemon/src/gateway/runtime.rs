@@ -13402,6 +13402,11 @@ impl GatewayRuntimeState {
         self.journal_store.max_payload_bytes()
     }
 
+    /// Maximum tape-event payload size accepted by the journal store.
+    pub(crate) fn orchestrator_tape_max_payload_bytes(&self) -> usize {
+        self.journal_store.max_payload_bytes()
+    }
+
     #[allow(clippy::result_large_err)]
     fn read_tool_result_artifact_blocking(
         &self,
