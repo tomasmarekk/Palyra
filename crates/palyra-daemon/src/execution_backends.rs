@@ -4429,14 +4429,10 @@ fn docker_version_at_least(raw: &str, minimum_major: u64, minimum_minor: u64) ->
 }
 
 fn container_user_is_root(user: &str) -> bool {
-    let user = user.trim();
-    if user.is_empty() || user.eq_ignore_ascii_case("root") {
-        return true;
-    }
-    let Some(first) = user.split(':').next() else {
-        return true;
-    };
-    first == "0"
+    let principal = user.trim().split(':').next().unwrap_or_default().trim();
+    principal.is_empty()
+        || principal.eq_ignore_ascii_case("root")
+        || principal.parse::<i64>().is_ok_and(|uid| uid == 0)
 }
 
 fn sha256_hex(input: &[u8]) -> String {
@@ -8194,9 +8190,14 @@ mod tests {
             .expect_err("Docker image tags without digests must fail")
             .contains("sha256 digest"));
 
-        let mut root_user = safe_container_profile();
-        root_user.user = "0:0".to_owned();
-        assert!(root_user.validate().expect_err("root user must fail").contains("non-root user"));
+        for root_identity in ["root", "root:root", "0", "0:0", "0:root", "00:1000", "+0:1000"] {
+            let mut root_user = safe_container_profile();
+            root_user.user = root_identity.to_owned();
+            assert!(
+                root_user.validate().expect_err("root user must fail").contains("non-root user"),
+                "{root_identity} must not satisfy the explicit non-root invariant"
+            );
+        }
 
         let mut writable_root = safe_container_profile();
         writable_root.readonly_rootfs = false;
