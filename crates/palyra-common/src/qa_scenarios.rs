@@ -1920,6 +1920,17 @@ fn validate_requires(
         false,
         issues,
     );
+    for (index, fixture) in value.fixtures.iter().enumerate() {
+        if !qa_path_is_below(fixture.as_str(), &["qa/fixtures"]) {
+            push_issue(
+                issues,
+                "unsafe_fixture_path",
+                format!("$.requires.fixtures[{index}]").as_str(),
+                format!("fixture path '{fixture}' must stay below qa/fixtures"),
+                "Use a normalized repository-relative path below qa/fixtures.",
+            );
+        }
+    }
     Some(QaScenarioRequires {
         model,
         capabilities: value.capabilities,
@@ -2794,20 +2805,30 @@ fn validate_artifact_path(
     issues: &mut Vec<QaScenarioManifestIssue>,
 ) -> Option<String> {
     let value = validate_required_string(value, path, "artifact path", issues)?;
-    let value_path = Path::new(value.as_str());
-    if value_path.is_absolute()
-        || value_path.components().any(|component| matches!(component, Component::ParentDir))
-    {
+    if !qa_path_is_below(value.as_str(), &["qa/reports", "qa/fixtures"]) {
         push_issue(
             issues,
             "unsafe_artifact_path",
             path,
-            format!("artifact path '{value}' must be relative and must not contain '..'"),
+            format!("artifact path '{value}' must stay below qa/reports or qa/fixtures"),
             "Use a repository-relative artifact path below qa/reports or qa/fixtures.",
         );
         return None;
     }
     Some(value)
+}
+
+fn qa_path_is_below(value: &str, allowed_roots: &[&str]) -> bool {
+    if runner_path_is_unsafe(value) || value.contains('\\') || value.contains(':') {
+        return false;
+    }
+    let normalized = value.split('/').collect::<Vec<_>>();
+    if normalized.iter().any(|component| component.is_empty() || *component == ".") {
+        return false;
+    }
+    allowed_roots.iter().any(|root| {
+        value.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+    })
 }
 
 fn validate_runner_path(
@@ -3862,6 +3883,37 @@ timeout:
             schema_v3_scenario_with_runner("record_replay", RECORD_REPLAY_RUNNER_BLOCK)
                 .replace("qa/fixtures/provider_basic.yaml", "../provider-secret.yaml");
         assert_validation_issue(&unsafe_replay, "$.runner.replay_fixture", "unsafe_runner_path");
+    }
+
+    #[test]
+    fn requires_fixtures_stay_below_the_fixture_root() {
+        for unsafe_path in [
+            "../../secret.yaml",
+            "/etc/passwd",
+            r"C:\secret.yaml",
+            r"qa\fixtures\provider.yaml",
+            "fixtures/provider.yaml",
+        ] {
+            let scenario = V2_FIXTURE_SCENARIO
+                .replace("  fixtures: []", format!("  fixtures:\n    - {unsafe_path}").as_str());
+
+            assert_validation_issue(&scenario, "$.requires.fixtures[0]", "unsafe_fixture_path");
+        }
+    }
+
+    #[test]
+    fn artifact_paths_stay_below_qa_artifact_roots() {
+        for unsafe_path in [
+            "../../report.json",
+            "/tmp/report.json",
+            r"C:\report.json",
+            r"qa\reports\report.json",
+            "reports/report.json",
+        ] {
+            let scenario = EXAMPLE_SCENARIO.replace("qa/reports/text_run_basic.json", unsafe_path);
+
+            assert_validation_issue(&scenario, "$.artifacts[0].path", "unsafe_artifact_path");
+        }
     }
 
     #[test]
