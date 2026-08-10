@@ -6144,7 +6144,7 @@ fn agent_resume_command(
     args.push(agent_approval_mode_cli_value(request.approval_mode).to_owned());
     args.push("--prompt".to_owned());
     args.push(agent_resume_prompt(request.run_id.as_str(), checkpoint));
-    args.into_iter().map(|arg| quote_cli_arg(arg.as_str())).collect::<Vec<_>>().join(" ")
+    render_agent_resume_command(args.as_slice())
 }
 
 fn agent_resume_prompt(run_id: &str, checkpoint: Option<&AgentRunProgressCheckpoint>) -> String {
@@ -6275,6 +6275,20 @@ fn non_empty_str(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// Renders a copy-pasteable resume command without relying on `cmd.exe`
+/// single-quote semantics, which do not protect shell metacharacters.
+fn render_agent_resume_command(args: &[String]) -> String {
+    #[cfg(windows)]
+    {
+        powershell_encoded_cli_command(args)
+    }
+    #[cfg(not(windows))]
+    {
+        args.iter().map(|arg| quote_cli_arg(arg.as_str())).collect::<Vec<_>>().join(" ")
+    }
+}
+
+#[cfg(not(windows))]
 fn quote_cli_arg(value: &str) -> String {
     if value.chars().all(is_unquoted_cli_arg_char) {
         return value.to_owned();
@@ -6282,18 +6296,40 @@ fn quote_cli_arg(value: &str) -> String {
     shell_single_quote_cli_arg(value)
 }
 
-#[cfg(windows)]
-fn shell_single_quote_cli_arg(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(not(windows))]
 fn shell_single_quote_cli_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(not(windows))]
 fn is_unquoted_cli_arg_char(value: char) -> bool {
     value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '/' | '\\' | ':' | '=')
+}
+
+fn powershell_encoded_cli_command(args: &[String]) -> String {
+    let script = powershell_invocation_script(args);
+    let encoded = BASE64_STANDARD.encode(utf16le_bytes(script.as_str()));
+    format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand \"{encoded}\"")
+}
+
+fn powershell_invocation_script(args: &[String]) -> String {
+    let Some((program, rest)) = args.split_first() else {
+        return String::new();
+    };
+    let mut script = format!("& {}", quote_powershell_single_quoted_arg(program));
+    for arg in rest {
+        script.push(' ');
+        script.push_str(quote_powershell_single_quoted_arg(arg).as_str());
+    }
+    script
+}
+
+fn quote_powershell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn utf16le_bytes(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 async fn prepare_agent_run_input(
@@ -7657,30 +7693,41 @@ mod agent_stream_output_tests {
             .expect_err("continuation handoff should fail with resume command");
         let rendered = error.to_string();
 
-        assert!(rendered.contains("resume_command=palyra agent run"), "{rendered}");
-        assert!(rendered.contains("--session-id 01ARZ3NDEKTSV4RRFFQ69G5FAS"), "{rendered}");
-        assert!(rendered.contains("--require-existing"), "{rendered}");
-        assert!(rendered.contains("--allow-sensitive-tools"), "{rendered}");
-        assert!(rendered.contains("--approval-mode allow-once"), "{rendered}");
-        assert!(rendered.contains("Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{rendered}");
+        #[cfg(windows)]
+        {
+            assert!(
+                rendered.contains(
+                    "resume_command=powershell.exe -NoProfile -NonInteractive -EncodedCommand"
+                ),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("--prompt"), "{rendered}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(rendered.contains("resume_command=palyra agent run"), "{rendered}");
+            assert!(rendered.contains("--session-id 01ARZ3NDEKTSV4RRFFQ69G5FAS"), "{rendered}");
+            assert!(rendered.contains("--require-existing"), "{rendered}");
+            assert!(rendered.contains("--allow-sensitive-tools"), "{rendered}");
+            assert!(rendered.contains("--approval-mode allow-once"), "{rendered}");
+            assert!(rendered.contains("Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{rendered}");
+        }
         assert!(
             !rendered.contains("original prompt with sensitive context"),
             "resume command must not echo the original prompt: {rendered}"
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn quote_cli_arg_single_quotes_shell_substitutions() {
         let quoted = quote_cli_arg("$(touch pwn)'x");
 
-        #[cfg(windows)]
-        assert_eq!(quoted, "'$(touch pwn)''x'");
-        #[cfg(not(windows))]
         assert_eq!(quoted, "'$(touch pwn)'\\''x'");
     }
 
     #[test]
-    fn resume_command_single_quotes_checkpoint_shell_substitutions() {
+    fn resume_command_escapes_checkpoint_shell_metacharacters() {
         let session = gateway_v1::SessionSummary {
             session_id: Some(common_v1::CanonicalId {
                 ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
@@ -7715,13 +7762,50 @@ mod agent_stream_output_tests {
             Some(&checkpoint),
         );
 
-        assert!(
-            message.contains("--prompt 'Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-            "{message}"
+        #[cfg(windows)]
+        {
+            assert!(
+                message.contains(
+                    "resume_command=powershell.exe -NoProfile -NonInteractive -EncodedCommand"
+                ),
+                "{message}"
+            );
+            assert!(!message.contains("$(touch /tmp/palyra-pwn).txt"), "{message}");
+            assert!(!message.contains("`whoami`"), "{message}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                message.contains("--prompt 'Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                "{message}"
+            );
+            assert!(!message.contains("--prompt \"Resume from run"), "{message}");
+            assert!(message.contains("$(touch /tmp/palyra-pwn).txt"), "{message}");
+            assert!(message.contains("`whoami`"), "{message}");
+        }
+    }
+
+    #[test]
+    fn powershell_invocation_quotes_cmd_metacharacters_as_prompt_data() {
+        let args = vec![
+            "palyra".to_owned(),
+            "agent".to_owned(),
+            "run".to_owned(),
+            "--prompt".to_owned(),
+            "done & calc & rem | more < input > output 'quoted'".to_owned(),
+        ];
+        let script = powershell_invocation_script(args.as_slice());
+        let command = powershell_encoded_cli_command(args.as_slice());
+
+        assert_eq!(
+            script,
+            "& 'palyra' 'agent' 'run' '--prompt' 'done & calc & rem | more < input > output ''quoted'''"
         );
-        assert!(!message.contains("--prompt \"Resume from run"), "{message}");
-        assert!(message.contains("$(touch /tmp/palyra-pwn).txt"), "{message}");
-        assert!(message.contains("`whoami`"), "{message}");
+        assert!(
+            command.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand \""),
+            "{command}"
+        );
+        assert!(!command.contains("done & calc"), "{command}");
     }
 
     #[test]
@@ -7758,14 +7842,25 @@ mod agent_stream_output_tests {
             None,
         );
 
+        #[cfg(windows)]
+        assert!(
+            message.contains(
+                "resume_command=powershell.exe -NoProfile -NonInteractive -EncodedCommand"
+            ),
+            "{message}"
+        );
+        #[cfg(not(windows))]
         assert!(message.contains("resume_command=palyra agent run"), "{message}");
         assert!(!message.contains("/tmp/pwned"), "{message}");
         assert!(!message.contains("--prompt \"$(touch"), "{message}");
+        #[cfg(windows)]
+        assert!(!message.contains("--session-id"), "{message}");
+        #[cfg(not(windows))]
         assert!(message.contains("--session-id 01ARZ3NDEKTSV4RRFFQ69G5FAS"), "{message}");
     }
 
     #[test]
-    fn resume_command_single_quotes_session_key_shell_substitutions() {
+    fn resume_command_escapes_session_key_shell_substitutions() {
         let session = gateway_v1::SessionSummary {
             session_id: None,
             session_key: "tenant$(touch /tmp/palyra_quote_pwned)-ops".to_owned(),
@@ -7795,6 +7890,17 @@ mod agent_stream_output_tests {
             None,
         );
 
+        #[cfg(windows)]
+        {
+            assert!(
+                message.contains(
+                    "resume_command=powershell.exe -NoProfile -NonInteractive -EncodedCommand"
+                ),
+                "{message}"
+            );
+            assert!(!message.contains("tenant$(touch"), "{message}");
+        }
+        #[cfg(not(windows))]
         assert!(
             message.contains("--session-key 'tenant$(touch /tmp/palyra_quote_pwned)-ops'"),
             "{message}"
