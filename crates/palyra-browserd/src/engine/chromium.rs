@@ -3561,7 +3561,7 @@ async fn chromium_read_local_storage(
             .map_err(|error| format!("failed to read Chromium localStorage: {error}"))?
             .value
             .unwrap_or_else(|| serde_json::Value::String("{}".to_owned()));
-        Ok(decode_chromium_json_script_value(value))
+        Ok(decode_chromium_bounded_json_script_value(value, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES))
     })
     .await?;
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
@@ -3911,6 +3911,19 @@ fn decode_chromium_json_script_value(value: serde_json::Value) -> serde_json::Va
         serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw.as_str())
             .unwrap_or(serde_json::Value::Null),
         value => value,
+    }
+}
+
+fn decode_chromium_bounded_json_script_value(
+    value: serde_json::Value,
+    max_json_bytes: usize,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(raw) if raw.len() <= max_json_bytes => {
+            serde_json::from_str::<serde_json::Value>(raw.as_str())
+                .unwrap_or(serde_json::Value::Null)
+        }
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -6012,14 +6025,14 @@ mod tests {
         chromium_timeout_snapshot_url_is_usable, chromium_touch_emulation_max_touch_points,
         chromium_transport_idle_timeout, chromium_upload_staging_path,
         chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
-        decode_chromium_console_entries_value, decode_chromium_json_script_value,
-        decode_chromium_network_entries_value, decode_chromium_observe_state_value,
-        page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
-        parse_chromium_client_download_entries, parse_chromium_console_entries,
-        parse_chromium_document_cookie_snapshot, parse_chromium_element_captures,
-        parse_chromium_layout_metrics, parse_chromium_local_storage_restore_status,
-        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
-        parse_chromium_viewport_metrics, parse_key_press_spec,
+        decode_chromium_bounded_json_script_value, decode_chromium_console_entries_value,
+        decode_chromium_json_script_value, decode_chromium_network_entries_value,
+        decode_chromium_observe_state_value, page_body_with_chromium_observe_state,
+        parse_chromium_clear_storage_status, parse_chromium_client_download_entries,
+        parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
+        parse_chromium_element_captures, parse_chromium_layout_metrics,
+        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
+        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
         selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
         ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
         CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
@@ -6480,14 +6493,38 @@ mod tests {
                 .to_owned(),
         );
 
-        let (origin, entries) =
-            parse_chromium_local_storage_snapshot(decode_chromium_json_script_value(raw))
-                .expect("snapshot payload should parse")
-                .expect("origin should be present");
+        let (origin, entries) = parse_chromium_local_storage_snapshot(
+            decode_chromium_bounded_json_script_value(raw, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES),
+        )
+        .expect("snapshot payload should parse")
+        .expect("origin should be present");
 
         assert_eq!(origin, "http://127.0.0.1:49152");
         assert_eq!(entries.get("cart").map(String::as_str), Some("1"));
         assert_eq!(entries.get("theme").map(String::as_str), Some("dark"));
+    }
+
+    #[test]
+    fn local_storage_decoder_rejects_oversized_or_non_string_payloads() {
+        let oversized = serde_json::Value::String(format!(
+            r#"{{"padding":"{}"}}"#,
+            "x".repeat(MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES)
+        ));
+
+        assert_eq!(
+            decode_chromium_bounded_json_script_value(
+                oversized,
+                MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+            ),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            decode_chromium_bounded_json_script_value(
+                serde_json::json!({"entries": {"forged": "value"}}),
+                MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+            ),
+            serde_json::Value::Null
+        );
     }
 
     #[test]
