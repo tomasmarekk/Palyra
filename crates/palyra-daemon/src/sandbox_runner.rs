@@ -5794,6 +5794,7 @@ fn process_env_key_is_reserved(key: &str) -> bool {
             | "KUBECONFIG"
             | "DOCKER_CONFIG"
             | "NPM_CONFIG_USERCONFIG"
+            | "NODE_DISABLE_COMPILE_CACHE"
             | "PIP_CONFIG_FILE"
             | "REQUESTS_CA_BUNDLE"
             | "SSL_CERT_FILE"
@@ -11469,6 +11470,7 @@ fn build_process_command(
         )?;
         apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
         apply_process_env_overrides(&mut command, input);
+        configure_node_runtime_environment(&mut command);
         configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
         return Ok(command);
     }
@@ -11505,8 +11507,8 @@ fn build_process_command(
             .env("PATH", sandbox_process_path())
             .env("LANG", "C")
             .env("LC_ALL", "C");
-        configure_node_runtime_environment(&mut command);
         apply_process_env_overrides(&mut command, input);
+        configure_node_runtime_environment(&mut command);
         return Ok(command);
     }
 
@@ -11526,6 +11528,7 @@ fn build_process_command(
     )?;
     apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
     apply_process_env_overrides(&mut command, input);
+    configure_node_runtime_environment(&mut command);
     configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
     Ok(command)
 }
@@ -11609,8 +11612,8 @@ fn env_key_matches(key: &OsStr, requested_key: &str) -> bool {
     key == OsStr::new(requested_key)
 }
 
-// Applied last so explicit, already-validated overrides win over computed defaults; the
-// reserved-key check in validate_process_env_key keeps PATH/loader/config keys out of here.
+// Applied after computed defaults so validated task-specific settings win. Runtime-owned
+// hardening values are reapplied by the caller after this function returns.
 fn apply_process_env_overrides(command: &mut Command, input: &ProcessRunnerInput) {
     for (key, value) in &input.env {
         command.env(key, value);
@@ -14965,6 +14968,7 @@ mod tests {
             "HOME",
             "AWS_SHARED_CREDENTIALS_FILE",
             "npm_config_registry",
+            "node_disable_compile_cache",
             "LD_AUDIT",
             "ld_debug_output",
             "DYLD_FRAMEWORK_PATH",

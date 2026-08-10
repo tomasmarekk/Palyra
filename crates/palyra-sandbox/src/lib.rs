@@ -230,6 +230,9 @@ mod platform {
                 "--setenv".to_owned(),
                 "LC_ALL".to_owned(),
                 "C".to_owned(),
+                "--setenv".to_owned(),
+                "NODE_DISABLE_COMPILE_CACHE".to_owned(),
+                "1".to_owned(),
             ]);
             if policy.enforce_network_isolation {
                 args.push("--unshare-net".to_owned());
@@ -555,6 +558,12 @@ mod tests {
         assert!(
             plan.args.iter().any(|arg| arg == "--new-session"),
             "linux tier-c commands must detach from the operator's controlling terminal"
+        );
+        assert!(
+            plan.args.windows(3).any(|window| window[0] == "--setenv"
+                && window[1] == "NODE_DISABLE_COMPILE_CACHE"
+                && window[2] == "1"),
+            "linux tier-c commands must disable the Node compile cache inside bwrap"
         );
     }
 
