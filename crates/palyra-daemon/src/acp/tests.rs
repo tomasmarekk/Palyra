@@ -18,6 +18,13 @@ fn context() -> AcpClientContext {
     }
 }
 
+fn event_reader_context() -> AcpClientContext {
+    let mut context = context();
+    context.scopes.push(AcpScope::EventsRead);
+    context.capabilities.push(AcpCapability::SessionReplay);
+    context
+}
+
 #[test]
 fn session_binding_survives_restart_and_marks_permissions_stale() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -202,7 +209,7 @@ fn presentation_projection_builds_edit_proposal_and_rich_blocks() {
 }
 
 #[test]
-fn reconnect_returns_event_ledger_records_after_client_cursor() {
+fn reconnect_requires_event_replay_grant_for_ledger_records() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let runtime = AcpRuntime::open(tempdir.path().join("acp")).expect("runtime should open");
     runtime
@@ -242,10 +249,14 @@ fn reconnect_returns_event_ledger_records_after_client_cursor() {
         })
         .expect("second event should persist");
 
-    let outcome = runtime
+    let unauthorized = runtime
         .reconnect(&context(), "acp-session-a", AcpCursor { sequence: 1 })
         .expect("reconnect should succeed");
+    assert!(unauthorized.event_ledger.is_empty());
 
+    let outcome = runtime
+        .reconnect(&event_reader_context(), "acp-session-a", AcpCursor { sequence: 1 })
+        .expect("authorized reconnect should succeed");
     assert_eq!(outcome.event_ledger.len(), 1);
     assert_eq!(outcome.event_ledger[0].kind, AcpEventLedgerKind::Cancel);
     assert_eq!(outcome.event_ledger[0].sequence, 2);

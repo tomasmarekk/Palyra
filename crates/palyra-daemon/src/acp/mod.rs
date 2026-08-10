@@ -665,6 +665,8 @@ impl AcpRuntime {
     /// Re-attaches a returning client to its session binding: refreshes the
     /// cursor, scopes, and capabilities (clearing `stale_permissions`) and
     /// returns prompts still pending inside the disconnect grace window.
+    /// Event-ledger replay is included only when the returning client presents
+    /// both `events:read` and `session_replay`.
     ///
     /// Only the binding's recorded owner principal may reconnect; this is the
     /// permission boundary that stops a different ACP client identity from
@@ -720,14 +722,18 @@ impl AcpRuntime {
             })
             .cloned()
             .collect();
-        let event_ledger = event_ledger_after_cursor(
-            &index,
-            binding.acp_client_id.as_str(),
-            binding.acp_session_id.as_str(),
-            binding.palyra_session_id.as_str(),
-            cursor.sequence,
-            MAX_EVENT_LEDGER_EVENTS_PER_SESSION,
-        );
+        let event_ledger = if can_replay_event_ledger(context) {
+            event_ledger_after_cursor(
+                &index,
+                binding.acp_client_id.as_str(),
+                binding.acp_session_id.as_str(),
+                binding.palyra_session_id.as_str(),
+                cursor.sequence,
+                MAX_EVENT_LEDGER_EVENTS_PER_SESSION,
+            )
+        } else {
+            Vec::new()
+        };
         save_locked_index(self.root.as_path(), &mut index)?;
         Ok(AcpReconnectOutcome { binding, pending_prompts, expired_prompt_ids, event_ledger })
     }
@@ -1868,6 +1874,11 @@ fn event_ledger_after_cursor(
     } else {
         records
     }
+}
+
+fn can_replay_event_ledger(context: &AcpClientContext) -> bool {
+    context.scopes.contains(&AcpScope::EventsRead)
+        && context.capabilities.contains(&AcpCapability::SessionReplay)
 }
 
 fn next_event_ledger_sequence(
