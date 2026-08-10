@@ -1955,7 +1955,25 @@ impl GatewayProviderAttemptAdmission {
         }
     }
 
-    fn apply_buffered_feedback(&self) -> bool {
+    /// Keeps registry file locking and synchronous journal writes off Tokio
+    /// workers while preserving the provider-generation critical section.
+    async fn apply_buffered_feedback(&self) -> bool {
+        let admission = self.clone();
+        match tokio::task::spawn_blocking(move || admission.apply_buffered_feedback_blocking())
+            .await
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "provider feedback blocking task failed before settlement"
+                );
+                false
+            }
+        }
+    }
+
+    fn apply_buffered_feedback_blocking(&self) -> bool {
         let _reload_guard = self
             .runtime_state
             .model_provider_reload_lock
@@ -9455,7 +9473,7 @@ impl GatewayRuntimeState {
             }
             return Err(provider_reconfigured_status());
         }
-        if !candidate_admission.apply_buffered_feedback() {
+        if !candidate_admission.apply_buffered_feedback().await {
             let current_provider_generation = self
                 .model_provider
                 .read()
@@ -9720,7 +9738,7 @@ impl GatewayRuntimeState {
                 break attempt_result;
             }
         };
-        if !candidate_admission.apply_buffered_feedback() {
+        if !candidate_admission.apply_buffered_feedback().await {
             return Err(provider_reconfigured_status());
         }
         match result {
@@ -9867,7 +9885,7 @@ impl GatewayRuntimeState {
                 break attempt_result;
             }
         };
-        if !candidate_admission.apply_buffered_feedback() {
+        if !candidate_admission.apply_buffered_feedback().await {
             return Err(provider_reconfigured_status());
         }
         match result {
@@ -22543,7 +22561,7 @@ pub(crate) mod tests {
             "duplicate completion must not enqueue a second mutable feedback bundle"
         );
 
-        admission.apply_buffered_feedback();
+        admission.apply_buffered_feedback().await;
 
         assert_eq!(provider_configuration_completion_count(&state), 1);
         assert_eq!(
@@ -22655,7 +22673,7 @@ pub(crate) mod tests {
             "duplicate completion must not enqueue a second mutable feedback bundle"
         );
 
-        admission.apply_buffered_feedback();
+        admission.apply_buffered_feedback().await;
 
         assert_eq!(provider_completion_event_count(&state, "run-1"), 1);
         assert_eq!(
@@ -22736,7 +22754,7 @@ pub(crate) mod tests {
             .lock()
             .expect("provider feedback lock should not be poisoned")
             .push(ProviderAttemptFeedback::Success(binding.clone()));
-        admission.apply_buffered_feedback();
+        admission.apply_buffered_feedback().await;
 
         assert!(state.provider_health_authority_is_latched(&authority));
         assert_eq!(
