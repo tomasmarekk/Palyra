@@ -1990,7 +1990,7 @@ fn subagent_merge_preview_json(
             "reason": "merge preview is not available until the child run reaches a merge checkpoint",
         });
     };
-    json!({
+    crate::delegation::redact_subagent_operator_value(json!({
         "ready": true,
         "summary": merge_result
             .get("summary_text")
@@ -2007,7 +2007,7 @@ fn subagent_merge_preview_json(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         "warnings": merge_result.get("warnings").cloned().unwrap_or_else(|| json!([])),
-    })
+    }))
 }
 
 fn subagent_verification_state(child_state: &str, terminal: bool, merge_preview: &Value) -> String {

@@ -549,6 +549,29 @@ pub struct SubagentSessionRecordBuildRequest {
     pub updated_at_unix_ms: i64,
 }
 
+/// Applies the canonical recursive payload redactor before subagent-derived
+/// JSON reaches an operator-facing snapshot or export. Redaction failures
+/// collapse to a fixed marker instead of returning the original value.
+pub(crate) fn redact_subagent_operator_value(value: Value) -> Value {
+    serde_json::to_vec(&value)
+        .ok()
+        .and_then(|encoded| crate::journal::redact_payload_json(encoded.as_slice()).ok())
+        .and_then(|redacted| serde_json::from_str(redacted.as_str()).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "redacted": true,
+                "reason": "subagent_projection_redaction_failed",
+            })
+        })
+}
+
+fn redact_subagent_operator_values(values: Vec<Value>) -> Vec<Value> {
+    match redact_subagent_operator_value(Value::Array(values)) {
+        Value::Array(values) => values,
+        redaction_failure => vec![redaction_failure],
+    }
+}
+
 /// Builds the redacted persistent subagent record exposed by session snapshot,
 /// CLI, and trajectory export surfaces.
 #[must_use]
@@ -594,8 +617,8 @@ pub fn build_subagent_session_record(
             run_id: request.child_run_id,
             session_id: request.child_session_id,
         },
-        artifacts: request.artifacts,
-        evidence_refs: request.evidence_refs,
+        artifacts: redact_subagent_operator_values(request.artifacts),
+        evidence_refs: redact_subagent_operator_values(request.evidence_refs),
         verification_state: safe_text(request.verification_state.as_str()),
         stale_link_repair,
         created_at_unix_ms: request.created_at_unix_ms,
@@ -2210,8 +2233,13 @@ mod tests {
             artifacts: vec![serde_json::json!({
                 "artifact_id": "artifact-1",
                 "artifact_kind": "patch",
+                "details": {
+                    "api_key": "artifact-secret",
+                },
             })],
-            evidence_refs: Vec::new(),
+            evidence_refs: vec![serde_json::json!({
+                "tool_output": "token=child-secret",
+            })],
             verification_state: "verified".to_owned(),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
@@ -2226,5 +2254,26 @@ mod tests {
         assert!(encoded.contains("\"transcript_ref\""), "{encoded}");
         assert!(encoded.contains("\"retry_or_clear_task_target\""), "{encoded}");
         assert!(!encoded.contains("token=secret"), "{encoded}");
+        assert!(!encoded.contains("artifact-secret"), "{encoded}");
+        assert!(!encoded.contains("child-secret"), "{encoded}");
+        assert!(encoded.contains("<redacted>"), "{encoded}");
+    }
+
+    #[test]
+    fn subagent_operator_projection_redacts_nested_merge_warnings() {
+        let redacted = super::redact_subagent_operator_value(serde_json::json!({
+            "warnings": [{
+                "message": "Authorization: Bearer warning-secret",
+            }],
+            "provenance": [{
+                "excerpt": "token=provenance-secret",
+            }],
+        }));
+        let encoded =
+            serde_json::to_string(&redacted).expect("redacted projection should serialize");
+
+        assert!(!encoded.contains("warning-secret"), "{encoded}");
+        assert!(!encoded.contains("provenance-secret"), "{encoded}");
+        assert!(encoded.contains("<redacted>"), "{encoded}");
     }
 }
