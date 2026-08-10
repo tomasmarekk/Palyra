@@ -101,6 +101,12 @@ const POST_RUN_REFLECTION_HARD_TIMEOUT: Duration = Duration::from_secs(120);
 const POST_RUN_REFLECTION_TIMEOUT_REASON: &str = "post_run_reflection.hard_timeout";
 const POST_RUN_REFLECTION_TIMEOUT_MESSAGE: &str =
     "post-run reflection exceeded its hard execution timeout";
+const DELEGATION_TAPE_REPLAY_PAGE_ENTRIES: usize = 128;
+const DELEGATION_TAPE_REPLAY_MAX_PAGES: usize = 32;
+const DELEGATION_TAPE_REPLAY_MAX_EVENTS: usize = 4_096;
+const DELEGATION_TAPE_REPLAY_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DELEGATION_TAPE_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+const DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 
 /// Spawns the background queue polling loop on the Tokio runtime.
 ///
@@ -3122,7 +3128,7 @@ async fn build_merge_result(
             }
             "model_token" => {
                 if let Some(token) = payload.get("token").and_then(Value::as_str) {
-                    model_output.push_str(token);
+                    append_delegation_model_token(&mut model_output, token)?;
                 }
             }
             "tool_result" => {
@@ -3337,17 +3343,59 @@ fn categorize_child_failure(
     Some(DelegationMergeFailureCategory::Unknown)
 }
 
-/// Loads the full child run tape using fixed-size pages.
+fn append_delegation_model_token(output: &mut String, token: &str) -> Result<(), Status> {
+    if output.len().saturating_add(token.len()) > DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "delegation merge model output exceeds {DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES} bytes"
+        )));
+    }
+    output.push_str(token);
+    Ok(())
+}
+
+/// Loads a bounded child run tape using fixed-size pages.
 async fn load_run_tape(
     runtime: &Arc<GatewayRuntimeState>,
     run_id: &str,
 ) -> Result<Vec<crate::journal::OrchestratorTapeRecord>, Status> {
+    let started_at = Instant::now();
     let mut after_seq = None;
     let mut events = Vec::new();
+    let mut page_count = 0_usize;
+    let mut payload_bytes = 0_usize;
     loop {
-        let page =
-            runtime.orchestrator_tape_snapshot(run_id.to_owned(), after_seq, Some(128)).await?;
+        if page_count >= DELEGATION_TAPE_REPLAY_MAX_PAGES {
+            ensure_delegation_tape_replay_budget(
+                page_count.saturating_add(1),
+                events.len(),
+                payload_bytes,
+                run_id,
+            )?;
+        }
+        if started_at.elapsed() > DELEGATION_TAPE_REPLAY_TIMEOUT {
+            return Err(Status::resource_exhausted(format!(
+                "delegation tape replay exceeded its {}ms time budget for run {run_id}",
+                DELEGATION_TAPE_REPLAY_TIMEOUT.as_millis()
+            )));
+        }
+        page_count = page_count.saturating_add(1);
+        let page = runtime
+            .orchestrator_tape_snapshot(
+                run_id.to_owned(),
+                after_seq,
+                Some(DELEGATION_TAPE_REPLAY_PAGE_ENTRIES),
+            )
+            .await?;
         let next_after_seq = advance_tape_cursor(after_seq, page.next_after_seq, run_id)?;
+        payload_bytes = payload_bytes.saturating_add(
+            page.events.iter().map(|event| event.payload_json.len()).sum::<usize>(),
+        );
+        ensure_delegation_tape_replay_budget(
+            page_count,
+            events.len().saturating_add(page.events.len()),
+            payload_bytes,
+            run_id,
+        )?;
         events.extend(page.events);
         let Some(next_after_seq) = next_after_seq else {
             break;
@@ -3355,6 +3403,23 @@ async fn load_run_tape(
         after_seq = Some(next_after_seq);
     }
     Ok(events)
+}
+
+fn ensure_delegation_tape_replay_budget(
+    pages: usize,
+    events: usize,
+    payload_bytes: usize,
+    run_id: &str,
+) -> Result<(), Status> {
+    if pages > DELEGATION_TAPE_REPLAY_MAX_PAGES
+        || events > DELEGATION_TAPE_REPLAY_MAX_EVENTS
+        || payload_bytes > DELEGATION_TAPE_REPLAY_MAX_BYTES
+    {
+        return Err(Status::resource_exhausted(format!(
+            "delegation tape replay exceeds aggregate limits for run {run_id} (pages={pages}/{DELEGATION_TAPE_REPLAY_MAX_PAGES}, events={events}/{DELEGATION_TAPE_REPLAY_MAX_EVENTS}, payload_bytes={payload_bytes}/{DELEGATION_TAPE_REPLAY_MAX_BYTES})"
+        )));
+    }
+    Ok(())
 }
 
 fn advance_tape_cursor(
@@ -4012,11 +4077,12 @@ fn is_terminal_run_state(state: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_tape_cursor, append_artifact_references, attach_background_task_child_run,
-        background_task_heartbeat_update, background_task_terminal_state_from_run,
-        build_optional_delegated_run_context, build_parameter_delta_bytes,
-        categorize_child_failure, child_merge_lifecycle_details, delegated_child_timeout_message,
-        dispatch_auxiliary_executor_task, ensure_child_task_context_permits_dispatch,
+        advance_tape_cursor, append_artifact_references, append_delegation_model_token,
+        attach_background_task_child_run, background_task_heartbeat_update,
+        background_task_terminal_state_from_run, build_optional_delegated_run_context,
+        build_parameter_delta_bytes, categorize_child_failure, child_merge_lifecycle_details,
+        delegated_child_timeout_message, dispatch_auxiliary_executor_task,
+        ensure_child_task_context_permits_dispatch, ensure_delegation_tape_replay_budget,
         evaluate_delegation_scheduler_limits, expire_child_task_cancellation_context,
         finalize_task_from_run, finalize_task_from_run_if_parent_generation_current,
         inject_background_metadata, parent_tape_accepts_background_event,
@@ -4028,6 +4094,8 @@ mod tests {
         task_has_in_flight_work_without_target, validate_child_task_cancellation_contract,
         ChildLifecycleTapeBudget, ChildLifecycleTapeDecision, ChildStreamProgress,
         DelegationSchedulerDecision, MergeDeliveryPayloadContext, PostRunReflectionSettlement,
+        DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES, DELEGATION_TAPE_REPLAY_MAX_BYTES,
+        DELEGATION_TAPE_REPLAY_MAX_EVENTS, DELEGATION_TAPE_REPLAY_MAX_PAGES,
         POST_RUN_REFLECTION_TIMEOUT_MESSAGE, POST_RUN_REFLECTION_TIMEOUT_REASON,
     };
     use crate::{
@@ -4405,6 +4473,52 @@ mod tests {
             .expect_err("repeated cursor must fail instead of looping");
         assert_eq!(error.code(), Code::Internal);
         assert!(error.message().contains("did not advance"));
+    }
+
+    #[test]
+    fn delegation_tape_replay_rejects_aggregate_limit_overflow() {
+        ensure_delegation_tape_replay_budget(
+            DELEGATION_TAPE_REPLAY_MAX_PAGES,
+            DELEGATION_TAPE_REPLAY_MAX_EVENTS,
+            DELEGATION_TAPE_REPLAY_MAX_BYTES,
+            "run-1",
+        )
+        .expect("exact aggregate limits should be accepted");
+
+        for (pages, events, bytes) in [
+            (
+                DELEGATION_TAPE_REPLAY_MAX_PAGES + 1,
+                DELEGATION_TAPE_REPLAY_MAX_EVENTS,
+                DELEGATION_TAPE_REPLAY_MAX_BYTES,
+            ),
+            (
+                DELEGATION_TAPE_REPLAY_MAX_PAGES,
+                DELEGATION_TAPE_REPLAY_MAX_EVENTS + 1,
+                DELEGATION_TAPE_REPLAY_MAX_BYTES,
+            ),
+            (
+                DELEGATION_TAPE_REPLAY_MAX_PAGES,
+                DELEGATION_TAPE_REPLAY_MAX_EVENTS,
+                DELEGATION_TAPE_REPLAY_MAX_BYTES + 1,
+            ),
+        ] {
+            let error = ensure_delegation_tape_replay_budget(pages, events, bytes, "run-1")
+                .expect_err("aggregate overflow must fail closed");
+            assert_eq!(error.code(), Code::ResourceExhausted);
+        }
+    }
+
+    #[test]
+    fn delegation_merge_bounds_accumulated_model_output() {
+        let mut output = "x".repeat(DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES);
+        append_delegation_model_token(&mut output, "")
+            .expect("exact model-output limit should be accepted");
+
+        let error = append_delegation_model_token(&mut output, "x")
+            .expect_err("model output beyond the merge limit must be rejected");
+
+        assert_eq!(error.code(), Code::ResourceExhausted);
+        assert_eq!(output.len(), DELEGATION_MERGE_MODEL_OUTPUT_MAX_BYTES);
     }
 
     #[test]
