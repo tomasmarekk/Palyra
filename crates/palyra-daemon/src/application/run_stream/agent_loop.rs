@@ -105,13 +105,15 @@ impl ToolResultClass {
 
 pub(crate) type RunProgressOutcomeClass = ToolResultClass;
 
-/// Normalized attempt data fed into [`RunProgressController`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Process-local normalized attempt data fed into [`RunProgressController`].
+///
+/// The output digest supports equality checks only and must never become
+/// replay-visible diagnostic evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunProgressAttempt {
     pub(crate) tool_name: String,
     pub(crate) normalized_input_json: Vec<u8>,
     pub(crate) normalized_output_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) volatile_output_fields: Vec<String>,
     pub(crate) workspace_key: Option<String>,
     pub(crate) query_hash: Option<String>,
@@ -160,7 +162,6 @@ pub(crate) struct RunProgressIntervention {
 pub(crate) struct LoopDetectionEvidence {
     pub(crate) schema_version: u32,
     pub(crate) detector_type: LoopDetectorType,
-    pub(crate) normalized_outcome_hash: Option<String>,
     pub(crate) cycle_length: Option<u8>,
     pub(crate) monotonic_progress: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -255,7 +256,6 @@ impl RunProgressController {
             detection: LoopDetectionEvidence {
                 schema_version: 1,
                 detector_type: LoopDetectorType::RepeatedSignature,
-                normalized_outcome_hash: attempt.normalized_output_hash,
                 cycle_length: None,
                 monotonic_progress: false,
                 volatile_fields_stripped: attempt.volatile_output_fields,
@@ -299,7 +299,6 @@ impl RunProgressController {
                 cycle_attempts,
                 LoopDetectorType::AlternatingCycle,
                 Some(2),
-                outcome_hash,
             ));
         }
 
@@ -318,7 +317,6 @@ impl RunProgressController {
             attempts,
             LoopDetectorType::VolatileFieldPoll,
             None,
-            outcome_hash,
         ))
     }
 
@@ -349,7 +347,6 @@ impl RunProgressController {
         attempts: u32,
         detector_type: LoopDetectorType,
         cycle_length: Option<u8>,
-        outcome_hash: String,
     ) -> RunProgressIntervention {
         let terminate_run = match detector_type {
             LoopDetectorType::AlternatingCycle => attempts >= 6,
@@ -380,7 +377,6 @@ impl RunProgressController {
             detection: LoopDetectionEvidence {
                 schema_version: 1,
                 detector_type,
-                normalized_outcome_hash: Some(outcome_hash),
                 cycle_length,
                 monotonic_progress: false,
                 volatile_fields_stripped: attempt.volatile_output_fields,
@@ -2992,6 +2988,12 @@ mod tests {
         assert_eq!(
             warning.detection.volatile_fields_stripped,
             vec!["timestamp".to_owned(), "request_id".to_owned()]
+        );
+        let serialized =
+            serde_json::to_value(&warning).expect("loop intervention should serialize");
+        assert!(
+            serialized.pointer("/detection/normalized_outcome_hash").is_none(),
+            "replay-visible evidence must not expose process-local output digests: {serialized}"
         );
     }
 
