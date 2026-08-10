@@ -965,16 +965,28 @@ pub(crate) fn is_file_input_tag(tag: &str) -> bool {
 /// href ending in a known file extension.
 pub(crate) fn is_download_like_tag(tag: &str) -> bool {
     let tag_lower = tag.to_ascii_lowercase();
-    if html_tag_name(tag_lower.as_str()) != Some("a") {
+    is_download_like_element_metadata(
+        html_tag_name(tag_lower.as_str()).unwrap_or_default(),
+        tag_lower.contains(" download")
+            || tag_lower.contains(" download=")
+            || tag_lower.ends_with("download>"),
+        extract_attr_value(tag_lower.as_str(), "href").as_deref(),
+    )
+}
+
+/// Classifies a DOM element as download-like from host-observed tag metadata.
+pub(crate) fn is_download_like_element_metadata(
+    tag_name: &str,
+    has_download_attribute: bool,
+    href: Option<&str>,
+) -> bool {
+    if !tag_name.eq_ignore_ascii_case("a") {
         return false;
     }
-    if tag_lower.contains(" download")
-        || tag_lower.contains(" download=")
-        || tag_lower.ends_with("download>")
-    {
+    if has_download_attribute {
         return true;
     }
-    let Some(href) = extract_attr_value(tag_lower.as_str(), "href") else {
+    let Some(href) = href else {
         return false;
     };
     let href = href.split('?').next().unwrap_or_default();
@@ -990,7 +1002,8 @@ pub(crate) fn is_download_like_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_attr_value_case_insensitive, find_matching_html_tag, is_download_like_tag,
+        extract_attr_value_case_insensitive, find_matching_html_tag,
+        is_download_like_element_metadata, is_download_like_tag,
     };
 
     #[test]
@@ -1046,6 +1059,14 @@ mod tests {
         let tag = find_matching_html_tag("[download]", html)
             .expect("real download attribute selector should match the anchor");
         assert!(tag.contains(r#"id="real""#), "{tag}");
+    }
+
+    #[test]
+    fn download_metadata_classification_matches_full_tag_classification() {
+        assert!(is_download_like_element_metadata("A", true, Some("/view")));
+        assert!(is_download_like_element_metadata("a", false, Some("/report.csv?fresh=1")));
+        assert!(!is_download_like_element_metadata("button", true, Some("/report.csv")));
+        assert!(!is_download_like_element_metadata("a", false, Some("/view")));
     }
 
     #[test]

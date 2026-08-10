@@ -4877,7 +4877,8 @@ fn chromium_timeout_snapshot_url_is_usable(page_url: &str, target_url: &str) -> 
 /// Clicks the first element matching `selector` on the active tab.
 ///
 /// Retries only `not_found` results until `timeout_ms`/`max_attempts` runs
-/// out; download-like anchors are blocked unless `allow_downloads` is set.
+/// out. CDP resolves the full CSS selector, while host-observed element
+/// metadata enforces disabled and download policy before input dispatch.
 pub(crate) async fn click_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4911,22 +4912,21 @@ pub(crate) async fn click_with_chromium(
         let selector_for_attempt = selector.to_owned();
         let tab_for_attempt = Arc::clone(&tab);
         let attempt = run_chromium_blocking("chromium click", move || {
-            let page_body = tab_for_attempt
-                .get_content()
-                .map_err(|error| format!("failed to read Chromium DOM before click: {error}"))?;
-            let Some(tag) =
-                find_matching_html_tag(selector_for_attempt.as_str(), page_body.as_str())
-            else {
+            let Ok(element) = tab_for_attempt.find_element(selector_for_attempt.as_str()) else {
                 return Ok(ClickAttempt::NotFound);
             };
-            let download_like = is_download_like_tag(tag.as_str());
+            let attributes = element.attributes.as_deref();
+            let download_like = is_download_like_element_metadata(
+                element.tag_name.as_str(),
+                chromium_element_has_attribute(attributes, "download"),
+                chromium_element_attribute(attributes, "href"),
+            );
             if download_like && !allow_downloads {
                 return Ok(ClickAttempt::DownloadBlocked);
             }
-            let tag_lower = tag.to_ascii_lowercase();
-            if tag_lower.contains(" disabled")
-                || tag_lower.contains(" aria-disabled=\"true\"")
-                || tag_lower.contains(" aria-disabled='true'")
+            if chromium_element_has_attribute(attributes, "disabled")
+                || chromium_element_attribute(attributes, "aria-disabled")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
             {
                 return Ok(ClickAttempt::Disabled);
             }
@@ -4937,13 +4937,6 @@ pub(crate) async fn click_with_chromium(
                         format!("failed to initialize Chromium download capture: {error}")
                     })?;
             }
-            let element =
-                tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(|error| {
-                    format!(
-                        "failed to resolve selector '{}' on Chromium page: {error}",
-                        selector_for_attempt
-                    )
-                })?;
             element.click().map_err(|error| {
                 format!(
                     "failed to click selector '{}' through Chromium input dispatch: {error}",
@@ -5036,6 +5029,21 @@ pub(crate) async fn click_with_chromium(
         .await,
         attempts,
     }
+}
+
+fn chromium_element_attribute<'a>(
+    attributes: Option<&'a [String]>,
+    expected_name: &str,
+) -> Option<&'a str> {
+    attributes?
+        .chunks_exact(2)
+        .find_map(|pair| pair[0].eq_ignore_ascii_case(expected_name).then_some(pair[1].as_str()))
+}
+
+fn chromium_element_has_attribute(attributes: Option<&[String]>, expected_name: &str) -> bool {
+    attributes.is_some_and(|attributes| {
+        attributes.chunks_exact(2).any(|pair| pair[0].eq_ignore_ascii_case(expected_name))
+    })
 }
 
 async fn chromium_sync_session_tabs_after_click(
