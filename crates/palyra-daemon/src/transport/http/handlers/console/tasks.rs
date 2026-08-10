@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use palyra_common::runtime_contracts::{AuxiliaryTaskState, FlowState};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use tonic::Status;
 use ulid::Ulid;
@@ -110,17 +110,17 @@ pub(crate) struct ConsoleWorkItemClaimRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleWorkItemUpdateRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_nullable_string")]
     parent_work_item_id: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_nullable_string")]
     objective_id: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_nullable_string")]
     routine_id: Option<Option<String>>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
     priority: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_nullable_string")]
     assigned_worker: Option<Option<String>>,
     #[serde(default)]
     dependencies: Option<Value>,
@@ -136,6 +136,15 @@ pub(crate) struct ConsoleWorkItemUpdateRequest {
     metadata: Option<Value>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+fn deserialize_present_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -862,4 +871,46 @@ fn workboard_contract_descriptor() -> Value {
         "graph_fields": ["parent_work_item_id", "dependencies_json", "evidence_refs_json", "artifact_refs_json", "objective_id", "routine_id"],
         "operations": ["list", "get", "create", "update", "block", "complete", "link_artifact", "claim", "heartbeat"],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConsoleWorkItemUpdateRequest;
+
+    #[test]
+    fn work_item_update_distinguishes_omitted_cleared_and_set_fields() {
+        let omitted = serde_json::from_str::<ConsoleWorkItemUpdateRequest>("{}")
+            .expect("omitted update should deserialize");
+        let cleared = serde_json::from_str::<ConsoleWorkItemUpdateRequest>(
+            r#"{
+                "parent_work_item_id": null,
+                "objective_id": null,
+                "routine_id": null,
+                "assigned_worker": null
+            }"#,
+        )
+        .expect("clear update should deserialize");
+        let set = serde_json::from_str::<ConsoleWorkItemUpdateRequest>(
+            r#"{
+                "parent_work_item_id": "parent-1",
+                "objective_id": "objective-1",
+                "routine_id": "routine-1",
+                "assigned_worker": "worker-1"
+            }"#,
+        )
+        .expect("set update should deserialize");
+
+        assert_eq!(omitted.parent_work_item_id, None);
+        assert_eq!(omitted.objective_id, None);
+        assert_eq!(omitted.routine_id, None);
+        assert_eq!(omitted.assigned_worker, None);
+        assert_eq!(cleared.parent_work_item_id, Some(None));
+        assert_eq!(cleared.objective_id, Some(None));
+        assert_eq!(cleared.routine_id, Some(None));
+        assert_eq!(cleared.assigned_worker, Some(None));
+        assert_eq!(set.parent_work_item_id, Some(Some("parent-1".to_owned())));
+        assert_eq!(set.objective_id, Some(Some("objective-1".to_owned())));
+        assert_eq!(set.routine_id, Some(Some("routine-1".to_owned())));
+        assert_eq!(set.assigned_worker, Some(Some("worker-1".to_owned())));
+    }
 }
