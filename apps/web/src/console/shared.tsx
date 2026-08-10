@@ -7,7 +7,7 @@ export type JsonObject = { [key: string]: JsonValue };
 const SENSITIVE_KEY_PATTERN =
   /(secret|token|password|cookie|authorization|credential|api[-_]?key|private[-_]?key|vault[-_]?ref)/i;
 const SENSITIVE_VALUE_PATTERN =
-  /^(Bearer\s+|sk-[a-z0-9]|ghp_[A-Za-z0-9]|xox[baprs]-|AIza[0-9A-Za-z\-_]{20,})/i;
+  /(Bearer\s+|sk-[a-z0-9]|ghp_[A-Za-z0-9]|xox[baprs]-|AIza[0-9A-Za-z\-_]{20,})/i;
 
 type DiscordOnboardingHighlightsProps = {
   title: string;
@@ -243,6 +243,11 @@ function redactValue(value: JsonValue, revealSensitive: boolean): JsonValue {
 
 export function toPrettyJson(value: JsonValue, revealSensitive: boolean): string {
   return JSON.stringify(redactValue(value, revealSensitive), null, 2);
+}
+
+export function redactSensitiveText(value: string, revealSensitive: boolean): string {
+  const redacted = redactValue(value, revealSensitive);
+  return typeof redacted === "string" ? redacted : "[redacted]";
 }
 
 export const PrettyJsonBlock = memo(function PrettyJsonBlock({

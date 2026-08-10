@@ -25,6 +25,7 @@ import {
 } from "../components/workspace/WorkspacePatterns";
 import {
   formatUnixMs,
+  redactSensitiveText,
   readNumber,
   readObject,
   readString,
@@ -91,6 +92,7 @@ type MemorySectionProps = {
     | "memorySessionSearchResults"
     | "memoryRecallPreview"
     | "memoryRecallArtifacts"
+    | "revealSensitiveValues"
     | "refreshMemoryStatus"
     | "refreshLearningQueue"
     | "createLearningCuratorReport"
@@ -1642,10 +1644,10 @@ export function MemorySection({ app }: MemorySectionProps) {
                             "No channel"}
                         </span>
                         <p>
-                          {readString(hit, "snippet") ??
-                            readString(hit, "content") ??
-                            readString(readObject(hit, "item") ?? EMPTY_OBJECT, "content_text") ??
-                            "No snippet"}
+                          {redactSensitiveText(
+                            readMemorySnippet(hit, "No snippet"),
+                            app.revealSensitiveValues,
+                          )}
                         </p>
                       </div>
                       <div className="chat-ops-card__actions">
@@ -1974,10 +1976,10 @@ export function MemorySection({ app }: MemorySectionProps) {
                             "No channel"}
                         </span>
                         <p>
-                          {readString(item, "snippet") ??
-                            readString(item, "content") ??
-                            readString(readObject(item, "item") ?? EMPTY_OBJECT, "content_text") ??
-                            "No snippet returned."}
+                          {redactSensitiveText(
+                            readMemorySnippet(item, "No snippet returned."),
+                            app.revealSensitiveValues,
+                          )}
                         </p>
                       </div>
                       <div className="chat-ops-card__actions">
@@ -2245,6 +2247,15 @@ function readMemoryId(hit: JsonObject, index: number): string {
     readString(hit, "memory_id") ??
     readString(readObject(hit, "item") ?? EMPTY_OBJECT, "memory_id") ??
     `memory-${index + 1}`
+  );
+}
+
+function readMemorySnippet(hit: JsonObject, fallback: string): string {
+  return (
+    readString(hit, "snippet") ??
+    readString(hit, "content") ??
+    readString(readObject(hit, "item") ?? EMPTY_OBJECT, "content_text") ??
+    fallback
   );
 }
 
