@@ -2220,6 +2220,7 @@ async fn launch_chromium_session_runtime(
                 health,
                 private_target_policy,
                 security_incident,
+                staged_upload_bytes: Arc::new(AtomicU64::new(0)),
                 _profile_dir: profile_dir,
                 _proxy: None,
             })
@@ -5265,7 +5266,7 @@ pub(crate) async fn set_file_input_with_chromium(
             }
         }
     };
-    let upload_path =
+    let mut staged_upload =
         match write_chromium_upload_file(runtime, session_id, file_name, file_bytes).await {
             Ok(value) => value,
             Err(error) => {
@@ -5277,7 +5278,7 @@ pub(crate) async fn set_file_input_with_chromium(
                 }
             }
         };
-    let upload_path_text = upload_path.to_string_lossy().to_string();
+    let upload_path_text = staged_upload.path().to_string_lossy().to_string();
     let started = Instant::now();
     let mut attempts = 0_u32;
     loop {
@@ -5319,6 +5320,7 @@ pub(crate) async fn set_file_input_with_chromium(
 
         match attempt {
             Ok(FileInputAttempt::Set) => {
+                staged_upload.retain();
                 let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
                 return ChromiumActionOutcome {
                     success: true,
@@ -5370,27 +5372,75 @@ pub(crate) async fn set_file_input_with_chromium(
     }
 }
 
+struct ChromiumStagedUpload {
+    path: PathBuf,
+    reserved_bytes: u64,
+    session_bytes: Arc<AtomicU64>,
+    retained: bool,
+}
+
+impl ChromiumStagedUpload {
+    fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for ChromiumStagedUpload {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        let cleanup_path = self.path.parent().unwrap_or(self.path.as_path());
+        match fs::remove_dir_all(cleanup_path) {
+            Ok(()) => {
+                self.session_bytes.fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.session_bytes.fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+            }
+            Err(error) => {
+                warn!(
+                    path = %cleanup_path.display(),
+                    error = %error,
+                    "failed to remove unsuccessful Chromium upload staging directory"
+                );
+            }
+        }
+    }
+}
+
 async fn write_chromium_upload_file(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     file_name: &str,
     file_bytes: &[u8],
-) -> Result<PathBuf, String> {
-    let upload_dir = {
+) -> Result<ChromiumStagedUpload, String> {
+    let (upload_dir, session_bytes) = {
         let chromium_sessions = runtime.chromium_sessions.lock().await;
         let Some(chromium_session) = chromium_sessions.get(session_id) else {
             return Err("chromium_session_not_found".to_owned());
         };
-        chromium_session._profile_dir.path().join(UPLOADS_DIR)
+        (
+            chromium_session._profile_dir.path().join(UPLOADS_DIR),
+            Arc::clone(&chromium_session.staged_upload_bytes),
+        )
     };
+    let reserved_bytes = u64::try_from(file_bytes.len()).unwrap_or(u64::MAX);
+    let path = chromium_upload_staging_path(upload_dir.as_path(), file_name)?;
+    reserve_chromium_upload_bytes(session_bytes.as_ref(), reserved_bytes)?;
+    let staged_upload =
+        ChromiumStagedUpload { path, reserved_bytes, session_bytes, retained: false };
     fs::create_dir_all(upload_dir.as_path()).map_err(|error| {
         format!(
             "failed to initialize Chromium upload directory '{}': {error}",
             upload_dir.display()
         )
     })?;
-    let path = chromium_upload_staging_path(upload_dir.as_path(), file_name)?;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = staged_upload.path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             format!(
                 "failed to initialize Chromium upload staging directory '{}': {error}",
@@ -5398,10 +5448,41 @@ async fn write_chromium_upload_file(
             )
         })?;
     }
-    fs::write(path.as_path(), file_bytes).map_err(|error| {
-        format!("failed to stage uploaded browser file '{}': {error}", path.display())
+    fs::write(staged_upload.path.as_path(), file_bytes).map_err(|error| {
+        format!("failed to stage uploaded browser file '{}': {error}", staged_upload.path.display())
     })?;
-    Ok(path)
+    Ok(staged_upload)
+}
+
+fn reserve_chromium_upload_bytes(
+    session_bytes: &AtomicU64,
+    requested_bytes: u64,
+) -> Result<(), String> {
+    if requested_bytes > UPLOAD_MAX_FILE_BYTES {
+        return Err(format!(
+            "upload file exceeds max_file_bytes ({requested_bytes} > {UPLOAD_MAX_FILE_BYTES})"
+        ));
+    }
+    let mut current = session_bytes.load(Ordering::Acquire);
+    loop {
+        let projected = current.checked_add(requested_bytes).ok_or_else(|| {
+            "upload session byte accounting overflowed; refusing staging".to_owned()
+        })?;
+        if projected > UPLOAD_MAX_TOTAL_BYTES_PER_SESSION {
+            return Err(format!(
+                "upload session exceeds max_total_bytes ({projected} > {UPLOAD_MAX_TOTAL_BYTES_PER_SESSION})"
+            ));
+        }
+        match session_bytes.compare_exchange_weak(
+            current,
+            projected,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn chromium_upload_staging_path(upload_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
@@ -6034,22 +6115,27 @@ mod tests {
         parse_chromium_element_captures, parse_chromium_layout_metrics,
         parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
         parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
-        selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
-        ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
-        CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
-        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
-        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
-        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
-        MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        reserve_chromium_upload_bytes, selector_not_found_error_from_cached_snapshot,
+        ChromiumLayoutMetrics, ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
+        ChromiumStagedUpload, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
+        CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
+        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
+        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
+        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         PermissionSettingInternal, SessionPermissionsInternal, DEFAULT_SESSION_IDLE_TTL_MS,
         MAX_CONSOLE_MESSAGE_BYTES, MAX_CONSOLE_SOURCE_BYTES, MAX_CONSOLE_STACK_BYTES,
-        MAX_NETWORK_LOG_URL_BYTES,
+        MAX_NETWORK_LOG_URL_BYTES, UPLOAD_MAX_FILE_BYTES, UPLOAD_MAX_TOTAL_BYTES_PER_SESSION,
     };
     use base64::Engine as _;
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
     #[test]
@@ -6332,6 +6418,48 @@ mod tests {
         assert_eq!(file_name, "upload_source.csv");
         assert_ne!(staging_dir_name, file_name);
         assert_eq!(staged.parent().and_then(|value| value.parent()), Some(upload_dir));
+    }
+
+    #[test]
+    fn chromium_upload_reservation_enforces_session_byte_cap() {
+        let session_bytes = AtomicU64::new(0);
+        let full_file_reservations =
+            UPLOAD_MAX_TOTAL_BYTES_PER_SESSION.div_euclid(UPLOAD_MAX_FILE_BYTES);
+        for _ in 0..full_file_reservations {
+            reserve_chromium_upload_bytes(&session_bytes, UPLOAD_MAX_FILE_BYTES)
+                .expect("uploads through the session cap should reserve");
+        }
+        let remainder = UPLOAD_MAX_TOTAL_BYTES_PER_SESSION.rem_euclid(UPLOAD_MAX_FILE_BYTES);
+        if remainder > 0 {
+            reserve_chromium_upload_bytes(&session_bytes, remainder)
+                .expect("the final partial upload should reach the session cap");
+        }
+
+        let error = reserve_chromium_upload_bytes(&session_bytes, 1)
+            .expect_err("upload beyond the session cap must fail");
+
+        assert!(error.contains("max_total_bytes"), "{error}");
+        assert_eq!(session_bytes.load(Ordering::Acquire), UPLOAD_MAX_TOTAL_BYTES_PER_SESSION);
+    }
+
+    #[test]
+    fn unsuccessful_chromium_upload_releases_disk_and_reservation() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let staging_dir = tempdir.path().join("staged");
+        let staged_path = staging_dir.join("upload.txt");
+        fs::create_dir_all(staging_dir.as_path()).expect("staging directory should exist");
+        fs::write(staged_path.as_path(), b"payload").expect("staged upload should exist");
+        let session_bytes = Arc::new(AtomicU64::new(7));
+
+        drop(ChromiumStagedUpload {
+            path: staged_path,
+            reserved_bytes: 7,
+            session_bytes: Arc::clone(&session_bytes),
+            retained: false,
+        });
+
+        assert!(!staging_dir.exists(), "failed upload staging must be removed");
+        assert_eq!(session_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]

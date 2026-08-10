@@ -159,6 +159,7 @@ pub(crate) const DOWNLOAD_ALLOWED_MIME_TYPES: &[&str] = &[
     "video/webm",
 ];
 pub(crate) const UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const UPLOAD_MAX_TOTAL_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
 pub(crate) const UPLOADS_DIR: &str = "palyra-uploads";
 pub(crate) const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 pub(crate) const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
