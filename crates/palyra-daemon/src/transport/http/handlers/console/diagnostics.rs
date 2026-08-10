@@ -203,8 +203,11 @@ pub(crate) async fn console_diagnostics_handler(
         })
         .await
         .map_err(runtime_status_response)?;
-    let session_write_leases =
-        state.runtime.list_session_write_leases().await.map_err(runtime_status_response)?;
+    let session_write_leases = state
+        .runtime
+        .list_session_write_leases(session.context.clone())
+        .await
+        .map_err(runtime_status_response)?;
     let session_write_leases_payload =
         build_session_write_leases_diagnostics(session_write_leases.as_slice());
     let shared_runtime =

@@ -13645,22 +13645,30 @@ impl GatewayRuntimeState {
     // reports, flows, background tasks, and learning records.
 
     #[allow(clippy::result_large_err)]
-    fn list_session_write_leases_blocking(&self) -> Result<Vec<SessionWriteLeaseRecord>, Status> {
+    fn list_session_write_leases_blocking(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<SessionWriteLeaseRecord>, Status> {
         self.journal_store
-            .list_session_write_leases()
+            .list_session_write_leases_for_scope(
+                context.principal.as_str(),
+                context.device_id.as_str(),
+                context.channel.as_deref(),
+            )
             .map_err(|error| map_orchestrator_store_error("list session write leases", error))
     }
 
-    /// Lists active session write leases for operator diagnostics.
+    /// Lists active session write leases owned by the authenticated context.
     ///
     /// # Errors
     /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_session_write_leases(
         self: &Arc<Self>,
+        context: RequestContext,
     ) -> Result<Vec<SessionWriteLeaseRecord>, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || state.list_session_write_leases_blocking())
+        tokio::task::spawn_blocking(move || state.list_session_write_leases_blocking(&context))
             .await
             .map_err(|_| Status::internal("session write lease list worker panicked"))?
     }

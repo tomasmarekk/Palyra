@@ -11032,30 +11032,42 @@ impl JournalStore {
         }
     }
 
-    /// Lists active session writer leases after pruning expired records.
+    /// Lists active session writer leases for one exact session owner scope
+    /// after pruning expired records.
     ///
     /// # Errors
     /// Returns [`JournalError`] when storage fails.
-    pub fn list_session_write_leases(&self) -> Result<Vec<SessionWriteLeaseRecord>, JournalError> {
+    pub fn list_session_write_leases_for_scope(
+        &self,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<SessionWriteLeaseRecord>, JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         reap_expired_session_write_leases_tx(&guard, now)?;
         let mut statement = guard.prepare(
             r#"
                 SELECT
-                    session_ulid,
-                    lease_ulid,
-                    owner_process_id,
-                    owner_label,
-                    reason,
-                    acquired_at_unix_ms,
-                    expires_at_unix_ms,
-                    reentrant_depth
-                FROM orchestrator_session_write_leases
-                ORDER BY expires_at_unix_ms ASC, session_ulid ASC
+                    leases.session_ulid,
+                    leases.lease_ulid,
+                    leases.owner_process_id,
+                    leases.owner_label,
+                    leases.reason,
+                    leases.acquired_at_unix_ms,
+                    leases.expires_at_unix_ms,
+                    leases.reentrant_depth
+                FROM orchestrator_session_write_leases AS leases
+                INNER JOIN orchestrator_sessions AS sessions
+                    ON sessions.session_ulid = leases.session_ulid
+                WHERE sessions.principal = ?1
+                  AND sessions.device_id = ?2
+                  AND ((sessions.channel = ?3) OR (sessions.channel IS NULL AND ?3 IS NULL))
+                ORDER BY leases.expires_at_unix_ms ASC, leases.session_ulid ASC
             "#,
         )?;
-        let rows = statement.query_map([], hydrate_session_write_lease)?;
+        let rows = statement
+            .query_map(params![principal, device_id, channel], hydrate_session_write_lease)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
@@ -36320,6 +36332,16 @@ mod tests {
         release_session_write_lease_tx(&guard, request, now)
     }
 
+    fn list_test_session_write_leases(
+        store: &JournalStore,
+    ) -> Result<Vec<SessionWriteLeaseRecord>, JournalError> {
+        store.list_session_write_leases_for_scope(
+            "user:ops",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            Some("cli"),
+        )
+    }
+
     fn progress_draft_request(
         run_id: &str,
         seq: i64,
@@ -36965,7 +36987,7 @@ mod tests {
         assert_eq!(nested.lease_id, first.lease_id);
         assert_eq!(nested.reentrant_depth, 2);
 
-        let active = store.list_session_write_leases().expect("active leases should list");
+        let active = list_test_session_write_leases(&store).expect("active leases should list");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].reentrant_depth, 2);
 
@@ -36995,8 +37017,7 @@ mod tests {
             },
         )
         .expect("nested release should decrement depth");
-        let active = store
-            .list_session_write_leases()
+        let active = list_test_session_write_leases(&store)
             .expect("active leases should list after nested release");
         assert_eq!(active[0].reentrant_depth, 1);
         release_test_session_write_lease(
@@ -37009,10 +37030,60 @@ mod tests {
             },
         )
         .expect("outer release should clear lease");
-        assert!(store
-            .list_session_write_leases()
+        assert!(list_test_session_write_leases(&store)
             .expect("active leases should list after release")
             .is_empty());
+    }
+
+    #[test]
+    fn session_write_lease_listing_is_scoped_to_exact_session_owner() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let owned_session_id = "01ARZ3NDEKTSV4RRFFQ69G5WL5";
+        let foreign_session_id = "01ARZ3NDEKTSV4RRFFQ69G5WL6";
+        upsert_orchestrator_session(&store, owned_session_id);
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: foreign_session_id.to_owned(),
+                session_key: foreign_session_id.to_owned(),
+                session_label: None,
+                principal: "user:other".to_owned(),
+                device_id: "device:other".to_owned(),
+                channel: Some("web".to_owned()),
+            })
+            .expect("foreign session should be created");
+
+        for (session_id, process_id) in [(owned_session_id, 40_001), (foreign_session_id, 40_002)] {
+            acquire_test_session_write_lease(
+                &store,
+                &session_write_lease_request(
+                    session_id,
+                    process_id,
+                    "lease-diagnostics-test",
+                    "scoped_listing",
+                    60_000,
+                    false,
+                ),
+            )
+            .expect("test lease should acquire");
+        }
+
+        let visible = store
+            .list_session_write_leases_for_scope(
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+            )
+            .expect("scoped lease listing should succeed");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].session_id, owned_session_id);
+
+        let foreign = store
+            .list_session_write_leases_for_scope("user:other", "device:other", Some("web"))
+            .expect("foreign scoped lease listing should succeed");
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].session_id, foreign_session_id);
     }
 
     #[test]
@@ -37041,8 +37112,7 @@ mod tests {
         let reopened = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should reopen");
         assert!(
-            reopened
-                .list_session_write_leases()
+            list_test_session_write_leases(&reopened)
                 .expect("expired lease should be reaped during list")
                 .is_empty(),
             "expired session write lease must not deadlock a restarted daemon"
