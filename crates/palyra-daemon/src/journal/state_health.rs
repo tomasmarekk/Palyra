@@ -406,7 +406,8 @@ impl JournalStore {
         scope: JournalHashVerificationScope,
     ) -> Result<JournalHashChainVerificationReport, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let report = verify_hash_chain_for_connection(&guard, scope)?;
+        let report =
+            verify_hash_chain_for_connection(&guard, scope, self.config.hash_chain_enabled)?;
         if let Some(mismatch) = report.mismatch.clone() {
             self.block_hash_chain_writes(mismatch)?;
         }
@@ -640,7 +641,7 @@ fn journal_health_report_for_connection(
     let schema = collect_schema_health(connection)?;
     let quick_check = collect_quick_check(connection)?;
     let write_probe = collect_write_probe(connection);
-    let hash_chain = verify_hash_chain_for_connection(connection, hash_scope)?;
+    let hash_chain = verify_hash_chain_for_connection(connection, hash_scope, hash_chain_enabled)?;
     let fts = collect_fts_health(connection)?;
     let sidecars = sidecar_index_descriptors(db_path);
 
@@ -903,8 +904,18 @@ fn collect_write_probe(connection: &Connection) -> JournalWriteProbeHealth {
 fn verify_hash_chain_for_connection(
     connection: &Connection,
     scope: JournalHashVerificationScope,
+    hash_chain_enabled: bool,
 ) -> Result<JournalHashChainVerificationReport, JournalError> {
     let total_events = count_table_rows(connection, "journal_events").unwrap_or(0).max(0) as usize;
+    if !hash_chain_enabled {
+        return Ok(JournalHashChainVerificationReport {
+            scope: scope.label().to_owned(),
+            checked_events: 0,
+            total_events,
+            status: "disabled".to_owned(),
+            mismatch: None,
+        });
+    }
     if !table_exists(connection, "journal_events")? {
         return Ok(JournalHashChainVerificationReport {
             scope: scope.label().to_owned(),
@@ -1455,6 +1466,25 @@ mod tests {
         assert_eq!(report.overall_severity, StateHealthSeverity::Ok);
         assert!(!encoded.contains(temp.path().to_string_lossy().as_ref()));
         assert!(report.db.path_ref.contains("journal.sqlite3:sha256:"));
+    }
+
+    #[test]
+    fn hash_disabled_state_health_does_not_block_journal_writes() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("journal.sqlite3");
+        let store = JournalStore::open(test_config(db_path, false)).expect("journal should open");
+        append_event(&store, "01ARZ3NDEKTSV4RRFFQ69G5FD1", br#"{"message":"before-doctor"}"#);
+
+        let report = store.state_health_report(Some(8)).expect("report should build");
+
+        assert_eq!(report.hash_chain.status, "disabled");
+        assert_eq!(report.hash_chain.checked_events, 0);
+        assert!(report.hash_chain.mismatch.is_none());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "journal.hash_chain.disabled"));
+        append_event(&store, "01ARZ3NDEKTSV4RRFFQ69G5FD2", br#"{"message":"after-doctor"}"#);
     }
 
     #[test]
