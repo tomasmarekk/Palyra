@@ -3937,13 +3937,25 @@ fn process_runner_input_should_use_launch_root(input_json: &[u8]) -> bool {
     let Ok(input) = parse_process_runner_tool_input(input_json) else {
         return false;
     };
-    if !process_runner_cwd_uses_workspace_alias(input.cwd.as_deref()) {
+    if !process_runner_cwd_uses_workspace_root_alias(input.cwd.as_deref()) {
         return false;
     }
     if !process_path_candidates(input.command.as_str()).is_empty() {
         return false;
     }
     !input.args.iter().any(|arg| !process_path_candidates(arg.as_str()).is_empty())
+}
+
+fn process_runner_cwd_uses_workspace_root_alias(cwd: Option<&str>) -> bool {
+    let Some(raw_cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let normalized = raw_cwd.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if matches!(trimmed, "." | "./") {
+        return true;
+    }
+    trimmed.strip_prefix('/').unwrap_or(trimmed) == "workspace"
 }
 
 fn process_runner_cwd_uses_workspace_alias(cwd: Option<&str>) -> bool {

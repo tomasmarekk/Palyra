@@ -475,7 +475,7 @@ fn process_runner_launch_root_selection_handles_generic_workspace_cwd() {
     assert!(process_runner_input_should_use_launch_root(
         br#"{"command":"node","args":["slow-report.js"],"cwd":"/workspace"}"#
     ));
-    assert!(process_runner_input_should_use_launch_root(
+    assert!(!process_runner_input_should_use_launch_root(
         br#"{"command":"npm","args":["test"],"cwd":"/workspace/legacy-cjs"}"#
     ));
     assert!(process_runner_input_should_use_launch_root(br#"{"command":"npm","args":["test"]}"#));
@@ -657,7 +657,7 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn process_runner_workspace_alias_subpaths_use_launch_root_outside_state_workspace() {
+async fn process_runner_workspace_alias_subpaths_keep_configured_root() {
     let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("state").join("workspace");
     let launch_workspace = tempdir.path().join("scenario-runs").join("S050").join("workspace");
@@ -733,8 +733,8 @@ async fn process_runner_workspace_alias_subpaths_use_launch_root_outside_state_w
     assert_eq!(
         fs::canonicalize(config.process_runner.workspace_root.as_path())
             .expect("selected workspace should canonicalize"),
-        launch_workspace,
-        "/workspace subpaths should resolve from launch cwd instead of configured state root {configured:?}"
+        configured,
+        "/workspace subpaths must not replace the configured process root with {launch_workspace:?}"
     );
 }
 
