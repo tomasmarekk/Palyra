@@ -2599,6 +2599,7 @@ fn set_background_process_stopped(
         process.active = false;
         process.unix_cleanup_acknowledged |= unix_cleanup_acknowledged;
         process.stdin.take();
+        process.output_monitor.take();
     });
 }
 
@@ -16963,6 +16964,62 @@ mod tests {
         assert!(snapshot.capabilities.signals);
         assert_eq!(snapshot.lifetime_mode, BackgroundLifetimeMode::UntilVerifier);
         assert_eq!(snapshot.provenance, provenance);
+    }
+
+    #[test]
+    fn stopped_background_process_releases_captured_output() {
+        let pid = 4_010_000_u32.saturating_add(std::process::id());
+        let provenance = palyra_common::runtime_contracts::ProcessProvenance {
+            ownership_kind: if cfg!(windows) {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::WindowsJobObject
+            } else {
+                palyra_common::runtime_contracts::ProcessOwnershipKind::UnixProcessGroup
+            },
+            start_token: "captured-output-start-token".to_owned(),
+            executable_sha256: "a".repeat(64),
+            owner_nonce: "captured-output-owner-nonce".to_owned(),
+            ownership_identity_sha256: "b".repeat(64),
+        };
+        let identity = super::register_background_process_pid(
+            pid,
+            super::BackgroundProcessHandleCapabilities {
+                stdin: false,
+                pty_requested: false,
+                pty: false,
+                signals: true,
+                background: true,
+            },
+            BackgroundLifetimeMode::RunOwned,
+            provenance,
+            None,
+            #[cfg(unix)]
+            None,
+        )
+        .expect("test process identity should register");
+        let stdout = Arc::new(Mutex::new(StreamCapture::from_text("sensitive stdout".to_owned())));
+        let stderr = Arc::new(Mutex::new(StreamCapture::from_text("sensitive stderr".to_owned())));
+        let stdout_weak = Arc::downgrade(&stdout);
+        let stderr_weak = Arc::downgrade(&stderr);
+        super::attach_background_output_monitor(
+            &identity,
+            super::BackgroundOutputMonitor {
+                stdout,
+                stderr,
+                quota_triggered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        )
+        .expect("matching process identity should accept the output monitor");
+
+        super::mark_background_process_stopped(&identity);
+
+        assert!(
+            stdout_weak.upgrade().is_none(),
+            "stopped registry entries must not retain captured stdout"
+        );
+        assert!(
+            stderr_weak.upgrade().is_none(),
+            "stopped registry entries must not retain captured stderr"
+        );
     }
 
     #[test]
