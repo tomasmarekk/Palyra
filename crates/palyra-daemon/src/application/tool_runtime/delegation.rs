@@ -441,7 +441,7 @@ async fn create_delegation_background_task(
         })
         .await?;
     let delegation_request = delegation_request_for_spawn(&request);
-    let mut delegation = resolve_delegation_request(
+    let delegation = resolve_delegation_request(
         &delegation_request,
         &DelegationParentContext {
             parent_run_id: Some(parent_run_id.clone()),
@@ -449,17 +449,11 @@ async fn create_delegation_background_task(
             parent_model_profile: normalize_optional(Some(
                 resolved_agent.agent.default_model_profile.as_str(),
             )),
-            parent_tool_allowlist: parent_tool_allowlist_for_spawn_resolution(
-                &request,
-                resolved_agent.agent.default_tool_allowlist.as_slice(),
-            ),
+            parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist.clone(),
             parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist.clone(),
             parent_budget_tokens,
         },
     )?;
-    if request.explicit_empty_tool_allowlist {
-        delegation.tool_allowlist.clear();
-    }
     let cancellation_context = derive_child_task_cancellation_context(
         child_task_parent_context,
         delegation.runtime_limits.child_timeout_ms,
@@ -549,6 +543,7 @@ fn delegation_request_for_spawn(request: &DelegationSpawnRequest) -> DelegationR
         template_id: request.template_id.clone(),
         group_id: request.group_id.clone(),
         execution_mode: request.execution_mode,
+        clear_tool_allowlist: request.explicit_empty_tool_allowlist,
         manifest: Some(DelegationManifestInput {
             display_name: request.display_name.clone(),
             model_profile: request.model_profile.clone(),
@@ -568,16 +563,6 @@ fn delegation_request_for_spawn(request: &DelegationSpawnRequest) -> DelegationR
             ..Default::default()
         }),
     }
-}
-
-fn parent_tool_allowlist_for_spawn_resolution(
-    request: &DelegationSpawnRequest,
-    parent_tool_allowlist: &[String],
-) -> Vec<String> {
-    if request.explicit_empty_tool_allowlist {
-        return Vec::new();
-    }
-    parent_tool_allowlist.to_vec()
 }
 
 fn sessions_spawn_response(
@@ -1531,9 +1516,8 @@ fn build_outcome(
 mod tests {
     use super::{
         delegation_request_for_spawn, derive_child_task_cancellation_context,
-        execute_delegation_tool_inner, parent_tool_allowlist_for_spawn_resolution,
-        sessions_spawn_delegation_spawn_request, sessions_spawn_response,
-        sessions_yield_idempotency_key, sessions_yield_missing_child_json,
+        execute_delegation_tool_inner, sessions_spawn_delegation_spawn_request,
+        sessions_spawn_response, sessions_yield_idempotency_key, sessions_yield_missing_child_json,
         sessions_yield_requested_run_id, sessions_yield_selects_task,
         sessions_yield_task_projection, sessions_yield_terminal_run_state, task_merge_preview,
         task_safe_json, SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
@@ -1738,28 +1722,12 @@ mod tests {
         assert_eq!(request.priority, 4);
         assert_eq!(request.preallocated_child_run_id.as_deref(), Some("child-run"));
 
-        let mut snapshot = resolve_delegation_request(
+        let snapshot = resolve_delegation_request(
             &delegation_request_for_spawn(&request),
             &test_parent_context(Some(2_000)),
         )
-        .expect("base delegation should resolve");
-        assert!(
-            !snapshot.tool_allowlist.is_empty(),
-            "the profile default would grant tools unless the explicit empty list is applied"
-        );
-        if request.explicit_empty_tool_allowlist {
-            snapshot.tool_allowlist.clear();
-        }
+        .expect("explicit no-tool delegation should resolve");
         assert!(snapshot.tool_allowlist.is_empty());
-
-        let parent_resolution_allowlist = parent_tool_allowlist_for_spawn_resolution(
-            &request,
-            &["sessions_spawn".to_owned(), "palyra.echo".to_owned()],
-        );
-        assert!(
-            parent_resolution_allowlist.is_empty(),
-            "explicit child no-tools requests must not fail on profile default tools"
-        );
     }
 
     #[test]

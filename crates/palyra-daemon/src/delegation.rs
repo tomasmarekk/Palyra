@@ -784,7 +784,8 @@ pub struct DelegatedScopeBuildRequest {
 /// # Errors
 /// Returns `Status::invalid_argument` for an empty objective, empty
 /// reference fields, or allowlist entries outside a non-empty parent
-/// allowlist.
+/// allowlist; and `Status::failed_precondition` when an empty parent
+/// allowlist would otherwise grant child entries.
 pub fn build_delegated_scope(
     request: DelegatedScopeBuildRequest,
 ) -> Result<DelegatedRunScope, Status> {
@@ -1038,6 +1039,11 @@ pub struct DelegationRequestInput {
     pub execution_mode: Option<DelegationExecutionMode>,
     #[serde(default)]
     pub manifest: Option<DelegationManifestInput>,
+    /// Clears profile and manifest tool grants before parent containment is
+    /// checked. This is authority-reducing and supports explicit no-tool
+    /// child requests without treating an empty parent as unrestricted.
+    #[serde(default)]
+    pub clear_tool_allowlist: bool,
 }
 
 /// Per-request manifest overriding individual fields of the resolved
@@ -1523,10 +1529,10 @@ fn validate_allowlist_subset(
     requested: &[String],
     parent_allowlist: &[String],
 ) -> Result<(), Status> {
-    // Empty parent allowlists are the default unrestricted harness mode; a
-    // non-empty list opts into subset containment for delegated children.
-    if parent_allowlist.is_empty() {
-        return Ok(());
+    if parent_allowlist.is_empty() && !requested.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "{field} cannot grant entries because the parent allowlist is empty"
+        )));
     }
     if let Some(disallowed) = requested
         .iter()
@@ -1647,6 +1653,9 @@ pub fn resolve_delegation_request(
             base_profile.merge_contract.approval_required = approval_required;
         }
         apply_manifest_runtime_overrides(&mut base_profile.runtime_limits, manifest)?;
+    }
+    if request.clear_tool_allowlist {
+        base_profile.tool_allowlist.clear();
     }
 
     let execution_mode = request.execution_mode.unwrap_or(base_profile.execution_mode);
@@ -1857,19 +1866,50 @@ mod tests {
     }
 
     #[test]
-    fn resolve_delegation_request_treats_empty_parent_allowlist_as_unrestricted() {
+    fn resolve_delegation_request_denies_grants_from_empty_parent_allowlist() {
         let mut parent = parent_context();
         parent.parent_tool_allowlist.clear();
-        let delegated = resolve_delegation_request(
+        let error = resolve_delegation_request(
             &DelegationRequestInput {
                 profile_id: Some("research".to_owned()),
                 ..Default::default()
             },
             &parent,
         )
-        .expect("empty parent allowlist should not block default harness tools");
+        .expect_err("empty parent allowlist must not grant profile tools");
 
-        assert!(delegated.tool_allowlist.contains(&"palyra.http.fetch".to_owned()));
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("parent allowlist is empty"));
+        let manifest_error = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("synthesis".to_owned()),
+                manifest: Some(DelegationManifestInput {
+                    tool_allowlist: vec!["palyra.fs.apply_patch".to_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent,
+        )
+        .expect_err("empty parent allowlist must not grant manifest tools");
+        assert_eq!(manifest_error.code(), tonic::Code::FailedPrecondition);
+
+        let mut no_skill_parent = parent_context();
+        no_skill_parent.parent_skill_allowlist.clear();
+        let skill_error = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("synthesis".to_owned()),
+                manifest: Some(DelegationManifestInput {
+                    skill_allowlist: vec!["repo.read".to_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &no_skill_parent,
+        )
+        .expect_err("empty parent allowlist must not grant manifest skills");
+        assert_eq!(skill_error.code(), tonic::Code::FailedPrecondition);
+
         let no_tools = resolve_delegation_request(
             &DelegationRequestInput {
                 profile_id: Some("synthesis".to_owned()),
@@ -1877,7 +1917,7 @@ mod tests {
             },
             &parent,
         )
-        .expect("no-tool child profile should remain valid under an empty parent allowlist");
+        .expect("an empty child allowlist is contained by an empty parent allowlist");
         assert!(no_tools.tool_allowlist.is_empty());
     }
 
@@ -2046,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_scope_builder_accepts_empty_parent_allowlist_default() {
+    fn delegated_scope_builder_rejects_grants_from_empty_parent_allowlist() {
         let delegation = resolve_delegation_request(
             &DelegationRequestInput {
                 manifest: Some(DelegationManifestInput {
@@ -2060,7 +2100,7 @@ mod tests {
         )
         .expect("delegation should resolve");
 
-        let scope = build_delegated_scope(DelegatedScopeBuildRequest {
+        let error = build_delegated_scope(DelegatedScopeBuildRequest {
             objective: "Fetch docs and summarize".to_owned(),
             delegation,
             parent_tool_allowlist: Vec::new(),
@@ -2069,9 +2109,10 @@ mod tests {
             memory_refs: Vec::new(),
             artifact_refs: Vec::new(),
         })
-        .expect("empty parent allowlist should not block default harness tools");
+        .expect_err("empty parent allowlist must not grant delegated scope tools");
 
-        assert_eq!(scope.tool_allowlist, vec!["palyra.http.fetch"]);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("parent allowlist is empty"));
     }
 
     #[test]
