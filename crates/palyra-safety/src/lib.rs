@@ -1210,7 +1210,7 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     let raw_key = line.get(..separator_index)?;
     let key = assignment_key_identifier(raw_key)?;
     let value = line.get(separator_index + 1..)?.trim();
-    if is_scenario_completion_marker_assignment(raw_key, key.as_str()) {
+    if is_scenario_completion_marker_assignment(raw_key, key.as_str(), value) {
         return None;
     }
     if value.is_empty()
@@ -1231,12 +1231,14 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     Some(classification)
 }
 
-fn is_scenario_completion_marker_assignment(raw_key: &str, key: &str) -> bool {
+fn is_scenario_completion_marker_assignment(raw_key: &str, key: &str, value: &str) -> bool {
     if key != "token" {
         return false;
     }
     let trimmed = raw_key.trim();
-    trimmed.starts_with("**") && trimmed.trim_matches('*').eq_ignore_ascii_case("token")
+    trimmed.starts_with("**")
+        && trimmed.trim_matches('*').eq_ignore_ascii_case("token")
+        && value == "palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 
 fn sensitive_assignment_separator_index(line: &str) -> Option<usize> {
@@ -3989,6 +3991,25 @@ mod tests {
         assert_eq!(outcome.redacted_text, source);
         assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+    }
+
+    #[test]
+    fn markdown_token_label_does_not_exempt_arbitrary_secret_values() {
+        let source = "**Token:opaque-session-secret-1234567890abcdef";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::ToolOutput,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert_eq!(outcome.redacted_text, "**Token:[REDACTED_SECRET]");
+        assert!(outcome
             .scan
             .finding_codes()
             .iter()
