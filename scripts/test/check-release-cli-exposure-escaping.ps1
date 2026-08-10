@@ -103,6 +103,9 @@ try {
     Set-Content -LiteralPath $targetBinary -Value "" -NoNewline
 
     if ($IsWindows) {
+        New-Item -ItemType Directory -Path $commandRoot -Force | Out-Null
+        $legacyShim = Join-Path $commandRoot "palyra.ps1"
+        Set-Content -LiteralPath $legacyShim -Value "# obsolete Palyra shim" -NoNewline
         $legacyAliasRoot = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Palyra/bin"
         [Environment]::SetEnvironmentVariable(
             "Path",
@@ -134,6 +137,14 @@ try {
         -Message "Parent-shell note must tell users to restart before relying on PATH."
 
     if ($IsWindows) {
+        Assert-Equal `
+            -Actual (Test-Path -LiteralPath $legacyShim) `
+            -Expected $false `
+            -Message "CLI exposure must remove the legacy PowerShell shim that shadows palyra.cmd."
+        Assert-Equal `
+            -Actual (@($cliExposure.legacy_shim_paths_removed) -contains $legacyShim) `
+            -Expected $true `
+            -Message "CLI exposure metadata must report the removed legacy shim."
         Assert-Equal `
             -Actual (Test-PathEntryPresent -Entry $legacyAliasRoot -PathValue ([Environment]::GetEnvironmentVariable("Path", "User"))) `
             -Expected $true `

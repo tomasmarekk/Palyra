@@ -905,6 +905,7 @@ function Install-PalyraCliExposure {
 
     $commandName = "palyra"
     $shimPaths = New-Object System.Collections.Generic.List[string]
+    $legacyShimPathsRemoved = New-Object System.Collections.Generic.List[string]
     $secondaryAliasRoots = New-Object System.Collections.Generic.List[string]
 
     function Write-WindowsPalyraCliShims {
@@ -914,6 +915,14 @@ function Install-PalyraCliExposure {
         )
 
         New-Item -ItemType Directory -Path $Root -Force | Out-Null
+
+        # PowerShell resolves palyra.ps1 ahead of palyra.cmd, so an obsolete
+        # installer-owned shim would otherwise shadow the new command shim.
+        $legacyPowerShellShimPath = Join-Path $Root "$commandName.ps1"
+        if (Test-Path -LiteralPath $legacyPowerShellShimPath -PathType Leaf) {
+            Remove-Item -LiteralPath $legacyPowerShellShimPath -Force
+            $legacyShimPathsRemoved.Add($legacyPowerShellShimPath) | Out-Null
+        }
 
         $cmdTargetBinary = ConvertTo-CmdShimLiteral -Value $resolvedTargetBinary
         $cmdStateRoot = if ($null -ne $resolvedStateRoot) { ConvertTo-CmdShimLiteral -Value $resolvedStateRoot } else { $null }
@@ -1040,6 +1049,7 @@ exec $shTargetBinary "$@"
         parent_shell_path_note = $parentShellPathNote
         user_path_updated = $userPathUpdated
         secondary_alias_roots = @($secondaryAliasRoots)
+        legacy_shim_paths_removed = @($legacyShimPathsRemoved)
         legacy_path_entries_removed = @($legacyPathCleanup.removed_roots)
         legacy_session_path_updated = $legacyPathCleanup.session_path_updated
         legacy_user_path_updated = $legacyPathCleanup.user_path_updated
