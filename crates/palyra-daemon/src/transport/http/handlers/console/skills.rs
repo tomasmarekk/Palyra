@@ -151,7 +151,7 @@ pub(crate) async fn console_skill_builder_candidate_create_handler(
         payload.skill_id.as_deref().unwrap_or(default_skill_id.as_str()),
         "skill_id",
     )?;
-    let version = payload.version.unwrap_or_else(|| "0.1.0".to_owned());
+    let version = normalize_generated_skill_version(payload.version.as_deref().unwrap_or("0.1.0"))?;
     let publisher = normalize_generated_skill_identifier(
         payload.publisher.as_deref().unwrap_or("palyra.generated"),
         "publisher",
@@ -1090,7 +1090,7 @@ pub(crate) async fn console_procedure_skill_promote_handler(
         payload.skill_id.as_deref().unwrap_or(default_skill_id.as_str()),
         "skill_id",
     )?;
-    let version = payload.version.unwrap_or_else(|| "0.1.0".to_owned());
+    let version = normalize_generated_skill_version(payload.version.as_deref().unwrap_or("0.1.0"))?;
     let publisher = normalize_generated_skill_identifier(
         payload.publisher.as_deref().unwrap_or("palyra.generated"),
         "publisher",
@@ -1314,6 +1314,20 @@ fn normalize_generated_skill_identifier(raw: &str, field: &str) -> Result<String
     Ok(normalized)
 }
 
+fn normalize_generated_skill_version(raw: &str) -> Result<String, Response> {
+    let normalized = raw.trim();
+    let mut parts = normalized.split('.');
+    let valid = (0..3)
+        .all(|_| parts.next().is_some_and(|part| !part.is_empty() && part.parse::<u32>().is_ok()))
+        && parts.next().is_none();
+    if !valid {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "version must use numeric major.minor.patch form",
+        )));
+    }
+    Ok(normalized.to_owned())
+}
+
 /// Loads the generated skill-builder candidate index.
 ///
 /// # Errors
@@ -1392,8 +1406,12 @@ fn skill_builder_candidates_index_path(skills_root: &FsPath) -> PathBuf {
 #[allow(clippy::result_large_err)]
 fn write_skill_builder_scaffold(
     source: &BuilderSource,
-    request: SkillBuilderScaffoldRequest,
+    mut request: SkillBuilderScaffoldRequest,
 ) -> Result<GeneratedSkillScaffold, Response> {
+    request.skill_id = normalize_generated_skill_identifier(request.skill_id.as_str(), "skill_id")?;
+    request.publisher =
+        normalize_generated_skill_identifier(request.publisher.as_str(), "publisher")?;
+    request.version = normalize_generated_skill_version(request.version.as_str())?;
     let skills_root = resolve_skills_root()?;
     let scaffold_root = skill_builder_candidates_root(skills_root.as_path())
         .join(request.skill_id.as_str())
@@ -1803,7 +1821,8 @@ mod tests {
 
     use super::{
         apply_installed_skill_lifecycle_action, load_skill_builder_candidate_index,
-        procedure_candidate_status_is_promotable, skill_builder_candidates_index_path,
+        normalize_generated_skill_version, procedure_candidate_status_is_promotable,
+        skill_builder_candidates_index_path,
     };
     use crate::{
         InstalledSkillRecord, InstalledSkillRollbackSnapshot, InstalledSkillSecuritySnapshot,
@@ -1880,6 +1899,20 @@ mod tests {
         assert!(!procedure_candidate_status_is_promotable("suppressed"));
         assert!(procedure_candidate_status_is_promotable("proposed"));
         assert!(procedure_candidate_status_is_promotable("accepted"));
+    }
+
+    #[test]
+    fn generated_skill_version_rejects_path_syntax_before_scaffolding() {
+        for version in ["../escape", "1.0/../../escape", r"C:\escape", ".", "1.2"] {
+            assert!(
+                normalize_generated_skill_version(version).is_err(),
+                "{version:?} must fail closed"
+            );
+        }
+        assert_eq!(
+            normalize_generated_skill_version(" 1.2.3 ").expect("semver should normalize"),
+            "1.2.3"
+        );
     }
 
     #[test]
