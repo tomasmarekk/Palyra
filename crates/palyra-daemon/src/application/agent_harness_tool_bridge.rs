@@ -13,7 +13,9 @@ use thiserror::Error;
 use crate::application::{
     codex_app_server_harness::CODEX_APP_SERVER_HARNESS_ID,
     file_view_registry::WorkspacePatchFileViewReport,
+    tool_registry::{resolve_tool_execution_semantics, ToolReplaySafetyClass},
 };
+use palyra_common::runtime_contracts::RuntimeIdempotencyClass;
 
 pub const CODEX_EVENT_PROJECTOR_SCHEMA_VERSION: u32 = 1;
 pub const CODEX_EVENT_PROJECTOR_REDACTION_LEVEL: &str = "metadata_and_redacted_summary";
@@ -30,6 +32,7 @@ pub struct HarnessToolCallRequest {
     pub raw_args: Value,
     pub catalog_snapshot_id: String,
     pub replay_metadata: HarnessToolReplayMetadata,
+    /// Harness-provided compatibility hint. Host authorization ignores it.
     pub mutating: bool,
 }
 
@@ -136,6 +139,8 @@ pub enum HarnessToolBridgeError {
     EmptyToolCallId,
     #[error("catalog snapshot mismatch")]
     CatalogSnapshotMismatch,
+    #[error("tool arguments could not be normalized")]
+    InvalidToolArguments,
 }
 
 /// Evaluates a harness tool call against the host-owned policy boundary.
@@ -164,8 +169,19 @@ pub fn evaluate_harness_tool_call(
         return Ok(denied_decision(normalized_tool_name, "harness_tool.execution_gate_required"));
     }
 
-    let approval_required = request.mutating && policy.approval_required_for_mutation;
-    if request.mutating && !approval_required {
+    let input_json = serde_json::to_vec(&request.raw_args)
+        .map_err(|_| HarnessToolBridgeError::InvalidToolArguments)?;
+    let host_semantics = resolve_tool_execution_semantics(
+        normalized_tool_name.as_str(),
+        ToolReplaySafetyClass::RequiresHumanConfirmation,
+        input_json.as_slice(),
+    );
+    let host_classifies_mutation = !matches!(
+        host_semantics.semantics.idempotency_class,
+        RuntimeIdempotencyClass::ReadOnly | RuntimeIdempotencyClass::DeterministicIdempotent
+    );
+    let approval_required = host_classifies_mutation && policy.approval_required_for_mutation;
+    if host_classifies_mutation && !approval_required {
         return Ok(denied_decision(
             normalized_tool_name,
             "harness_tool.mutating_approval_required",
@@ -443,6 +459,34 @@ mod tests {
         assert_eq!(decision.normalized_tool_name, "palyra.fs.read_file");
         assert!(decision.execution_gate_required);
         assert!(!decision.approval_required);
+    }
+
+    #[test]
+    fn bridge_ignores_harness_mutation_hint_for_authorization() {
+        let policy = HarnessToolBridgePolicy::new(
+            ["palyra.fs.read_file", "palyra.process.run"],
+            "catalog-1",
+        );
+
+        let read_only = evaluate_harness_tool_call(&request("palyra.fs.read_file", true), &policy)
+            .expect("host should classify the read-only tool");
+        let mutating = evaluate_harness_tool_call(&request("palyra.process.run", false), &policy)
+            .expect("host should classify the mutating tool");
+
+        assert!(!read_only.approval_required);
+        assert!(mutating.approval_required);
+    }
+
+    #[test]
+    fn bridge_fails_closed_when_host_mutation_approval_is_disabled() {
+        let mut policy = HarnessToolBridgePolicy::new(["palyra.process.run"], "catalog-1");
+        policy.approval_required_for_mutation = false;
+
+        let decision = evaluate_harness_tool_call(&request("palyra.process.run", false), &policy)
+            .expect("host-classified mutation should become a denied decision");
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason_code, "harness_tool.mutating_approval_required");
     }
 
     #[test]
