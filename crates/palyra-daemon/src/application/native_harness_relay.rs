@@ -50,7 +50,6 @@ pub struct NativeHarnessRelayRequest {
     pub generation: u64,
     pub observed_at_unix_ms: i64,
     pub payload: Value,
-    pub revise_budget_remaining: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -149,6 +148,32 @@ pub struct NativeHarnessRelayEvaluation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeHarnessRelayHostState {
+    now_unix_ms: i64,
+    revise_budget_remaining: u32,
+}
+
+impl NativeHarnessRelayHostState {
+    #[must_use]
+    pub const fn new(now_unix_ms: i64, revise_budget_remaining: u32) -> Self {
+        Self { now_unix_ms, revise_budget_remaining }
+    }
+
+    #[must_use]
+    pub const fn revise_budget_remaining(&self) -> u32 {
+        self.revise_budget_remaining
+    }
+
+    fn consume_revise_budget(&mut self) -> bool {
+        if self.revise_budget_remaining == 0 {
+            return false;
+        }
+        self.revise_budget_remaining = self.revise_budget_remaining.saturating_sub(1);
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeHarnessRelayRateLimit {
     max_permission_requests: u32,
     permission_requests_used: u32,
@@ -178,21 +203,23 @@ impl NativeHarnessRelayRateLimit {
 pub fn evaluate_native_harness_relay(
     registration: &NativeHarnessRelayRegistration,
     request: &NativeHarnessRelayRequest,
+    host_state: &mut NativeHarnessRelayHostState,
 ) -> NativeHarnessRelayDecision {
-    evaluate_native_harness_relay_with_audit(registration, request, None).decision
+    evaluate_native_harness_relay_with_audit(registration, request, host_state, None).decision
 }
 
 #[must_use]
 pub fn evaluate_native_harness_relay_with_audit(
     registration: &NativeHarnessRelayRegistration,
     request: &NativeHarnessRelayRequest,
+    host_state: &mut NativeHarnessRelayHostState,
     mut rate_limit: Option<&mut NativeHarnessRelayRateLimit>,
 ) -> NativeHarnessRelayEvaluation {
     let decision = if registration.cancelled {
         rejected(request.event_kind, NativeHarnessRelayReasonCode::CancelledRelay)
     } else if request.generation != registration.generation {
         rejected(request.event_kind, NativeHarnessRelayReasonCode::StaleGeneration)
-    } else if request.observed_at_unix_ms
+    } else if host_state.now_unix_ms
         > registration.registered_at_unix_ms.saturating_add(registration.ttl_ms.max(0))
     {
         rejected(request.event_kind, NativeHarnessRelayReasonCode::ExpiredRelay)
@@ -206,6 +233,10 @@ pub fn evaluate_native_harness_relay_with_audit(
         && rate_limit.as_deref_mut().is_some_and(|limit| !limit.consume_permission_request())
     {
         rejected(request.event_kind, NativeHarnessRelayReasonCode::PermissionRateLimited)
+    } else if request.event_kind == NativeHarnessRelayEventKind::BeforeAgentFinalize
+        && !host_state.consume_revise_budget()
+    {
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::ReviseBudgetExhausted)
     } else {
         accepted_decision(registration, request)
     };
@@ -254,24 +285,19 @@ fn accepted_decision(
             direct_journal_authority_granted: false,
             tool_executor_authority_granted: false,
         },
-        NativeHarnessRelayEventKind::BeforeAgentFinalize if request.revise_budget_remaining > 0 => {
-            NativeHarnessRelayDecision {
-                schema_version: NATIVE_HARNESS_RELAY_SCHEMA_VERSION,
-                event_kind: request.event_kind,
-                decision: NativeHarnessRelayDecisionKind::RevisionRequested,
-                reason_codes: vec![
-                    NativeHarnessRelayReasonCode::RelayAccepted,
-                    NativeHarnessRelayReasonCode::FinalizeRevisionRequested,
-                ],
-                approval_projection: None,
-                approval_authority_granted: false,
-                direct_journal_authority_granted: false,
-                tool_executor_authority_granted: false,
-            }
-        }
-        NativeHarnessRelayEventKind::BeforeAgentFinalize => {
-            rejected(request.event_kind, NativeHarnessRelayReasonCode::ReviseBudgetExhausted)
-        }
+        NativeHarnessRelayEventKind::BeforeAgentFinalize => NativeHarnessRelayDecision {
+            schema_version: NATIVE_HARNESS_RELAY_SCHEMA_VERSION,
+            event_kind: request.event_kind,
+            decision: NativeHarnessRelayDecisionKind::RevisionRequested,
+            reason_codes: vec![
+                NativeHarnessRelayReasonCode::RelayAccepted,
+                NativeHarnessRelayReasonCode::FinalizeRevisionRequested,
+            ],
+            approval_projection: None,
+            approval_authority_granted: false,
+            direct_journal_authority_granted: false,
+            tool_executor_authority_granted: false,
+        },
         NativeHarnessRelayEventKind::PreToolUse | NativeHarnessRelayEventKind::PostToolUse => {
             NativeHarnessRelayDecision {
                 schema_version: NATIVE_HARNESS_RELAY_SCHEMA_VERSION,
@@ -392,16 +418,21 @@ mod tests {
             generation: 2,
             observed_at_unix_ms: 2_000,
             payload: json!({ "tool_name": "palyra.fs.apply_patch" }),
-            revise_budget_remaining: 1,
         }
+    }
+
+    fn host_state() -> NativeHarnessRelayHostState {
+        NativeHarnessRelayHostState::new(2_000, 1)
     }
 
     #[test]
     fn native_harness_requests_permission_without_authority() {
         let mut rate_limit = NativeHarnessRelayRateLimit::new(2);
+        let mut host_state = host_state();
         let evaluation = evaluate_native_harness_relay_with_audit(
             &registration(),
             &request(NativeHarnessRelayEventKind::PermissionRequest),
+            &mut host_state,
             Some(&mut rate_limit),
         );
         let decision = evaluation.decision;
@@ -419,25 +450,55 @@ mod tests {
 
     #[test]
     fn before_finalize_can_request_bounded_revision() {
+        let mut host_state = host_state();
         let decision = evaluate_native_harness_relay(
             &registration(),
             &request(NativeHarnessRelayEventKind::BeforeAgentFinalize),
+            &mut host_state,
         );
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::RevisionRequested);
+        assert_eq!(host_state.revise_budget_remaining(), 0);
         assert!(decision
             .reason_codes
             .contains(&NativeHarnessRelayReasonCode::FinalizeRevisionRequested));
     }
 
     #[test]
+    fn before_finalize_cannot_self_grant_another_revision() {
+        let mut host_state = NativeHarnessRelayHostState::new(2_000, 1);
+        let request = request(NativeHarnessRelayEventKind::BeforeAgentFinalize);
+
+        let first = evaluate_native_harness_relay(&registration(), &request, &mut host_state);
+        let second = evaluate_native_harness_relay(&registration(), &request, &mut host_state);
+
+        assert_eq!(first.decision, NativeHarnessRelayDecisionKind::RevisionRequested);
+        assert_eq!(second.decision, NativeHarnessRelayDecisionKind::Rejected);
+        assert_eq!(second.reason_codes, [NativeHarnessRelayReasonCode::ReviseBudgetExhausted]);
+    }
+
+    #[test]
+    fn relay_expiry_uses_host_time() {
+        let mut host_state = NativeHarnessRelayHostState::new(20_000, 1);
+        let mut request = request(NativeHarnessRelayEventKind::PreToolUse);
+        request.observed_at_unix_ms = 1_001;
+
+        let decision = evaluate_native_harness_relay(&registration(), &request, &mut host_state);
+
+        assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
+        assert_eq!(decision.reason_codes, [NativeHarnessRelayReasonCode::ExpiredRelay]);
+    }
+
+    #[test]
     fn expired_generation_is_denied() {
+        let mut host_state = host_state();
         let decision = evaluate_native_harness_relay(
             &registration(),
             &NativeHarnessRelayRequest {
                 generation: 1,
                 ..request(NativeHarnessRelayEventKind::PreToolUse)
             },
+            &mut host_state,
         );
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
@@ -446,12 +507,14 @@ mod tests {
 
     #[test]
     fn payload_cap_blocks_large_strings() {
+        let mut host_state = host_state();
         let decision = evaluate_native_harness_relay(
             &registration(),
             &NativeHarnessRelayRequest {
                 payload: json!({ "summary": "x".repeat(MAX_RELAY_STRING_BYTES + 1) }),
                 ..request(NativeHarnessRelayEventKind::PostToolUse)
             },
+            &mut host_state,
         );
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
@@ -461,14 +524,17 @@ mod tests {
     #[test]
     fn permission_rate_limit_fails_closed() {
         let mut rate_limit = NativeHarnessRelayRateLimit::new(1);
+        let mut host_state = host_state();
         let first = evaluate_native_harness_relay_with_audit(
             &registration(),
             &request(NativeHarnessRelayEventKind::PermissionRequest),
+            &mut host_state,
             Some(&mut rate_limit),
         );
         let second = evaluate_native_harness_relay_with_audit(
             &registration(),
             &request(NativeHarnessRelayEventKind::PermissionRequest),
+            &mut host_state,
             Some(&mut rate_limit),
         );
 
@@ -483,6 +549,7 @@ mod tests {
 
     #[test]
     fn post_tool_relay_cannot_escalate_visibility() {
+        let mut host_state = host_state();
         let decision = evaluate_native_harness_relay(
             &registration(),
             &NativeHarnessRelayRequest {
@@ -493,6 +560,7 @@ mod tests {
                 }),
                 ..request(NativeHarnessRelayEventKind::PostToolUse)
             },
+            &mut host_state,
         );
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
