@@ -6952,10 +6952,7 @@ fn sanitize_agent_failure_message(message: &str) -> String {
 }
 
 fn is_agent_cancellation_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("cancelled by request")
-        || lower.contains("canceled by request")
-        || lower.contains("run cancellation requested")
+    message.trim().eq_ignore_ascii_case("cancelled by request")
 }
 
 fn is_agent_needs_continuation_message(message: &str) -> bool {
@@ -7621,6 +7618,14 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn cancellation_classification_requires_the_canonical_terminal_reason() {
+        assert!(is_agent_cancellation_message("cancelled by request"));
+        assert!(is_agent_cancellation_message(" CANCELLED BY REQUEST "));
+        assert!(!is_agent_cancellation_message("provider failed: cancelled by request"));
+        assert!(!is_agent_cancellation_message("run cancellation requested by upstream"));
+    }
+
+    #[test]
     fn needs_continuation_stream_outcome_is_distinct_command_error() {
         let outcome = AgentStreamOutcome {
             completed: false,
@@ -8235,6 +8240,23 @@ mod agent_stream_output_tests {
         };
 
         outcome.ensure_success().expect("requested cancellation should not fail the command");
+    }
+
+    #[test]
+    fn failed_stream_outcome_overrides_cancellation_flag() {
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: true,
+            needs_continuation_message: None,
+            needs_continuation_checkpoint: None,
+            failed_message: Some("provider failed: cancelled by request".to_owned()),
+            continuation_request: None,
+        };
+
+        let error = outcome
+            .ensure_success()
+            .expect_err("recorded stream failure must override cancellation");
+        assert!(error.to_string().contains("provider failed"), "unexpected error: {error}");
     }
 
     #[test]
@@ -9128,9 +9150,6 @@ impl AgentStreamOutcome {
     }
 
     fn ensure_success(&self) -> Result<()> {
-        if self.cancelled {
-            return Ok(());
-        }
         if let Some(message) = self.needs_continuation_message.as_ref() {
             let continuation_state = agent_continuation_blocked_state(
                 message,
@@ -9144,6 +9163,9 @@ impl AgentStreamOutcome {
         }
         if let Some(message) = self.failed_message.as_ref() {
             anyhow::bail!("agent run failed: {message}");
+        }
+        if self.cancelled {
+            return Ok(());
         }
         if !self.completed {
             anyhow::bail!(
