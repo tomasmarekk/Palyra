@@ -3,7 +3,12 @@
 //! This module does not enforce sandbox or path policy. It describes host-wide side effects
 //! before/after execution so tool outputs and diagnostics can surface blast radius.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
 
 use serde::Serialize;
 
@@ -13,6 +18,7 @@ use crate::process_runner_input::ProcessRunnerToolInput;
 /// semantics for generated artifacts.
 pub const TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS: &str =
     "host_windows_vs_docker_posix_permissions";
+const MAX_PROCESS_RISK_METADATA_BYTES: u64 = 64 * 1024;
 
 /// Risk category detected in a process-run command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -599,7 +605,7 @@ fn infer_target_runtime(workspace_root: Option<&Path>) -> Option<TargetRuntimeBo
 
 fn infer_task_toml_runtime(root: &Path) -> Option<TargetRuntimeBoundary> {
     let path = root.join("task.toml");
-    let content = fs::read_to_string(path.as_path()).ok()?;
+    let content = read_bounded_process_risk_metadata(path.as_path())?;
     let lower = content.to_ascii_lowercase();
     if lower.contains("docker") || lower.contains("image") || lower.contains("/app") {
         return Some(TargetRuntimeBoundary {
@@ -623,7 +629,7 @@ fn infer_dockerfile_runtime(root: &Path) -> Option<TargetRuntimeBoundary> {
 fn infer_readme_runtime(root: &Path) -> Option<TargetRuntimeBoundary> {
     let candidates = [root.join("README.md"), root.join("README")];
     for path in candidates {
-        let Ok(content) = fs::read_to_string(path.as_path()) else {
+        let Some(content) = read_bounded_process_risk_metadata(path.as_path()) else {
             continue;
         };
         let lower = content.to_ascii_lowercase();
@@ -636,6 +642,26 @@ fn infer_readme_runtime(root: &Path) -> Option<TargetRuntimeBoundary> {
         }
     }
     None
+}
+
+fn read_bounded_process_risk_metadata(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROCESS_RISK_METADATA_BYTES {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let opened_metadata = file.metadata().ok()?;
+    if !opened_metadata.file_type().is_file()
+        || opened_metadata.len() > MAX_PROCESS_RISK_METADATA_BYTES
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).ok()?);
+    file.take(MAX_PROCESS_RISK_METADATA_BYTES.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).ok()? > MAX_PROCESS_RISK_METADATA_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn relative_runtime_source(root: &Path, path: &Path) -> String {
@@ -1094,6 +1120,48 @@ mod tests {
             Some("docker")
         );
         assert!(has_class(&report, ProcessRiskClass::TargetRuntimeMismatch));
+    }
+
+    #[test]
+    fn oversized_runtime_metadata_is_ignored() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        let mut content = vec![b'x'; (super::MAX_PROCESS_RISK_METADATA_BYTES + 1) as usize];
+        content.extend_from_slice(b"\ndocker\n");
+        fs::write(workspace.path().join("README.md"), content)
+            .expect("oversized README should be written");
+
+        let report = classify_process_run(
+            &input("pip", &["install", "scipy"]),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        assert!(report.target_runtime.is_none());
+        assert!(!has_class(&report, ProcessRiskClass::TargetRuntimeMismatch));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_metadata_symlinks_are_ignored() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        let outside = tempfile::NamedTempFile::new().expect("outside fixture should be created");
+        fs::write(outside.path(), b"docker runtime under /app\n")
+            .expect("outside fixture should be written");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("README.md"))
+            .expect("README symlink should be created");
+
+        let report = classify_process_run(
+            &input("pip", &["install", "scipy"]),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        assert!(report.target_runtime.is_none());
+        assert!(!has_class(&report, ProcessRiskClass::TargetRuntimeMismatch));
     }
 
     #[test]
