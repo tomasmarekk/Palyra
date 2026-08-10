@@ -1605,6 +1605,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -1796,6 +1797,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -1976,6 +1978,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2145,6 +2148,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2243,6 +2247,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2411,6 +2416,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2525,6 +2531,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2627,6 +2634,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             false,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2737,6 +2745,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             self.runtime.as_ref(),
             session_id.as_str(),
             true,
+            ActionSnapshotRefresh::Full,
         )
         .await
         {
@@ -2996,16 +3005,87 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 error: "native dialogs require the Chromium browser engine".to_owned(),
             }));
         }
+        if action.mutates_page() {
+            if let Err(error) = consume_action_budget_and_snapshot(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                false,
+                ActionSnapshotRefresh::UrlOnly,
+            )
+            .await
+            {
+                return Ok(Response::new(browser_v1::HandleDialogResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    present: false,
+                    event: None,
+                    mutated_page: false,
+                    timed_out: false,
+                    backend_support: true,
+                    error_code: "dialog_action_blocked".to_owned(),
+                    error,
+                }));
+            }
+        }
         let prompt_text = (action == BrowserDialogAction::Respond).then_some(payload.prompt_text);
-        let outcome = chromium_handle_dialog(
+        let started_at_unix_ms = current_unix_ms();
+        let outcome_result = chromium_handle_dialog(
             self.runtime.as_ref(),
             session_id.as_str(),
             action,
             payload.expected_generation,
             prompt_text,
         )
-        .await
-        .map_err(Status::failed_precondition)?;
+        .await;
+        if action.mutates_page() {
+            let (success, outcome, error) = match &outcome_result {
+                Ok(outcome) => (
+                    outcome.success,
+                    if outcome.error_code.is_empty() {
+                        if outcome.success {
+                            "dialog_handled"
+                        } else {
+                            "dialog_failed"
+                        }
+                    } else {
+                        outcome.error_code.as_str()
+                    },
+                    outcome.error.as_str(),
+                ),
+                Err(error) => (false, "dialog_backend_failed", error.as_str()),
+            };
+            let _ = finalize_session_action(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                FinalizeActionRequest {
+                    action_name: action.action_log_name(),
+                    selector: "",
+                    success,
+                    outcome,
+                    error,
+                    started_at_unix_ms,
+                    attempts: 1,
+                    capture_failure_screenshot: false,
+                    max_failure_screenshot_bytes: 0,
+                },
+            )
+            .await;
+            let session_for_persist = {
+                let sessions = self.runtime.sessions.lock().await;
+                sessions
+                    .get(session_id.as_str())
+                    .filter(|session| session.persistence.enabled)
+                    .cloned()
+            };
+            persist_session_after_mutation(
+                self.runtime.as_ref(),
+                session_for_persist,
+                action.action_log_name(),
+            )
+            .await
+            .map_err(map_persist_error_to_status)?;
+        }
+        let outcome = outcome_result.map_err(Status::failed_precondition)?;
         Ok(Response::new(browser_v1::HandleDialogResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             success: outcome.success,

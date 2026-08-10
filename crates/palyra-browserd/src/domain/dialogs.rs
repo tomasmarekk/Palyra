@@ -35,6 +35,15 @@ impl BrowserDialogAction {
     pub(crate) fn mutates_page(self) -> bool {
         !matches!(self, Self::Inspect)
     }
+
+    pub(crate) fn action_log_name(self) -> &'static str {
+        match self {
+            Self::Inspect => "dialog_inspect",
+            Self::Accept => "dialog_accept",
+            Self::Dismiss => "dialog_dismiss",
+            Self::Respond => "dialog_respond",
+        }
+    }
 }
 
 /// Fail-closed limits applied to every native browser dialog.
@@ -254,5 +263,7 @@ mod tests {
         assert!(BrowserDialogAction::Accept.mutates_page());
         assert!(BrowserDialogAction::Dismiss.mutates_page());
         assert!(BrowserDialogAction::Respond.mutates_page());
+        assert_eq!(BrowserDialogAction::Inspect.action_log_name(), "dialog_inspect");
+        assert_eq!(BrowserDialogAction::Respond.action_log_name(), "dialog_respond");
     }
 }

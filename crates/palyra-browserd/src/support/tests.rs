@@ -2323,6 +2323,10 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
     .await
     .expect("prompt should be scheduled");
 
+    let actions_before_inspection = {
+        let sessions = runtime.sessions.lock().await;
+        sessions.get(session_id.ulid.as_str()).expect("dialog session should exist").action_count
+    };
     let mut inspected = None;
     for _ in 0..40 {
         let response = service
@@ -2347,6 +2351,38 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
     let first_event = inspected.event.expect("dialog event should be returned");
     assert_eq!(first_event.dialog_type, "prompt");
     assert_eq!(first_event.message, "Choose a bounded value");
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session =
+            sessions.get_mut(session_id.ulid.as_str()).expect("dialog session should exist");
+        assert_eq!(
+            session.action_count, actions_before_inspection,
+            "read-only dialog inspection must not consume the mutation budget"
+        );
+        session.budget.max_actions_per_session = session.action_count;
+    }
+
+    let blocked = service
+        .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            action: browser_v1::BrowserDialogAction::Respond.into(),
+            expected_generation: first_event.generation,
+            prompt_text: "blocked".to_owned(),
+        }))
+        .await
+        .expect("blocked dialog response should execute")
+        .into_inner();
+    assert!(!blocked.success);
+    assert_eq!(blocked.error_code, "dialog_action_blocked");
+    assert!(blocked.error.contains("session action budget exceeded"));
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session =
+            sessions.get_mut(session_id.ulid.as_str()).expect("dialog session should exist");
+        assert_eq!(session.action_count, actions_before_inspection);
+        session.budget.max_actions_per_session = session.action_count.saturating_add(16);
+    }
 
     let responded = service
         .handle_dialog(Request::new(browser_v1::HandleDialogRequest {
@@ -2361,6 +2397,15 @@ async fn browser_service_chromium_handles_native_dialogs_with_generation_fence()
         .into_inner();
     assert!(responded.success, "prompt response should succeed: {}", responded.error);
     assert!(responded.mutated_page);
+    {
+        let sessions = runtime.sessions.lock().await;
+        let session = sessions.get(session_id.ulid.as_str()).expect("dialog session should exist");
+        assert_eq!(session.action_count, actions_before_inspection.saturating_add(1));
+        let entry = session.action_log.back().expect("dialog mutation should be audited");
+        assert_eq!(entry.action_name, "dialog_respond");
+        assert!(entry.success);
+        assert_eq!(entry.outcome, "dialog_handled");
+    }
 
     let updated = service
         .wait_for(Request::new(browser_v1::WaitForRequest {

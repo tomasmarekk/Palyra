@@ -4565,6 +4565,32 @@ pub(crate) async fn chromium_refresh_tab_snapshot(
     Ok(())
 }
 
+/// Refreshes only the active URL while preserving a pending native dialog.
+///
+/// # Errors
+/// Returns lookup sentinels or remote-IP guard incidents.
+pub(crate) async fn chromium_refresh_tab_url(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
+    let page_url =
+        run_chromium_blocking("chromium refresh tab URL", move || Ok(tab.get_url())).await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+
+    let mut sessions = runtime.sessions.lock().await;
+    let Some(session) = sessions.get_mut(session_id) else {
+        return Err("session_not_found".to_owned());
+    };
+    let Some(tab) = session.tabs.get_mut(tab_id) else {
+        return Err("tab_not_found".to_owned());
+    };
+    tab.last_url = Some(page_url);
+    Ok(())
+}
+
 /// Reads the live page title of a tab.
 ///
 /// # Errors

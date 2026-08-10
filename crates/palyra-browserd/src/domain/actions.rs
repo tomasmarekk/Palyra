@@ -251,11 +251,20 @@ pub(crate) struct FinalizeActionRequest<'a> {
     pub(crate) max_failure_screenshot_bytes: u64,
 }
 
+/// Live Chromium state that must be refreshed before enforcing an action policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionSnapshotRefresh {
+    Full,
+    UrlOnly,
+}
+
 /// Validates and charges one action against the session's budget, returning a snapshot.
 ///
 /// Enforces the domain allowlist, the per-session action cap, and the sliding-window rate
-/// limit, then records the action. In Chromium mode the active tab snapshot is refreshed first
-/// so the allowlist check sees the real current URL.
+/// limit, then records the action. In Chromium mode the requested active-tab state is refreshed
+/// first so the allowlist check sees the real current URL. URL-only refresh is reserved for
+/// native-dialog mutations because reading the DOM while a dialog is open can block until its
+/// fail-safe timeout closes it.
 ///
 /// # Errors
 /// Returns an error string when the session or active tab is missing, the allowlist or an
@@ -265,6 +274,7 @@ pub(crate) async fn consume_action_budget_and_snapshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     require_page_body: bool,
+    refresh: ActionSnapshotRefresh,
 ) -> Result<ActionSessionSnapshot, String> {
     if matches!(runtime.engine_mode, BrowserEngineMode::Chromium) {
         // The sessions lock must not be held across the Chromium refresh await: grab the tab
@@ -276,7 +286,14 @@ pub(crate) async fn consume_action_budget_and_snapshot(
             };
             session.active_tab_id.clone()
         };
-        chromium_refresh_tab_snapshot(runtime, session_id, active_tab_id.as_str()).await?;
+        match refresh {
+            ActionSnapshotRefresh::Full => {
+                chromium_refresh_tab_snapshot(runtime, session_id, active_tab_id.as_str()).await?;
+            }
+            ActionSnapshotRefresh::UrlOnly => {
+                chromium_refresh_tab_url(runtime, session_id, active_tab_id.as_str()).await?;
+            }
+        }
     }
 
     let mut sessions = runtime.sessions.lock().await;
