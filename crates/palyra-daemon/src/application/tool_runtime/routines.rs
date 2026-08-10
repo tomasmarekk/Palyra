@@ -2631,35 +2631,24 @@ enum RoutineSuccessVisibility {
     AuditOnly,
 }
 
-/// Applies the success-visibility default: a routine whose successes would be
-/// invisible (local_only/logs_only mode or audit_only silence) is upgraded to
-/// same_channel + noisy delivery unless the caller explicitly opted into
-/// artifact/audit-only visibility.
+/// Applies an explicit success-visibility intent without overriding the
+/// delivery controls used by clients that predate that field.
 fn normalize_delivery_for_success_visibility(
     mut delivery: RoutineDeliveryConfig,
     success_visibility: Option<RoutineSuccessVisibility>,
 ) -> RoutineDeliveryConfig {
     match success_visibility {
-        Some(RoutineSuccessVisibility::ArtifactOnly | RoutineSuccessVisibility::AuditOnly) => {
+        None
+        | Some(RoutineSuccessVisibility::ArtifactOnly | RoutineSuccessVisibility::AuditOnly) => {
             return delivery;
         }
         Some(RoutineSuccessVisibility::Announce) => {}
-        None if output_delivered_for_outcome(
-            &delivery,
-            RoutineRunOutcomeKind::SuccessWithOutput,
-        ) =>
-        {
-            return delivery;
-        }
-        None => {}
     }
 
     if output_delivered_for_outcome(&delivery, RoutineRunOutcomeKind::SuccessWithOutput) {
         return delivery;
     }
 
-    // Reaching here means success output would be silently dropped without
-    // an explicit opt-in: upgrade to user-visible delivery.
     if matches!(delivery.mode, RoutineDeliveryMode::LocalOnly | RoutineDeliveryMode::LogsOnly) {
         delivery.mode = RoutineDeliveryMode::SameChannel;
         delivery.channel = None;
@@ -4082,7 +4071,7 @@ mod tests {
     }
 
     #[test]
-    fn silent_success_delivery_defaults_to_same_channel_without_structured_opt_in() {
+    fn legacy_silent_delivery_remains_suppressed_without_success_visibility() {
         let delivery = RoutineDeliveryConfig {
             mode: RoutineDeliveryMode::LocalOnly,
             channel: None,
@@ -4093,16 +4082,16 @@ mod tests {
 
         let normalized = super::normalize_delivery_for_success_visibility(delivery, None);
 
-        assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
-        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
-        assert!(super::output_delivered_for_outcome(
+        assert_eq!(normalized.mode, RoutineDeliveryMode::LocalOnly);
+        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::AuditOnly);
+        assert!(!super::output_delivered_for_outcome(
             &normalized,
             RoutineRunOutcomeKind::SuccessWithOutput
         ));
     }
 
     #[test]
-    fn audit_only_policy_defaults_to_visible_without_success_visibility() {
+    fn audit_only_policy_remains_silent_without_success_visibility() {
         let delivery = RoutineDeliveryConfig {
             mode: RoutineDeliveryMode::SameChannel,
             channel: None,
@@ -4114,15 +4103,15 @@ mod tests {
         let normalized = super::normalize_delivery_for_success_visibility(delivery, None);
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
-        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
-        assert!(super::output_delivered_for_outcome(
+        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::AuditOnly);
+        assert!(!super::output_delivered_for_outcome(
             &normalized,
             RoutineRunOutcomeKind::SuccessWithOutput
         ));
     }
 
     #[test]
-    fn failure_only_policy_defaults_to_visible_without_success_visibility() {
+    fn failure_only_policy_remains_silent_without_success_visibility() {
         let delivery = RoutineDeliveryConfig {
             mode: RoutineDeliveryMode::SameChannel,
             channel: None,
@@ -4134,8 +4123,8 @@ mod tests {
         let normalized = super::normalize_delivery_for_success_visibility(delivery, None);
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
-        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
-        assert!(super::output_delivered_for_outcome(
+        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::FailureOnly);
+        assert!(!super::output_delivered_for_outcome(
             &normalized,
             RoutineRunOutcomeKind::SuccessWithOutput
         ));
@@ -4203,7 +4192,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_mode_without_success_visibility_defaults_to_visible_success() {
+    fn logs_only_mode_remains_suppressed_without_success_visibility() {
         let delivery = RoutineDeliveryConfig {
             mode: RoutineDeliveryMode::LogsOnly,
             channel: None,
@@ -4214,9 +4203,9 @@ mod tests {
 
         let normalized = super::normalize_delivery_for_success_visibility(delivery, None);
 
-        assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
+        assert_eq!(normalized.mode, RoutineDeliveryMode::LogsOnly);
         assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
-        assert!(super::output_delivered_for_outcome(
+        assert!(!super::output_delivered_for_outcome(
             &normalized,
             RoutineRunOutcomeKind::SuccessWithOutput
         ));
