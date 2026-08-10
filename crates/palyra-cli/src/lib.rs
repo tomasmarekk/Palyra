@@ -10734,7 +10734,7 @@ fn load_skill_runtime_status_snapshot(skill_id: &str, version: &str) -> SkillRun
 }
 
 fn build_skill_eligibility_snapshot(
-    _record: &InstalledSkillRecord,
+    record: &InstalledSkillRecord,
     requirements: &SkillRequirementsSnapshot,
     runtime_status: &SkillRuntimeStatusSnapshot,
 ) -> SkillEligibilitySnapshot {
@@ -10755,6 +10755,11 @@ fn build_skill_eligibility_snapshot(
             env!("CARGO_PKG_VERSION")
         ));
     }
+    // Eligibility needs only an aggregate blocker; scope and key identifiers
+    // remain absent from ordinary text diagnostics.
+    if !record.missing_secrets.is_empty() {
+        reasons.push("missing required secrets".to_owned());
+    }
     match runtime_status.status.as_str() {
         "quarantined" => reasons.push("skill is quarantined".to_owned()),
         "disabled" => reasons.push("skill is disabled".to_owned()),
@@ -10774,6 +10779,59 @@ fn build_skill_eligibility_snapshot(
     }
 
     SkillEligibilitySnapshot { status: "eligible".to_owned(), eligible: true, reasons }
+}
+
+#[cfg(test)]
+mod skill_eligibility_tests {
+    use super::{
+        build_skill_eligibility_snapshot, InstalledSkillRecord, InstalledSkillSource,
+        MissingSkillSecret, SkillRequirementsSnapshot, SkillRuntimeStatusSnapshot,
+        CANONICAL_PROTOCOL_MAJOR,
+    };
+
+    #[test]
+    fn missing_required_secrets_block_skill_eligibility_without_identifiers() {
+        let record = InstalledSkillRecord {
+            skill_id: "acme.secret-reader".to_owned(),
+            version: "1.0.0".to_owned(),
+            publisher: "acme".to_owned(),
+            current: true,
+            installed_at_unix_ms: 1,
+            artifact_sha256: "0".repeat(64),
+            payload_sha256: "1".repeat(64),
+            signature_key_id: "ed25519:0011223344556677".to_owned(),
+            trust_decision: "allowlisted".to_owned(),
+            source: InstalledSkillSource {
+                kind: "local_artifact".to_owned(),
+                reference: "fixture".to_owned(),
+            },
+            missing_secrets: vec![MissingSkillSecret {
+                scope: "provider".to_owned(),
+                key: "sensitive-api-key-name".to_owned(),
+            }],
+            security_scan: None,
+            rollback_snapshot: None,
+        };
+        let requirements = SkillRequirementsSnapshot {
+            required_protocol_major: CANONICAL_PROTOCOL_MAJOR,
+            min_palyra_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        let runtime_status = SkillRuntimeStatusSnapshot {
+            status: "active".to_owned(),
+            source: "default".to_owned(),
+            quarantine_status: "not_quarantined".to_owned(),
+            reason: None,
+            detected_at_ms: None,
+            operator_principal: None,
+        };
+
+        let eligibility = build_skill_eligibility_snapshot(&record, &requirements, &runtime_status);
+
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.status, "blocked");
+        assert_eq!(eligibility.reasons, vec!["missing required secrets".to_owned()]);
+        assert!(!eligibility.reasons.join(" ").contains("sensitive-api-key-name"));
+    }
 }
 
 fn artifact_path_for_installed_skill(skills_root: &Path, record: &InstalledSkillRecord) -> PathBuf {
