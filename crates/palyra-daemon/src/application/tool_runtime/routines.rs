@@ -66,10 +66,10 @@ const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
-const DEFAULT_ROUTINE_WAIT_TIMEOUT_MS: u64 = 300_000;
-const MAX_ROUTINE_WAIT_TIMEOUT_MS: u64 = 900_000;
-const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 1_000;
-const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 250;
+const DEFAULT_ROUTINE_WAIT_TIMEOUT_MS: u64 = 60_000;
+const MAX_ROUTINE_WAIT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 5_000;
+const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 5_000;
 const MAX_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 30_000;
 const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
 const COMPLETION_TOOL_MISSING_ERROR_KIND: &str = "completion_tool_missing";
@@ -466,6 +466,7 @@ async fn wait_for_terminal_routine(
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let poll_interval = Duration::from_millis(poll_interval_ms);
+    synchronize_schedule_routines(runtime_state, registry).await?;
 
     loop {
         let observation = observe_routine_wait_state(
@@ -503,7 +504,7 @@ async fn observe_routine_wait_state(
     expected_successful_runs: Option<u32>,
     elapsed: Duration,
 ) -> Result<Value, String> {
-    let routine = load_routine_parts_for_owner(
+    let routine = load_routine_parts_for_owner_without_sync(
         runtime_state,
         registry,
         routine_id,
@@ -1874,6 +1875,15 @@ async fn load_routine_parts_for_owner(
     principal: &str,
 ) -> Result<RoutineParts, String> {
     synchronize_schedule_routines(runtime_state, registry).await?;
+    load_routine_parts_for_owner_without_sync(runtime_state, registry, routine_id, principal).await
+}
+
+async fn load_routine_parts_for_owner_without_sync(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    registry: &Arc<RoutineRegistry>,
+    routine_id: &str,
+    principal: &str,
+) -> Result<RoutineParts, String> {
     let metadata = registry
         .get_routine(routine_id)
         .map_err(map_registry_error)?

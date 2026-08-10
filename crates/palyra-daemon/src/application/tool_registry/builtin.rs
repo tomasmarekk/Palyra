@@ -611,16 +611,16 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "timeout_ms",
-                        json!({"type":"integer","minimum":1,"maximum":900000,"description":"Maximum wait for operation=wait_terminal. Prefer enough time for capped scheduler intervals plus one safety poll."}),
+                        json!({"type":"integer","minimum":1,"maximum":120000,"description":"Maximum wait for operation=wait_terminal. Prefer enough time for capped scheduler intervals plus one safety poll."}),
                     ),
                     (
                         "poll_interval_ms",
-                        json!({"type":"integer","minimum":250,"maximum":30000,"description":"Polling cadence for operation=wait_terminal inside one tool call."}),
+                        json!({"type":"integer","minimum":5000,"maximum":30000,"description":"Polling cadence for operation=wait_terminal inside one tool call."}),
                     ),
                 ],
                 true,
             ),
-            ToolParallelismPolicy::ReadOnly,
+            ToolParallelismPolicy::Exclusive,
             ToolResultProjectionPolicy::SummarizeAndArtifact,
         ),
         entry(

@@ -1646,8 +1646,9 @@ fn routines_query_schema_exposes_scheduler_wait_terminal_operation() {
         entry.description.contains("operation=wait_terminal"),
         "description should guide models away from repeated scheduler polling"
     );
-    assert_eq!(entry.input_schema["properties"]["timeout_ms"]["maximum"], 900_000);
-    assert_eq!(entry.input_schema["properties"]["poll_interval_ms"]["minimum"], 250);
+    assert_eq!(entry.input_schema["properties"]["timeout_ms"]["maximum"], 120_000);
+    assert_eq!(entry.input_schema["properties"]["poll_interval_ms"]["minimum"], 5_000);
+    assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
     assert!(entry.input_schema["properties"]["expected_successful_runs"]["description"]
         .as_str()
         .unwrap_or_default()

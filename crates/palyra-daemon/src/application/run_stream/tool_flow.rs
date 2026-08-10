@@ -1431,7 +1431,6 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
         | "palyra.memory.recall"
         | "palyra.memory.session_search"
         | "palyra.session_search"
-        | "palyra.routines.query"
         | "palyra.work_graph.query"
         | "palyra.work_graph.artifact"
         | "palyra.artifact.read"
@@ -1450,6 +1449,7 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
         | "palyra.browser.console_log"
         | "palyra.browser.tabs.list"
         | "palyra.browser.permissions.get" => ToolParallelism::ReadOnlySafe,
+        "palyra.routines.query" => ToolParallelism::Never,
         "palyra.http.fetch" if is_idempotent_http_fetch_input(input_json) => {
             ToolParallelism::IdempotentNetwork
         }
@@ -5780,6 +5780,13 @@ mod tests {
         assert_eq!(
             classify_tool_parallelism("palyra.echo", br#"{"text":"hello"}"#),
             ToolParallelism::ReadOnlySafe
+        );
+        assert_eq!(
+            classify_tool_parallelism(
+                "palyra.routines.query",
+                br#"{"operation":"wait_terminal","routine_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#
+            ),
+            ToolParallelism::Never
         );
         assert_eq!(
             classify_tool_parallelism(
