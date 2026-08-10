@@ -236,10 +236,82 @@ pub struct ReferenceWorkerResponse {
     pub output_json: String,
 }
 
+struct ReferenceWorkerExecution {
+    output_json: String,
+    patch_bundle: Option<RemotePatchBundle>,
+    success: bool,
+    duration_ms: u64,
+    reason_code: String,
+}
+
+fn remove_scoped_worker_workspace(
+    workspace: tempfile::TempDir,
+) -> Result<WorkerCleanupReport, NetworkWorkerRuntimeError> {
+    let workspace_path = workspace.path().to_path_buf();
+    workspace.close().map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?;
+    if workspace_path
+        .try_exists()
+        .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?
+    {
+        return Err(NetworkWorkerRuntimeError::Workspace(
+            "worker workspace still exists after cleanup".to_owned(),
+        ));
+    }
+    Ok(WorkerCleanupReport {
+        removed_workspace_scope: true,
+        removed_artifacts: true,
+        removed_logs: true,
+        failure_reason: None,
+    })
+}
+
+fn finalize_reference_worker_response(
+    worker_id: &str,
+    protocol: &RemoteWorkerProtocolV1,
+    execution: ReferenceWorkerExecution,
+    cleanup: RemoteCleanupAttestation,
+    observed_at_unix_ms: i64,
+) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
+    let output_sha256 = sha256_hex(execution.output_json.as_bytes());
+    let outcome = RemoteTaskOutcome {
+        task_id: protocol.task.task_id.clone(),
+        idempotency_key: protocol.task.idempotency_key.clone(),
+        worker_id: worker_id.to_owned(),
+        response_sequence: 1,
+        run_generation: protocol.task.run_generation,
+        fence_generation: protocol.task.fence_generation,
+        success: execution.success,
+        output_sha256: output_sha256.clone(),
+        output_artifacts: vec![ContentAddressedArtifact {
+            artifact_id: "reference-worker-output".to_owned(),
+            sha256: output_sha256,
+            size_bytes: u64::try_from(execution.output_json.len()).unwrap_or(u64::MAX),
+            media_type: "application/json".to_owned(),
+        }],
+        patch_bundle: execution.patch_bundle,
+        usage: RemoteResourceUsage {
+            duration_ms: execution.duration_ms,
+            peak_memory_bytes: 0,
+            cpu_time_ms: 0,
+            input_bytes: protocol
+                .task
+                .input_artifacts
+                .iter()
+                .fold(0_u64, |total, artifact| total.saturating_add(artifact.size_bytes)),
+            output_bytes: u64::try_from(execution.output_json.len()).unwrap_or(u64::MAX),
+        },
+        cleanup,
+        completed_at_unix_ms: observed_at_unix_ms
+            .saturating_add(i64::try_from(execution.duration_ms).unwrap_or(i64::MAX)),
+        reason_code: execution.reason_code,
+    };
+    outcome.validate_against(&protocol.task, observed_at_unix_ms)?;
+    Ok(ReferenceWorkerResponse { outcome, output_json: execution.output_json })
+}
+
 /// Executes the safe reference subset inside an already isolated workspace root.
 #[derive(Debug, Clone)]
 pub struct ReferenceNetworkWorker {
-    worker_id: String,
     workspace_root: PathBuf,
     metadata_file_sizes: BTreeMap<PathBuf, u64>,
 }
@@ -293,23 +365,21 @@ impl ReferenceNetworkWorker {
             workspace.path().to_path_buf(),
             metadata_file_sizes,
         )?;
-        let response = worker.execute_with_authority(
+        let execution = worker.execute_task_with_authority(
             protocol,
             request.lease.process_executable_allowlist.as_slice(),
             observed_at_unix_ms,
             cancellation_requested,
         )?;
         drop(worker);
-        workspace
-            .close()
-            .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?;
-
-        let cleanup_report = WorkerCleanupReport {
-            removed_workspace_scope: true,
-            removed_artifacts: true,
-            removed_logs: true,
-            failure_reason: None,
-        };
+        let cleanup_report = remove_scoped_worker_workspace(workspace)?;
+        let response = finalize_reference_worker_response(
+            request.lease.worker_id.as_str(),
+            protocol,
+            execution,
+            RemoteCleanupAttestation::from(&cleanup_report),
+            observed_at_unix_ms,
+        )?;
         let result = WorkerRemoteToolResultEnvelope {
             protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
             schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -365,28 +435,31 @@ impl ReferenceNetworkWorker {
                 "worker workspace root is not a directory".to_owned(),
             ));
         }
-        Ok(Self { worker_id, workspace_root, metadata_file_sizes })
+        Ok(Self { workspace_root, metadata_file_sizes })
     }
 
-    /// Executes one canonical task with bounded output and fail-closed cleanup evidence.
+    /// Rejects the legacy borrowed-workspace execution path.
+    ///
+    /// Callers must use [`Self::execute_remote_request`] so the worker owns and removes a scoped
+    /// temporary workspace before emitting cleanup evidence.
     ///
     /// # Errors
-    /// Returns a typed error before execution for invalid protocol, scope, or input.
+    /// Always returns [`NetworkWorkerRuntimeError::ScopedWorkspaceRequired`].
     pub fn execute(
         &self,
-        protocol: &RemoteWorkerProtocolV1,
-        observed_at_unix_ms: i64,
+        _protocol: &RemoteWorkerProtocolV1,
+        _observed_at_unix_ms: i64,
     ) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
-        self.execute_with_authority(protocol, &[], observed_at_unix_ms, None)
+        Err(NetworkWorkerRuntimeError::ScopedWorkspaceRequired)
     }
 
-    fn execute_with_authority(
+    fn execute_task_with_authority(
         &self,
         protocol: &RemoteWorkerProtocolV1,
         process_executable_allowlist: &[String],
         observed_at_unix_ms: i64,
         cancellation_requested: Option<&AtomicBool>,
-    ) -> Result<ReferenceWorkerResponse, NetworkWorkerRuntimeError> {
+    ) -> Result<ReferenceWorkerExecution, NetworkWorkerRuntimeError> {
         protocol.validate(observed_at_unix_ms)?;
         let started = std::time::Instant::now();
         let (output_json, patch_bundle, success, reason_code) =
@@ -453,47 +526,13 @@ impl ReferenceNetworkWorker {
         {
             return Err(NetworkWorkerRuntimeError::OutputLimitExceeded);
         }
-        let output_sha256 = sha256_hex(output_json.as_bytes());
-        let outcome = RemoteTaskOutcome {
-            task_id: protocol.task.task_id.clone(),
-            idempotency_key: protocol.task.idempotency_key.clone(),
-            worker_id: self.worker_id.clone(),
-            response_sequence: 1,
-            run_generation: protocol.task.run_generation,
-            fence_generation: protocol.task.fence_generation,
-            success,
-            output_sha256: output_sha256.clone(),
-            output_artifacts: vec![ContentAddressedArtifact {
-                artifact_id: "reference-worker-output".to_owned(),
-                sha256: output_sha256,
-                size_bytes: u64::try_from(output_json.len()).unwrap_or(u64::MAX),
-                media_type: "application/json".to_owned(),
-            }],
+        Ok(ReferenceWorkerExecution {
+            output_json,
             patch_bundle,
-            usage: RemoteResourceUsage {
-                duration_ms,
-                peak_memory_bytes: 0,
-                cpu_time_ms: 0,
-                input_bytes: protocol
-                    .task
-                    .input_artifacts
-                    .iter()
-                    .fold(0_u64, |total, artifact| total.saturating_add(artifact.size_bytes)),
-                output_bytes: u64::try_from(output_json.len()).unwrap_or(u64::MAX),
-            },
-            cleanup: RemoteCleanupAttestation {
-                workspace_removed: true,
-                scratch_artifacts_removed: true,
-                logs_removed: true,
-                secret_material_removed: true,
-                reason_code: "worker.cleanup.ok".to_owned(),
-            },
-            completed_at_unix_ms: observed_at_unix_ms
-                .saturating_add(i64::try_from(duration_ms).unwrap_or(i64::MAX)),
+            success,
+            duration_ms,
             reason_code: reason_code.to_owned(),
-        };
-        outcome.validate_against(&protocol.task, observed_at_unix_ms)?;
-        Ok(ReferenceWorkerResponse { outcome, output_json })
+        })
     }
 
     fn execute_process(
@@ -1443,6 +1482,22 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str()),
             Some("note.txt")
+        );
+    }
+
+    #[test]
+    fn scoped_workspace_cleanup_removes_task_data_before_attestation() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let workspace_path = workspace.path().to_path_buf();
+        fs::write(workspace.path().join("task-secret.txt"), "sensitive").expect("fixture");
+
+        let cleanup =
+            remove_scoped_worker_workspace(workspace).expect("scoped cleanup should complete");
+
+        assert!(cleanup.is_verified());
+        assert!(
+            !workspace_path.exists(),
+            "verified cleanup must follow physical workspace removal"
         );
     }
 

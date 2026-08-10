@@ -1,17 +1,12 @@
 //! Reference canonical worker process for transport conformance and local deployment.
-//! `--stdio` executes the full remote request envelope from a scoped bundle;
-//! positional arguments retain the lower-level canonical-task conformance mode.
+//! `--stdio` executes the full remote request envelope from a scoped bundle.
 
 use std::{
     env,
     io::{self, Read, Write},
-    path::PathBuf,
 };
 
-use palyra_workerd::{
-    network_runtime::ReferenceNetworkWorker, remote_protocol::RemoteWorkerProtocolV1,
-    WorkerRemoteToolRequestEnvelope,
-};
+use palyra_workerd::{network_runtime::ReferenceNetworkWorker, WorkerRemoteToolRequestEnvelope};
 
 fn main() {
     if let Err(error) = run() {
@@ -22,31 +17,10 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
-    let first =
-        args.next().ok_or("usage: palyra-workerd --stdio | <workspace-root> <worker-id>")?;
-    if first == "--stdio" {
-        if args.next().is_some() {
-            return Err("palyra-workerd --stdio does not accept additional arguments".into());
-        }
-        return run_canonical_stdio();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--stdio")) || args.next().is_some() {
+        return Err("usage: palyra-workerd --stdio".into());
     }
-    let workspace_root = PathBuf::from(first);
-    let worker_id = args
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("usage: palyra-workerd --stdio | <workspace-root> <worker-id>")?;
-    if args.next().is_some() {
-        return Err("unexpected palyra-workerd arguments".into());
-    }
-    let mut input = Vec::new();
-    io::stdin().take(1024 * 1024).read_to_end(&mut input)?;
-    let protocol: RemoteWorkerProtocolV1 = serde_json::from_slice(input.as_slice())?;
-    let worker = ReferenceNetworkWorker::new(worker_id, workspace_root)?;
-    let observed_at_unix_ms = unix_time_ms()?;
-    let response = worker.execute(&protocol, observed_at_unix_ms)?;
-    let output = serde_json::to_vec(&response)?;
-    io::stdout().write_all(output.as_slice())?;
-    Ok(())
+    run_canonical_stdio()
 }
 
 fn run_canonical_stdio() -> Result<(), Box<dyn std::error::Error>> {
