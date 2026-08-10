@@ -321,6 +321,10 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
   state.pending_client_downloads = Number(state.pending_client_downloads || 0);
   const MAX_CLIENT_DOWNLOAD_ENTRIES = 32;
   const MAX_CLIENT_DOWNLOAD_BYTES = 8 * 1024 * 1024;
+  const blobSizeGetter = typeof Blob === "function"
+    ? Object.getOwnPropertyDescriptor(Blob.prototype, "size")?.get
+    : null;
+  const blobArrayBuffer = typeof Blob === "function" ? Blob.prototype.arrayBuffer : null;
   const normalizeNetworkUrl = (raw) => {
     try {
       return new URL(String(raw || ""), window.location.href).href;
@@ -354,7 +358,17 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
     return (text || "download.bin").slice(0, 96);
   };
   const blobToBase64 = async (blob) => {
-    const buffer = await blob.arrayBuffer();
+    if (typeof blobSizeGetter !== "function" || typeof blobArrayBuffer !== "function") {
+      throw new Error("client-side Blob inspection is unavailable");
+    }
+    const sizeBytes = Number(blobSizeGetter.call(blob));
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0) {
+      throw new Error("client-side download reported an invalid size");
+    }
+    if (sizeBytes > MAX_CLIENT_DOWNLOAD_BYTES) {
+      throw new Error(`client-side download exceeds max bytes (${sizeBytes} > ${MAX_CLIENT_DOWNLOAD_BYTES})`);
+    }
+    const buffer = await blobArrayBuffer.call(blob);
     if (buffer.byteLength > MAX_CLIENT_DOWNLOAD_BYTES) {
       throw new Error(`client-side download exceeds max bytes (${buffer.byteLength} > ${MAX_CLIENT_DOWNLOAD_BYTES})`);
     }
@@ -383,7 +397,7 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
       anchor.__palyraLastDownloadCaptureUrl = href;
       anchor.__palyraLastDownloadCaptureAt = now;
       const blob = state.object_urls[href];
-      if (!blob || typeof blob.arrayBuffer !== "function") {
+      if (!blob || typeof blobSizeGetter !== "function" || typeof blobArrayBuffer !== "function") {
         return;
       }
       const fileName = clampDownloadFileName(anchor.getAttribute("download") || "");
@@ -6396,6 +6410,20 @@ mod tests {
                 && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Object]\"")
                 && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Array]\""),
             "console hook must represent objects without traversing page-controlled values"
+        );
+        let blob_size_guard = CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT
+            .find("if (sizeBytes > MAX_CLIENT_DOWNLOAD_BYTES)")
+            .expect("client-side download script should check Blob size");
+        let blob_materialization = CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT
+            .find("const buffer = await blobArrayBuffer.call(blob)")
+            .expect("client-side download script should use the captured Blob intrinsic");
+        assert!(
+            blob_size_guard < blob_materialization,
+            "Blob size must be rejected before arrayBuffer materializes client download bytes"
+        );
+        assert!(
+            !CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("await blob.arrayBuffer()"),
+            "page-overridable Blob methods must not control download materialization"
         );
     }
 
