@@ -21087,6 +21087,8 @@ impl JournalStore {
             if let Some(existing) = commitment_candidates::query_deduped_commitment(
                 &transaction,
                 request.owner_principal.as_str(),
+                request.device_id.as_str(),
+                request.channel.as_deref(),
                 candidate.dedupe_key.as_str(),
             )? {
                 return Ok(existing);
@@ -49214,60 +49216,64 @@ mod tests {
     }
 
     #[test]
-    fn commitment_candidate_dedupe_survives_dismissal_and_reopen() {
+    fn commitment_candidate_dedupe_is_scope_bound_and_survives_reopen() {
         let db_path = temp_db_path();
         let config = test_journal_config(db_path.clone(), false);
         let store = JournalStore::open(config.clone()).expect("journal store should open");
-        let request = |commitment_id: &str| CommitmentCreateRequest {
-            commitment_id: commitment_id.to_owned(),
-            owner_principal: "user:ops".to_owned(),
-            device_id: "device-1".to_owned(),
-            channel: Some("cli".to_owned()),
-            session_id: None,
-            run_id: None,
-            user_wording: "I will send the report every week".to_owned(),
-            normalized_action: "i will send the report every week".to_owned(),
-            due_condition_json: r#"{"type":"unspecified"}"#.to_owned(),
-            recurrence_json:
-                r#"{"type":"interval","unit":"week","every":1,"review_required":true}"#.to_owned(),
-            channel_binding_json: r#"{"type":"console_review"}"#.to_owned(),
-            approval_requirement: "manual_review".to_owned(),
-            privacy_label: "user_visible".to_owned(),
-            status: "proposed".to_owned(),
-            confidence_bps: 7_500,
-            extraction_model: "deterministic.commitment-extractor.v2".to_owned(),
-            review_reason: "test".to_owned(),
-            scheduler_binding_json:
-                r#"{"type":"none","state":"awaiting_review","candidate_kind":"explicit"}"#
-                    .to_owned(),
-            due_at_unix_ms: None,
-            source_kind: "post_run_text".to_owned(),
-            tape_start_seq: None,
-            tape_end_seq: None,
-            evidence_json: r#"{"source":"redacted"}"#.to_owned(),
-            candidate_v2: Some(CommitmentCandidateV2 {
-                schema_version: COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
-                evidence_span: CommitmentEvidenceSpanV2 {
-                    start_byte: 0,
-                    end_byte: 34,
-                    redacted_text_sha256: "a".repeat(64),
-                },
-                confidence_bps: 7_500,
+        let request =
+            |commitment_id: &str, device_id: &str, channel: &str| CommitmentCreateRequest {
+                commitment_id: commitment_id.to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                device_id: device_id.to_owned(),
+                channel: Some(channel.to_owned()),
+                session_id: None,
+                run_id: None,
+                user_wording: "I will send the report every week".to_owned(),
+                normalized_action: "i will send the report every week".to_owned(),
+                due_condition_json: r#"{"type":"unspecified"}"#.to_owned(),
                 recurrence_json:
                     r#"{"type":"interval","unit":"week","every":1,"review_required":true}"#
                         .to_owned(),
-                sensitivity: CommitmentCandidateSensitivity::General,
-                dedupe_key: "b".repeat(64),
-                extraction_reason_code: "hybrid_commitments.explicit_language".to_owned(),
-                selection_reason_code: "commitment.extraction.high_value".to_owned(),
-                value_score_bps: 9_000,
-                sample_bucket_bps: 42,
-                source_sha256: "c".repeat(64),
-            }),
-            actor_principal: "system:commitment-extractor".to_owned(),
-        };
+                channel_binding_json: r#"{"type":"console_review"}"#.to_owned(),
+                approval_requirement: "manual_review".to_owned(),
+                privacy_label: "user_visible".to_owned(),
+                status: "proposed".to_owned(),
+                confidence_bps: 7_500,
+                extraction_model: "deterministic.commitment-extractor.v2".to_owned(),
+                review_reason: "test".to_owned(),
+                scheduler_binding_json:
+                    r#"{"type":"none","state":"awaiting_review","candidate_kind":"explicit"}"#
+                        .to_owned(),
+                due_at_unix_ms: None,
+                source_kind: "post_run_text".to_owned(),
+                tape_start_seq: None,
+                tape_end_seq: None,
+                evidence_json: r#"{"source":"redacted"}"#.to_owned(),
+                candidate_v2: Some(CommitmentCandidateV2 {
+                    schema_version: COMMITMENT_CANDIDATE_V2_SCHEMA_VERSION,
+                    evidence_span: CommitmentEvidenceSpanV2 {
+                        start_byte: 0,
+                        end_byte: 34,
+                        redacted_text_sha256: "a".repeat(64),
+                    },
+                    confidence_bps: 7_500,
+                    recurrence_json:
+                        r#"{"type":"interval","unit":"week","every":1,"review_required":true}"#
+                            .to_owned(),
+                    sensitivity: CommitmentCandidateSensitivity::General,
+                    dedupe_key: "b".repeat(64),
+                    extraction_reason_code: "hybrid_commitments.explicit_language".to_owned(),
+                    selection_reason_code: "commitment.extraction.high_value".to_owned(),
+                    value_score_bps: 9_000,
+                    sample_bucket_bps: 42,
+                    source_sha256: "c".repeat(64),
+                }),
+                actor_principal: "system:commitment-extractor".to_owned(),
+            };
 
-        let first = store.create_commitment(&request("candidate-1")).expect("first candidate");
+        let first = store
+            .create_commitment(&request("candidate-1", "device-1", "cli"))
+            .expect("first candidate");
         store
             .update_commitment(&CommitmentUpdateRequest {
                 commitment_id: first.commitment_id.clone(),
@@ -49291,21 +49297,33 @@ mod tests {
                 payload_json: "{}".to_owned(),
             })
             .expect("candidate should be dismissed");
-        let duplicate =
-            store.create_commitment(&request("candidate-2")).expect("duplicate should replay");
+        let duplicate = store
+            .create_commitment(&request("candidate-2", "device-1", "cli"))
+            .expect("same-scope duplicate should replay");
         assert_eq!(duplicate.commitment_id, first.commitment_id);
         assert_eq!(duplicate.status, "dismissed");
+        let other_scope = store
+            .create_commitment(&request("candidate-3", "device-2", "web"))
+            .expect("cross-scope candidate should remain isolated");
+        assert_eq!(other_scope.commitment_id, "candidate-3");
+        assert_eq!(other_scope.device_id, "device-2");
+        assert_eq!(other_scope.channel.as_deref(), Some("web"));
         drop(store);
 
         let reopened = JournalStore::open(config).expect("journal should reopen");
-        let after_reopen =
-            reopened.create_commitment(&request("candidate-3")).expect("dedupe should survive");
+        let after_reopen = reopened
+            .create_commitment(&request("candidate-4", "device-1", "cli"))
+            .expect("same-scope dedupe should survive");
         assert_eq!(after_reopen.commitment_id, first.commitment_id);
+        let other_scope_after_reopen = reopened
+            .create_commitment(&request("candidate-5", "device-2", "web"))
+            .expect("cross-scope dedupe should survive");
+        assert_eq!(other_scope_after_reopen.commitment_id, other_scope.commitment_id);
         let diagnostics = reopened
             .commitment_candidate_v2_diagnostics("user:ops")
             .expect("candidate diagnostics should load");
-        assert_eq!(diagnostics.total_candidates, 1);
-        assert_eq!(diagnostics.recurring_candidates, 1);
+        assert_eq!(diagnostics.total_candidates, 2);
+        assert_eq!(diagnostics.recurring_candidates, 2);
     }
 
     #[test]

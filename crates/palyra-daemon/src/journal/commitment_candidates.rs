@@ -1,5 +1,5 @@
 //! Durable V2 evidence for review-only commitment candidates.
-//! Candidate insertion and owner-scoped deduplication share the commitment
+//! Candidate insertion and console-scope deduplication share the commitment
 //! creation transaction so retries cannot create recurring automation.
 
 use super::*;
@@ -158,17 +158,49 @@ fn ensure_sha256(value: &str, field: &str) -> Result<(), JournalError> {
 pub(super) fn query_deduped_commitment(
     connection: &Connection,
     owner_principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
     dedupe_key: &str,
+) -> Result<Option<CommitmentRecord>, JournalError> {
+    let scoped_dedupe_key =
+        scoped_commitment_dedupe_key(owner_principal, device_id, channel, dedupe_key)?;
+    if let Some(commitment) = query_deduped_commitment_for_key(
+        connection,
+        owner_principal,
+        device_id,
+        channel,
+        scoped_dedupe_key.as_str(),
+    )? {
+        return Ok(Some(commitment));
+    }
+    // Migration 90 stored the unscoped candidate hash. The exact commitment
+    // scope guard permits same-scope replay without exposing a legacy record
+    // to another device or channel.
+    query_deduped_commitment_for_key(connection, owner_principal, device_id, channel, dedupe_key)
+}
+
+fn query_deduped_commitment_for_key(
+    connection: &Connection,
+    owner_principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    stored_dedupe_key: &str,
 ) -> Result<Option<CommitmentRecord>, JournalError> {
     let commitment_id = connection
         .query_row(
             r#"
-                SELECT commitment_ulid
-                FROM commitment_candidates_v2
-                WHERE owner_principal = ?1 AND dedupe_key = ?2
+                SELECT candidate.commitment_ulid
+                FROM commitment_candidates_v2 AS candidate
+                INNER JOIN commitments AS commitment
+                    ON commitment.commitment_ulid = candidate.commitment_ulid
+                WHERE candidate.owner_principal = ?1
+                  AND candidate.dedupe_key = ?2
+                  AND commitment.owner_principal = ?1
+                  AND commitment.device_id = ?3
+                  AND commitment.channel IS ?4
                 LIMIT 1
             "#,
-            params![owner_principal, dedupe_key],
+            params![owner_principal, stored_dedupe_key, device_id, channel],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -178,12 +210,34 @@ pub(super) fn query_deduped_commitment(
         .map(Option::flatten)
 }
 
+fn scoped_commitment_dedupe_key(
+    owner_principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    candidate_dedupe_key: &str,
+) -> Result<String, JournalError> {
+    let payload = serde_json::to_vec(&(
+        "commitment.console_scope.v1",
+        owner_principal,
+        device_id,
+        channel,
+        candidate_dedupe_key,
+    ))?;
+    Ok(sha256_hex(payload.as_slice()))
+}
+
 pub(super) fn insert_candidate(
     transaction: &Transaction<'_>,
     request: &CommitmentCreateRequest,
     candidate: &CommitmentCandidateV2,
     created_at_unix_ms: i64,
 ) -> Result<(), JournalError> {
+    let scoped_dedupe_key = scoped_commitment_dedupe_key(
+        request.owner_principal.as_str(),
+        request.device_id.as_str(),
+        request.channel.as_deref(),
+        candidate.dedupe_key.as_str(),
+    )?;
     transaction.execute(
         r#"
             INSERT INTO commitment_candidates_v2 (
@@ -210,7 +264,7 @@ pub(super) fn insert_candidate(
         params![
             request.commitment_id,
             request.owner_principal,
-            candidate.dedupe_key,
+            scoped_dedupe_key,
             u64_to_sqlite(candidate.evidence_span.start_byte, "evidence_start_byte")?,
             u64_to_sqlite(candidate.evidence_span.end_byte, "evidence_end_byte")?,
             candidate.evidence_span.redacted_text_sha256,
