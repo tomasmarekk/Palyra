@@ -260,6 +260,22 @@ mod stage_contract_tests {
     }
 
     #[test]
+    fn request_tool_exposure_cannot_grant_approval() {
+        let approval_start = TOOL_FLOW_SOURCE
+            .find("async fn resolve_run_stream_tool_approval_outcome")
+            .expect("approval outcome stage exists");
+        let approval_end = TOOL_FLOW_SOURCE[approval_start..]
+            .find("fn tool_execution_timeout")
+            .map(|offset| approval_start + offset)
+            .expect("tool execution helpers follow the approval stage");
+        let approval_source = &TOOL_FLOW_SOURCE[approval_start..approval_end];
+
+        assert!(!approval_source.contains("allow_sensitive_tools"));
+        assert!(approval_source.contains("create_approval_record("));
+        assert!(approval_source.contains("send_tool_approval_request_with_tape("));
+    }
+
+    #[test]
     fn projection_precedes_legacy_commit_and_publish() {
         let finalize_start = TOOL_FLOW_SOURCE
             .find("async fn finalize_prepared_tool_execution_outcome")

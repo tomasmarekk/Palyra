@@ -420,7 +420,6 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
     input_json: &[u8],
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
@@ -439,7 +438,6 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
         input_json,
         tool_catalog_snapshot,
         remaining_tool_budget,
-        allow_sensitive_tools,
         approval_cache_generation,
         flow_control,
         tape_seq,
@@ -494,7 +492,6 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     input_json: &[u8],
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
@@ -673,7 +670,6 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         execution_tool_name.as_str(),
         execution_input_json.as_slice(),
         remaining_tool_budget,
-        allow_sensitive_tools,
         approval_cache_generation,
         flow_control,
         tape_seq,
@@ -1934,7 +1930,6 @@ async fn prepare_run_stream_tool_proposal_execution(
     tool_name: &str,
     input_json: &[u8],
     remaining_tool_budget: &mut u32,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
@@ -1962,7 +1957,6 @@ async fn prepare_run_stream_tool_proposal_execution(
         tool_name,
         input_json,
         remaining_tool_budget,
-        allow_sensitive_tools,
         approval_cache_generation,
         flow_control,
         tape_seq,
@@ -2115,7 +2109,6 @@ async fn resolve_run_stream_tool_gate_approval(
     tool_name: &str,
     input_json: &[u8],
     remaining_tool_budget: &mut u32,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
@@ -2146,7 +2139,6 @@ async fn resolve_run_stream_tool_gate_approval(
         approval_subject_id.as_str(),
         proposal_approval_required,
         &backend_selection,
-        allow_sensitive_tools,
         approval_cache_generation,
         flow_control,
         tape_seq,
@@ -2302,33 +2294,13 @@ async fn resolve_run_stream_tool_approval_outcome(
     approval_subject_id: &str,
     proposal_approval_required: bool,
     backend_selection: &ToolProposalBackendSelection,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
 ) -> Result<Option<ToolApprovalOutcome>, Status> {
-    // Approval gate precedence: (1) explicit allow-sensitive-tools bypass,
-    // (2) cached session-scoped decision, (3) no approval needed, (4)
-    // interactive prompt with a hard response timeout. Every resolved outcome
-    // is echoed to the stream and tape so replay shows who allowed what.
-    if proposal_approval_required && allow_sensitive_tools {
-        let outcome = allow_sensitive_tools_approval_outcome();
-        send_tool_approval_response_with_tape(
-            sender,
-            runtime_state,
-            run_id,
-            tape_seq,
-            proposal_id,
-            outcome.approval_id.as_str(),
-            outcome.approved,
-            outcome.reason.as_str(),
-            outcome.decision_scope,
-            outcome.decision_scope_ttl_ms,
-        )
-        .await?;
-        return Ok(Some(outcome));
-    }
-
+    // A run may expose sensitive tools to the model, but only a host-owned
+    // decision can grant a specific proposal. The request-level exposure flag
+    // therefore never enters this approval stage.
     let cached_approval_outcome = resolve_cached_tool_approval_for_proposal(
         runtime_state,
         request_context,
@@ -2576,17 +2548,6 @@ fn tool_execution_timeout(runtime_state: &GatewayRuntimeState, tool_name: &str) 
         configured.max(Duration::from_secs(1))
     } else {
         configured
-    }
-}
-
-fn allow_sensitive_tools_approval_outcome() -> ToolApprovalOutcome {
-    ToolApprovalOutcome {
-        approval_id: Ulid::new().to_string(),
-        approved: true,
-        reason: "approved_by_run_stream_allow_sensitive_tools".to_owned(),
-        decision: crate::journal::ApprovalDecision::Allow,
-        decision_scope: crate::journal::ApprovalDecisionScope::Once,
-        decision_scope_ttl_ms: None,
     }
 }
 
@@ -5160,17 +5121,17 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_sensitive_tools_approval_outcome, append_process_progress_backpressure_tape_event,
-        classify_tool_parallelism, classify_tool_result_replay_safety,
-        commit_run_stream_tool_execution_outcome, drain_parallel_tool_group_after_cancel,
-        drain_parallel_tool_group_after_error, finalize_drained_tool_execution_before_error,
-        process_progress_channel_for_tool, process_progress_status_message,
-        projection_policy_contract, retain_commit_projected_tool_execution_outcome,
-        sessions_spawn_tape_payload, settle_failed_tool_finalization,
-        tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
-        workspace_spill_unavailable_projection, OrchestratorTapeAppendRequest,
-        ParallelToolExecutionTaskOutcome, RunStreamPreparedToolExecution, ToolParallelism,
-        TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
+        append_process_progress_backpressure_tape_event, classify_tool_parallelism,
+        classify_tool_result_replay_safety, commit_run_stream_tool_execution_outcome,
+        drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
+        finalize_drained_tool_execution_before_error, process_progress_channel_for_tool,
+        process_progress_status_message, projection_policy_contract,
+        retain_commit_projected_tool_execution_outcome, sessions_spawn_tape_payload,
+        settle_failed_tool_finalization, tool_side_effect_cleanup_outcome_request,
+        workspace_spill_policy_grants_sensitivity, workspace_spill_unavailable_projection,
+        OrchestratorTapeAppendRequest, ParallelToolExecutionTaskOutcome,
+        RunStreamPreparedToolExecution, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
+        TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
     use crate::application::tool_governance::build_tool_call_signature;
     use crate::application::tool_registry::{
@@ -5180,7 +5141,6 @@ mod tests {
     use crate::execution_backends::{ExecutionBackendPreference, ExecutionBackendResolution};
     use crate::gateway::runtime::tests::{start_test_orchestrator_run, test_runtime_state};
     use crate::gateway::GatewayRuntimeState;
-    use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolDecision, ToolExecutionOutcome};
     use crate::transport::grpc::auth::RequestContext;
@@ -5192,7 +5152,6 @@ mod tests {
         SideEffectFenceState, SideEffectFenceV1, SideEffectRestartPolicy, ToolResultArtifactRef,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
     };
-    use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -5965,21 +5924,6 @@ mod tests {
         assert_eq!(payload["transcript_ref"]["run_id"], "child-run");
         assert!(!payload_text.contains("access_token"));
         assert!(!payload_text.contains("secret"));
-    }
-
-    #[test]
-    fn allow_sensitive_tools_outcome_is_explicit_once_approval() {
-        let outcome = allow_sensitive_tools_approval_outcome();
-
-        assert!(outcome.approved);
-        assert_eq!(outcome.decision, ApprovalDecision::Allow);
-        assert_eq!(outcome.decision_scope, ApprovalDecisionScope::Once);
-        assert!(
-            outcome.reason.contains("allow_sensitive_tools"),
-            "approval reason should identify the run-stream bypass"
-        );
-        validate_canonical_id(outcome.approval_id.as_str())
-            .expect("auto approval id should be canonical");
     }
 
     #[test]

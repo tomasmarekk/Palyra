@@ -4948,7 +4948,6 @@ async fn process_run_stream_message_inner(
             base_provider_request,
             tool_catalog,
             remaining_tool_budget,
-            allow_sensitive_tools: message.allow_sensitive_tools,
             approval_cache_generation: *active_approval_cache_generation,
             flow_control: active_flow_control.as_ref().ok_or_else(|| {
                 Status::internal("V2 runtime requires an active flow-control scope")
@@ -6074,7 +6073,6 @@ async fn process_run_stream_message_inner(
             provider_response,
             &tool_catalog_snapshot,
             remaining_tool_budget,
-            message.allow_sensitive_tools,
             *active_approval_cache_generation,
             flow_control,
             tape_seq,
@@ -6836,7 +6834,6 @@ async fn process_run_stream_provider_response(
     provider_response: ProviderResponse,
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
-    allow_sensitive_tools: bool,
     approval_cache_generation: Option<u64>,
     flow_control: &RunStreamFlowControl,
     tape_seq: &mut i64,
@@ -6910,7 +6907,6 @@ async fn process_run_stream_provider_response(
         provider_response.events,
         tool_catalog_snapshot,
         remaining_tool_budget,
-        allow_sensitive_tools,
         approval_cache_generation,
         flow_control,
         tape_seq,
