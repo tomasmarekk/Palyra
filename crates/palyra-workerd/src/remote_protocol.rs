@@ -273,9 +273,19 @@ impl WorkerTaskEnvelope {
                 .map(|entry| ContentAddressedArtifact {
                     artifact_id: entry.path.clone(),
                     sha256: entry.sha256.clone(),
-                    size_bytes: u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX),
+                    size_bytes: if matches!(
+                        entry.kind,
+                        crate::WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile
+                    ) {
+                        8
+                    } else {
+                        u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX)
+                    },
                     media_type: match entry.kind {
                         crate::WorkerRemoteWorkspaceEntryKind::File => "application/octet-stream",
+                        crate::WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile => {
+                            "application/vnd.palyra.workspace-file-metadata"
+                        }
                         crate::WorkerRemoteWorkspaceEntryKind::Directory => {
                             "application/vnd.palyra.workspace-directory"
                         }

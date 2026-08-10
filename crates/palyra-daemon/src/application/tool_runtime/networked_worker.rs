@@ -1990,7 +1990,53 @@ fn add_remote_workspace_file(
             path: key,
             kind: WorkerRemoteWorkspaceEntryKind::File,
             sha256: sha256_hex(bytes.as_slice()),
+            source_size_bytes: None,
             bytes,
+        },
+    );
+    enforce_remote_workspace_entry_limit(entries)
+}
+
+fn add_remote_workspace_file_metadata(
+    root: &Path,
+    relative: &Path,
+    entries: &mut BTreeMap<String, WorkerRemoteWorkspaceEntry>,
+) -> Result<(), String> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| {
+        format!("networked worker failed to inspect {}: {error}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "networked worker scoped metadata path is not a regular file: {}",
+            relative.display()
+        ));
+    }
+    if remote_workspace_path_may_contain_secrets(relative) {
+        return Err(format!(
+            "networked worker scoped transfer blocks secret-bearing path {}",
+            relative.display()
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|error| {
+        format!("networked worker failed to resolve {}: {error}", path.display())
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "networked worker scoped metadata path escapes the workspace: {}",
+            relative.display()
+        ));
+    }
+    let key = remote_workspace_path_string(relative)?;
+    let source_size_bytes = metadata.len();
+    entries.insert(
+        key.clone(),
+        WorkerRemoteWorkspaceEntry {
+            path: key,
+            kind: WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile,
+            sha256: sha256_hex(source_size_bytes.to_be_bytes().as_slice()),
+            source_size_bytes: Some(source_size_bytes),
+            bytes: Vec::new(),
         },
     );
     enforce_remote_workspace_entry_limit(entries)
@@ -2042,7 +2088,7 @@ fn add_remote_workspace_directory_listing(
         if file_type.is_dir() {
             add_remote_workspace_directory_entry(child_relative.as_path(), entries)?;
         } else if file_type.is_file() {
-            add_remote_workspace_file(root, child_relative.as_path(), entries)?;
+            add_remote_workspace_file_metadata(root, child_relative.as_path(), entries)?;
         }
     }
     Ok(())
@@ -2108,6 +2154,7 @@ fn add_remote_workspace_directory_entry(
             path: key,
             kind: WorkerRemoteWorkspaceEntryKind::Directory,
             sha256: sha256_hex(&[]),
+            source_size_bytes: None,
             bytes: Vec::new(),
         },
     );
@@ -2972,8 +3019,8 @@ mod tests {
         computer_use::ComputerUseTaskContract, WorkerArtifactTransport, WorkerCleanupReport,
         WorkerLease, WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolKind,
         WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope,
-        WorkerRemoteWorkspaceTransfer, WorkerRunGrant, WorkerWorkspaceScope,
-        WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        WorkerRemoteWorkspaceEntryKind, WorkerRemoteWorkspaceTransfer, WorkerRunGrant,
+        WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
     };
     use serde_json::{json, Value};
 
@@ -3423,8 +3470,9 @@ mod tests {
     }
 
     #[test]
-    fn scoped_workspace_transfer_hashes_exact_bytes_and_blocks_secret_paths() {
+    fn scoped_workspace_transfer_limits_content_to_tools_that_need_it() {
         let workspace = tempfile::tempdir().expect("workspace");
+        let listing_contents = b"authorization=PALYRA_TEST_SECRET";
         std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
         std::fs::write(workspace.path().join("src/lib.rs"), b"pub fn worker() {}\n")
             .expect("source fixture");
@@ -3434,7 +3482,7 @@ mod tests {
         )
         .expect("embedded secret fixture");
         std::fs::create_dir_all(workspace.path().join("listing")).expect("listing directory");
-        std::fs::write(workspace.path().join("listing/item.txt"), b"12345")
+        std::fs::write(workspace.path().join("listing/item.txt"), listing_contents)
             .expect("listing fixture");
         std::fs::write(workspace.path().join(".env"), b"PALYRA_TEST_SECRET=blocked")
             .expect("secret fixture");
@@ -3474,8 +3522,24 @@ mod tests {
             .iter()
             .find(|entry| entry.path == "listing/item.txt")
             .expect("listed file entry");
-        assert_eq!(listed_file.bytes, b"12345");
-        assert_eq!(listed_file.sha256, sha256_hex(b"12345"));
+        assert_eq!(listed_file.kind, WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile);
+        assert!(listed_file.bytes.is_empty());
+        assert_eq!(
+            listed_file.source_size_bytes,
+            Some(u64::try_from(listing_contents.len()).expect("listing size"))
+        );
+        assert_eq!(
+            listed_file.sha256,
+            sha256_hex(
+                u64::try_from(listing_contents.len())
+                    .expect("listing size")
+                    .to_be_bytes()
+                    .as_slice()
+            )
+        );
+        assert!(!serde_json::to_string(&listing)
+            .expect("listing transfer JSON")
+            .contains("PALYRA_TEST_SECRET"));
 
         let secret = build_scoped_networked_worker_workspace(
             workspace.path(),

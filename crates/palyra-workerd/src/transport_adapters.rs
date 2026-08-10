@@ -1434,6 +1434,7 @@ mod tests {
             path: "note.txt".to_owned(),
             kind: WorkerRemoteWorkspaceEntryKind::File,
             sha256: hex::encode(Sha256::digest(b"hello")),
+            source_size_bytes: None,
             bytes: b"hello".to_vec(),
         };
         let mut request = WorkerRemoteToolRequestEnvelope {

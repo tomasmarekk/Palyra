@@ -408,6 +408,8 @@ impl WorkerRemoteWorkspaceTransferMode {
 pub enum WorkerRemoteWorkspaceEntryKind {
     /// Regular file whose exact bytes are carried by the bundle.
     File,
+    /// Regular file represented only by listing-safe metadata.
+    MetadataOnlyFile,
     /// Directory required to preserve the scoped tree shape.
     Directory,
 }
@@ -420,9 +422,12 @@ pub struct WorkerRemoteWorkspaceEntry {
     pub path: String,
     /// Entry kind used during materialization.
     pub kind: WorkerRemoteWorkspaceEntryKind,
-    /// SHA-256 of file bytes, or the SHA-256 of an empty byte slice for directories.
+    /// SHA-256 of file bytes, metadata size, or an empty byte slice for directories.
     pub sha256: String,
-    /// Exact bounded file bytes. Directories must carry an empty vector.
+    /// Original file size for metadata-only directory listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_size_bytes: Option<u64>,
+    /// Exact bounded file bytes. Metadata-only entries and directories must be empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bytes: Vec<u8>,
 }
@@ -457,7 +462,8 @@ impl WorkerRemoteWorkspaceTransfer {
     ///
     /// # Errors
     /// Returns a typed contract error when an entry path escapes the scope, a
-    /// digest is invalid, directory bytes are present, or aggregate limits are exceeded.
+    /// digest is invalid, metadata-only/directory bytes are present, or aggregate limits are
+    /// exceeded.
     pub fn scoped(
         workspace_manifest_sha256: String,
         scoped_entries: Vec<WorkerRemoteWorkspaceEntry>,
@@ -511,16 +517,40 @@ impl WorkerRemoteWorkspaceTransfer {
             }
             previous_path = Some(entry.path.as_str());
             validate_sha256_hex(entry.sha256.as_str(), "workspace_entry_sha256")?;
-            if matches!(entry.kind, WorkerRemoteWorkspaceEntryKind::Directory) {
-                if !entry.bytes.is_empty() || entry.sha256 != sha256_hex(&[]) {
-                    return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
-                        path: entry.path.clone(),
-                    });
+            match entry.kind {
+                WorkerRemoteWorkspaceEntryKind::File => {
+                    if entry.source_size_bytes.is_some()
+                        || entry.sha256 != sha256_hex(entry.bytes.as_slice())
+                    {
+                        return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                            path: entry.path.clone(),
+                        });
+                    }
                 }
-            } else if entry.sha256 != sha256_hex(entry.bytes.as_slice()) {
-                return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
-                    path: entry.path.clone(),
-                });
+                WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile => {
+                    let Some(source_size_bytes) = entry.source_size_bytes else {
+                        return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                            path: entry.path.clone(),
+                        });
+                    };
+                    if !entry.bytes.is_empty()
+                        || entry.sha256 != sha256_hex(source_size_bytes.to_be_bytes().as_slice())
+                    {
+                        return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                            path: entry.path.clone(),
+                        });
+                    }
+                }
+                WorkerRemoteWorkspaceEntryKind::Directory => {
+                    if entry.source_size_bytes.is_some()
+                        || !entry.bytes.is_empty()
+                        || entry.sha256 != sha256_hex(&[])
+                    {
+                        return Err(WorkerRemoteToolContractError::WorkspaceEntryDigestMismatch {
+                            path: entry.path.clone(),
+                        });
+                    }
+                }
             }
             total_bytes = total_bytes
                 .checked_add(entry.bytes.len())
@@ -730,6 +760,18 @@ impl WorkerRemoteToolRequestEnvelope {
                 actual: self.tool_kind.as_str(),
             });
         }
+        let workspace_entry_kind_is_invalid =
+            self.workspace_transfer.scoped_entries.iter().any(|entry| match expected_kind {
+                WorkerRemoteToolKind::FsList => {
+                    matches!(entry.kind, WorkerRemoteWorkspaceEntryKind::File)
+                }
+                _ => matches!(entry.kind, WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile),
+            });
+        if workspace_entry_kind_is_invalid {
+            return Err(WorkerRemoteToolContractError::WorkspaceEntryKindNotAllowed {
+                tool_name: self.tool_name.clone(),
+            });
+        }
         if self.lease.worker_id != self.worker_identity.worker_id {
             return Err(WorkerRemoteToolContractError::WorkerIdentityMismatch {
                 expected: self.lease.worker_id.clone(),
@@ -915,6 +957,8 @@ pub enum WorkerRemoteToolContractError {
     WorkspaceEntriesNotCanonical,
     #[error("worker remote scoped workspace entry digest mismatch: {path}")]
     WorkspaceEntryDigestMismatch { path: String },
+    #[error("worker remote scoped workspace entry kind is not allowed for tool '{tool_name}'")]
+    WorkspaceEntryKindNotAllowed { tool_name: String },
     #[error("worker remote scoped workspace bundle exceeds its entry or byte limit")]
     WorkspaceBundleLimitExceeded,
     #[error("worker remote workspace lease allowlist is missing or invalid")]

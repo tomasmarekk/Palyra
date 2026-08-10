@@ -97,6 +97,7 @@ fn desktop_adapter_executes_the_same_scoped_stdio_protocol() {
         path: "note.txt".to_owned(),
         kind: WorkerRemoteWorkspaceEntryKind::File,
         sha256: sha256_hex(b"hello desktop adapter"),
+        source_size_bytes: None,
         bytes: b"hello desktop adapter".to_vec(),
     };
     let mut request = WorkerRemoteToolRequestEnvelope {

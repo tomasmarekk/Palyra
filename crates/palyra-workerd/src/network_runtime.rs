@@ -3,6 +3,7 @@
 //! module enforces the canonical task, workspace, heartbeat, and outcome contracts.
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -240,6 +241,7 @@ pub struct ReferenceWorkerResponse {
 pub struct ReferenceNetworkWorker {
     worker_id: String,
     workspace_root: PathBuf,
+    metadata_file_sizes: BTreeMap<PathBuf, u64>,
 }
 
 impl ReferenceNetworkWorker {
@@ -282,11 +284,15 @@ impl ReferenceNetworkWorker {
         }
         let workspace = tempfile::tempdir()
             .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?;
-        materialize_scoped_workspace(workspace.path(), request)?;
+        let metadata_file_sizes = materialize_scoped_workspace(workspace.path(), request)?;
         if matches!(request.tool_kind, crate::WorkerRemoteToolKind::ComputerUse) {
             validate_computer_use_remote_scopes(request)?;
         }
-        let worker = Self::new(request.lease.worker_id.clone(), workspace.path().to_path_buf())?;
+        let worker = Self::new_with_metadata(
+            request.lease.worker_id.clone(),
+            workspace.path().to_path_buf(),
+            metadata_file_sizes,
+        )?;
         let response = worker.execute_with_authority(
             protocol,
             request.lease.process_executable_allowlist.as_slice(),
@@ -342,6 +348,14 @@ impl ReferenceNetworkWorker {
         worker_id: String,
         workspace_root: PathBuf,
     ) -> Result<Self, NetworkWorkerRuntimeError> {
+        Self::new_with_metadata(worker_id, workspace_root, BTreeMap::new())
+    }
+
+    fn new_with_metadata(
+        worker_id: String,
+        workspace_root: PathBuf,
+        metadata_file_sizes: BTreeMap<PathBuf, u64>,
+    ) -> Result<Self, NetworkWorkerRuntimeError> {
         validate_identity(worker_id.as_str(), "worker_id")?;
         let workspace_root = workspace_root
             .canonicalize()
@@ -351,7 +365,7 @@ impl ReferenceNetworkWorker {
                 "worker workspace root is not a directory".to_owned(),
             ));
         }
-        Ok(Self { worker_id, workspace_root })
+        Ok(Self { worker_id, workspace_root, metadata_file_sizes })
     }
 
     /// Executes one canonical task with bounded output and fail-closed cleanup evidence.
@@ -674,14 +688,17 @@ impl ReferenceNetworkWorker {
                     format!("{}/{}", input.path.trim_end_matches('/'), name)
                 };
                 let size_bytes = if file_type.is_file() {
-                    Some(
-                        value
-                            .metadata()
-                            .map_err(|error| {
-                                NetworkWorkerRuntimeError::Workspace(error.to_string())
-                            })?
-                            .len(),
-                    )
+                    self.metadata_file_sizes
+                        .get(Path::new(relative_path.as_str()))
+                        .copied()
+                        .map_or_else(
+                            || {
+                                value.metadata().map(|metadata| Some(metadata.len())).map_err(
+                                    |error| NetworkWorkerRuntimeError::Workspace(error.to_string()),
+                                )
+                            },
+                            |size| Ok(Some(size)),
+                        )?
                 } else {
                     None
                 };
@@ -1291,11 +1308,12 @@ fn portable_path_allowed_by_lease(path: &str, allowed_paths: &[String]) -> bool 
 fn materialize_scoped_workspace(
     workspace_root: &Path,
     request: &WorkerRemoteToolRequestEnvelope,
-) -> Result<(), NetworkWorkerRuntimeError> {
+) -> Result<BTreeMap<PathBuf, u64>, NetworkWorkerRuntimeError> {
     request
         .workspace_transfer
         .canonical_bundle_sha256()
         .map_err(|error| NetworkWorkerRuntimeError::Input(error.to_string()))?;
+    let mut metadata_file_sizes = BTreeMap::new();
     for entry in &request.workspace_transfer.scoped_entries {
         let path = workspace_root.join(entry.path.as_str());
         if let Some(parent) = path.parent() {
@@ -1309,9 +1327,19 @@ fn materialize_scoped_workspace(
                 fs::write(path.as_path(), entry.bytes.as_slice())
                     .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?
             }
+            WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile => {
+                fs::write(path.as_path(), [])
+                    .map_err(|error| NetworkWorkerRuntimeError::Workspace(error.to_string()))?;
+                let size_bytes = entry.source_size_bytes.ok_or_else(|| {
+                    NetworkWorkerRuntimeError::Input(
+                        "metadata-only workspace file is missing its source size".to_owned(),
+                    )
+                })?;
+                metadata_file_sizes.insert(PathBuf::from(entry.path.as_str()), size_bytes);
+            }
         }
     }
-    Ok(())
+    Ok(metadata_file_sizes)
 }
 
 fn collect_regular_files(
@@ -1416,6 +1444,50 @@ mod tests {
                 .and_then(|name| name.to_str()),
             Some("note.txt")
         );
+    }
+
+    #[test]
+    fn remote_list_uses_signed_file_metadata_without_materializing_contents() {
+        let content_bearing_request = scoped_request(
+            "palyra.fs.list_dir",
+            WorkerRemoteToolKind::FsList,
+            r#"{"path":""}"#,
+            b"must not cross the transport",
+        );
+        assert!(matches!(
+            content_bearing_request.validate(60_000),
+            Err(crate::WorkerRemoteToolContractError::WorkspaceEntryKindNotAllowed { .. })
+        ));
+
+        let source_size_bytes = 27_u64;
+        let entry = WorkerRemoteWorkspaceEntry {
+            path: "note.txt".to_owned(),
+            kind: WorkerRemoteWorkspaceEntryKind::MetadataOnlyFile,
+            sha256: sha256_hex(source_size_bytes.to_be_bytes().as_slice()),
+            source_size_bytes: Some(source_size_bytes),
+            bytes: Vec::new(),
+        };
+        let mut request = scoped_request(
+            "palyra.fs.list_dir",
+            WorkerRemoteToolKind::FsList,
+            r#"{"path":""}"#,
+            b"",
+        );
+        request.workspace_transfer =
+            WorkerRemoteWorkspaceTransfer::scoped("7".repeat(64), vec![entry])
+                .expect("metadata-only workspace");
+        request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
+
+        let result = ReferenceNetworkWorker::execute_remote_request(&request, 60_000)
+            .expect("metadata-only listing");
+        let output: serde_json::Value =
+            serde_json::from_str(result.output_json.as_str()).expect("listing output");
+        let listed =
+            output["entries"].as_array().and_then(|entries| entries.first()).expect("listed file");
+
+        assert_eq!(listed["name"], "note.txt");
+        assert_eq!(listed["kind"], "file");
+        assert_eq!(listed["size_bytes"], source_size_bytes);
     }
 
     #[test]
@@ -1639,6 +1711,7 @@ mod tests {
             path: "note.txt".to_owned(),
             kind: WorkerRemoteWorkspaceEntryKind::File,
             sha256: sha256_hex(file_bytes),
+            source_size_bytes: None,
             bytes: file_bytes.to_vec(),
         };
         let workspace_transfer = WorkerRemoteWorkspaceTransfer::scoped("7".repeat(64), vec![entry])
