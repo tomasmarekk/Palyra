@@ -429,15 +429,15 @@ enum E2eReporterExistingInstallState {
 }
 
 fn seed_e2e_skill_fixtures(state_root: &Path) -> Result<E2eSkillFixtureSeedReport> {
-    ensure_e2e_harness_state_root(state_root)?;
+    let state_root = ensure_e2e_harness_state_root(state_root)?;
     let skills_root = state_root.join("skills");
     let artifact = build_e2e_reporter_skill_artifact()?;
+    ensure_e2e_reporter_fixture_trust_store(state_root.as_path(), &artifact)?;
     let installed = ensure_e2e_reporter_skill_installed(skills_root.as_path(), &artifact)?;
-    ensure_e2e_reporter_fixture_trust_store(state_root, &artifact)?;
     let journal_path = state_root.join(DEFAULT_JOURNAL_DB_PATH);
     upsert_e2e_reporter_skill_status(journal_path.as_path())?;
     Ok(E2eSkillFixtureSeedReport {
-        state_root: state_root.to_path_buf(),
+        state_root,
         skills_root,
         journal_path,
         installed,
@@ -445,11 +445,50 @@ fn seed_e2e_skill_fixtures(state_root: &Path) -> Result<E2eSkillFixtureSeedRepor
     })
 }
 
-fn ensure_e2e_harness_state_root(state_root: &Path) -> Result<()> {
-    if path_has_component(state_root, "Palyra-TestHarness") {
-        return Ok(());
+fn ensure_e2e_harness_state_root(state_root: &Path) -> Result<PathBuf> {
+    let mut existing = if state_root.is_absolute() {
+        state_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for E2E harness state root")?
+            .join(state_root)
+    };
+    let mut missing_tail = Vec::new();
+    while !existing.exists() {
+        let leaf = existing.file_name().ok_or_else(|| {
+            anyhow!(
+                "skills seed-e2e-fixtures could not resolve state root {}",
+                state_root.display()
+            )
+        })?;
+        missing_tail.push(leaf.to_os_string());
+        if !existing.pop() {
+            anyhow::bail!(
+                "skills seed-e2e-fixtures could not resolve state root {}",
+                state_root.display()
+            );
+        }
     }
-    anyhow::bail!("skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots")
+    let mut resolved = fs::canonicalize(existing.as_path()).with_context(|| {
+        format!("failed to canonicalize E2E harness state-root ancestor {}", existing.display())
+    })?;
+    for component in missing_tail.iter().rev() {
+        resolved.push(component);
+    }
+
+    if !path_has_component(resolved.as_path(), "Palyra-TestHarness") {
+        anyhow::bail!("skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots");
+    }
+    fs::create_dir_all(resolved.as_path()).with_context(|| {
+        format!("failed to create E2E harness state root {}", resolved.display())
+    })?;
+    let canonical = fs::canonicalize(resolved.as_path()).with_context(|| {
+        format!("failed to canonicalize E2E harness state root {}", resolved.display())
+    })?;
+    if !path_has_component(canonical.as_path(), "Palyra-TestHarness") {
+        anyhow::bail!("skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots");
+    }
+    Ok(canonical)
 }
 
 fn path_has_component(path: &Path, expected: &str) -> bool {
@@ -630,6 +669,14 @@ fn ensure_e2e_reporter_fixture_trust_store(
     artifact: &E2eReporterSkillFixtureArtifact,
 ) -> Result<()> {
     let trust_store_path = state_root.join("skills").join("trust-store.json");
+    let vault = open_e2e_harness_vault(state_root)?;
+    verify_or_initialize_trust_store_integrity_with_vault(trust_store_path.as_path(), &vault)
+        .with_context(|| {
+            format!(
+                "failed to verify trust-store integrity before seeding e2e fixture at {}",
+                trust_store_path.display()
+            )
+        })?;
     let mut trust_store = SkillTrustStore::load(trust_store_path.as_path()).with_context(|| {
         format!("failed to load skills trust store {}", trust_store_path.display())
     })?;
@@ -639,7 +686,6 @@ fn ensure_e2e_reporter_fixture_trust_store(
     trust_store.save(trust_store_path.as_path()).with_context(|| {
         format!("failed to save skills trust store {}", trust_store_path.display())
     })?;
-    let vault = open_e2e_harness_vault(state_root)?;
     update_trust_store_integrity_digest_with_vault(trust_store_path.as_path(), &vault)
         .with_context(|| {
             format!(
@@ -2994,6 +3040,45 @@ mod tests {
             error.to_string().contains("restricted to Palyra-TestHarness state roots"),
             "error should explain harness restriction: {error}"
         );
+    }
+
+    #[test]
+    fn seed_e2e_skill_fixtures_rejects_tampered_trust_store() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
+        let tempdir = tempfile::tempdir()?;
+        let _vault_env = E2eFixtureVaultEnv::new(tempdir.path());
+        let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
+        seed_e2e_skill_fixtures(state_root.as_path())?;
+        let trust_store_path = state_root.join("skills").join("trust-store.json");
+        let mut tampered = fs::read_to_string(trust_store_path.as_path())?;
+        tampered.push(' ');
+        fs::write(trust_store_path.as_path(), tampered)?;
+
+        let error = seed_e2e_skill_fixtures(state_root.as_path())
+            .expect_err("tampered trust store must not be blessed by reseeding");
+        assert!(
+            format!("{error:#}").contains("trust-store integrity mismatch"),
+            "error should preserve integrity mismatch context: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_e2e_skill_fixtures_rejects_harness_symlink_to_other_root() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let real_root = tempdir.path().join("real-state-root");
+        fs::create_dir_all(real_root.as_path())?;
+        let harness_alias = tempdir.path().join("Palyra-TestHarness");
+        std::os::unix::fs::symlink(real_root.as_path(), harness_alias.as_path())?;
+
+        let error = seed_e2e_skill_fixtures(harness_alias.join("state").as_path())
+            .expect_err("canonical root outside the harness must be rejected");
+        assert!(
+            error.to_string().contains("restricted to Palyra-TestHarness state roots"),
+            "error should explain canonical harness restriction: {error}"
+        );
+        Ok(())
     }
 
     #[test]
