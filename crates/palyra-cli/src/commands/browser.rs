@@ -4544,8 +4544,15 @@ fn emit_browser_value_for_mode(
     mode: BrowserOutputMode,
 ) -> Result<()> {
     match mode {
-        BrowserOutputMode::Json => output::print_json_pretty(value, error_context),
-        BrowserOutputMode::Ndjson => output::print_json_line(value, error_context),
+        BrowserOutputMode::Json | BrowserOutputMode::Ndjson => {
+            let mut redacted = value.clone();
+            redact_browser_output_value(&mut redacted, None);
+            if mode == BrowserOutputMode::Json {
+                output::print_json_pretty(&redacted, error_context)
+            } else {
+                output::print_json_line(&redacted, error_context)
+            }
+        }
         BrowserOutputMode::Text => {
             print!("{text}");
             if !text.ends_with('\n') {
@@ -4940,11 +4947,9 @@ fn quoted_browser_text_field(value: &str) -> String {
     }
 }
 
-// INTENTIONAL: plain `session_id` is absent so the operator-supplied reusable handle
-// survives redaction; only daemon-issued identifiers are hashed.
 fn browser_identifier_kind_for_key(key: &str) -> Option<&'static str> {
     match key {
-        "runtime_session_id" => Some("session"),
+        "session_id" | "runtime_session_id" => Some("session"),
         "active_tab_id" | "tab_id" | "closed_tab_id" => Some("tab"),
         "profile_id" | "active_profile_id" => Some("profile"),
         "artifact_id" => Some("artifact"),
@@ -5882,7 +5887,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_output_redaction_preserves_reusable_session_id() {
+    fn browser_output_redaction_hashes_reusable_session_id() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let runtime_session_id = "session-b66347f61acd";
         let mut value = json!({
@@ -5893,7 +5898,13 @@ mod tests {
 
         redact_browser_output_value(&mut value, None);
 
-        assert_eq!(value.get("session_id").and_then(Value::as_str), Some(session_id));
+        assert!(
+            value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.starts_with("session-") && value != session_id),
+            "session id should be redacted: {value}"
+        );
         assert!(
             value
                 .get("runtime_session_id")
