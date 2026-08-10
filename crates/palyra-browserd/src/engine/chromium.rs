@@ -6,7 +6,7 @@
 //! through [`run_chromium_blocking`].
 
 use crate::*;
-use headless_chrome::protocol::cdp::{types::Event, Browser, Emulation};
+use headless_chrome::protocol::cdp::{types::Event, Browser, Emulation, Page};
 use headless_chrome::{
     browser::tab::ModifierKey,
     types::{Bounds, PrintToPdfOptions},
@@ -2220,6 +2220,7 @@ async fn launch_chromium_session_runtime(
                 health,
                 private_target_policy,
                 security_incident,
+                device_scale_factor: 1.0,
                 staged_upload_bytes: Arc::new(AtomicU64::new(0)),
                 _profile_dir: profile_dir,
                 _proxy: None,
@@ -4359,65 +4360,48 @@ fn chromium_u32_metric_option(value: &serde_json::Value, field: &str) -> Option<
         .filter(|value| *value > 0)
 }
 
-fn chromium_u32_metric_prefer(
-    value: &serde_json::Value,
-    preferred_field: &str,
-    fallback_field: &str,
-) -> Option<u32> {
-    chromium_u32_metric_option(value, preferred_field)
-        .or_else(|| chromium_u32_metric_option(value, fallback_field))
+fn chromium_positive_f64_metric(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    value.trunc().min(f64::from(u32::MAX)) as u32
 }
 
-fn chromium_u32_metric(value: &serde_json::Value, field: &str) -> u32 {
-    chromium_u32_metric_option(value, field).unwrap_or(0)
-}
-
-fn parse_chromium_layout_metrics(value: serde_json::Value) -> ChromiumLayoutMetrics {
-    let viewport_width =
-        chromium_u32_metric_prefer(&value, "viewport_width", "visual_viewport_width").unwrap_or(0);
-    let viewport_height =
-        chromium_u32_metric_prefer(&value, "viewport_height", "visual_viewport_height")
-            .unwrap_or(0);
-    let document_scroll_width = chromium_u32_metric(&value, "document_scroll_width");
-    let document_scroll_height = chromium_u32_metric(&value, "document_scroll_height");
-    let document_client_width = chromium_u32_metric(&value, "document_client_width");
-    let document_client_height = chromium_u32_metric(&value, "document_client_height");
-    let device_scale_factor = value
-        .get("device_scale_factor")
-        .and_then(serde_json::Value::as_f64)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(1.0);
-    let measured_horizontal_overflow = {
-        let comparison_width =
-            if viewport_width > 0 { viewport_width } else { document_client_width };
-        document_scroll_width > 0
-            && comparison_width > 0
-            && document_scroll_width > comparison_width.saturating_add(1)
+fn chromium_layout_metrics_from_cdp(
+    layout_viewport_width: u32,
+    layout_viewport_height: u32,
+    visual_viewport_width: f64,
+    visual_viewport_height: f64,
+    content_width: f64,
+    content_height: f64,
+    device_scale_factor: f64,
+) -> ChromiumLayoutMetrics {
+    let viewport_width = if layout_viewport_width > 0 {
+        layout_viewport_width
+    } else {
+        chromium_positive_f64_metric(visual_viewport_width)
     };
-    let horizontal_overflow =
-        value.get("horizontal_overflow").and_then(serde_json::Value::as_bool).unwrap_or(false)
-            || measured_horizontal_overflow;
-    let measured_vertical_overflow = {
-        let comparison_height =
-            if viewport_height > 0 { viewport_height } else { document_client_height };
-        document_scroll_height > 0
-            && comparison_height > 0
-            && document_scroll_height > comparison_height.saturating_add(1)
+    let viewport_height = if layout_viewport_height > 0 {
+        layout_viewport_height
+    } else {
+        chromium_positive_f64_metric(visual_viewport_height)
     };
-    let vertical_overflow =
-        value.get("vertical_overflow").and_then(serde_json::Value::as_bool).unwrap_or(false)
-            || measured_vertical_overflow;
-
+    let document_scroll_width = chromium_positive_f64_metric(content_width).max(viewport_width);
+    let document_scroll_height = chromium_positive_f64_metric(content_height).max(viewport_height);
     ChromiumLayoutMetrics {
         viewport_width,
         viewport_height,
-        device_scale_factor,
+        device_scale_factor: if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+            device_scale_factor
+        } else {
+            1.0
+        },
         document_scroll_width,
         document_scroll_height,
-        document_client_width,
-        document_client_height,
-        horizontal_overflow,
-        vertical_overflow,
+        document_client_width: viewport_width,
+        document_client_height: viewport_height,
+        horizontal_overflow: document_scroll_width > viewport_width.saturating_add(1),
+        vertical_overflow: document_scroll_height > viewport_height.saturating_add(1),
     }
 }
 
@@ -4632,7 +4616,7 @@ pub(crate) async fn chromium_screenshot(
 /// Reads layout/visual viewport metrics and overflow flags from the active tab.
 ///
 /// # Errors
-/// Returns lookup sentinels, remote-IP guard incidents, or a script evaluation
+/// Returns lookup sentinels, remote-IP guard incidents, or a CDP transport
 /// failure.
 pub(crate) async fn chromium_layout_metrics(
     runtime: &BrowserRuntimeState,
@@ -4640,43 +4624,26 @@ pub(crate) async fn chromium_layout_metrics(
 ) -> Result<ChromiumLayoutMetrics, String> {
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    let device_scale_factor = runtime
+        .chromium_sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.device_scale_factor)
+        .ok_or_else(|| "chromium_session_not_found".to_owned())?;
     let value = run_chromium_blocking("chromium layout metrics", move || {
-        let raw_value = tab
-            .evaluate(
-                r#"JSON.stringify((() => {
-              const doc = document.documentElement || {};
-              const body = document.body || {};
-              const scrollWidth = Math.max(doc.scrollWidth || 0, body.scrollWidth || 0);
-              const scrollHeight = Math.max(doc.scrollHeight || 0, body.scrollHeight || 0);
-              const clientWidth = Math.max(doc.clientWidth || 0, window.innerWidth || 0);
-              const clientHeight = Math.max(doc.clientHeight || 0, window.innerHeight || 0);
-              const visualViewport = window.visualViewport || {};
-              const visualViewportWidth = Math.trunc(visualViewport.width || 0);
-              const visualViewportHeight = Math.trunc(visualViewport.height || 0);
-              const layoutViewportWidth = Math.trunc(window.innerWidth || clientWidth || 0);
-              const layoutViewportHeight = Math.trunc(window.innerHeight || clientHeight || 0);
-              const effectiveViewportWidth = layoutViewportWidth || visualViewportWidth;
-              const effectiveViewportHeight = layoutViewportHeight || visualViewportHeight;
-              return {
-                viewport_width: layoutViewportWidth,
-                viewport_height: layoutViewportHeight,
-                visual_viewport_width: visualViewportWidth,
-                visual_viewport_height: visualViewportHeight,
-                device_scale_factor: Number(window.devicePixelRatio || 1),
-                document_scroll_width: Math.trunc(scrollWidth),
-                document_scroll_height: Math.trunc(scrollHeight),
-                document_client_width: Math.trunc(clientWidth),
-                document_client_height: Math.trunc(clientHeight),
-                horizontal_overflow: scrollWidth > effectiveViewportWidth + 1,
-                vertical_overflow: scrollHeight > effectiveViewportHeight + 1
-              };
-            })())"#,
-                false,
-            )
-            .map_err(|error| format!("failed to read Chromium layout metrics: {error}"))?
-            .value
-            .unwrap_or(serde_json::Value::Null);
-        Ok(parse_chromium_layout_metrics(decode_chromium_json_script_value(raw_value)))
+        let metrics = tab
+            .call_method(Page::GetLayoutMetrics(None))
+            .map_err(|error| format!("failed to read Chromium layout metrics: {error}"))?;
+        Ok(chromium_layout_metrics_from_cdp(
+            metrics.css_layout_viewport.client_width,
+            metrics.css_layout_viewport.client_height,
+            metrics.css_visual_viewport.client_width,
+            metrics.css_visual_viewport.client_height,
+            metrics.css_content_size.width,
+            metrics.css_content_size.height,
+            device_scale_factor,
+        ))
     })
     .await?;
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
@@ -6038,6 +6005,9 @@ pub(crate) async fn set_viewport_with_chromium(
                     error,
                 };
             }
+            if let Some(session) = runtime.chromium_sessions.lock().await.get_mut(session_id) {
+                session.device_scale_factor = device_scale_factor;
+            }
             ChromiumViewportOutcome {
                 success: true,
                 width: actual_width,
@@ -6099,7 +6069,8 @@ fn chromium_viewport_dimensions_match(
 mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_element_capture_script,
-        chromium_network_log_headers, chromium_observe_state_script, chromium_permission_origin,
+        chromium_layout_metrics_from_cdp, chromium_network_log_headers,
+        chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -6112,16 +6083,16 @@ mod tests {
         decode_chromium_observe_state_value, page_body_with_chromium_observe_state,
         parse_chromium_clear_storage_status, parse_chromium_client_download_entries,
         parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
-        parse_chromium_element_captures, parse_chromium_layout_metrics,
-        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
-        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
-        reserve_chromium_upload_bytes, selector_not_found_error_from_cached_snapshot,
-        ChromiumLayoutMetrics, ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
-        ChromiumStagedUpload, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
-        CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
-        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
-        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
-        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        parse_chromium_element_captures, parse_chromium_local_storage_restore_status,
+        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
+        parse_chromium_viewport_metrics, parse_key_press_spec, reserve_chromium_upload_bytes,
+        selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
+        ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy, ChromiumStagedUpload,
+        CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
+        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
+        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
+        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+        MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         PermissionSettingInternal, SessionPermissionsInternal, DEFAULT_SESSION_IDLE_TTL_MS,
@@ -7022,18 +6993,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_chromium_layout_metrics_reports_overflow() {
-        let raw = serde_json::json!({
-            "viewport_width": 390,
-            "viewport_height": 844,
-            "device_scale_factor": 2.0,
-            "document_scroll_width": 980,
-            "document_scroll_height": 1200,
-            "document_client_width": 390,
-            "document_client_height": 844
-        });
-
-        let metrics = parse_chromium_layout_metrics(raw);
+    fn chromium_layout_metrics_from_cdp_reports_overflow() {
+        let metrics = chromium_layout_metrics_from_cdp(390, 844, 390.0, 844.0, 980.0, 1200.0, 2.0);
 
         assert_eq!(
             metrics,
@@ -7052,26 +7013,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_chromium_layout_metrics_keeps_layout_viewport_for_overflow() {
-        let raw = serde_json::json!({
-            "viewport_width": 375,
-            "viewport_height": 667,
-            "visual_viewport_width": 531,
-            "visual_viewport_height": 944,
-            "device_scale_factor": 2.0,
-            "document_scroll_width": 531,
-            "document_scroll_height": 1200,
-            "document_client_width": 531,
-            "document_client_height": 944,
-            "horizontal_overflow": false,
-            "vertical_overflow": false
-        });
-
-        let metrics = parse_chromium_layout_metrics(raw);
+    fn chromium_layout_metrics_from_cdp_keeps_layout_viewport_for_overflow() {
+        let metrics = chromium_layout_metrics_from_cdp(375, 667, 531.0, 944.0, 531.0, 1200.0, 2.0);
 
         assert_eq!(metrics.viewport_width, 375);
         assert_eq!(metrics.viewport_height, 667);
-        assert_eq!(metrics.document_client_width, 531);
+        assert_eq!(metrics.document_client_width, 375);
         assert!(metrics.horizontal_overflow);
         assert!(metrics.vertical_overflow);
     }

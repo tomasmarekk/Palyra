@@ -28,6 +28,8 @@ pub(crate) struct ChromiumSessionState {
     pub(crate) private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
     /// First remote-IP guard incident, if any; consuming it terminates the session.
     pub(crate) security_incident: Arc<std::sync::Mutex<Option<String>>>,
+    /// Last device scale factor successfully applied through CDP.
+    pub(crate) device_scale_factor: f64,
     /// Bytes retained for successful file-input uploads in this session.
     pub(crate) staged_upload_bytes: Arc<AtomicU64>,
     pub(crate) _profile_dir: TempDir,
