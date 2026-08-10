@@ -30,6 +30,7 @@ pub const QA_SCENARIO_FORMAT: &str = "palyra-qa-scenario";
 
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_EXPECTED_DAEMON_RESTARTS: u32 = 32;
+const MAX_EXPECTED_MIN_COUNT: u32 = 4_096;
 
 const AREA_VALUES: &[&str] = &[
     "text",
@@ -2252,12 +2253,20 @@ fn validate_expected_events(
     let mut events = Vec::with_capacity(values.len());
     for (index, event) in values.into_iter().enumerate() {
         let path = format!("$.expect.events[{index}]");
-        if let Some(event_type) = validate_required_string(
+        let min_count_is_valid = validate_expected_min_count(
+            event.min_count,
+            format!("{path}.min_count").as_str(),
+            issues,
+        );
+        let Some(event_type) = validate_required_string(
             event.event_type,
             format!("{path}.event_type").as_str(),
             "event type",
             issues,
-        ) {
+        ) else {
+            continue;
+        };
+        if min_count_is_valid {
             events.push(QaScenarioExpectedEvent { event_type, min_count: event.min_count });
         }
     }
@@ -2272,12 +2281,20 @@ fn validate_expected_tool_calls(
     let mut tool_calls = Vec::with_capacity(values.len());
     for (index, tool_call) in values.into_iter().enumerate() {
         let path = format!("$.expect.tool_calls[{index}]");
-        if let Some(name) = validate_required_string(
+        let min_count_is_valid = validate_expected_min_count(
+            tool_call.min_count,
+            format!("{path}.min_count").as_str(),
+            issues,
+        );
+        let Some(name) = validate_required_string(
             tool_call.name,
             format!("{path}.name").as_str(),
             "tool call name",
             issues,
-        ) {
+        ) else {
+            continue;
+        };
+        if min_count_is_valid {
             let max_count = if schema_version
                 .is_some_and(|version| version >= FAULT_CONTRACT_MIN_SCHEMA_VERSION)
             {
@@ -2316,6 +2333,24 @@ fn validate_expected_tool_calls(
         }
     }
     tool_calls
+}
+
+fn validate_expected_min_count(
+    value: Option<u32>,
+    path: &str,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> bool {
+    if value.is_none_or(|count| count <= MAX_EXPECTED_MIN_COUNT) {
+        return true;
+    }
+    push_issue(
+        issues,
+        "expected_min_count_out_of_range",
+        path,
+        format!("min_count must not exceed {MAX_EXPECTED_MIN_COUNT}"),
+        "Lower min_count to keep QA evidence generation bounded.",
+    );
+    false
 }
 
 fn validate_runtime_path_expectation(
@@ -3561,6 +3596,29 @@ timeout:
             invalid_digest.as_str(),
             "$.artifacts[0].sha256",
             "invalid_artifact_sha256",
+        );
+    }
+
+    #[test]
+    fn rejects_min_counts_that_would_expand_unbounded_preview_evidence() {
+        let event = V2_FIXTURE_SCENARIO.replace(
+            "  events: []",
+            "  events:\n    - event_type: qa.event\n      min_count: 4294967295",
+        );
+        assert_validation_issue(
+            event.as_str(),
+            "$.expect.events[0].min_count",
+            "expected_min_count_out_of_range",
+        );
+
+        let tool_call = V2_FIXTURE_SCENARIO.replace(
+            "  tool_calls: []",
+            "  tool_calls:\n    - name: palyra.fs.read_file\n      min_count: 4294967295",
+        );
+        assert_validation_issue(
+            tool_call.as_str(),
+            "$.expect.tool_calls[0].min_count",
+            "expected_min_count_out_of_range",
         );
     }
 
