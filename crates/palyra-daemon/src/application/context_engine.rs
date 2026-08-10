@@ -3176,8 +3176,23 @@ fn normalized_word_tokens(input: &str) -> Vec<String> {
     input
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
+        .map(|token| normalize_contradiction_token(token.to_ascii_lowercase()))
         .collect()
+}
+
+fn normalize_contradiction_token(token: String) -> String {
+    let canonical = match token.as_str() {
+        "enables" | "enabled" | "enabling" => "enable",
+        "disables" | "disabled" | "disabling" => "disable",
+        "allows" | "allowed" | "allowing" => "allow",
+        "denies" | "denied" | "denying" => "deny",
+        "uses" | "used" | "using" => "use",
+        "avoids" | "avoided" | "avoiding" => "avoid",
+        "keeps" | "kept" | "keeping" => "keep",
+        "removes" | "removed" | "removing" => "remove",
+        _ => return token,
+    };
+    canonical.to_owned()
 }
 
 fn contains_non_overlapping_terms(tokens: &[String], left: &str, right: &str) -> bool {
@@ -5564,5 +5579,17 @@ mod tests {
             super::count_contradiction_signals("The rollout must proceed, but must not leak."),
             1
         );
+        for summary in [
+            "The integration was enabled, but the fallback remained disabled.",
+            "Private access was allowed, while public access was denied.",
+            "The remote cache is being used, but the local cache is being avoided.",
+            "The public endpoint was kept, but the private endpoint was removed.",
+        ] {
+            assert_eq!(
+                super::count_contradiction_signals(summary),
+                1,
+                "inflected directive terms must retain their contradiction signal: {summary}"
+            );
+        }
     }
 }
