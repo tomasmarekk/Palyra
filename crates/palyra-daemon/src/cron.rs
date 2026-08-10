@@ -185,6 +185,8 @@ pub struct DispatchOutcome {
     pub status: CronRunStatus,
     /// Human-readable dispatch summary.
     pub message: String,
+    /// Stable terminal error kind when dispatch ended before starting a run.
+    pub error_kind: Option<String>,
     /// Session key the run executes under, when known at dispatch time.
     pub session_key: Option<String>,
     /// Session label the run executes under, when known at dispatch time.
@@ -1840,10 +1842,15 @@ async fn process_due_jobs(
         let reference_unix_ms = job.next_run_at_unix_ms.unwrap_or(now_unix_ms);
         let recovery_plan = compute_misfire_recovery_plan(&job, reference_unix_ms, now_unix_ms)?;
         let next_run_at_unix_ms = recovery_plan.next_run_at_unix_ms;
+        let exhausted_one_shot =
+            should_disable_exhausted_scheduled_one_shot(&job, next_run_at_unix_ms);
+        let defer_one_shot_disable = exhausted_one_shot
+            && recovery_plan.action != CronMisfireRecoveryAction::RequireReview
+            && scheduled_job_requires_first_run_approval(&state, &job)?;
         // Advance the persisted tick before dispatching: if the daemon dies
         // mid-dispatch the tick is lost rather than double-fired (at-most-once).
         state.set_cron_job_next_run(job.job_id.clone(), next_run_at_unix_ms, None).await?;
-        if should_disable_exhausted_scheduled_one_shot(&job, next_run_at_unix_ms) {
+        if exhausted_one_shot && !defer_one_shot_disable {
             disable_exhausted_scheduled_one_shot(Arc::clone(&state), &job).await?;
         }
         state.record_cron_trigger_fired();
@@ -1857,16 +1864,19 @@ async fn process_due_jobs(
             .await?;
             continue;
         }
-        let _outcome = dispatch_job(
+        let outcome = dispatch_job(
             Arc::clone(&state),
             auth.clone(),
             grpc_url.clone(),
-            job,
+            job.clone(),
             Arc::clone(&wake_signal),
             false,
             TriggerJobOptions::default(),
         )
         .await?;
+        if defer_one_shot_disable && deferred_one_shot_should_be_disabled(&outcome) {
+            disable_exhausted_scheduled_one_shot(Arc::clone(&state), &job).await?;
+        }
         if next_run_at_unix_ms.is_some_and(|value| value <= now_unix_ms) {
             // Catch-up backlog: the new tick is already due, so nudge the loop
             // instead of waiting out the idle sleep.
@@ -1881,6 +1891,23 @@ fn should_disable_exhausted_scheduled_one_shot(
     next_run_at_unix_ms: Option<i64>,
 ) -> bool {
     one_shot_schedule_is_exhausted(job, next_run_at_unix_ms)
+}
+
+fn scheduled_job_requires_first_run_approval(
+    state: &GatewayRuntimeState,
+    job: &CronJobRecord,
+) -> Result<bool, Status> {
+    let Ok(runtime) = state.routines_runtime_config() else {
+        return Ok(false);
+    };
+    let routine = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
+        Status::internal(format!("failed to load routine metadata for scheduled approval: {error}"))
+    })?;
+    Ok(routine.as_ref().is_some_and(scheduled_routine_requires_first_run_approval))
+}
+
+fn deferred_one_shot_should_be_disabled(outcome: &DispatchOutcome) -> bool {
+    outcome.error_kind.as_deref() != Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)
 }
 
 async fn disable_exhausted_scheduled_one_shot(
@@ -2091,6 +2118,7 @@ async fn handle_atomic_concurrency_claim_conflict(
                 run_id: None,
                 status: CronRunStatus::Accepted,
                 message: "run queued due to active execution".to_owned(),
+                error_kind: None,
                 session_key: None,
                 session_label: None,
             })
@@ -2099,6 +2127,7 @@ async fn handle_atomic_concurrency_claim_conflict(
             run_id: None,
             status: CronRunStatus::Accepted,
             message: "run remains queued until active execution completes".to_owned(),
+            error_kind: None,
             session_key: None,
             session_label: None,
         }),
@@ -2798,6 +2827,7 @@ async fn prepare_file_watch_dispatch(
             run_id: None,
             status: CronRunStatus::Accepted,
             message: "file watch unchanged; no run dispatched".to_owned(),
+            error_kind: None,
             session_key: None,
             session_label: None,
         }));
@@ -3047,6 +3077,7 @@ async fn dispatch_job(
             run_id: None,
             status: CronRunStatus::Skipped,
             message: cron_max_run_slots_exhausted_message(&exhaustion),
+            error_kind: None,
             session_key: None,
             session_label: None,
         });
@@ -3123,6 +3154,7 @@ async fn dispatch_job(
                     run_id: None,
                     status: CronRunStatus::Accepted,
                     message: "run queued due to active execution".to_owned(),
+                    error_kind: None,
                     session_key: None,
                     session_label: None,
                 });
@@ -3132,6 +3164,7 @@ async fn dispatch_job(
                     run_id: None,
                     status: CronRunStatus::Accepted,
                     message: "run remains queued until active execution completes".to_owned(),
+                    error_kind: None,
                     session_key: None,
                     session_label: None,
                 });
@@ -3206,6 +3239,7 @@ async fn dispatch_job(
                     run_id: None,
                     status: CronRunStatus::Skipped,
                     message: cron_max_run_slots_exhausted_message(&exhaustion),
+                    error_kind: None,
                     session_key: None,
                     session_label: None,
                 });
@@ -3259,6 +3293,7 @@ async fn dispatch_job(
         } else {
             "scheduled run dispatched".to_owned()
         },
+        error_kind: None,
         session_key: Some(effective_preview.session_key),
         session_label: Some(effective_preview.session_label),
     })
@@ -3338,6 +3373,7 @@ async fn register_terminal(
         run_id: Some(run_id),
         status,
         message: message.to_owned(),
+        error_kind: Some(error_kind.to_owned()),
         session_key: None,
         session_label: None,
     })
@@ -5929,6 +5965,24 @@ mod tests {
             sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAW", None, CronMisfirePolicy::Skip);
         assert!(visible_cron_job_enabled(&recurring_job));
         assert!(!should_disable_exhausted_scheduled_one_shot(&recurring_job, None));
+    }
+
+    #[test]
+    fn one_shot_waiting_for_first_run_approval_stays_enabled() {
+        let awaiting_approval = DispatchOutcome {
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
+            status: CronRunStatus::Denied,
+            message: "approval required".to_owned(),
+            error_kind: Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND.to_owned()),
+            session_key: None,
+            session_label: None,
+        };
+        let mut dispatched = awaiting_approval.clone();
+        dispatched.status = CronRunStatus::Running;
+        dispatched.error_kind = None;
+
+        assert!(!deferred_one_shot_should_be_disabled(&awaiting_approval));
+        assert!(deferred_one_shot_should_be_disabled(&dispatched));
     }
 
     #[test]
