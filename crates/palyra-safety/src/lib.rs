@@ -3869,7 +3869,7 @@ mod tests {
 
     #[test]
     fn credential_comparison_literals_are_redacted_for_export() {
-        let source = "if (password === \"CorrectHorseBatteryStaple\") { login(); }\n\
+        let source = "if (password === \"CorrectHorseBatteryStaple123!\") { login(); }\n\
                       if (apiKey == \"prod-api-key-value\") { connect(); }\n\
                       if (token !== \"palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\") { rotate(); }";
         let outcome = redact_text_for_export(
@@ -3883,7 +3883,7 @@ mod tests {
         assert!(outcome.redacted_text.contains("password === \"[REDACTED_SECRET]\""));
         assert!(outcome.redacted_text.contains("apiKey == \"[REDACTED_SECRET]\""));
         assert!(outcome.redacted_text.contains("token !== \"[REDACTED_SECRET]\""));
-        assert!(!outcome.redacted_text.contains("CorrectHorseBatteryStaple"));
+        assert!(!outcome.redacted_text.contains("CorrectHorseBatteryStaple123!"));
         assert!(!outcome.redacted_text.contains("prod-api-key-value"));
         assert!(!outcome.redacted_text.contains("palyra_e2e_access_token"));
         assert!(outcome
@@ -3934,7 +3934,7 @@ mod tests {
     #[test]
     fn credential_comparison_literals_block_prompt_assembly() {
         let outcome = transform_text_for_prompt(
-            "if (password === \"CorrectHorseBatteryStaple\") { login(); }",
+            "if (password === \"CorrectHorseBatteryStaple123!\") { login(); }",
             SafetySourceKind::Workspace,
             SafetyContentKind::WorkspaceDocument,
             TrustLabel::TrustedLocal,
@@ -3942,7 +3942,7 @@ mod tests {
 
         assert!(outcome.blocked);
         assert_eq!(outcome.scan.recommended_action, SafetyAction::Block);
-        assert!(!outcome.transformed_text.contains("CorrectHorseBatteryStaple"));
+        assert!(!outcome.transformed_text.contains("CorrectHorseBatteryStaple123!"));
         assert!(outcome
             .scan
             .finding_codes()
