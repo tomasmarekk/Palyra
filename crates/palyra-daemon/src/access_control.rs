@@ -1294,16 +1294,18 @@ impl AccessRegistry {
         detail: Option<&str>,
         now: i64,
     ) -> Result<(), AccessRegistryError> {
-        let (principal, workspace_id) = {
+        let (principal, workspace_id, activity_at_unix_ms) = {
             let record = self
                 .data
                 .api_tokens
                 .iter_mut()
                 .find(|record| record.token_id == token_id)
                 .ok_or_else(|| AccessRegistryError::ApiTokenNotFound(token_id.to_owned()))?;
-            record.last_used_at_unix_ms = Some(now);
-            record.updated_at_unix_ms = now;
-            (record.principal.clone(), record.workspace_id.clone())
+            let activity_at_unix_ms =
+                record.last_used_at_unix_ms.map_or(now, |last_used| last_used.max(now));
+            record.last_used_at_unix_ms = Some(activity_at_unix_ms);
+            record.updated_at_unix_ms = record.updated_at_unix_ms.max(activity_at_unix_ms);
+            (record.principal.clone(), record.workspace_id.clone(), activity_at_unix_ms)
         };
         self.record_telemetry(
             feature_key,
@@ -1313,7 +1315,7 @@ impl AccessRegistry {
             workspace_id.as_deref(),
             Some(token_id),
             detail,
-            now,
+            activity_at_unix_ms,
         );
         self.persist()?;
         Ok(())
@@ -2534,6 +2536,84 @@ mod tests {
             rotated.token_record.rotated_from_token_id.as_deref(),
             Some(created.token_record.token_id.as_str())
         );
+    }
+
+    #[test]
+    fn api_token_activity_timestamps_never_move_backwards() {
+        let temp = tempdir().expect("tempdir should exist");
+        let mut registry = AccessRegistry::open(temp.path()).expect("registry should open");
+        registry
+            .set_feature_flag(
+                FEATURE_COMPAT_API,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                1,
+            )
+            .expect("compat api should enable");
+        registry
+            .set_feature_flag(
+                FEATURE_API_TOKENS,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                2,
+            )
+            .expect("api tokens should enable");
+        let created = registry
+            .create_api_token(
+                "user:ops",
+                ApiTokenCreateRequest {
+                    label: "Compat".to_owned(),
+                    scopes: vec![PERMISSION_COMPAT_RESPONSES_CREATE.to_owned()],
+                    principal: "user:ops".to_owned(),
+                    workspace_id: None,
+                    role: "operator".to_owned(),
+                    expires_at_unix_ms: None,
+                    rate_limit_per_minute: Some(50),
+                },
+                10,
+            )
+            .expect("token should be created");
+        let token_id = created.token_record.token_id;
+
+        registry
+            .touch_api_token(
+                token_id.as_str(),
+                FEATURE_COMPAT_API,
+                "runs_wait",
+                "run_wait_completed",
+                None,
+                30,
+            )
+            .expect("newer activity should persist");
+        registry
+            .touch_api_token(
+                token_id.as_str(),
+                FEATURE_COMPAT_API,
+                "runs_wait",
+                "run_wait_completed",
+                None,
+                20,
+            )
+            .expect("late stale activity should be recorded without backdating");
+
+        let token = registry
+            .data
+            .api_tokens
+            .iter()
+            .find(|record| record.token_id == token_id)
+            .expect("token should remain registered");
+        assert_eq!(token.last_used_at_unix_ms, Some(30));
+        assert_eq!(token.updated_at_unix_ms, 30);
+        let latest_activity = registry
+            .data
+            .telemetry
+            .iter()
+            .rev()
+            .find(|event| event.token_id.as_deref() == Some(token_id.as_str()))
+            .expect("token activity telemetry should be recorded");
+        assert_eq!(latest_activity.recorded_at_unix_ms, 30);
     }
 
     #[test]

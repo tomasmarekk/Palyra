@@ -1105,7 +1105,7 @@ pub(crate) async fn compat_run_wait_handler(
             "run_wait_completed"
         },
         Some(run_id.as_str()),
-        now,
+        unix_ms_now().map_err(internal_clock_error_response)?.max(now),
     );
     Ok(Json(payload).into_response())
 }
