@@ -3080,13 +3080,23 @@ fn sanitize_diagnostics_string(raw: &str, key_context: Option<&str>) -> String {
     redacted
 }
 
+pub(crate) const REDACTED_TRACE_ABSOLUTE_PATH: &str = "<redacted:path>";
+
 fn redact_absolute_path_tokens(raw: &str) -> String {
+    redact_absolute_path_tokens_with_marker(raw, "<redacted>")
+}
+
+pub(crate) fn redact_trace_absolute_path_tokens(raw: &str) -> String {
+    redact_absolute_path_tokens_with_marker(raw, REDACTED_TRACE_ABSOLUTE_PATH)
+}
+
+fn redact_absolute_path_tokens_with_marker(raw: &str, marker: &str) -> String {
     raw.split_inclusive(char::is_whitespace)
         .map(|token| {
             let content = token.trim_end_matches(char::is_whitespace);
             let separator = &token[content.len()..];
             if token_contains_absolute_path(content) {
-                format!("<redacted>{separator}")
+                format!("{marker}{separator}")
             } else {
                 token.to_owned()
             }
@@ -3098,13 +3108,41 @@ fn token_contains_absolute_path(raw: &str) -> bool {
     let trimmed = raw.trim_matches(|ch: char| {
         !ch.is_ascii_alphanumeric() && !matches!(ch, ':' | '\\' | '/' | '_' | '-' | '.')
     });
+    if trimmed.to_ascii_lowercase().starts_with("file://") {
+        return true;
+    }
+    if trimmed.contains("://") {
+        return false;
+    }
     looks_like_absolute_path(trimmed)
         || trimmed.as_bytes().windows(3).any(|window| {
             window[0].is_ascii_alphabetic()
                 && window[1] == b':'
                 && matches!(window[2], b'\\' | b'/')
         })
-        || trimmed.starts_with("\\\\")
+        || trimmed.contains("\\\\")
+        || contains_embedded_posix_absolute_path(trimmed)
+}
+
+fn contains_embedded_posix_absolute_path(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| {
+        if *byte != b'/' {
+            return false;
+        }
+        let has_path_component = bytes.get(index + 1).is_some_and(|next| {
+            !next.is_ascii_whitespace() && !matches!(*next, b'/' | b'\\' | b'\'' | b'"' | b'`')
+        });
+        let has_left_boundary = index == 0
+            || bytes.get(index - 1).is_some_and(|previous| {
+                previous.is_ascii_whitespace()
+                    || matches!(
+                        *previous,
+                        b'=' | b':' | b'\'' | b'"' | b'`' | b'(' | b'[' | b'{' | b',' | b';'
+                    )
+            });
+        has_path_component && has_left_boundary
+    })
 }
 
 fn sanitize_low_cardinality_value(raw: &str, label_name: &str) -> String {

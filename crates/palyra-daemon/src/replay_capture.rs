@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use palyra_common::redaction::{
     is_sensitive_key, redact_diagnostic_text, redact_internal_runtime_paths,
+    REDACTED_INTERNAL_RUNTIME_PATH,
 };
 use palyra_common::replay_bundle::{
     build_replay_bundle, ReplayArtifactRef, ReplayBundle, ReplayBundleBuildInput,
@@ -24,7 +25,9 @@ use serde_json::{json, Value};
 use crate::{
     config::{FeatureRolloutsConfig, ReplayCaptureConfig},
     journal::{JournalStore, OrchestratorRunStatusSnapshot},
-    runtime_diagnostics::RunStageTimingReport,
+    runtime_diagnostics::{
+        redact_trace_absolute_path_tokens, RunStageTimingReport, REDACTED_TRACE_ABSOLUTE_PATH,
+    },
 };
 
 mod fixture_matrix;
@@ -630,14 +633,15 @@ fn redact_trace_value(
             }
         }
         Value::String(raw) => {
+            let prior_path_markers = path_redaction_marker_count(raw);
             let redacted = redact_trace_string(raw.as_str());
             if redacted != *raw {
                 if key_context.is_some_and(is_sensitive_key) {
                     stats.redacted_fields.push(key_context.unwrap_or_default().to_owned());
                 }
-                if redacted.contains("<redacted:path>") || redacted.contains("<redacted:home>") {
-                    stats.path_redactions = stats.path_redactions.saturating_add(1);
-                }
+                let added_path_markers = path_redaction_marker_count(redacted.as_str())
+                    .saturating_sub(prior_path_markers);
+                stats.path_redactions = stats.path_redactions.saturating_add(added_path_markers);
                 *raw = redacted;
             }
         }
@@ -647,7 +651,14 @@ fn redact_trace_value(
 
 fn redact_trace_string(raw: &str) -> String {
     let redacted = redact_diagnostic_text(raw);
-    redact_internal_runtime_paths(redacted.as_str())
+    let redacted = redact_internal_runtime_paths(redacted.as_str());
+    redact_trace_absolute_path_tokens(redacted.as_str())
+}
+
+fn path_redaction_marker_count(raw: &str) -> usize {
+    raw.matches(REDACTED_TRACE_ABSOLUTE_PATH)
+        .count()
+        .saturating_add(raw.matches(REDACTED_INTERNAL_RUNTIME_PATH).count())
 }
 
 fn sanitize_trace_label(raw: &str, fallback: &str) -> String {
@@ -942,7 +953,15 @@ mod tests {
             ("provider.request", json!({"status":"started","authorization":"Bearer raw"})),
             (
                 "tool_proposal",
-                json!({"tool_name":"palyra.fs.read_file","path":"C:\\Users\\Palo\\secret.txt"}),
+                json!({
+                    "tool_name":"palyra.fs.read_file",
+                    "path":"C:\\Users\\Alice\\secret.txt",
+                    "posix_path":"/home/alice/project/secret.txt",
+                    "unc_path":"\\\\server\\share\\secret.txt",
+                    "detail":"failed at /tmp/private.txt with cwd=D:\\work\\secret.txt",
+                    "file_url":"file:///home/alice/private.txt",
+                    "url":"https://example.test/public/status"
+                }),
             ),
             ("approval.requested", json!({"status":"pending"})),
             ("policy.decision", json!({"outcome":"allow"})),
@@ -961,7 +980,7 @@ mod tests {
             generated_at_unix_ms: 1_730_000_001_000,
             stage_timings: sample_stage_timing_report(),
             max_events: 64,
-            max_payload_bytes: 256,
+            max_payload_bytes: 1_024,
             trace_unavailable_reason: None,
         });
         let encoded = serde_json::to_string(&trace).expect("trace should serialize");
@@ -979,7 +998,14 @@ mod tests {
             );
         }
         assert!(!encoded.contains("Bearer raw"));
-        assert!(!encoded.contains("C:\\Users\\Palo"));
+        assert!(!encoded.contains("C:\\Users\\Alice"));
+        assert!(!encoded.contains("/home/alice"));
+        assert!(!encoded.contains("\\\\server\\share"));
+        assert!(!encoded.contains("/tmp/private.txt"));
+        assert!(!encoded.contains("D:\\work"));
+        assert!(!encoded.contains("file:///home/alice"));
+        assert!(encoded.contains("https://example.test/public/status"));
+        assert_eq!(trace.redaction.path_redactions, 6);
     }
 
     #[test]
