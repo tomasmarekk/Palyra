@@ -3108,18 +3108,21 @@ mod tests {
         allowed_xai_callback_cors_origin, build_anthropic_oauth_authorization_url,
         build_auth_profiles_list_json_payload, build_openai_oauth_launch_payload,
         build_provider_status_payload, build_xai_oauth_authorization_url,
-        generate_oauth_random_urlsafe, normalize_xai_oauth_browser_url,
+        generate_oauth_random_urlsafe, handle_xai_callback_stream, normalize_xai_oauth_browser_url,
         normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
         parse_anthropic_authorization_code, parse_xai_callback_url,
-        provider_console_unavailable_status_payload, write_xai_callback_response_best_effort,
-        xai_oauth_instruction_message, AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload,
-        ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI,
-        ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
-        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID,
-        XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
+        provider_console_unavailable_status_payload, read_xai_callback_line,
+        write_xai_callback_response_best_effort, xai_oauth_instruction_message,
+        AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL,
+        ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES,
+        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
+        OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CALLBACK_MAX_LINE_BYTES,
+        XAI_OAUTH_CALLBACK_MAX_REQUEST_BYTES, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI,
+        XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
+    use std::{io::Write as _, time::Duration};
 
     #[test]
     fn empty_auth_profiles_json_points_to_model_provider_auth_sources() {

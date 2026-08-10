@@ -1712,7 +1712,7 @@ mod tests {
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
-    use crate::AgentApprovalMode;
+    use crate::{AgentApprovalMode, REDACTED};
 
     #[test]
     fn resolve_session_request_requires_identifier() {
