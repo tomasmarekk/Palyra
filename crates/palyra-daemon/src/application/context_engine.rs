@@ -621,8 +621,6 @@ pub(crate) struct ContextInspectorBreakdownItem {
     pub(crate) reserved_tokens: u64,
     pub(crate) pruned_tokens: u64,
     pub(crate) source_ref_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) source_ref_hashes: Vec<String>,
     pub(crate) trust_labels: Vec<String>,
     pub(crate) reason_codes: Vec<String>,
 }
@@ -2405,10 +2403,7 @@ fn context_memory_snapshot_hash(explain: &ContextAssemblyTrace) -> Option<String
                 "estimated_tokens": segment.estimated_tokens,
                 "trust_label": segment.trust_label.as_str(),
                 "redaction_status": segment.redaction_status.as_str(),
-                "source_ref_hashes": segment.source_refs.iter().map(|value| {
-                    let hash = cache_scope_hash(value);
-                    format!("ref_{}", &hash[..16])
-                }).collect::<Vec<_>>(),
+                "source_ref_count": segment.source_refs.len(),
                 "preview_hash": cache_scope_hash(segment.preview.as_str()),
             })
         })
@@ -2451,7 +2446,6 @@ struct ContextInspectorBreakdownAccumulator {
     reserved_tokens: u64,
     pruned_tokens: u64,
     source_ref_count: usize,
-    source_ref_hashes: BTreeSet<String>,
     trust_labels: BTreeSet<String>,
     reason_codes: BTreeSet<String>,
 }
@@ -2466,7 +2460,6 @@ impl ContextInspectorBreakdownAccumulator {
             reserved_tokens: self.reserved_tokens,
             pruned_tokens: self.pruned_tokens,
             source_ref_count: self.source_ref_count,
-            source_ref_hashes: self.source_ref_hashes.into_iter().collect(),
             trust_labels: self.trust_labels.into_iter().collect(),
             reason_codes: self.reason_codes.into_iter().collect(),
         }
@@ -2485,7 +2478,7 @@ pub(crate) fn context_inspector_snapshot(
         trace_id: explain.trace_id.clone(),
         snapshot_hash: String::new(),
         provider_input_snapshot_hash,
-        redaction_level: "metadata_with_hashed_source_refs".to_owned(),
+        redaction_level: "metadata_counts_no_source_refs".to_owned(),
         strategy: explain.strategy,
         reason_codes: explain.reason_codes.clone(),
         window: context_inspector_window(explain),
@@ -2636,10 +2629,6 @@ fn context_inspector_prompt_breakdown(
         entry.selected_segments = entry.selected_segments.saturating_add(1);
         entry.selected_tokens = entry.selected_tokens.saturating_add(segment.estimated_tokens);
         entry.source_ref_count = entry.source_ref_count.saturating_add(segment.source_refs.len());
-        entry.source_ref_hashes.extend(segment.source_refs.iter().map(|value| {
-            let hash = cache_scope_hash(value);
-            format!("ref_{}", &hash[..16])
-        }));
         entry.trust_labels.insert(segment.trust_label.as_str().to_owned());
         entry.reason_codes.insert(segment.include_reason.clone());
         if !segment.safety_findings.is_empty() {
@@ -2743,10 +2732,7 @@ fn context_inspector_provider_input_hash(explain: &ContextAssemblyTrace) -> Stri
             "safety_action": segment.safety_action.as_str(),
             "safety_findings": segment.safety_findings.as_slice(),
             "group_id": segment.group_id.as_deref(),
-            "source_ref_hashes": segment.source_refs.iter().map(|value| {
-                let hash = cache_scope_hash(value);
-                format!("ref_{}", &hash[..16])
-            }).collect::<Vec<_>>(),
+            "source_ref_count": segment.source_refs.len(),
         })).collect::<Vec<_>>(),
         "dropped_segments": explain.dropped_segments.iter().map(|segment| json!({
             "kind": segment.kind,
@@ -3498,10 +3484,10 @@ fn latest_context_inspector_snapshot(
     })
 }
 
-/// Privacy-reduced trace for runtime diagnostics: segment previews and
-/// raw source refs are omitted entirely (only counts and hashed refs are
-/// disclosed) and the identity-bearing cache scope key is replaced by a
-/// non-reversible hash. Pinned by the diagnostics redaction tests.
+/// Privacy-reduced trace for runtime diagnostics: segment previews and source
+/// refs, including reversible low-entropy hashes, are omitted entirely. Only
+/// source counts are disclosed, and the identity-bearing cache scope key is
+/// replaced by a non-reversible hash. Pinned by the diagnostics redaction tests.
 fn context_assembly_diagnostics_payload_with_previous(
     explain: &ContextAssemblyTrace,
     previous_snapshot: Option<&ContextInspectorSnapshot>,
@@ -5048,6 +5034,14 @@ mod tests {
                 .is_some(),
             "diagnostics should expose support-safe context window usage"
         );
+        assert_eq!(
+            payload.pointer("/context_inspector/redaction_level").and_then(Value::as_str),
+            Some("metadata_counts_no_source_refs")
+        );
+        assert!(
+            !payload.to_string().contains("source_ref_hashes"),
+            "diagnostics must not expose dictionary-matchable source reference hashes"
+        );
     }
 
     #[test]
@@ -5313,9 +5307,11 @@ mod tests {
         );
         let memory_breakdown = breakdown(&snapshot, "memory_recall");
         assert_eq!(memory_breakdown.source_ref_count, 1);
+        let predictable_source_ref = "segment:memory_recall:memory json";
+        let predictable_source_hash = cache_scope_hash(predictable_source_ref);
         assert!(
-            memory_breakdown.source_ref_hashes.iter().all(|value| value.starts_with("ref_")),
-            "inspector should expose hashed source refs rather than raw source identifiers"
+            !encoded.contains(&predictable_source_hash[..16]),
+            "inspector must not expose dictionary-matchable source reference hashes"
         );
         assert!(
             !encoded.contains("segment:memory_recall"),
