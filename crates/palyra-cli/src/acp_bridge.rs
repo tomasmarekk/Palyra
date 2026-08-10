@@ -938,7 +938,7 @@ pub fn run_agent_acp_bridge(
                     )?;
                 let daemon = AcpDaemonControl {
                     client: Arc::new(TokioMutex::new(daemon_context.client)),
-                    principal: connection.principal.clone(),
+                    principal: daemon_context.principal,
                     device_id: connection.device_id.clone(),
                     channel: Some(connection.channel.clone()),
                 };

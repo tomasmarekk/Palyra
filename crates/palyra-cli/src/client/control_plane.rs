@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use palyra_control_plane::{
-    ConsoleLoginRequest, ControlPlaneClient, ControlPlaneClientConfig, ControlPlaneClientError,
+    ConsoleLoginRequest, ConsoleSession, ControlPlaneClient, ControlPlaneClientConfig,
+    ControlPlaneClientError,
 };
 
 use crate::app;
@@ -18,6 +19,7 @@ const ADMIN_LOGIN_RATE_LIMIT_RETRY_DELAYS: [Duration; 3] =
 /// A control-plane client that already holds an authenticated console session.
 pub(crate) struct AdminConsoleContext {
     pub(crate) client: ControlPlaneClient,
+    pub(crate) principal: String,
 }
 
 /// Connects to the admin console using the client's default request timeout.
@@ -57,26 +59,26 @@ pub(crate) async fn connect_admin_console_with_request_timeout(
         device_id: connection.device_id.clone(),
         channel: Some(connection.channel.clone()),
     };
-    login_admin_console_with_rate_limit_retry(&mut client, &login_request)
+    let session = login_admin_console_with_rate_limit_retry(&mut client, &login_request)
         .await
         .context("failed to establish authenticated console session")?;
-    Ok(AdminConsoleContext { client })
+    Ok(AdminConsoleContext { client, principal: session.principal })
 }
 
 async fn login_admin_console_with_rate_limit_retry(
     client: &mut ControlPlaneClient,
     request: &ConsoleLoginRequest,
-) -> Result<(), ControlPlaneClientError> {
+) -> Result<ConsoleSession, ControlPlaneClientError> {
     for delay in ADMIN_LOGIN_RATE_LIMIT_RETRY_DELAYS {
         match client.login(request).await {
-            Ok(_) => return Ok(()),
+            Ok(session) => return Ok(session),
             Err(error) if control_plane_login_error_is_rate_limited(&error) => {
                 tokio::time::sleep(delay).await;
             }
             Err(error) => return Err(error),
         }
     }
-    client.login(request).await.map(|_| ())
+    client.login(request).await
 }
 
 fn control_plane_login_error_is_rate_limited(error: &ControlPlaneClientError) -> bool {
