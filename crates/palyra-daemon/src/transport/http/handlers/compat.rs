@@ -2832,6 +2832,7 @@ fn build_compat_run_events_streaming_response(
                 let Some(public_event) = public_event else {
                     continue;
                 };
+                let public_event = sanitize_public_event_for_compat_stream(&public_event);
                 let event_name = public_event
                     .get("event")
                     .and_then(Value::as_str)
@@ -6371,6 +6372,42 @@ mod tests {
             !encoded.contains("sk-test-secret"),
             "Responses SSE tool result payload must not contain raw tool output: {encoded}"
         );
+    }
+
+    #[test]
+    fn run_event_replay_withholds_operator_tool_payloads() {
+        let cases = [
+            json!({
+                "event": "tool.call.started",
+                "payload": {
+                    "input_json": { "api_key": "tool-input-secret" },
+                },
+            }),
+            json!({
+                "event": "tool.call.completed",
+                "payload": {
+                    "output_json": { "token": "tool-output-secret" },
+                },
+            }),
+            json!({
+                "event": "approval.required",
+                "payload": {
+                    "input_json": { "command": "approval-input-secret" },
+                    "prompt": {
+                        "details_json": { "reason": "approval-details-secret" },
+                    },
+                },
+            }),
+        ];
+
+        for public_event in cases {
+            let sanitized = sanitize_public_event_for_compat_stream(&public_event);
+            let encoded = sanitized.to_string();
+            assert!(!encoded.contains("tool-input-secret"), "{encoded}");
+            assert!(!encoded.contains("tool-output-secret"), "{encoded}");
+            assert!(!encoded.contains("approval-input-secret"), "{encoded}");
+            assert!(!encoded.contains("approval-details-secret"), "{encoded}");
+        }
     }
 
     #[test]
