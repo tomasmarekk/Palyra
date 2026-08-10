@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     future::Future,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -3170,9 +3170,24 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<(), DockerEn
     Ok(())
 }
 
+/// Content fingerprint kept for every workspace file without retaining its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DockerWorkspaceFileSnapshot {
-    bytes: Vec<u8>,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerWorkspaceChangeKind {
+    Add,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerWorkspaceChange {
+    path: String,
+    kind: DockerWorkspaceChangeKind,
 }
 
 fn docker_patch_bundle_from_workspace_diff(
@@ -3180,13 +3195,15 @@ fn docker_patch_bundle_from_workspace_diff(
     mutated_root: &Path,
     source_manifest: WorkspacePatchBundleSourceManifest,
 ) -> Result<Option<DockerPatchBundle>, DockerEngineError> {
-    let before = collect_workspace_file_snapshots(original_root, original_root)?;
-    let after = collect_workspace_file_snapshots(mutated_root, mutated_root)?;
-    let Some((patch_document, files)) = docker_patch_document_from_snapshots(&before, &after)?
+    let limits = WorkspacePatchLimits::default();
+    let before = collect_workspace_file_snapshots(original_root, original_root, None, &limits)?;
+    let after =
+        collect_workspace_file_snapshots(mutated_root, mutated_root, Some(&before), &limits)?;
+    let Some((patch_document, files)) =
+        docker_patch_document_from_snapshots(&before, &after, mutated_root, &limits)?
     else {
         return Ok(None);
     };
-    let limits = WorkspacePatchLimits::default();
     let redaction_policy = WorkspacePatchRedactionPolicy::default();
     let request = WorkspacePatchRequest {
         patch: patch_document.clone(),
@@ -3357,29 +3374,39 @@ fn workspace_patch_bundle_manifest_projection(bundle: &WorkspacePatchBundle) -> 
 fn collect_workspace_file_snapshots(
     root: &Path,
     current: &Path,
+    baseline: Option<&BTreeMap<String, DockerWorkspaceFileSnapshot>>,
+    limits: &WorkspacePatchLimits,
 ) -> Result<BTreeMap<String, DockerWorkspaceFileSnapshot>, DockerEngineError> {
     let mut snapshots = BTreeMap::new();
-    collect_workspace_file_snapshots_into(root, current, &mut snapshots)?;
+    let mut changed_files = 0_usize;
+    collect_workspace_file_snapshots_into(
+        root,
+        current,
+        baseline,
+        limits,
+        &mut changed_files,
+        &mut snapshots,
+    )?;
     Ok(snapshots)
 }
 
 fn collect_workspace_file_snapshots_into(
     root: &Path,
     current: &Path,
+    baseline: Option<&BTreeMap<String, DockerWorkspaceFileSnapshot>>,
+    limits: &WorkspacePatchLimits,
+    changed_files: &mut usize,
     snapshots: &mut BTreeMap<String, DockerWorkspaceFileSnapshot>,
 ) -> Result<(), DockerEngineError> {
-    let mut entries = fs::read_dir(current)
-        .map_err(|error| DockerEngineError {
-            reason_code: "docker.writeback.diff_failed".to_owned(),
-            message: format!("failed to read workspace {}: {error}", current.display()),
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| DockerEngineError {
+    let entries = fs::read_dir(current).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.diff_failed".to_owned(),
+        message: format!("failed to read workspace {}: {error}", current.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| DockerEngineError {
             reason_code: "docker.writeback.diff_failed".to_owned(),
             message: format!("failed to enumerate workspace {}: {error}", current.display()),
         })?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
         let path = entry.path();
         let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| DockerEngineError {
             reason_code: "docker.writeback.diff_failed".to_owned(),
@@ -3393,14 +3420,37 @@ fn collect_workspace_file_snapshots_into(
             });
         }
         if file_type.is_dir() {
-            collect_workspace_file_snapshots_into(root, path.as_path(), snapshots)?;
+            collect_workspace_file_snapshots_into(
+                root,
+                path.as_path(),
+                baseline,
+                limits,
+                changed_files,
+                snapshots,
+            )?;
         } else if file_type.is_file() {
             let relative_path = workspace_relative_patch_path(root, path.as_path())?;
-            let bytes = fs::read(path.as_path()).map_err(|error| DockerEngineError {
-                reason_code: "docker.writeback.diff_failed".to_owned(),
-                message: format!("failed to read workspace file {}: {error}", path.display()),
-            })?;
-            snapshots.insert(relative_path, DockerWorkspaceFileSnapshot { bytes });
+            let baseline_file = baseline.and_then(|files| files.get(relative_path.as_str()));
+            if baseline.is_some()
+                && baseline_file.is_none_or(|file| file.byte_len != metadata.len())
+            {
+                validate_docker_writeback_changed_file_size(
+                    relative_path.as_str(),
+                    metadata.len(),
+                    limits,
+                )?;
+            }
+            let snapshot = docker_workspace_file_snapshot(path.as_path())?;
+            if baseline.is_some() && baseline_file != Some(&snapshot) {
+                validate_docker_writeback_changed_file_size(
+                    relative_path.as_str(),
+                    snapshot.byte_len,
+                    limits,
+                )?;
+                *changed_files = changed_files.saturating_add(1);
+                ensure_docker_writeback_changed_file_count(*changed_files, limits)?;
+            }
+            snapshots.insert(relative_path, snapshot);
         } else {
             return Err(DockerEngineError {
                 reason_code: "docker.writeback.special_file_unsupported".to_owned(),
@@ -3410,6 +3460,64 @@ fn collect_workspace_file_snapshots_into(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+fn docker_workspace_file_snapshot(
+    path: &Path,
+) -> Result<DockerWorkspaceFileSnapshot, DockerEngineError> {
+    let mut file = fs::File::open(path).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.diff_failed".to_owned(),
+        message: format!("failed to open workspace file {}: {error}", path.display()),
+    })?;
+    let mut hasher = Sha256::new();
+    let mut byte_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to read workspace file {}: {error}", path.display()),
+        })?;
+        if read == 0 {
+            break;
+        }
+        byte_len = byte_len.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        hasher.update(&buffer[..read]);
+    }
+    Ok(DockerWorkspaceFileSnapshot { byte_len, sha256: hasher.finalize().into() })
+}
+
+fn validate_docker_writeback_changed_file_size(
+    path: &str,
+    byte_len: u64,
+    limits: &WorkspacePatchLimits,
+) -> Result<(), DockerEngineError> {
+    let max_bytes =
+        u64::try_from(limits.max_file_bytes.min(limits.max_patch_bytes)).unwrap_or(u64::MAX);
+    if byte_len > max_bytes {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.limit_exceeded".to_owned(),
+            message: format!(
+                "Docker writeback file {path} has {byte_len} bytes, exceeding the {max_bytes}-byte patch capture limit"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_docker_writeback_changed_file_count(
+    changed_files: usize,
+    limits: &WorkspacePatchLimits,
+) -> Result<(), DockerEngineError> {
+    if changed_files > limits.max_files_touched {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.limit_exceeded".to_owned(),
+            message: format!(
+                "Docker writeback changed {changed_files} files, exceeding the {}-file limit",
+                limits.max_files_touched
+            ),
+        });
     }
     Ok(())
 }
@@ -3465,46 +3573,70 @@ fn workspace_relative_patch_path(root: &Path, path: &Path) -> Result<String, Doc
 fn docker_patch_document_from_snapshots(
     before: &BTreeMap<String, DockerWorkspaceFileSnapshot>,
     after: &BTreeMap<String, DockerWorkspaceFileSnapshot>,
+    mutated_root: &Path,
+    limits: &WorkspacePatchLimits,
 ) -> Result<Option<(String, Vec<String>)>, DockerEngineError> {
-    let mut paths = BTreeSet::new();
-    paths.extend(before.keys().cloned());
-    paths.extend(after.keys().cloned());
-
-    let mut changed_files = Vec::new();
-    let mut patch = String::from("*** Begin Patch\n");
-    for path in paths {
-        match (before.get(path.as_str()), after.get(path.as_str())) {
-            (None, Some(after_file)) => {
-                append_docker_full_file_patch(
-                    &mut patch,
-                    "*** Add File",
-                    path.as_str(),
-                    after_file,
-                )?;
-                changed_files.push(path);
+    let mut changes = Vec::new();
+    for (path, after_file) in after {
+        let kind = match before.get(path.as_str()) {
+            None => Some(DockerWorkspaceChangeKind::Add),
+            Some(before_file) if before_file != after_file => {
+                Some(DockerWorkspaceChangeKind::Replace)
             }
-            (Some(_), None) => {
-                patch.push_str("*** Delete File: ");
-                patch.push_str(path.as_str());
-                patch.push('\n');
-                changed_files.push(path);
-            }
-            (Some(before_file), Some(after_file)) if before_file.bytes != after_file.bytes => {
-                append_docker_full_file_patch(
-                    &mut patch,
-                    "*** Replace File",
-                    path.as_str(),
-                    after_file,
-                )?;
-                changed_files.push(path);
-            }
-            _ => {}
+            Some(_) => None,
+        };
+        if let Some(kind) = kind {
+            changes.push(DockerWorkspaceChange { path: path.clone(), kind });
+            ensure_docker_writeback_changed_file_count(changes.len(), limits)?;
         }
     }
-    if changed_files.is_empty() {
+    for path in before.keys().filter(|path| !after.contains_key(path.as_str())) {
+        changes.push(DockerWorkspaceChange {
+            path: path.clone(),
+            kind: DockerWorkspaceChangeKind::Delete,
+        });
+        ensure_docker_writeback_changed_file_count(changes.len(), limits)?;
+    }
+    if changes.is_empty() {
         return Ok(None);
     }
-    patch.push_str("*** End Patch\n");
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut patch = String::from("*** Begin Patch\n");
+    let mut changed_files = Vec::with_capacity(changes.len());
+    for change in changes {
+        match change.kind {
+            DockerWorkspaceChangeKind::Add | DockerWorkspaceChangeKind::Replace => {
+                let operation = if change.kind == DockerWorkspaceChangeKind::Add {
+                    "*** Add File"
+                } else {
+                    "*** Replace File"
+                };
+                let expected =
+                    after.get(change.path.as_str()).ok_or_else(|| DockerEngineError {
+                        reason_code: "docker.writeback.diff_failed".to_owned(),
+                        message: format!(
+                            "changed Docker writeback path {} is missing its after snapshot",
+                            change.path
+                        ),
+                    })?;
+                append_docker_full_file_patch(
+                    &mut patch,
+                    operation,
+                    change.path.as_str(),
+                    mutated_root,
+                    expected,
+                    limits,
+                )?;
+            }
+            DockerWorkspaceChangeKind::Delete => {
+                let fragment = format!("*** Delete File: {}\n", change.path);
+                append_bounded_docker_patch_fragment(&mut patch, fragment.as_str(), limits)?;
+            }
+        }
+        changed_files.push(change.path);
+    }
+    append_bounded_docker_patch_fragment(&mut patch, "*** End Patch\n", limits)?;
     Ok(Some((patch, changed_files)))
 }
 
@@ -3512,9 +3644,52 @@ fn append_docker_full_file_patch(
     patch: &mut String,
     operation: &str,
     path: &str,
-    file: &DockerWorkspaceFileSnapshot,
+    mutated_root: &Path,
+    expected: &DockerWorkspaceFileSnapshot,
+    limits: &WorkspacePatchLimits,
 ) -> Result<(), DockerEngineError> {
-    let text = std::str::from_utf8(file.bytes.as_slice()).map_err(|error| DockerEngineError {
+    validate_docker_writeback_changed_file_size(path, expected.byte_len, limits)?;
+    let max_bytes = limits.max_file_bytes.min(limits.max_patch_bytes);
+    let changed_path = mutated_root.join(Path::new(path));
+    let metadata =
+        fs::symlink_metadata(changed_path.as_path()).map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to inspect changed Docker writeback file {path}: {error}"),
+        })?;
+    if !metadata.file_type().is_file() {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("changed Docker writeback path {path} is no longer a regular file"),
+        });
+    }
+    let read_limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut reader = fs::File::open(changed_path.as_path())
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to open changed Docker writeback file {path}: {error}"),
+        })?
+        .take(read_limit);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(expected.byte_len).unwrap_or(max_bytes).min(max_bytes));
+    reader.read_to_end(&mut bytes).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.diff_failed".to_owned(),
+        message: format!("failed to read changed Docker writeback file {path}: {error}"),
+    })?;
+    let observed_byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    validate_docker_writeback_changed_file_size(path, observed_byte_len, limits)?;
+    let observed = DockerWorkspaceFileSnapshot {
+        byte_len: observed_byte_len,
+        sha256: Sha256::digest(bytes.as_slice()).into(),
+    };
+    if &observed != expected {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!(
+                "Docker writeback file {path} changed while its patch was being captured"
+            ),
+        });
+    }
+    let text = std::str::from_utf8(bytes.as_slice()).map_err(|error| DockerEngineError {
         reason_code: "docker.writeback.binary_unsupported".to_owned(),
         message: format!("Docker writeback file {path} is not UTF-8 text: {error}"),
     })?;
@@ -3526,14 +3701,38 @@ fn append_docker_full_file_patch(
             ),
         });
     }
-    patch.push_str(operation);
-    patch.push_str(": ");
-    patch.push_str(path);
-    patch.push('\n');
+    let mut fragment = String::with_capacity(bytes.len().saturating_add(path.len() + 32));
+    fragment.push_str(operation);
+    fragment.push_str(": ");
+    fragment.push_str(path);
+    fragment.push('\n');
     let without_final_newline = text.strip_suffix('\n').unwrap_or(text);
     for line in without_final_newline.split('\n') {
-        append_docker_full_file_patch_line(patch, line);
+        append_docker_full_file_patch_line(&mut fragment, line);
     }
+    append_bounded_docker_patch_fragment(patch, fragment.as_str(), limits)?;
+    Ok(())
+}
+
+fn append_bounded_docker_patch_fragment(
+    patch: &mut String,
+    fragment: &str,
+    limits: &WorkspacePatchLimits,
+) -> Result<(), DockerEngineError> {
+    let next_len = patch.len().checked_add(fragment.len()).ok_or_else(|| DockerEngineError {
+        reason_code: "docker.writeback.limit_exceeded".to_owned(),
+        message: "Docker writeback patch size overflowed".to_owned(),
+    })?;
+    if next_len > limits.max_patch_bytes {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.limit_exceeded".to_owned(),
+            message: format!(
+                "Docker writeback patch has at least {next_len} bytes, exceeding the {}-byte limit",
+                limits.max_patch_bytes
+            ),
+        });
+    }
+    patch.push_str(fragment);
     Ok(())
 }
 
@@ -6560,14 +6759,15 @@ mod tests {
         apply_docker_cli_preflight_probe, build_environment_inventory,
         build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
-        build_execution_backend_status_reports, parse_execution_backend_preference,
-        plan_stuck_tool_job_recovery, prepare_docker_run_plan, resolve_execution_backend,
-        resolve_execution_backend_for_request, sha256_hex, validate_execution_backend_selection,
-        CanonicalSshWorkerTransport, ContainerBackendProfile, ContainerCleanupAttestation,
-        ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
-        ContainerResourceLimits, ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine,
-        DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
-        DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        build_execution_backend_status_reports, collect_workspace_file_snapshots,
+        parse_execution_backend_preference, plan_stuck_tool_job_recovery, prepare_docker_run_plan,
+        resolve_execution_backend, resolve_execution_backend_for_request, sha256_hex,
+        validate_execution_backend_selection, CanonicalSshWorkerTransport, ContainerBackendProfile,
+        ContainerCleanupAttestation, ContainerEnvBinding, ContainerEnvSourceKind,
+        ContainerMountPolicy, ContainerNetworkPolicy, ContainerResourceLimits,
+        ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine, DockerEngineError,
+        DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner,
+        ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
@@ -7767,6 +7967,63 @@ mod tests {
         .expect("captured patch bundle should dry-run apply to authoritative workspace");
         assert_eq!(dry_run.files_touched.len(), 2);
         assert_eq!(dry_run.patch_sha256, bundle.patch_sha256);
+    }
+
+    #[test]
+    fn docker_writeback_rejects_oversized_changed_file_before_capture() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let original = temp.path().join("original");
+        let mutated = temp.path().join("mutated");
+        fs::create_dir_all(original.as_path()).expect("original workspace should exist");
+        fs::create_dir_all(mutated.as_path()).expect("mutated workspace should exist");
+        let limits = WorkspacePatchLimits::default();
+        let before =
+            collect_workspace_file_snapshots(original.as_path(), original.as_path(), None, &limits)
+                .expect("empty baseline should be captured");
+        fs::write(
+            mutated.join("oversized.txt"),
+            vec![b'x'; limits.max_patch_bytes.saturating_add(1)],
+        )
+        .expect("oversized mutation fixture should be written");
+
+        let error = collect_workspace_file_snapshots(
+            mutated.as_path(),
+            mutated.as_path(),
+            Some(&before),
+            &limits,
+        )
+        .expect_err("oversized changed file must fail before patch capture");
+
+        assert_eq!(error.reason_code, "docker.writeback.limit_exceeded");
+        assert!(error.message.contains("patch capture limit"));
+    }
+
+    #[test]
+    fn docker_writeback_allows_large_unchanged_files_with_fingerprints() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let original = temp.path().join("original");
+        let mutated = temp.path().join("mutated");
+        fs::create_dir_all(original.as_path()).expect("original workspace should exist");
+        fs::create_dir_all(mutated.as_path()).expect("mutated workspace should exist");
+        let limits = WorkspacePatchLimits::default();
+        let content = vec![b'x'; limits.max_patch_bytes.saturating_add(1)];
+        fs::write(original.join("large.bin"), content.as_slice())
+            .expect("large baseline fixture should be written");
+        fs::write(mutated.join("large.bin"), content.as_slice())
+            .expect("large unchanged fixture should be written");
+
+        let before =
+            collect_workspace_file_snapshots(original.as_path(), original.as_path(), None, &limits)
+                .expect("large baseline should be fingerprinted");
+        let after = collect_workspace_file_snapshots(
+            mutated.as_path(),
+            mutated.as_path(),
+            Some(&before),
+            &limits,
+        )
+        .expect("large unchanged file should not be treated as patch content");
+
+        assert_eq!(before, after);
     }
 
     #[cfg(unix)]
