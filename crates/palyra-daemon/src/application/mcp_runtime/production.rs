@@ -1826,6 +1826,9 @@ impl McpRemoteSessionPort {
             config.url.as_deref().ok_or_else(|| factory_error("mcp.runtime.remote.url_missing"))?,
         )
         .map_err(|_| factory_error("mcp.runtime.remote.url_invalid"))?;
+        if !remote_transport_url_allowed(&base_url) {
+            return Err(factory_error("mcp.runtime.remote.url_insecure"));
+        }
         let verdict = evaluate_remote_target(
             base_url.clone(),
             config.egress_allowlist.clone(),
@@ -2609,6 +2612,22 @@ fn remote_url_targets_loopback(url: &Url) -> bool {
     })
 }
 
+fn remote_transport_url_allowed(url: &Url) -> bool {
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.scheme() {
+        "https" => true,
+        "http" => remote_url_targets_loopback(url),
+        _ => false,
+    }
+}
+
 fn load_vault_text(vault: &Vault, raw_ref: &str) -> Result<String, ()> {
     let reference = VaultRef::parse(raw_ref.trim_start_matches("vault://")).map_err(|_| ())?;
     let bytes = vault.get_secret(&reference.scope, reference.key.as_str()).map_err(|_| ())?;
@@ -3075,6 +3094,27 @@ mod tests {
             oauth: None,
             oauth_request_sequence: AtomicU64::new(0),
             sessions: AsyncMutex::new(BTreeMap::new()),
+        }
+    }
+
+    #[test]
+    fn production_remote_transport_rejects_plaintext_host_prefix_spoofs() {
+        for raw in [
+            "http://localhost.evil.example/mcp",
+            "http://127.0.0.1.evil.example/mcp",
+            "http://localhost@evil.example/mcp",
+        ] {
+            let url = Url::parse(raw).expect("test URL should parse");
+            assert!(!remote_transport_url_allowed(&url), "{raw} must be rejected");
+        }
+        for raw in [
+            "https://mcp.example.test/mcp",
+            "http://localhost:3000/mcp",
+            "http://127.42.0.7/mcp",
+            "http://[::1]/mcp",
+        ] {
+            let url = Url::parse(raw).expect("test URL should parse");
+            assert!(remote_transport_url_allowed(&url), "{raw} should be allowed");
         }
     }
 
