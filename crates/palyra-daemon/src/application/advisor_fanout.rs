@@ -182,6 +182,9 @@ pub(crate) struct AdvisorRuntimeSelection {
 
 /// Selects the advisor runtime. `None` preserves the baseline hot path exactly.
 ///
+/// Host-owned security triggers are authority-increasing and cannot be disabled
+/// by request-provided `advisor_fanout` parameters.
+///
 /// # Errors
 /// Returns `Status::invalid_argument` for malformed or unsupported
 /// `advisor_fanout` run parameters.
@@ -193,9 +196,6 @@ pub(crate) fn select_advisor_runtime(
         return Ok(None);
     }
     let explicit = parse_advisor_parameter(input.parameter_delta_json)?;
-    if explicit.as_ref().is_some_and(|parameter| parameter.mode == AdvisorRuntimeMode::Off) {
-        return Ok(None);
-    }
     let (mode, trigger_reason) = match explicit.as_ref().map(|parameter| parameter.mode) {
         Some(AdvisorRuntimeMode::Manual) => {
             (AdvisorRuntimeMode::Manual, "advisor_fanout.manual_requested")
@@ -209,6 +209,9 @@ pub(crate) fn select_advisor_runtime(
         ),
         Some(AdvisorRuntimeMode::Shadow) => {
             (AdvisorRuntimeMode::Shadow, "advisor_fanout.shadow_requested")
+        }
+        Some(AdvisorRuntimeMode::Off) if input.security_policy_triggered => {
+            (AdvisorRuntimeMode::PolicyTriggered, "advisor_fanout.security_policy_triggered")
         }
         Some(AdvisorRuntimeMode::Off) => return Ok(None),
         None if input.security_policy_triggered => {
@@ -1934,11 +1937,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_off_preserves_baseline_even_for_security_trigger() {
+    fn explicit_off_cannot_disable_security_trigger() {
         let selected = select_advisor_runtime(AdvisorRuntimeSelectionInput {
             feature_enabled: true,
             parameter_delta_json: Some(r#"{"advisor_fanout":{"mode":"off"}}"#),
             security_policy_triggered: true,
+            objective_checkpoint: true,
+            recursion_depth: 0,
+        })
+        .expect("off advisor selection should parse")
+        .expect("security policy should override request-provided off mode");
+
+        assert_eq!(selected.mode, AdvisorRuntimeMode::PolicyTriggered);
+        assert_eq!(selected.trigger_reason, "advisor_fanout.security_policy_triggered");
+        assert!(selected.security_quorum_required);
+        assert_eq!(selected.requested_presets[0], AdvisorPreset::SecurityReview);
+    }
+
+    #[test]
+    fn explicit_off_preserves_baseline_without_security_trigger() {
+        let selected = select_advisor_runtime(AdvisorRuntimeSelectionInput {
+            feature_enabled: true,
+            parameter_delta_json: Some(r#"{"advisor_fanout":{"mode":"off"}}"#),
+            security_policy_triggered: false,
             objective_checkpoint: true,
             recursion_depth: 0,
         })
