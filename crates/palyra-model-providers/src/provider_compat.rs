@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    sanitize_remote_error, ProviderFailureClass, ProviderFailureClassification,
+    contains_remote_secret_fragments, ProviderFailureClass, ProviderFailureClassification,
     ProviderFailureClassifier, ProviderRecoveryDecisionKind, QaMockProviderBehaviorKind,
 };
 
@@ -1008,8 +1008,7 @@ fn validate_raw_payload_is_sanitized(
     path: &str,
     issues: &mut Vec<ProviderCompatFixtureIssue>,
 ) {
-    let sanitized = sanitize_remote_error(body);
-    if sanitized.contains("<redacted>") && !body.to_ascii_lowercase().contains("<redacted>") {
+    if contains_remote_secret_fragments(body) {
         push_issue(
             issues,
             "raw_payload_contains_secret",
@@ -1338,6 +1337,27 @@ fixtures:
 
         let issues = error.issues().expect("validation issue should be available");
         assert!(issues.iter().any(|issue| issue.code == "raw_payload_contains_secret"));
+    }
+
+    #[test]
+    fn raw_payload_secret_validation_scans_beyond_placeholders_and_preview_limits() {
+        let body = format!("<redacted> {} sk-live-secret1234567890", "visible ".repeat(80));
+        let mut issues = Vec::new();
+
+        validate_raw_payload_is_sanitized(
+            body.as_str(),
+            "$.fixtures[0].raw_payload.body",
+            &mut issues,
+        );
+
+        assert!(issues.iter().any(|issue| issue.code == "raw_payload_contains_secret"));
+        let mut placeholder_issues = Vec::new();
+        validate_raw_payload_is_sanitized(
+            "Bearer <redacted> token=<redacted>",
+            "$.fixtures[0].raw_payload.body",
+            &mut placeholder_issues,
+        );
+        assert!(placeholder_issues.is_empty());
     }
 
     #[test]

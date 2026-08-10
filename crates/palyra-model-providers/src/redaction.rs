@@ -30,29 +30,41 @@ pub fn sanitize_remote_error(body: &str) -> String {
 /// length or applying the remote-error display truncation.
 #[must_use]
 pub fn redact_remote_secret_fragments(raw: &str) -> String {
-    redact_remote_error_secrets(raw)
+    scan_remote_error_secrets(raw).0
+}
+
+/// Reports credential-shaped substrings across the complete untruncated input.
+#[must_use]
+pub fn contains_remote_secret_fragments(raw: &str) -> bool {
+    scan_remote_error_secrets(raw).1
 }
 
 // Byte-level scan that blanks bearer header values, provider API key prefixes,
 // and key=value credential pairs. It operates on bytes so mixed/invalid UTF-8
 // bodies never panic the sanitizer path.
-fn redact_remote_error_secrets(raw: &str) -> String {
+fn scan_remote_error_secrets(raw: &str) -> (String, bool) {
     const REDACTED: &[u8] = b"<redacted>";
     const KV_PATTERNS: [&[u8]; 3] = [b"api_key=", b"token=", b"secret="];
 
     let source = raw.as_bytes();
     let mut output = Vec::with_capacity(source.len());
     let mut index = 0;
+    let mut contains_secret = false;
 
     while index < source.len() {
         if starts_with_ascii_case_insensitive(source, index, b"bearer ") {
-            output.extend_from_slice(b"Bearer ");
-            output.extend_from_slice(REDACTED);
-            index += b"bearer ".len();
-            while index < source.len() && is_bearer_token_byte(source[index]) {
-                index += 1;
+            let token_start = index + b"bearer ".len();
+            let mut token_end = token_start;
+            while token_end < source.len() && is_bearer_token_byte(source[token_end]) {
+                token_end += 1;
             }
-            continue;
+            if token_end > token_start {
+                output.extend_from_slice(b"Bearer ");
+                output.extend_from_slice(REDACTED);
+                index = token_end;
+                contains_secret = true;
+                continue;
+            }
         }
 
         if starts_with_ascii_case_insensitive(source, index, b"sk-") {
@@ -63,6 +75,7 @@ fn redact_remote_error_secrets(raw: &str) -> String {
             if end.saturating_sub(index + b"sk-".len()) >= 8 {
                 output.extend_from_slice(REDACTED);
                 index = end;
+                contains_secret = true;
                 continue;
             }
         }
@@ -77,7 +90,13 @@ fn redact_remote_error_secrets(raw: &str) -> String {
                     index += 1;
                 }
                 if index > value_start {
-                    output.extend_from_slice(REDACTED);
+                    let value = &source[value_start..index];
+                    if value.eq_ignore_ascii_case(REDACTED) {
+                        output.extend_from_slice(value);
+                    } else {
+                        output.extend_from_slice(REDACTED);
+                        contains_secret = true;
+                    }
                 }
                 matched_kv = true;
                 break;
@@ -91,7 +110,7 @@ fn redact_remote_error_secrets(raw: &str) -> String {
         index += 1;
     }
 
-    String::from_utf8_lossy(output.as_slice()).into_owned()
+    (String::from_utf8_lossy(output.as_slice()).into_owned(), contains_secret)
 }
 
 fn starts_with_ascii_case_insensitive(source: &[u8], offset: usize, pattern: &[u8]) -> bool {
@@ -119,7 +138,9 @@ fn is_secret_value_delimiter(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_remote_secret_fragments, sanitize_remote_error};
+    use super::{
+        contains_remote_secret_fragments, redact_remote_secret_fragments, sanitize_remote_error,
+    };
 
     #[test]
     fn truncates_multibyte_text_without_panicking() {
@@ -154,6 +175,15 @@ mod tests {
         assert!(!redacted.contains("sk-live123456789"));
         assert!(!redacted.contains("token=value"));
         assert!(!redacted.ends_with('…'));
+    }
+
+    #[test]
+    fn detects_complete_secret_input_without_treating_placeholders_as_secrets() {
+        assert!(!contains_remote_secret_fragments(
+            "Bearer <redacted> token=<redacted> secret=<REDACTED>"
+        ));
+        let input = format!("<redacted> {} sk-live123456789", "visible ".repeat(80));
+        assert!(contains_remote_secret_fragments(input.as_str()));
     }
 
     #[test]

@@ -110,7 +110,9 @@ pub use qa_mock::{
     QA_MOCK_PROVIDER_FIXTURE_FORMAT, QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
     QA_MOCK_PROVIDER_REDACTION_CONTRACT,
 };
-pub use redaction::{redact_remote_secret_fragments, sanitize_remote_error};
+pub use redaction::{
+    contains_remote_secret_fragments, redact_remote_secret_fragments, sanitize_remote_error,
+};
 pub use snapshots::{
     ProviderCircuitBreakerSnapshot, ProviderCredentialCapabilitySummary, ProviderDiscoverySnapshot,
     ProviderHealthProbeSnapshot, ProviderRegistryCredentialSnapshot, ProviderRegistryModelSnapshot,
