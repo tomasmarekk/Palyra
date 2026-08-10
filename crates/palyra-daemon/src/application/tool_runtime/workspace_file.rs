@@ -68,6 +68,7 @@ const WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES: usize = 4 * 1024;
 const WORKSPACE_SEARCH_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES: usize = 160;
 const WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES: usize = 8 * 1024;
+const WORKSPACE_READ_LINE_SCAN_MAX_BYTES: u64 = WORKSPACE_SEARCH_MAX_FILE_BYTES;
 const WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES: usize = 96;
 // Well-known dependency/build directories whose contents are noise for search.
 const WORKSPACE_SEARCH_SKIPPED_DIRS: &[&str] =
@@ -2208,7 +2209,24 @@ fn workspace_line_read_window(
     let mut buffer = [0_u8; WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES];
 
     'scan: loop {
-        let bytes_read = file.read(&mut buffer).map_err(|error| {
+        if start_offset.is_some() && requested_line_end.is_none() {
+            break;
+        }
+        if absolute_offset >= size_bytes {
+            break;
+        }
+        let remaining_scan_bytes =
+            WORKSPACE_READ_LINE_SCAN_MAX_BYTES.saturating_sub(absolute_offset);
+        if remaining_scan_bytes == 0 {
+            return Err(format!(
+                "{WORKSPACE_READ_FILE_TOOL_NAME} line lookup for workspace file {path} exceeds the {WORKSPACE_READ_LINE_SCAN_MAX_BYTES}-byte scan limit; use offset_bytes for larger files"
+            ));
+        }
+        let read_len = buffer.len().min(
+            usize::try_from(remaining_scan_bytes)
+                .expect("workspace line scan limit must fit usize"),
+        );
+        let bytes_read = file.read(&mut buffer[..read_len]).map_err(|error| {
             format!("{WORKSPACE_READ_FILE_TOOL_NAME} failed to scan workspace file {path}: {error}")
         })?;
         if bytes_read == 0 {
@@ -2921,6 +2939,36 @@ mod tests {
         assert_eq!(output.line_end, Some(4));
         assert!(output.eof);
         assert!(!output.binary);
+    }
+
+    #[test]
+    fn read_workspace_file_bounds_line_lookup_scan() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("large.log");
+        fs::write(
+            file_path,
+            vec![
+                b'x';
+                usize::try_from(WORKSPACE_READ_LINE_SCAN_MAX_BYTES)
+                    .expect("scan limit should fit usize")
+                    + 1
+            ],
+        )
+        .expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "large.log".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: Some(u64::MAX),
+            line_count: None,
+        };
+
+        let error = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect_err("line lookup must stop at the bounded scan limit");
+
+        assert!(error.contains("1048576-byte scan limit"), "{error}");
+        assert!(error.contains("use offset_bytes"), "{error}");
     }
 
     #[test]
