@@ -280,38 +280,79 @@ pub struct AssistantVisibleTextSanitization {
 /// Removes internal assistant control payloads from text that is about to be
 /// sent to a user-visible channel.
 ///
-/// The sanitizer intentionally preserves fenced code blocks so legitimate
-/// examples of JSON, XML, or stack traces can be discussed without being
-/// rewritten. Outside code fences it removes tool-call XML, function-call JSON,
-/// provider-control fragments, internal artifact references, policy metadata,
-/// and stack traces. The summary contains only stable reason codes.
+/// Safe fenced code blocks remain intact, but a fence containing tool-call
+/// XML, function-call JSON, provider-control fragments, internal artifact
+/// references, policy metadata, or stack traces is redacted as one segment.
+/// Unterminated fences follow the same fail-closed rule. The summary contains
+/// only stable reason codes.
 #[must_use]
 pub fn sanitize_visible_assistant_text(text: &str) -> AssistantVisibleTextSanitization {
+    let lines = text.lines().collect::<Vec<_>>();
     let mut sanitized_lines = Vec::new();
-    let mut in_fenced_code = false;
     let mut reason_codes = Vec::<String>::new();
     let mut redaction_count = 0_u32;
     let mut previous_was_placeholder = false;
+    let mut index = 0;
 
-    for line in text.lines() {
-        let trimmed_start = line.trim_start();
-        if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
-            in_fenced_code = !in_fenced_code;
-            sanitized_lines.push(line.to_owned());
-            previous_was_placeholder = false;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(fence_marker) = assistant_visible_fence_marker(line) {
+            let block_start = index;
+            index = index.saturating_add(1);
+            while index < lines.len() {
+                let closes_fence = lines[index].trim_start().starts_with(fence_marker);
+                index = index.saturating_add(1);
+                if closes_fence {
+                    break;
+                }
+            }
+            let block = &lines[block_start..index];
+            let mut block_reasons = block
+                .iter()
+                .filter_map(|line| assistant_visible_line_reason(line))
+                .collect::<Vec<_>>();
+            let content_end = if block.len() > 1
+                && block.last().is_some_and(|line| line.trim_start().starts_with(fence_marker))
+            {
+                block.len().saturating_sub(1)
+            } else {
+                block.len()
+            };
+            if content_end > 1 {
+                let combined_content = block[1..content_end].join("\n");
+                if let Some(reason_code) = assistant_visible_line_reason(combined_content.as_str())
+                {
+                    if !block_reasons.contains(&reason_code) {
+                        block_reasons.push(reason_code);
+                    }
+                }
+            }
+            if block_reasons.is_empty() {
+                sanitized_lines.extend(block.iter().map(|line| (*line).to_owned()));
+                previous_was_placeholder = false;
+                continue;
+            }
+            if !previous_was_placeholder {
+                sanitized_lines.push(ASSISTANT_VISIBLE_REDACTION_PLACEHOLDER.to_owned());
+                previous_was_placeholder = true;
+            }
+            redaction_count = redaction_count
+                .saturating_add(u32::try_from(block_reasons.len()).unwrap_or(u32::MAX));
+            for reason_code in block_reasons {
+                push_unique_reason(&mut reason_codes, reason_code);
+            }
             continue;
         }
 
-        if !in_fenced_code {
-            if let Some(reason_code) = assistant_visible_line_reason(line) {
-                if !previous_was_placeholder {
-                    sanitized_lines.push(ASSISTANT_VISIBLE_REDACTION_PLACEHOLDER.to_owned());
-                    previous_was_placeholder = true;
-                }
-                redaction_count = redaction_count.saturating_add(1);
-                push_unique_reason(&mut reason_codes, reason_code);
-                continue;
+        index = index.saturating_add(1);
+        if let Some(reason_code) = assistant_visible_line_reason(line) {
+            if !previous_was_placeholder {
+                sanitized_lines.push(ASSISTANT_VISIBLE_REDACTION_PLACEHOLDER.to_owned());
+                previous_was_placeholder = true;
             }
+            redaction_count = redaction_count.saturating_add(1);
+            push_unique_reason(&mut reason_codes, reason_code);
+            continue;
         }
 
         sanitized_lines.push(line.to_owned());
@@ -326,6 +367,17 @@ pub fn sanitize_visible_assistant_text(text: &str) -> AssistantVisibleTextSaniti
         sanitized_text,
         redacted: redaction_count > 0,
         summary: AssistantVisibleTextRedactionSummary { redaction_count, reason_codes },
+    }
+}
+
+fn assistant_visible_fence_marker(line: &str) -> Option<&'static str> {
+    let trimmed_start = line.trim_start();
+    if trimmed_start.starts_with("```") {
+        Some("```")
+    } else if trimmed_start.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
     }
 }
 
@@ -4135,11 +4187,42 @@ mod tests {
 
     #[test]
     fn assistant_visible_sanitizer_preserves_legitimate_code_blocks() {
-        let source = "Example:\n```json\n{\"function_call\":{\"name\":\"demo\"}}\n```\nEnd.";
+        let source = "Example:\n```json\n{\"example\":\"visible\"}\n```\nEnd.";
         let outcome = sanitize_visible_assistant_text(source);
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.sanitized_text, source);
+    }
+
+    #[test]
+    fn assistant_visible_sanitizer_redacts_control_payloads_inside_code_fences() {
+        let source =
+            "Example:\n```json\n{\n  \"function_call\": {\n    \"name\": \"demo\"\n  }\n}\n```\nEnd.";
+        let outcome = sanitize_visible_assistant_text(source);
+
+        assert!(outcome.redacted);
+        assert!(!outcome.sanitized_text.contains("function_call"));
+        assert!(!outcome.sanitized_text.contains("```"));
+        assert_eq!(outcome.sanitized_text, "Example:\n[redacted assistant control payload]\nEnd.");
+        assert!(outcome
+            .summary
+            .reason_codes
+            .iter()
+            .any(|code| code == "assistant_visible.function_json"));
+    }
+
+    #[test]
+    fn assistant_visible_sanitizer_fails_closed_for_unterminated_sensitive_fence() {
+        let source = "Example:\n~~~text\npolicy_action=tool.execute\nstill internal";
+        let outcome = sanitize_visible_assistant_text(source);
+
+        assert!(outcome.redacted);
+        assert_eq!(outcome.sanitized_text, "Example:\n[redacted assistant control payload]");
+        assert!(outcome
+            .summary
+            .reason_codes
+            .iter()
+            .any(|code| code == "assistant_visible.policy_metadata"));
     }
 
     #[test]
