@@ -1932,7 +1932,7 @@ fn parse_input_json(input_json: &[u8]) -> Result<Value, String> {
 // fields cannot be reinterpreted across boundaries (no "A|B"/"AB|" style
 // collisions); pinned by the delimiter-collision test below.
 #[allow(clippy::too_many_arguments)]
-fn compute_execution_hash(
+pub(crate) fn compute_execution_hash(
     proposal_id: &str,
     tool_name: &str,
     input_json: &[u8],

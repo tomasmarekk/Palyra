@@ -1088,7 +1088,7 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
     ) -> RunnerExecutionFuture<'a> {
         Box::pin(async move {
             let fault_injection = request.fault_injection.clone();
-            let mut outcome = crate::tool_protocol::execute_tool_call_with_fault_injection(
+            let outcome = crate::tool_protocol::execute_tool_call_with_fault_injection(
                 request.config,
                 request.proposal_id,
                 request.tool_name,
@@ -1099,13 +1099,24 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
                 request.fault_injection,
             )
             .await;
-            outcome.attestation.execution_manifest =
-                Some(Box::new(local_sandbox_process_manifest(
-                    self,
-                    &request.config.process_runner,
-                    request.input_json,
-                    &outcome,
-                )));
+            let execution_manifest = local_sandbox_process_manifest(
+                self,
+                &request.config.process_runner,
+                request.input_json,
+                &outcome,
+            );
+            let mut outcome = build_tool_execution_outcome_with_manifest(
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+                outcome.success,
+                outcome.output_json,
+                outcome.error,
+                outcome.attestation.timed_out,
+                outcome.attestation.executor,
+                outcome.attestation.sandbox_enforcement,
+                execution_manifest,
+            );
             apply_cleanup_fault_to_verified_outcome(
                 &fault_injection,
                 request.proposal_id,
@@ -8154,6 +8165,21 @@ mod tests {
         );
         assert_eq!(manifest.output_manifest_sha256, sha256_hex(outcome.output_json.as_slice()));
         assert!(manifest.cleanup.success);
+        let manifest_sha256 = manifest.manifest_sha256();
+        let expected_execution_sha256 = crate::tool_protocol::compute_execution_hash(
+            "proposal-local-process",
+            "palyra.process.run",
+            br#"{"command":"echo","args":["runner-ok"]}"#,
+            outcome.success,
+            outcome.output_json.as_slice(),
+            outcome.error.as_str(),
+            outcome.attestation.timed_out,
+            outcome.attestation.executor.as_str(),
+            outcome.attestation.sandbox_enforcement.as_str(),
+            outcome.attestation.executed_at_unix_ms,
+            Some(manifest_sha256.as_str()),
+        );
+        assert_eq!(outcome.attestation.execution_sha256, expected_execution_sha256);
     }
 
     #[test]
