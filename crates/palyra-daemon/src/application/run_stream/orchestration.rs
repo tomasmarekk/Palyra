@@ -3544,7 +3544,7 @@ async fn send_terminal_agent_loop_progress_status(
     }
 }
 
-fn is_run_stream_response_channel_closed(error: &Status) -> bool {
+pub(super) fn is_run_stream_response_channel_closed(error: &Status) -> bool {
     error.code() == Code::Cancelled && error.message() == RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE
 }
 

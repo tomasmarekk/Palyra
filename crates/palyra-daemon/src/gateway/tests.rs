@@ -15966,6 +15966,10 @@ fn approval_failure_decision_keeps_durable_recording_errors_as_errors() {
         ApprovalDecision::Error
     );
     assert_eq!(
+        approval_failure_decision("approval_request_tape_error: disk full"),
+        ApprovalDecision::Error
+    );
+    assert_eq!(
         approval_failure_decision("route_approval_request_tape_error: write failed"),
         ApprovalDecision::Error
     );

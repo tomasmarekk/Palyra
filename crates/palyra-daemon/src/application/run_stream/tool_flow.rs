@@ -121,7 +121,7 @@ use super::{
         RunStreamFlowControl, PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE,
         PROCESS_PROGRESS_BACKPRESSURE_TAPE_EVENT,
     },
-    orchestration::RunStreamHarnessLifecycle,
+    orchestration::{is_run_stream_response_channel_closed, RunStreamHarnessLifecycle},
     tape::{
         append_mcp_transport_invocation_tape_event, mcp_transport_invocation_tape_append_request,
         redact_run_stream_text, redacted_run_stream_output_json, send_status_with_tape,
@@ -2416,7 +2416,7 @@ async fn resolve_run_stream_tool_approval_outcome(
         best_effort_mark_approval_error(
             runtime_state,
             pending_approval.approval_id.as_str(),
-            format!("approval_request_dispatch_error: {}", error.message()),
+            approval_request_failure_reason(&error),
         )
         .await;
         return Err(error);
@@ -2563,6 +2563,15 @@ async fn resolve_run_stream_tool_approval_outcome(
         );
     }
     Ok(Some(response))
+}
+
+fn approval_request_failure_reason(error: &Status) -> String {
+    let reason_code = if is_run_stream_response_channel_closed(error) {
+        "approval_request_dispatch_error"
+    } else {
+        "approval_request_tape_error"
+    };
+    format!("{reason_code}: {}", error.message())
 }
 
 fn tool_execution_timeout(runtime_state: &GatewayRuntimeState, tool_name: &str) -> Duration {
@@ -5144,8 +5153,8 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_process_progress_backpressure_tape_event, before_tool_fail_run_status,
-        classify_tool_parallelism, classify_tool_result_replay_safety,
+        append_process_progress_backpressure_tape_event, approval_request_failure_reason,
+        before_tool_fail_run_status, classify_tool_parallelism, classify_tool_result_replay_safety,
         commit_run_stream_tool_execution_outcome, drain_parallel_tool_group_after_cancel,
         drain_parallel_tool_group_after_error, finalize_drained_tool_execution_before_error,
         process_progress_channel_for_tool, process_progress_status_message,
@@ -5154,7 +5163,8 @@ mod tests {
         tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
         workspace_spill_unavailable_projection, OrchestratorTapeAppendRequest,
         ParallelToolExecutionTaskOutcome, RunStreamPreparedToolExecution, ToolParallelism,
-        TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
+        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE, TOOL_RESULT_PROJECTION_POLICY_EVENT,
+        TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
     use crate::application::tool_governance::{
         build_tool_call_signature, evaluate_before_tool_decision_pipeline, BeforeToolDecisionInput,
@@ -5210,6 +5220,17 @@ mod tests {
             "inline before-tool hook requested fail_run before tool execution; \
              reason_code=hook.failed_run"
         );
+    }
+
+    #[test]
+    fn approval_request_failure_reason_distinguishes_dispatch_from_tape_errors() {
+        let dispatch = approval_request_failure_reason(&Status::cancelled(
+            RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
+        ));
+        let tape = approval_request_failure_reason(&Status::internal("tape append failed"));
+
+        assert!(dispatch.starts_with("approval_request_dispatch_error:"));
+        assert!(tape.starts_with("approval_request_tape_error:"));
     }
 
     fn start_backpressure_test_run(state: &GatewayRuntimeState, session_id: &str, run_id: &str) {
