@@ -245,10 +245,27 @@ impl HostCapabilityServiceGrantSet {
 pub struct WasmHostCallRequest {
     /// Service being requested.
     pub service: HostCapabilityServiceKind,
+    /// Concrete capability resource extracted from the validated call payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_resource: Option<WasmHostCallResource>,
     /// Serialized payload size before host parsing.
     pub payload_bytes: u64,
     /// Requested timeout in milliseconds.
     pub timeout_ms: u64,
+}
+
+/// Concrete resource a capability-scoped Wasm host service intends to use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmHostCallResource {
+    /// HTTP host selected for a bounded model or connector request.
+    HttpHost(String),
+    /// Vault key selected for an opaque secret lease.
+    SecretKey(String),
+    /// Storage namespace selected for a task or memory operation.
+    StoragePrefix(String),
+    /// Channel selected for an outbound intent.
+    Channel(String),
 }
 
 /// Authorization status for one Wasm host service call.
@@ -313,11 +330,15 @@ pub fn authorize_wasm_host_call(
         );
     }
     if let Some(required) = descriptor.required_capability_class {
-        if !capability_class_granted(&grants.capability_grants, required) {
+        if !capability_resource_granted(
+            &grants.capability_grants,
+            required,
+            request.requested_resource.as_ref(),
+        ) {
             return wasm_host_call_decision(
                 request.service,
                 WasmHostCallStatus::Denied,
-                "plugin.host_call.denied.capability_class_missing",
+                "plugin.host_call.denied.resource_grant_missing",
                 descriptor,
             );
         }
@@ -330,15 +351,26 @@ pub fn authorize_wasm_host_call(
     )
 }
 
-fn capability_class_granted(
+fn capability_resource_granted(
     grants: &CapabilityGrantSet,
     required: TypedPluginCapabilityClass,
+    requested_resource: Option<&WasmHostCallResource>,
 ) -> bool {
-    match required {
-        TypedPluginCapabilityClass::HttpHosts => !grants.http_hosts.is_empty(),
-        TypedPluginCapabilityClass::Secrets => !grants.secret_keys.is_empty(),
-        TypedPluginCapabilityClass::StoragePrefixes => !grants.storage_prefixes.is_empty(),
-        TypedPluginCapabilityClass::Channels => !grants.channels.is_empty(),
+    match (required, requested_resource) {
+        (TypedPluginCapabilityClass::HttpHosts, Some(WasmHostCallResource::HttpHost(host))) => {
+            grants.http_hosts.iter().any(|granted| granted == host.trim())
+        }
+        (TypedPluginCapabilityClass::Secrets, Some(WasmHostCallResource::SecretKey(key))) => {
+            grants.secret_keys.iter().any(|granted| granted == key.trim())
+        }
+        (
+            TypedPluginCapabilityClass::StoragePrefixes,
+            Some(WasmHostCallResource::StoragePrefix(prefix)),
+        ) => grants.storage_prefixes.iter().any(|granted| granted == prefix.trim()),
+        (TypedPluginCapabilityClass::Channels, Some(WasmHostCallResource::Channel(channel))) => {
+            grants.channels.iter().any(|granted| granted == channel.trim())
+        }
+        _ => false,
     }
 }
 
@@ -890,7 +922,7 @@ mod tests {
         HostCapabilityServiceGrantSet, RuntimeError, RuntimeLimits,
         TypedPluginContractAdapterSupport, TypedPluginContractMode,
         TypedPluginContractNegotiationInput, TypedPluginContractStatus, WasmHostCallRequest,
-        WasmHostCallStatus, WasmRuntime,
+        WasmHostCallResource, WasmHostCallStatus, WasmRuntime,
     };
     use palyra_plugins_sdk::{
         HostCapabilityServiceKind, TypedPluginCapabilityClass, TypedPluginContractDeclaration,
@@ -1017,6 +1049,7 @@ mod tests {
             &HostCapabilityServiceGrantSet::default(),
             &WasmHostCallRequest {
                 service: HostCapabilityServiceKind::TasksCreate,
+                requested_resource: None,
                 payload_bytes: 128,
                 timeout_ms: 100,
             },
@@ -1038,13 +1071,16 @@ mod tests {
             &grants,
             &WasmHostCallRequest {
                 service: HostCapabilityServiceKind::TasksCreate,
+                requested_resource: Some(WasmHostCallResource::StoragePrefix(
+                    "tasks/default".to_owned(),
+                )),
                 payload_bytes: 128,
                 timeout_ms: 100,
             },
         );
 
         assert_eq!(decision.status, WasmHostCallStatus::Denied);
-        assert_eq!(decision.reason_code, "plugin.host_call.denied.capability_class_missing");
+        assert_eq!(decision.reason_code, "plugin.host_call.denied.resource_grant_missing");
     }
 
     #[test]
@@ -1061,6 +1097,9 @@ mod tests {
             &grants,
             &WasmHostCallRequest {
                 service: HostCapabilityServiceKind::VaultSecretLeaseRequest,
+                requested_resource: Some(WasmHostCallResource::SecretKey(
+                    "global/openai_api_key".to_owned(),
+                )),
                 payload_bytes: 256,
                 timeout_ms: 250,
             },
@@ -1074,6 +1113,62 @@ mod tests {
             "vault host service must only expose lease metadata"
         );
         assert!(decision.redacted_fields.contains(&"secret.ref".to_owned()));
+    }
+
+    #[test]
+    fn host_call_authorization_binds_every_capability_class_to_the_requested_resource() {
+        let cases = [
+            (
+                HostCapabilityServiceKind::BoundedLlmComplete,
+                CapabilityGrantSet {
+                    http_hosts: vec!["api.example.com".to_owned()],
+                    ..CapabilityGrantSet::default()
+                },
+                WasmHostCallResource::HttpHost("other.example.com".to_owned()),
+            ),
+            (
+                HostCapabilityServiceKind::VaultSecretLeaseRequest,
+                CapabilityGrantSet {
+                    secret_keys: vec!["global/allowed".to_owned()],
+                    ..CapabilityGrantSet::default()
+                },
+                WasmHostCallResource::SecretKey("global/other".to_owned()),
+            ),
+            (
+                HostCapabilityServiceKind::MemoryProposeCandidate,
+                CapabilityGrantSet {
+                    storage_prefixes: vec!["memory/allowed".to_owned()],
+                    ..CapabilityGrantSet::default()
+                },
+                WasmHostCallResource::StoragePrefix("memory/other".to_owned()),
+            ),
+            (
+                HostCapabilityServiceKind::ChannelSendIntent,
+                CapabilityGrantSet {
+                    channels: vec!["discord".to_owned()],
+                    ..CapabilityGrantSet::default()
+                },
+                WasmHostCallResource::Channel("slack".to_owned()),
+            ),
+        ];
+
+        for (service, capability_grants, requested_resource) in cases {
+            let decision = authorize_wasm_host_call(
+                &HostCapabilityServiceGrantSet {
+                    allowed_services: vec![service],
+                    capability_grants,
+                },
+                &WasmHostCallRequest {
+                    service,
+                    requested_resource: Some(requested_resource),
+                    payload_bytes: 128,
+                    timeout_ms: 100,
+                },
+            );
+
+            assert_eq!(decision.status, WasmHostCallStatus::Denied);
+            assert_eq!(decision.reason_code, "plugin.host_call.denied.resource_grant_missing");
+        }
     }
 
     #[test]
