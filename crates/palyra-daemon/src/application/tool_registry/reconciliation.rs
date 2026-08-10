@@ -172,6 +172,18 @@ pub(crate) fn resolve_tool_execution_semantics(
     }
 }
 
+/// Returns whether an exact builtin invocation is safe to continue after a
+/// restart without reconciling an unresolved side effect.
+#[must_use]
+pub(crate) fn tool_wait_is_safe_to_resume(tool_name: &str, input_json: &[u8]) -> bool {
+    builtin_tool_effect(tool_name, input_json).is_some_and(|resolution| {
+        matches!(
+            resolution.effect,
+            BuiltinToolEffect::ReadOnly | BuiltinToolEffect::DeterministicIdempotent
+        )
+    })
+}
+
 /// Projects a tool's default input posture for callers that do not have a
 /// normalized payload. Runtime execution must use
 /// [`resolve_tool_execution_semantics`] so mixed-operation tools are precise.

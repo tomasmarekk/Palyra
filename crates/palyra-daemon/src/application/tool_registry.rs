@@ -39,7 +39,9 @@ pub(crate) use normalization::{
 };
 #[cfg(test)]
 pub(crate) use reconciliation::tool_execution_semantics;
-pub(crate) use reconciliation::{resolve_tool_execution_semantics, safe_resume_matrix};
+pub(crate) use reconciliation::{
+    resolve_tool_execution_semantics, safe_resume_matrix, tool_wait_is_safe_to_resume,
+};
 pub(crate) use schema::sanitize_schema_for_provider;
 pub(crate) use types::{
     FilteredToolCatalogEntry, ModelVisibleToolCatalogSnapshot, NormalizedToolCall,

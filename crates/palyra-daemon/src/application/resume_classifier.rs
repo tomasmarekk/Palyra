@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::orchestrator::RunLifecycleState;
+use crate::{
+    application::tool_registry::tool_wait_is_safe_to_resume, orchestrator::RunLifecycleState,
+};
 
 pub(crate) const RESUME_CLASSIFIER_SCHEMA_VERSION: i64 = 1;
 pub(crate) const RUN_RESUME_DECISION_RECORDED_EVENT: &str = "run.resume.decision_recorded";
@@ -327,7 +329,7 @@ pub(crate) fn summarize_resume_tape_observations(
     events: &[ResumeTapeObservation],
 ) -> ResumeTapeSafetySignals {
     let mut signals = ResumeTapeSafetySignals::default();
-    let mut proposals = BTreeMap::<String, String>::new();
+    let mut proposals = BTreeMap::<String, (String, Vec<u8>)>::new();
     let mut active_tool_proposal_id = None::<String>;
 
     for event in events {
@@ -344,7 +346,12 @@ pub(crate) fn summarize_resume_tape_observations(
                     if let (Some(proposal_id), Some(tool_name)) =
                         (proposal_id(payload), tool_name(payload))
                     {
-                        proposals.insert(proposal_id.to_owned(), tool_name.to_owned());
+                        let input_json = tool_input_json(payload)
+                            .map(Value::to_string)
+                            .unwrap_or_default()
+                            .into_bytes();
+                        proposals
+                            .insert(proposal_id.to_owned(), (tool_name.to_owned(), input_json));
                     }
                 }
             }
@@ -359,13 +366,19 @@ pub(crate) fn summarize_resume_tape_observations(
                     signals.pending_approval = true;
                 }
                 let proposal_id = proposal_id(payload).map(str::to_owned);
-                let tool_name = proposal_id
-                    .as_deref()
-                    .and_then(|id| proposals.get(id).map(String::as_str))
+                let proposal = proposal_id.as_deref().and_then(|id| proposals.get(id));
+                let tool_name = proposal
+                    .map(|(tool_name, _)| tool_name.as_str())
                     .or_else(|| tool_name(payload));
-                let is_read_only = tool_name.is_some_and(is_read_only_tool_name);
-                signals.read_only_tool_wait = is_read_only;
-                signals.mutating_tool_in_flight = !is_read_only;
+                let decision_input = tool_input_json(payload).map(Value::to_string);
+                let input_json = proposal
+                    .map(|(_, input_json)| input_json.as_slice())
+                    .or_else(|| decision_input.as_deref().map(str::as_bytes))
+                    .unwrap_or_default();
+                let safe_to_resume = tool_name
+                    .is_some_and(|tool_name| tool_wait_is_safe_to_resume(tool_name, input_json));
+                signals.read_only_tool_wait = safe_to_resume;
+                signals.mutating_tool_in_flight = !safe_to_resume;
                 active_tool_proposal_id = proposal_id;
             }
             "tool_approval_request" => {
@@ -493,6 +506,13 @@ fn tool_name(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn tool_input_json(payload: &Value) -> Option<&Value> {
+    payload
+        .pointer("/tool_proposal/input_json")
+        .or_else(|| payload.pointer("/tool_decision/input_json"))
+        .or_else(|| payload.pointer("/input_json"))
+}
+
 fn tool_decision_kind(payload: &Value) -> Option<&str> {
     payload
         .pointer("/tool_decision/kind")
@@ -514,19 +534,6 @@ fn checkpoint_stage(payload: Option<&Value>) -> Option<&str> {
         .pointer("/checkpoint_stage")
         .or_else(|| payload?.pointer("/workspace_checkpoint/checkpoint_stage"))
         .and_then(Value::as_str)
-}
-
-fn is_read_only_tool_name(tool_name: &str) -> bool {
-    let normalized = tool_name.trim().to_ascii_lowercase();
-    normalized == "palyra.sleep"
-        || normalized.contains(".read")
-        || normalized.contains(".list")
-        || normalized.contains(".get")
-        || normalized.contains(".status")
-        || normalized.contains(".search")
-        || normalized.contains(".diagnostics")
-        || normalized.contains(".inspect")
-        || normalized.contains(".tail")
 }
 
 #[cfg(test)]
@@ -617,7 +624,7 @@ mod tests {
             tape_event(
                 "tool_proposal",
                 1_200,
-                json!({"tool_proposal": {"proposal_id": "p1", "tool_name": "palyra.gateway.status"}}),
+                json!({"tool_proposal": {"proposal_id": "p1", "tool_name": "palyra.process.status"}}),
             ),
             tape_event(
                 "tool_decision",
@@ -642,6 +649,54 @@ mod tests {
         ]);
         assert!(mutating.mutating_tool_in_flight);
         assert!(!mutating.read_only_tool_wait);
+    }
+
+    #[test]
+    fn tape_summary_uses_download_output_path_effect() {
+        let mutating = summarize_resume_tape_observations(&[
+            tape_event(
+                "tool_proposal",
+                1_200,
+                json!({
+                    "tool_proposal": {
+                        "proposal_id": "download",
+                        "tool_name": "palyra.browser.downloads.get",
+                        "input_json": {
+                            "download_id": "download-1",
+                            "output_path": "artifacts/report.pdf"
+                        }
+                    }
+                }),
+            ),
+            tape_event(
+                "tool_decision",
+                1_300,
+                json!({"tool_decision": {"proposal_id": "download", "kind": "allow"}}),
+            ),
+        ]);
+        assert!(mutating.mutating_tool_in_flight);
+        assert!(!mutating.read_only_tool_wait);
+
+        let read_only = summarize_resume_tape_observations(&[
+            tape_event(
+                "tool_proposal",
+                1_200,
+                json!({
+                    "tool_proposal": {
+                        "proposal_id": "download",
+                        "tool_name": "palyra.browser.downloads.get",
+                        "input_json": {"download_id": "download-1"}
+                    }
+                }),
+            ),
+            tape_event(
+                "tool_decision",
+                1_300,
+                json!({"tool_decision": {"proposal_id": "download", "kind": "allow"}}),
+            ),
+        ]);
+        assert!(read_only.read_only_tool_wait);
+        assert!(!read_only.mutating_tool_in_flight);
     }
 
     fn base_input() -> ResumeClassifierInput {

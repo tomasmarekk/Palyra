@@ -757,7 +757,7 @@ mod tests {
                 "#,
             )
             .expect("run fixture should insert");
-        let tool_name = if mutating { "palyra.fs.apply_patch" } else { "palyra.gateway.status" };
+        let tool_name = if mutating { "palyra.fs.apply_patch" } else { "palyra.process.status" };
         guard
             .execute(
                 r#"
