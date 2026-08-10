@@ -1861,8 +1861,9 @@ impl RegistryBackedModelProvider {
             .tool_catalog_snapshot
             .as_ref()
             .map(stable_tool_catalog_snapshot_for_response_cache);
+        let reasoning_effort = request.reasoning_effort.or(self.config.reasoning_effort);
         let payload = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "provider_id": model.provider_id.as_str(),
             "model_id": model.model_id.as_str(),
             "input_text": request.input_text.as_str(),
@@ -1874,6 +1875,7 @@ impl RegistryBackedModelProvider {
             "context_trace_id": request.context_trace_id.as_deref(),
             "budget_profile": request.budget_profile.as_deref(),
             "max_output_tokens": request.max_output_tokens,
+            "reasoning_effort": reasoning_effort.map(ProviderReasoningEffort::as_str),
             "vision_inputs": &request.vision_inputs,
             "prompt_segments": &request.prompt_segments,
             "prompt_cache_policy": &request.prompt_cache_policy,
@@ -10441,6 +10443,29 @@ turns:
         );
 
         openai_handle.join().expect("openai scripted server thread should exit");
+    }
+
+    #[test]
+    fn registry_response_cache_key_binds_effective_reasoning_effort() {
+        let mut provider = RegistryBackedModelProvider::new(multi_provider_test_config(
+            "http://127.0.0.1:9".to_owned(),
+            "http://127.0.0.1:9".to_owned(),
+        ))
+        .expect("registry-backed provider should build");
+        provider.config.reasoning_effort = Some(ProviderReasoningEffort::High);
+        let model =
+            provider.models.get("gpt-4o-mini").expect("primary test model should be registered");
+        let request =
+            ProviderRequest::from_input_text("cache reasoning".to_owned(), false, Vec::new(), None);
+        let default_key = provider.response_cache_key(&request, model);
+
+        let mut explicit_default = request.clone();
+        explicit_default.reasoning_effort = Some(ProviderReasoningEffort::High);
+        assert_eq!(default_key, provider.response_cache_key(&explicit_default, model));
+
+        let mut lower_effort = request;
+        lower_effort.reasoning_effort = Some(ProviderReasoningEffort::Low);
+        assert_ne!(default_key, provider.response_cache_key(&lower_effort, model));
     }
 
     #[tokio::test(flavor = "multi_thread")]
