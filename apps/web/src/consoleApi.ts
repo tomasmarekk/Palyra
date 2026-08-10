@@ -4192,7 +4192,7 @@ export class ConsoleApiClient {
         method: "POST",
         body: JSON.stringify(payload),
       },
-      { csrf: false },
+      { csrf: true },
     );
   }
 

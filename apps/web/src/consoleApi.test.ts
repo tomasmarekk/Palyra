@@ -1892,7 +1892,7 @@ describe("ConsoleApiClient", () => {
 
     expect(requestUrl(calls[3]?.input)).toBe("/console/v1/config/reload/plan");
     expect(calls[3]?.init?.method).toBe("POST");
-    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(calls[3]?.init?.body)).toContain('"path":"./palyra.toml"');
 
     expect(requestUrl(calls[4]?.input)).toBe("/console/v1/config/reload/apply");

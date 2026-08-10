@@ -213,7 +213,7 @@ pub(crate) async fn console_config_reload_plan_handler(
     headers: HeaderMap,
     Json(payload): Json<control_plane::ConfigReloadPlanRequest>,
 ) -> Result<Json<control_plane::ConfigReloadPlanEnvelope>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, true)?;
     Ok(Json(plan_config_reload_for_context(&state, &session.context, payload).await?))
 }
 
