@@ -32,10 +32,10 @@ use crate::{
     },
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
-        ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
-        ApprovalSubjectType, CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord,
-        CronJobUpdatePatch, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
-        CronRunRecord, CronRunStartRequest, CronRunStatus, CronScheduleType,
+        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
+        CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch,
+        CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunRecord,
+        CronRunStartRequest, CronRunStatus, CronScheduleType,
     },
     routines::operations::{
         routine_cron_security_projection, routine_lease_ledger_projection,
@@ -1128,13 +1128,9 @@ async fn upsert_routine(
             .await?,
         )
     } else {
-        ensure_first_run_approval_inherited_from_control_call(
-            runtime_state,
-            context,
-            &job_record,
-            &metadata,
-        )
-        .await?
+        // First-run approval belongs to dispatch; an accepted control call is
+        // not evidence of an interactive operator decision.
+        None
     };
     Ok(json!({
         "operation": "upsert",
@@ -2172,107 +2168,6 @@ async fn routine_approval_granted(
     Ok(approvals
         .into_iter()
         .any(|approval| matches!(approval.decision, Some(ApprovalDecision::Allow))))
-}
-
-async fn routine_approval_granted_for_policy(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    subject_id: &str,
-    principal: &str,
-    expected_policy_hash: &str,
-) -> Result<bool, String> {
-    let (approvals, _) = runtime_state
-        .list_approval_records(
-            None,
-            Some(25),
-            None,
-            None,
-            Some(subject_id.to_owned()),
-            Some(principal.to_owned()),
-            Some(ApprovalDecision::Allow),
-            Some(ApprovalSubjectType::Tool),
-        )
-        .await
-        .map_err(sanitize_status_message)?;
-    Ok(approvals.into_iter().any(|approval| {
-        approval.principal == principal
-            && approval.subject_id == subject_id
-            && approval.prompt.subject_id == subject_id
-            && approval.subject_type == ApprovalSubjectType::Tool
-            && matches!(approval.decision, Some(ApprovalDecision::Allow))
-            && approval.policy_snapshot.policy_id == ROUTINE_APPROVAL_POLICY_ID
-            && approval.policy_snapshot.policy_hash == expected_policy_hash
-    }))
-}
-
-async fn ensure_first_run_approval_inherited_from_control_call(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    context: &RoutinesToolContext,
-    job: &CronJobRecord,
-    metadata: &RoutineMetadataRecord,
-) -> Result<Option<Value>, String> {
-    if !routine_can_inherit_first_run_approval(job, metadata) {
-        return Ok(None);
-    }
-
-    let mode = RoutineApprovalMode::BeforeFirstRun;
-    let subject_id = routine_approval_subject_id(metadata.routine_id.as_str(), mode);
-    let details_json = routine_approval_details_json(job, metadata, mode);
-    let policy_hash = routine_approval_policy_hash(details_json.as_str());
-    if routine_approval_granted_for_policy(
-        runtime_state,
-        subject_id.as_str(),
-        context.principal.as_str(),
-        policy_hash.as_str(),
-    )
-    .await?
-    {
-        return Ok(None);
-    }
-
-    let record = runtime_state
-        .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
-            session_id: context.session_id.clone(),
-            run_id: context.run_id.clone(),
-            principal: context.principal.clone(),
-            device_id: ROUTINE_APPROVAL_DEVICE_ID.to_owned(),
-            channel: Some(job.channel.clone()),
-            subject_type: ApprovalSubjectType::Tool,
-            subject_id: subject_id.clone(),
-            request_summary: routine_approval_request_summary(job, metadata, mode),
-            policy_snapshot: routine_approval_policy_snapshot(metadata, mode, policy_hash.as_str()),
-            prompt: routine_approval_prompt(job, mode, subject_id, details_json),
-        })
-        .await
-        .map_err(sanitize_status_message)?;
-    let resolved =
-        runtime_state
-            .resolve_approval_record(ApprovalResolveRequest {
-                approval_id: record.approval_id.clone(),
-                decision: ApprovalDecision::Allow,
-                decision_scope: ApprovalDecisionScope::Once,
-                decision_reason:
-                    "first scheduled run approved by accepted palyra.routines.control upsert"
-                        .to_owned(),
-                decision_scope_ttl_ms: None,
-            })
-            .await
-            .map_err(sanitize_status_message)?;
-    serde_json::to_value(resolved)
-        .map(Some)
-        .map_err(|error| format!("failed to serialize routine approval record: {error}"))
-}
-
-fn routine_can_inherit_first_run_approval(
-    job: &CronJobRecord,
-    metadata: &RoutineMetadataRecord,
-) -> bool {
-    job.enabled
-        && matches!(
-            metadata.trigger_kind,
-            RoutineTriggerKind::Schedule | RoutineTriggerKind::FileWatch
-        )
-        && metadata.approval_policy.mode == RoutineApprovalMode::BeforeFirstRun
 }
 
 /// Returns the existing pending approval for the routine subject, or creates

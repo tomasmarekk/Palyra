@@ -20327,7 +20327,7 @@ async fn archived_objective_bound_dispatch_is_denied_before_orchestrator() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn routines_tool_inherits_first_run_approval_for_sensitive_schedule_workdir() {
+async fn routines_tool_defers_sensitive_schedule_approval_until_first_run() {
     let state = build_test_runtime_state(false);
     let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
     let context = routines_tool_test_context();
@@ -20373,41 +20373,55 @@ async fn routines_tool_inherits_first_run_approval_for_sensitive_schedule_workdi
         .and_then(Value::as_str)
         .expect("upsert should return routine id")
         .to_owned();
-    let approval = output
-        .get("approval")
-        .and_then(Value::as_object)
-        .expect("accepted control upsert should grant the first scheduled run approval");
-    assert_eq!(approval.get("decision").and_then(Value::as_str), Some("allow"));
     assert_eq!(
-        approval.get("decision_reason").and_then(Value::as_str),
-        Some("first scheduled run approved by accepted palyra.routines.control upsert")
+        output.get("approval"),
+        Some(&Value::Null),
+        "an accepted control upsert must not stand in for an operator approval"
     );
 
-    let job = state
-        .cron_job(routine_id.clone())
-        .await
-        .expect("cron job lookup should succeed")
-        .expect("upserted routine should have a backing cron job");
-    let outcome = crate::cron::trigger_job_now_with_options(
-        std::sync::Arc::clone(&state),
-        routines_tool_test_auth(),
-        "http://127.0.0.1:9".to_owned(),
-        job,
-        std::sync::Arc::new(Notify::new()),
-        crate::cron::TriggerJobOptions::default(),
+    let run_now_input = serde_json::to_vec(&json!({
+        "operation": "run_now",
+        "routine_id": routine_id,
+    }))
+    .expect("run-now payload should serialize");
+    let run_now_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_CONTROL_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBL",
+        run_now_input.as_slice(),
     )
-    .await
-    .expect("dispatch should report backend failures through cron runs, not transport errors");
-    let run_id = outcome.run_id.expect("dispatch should record a cron run");
+    .await;
+    assert!(run_now_outcome.success, "approval gate should return a routine outcome");
+    let run_now_json = parse_tool_output_json(&run_now_outcome);
+    assert_eq!(run_now_json.get("status").and_then(Value::as_str), Some("denied"));
+    let approval = run_now_json
+        .get("approval")
+        .and_then(Value::as_object)
+        .expect("first dispatch should return its pending approval");
+    assert!(
+        approval.get("approval_id").and_then(Value::as_str).is_some(),
+        "pending approval should expose its durable id"
+    );
+    assert_ne!(
+        approval.get("decision").and_then(Value::as_str),
+        Some("allow"),
+        "first dispatch must not inherit an Allow decision from upsert"
+    );
+    let run_id = run_now_json
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("approval-gated dispatch should record a cron run")
+        .to_owned();
     let run = state
         .cron_run(run_id)
         .await
         .expect("cron run lookup should succeed")
         .expect("dispatch should persist a run record");
-    assert_ne!(
+    assert_eq!(
         run.error_kind.as_deref(),
         Some("approval_required"),
-        "first scheduled run should pass the routine approval gate after inherited approval"
+        "first routine run must stop at the explicit operator approval gate"
     );
 }
 
