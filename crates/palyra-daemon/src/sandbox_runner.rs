@@ -11797,7 +11797,9 @@ fn configure_node_runtime_environment(command: &mut Command) {
 fn child_process_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        windows_process_current_dir(path)
+        windows_deverbatim_path_string(path)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
     }
     #[cfg(not(windows))]
     {
@@ -12302,7 +12304,6 @@ fn build_windows_tier_b_process_command(
     args: &[String],
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
-    let current_dir = windows_process_current_dir(cwd);
     // .cmd/.bat scripts cannot be spawned directly by CreateProcess, so they are dispatched
     // through cmd.exe with a fully controlled command line: /D skips AutoRun registry commands,
     // /S plus the outer quotes pins cmd's quote parsing, and every argument is validated and
@@ -12310,18 +12311,13 @@ fn build_windows_tier_b_process_command(
     if windows_program_requires_cmd_wrapper(program) {
         let mut command = Command::new(windows_command_processor());
         command.raw_arg(format!("/D /S /C {}", windows_cmd_wrapper_command_line(program, args)?));
-        command.current_dir(current_dir.as_path());
+        command.current_dir(cwd);
         return Ok(command);
     }
 
     let mut command = Command::new(program);
-    command.args(args).current_dir(current_dir.as_path());
+    command.args(args).current_dir(cwd);
     Ok(command)
-}
-
-#[cfg(windows)]
-fn windows_process_current_dir(cwd: &Path) -> PathBuf {
-    windows_deverbatim_path_string(cwd).map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 #[cfg(windows)]
@@ -16025,15 +16021,20 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn windows_process_current_dir_deverbatims_canonical_cwd() {
-        assert_eq!(
-            super::windows_process_current_dir(Path::new(r"\\?\C:\Users\test-user\fixture")),
-            PathBuf::from(r"C:\Users\test-user\fixture")
-        );
-        assert_eq!(
-            super::windows_process_current_dir(Path::new(r"\\?\UNC\server\share\fixture")),
-            PathBuf::from(r"\\server\share\fixture")
-        );
+    fn windows_process_commands_preserve_validated_verbatim_cwd() {
+        for (program, cwd) in [
+            (r"C:\Tools\tool.exe", r"\\?\C:\Users\test-user\fixture"),
+            (r"C:\Tools\tool.cmd", r"\\?\UNC\server\share\fixture"),
+        ] {
+            let command = super::build_windows_tier_b_process_command(
+                Path::new(program),
+                &[],
+                Path::new(cwd),
+            )
+            .expect("Windows process command should be built");
+
+            assert_eq!(command.get_current_dir(), Some(Path::new(cwd)));
+        }
     }
 
     #[test]
