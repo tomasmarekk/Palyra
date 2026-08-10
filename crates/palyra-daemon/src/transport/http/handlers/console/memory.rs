@@ -27,7 +27,7 @@ use crate::journal::{
     session_search_source_refs_projection, MemoryRetentionPolicy, RecallArtifactCreateRequest,
     RecallArtifactListFilter, RecallArtifactRecord, SessionSearchOutcome, SessionSearchRequest,
     RECALL_ARTIFACT_KIND_LEARNING_CURATOR_REPORT, RECALL_ARTIFACT_KIND_PREVIEW,
-    RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+    RECALL_ARTIFACT_KIND_SESSION_SEARCH, SESSION_SEARCH_MAX_QUERY_BYTES,
 };
 use crate::*;
 use crate::{
@@ -1974,10 +1974,8 @@ pub(crate) async fn console_search_all_handler(
     Query(query): Query<ConsoleSearchAllQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let search_query = query.q.trim();
-    if search_query.is_empty() {
-        return Err(runtime_status_response(tonic::Status::invalid_argument("q cannot be empty")));
-    }
+    let search_query =
+        validated_console_search_query(query.q.as_str()).map_err(runtime_status_response)?;
     let min_score = query.min_score.unwrap_or(0.0);
     if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
@@ -2104,6 +2102,19 @@ pub(crate) async fn console_search_all_handler(
     })))
 }
 
+fn validated_console_search_query(raw: &str) -> Result<&str, tonic::Status> {
+    if raw.len() > SESSION_SEARCH_MAX_QUERY_BYTES {
+        return Err(tonic::Status::invalid_argument(format!(
+            "q cannot exceed {SESSION_SEARCH_MAX_QUERY_BYTES} bytes"
+        )));
+    }
+    let query = raw.trim();
+    if query.is_empty() {
+        return Err(tonic::Status::invalid_argument("q cannot be empty"));
+    }
+    Ok(query)
+}
+
 /// `GET /console/v1/memory/session-search` — searches transcript windows
 /// across the caller's orchestrator sessions, persists the outcome as a
 /// session-search recall artifact, and records a `memory.session_search`
@@ -2118,10 +2129,8 @@ pub(crate) async fn console_session_search_handler(
     Query(query): Query<ConsoleSessionSearchQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let search_query = query.q.trim();
-    if search_query.is_empty() {
-        return Err(runtime_status_response(tonic::Status::invalid_argument("q cannot be empty")));
-    }
+    let search_query =
+        validated_console_search_query(query.q.as_str()).map_err(runtime_status_response)?;
     let min_score = query.min_score.unwrap_or(0.0);
     if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
@@ -3263,6 +3272,16 @@ mod tests {
         assert!(inventory.get("payload").is_none());
         assert!(inventory.get("diagnostics").is_none());
         assert!(inventory.get("provenance").is_none());
+    }
+
+    #[test]
+    fn console_session_search_query_rejects_oversized_input_before_runtime_work() {
+        let oversized = "x".repeat(SESSION_SEARCH_MAX_QUERY_BYTES + 1);
+        let error = validated_console_search_query(oversized.as_str())
+            .expect_err("oversized query should fail");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("cannot exceed"));
     }
 
     #[test]

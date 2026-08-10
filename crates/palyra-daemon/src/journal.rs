@@ -4310,6 +4310,11 @@ pub struct SessionSearchRequest {
     pub include_archived: bool,
 }
 
+/// Maximum UTF-8 bytes accepted for one transcript-search query.
+pub const SESSION_SEARCH_MAX_QUERY_BYTES: usize = 4 * 1024;
+const SESSION_SEARCH_MAX_TERMS: usize = 24;
+const SESSION_SEARCH_MAX_SCANNED_TERMS: usize = 96;
+
 /// Schema version for the typed Session Search 2.0 contracts.
 pub const SESSION_SEARCH_V2_SCHEMA_VERSION: u64 = 2;
 
@@ -16571,6 +16576,7 @@ impl JournalStore {
         &self,
         request: &SessionSearchRequest,
     ) -> Result<SessionSearchOutcome, JournalError> {
+        validate_session_search_query_size(request.query.as_str())?;
         let started_at = Instant::now();
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         search_orchestrator_session_windows(&guard, request, started_at)
@@ -28841,6 +28847,7 @@ fn load_session_search_lineage_members(
 fn validate_session_search_v2_request(
     request: &SessionSearchRequestV2,
 ) -> Result<(), JournalError> {
+    validate_session_search_query_size(request.query.as_str())?;
     if request.schema_version != SESSION_SEARCH_V2_SCHEMA_VERSION {
         return Err(JournalError::InvalidArgument(format!(
             "session search schema version {} is unsupported",
@@ -28884,6 +28891,15 @@ fn validate_session_search_v2_request(
                 "session search anchor is invalid".to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_session_search_query_size(query: &str) -> Result<(), JournalError> {
+    if query.len() > SESSION_SEARCH_MAX_QUERY_BYTES {
+        return Err(JournalError::InvalidArgument(format!(
+            "session search query cannot exceed {SESSION_SEARCH_MAX_QUERY_BYTES} bytes"
+        )));
     }
     Ok(())
 }
@@ -29546,9 +29562,11 @@ fn session_search_fts_query(normalized_query: &str, query_terms: &[String]) -> O
         terms.extend(
             normalized_query
                 .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .take(SESSION_SEARCH_MAX_SCANNED_TERMS)
                 .map(str::trim)
                 .filter(|term| !term.is_empty())
-                .map(str::to_lowercase),
+                .map(str::to_lowercase)
+                .take(SESSION_SEARCH_MAX_TERMS),
         );
     }
     terms.sort();
@@ -29667,14 +29685,18 @@ fn push_session_search_run_ref(
 }
 
 fn session_search_terms(query: &str) -> Vec<String> {
-    let mut terms = query
-        .split_whitespace()
-        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric()).to_lowercase())
-        .filter(|term| term.len() >= 2 && !session_search_is_stop_term(term.as_str()))
-        .collect::<Vec<_>>();
-    terms.sort();
-    terms.dedup();
-    terms
+    let mut terms = BTreeSet::new();
+    for raw_term in query.split_whitespace().take(SESSION_SEARCH_MAX_SCANNED_TERMS) {
+        let term = raw_term.trim_matches(|ch: char| !ch.is_alphanumeric()).to_lowercase();
+        if term.len() < 2 || session_search_is_stop_term(term.as_str()) {
+            continue;
+        }
+        terms.insert(term);
+        if terms.len() >= SESSION_SEARCH_MAX_TERMS {
+            break;
+        }
+    }
+    terms.into_iter().collect()
 }
 
 fn session_search_is_stop_term(term: &str) -> bool {
@@ -54942,6 +54964,20 @@ mod tests {
         assert_eq!(terms.len(), MEMORY_TAG_QUERY_MAX_TERMS);
         assert_eq!(terms.first().map(String::as_str), Some("distinct_memory_tag_00"));
         assert_eq!(terms.last().map(String::as_str), Some("distinct_memory_tag_07"));
+    }
+
+    #[test]
+    fn session_search_terms_stop_at_the_preprocessing_budget() {
+        let query = (0..256)
+            .map(|index| format!("session_search_term_{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let terms = session_search_terms(query.as_str());
+
+        assert_eq!(terms.len(), SESSION_SEARCH_MAX_TERMS);
+        assert_eq!(terms.first().map(String::as_str), Some("session_search_term_000"));
+        assert_eq!(terms.last().map(String::as_str), Some("session_search_term_023"));
     }
 
     #[test]
