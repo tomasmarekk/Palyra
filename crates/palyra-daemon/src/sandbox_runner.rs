@@ -3333,19 +3333,16 @@ fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
 
 fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
     let text = decode_process_output_text(output).text;
-    let normalized = text
+    let redacted = redacted_process_output_text(text.as_str()).text;
+    let normalized = redacted
         .chars()
         .map(|character| if character.is_control() { ' ' } else { character })
         .collect::<String>();
     let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
-        return None;
-    }
-    let redacted = redacted_process_output_text(collapsed.as_str()).text;
-    if redacted.trim().is_empty() {
         None
     } else {
-        Some(redacted)
+        Some(collapsed)
     }
 }
 
@@ -3694,7 +3691,8 @@ fn redacted_process_output(output: &[u8]) -> RedactedProcessOutputText {
 }
 
 fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
-    let redacted_urls = redact_url_segments_in_text(value);
+    let normalized = strip_process_output_terminal_controls(value);
+    let redacted_urls = redact_url_segments_in_text(normalized.as_str());
     let redacted_auth = redact_auth_error(redacted_urls.as_str());
     let redacted_paths = redact_sensitive_url_path_segments_in_text(redacted_auth.as_str());
     let export_redaction = redact_text_for_export(
@@ -3704,20 +3702,49 @@ fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
         TrustLabel::TrustedLocal,
     );
     let redaction_reasons = process_redaction_reason_codes(
-        value,
+        normalized.as_str(),
         redacted_urls.as_str(),
         redacted_auth.as_str(),
         redacted_paths.as_str(),
         &export_redaction,
     );
-    let redacted_text =
-        restore_process_output_trailing_line_endings(value, export_redaction.redacted_text);
-    let redacted = redacted_urls != value
+    let mut redaction_reasons = redaction_reasons;
+    if normalized != value {
+        redaction_reasons.push("terminal_control_sequence".to_owned());
+        redaction_reasons.sort();
+        redaction_reasons.dedup();
+    }
+    let redacted_text = restore_process_output_trailing_line_endings(
+        normalized.as_str(),
+        export_redaction.redacted_text,
+    );
+    let redacted = normalized != value
+        || redacted_urls != normalized
         || redacted_auth != redacted_urls
         || redacted_paths != redacted_auth
-        || redacted_text != value;
+        || redacted_text != normalized;
 
     RedactedProcessOutputText { text: redacted_text, redacted, redaction_reasons }
+}
+
+fn strip_process_output_terminal_controls(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x1b {
+            index = index.saturating_add(ansi_escape_sequence_len(&bytes[index..]).unwrap_or(1));
+            continue;
+        }
+        if matches!(byte, 0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        output.push(byte);
+        index = index.saturating_add(1);
+    }
+    String::from_utf8_lossy(output.as_slice()).into_owned()
 }
 
 /// Applies the canonical process-output redaction boundary for another
@@ -19613,7 +19640,7 @@ mod tests {
     }
 
     #[test]
-    fn process_success_output_preserves_ansi_stdout_as_text() {
+    fn process_success_output_normalizes_ansi_stdout_as_text() {
         let ansi_table =
             "\r\n\x1b[32;1mName\x1b[0m            \x1b[32;1mMode\x1b[0m\r\nsrc             d----\r\n"
                 .repeat(24);
@@ -19639,6 +19666,7 @@ mod tests {
 
         assert!(!rendered.contains("binary stdout omitted"), "{rendered}");
         assert!(stdout.contains("Name"), "{stdout}");
+        assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
         assert_eq!(parsed.pointer("/streams/stdout/binary").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(
             parsed.pointer("/streams/stdout/binary_output_omitted").and_then(|v| v.as_bool()),
@@ -19647,6 +19675,65 @@ mod tests {
         assert_eq!(
             parsed.pointer("/streams/stdout/encoding").and_then(|v| v.as_str()),
             Some("utf-8")
+        );
+    }
+
+    #[test]
+    fn process_success_output_redacts_ansi_obfuscated_secret() {
+        let stdout = StreamCapture {
+            bytes: b"MINIMAX_API_\x1b[31mKEY\x1b[0m=sk-\x1b]0;status\x07test-secret-value\n"
+                .to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let stderr = StreamCapture::default();
+
+        let output = process_success_output_json(ProcessSuccessOutputJsonInput {
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: 3,
+            tier: "b",
+            sandbox_backend: "tier_b_in_process",
+            process_risk: &empty_process_risk_report(),
+            input: None,
+        })
+        .expect("process output should serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+        let stdout = parsed["stdout"].as_str().expect("stdout should be string");
+        let stream =
+            parsed.pointer("/streams/stdout").expect("stdout stream metadata should be present");
+
+        assert!(stdout.contains("[REDACTED_SECRET]"), "{stdout}");
+        assert!(!stdout.contains("sk-test-secret-value"), "{stdout}");
+        assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+        assert_eq!(parsed.get("stdout_redacted").and_then(serde_json::Value::as_bool), Some(true));
+        assert!(
+            stream.get("redaction_reasons").and_then(serde_json::Value::as_array).is_some_and(
+                |reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == Some("terminal_control_sequence"))
+                }
+            ),
+            "{stream}"
+        );
+        assert!(
+            !stream
+                .get("head")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("sk-test-secret-value"),
+            "{stream}"
+        );
+        assert!(
+            !stream
+                .get("tail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("sk-test-secret-value"),
+            "{stream}"
         );
     }
 
