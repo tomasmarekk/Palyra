@@ -881,6 +881,35 @@ fn extension_lifecycle_blocks_quarantine_enable_without_review() {
 }
 
 #[test]
+fn extension_lifecycle_cannot_launder_quarantine_through_disabled() {
+    let output = build_signed_skill_artifact(sample_request()).expect("artifact should build");
+    let inspection =
+        inspect_skill_artifact(output.artifact_bytes.as_slice()).expect("artifact should inspect");
+    let record = extension_record_from_skill_artifact(
+        &inspection,
+        ExtensionPackageSource::local_artifact("dist/acme.echo_http.palyra-skill"),
+        ExtensionPackageStatus::Quarantined,
+        1,
+        1,
+    );
+    let mut registry = InMemoryExtensionPackageRegistry::default();
+    registry.upsert_package(record);
+
+    let error = registry
+        .transition_package(ExtensionLifecycleTransitionRequest {
+            package_id: skill_extension_package_id("acme.echo_http", "1.0.0"),
+            target_status: ExtensionPackageStatus::Disabled,
+            actor_principal: "user:ops".to_owned(),
+            reason: "attempt to clear quarantine history".to_owned(),
+            approved_by: None,
+            requested_at_unix_ms: 2,
+        })
+        .expect_err("quarantine must not be laundered through disabled");
+
+    assert!(error.to_string().contains("invalid extension lifecycle transition"));
+}
+
+#[test]
 fn extension_lifecycle_rejects_spoofed_quarantine_enable_approval() {
     let output = build_signed_skill_artifact(sample_request()).expect("artifact should build");
     let inspection =

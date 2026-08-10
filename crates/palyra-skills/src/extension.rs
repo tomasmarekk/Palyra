@@ -1111,7 +1111,6 @@ fn is_lifecycle_transition_allowed(
             | (Disabled, Enabled)
             | (Disabled, Removed)
             | (Quarantined, Enabled)
-            | (Quarantined, Disabled)
             | (Quarantined, Removed)
             | (Failed, Removed)
             | (RolledBack, Disabled)
