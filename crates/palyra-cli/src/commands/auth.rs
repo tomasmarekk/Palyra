@@ -132,18 +132,28 @@ pub(crate) async fn run_auth_profiles_async(
             json,
         } => {
             let json = output::preferred_json(json);
+            let after_profile_id = after.unwrap_or_default();
+            let provider_kind = provider
+                .map(auth_provider_arg_to_proto)
+                .unwrap_or(auth_v1::AuthProviderKind::Unspecified as i32);
+            let provider_custom_name = provider_name.unwrap_or_default();
+            let scope_kind = scope
+                .map(auth_scope_arg_to_proto)
+                .unwrap_or(auth_v1::AuthScopeKind::Unspecified as i32);
+            let scope_agent_id = agent_id.unwrap_or_default();
+            let query_starts_unfiltered_registry = after_profile_id.is_empty()
+                && provider_kind == auth_v1::AuthProviderKind::Unspecified as i32
+                && provider_custom_name.is_empty()
+                && scope_kind == auth_v1::AuthScopeKind::Unspecified as i32
+                && scope_agent_id.is_empty();
             let mut request = Request::new(auth_v1::ListAuthProfilesRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
-                after_profile_id: after.unwrap_or_default(),
+                after_profile_id,
                 limit: limit.unwrap_or(100),
-                provider_kind: provider
-                    .map(auth_provider_arg_to_proto)
-                    .unwrap_or(auth_v1::AuthProviderKind::Unspecified as i32),
-                provider_custom_name: provider_name.unwrap_or_default(),
-                scope_kind: scope
-                    .map(auth_scope_arg_to_proto)
-                    .unwrap_or(auth_v1::AuthScopeKind::Unspecified as i32),
-                scope_agent_id: agent_id.unwrap_or_default(),
+                provider_kind,
+                provider_custom_name,
+                scope_kind,
+                scope_agent_id,
             });
             inject_run_stream_metadata(request.metadata_mut(), &connection)?;
             let response =
@@ -157,6 +167,7 @@ pub(crate) async fn run_auth_profiles_async(
                     serde_json::to_string_pretty(&build_auth_profiles_list_json_payload(
                         profiles,
                         empty_to_none(payload.next_after_profile_id),
+                        query_starts_unfiltered_registry,
                     ))?
                 );
             } else {
@@ -178,7 +189,7 @@ pub(crate) async fn run_auth_profiles_async(
                         auth_profile_credential_type(profile)
                     );
                 }
-                if payload.profiles.is_empty() {
+                if payload.profiles.is_empty() && query_starts_unfiltered_registry {
                     println!("auth.profiles.note {}", AUTH_PROFILES_EMPTY_REGISTRY_NOTE);
                     println!(
                         "auth.profiles.model_provider_sources {}",
@@ -389,13 +400,14 @@ pub(crate) async fn run_auth_profiles_async(
 fn build_auth_profiles_list_json_payload(
     profiles: Vec<Value>,
     next_after_profile_id: Option<String>,
+    query_starts_unfiltered_registry: bool,
 ) -> Value {
-    let is_empty = profiles.is_empty();
+    let registry_is_empty = profiles.is_empty() && query_starts_unfiltered_registry;
     let mut payload = json!({
         "profiles": profiles,
         "next_after_profile_id": next_after_profile_id,
     });
-    if is_empty {
+    if registry_is_empty {
         payload["empty_registry_note"] = json!(AUTH_PROFILES_EMPTY_REGISTRY_NOTE);
         payload["model_provider_auth_sources"] = json!(AUTH_PROFILES_MODEL_PROVIDER_SOURCES);
     }
@@ -3111,7 +3123,7 @@ mod tests {
 
     #[test]
     fn empty_auth_profiles_json_points_to_model_provider_auth_sources() {
-        let payload = build_auth_profiles_list_json_payload(Vec::new(), None);
+        let payload = build_auth_profiles_list_json_payload(Vec::new(), None, true);
 
         assert_eq!(payload.get("profiles"), Some(&json!([])));
         assert!(
@@ -3134,6 +3146,7 @@ mod tests {
         let payload = build_auth_profiles_list_json_payload(
             vec![json!({"profile_id": "openai-default"})],
             Some("next-profile".to_owned()),
+            true,
         );
 
         assert!(payload.get("empty_registry_note").is_none());
@@ -3146,6 +3159,15 @@ mod tests {
             AUTH_PROFILES_EMPTY_REGISTRY_NOTE.contains("auth-profile registry"),
             "empty-registry note should keep the command boundary explicit"
         );
+    }
+
+    #[test]
+    fn filtered_empty_auth_profiles_json_does_not_claim_empty_registry() {
+        let payload = build_auth_profiles_list_json_payload(Vec::new(), None, false);
+
+        assert_eq!(payload.get("profiles"), Some(&json!([])));
+        assert!(payload.get("empty_registry_note").is_none());
+        assert!(payload.get("model_provider_auth_sources").is_none());
     }
 
     #[test]
