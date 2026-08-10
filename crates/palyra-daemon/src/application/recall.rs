@@ -33,6 +33,7 @@ use crate::{
             render_memory_augmented_prompt, sanitize_prompt_inline_value,
             sort_and_truncate_memory_search_hits,
         },
+        service_authorization::authorize_memory_action,
         session_compaction::{extract_transcript_search_text, truncate_console_text},
     },
     gateway::{current_unix_ms, GatewayRuntimeState, MEMORY_AUTO_INJECT_MIN_SCORE},
@@ -982,6 +983,13 @@ async fn build_selection_context(
         .clone()
         .or_else(|| request.channel.clone())
         .or_else(|| context.channel.clone());
+    for resource in explicit_recall_policy_resources(
+        session_id.as_deref(),
+        recall_channel.as_deref(),
+        selection,
+    ) {
+        authorize_memory_action(context.principal.as_str(), "memory.search", resource.as_str())?;
+    }
     let mut memory_hits = Vec::new();
     if !selection.memory_item_ids.is_empty() {
         let candidate_hits = runtime_state
@@ -1104,6 +1112,33 @@ async fn build_selection_context(
             confidence: None,
         },
     })
+}
+
+fn explicit_recall_policy_resources(
+    session_id: Option<&str>,
+    channel: Option<&str>,
+    selection: &ExplicitRecallSelection,
+) -> Vec<String> {
+    let selects_scoped_memory = !selection.memory_item_ids.is_empty()
+        || !selection.transcript_refs.is_empty()
+        || !selection.checkpoint_ids.is_empty()
+        || !selection.compaction_artifact_ids.is_empty();
+    let mut resources = Vec::with_capacity(2);
+    if selects_scoped_memory {
+        resources.push(session_id.map_or_else(
+            || {
+                channel.map_or_else(
+                    || "memory:principal".to_owned(),
+                    |channel| format!("memory:channel:{channel}"),
+                )
+            },
+            |session_id| format!("memory:session:{session_id}"),
+        ));
+    }
+    if !selection.workspace_document_ids.is_empty() {
+        resources.push("memory:workspace".to_owned());
+    }
+    resources
 }
 
 /// Resolves the requested session for the authenticated context
@@ -2520,11 +2555,11 @@ fn select_compaction_hits(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_query_variants, build_recall_plan, build_structured_output, finalize_top_candidates,
-        lexical_overlap_score, proxy_vector_score, recall_preview_console_payload,
-        selection_from_candidates, ExplicitRecallSelection, RecallCandidate, RecallCitation,
-        RecallRequest, RecallScoreBreakdown, RecallSourceDecision, RecallSourceKind,
-        TranscriptRecallRef,
+        build_query_variants, build_recall_plan, build_structured_output,
+        explicit_recall_policy_resources, finalize_top_candidates, lexical_overlap_score,
+        proxy_vector_score, recall_preview_console_payload, selection_from_candidates,
+        ExplicitRecallSelection, RecallCandidate, RecallCitation, RecallRequest,
+        RecallScoreBreakdown, RecallSourceDecision, RecallSourceKind, TranscriptRecallRef,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -2567,6 +2602,46 @@ mod tests {
                 final_score,
             },
         }
+    }
+
+    #[test]
+    fn explicit_recall_policy_resources_cover_every_selected_store() {
+        let selection = ExplicitRecallSelection {
+            query: "history".to_owned(),
+            channel: Some("web".to_owned()),
+            session_id: Some("session-1".to_owned()),
+            agent_id: None,
+            min_score: None,
+            workspace_prefix: None,
+            include_workspace_historical: false,
+            include_workspace_quarantined: false,
+            memory_item_ids: vec!["memory-1".to_owned()],
+            workspace_document_ids: vec!["document-1".to_owned()],
+            transcript_refs: Vec::new(),
+            checkpoint_ids: Vec::new(),
+            compaction_artifact_ids: Vec::new(),
+        };
+
+        assert_eq!(
+            explicit_recall_policy_resources(Some("session-1"), Some("web"), &selection),
+            vec!["memory:session:session-1".to_owned(), "memory:workspace".to_owned()]
+        );
+
+        let mut channel_selection = selection;
+        channel_selection.session_id = None;
+        channel_selection.workspace_document_ids.clear();
+        assert_eq!(
+            explicit_recall_policy_resources(None, Some("web"), &channel_selection),
+            vec!["memory:channel:web".to_owned()]
+        );
+
+        channel_selection.memory_item_ids.clear();
+        channel_selection.transcript_refs =
+            vec![TranscriptRecallRef { run_id: "run-1".to_owned(), seq: 7 }];
+        assert_eq!(
+            explicit_recall_policy_resources(Some("session-1"), Some("web"), &channel_selection),
+            vec!["memory:session:session-1".to_owned()]
+        );
     }
 
     #[test]
