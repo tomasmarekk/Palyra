@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 use palyra_common::runtime_contracts::{
     AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpCommandResultEnvelope,
     AcpCursor, AcpEventLedgerKind, AcpReplayCap, AcpScope, AcpSessionBindingRecord, AcpSessionMode,
-    ConversationBindingSensitivity, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
-    RealtimeCursor, RealtimeHandshakeRequest, RealtimeRole, RealtimeScope, StableErrorEnvelope,
-    ACP_DEFAULT_REPLAY_MAX_EVENTS,
+    AcpTransportKind, ConversationBindingSensitivity, RealtimeCapability, RealtimeCommand,
+    RealtimeCommandEnvelope, RealtimeCursor, RealtimeHandshakeRequest, RealtimeRole, RealtimeScope,
+    StableErrorEnvelope, ACP_DEFAULT_REPLAY_MAX_EVENTS,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -42,6 +42,37 @@ use crate::*;
 mod bindings;
 mod status;
 
+// HTTP clients may negotiate a narrower feature set, but this host-owned
+// ceiling prevents request-body claims from granting sensitive transcript
+// replay or any future scope/capability that has not been reviewed here.
+const CONSOLE_ACP_SCOPES: &[AcpScope] = &[
+    AcpScope::SessionsRead,
+    AcpScope::SessionsWrite,
+    AcpScope::RunsRead,
+    AcpScope::RunsWrite,
+    AcpScope::ApprovalsRead,
+    AcpScope::ApprovalsWrite,
+    AcpScope::BindingsRead,
+    AcpScope::BindingsWrite,
+    AcpScope::EventsRead,
+];
+const CONSOLE_ACP_CAPABILITIES: &[AcpCapability] = &[
+    AcpCapability::RuntimeStatus,
+    AcpCapability::SessionList,
+    AcpCapability::SessionLoad,
+    AcpCapability::SessionNew,
+    AcpCapability::SessionReplay,
+    AcpCapability::RunControl,
+    AcpCapability::ApprovalBridge,
+    AcpCapability::PendingPrompts,
+    AcpCapability::SessionConfig,
+    AcpCapability::SessionFork,
+    AcpCapability::SessionCompact,
+    AcpCapability::SessionExplain,
+    AcpCapability::ConversationBindings,
+    AcpCapability::BindingRepair,
+];
+
 pub(crate) use bindings::{
     console_binding_detach_handler, console_binding_explain_handler, console_binding_get_handler,
     console_binding_upsert_handler, console_bindings_list_handler,
@@ -53,7 +84,8 @@ pub(crate) use status::console_acp_status_handler;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcpHttpCommandRequest {
-    /// Client context supplied by the ACP client.
+    /// Client identity and requested grants; the handler validates these
+    /// against the authenticated session and the host-owned grant ceiling.
     pub(crate) client: AcpClientContext,
     /// Command envelope carrying command, params, and idempotency key.
     pub(crate) command: AcpCommandEnvelope,
@@ -84,13 +116,15 @@ async fn dispatch_acp_command(
     let command = envelope.command;
     let idempotency_key = envelope.idempotency_key.clone();
     let result = async {
-        ensure_client_matches_session(&client, request_context)?;
+        let authorized_client = authorize_console_acp_client(&client, request_context)?;
         let now = unix_ms_now().map_err(|error| AcpRuntimeError::InvalidField {
             field: "system_time",
             message: error.to_string(),
         })?;
-        state.acp_runtime.check_rate_limit(client.client_id.as_str(), command, now)?;
-        let value = execute_acp_command(state, request_context, &client, envelope.clone()).await?;
+        state.acp_runtime.check_rate_limit(authorized_client.client_id.as_str(), command, now)?;
+        let value =
+            execute_acp_command(state, request_context, &authorized_client, envelope.clone())
+                .await?;
         Ok::<Value, AcpDispatchError>(value)
     }
     .await;
@@ -1230,10 +1264,10 @@ async fn binding_explain(
     Ok(json!({ "explain": snapshot }))
 }
 
-fn ensure_client_matches_session(
+fn authorize_console_acp_client(
     client: &AcpClientContext,
     request_context: &RequestContext,
-) -> Result<(), AcpDispatchError> {
+) -> Result<AcpClientContext, AcpDispatchError> {
     if client.owner_principal != request_context.principal {
         return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
             message: "ACP owner_principal does not match authenticated console principal"
@@ -1250,7 +1284,33 @@ fn ensure_client_matches_session(
             message: "ACP channel does not match authenticated console channel".to_owned(),
         }));
     }
-    Ok(())
+    if client.transport != AcpTransportKind::Http {
+        return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
+            message: "console ACP commands require the http transport".to_owned(),
+        }));
+    }
+    if let Some(scope) = client.scopes.iter().find(|scope| !CONSOLE_ACP_SCOPES.contains(scope)) {
+        return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
+            message: format!("ACP scope {} is not granted to console clients", scope.as_str()),
+        }));
+    }
+    if let Some(capability) =
+        client.capabilities.iter().find(|capability| !CONSOLE_ACP_CAPABILITIES.contains(capability))
+    {
+        return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
+            message: format!(
+                "ACP capability {} is not granted to console clients",
+                capability.as_str()
+            ),
+        }));
+    }
+
+    let mut authorized = client.clone();
+    authorized.scopes.sort();
+    authorized.scopes.dedup();
+    authorized.capabilities.sort();
+    authorized.capabilities.dedup();
+    Ok(authorized)
 }
 
 fn ensure_grant(
@@ -1542,5 +1602,63 @@ impl AcpDispatchError {
             Self::Acp(error) => error.to_stable_error(),
             Self::Stable(error) => error.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn console_context() -> RequestContext {
+        RequestContext {
+            principal: "admin:test".to_owned(),
+            device_id: "desktop".to_owned(),
+            channel: Some("web".to_owned()),
+        }
+    }
+
+    fn client_context() -> AcpClientContext {
+        AcpClientContext {
+            protocol_version: 1,
+            client_id: "test-client".to_owned(),
+            transport: AcpTransportKind::Http,
+            owner_principal: "admin:test".to_owned(),
+            device_id: "desktop".to_owned(),
+            channel: Some("web".to_owned()),
+            scopes: vec![AcpScope::SessionsRead],
+            capabilities: vec![AcpCapability::SessionList],
+        }
+    }
+
+    #[test]
+    fn console_acp_authorization_rejects_client_claimed_sensitive_grants() {
+        let mut scope_client = client_context();
+        scope_client.scopes.push(AcpScope::EventsSensitive);
+        let scope_error = authorize_console_acp_client(&scope_client, &console_context())
+            .expect_err("sensitive scope must not be self-assigned");
+
+        let mut capability_client = client_context();
+        capability_client.capabilities.push(AcpCapability::SensitiveReplay);
+        let capability_error = authorize_console_acp_client(&capability_client, &console_context())
+            .expect_err("sensitive capability must not be self-assigned");
+
+        assert!(matches!(scope_error, AcpDispatchError::Acp(AcpRuntimeError::Permission { .. })));
+        assert!(matches!(
+            capability_error,
+            AcpDispatchError::Acp(AcpRuntimeError::Permission { .. })
+        ));
+    }
+
+    #[test]
+    fn console_acp_authorization_returns_only_validated_requested_grants() {
+        let mut client = client_context();
+        client.scopes.push(AcpScope::SessionsRead);
+        client.capabilities.push(AcpCapability::SessionList);
+
+        let authorized = authorize_console_acp_client(&client, &console_context())
+            .expect("safe console grants should be authorized");
+
+        assert_eq!(authorized.scopes, vec![AcpScope::SessionsRead]);
+        assert_eq!(authorized.capabilities, vec![AcpCapability::SessionList]);
     }
 }
