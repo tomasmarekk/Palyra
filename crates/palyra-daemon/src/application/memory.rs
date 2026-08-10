@@ -1648,7 +1648,9 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
             }
         }
         MemoryReflectionCategory::Preferences => {
-            if contains_any(normalized, &["prefer", "preference", "prefers", "use", "default"]) {
+            if contains_any(normalized, &["prefer", "preference", "prefers", "default"])
+                || contains_word(normalized, "use")
+            {
                 2
             } else {
                 0
@@ -1724,6 +1726,10 @@ pub(crate) fn normalize_lifecycle_content(raw: &str) -> String {
 
 fn contains_any(input: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| input.contains(pattern))
+}
+
+fn contains_word(input: &str, pattern: &str) -> bool {
+    input.split(|character: char| !character.is_alphanumeric()).any(|word| word == pattern)
 }
 
 /// Prepends the standard lifecycle/scope/trust tags to caller tags and
@@ -1895,6 +1901,23 @@ mod tests {
         assert_eq!(classification.approval_state, MemoryWriteApprovalState::Required);
         assert!(classification.reason_codes.iter().any(|reason| reason == "sensitivity:sensitive"));
         assert_eq!(classification.source_refs[0].source_kind, "orchestrator_tape");
+    }
+
+    #[test]
+    fn reflection_preference_use_keyword_requires_a_word_boundary() {
+        let categories = [MemoryReflectionCategory::Facts, MemoryReflectionCategory::Preferences];
+
+        assert_eq!(
+            reflection_category_for_observation(
+                &categories,
+                "The user decided because the house was already used."
+            ),
+            MemoryReflectionCategory::Facts
+        );
+        assert_eq!(
+            reflection_category_for_observation(&categories, "Use JSON for this output."),
+            MemoryReflectionCategory::Preferences
+        );
     }
 
     #[test]
