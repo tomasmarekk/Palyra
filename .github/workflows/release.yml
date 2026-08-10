@@ -24,7 +24,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GH_TOKEN: ${{ github.token }}
 
 jobs:
   prepare-release:
@@ -37,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -125,17 +126,27 @@ jobs:
           Set-Content -LiteralPath $releaseNotesPath -Value $releaseNotes -NoNewline
           Set-Content -LiteralPath $migrationNotesPath -Value $migrationNotes -NoNewline
 
-          if ($publish -eq "true") {
-            gh release view $tag | Out-Null 2>$null
-            if ($LASTEXITCODE -ne 0) {
-              gh release create $tag --draft --title "Palyra $repoVersion" --notes-file $releaseNotesPath
-            }
-            gh release upload $tag $releaseNotesPath $migrationNotesPath --clobber
-          }
-
           "version=$repoVersion" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "publish=$publish" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update draft GitHub release
+        if: steps.meta.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $outputRoot = Join-Path $PWD "target/release-artifacts/release-metadata"
+          $releaseNotesPath = Join-Path $outputRoot "release-notes-$version.md"
+          $migrationNotesPath = Join-Path $outputRoot "migration-notes-$version.md"
+
+          gh release view $tag | Out-Null 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --title "Palyra $version" --notes-file $releaseNotesPath
+          }
+          gh release upload $tag $releaseNotesPath $migrationNotesPath --clobber
 
   desktop-portable-bundles:
     name: Release / Desktop portable bundle (${{ matrix.os }})
@@ -154,6 +165,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -248,6 +261,8 @@ jobs:
       - name: Upload desktop bundle to release
         if: needs.prepare-release.outputs.publish == 'true'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.prepare-release.outputs.tag }}" `
             "${{ steps.package.outputs.archive_path }}" `
@@ -264,6 +279,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -349,6 +366,8 @@ jobs:
       - name: Upload headless bundle to release
         if: needs.prepare-release.outputs.publish == 'true'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.prepare-release.outputs.tag }}" `
             "${{ steps.package.outputs.archive_path }}" `
