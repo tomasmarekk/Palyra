@@ -1057,7 +1057,7 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
     assert!(
         refreshed_cookie.starts_with(cookie.as_str())
             && refreshed_cookie.contains("Max-Age=1800")
-            && refreshed_cookie.contains("SameSite=Lax"),
+            && refreshed_cookie.contains("SameSite=Strict"),
         "session endpoint should refresh the session cookie Max-Age"
     );
     let session_response =
@@ -1170,8 +1170,8 @@ fn console_browser_handoff_bootstraps_a_browser_session() -> Result<()> {
         .to_owned();
     let handoff_set_cookie = header_value(session_bootstrap_response.headers(), "set-cookie")?;
     assert!(
-        handoff_set_cookie.contains("SameSite=Lax"),
-        "browser handoff session bootstrap should issue a top-level navigation compatible session cookie"
+        handoff_set_cookie.contains("SameSite=Strict"),
+        "browser handoff session bootstrap should issue a cross-site-isolated session cookie"
     );
 
     let session_response = client
@@ -1238,8 +1238,8 @@ fn console_browser_handoff_session_endpoint_bootstraps_a_browser_session() -> Re
         .to_owned();
     let handoff_set_cookie = header_value(bootstrap_response.headers(), "set-cookie")?;
     assert!(
-        handoff_set_cookie.contains("SameSite=Lax"),
-        "browser handoff session bootstrap should issue a top-level navigation compatible session cookie"
+        handoff_set_cookie.contains("SameSite=Strict"),
+        "browser handoff session bootstrap should issue a cross-site-isolated session cookie"
     );
     let session = bootstrap_response
         .json::<Value>()

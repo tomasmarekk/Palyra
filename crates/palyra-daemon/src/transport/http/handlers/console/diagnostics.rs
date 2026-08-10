@@ -6425,7 +6425,7 @@ pub(crate) fn build_console_session_cookie(
     secure: bool,
 ) -> Result<HeaderValue, Response> {
     let mut cookie = format!(
-        "{CONSOLE_SESSION_COOKIE_NAME}={session_id}; Max-Age={CONSOLE_SESSION_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Lax"
+        "{CONSOLE_SESSION_COOKIE_NAME}={session_id}; Max-Age={CONSOLE_SESSION_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Strict"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -6445,8 +6445,9 @@ pub(crate) fn build_console_session_cookie(
 /// encoded.
 #[allow(clippy::result_large_err)]
 pub(crate) fn clear_console_session_cookie(secure: bool) -> Result<HeaderValue, Response> {
-    let mut cookie =
-        format!("{CONSOLE_SESSION_COOKIE_NAME}=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+    let mut cookie = format!(
+        "{CONSOLE_SESSION_COOKIE_NAME}=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+    );
     if secure {
         cookie.push_str("; Secure");
     }
