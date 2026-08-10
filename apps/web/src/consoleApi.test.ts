@@ -889,6 +889,40 @@ describe("ConsoleApiClient", () => {
     );
   });
 
+  it("requires CSRF for usage insights because the read also persists alerts", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({}),
+    ];
+    const client = new ConsoleApiClient("", (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    });
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+
+    await client.getUsageInsights(new URLSearchParams({ bucket: "hour" }));
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/usage/insights?bucket=hour");
+    expect(calls[1]?.init?.method ?? "GET").toBe("GET");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+  });
+
   it("retries safe-read GET requests once after a transport failure", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const fetcher: typeof fetch = (input, init) => {

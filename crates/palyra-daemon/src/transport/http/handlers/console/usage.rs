@@ -979,7 +979,8 @@ pub(crate) async fn console_usage_insights_handler(
     headers: HeaderMap,
     Query(query): Query<ConsoleUsageSummaryQuery>,
 ) -> Result<Json<UsageInsightsEnvelope>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
+    // Although this endpoint returns an insight snapshot, it also persists and may reopen alerts.
+    let session = authorize_console_session(&state, &headers, true)?;
     let resolved = resolve_usage_query(
         query.start_at_unix_ms,
         query.end_at_unix_ms,
