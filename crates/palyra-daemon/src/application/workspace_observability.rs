@@ -52,6 +52,7 @@ const MAX_COMPARE_FILE_LIMIT: usize = 256;
 const MAX_INLINE_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_DIFF_TEXT_BYTES: usize = 64 * 1024;
 const MAX_DIFF_LINES: usize = 160;
+const MAX_DIFF_INPUT_LINES: usize = 1_024;
 const MAX_ACTIVITY_LIST_LIMIT: usize = 32;
 
 // A run is a subset of one session, so this endpoint can inspect every retained
@@ -1563,12 +1564,17 @@ fn preview_kind(content_type: &str, is_text: bool) -> String {
 /// Builds a unified-style line diff (` `/`-`/`+` prefixes) capped at
 /// `max_output_lines`, appending `...` when truncated.
 ///
-/// Classic longest-common-subsequence DP; quadratic in line count, which is
-/// acceptable because both inputs are already capped at
-/// [`MAX_DIFF_TEXT_BYTES`] by `payload_text_for_diff`.
+/// Classic longest-common-subsequence DP; both byte size and line count are
+/// bounded before the quadratic table is allocated.
 fn build_line_diff_preview(left: &str, right: &str, max_output_lines: usize) -> String {
-    let left_lines = left.lines().collect::<Vec<_>>();
-    let right_lines = right.lines().collect::<Vec<_>>();
+    let mut left_lines =
+        left.lines().take(MAX_DIFF_INPUT_LINES.saturating_add(1)).collect::<Vec<_>>();
+    let left_input_truncated = left_lines.len() > MAX_DIFF_INPUT_LINES;
+    left_lines.truncate(MAX_DIFF_INPUT_LINES);
+    let mut right_lines =
+        right.lines().take(MAX_DIFF_INPUT_LINES.saturating_add(1)).collect::<Vec<_>>();
+    let right_input_truncated = right_lines.len() > MAX_DIFF_INPUT_LINES;
+    right_lines.truncate(MAX_DIFF_INPUT_LINES);
     let mut dp = vec![vec![0usize; right_lines.len() + 1]; left_lines.len() + 1];
     for left_index in (0..left_lines.len()).rev() {
         for right_index in (0..right_lines.len()).rev() {
@@ -1609,6 +1615,10 @@ fn build_line_diff_preview(left: &str, right: &str, max_output_lines: usize) -> 
         right_index += 1;
     }
     if left_index < left_lines.len() || right_index < right_lines.len() {
+        rows.push("...".to_owned());
+    }
+    if (left_input_truncated || right_input_truncated) && rows.last().is_none_or(|row| row != "...")
+    {
         rows.push("...".to_owned());
     }
     rows.join("\n")
@@ -2328,5 +2338,16 @@ mod tests {
         let diff = build_line_diff_preview("alpha\nbeta\n", "alpha\ngamma\n", 20);
         assert!(diff.contains("-beta"));
         assert!(diff.contains("+gamma"));
+    }
+
+    #[test]
+    fn line_diff_preview_bounds_many_line_inputs() {
+        let left = "a\n".repeat(MAX_DIFF_INPUT_LINES + 1);
+        let right = "b\n".repeat(MAX_DIFF_INPUT_LINES + 1);
+
+        let diff = build_line_diff_preview(left.as_str(), right.as_str(), 4);
+
+        assert!(diff.ends_with("..."));
+        assert!(diff.lines().count() <= 5);
     }
 }
