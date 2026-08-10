@@ -505,23 +505,30 @@ fn emit_tasks_list(payload: &Value, json: bool) -> Result<()> {
     }
     let tasks = json_array_at(payload, "/tasks");
     let summary = json_value_at(payload, "/summary").unwrap_or(&Value::Null);
-    println!(
-        "tasks.list count={} active={} blocked={} failed={} terminal={}",
-        tasks.len(),
-        json_number_at(summary, "/active"),
-        json_number_at(summary, "/blocked"),
-        json_number_at(summary, "/failed"),
-        json_number_at(summary, "/terminal")
-    );
+    output::print_text_line(
+        format!(
+            "tasks.list count={} active={} blocked={} failed={} terminal={}",
+            tasks.len(),
+            json_number_at(summary, "/active"),
+            json_number_at(summary, "/blocked"),
+            json_number_at(summary, "/failed"),
+            json_number_at(summary, "/terminal")
+        )
+        .as_str(),
+    )?;
     for task in tasks {
-        println!(
-            "tasks.task id={} source={} state={} title={} updated_at_ms={}",
-            json_optional_string_at(task, "/task_id").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(task, "/source_kind").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(task, "/state").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(task, "/title").unwrap_or_default(),
-            json_number_at(task, "/updated_at_unix_ms")
-        );
+        output::print_text_line(
+            format!(
+                "tasks.task id={} source={} state={} title={} updated_at_ms={}",
+                json_optional_string_at(task, "/task_id").unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(task, "/source_kind")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(task, "/state").unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(task, "/title").unwrap_or_default(),
+                json_number_at(task, "/updated_at_unix_ms")
+            )
+            .as_str(),
+        )?;
     }
     Ok(())
 }
@@ -531,13 +538,16 @@ fn emit_task_envelope(event: &str, payload: &Value, json: bool) -> Result<()> {
         return output::print_json_pretty(payload, "failed to encode task envelope as JSON");
     }
     let task = json_value_at(payload, "/task").unwrap_or(payload);
-    println!(
-        "{event} id={} source={} state={} title={}",
-        json_optional_string_at(task, "/task_id").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(task, "/source_kind").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(task, "/state").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(task, "/title").unwrap_or_default()
-    );
+    output::print_text_line(
+        format!(
+            "{event} id={} source={} state={} title={}",
+            json_optional_string_at(task, "/task_id").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(task, "/source_kind").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(task, "/state").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(task, "/title").unwrap_or_default()
+        )
+        .as_str(),
+    )?;
     Ok(())
 }
 
@@ -547,15 +557,19 @@ fn emit_task_timeline(payload: &Value, json: bool) -> Result<()> {
     }
     emit_task_envelope("tasks.timeline", payload, false)?;
     for event in json_array_at(payload, "/events") {
-        println!(
-            "tasks.event id={} type={} from={} to={} at_ms={} summary={}",
-            json_optional_string_at(event, "/event_id").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(event, "/event_type").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(event, "/from_state").unwrap_or_else(|| "none".to_owned()),
-            json_optional_string_at(event, "/to_state").unwrap_or_else(|| "none".to_owned()),
-            json_number_at(event, "/created_at_unix_ms"),
-            json_optional_string_at(event, "/summary").unwrap_or_default()
-        );
+        output::print_text_line(
+            format!(
+                "tasks.event id={} type={} from={} to={} at_ms={} summary={}",
+                json_optional_string_at(event, "/event_id").unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(event, "/event_type")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(event, "/from_state").unwrap_or_else(|| "none".to_owned()),
+                json_optional_string_at(event, "/to_state").unwrap_or_else(|| "none".to_owned()),
+                json_number_at(event, "/created_at_unix_ms"),
+                json_optional_string_at(event, "/summary").unwrap_or_default()
+            )
+            .as_str(),
+        )?;
     }
     Ok(())
 }
@@ -565,16 +579,20 @@ fn emit_workboard_list(payload: &Value, json: bool) -> Result<()> {
         return output::print_json_pretty(payload, "failed to encode WorkBoard list as JSON");
     }
     let items = json_array_at(payload, "/items");
-    println!("tasks.workboard.list count={}", items.len());
+    output::print_text_line(format!("tasks.workboard.list count={}", items.len()).as_str())?;
     for item in items {
-        println!(
-            "tasks.workboard.item id={} state={} priority={} title={} claim_owner={}",
-            json_optional_string_at(item, "/work_item_id").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(item, "/state").unwrap_or_else(|| "unknown".to_owned()),
-            json_number_at(item, "/priority"),
-            json_optional_string_at(item, "/title").unwrap_or_default(),
-            json_optional_string_at(item, "/claim_owner").unwrap_or_else(|| "none".to_owned())
-        );
+        output::print_text_line(
+            format!(
+                "tasks.workboard.item id={} state={} priority={} title={} claim_owner={}",
+                json_optional_string_at(item, "/work_item_id")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(item, "/state").unwrap_or_else(|| "unknown".to_owned()),
+                json_number_at(item, "/priority"),
+                json_optional_string_at(item, "/title").unwrap_or_default(),
+                json_optional_string_at(item, "/claim_owner").unwrap_or_else(|| "none".to_owned())
+            )
+            .as_str(),
+        )?;
     }
     Ok(())
 }
@@ -584,13 +602,16 @@ fn emit_workboard_item(event: &str, payload: &Value, json: bool) -> Result<()> {
         return output::print_json_pretty(payload, "failed to encode WorkBoard item as JSON");
     }
     let item = json_value_at(payload, "/item").unwrap_or(payload);
-    println!(
-        "{event} id={} state={} title={} priority={}",
-        json_optional_string_at(item, "/work_item_id").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(item, "/state").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(item, "/title").unwrap_or_default(),
-        json_number_at(item, "/priority")
-    );
+    output::print_text_line(
+        format!(
+            "{event} id={} state={} title={} priority={}",
+            json_optional_string_at(item, "/work_item_id").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(item, "/state").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(item, "/title").unwrap_or_default(),
+            json_number_at(item, "/priority")
+        )
+        .as_str(),
+    )?;
     Ok(())
 }
 

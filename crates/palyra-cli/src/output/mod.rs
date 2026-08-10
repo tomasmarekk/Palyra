@@ -132,7 +132,8 @@ where
     Ok(())
 }
 
-/// Prints a text line on stdout after running it through secret redaction.
+/// Prints one text record after redacting secrets and neutralizing terminal
+/// control characters, including embedded line breaks.
 ///
 /// # Errors
 /// Returns an error when the write to stdout fails.
@@ -145,7 +146,20 @@ pub(crate) fn print_text_line(line: &str) -> Result<()> {
 }
 
 fn sanitize_text_output_line(line: &str) -> String {
-    sanitize_diagnostic_text(line)
+    let redacted = sanitize_diagnostic_text(line);
+    let mut sanitized = String::with_capacity(redacted.len());
+    for character in redacted.chars() {
+        match character {
+            '\n' => sanitized.push_str("<LF>"),
+            '\r' => sanitized.push_str("<CR>"),
+            '\u{1b}' => sanitized.push_str("<ESC>"),
+            character if character.is_control() => {
+                sanitized.push_str(format!("<U+{:04X}>", character as u32).as_str());
+            }
+            character => sanitized.push(character),
+        }
+    }
+    sanitized
 }
 
 /// Redacts credential-shaped material (tokens, authorization headers, secret
@@ -694,5 +708,17 @@ mod tests {
         assert!(sanitized.contains("Bearer <redacted>"));
         assert!(!sanitized.contains("access_token=secret"));
         assert!(!sanitized.contains("Bearer abc"));
+    }
+
+    #[test]
+    fn text_output_sanitizer_neutralizes_terminal_controls_and_line_breaks() {
+        let sanitized =
+            sanitize_text_output_line("task\nforged\rrecord\x1b]52;c;clipboard\x07\ttrailing");
+
+        assert_eq!(
+            sanitized,
+            "task<LF>forged<CR>record<ESC>]52;c;clipboard<U+0007><U+0009>trailing"
+        );
+        assert!(!sanitized.chars().any(char::is_control));
     }
 }

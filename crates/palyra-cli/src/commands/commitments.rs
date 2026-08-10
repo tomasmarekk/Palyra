@@ -222,21 +222,28 @@ fn emit_commitments_list(payload: &Value, json: bool) -> Result<()> {
         return output::print_json_pretty(payload, "failed to encode commitments list as JSON");
     }
     let commitments = json_array_at(payload, "/commitments");
-    println!(
-        "commitments.list count={} extracted={}",
-        commitments.len(),
-        json_number_at(payload, "/extracted_count")
-    );
+    output::print_text_line(
+        format!(
+            "commitments.list count={} extracted={}",
+            commitments.len(),
+            json_number_at(payload, "/extracted_count")
+        )
+        .as_str(),
+    )?;
     for commitment in commitments {
-        println!(
-            "commitments.commitment id={} status={} action={} due_at_ms={} privacy={}",
-            json_optional_string_at(commitment, "/commitment_id")
-                .unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(commitment, "/status").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(commitment, "/normalized_action").unwrap_or_default(),
-            json_number_at(commitment, "/due_at_unix_ms"),
-            json_optional_string_at(commitment, "/privacy_label").unwrap_or_default()
-        );
+        output::print_text_line(
+            format!(
+                "commitments.commitment id={} status={} action={} due_at_ms={} privacy={}",
+                json_optional_string_at(commitment, "/commitment_id")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(commitment, "/status")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(commitment, "/normalized_action").unwrap_or_default(),
+                json_number_at(commitment, "/due_at_unix_ms"),
+                json_optional_string_at(commitment, "/privacy_label").unwrap_or_default()
+            )
+            .as_str(),
+        )?;
     }
     Ok(())
 }
@@ -246,15 +253,18 @@ fn emit_commitment_envelope(event: &str, payload: &Value, json: bool) -> Result<
         return output::print_json_pretty(payload, "failed to encode commitment as JSON");
     }
     let commitment = json_value_at(payload, "/commitment").unwrap_or(payload);
-    println!(
-        "{event} id={} status={} action={} due_at_ms={} scheduled_at_ms={}",
-        json_optional_string_at(commitment, "/commitment_id")
-            .unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(commitment, "/status").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(commitment, "/normalized_action").unwrap_or_default(),
-        json_number_at(commitment, "/due_at_unix_ms"),
-        json_number_at(commitment, "/scheduled_at_unix_ms")
-    );
+    output::print_text_line(
+        format!(
+            "{event} id={} status={} action={} due_at_ms={} scheduled_at_ms={}",
+            json_optional_string_at(commitment, "/commitment_id")
+                .unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(commitment, "/status").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(commitment, "/normalized_action").unwrap_or_default(),
+            json_number_at(commitment, "/due_at_unix_ms"),
+            json_number_at(commitment, "/scheduled_at_unix_ms")
+        )
+        .as_str(),
+    )?;
     Ok(())
 }
 
@@ -264,14 +274,19 @@ fn emit_commitment_sources(payload: &Value, json: bool) -> Result<()> {
     }
     emit_commitment_envelope("commitments.sources", payload, false)?;
     for source in json_array_at(payload, "/sources") {
-        println!(
-            "commitments.source id={} kind={} run={} start_seq={} end_seq={}",
-            json_optional_string_at(source, "/source_id").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(source, "/source_kind").unwrap_or_else(|| "unknown".to_owned()),
-            json_optional_string_at(source, "/run_id").unwrap_or_else(|| "none".to_owned()),
-            json_number_at(source, "/tape_start_seq"),
-            json_number_at(source, "/tape_end_seq")
-        );
+        output::print_text_line(
+            format!(
+                "commitments.source id={} kind={} run={} start_seq={} end_seq={}",
+                json_optional_string_at(source, "/source_id")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(source, "/source_kind")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                json_optional_string_at(source, "/run_id").unwrap_or_else(|| "none".to_owned()),
+                json_number_at(source, "/tape_start_seq"),
+                json_number_at(source, "/tape_end_seq")
+            )
+            .as_str(),
+        )?;
     }
     Ok(())
 }
@@ -280,14 +295,18 @@ fn emit_commitment_explain(payload: &Value, json: bool) -> Result<()> {
     if json {
         return output::print_json_pretty(payload, "failed to encode commitment explain as JSON");
     }
-    println!(
-        "commitments.explain id={} status={} reason={} approval={} privacy={}",
-        json_optional_string_at(payload, "/commitment_id").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(payload, "/status").unwrap_or_else(|| "unknown".to_owned()),
-        json_optional_string_at(payload, "/review_reason").unwrap_or_default(),
-        json_optional_string_at(payload, "/approval_requirement").unwrap_or_default(),
-        json_optional_string_at(payload, "/privacy_label").unwrap_or_default()
-    );
+    output::print_text_line(
+        format!(
+            "commitments.explain id={} status={} reason={} approval={} privacy={}",
+            json_optional_string_at(payload, "/commitment_id")
+                .unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(payload, "/status").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_at(payload, "/review_reason").unwrap_or_default(),
+            json_optional_string_at(payload, "/approval_requirement").unwrap_or_default(),
+            json_optional_string_at(payload, "/privacy_label").unwrap_or_default()
+        )
+        .as_str(),
+    )?;
     Ok(())
 }
 
