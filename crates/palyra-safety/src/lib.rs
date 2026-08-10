@@ -1052,7 +1052,7 @@ fn scan_secret_material(text: &str, normalized: &str, findings: &mut Vec<SafetyF
                 },
             );
         }
-        if let Some(comparison) = detect_sensitive_comparison(trimmed) {
+        for comparison in detect_sensitive_comparisons(trimmed) {
             push_unique_finding(
                 findings,
                 SafetyFinding {
@@ -1128,15 +1128,30 @@ struct SensitiveComparison {
 }
 
 fn detect_sensitive_comparison(line: &str) -> Option<SensitiveComparison> {
+    detect_sensitive_comparisons(line).into_iter().next()
+}
+
+fn detect_sensitive_comparisons(line: &str) -> Vec<SensitiveComparison> {
+    let mut comparisons = Vec::new();
     for (operator_start, operator_len, separator_index) in comparison_operators(line) {
-        let key = assignment_key_identifier(line.get(..operator_start)?)?;
-        let classification = classify_sensitive_assignment_key(key.as_str())?;
-        let value = line.get(operator_start + operator_len..)?.trim();
+        let Some(prefix) = line.get(..operator_start) else {
+            continue;
+        };
+        let Some(key) = assignment_key_identifier(prefix) else {
+            continue;
+        };
+        let Some(classification) = classify_sensitive_assignment_key(key.as_str()) else {
+            continue;
+        };
+        let Some(value) = line.get(operator_start + operator_len..) else {
+            continue;
+        };
+        let value = value.trim();
         if comparison_value_requires_redaction(classification, value) {
-            return Some(SensitiveComparison { classification, separator_index });
+            comparisons.push(SensitiveComparison { classification, separator_index });
         }
     }
-    None
+    comparisons
 }
 
 fn comparison_operators(line: &str) -> Vec<(usize, usize, usize)> {
@@ -2571,8 +2586,13 @@ fn redact_sensitive_header_or_assignment(line: &str) -> String {
             return redact_value_after_separator(line, separator);
         }
     }
-    if let Some(comparison) = detect_sensitive_comparison(line) {
-        return redact_value_after_separator(line, comparison.separator_index);
+    let comparisons = detect_sensitive_comparisons(line);
+    if !comparisons.is_empty() {
+        let mut redacted = line.to_owned();
+        for comparison in comparisons.into_iter().rev() {
+            redacted = redact_value_after_separator(&redacted, comparison.separator_index);
+        }
+        return redacted;
     }
     line.to_owned()
 }
@@ -3840,6 +3860,34 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code == "secret_leak.assignment.token"));
+    }
+
+    #[test]
+    fn all_sensitive_comparisons_on_one_line_are_redacted_for_export() {
+        let source = "if (user === \"admin\" && password === \"CorrectHorseBatteryStaple\" && apiKey == \"prod-api-key-value\") { login(); }";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("user === \"admin\""));
+        assert!(outcome.redacted_text.contains("password === \"[REDACTED_SECRET]\""));
+        assert!(outcome.redacted_text.contains("apiKey == \"[REDACTED_SECRET]\""));
+        assert!(!outcome.redacted_text.contains("CorrectHorseBatteryStaple"));
+        assert!(!outcome.redacted_text.contains("prod-api-key-value"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
     }
 
     #[test]
