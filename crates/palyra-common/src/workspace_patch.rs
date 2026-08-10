@@ -391,6 +391,38 @@ fn validate_workspace_patch_request_size(
     Ok(())
 }
 
+/// Validates patch syntax, paths, and request-wide limits without reading or mutating a
+/// workspace.
+///
+/// This is intended for callers that must validate a patch before creating a missing
+/// workspace root. Filesystem-dependent planning still happens through
+/// [`apply_workspace_patch`].
+///
+/// # Errors
+///
+/// Returns the same size, parse, path, and file-count errors as the corresponding
+/// pre-planning stages of [`apply_workspace_patch`].
+pub fn validate_workspace_patch_document(
+    patch: &str,
+    limits: &WorkspacePatchLimits,
+) -> Result<(), WorkspacePatchError> {
+    let request = WorkspacePatchRequest {
+        patch: patch.to_owned(),
+        dry_run: true,
+        redaction_policy: WorkspacePatchRedactionPolicy::default(),
+    };
+    validate_workspace_patch_request_size(&request, limits)?;
+    let normalized_patch = normalize_supported_patch_document(patch);
+    let operations = parse_patch_document(normalized_patch.as_ref())?;
+    if operations.len() > limits.max_files_touched {
+        return Err(WorkspacePatchError::TooManyFiles {
+            limit: limits.max_files_touched,
+            actual: operations.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Computes a deterministic SHA256 digest of the raw patch payload.
 #[must_use]
 pub fn compute_patch_sha256(patch: &str) -> String {

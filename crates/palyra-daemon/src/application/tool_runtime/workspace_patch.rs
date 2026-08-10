@@ -22,8 +22,8 @@ use std::{
 use palyra_common::workspace_patch::{
     apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
     compute_patch_sha256, normalized_workspace_patch_operation_paths, redact_patch_preview,
-    WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchOutcome,
-    WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
+    validate_workspace_patch_document, WorkspacePatchError, WorkspacePatchLimits,
+    WorkspacePatchOutcome, WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -509,15 +509,51 @@ async fn resolve_workspace_patch_roots_for_context(
         agent_outcome.source,
     )
     .await;
-    resolve_workspace_patch_roots(
+    let resolution = resolve_workspace_patch_roots(
         request.runtime_state,
         request.session_id,
         request.parsed,
         request.patch,
-        request.purpose.create_missing_relative(),
+        false,
         agent_workspace_roots.as_slice(),
     )
-    .await
+    .await;
+    if !request.purpose.create_missing_relative() {
+        return resolution;
+    }
+    match resolution {
+        Ok(roots) => Ok(roots),
+        Err(error) if error.contains("does not exist inside agent workspace roots") => {
+            let workspace_root = request
+                .parsed
+                .get("workspace_root")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(error)?;
+            resolve_missing_workspace_root_after_patch_validation(
+                agent_workspace_roots.as_slice(),
+                workspace_root,
+                request.patch,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_missing_workspace_root_after_patch_validation(
+    agent_workspace_roots: &[PathBuf],
+    workspace_root: &str,
+    patch: &str,
+) -> Result<ResolvedWorkspacePatchRoots, String> {
+    validate_workspace_patch_document(patch, &WorkspacePatchLimits::default()).map_err(
+        |error| {
+            format!(
+                "palyra.fs.apply_patch patch validation failed before workspace creation: {error}"
+            )
+        },
+    )?;
+    resolve_workspace_root_override(agent_workspace_roots, workspace_root, true)
 }
 
 fn normalize_workspace_patch_input_json(
@@ -1603,7 +1639,8 @@ mod tests {
     use super::{
         normalize_workspace_patch_header_paths, normalize_workspace_patch_input_json,
         patch_operation_paths, patch_should_use_active_root,
-        reject_env_prefixed_workspace_patch_paths, resolve_workspace_root_override,
+        reject_env_prefixed_workspace_patch_paths,
+        resolve_missing_workspace_root_after_patch_validation, resolve_workspace_root_override,
         serialize_workspace_patch_success, workspace_patch_checkpoint_root_mapping,
         workspace_patch_error_outcome, workspace_patch_planning_request,
         workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
@@ -1871,6 +1908,26 @@ mod tests {
         assert!(
             !workspace.join("web-research-smoke").exists(),
             "dry-run resolution must not mutate the filesystem"
+        );
+    }
+
+    #[test]
+    fn invalid_patch_does_not_create_missing_relative_workspace_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace directory should exist");
+
+        let error = resolve_missing_workspace_root_after_patch_validation(
+            std::slice::from_ref(&workspace),
+            "invalid-patch-target",
+            "*** Begin Patch\n*** Add File: broken.txt\nmissing addition marker\n*** End Patch",
+        )
+        .expect_err("invalid patch must fail before root creation");
+
+        assert!(error.contains("patch validation failed before workspace creation"));
+        assert!(
+            !workspace.join("invalid-patch-target").exists(),
+            "invalid patch validation must not mutate the workspace"
         );
     }
 
