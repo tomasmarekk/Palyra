@@ -924,18 +924,18 @@ pub(crate) struct ChannelHistoryScope {
 
 impl ChannelHistoryScope {
     #[must_use]
-    fn from_envelope(envelope: &ChannelTurnEnvelope) -> Self {
-        Self {
+    fn from_envelope(envelope: &ChannelTurnEnvelope) -> Option<Self> {
+        Some(Self {
             channel: envelope.receiver.channel.clone(),
             conversation_id: envelope.receiver.conversation_id.clone(),
             thread_id: envelope.receiver.thread_id.clone(),
-            sender_handle: envelope.sender.handle.clone(),
-        }
+            sender_handle: Some(envelope.sender.handle.clone()?),
+        })
     }
 
     #[must_use]
     fn matches_envelope(&self, envelope: &ChannelTurnEnvelope) -> bool {
-        self == &Self::from_envelope(envelope)
+        Self::from_envelope(envelope).as_ref() == Some(self)
     }
 }
 
@@ -1111,6 +1111,13 @@ impl ChannelHistoryStore {
                 self.max_records,
             );
         }
+        let Some(scope) = ChannelHistoryScope::from_envelope(envelope) else {
+            return ChannelHistoryDecision::skipped(
+                "channel.history.skipped.missing_stable_sender_handle",
+                guard.records.len(),
+                self.max_records,
+            );
+        };
 
         let sequence = guard.next_sequence;
         guard.next_sequence = guard.next_sequence.saturating_add(1);
@@ -1122,7 +1129,7 @@ impl ChannelHistoryStore {
         guard.records.push_back(ChannelHistoryEntry {
             schema_version: CHANNEL_TURN_SCHEMA_VERSION,
             sequence,
-            scope: ChannelHistoryScope::from_envelope(envelope),
+            scope,
             envelope: envelope.clone(),
             admission_kind: admission.kind,
             admission_reason_code: admission.reason_code.clone(),
@@ -1147,7 +1154,7 @@ impl ChannelHistoryStore {
         current_envelope: &ChannelTurnEnvelope,
         max_entries: usize,
     ) -> Option<ChannelHistoryAmbientContext> {
-        let scope = ChannelHistoryScope::from_envelope(current_envelope);
+        let scope = ChannelHistoryScope::from_envelope(current_envelope)?;
         let limit = max_entries.max(1);
         let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut entries = guard
@@ -1800,6 +1807,27 @@ mod tests {
         let roundtrip: ChannelHistoryAmbientContext =
             serde_json::from_str(serialized.as_str()).expect("ambient context should deserialize");
         assert_eq!(roundtrip, context);
+    }
+
+    #[test]
+    fn channel_history_rejects_ambient_context_without_a_stable_sender_handle() {
+        let store = ChannelHistoryStore::new(4);
+        let mut input = admission_input();
+        input.mention = ChannelTurnMentionState::NotMatched;
+        input.router_outcome = ChannelTurnRouterOutcomeKind::Rejected;
+        input.router_reason = Some("no_matching_mention_or_dm_policy".to_owned());
+        input.ambient_context_enabled = true;
+        let observe = decide_channel_turn_admission(&input);
+        let mut anonymous = envelope();
+        anonymous.sender.handle = None;
+        anonymous.sender.display = Some("Anonymous A".to_owned());
+
+        let decision = store.record(&anonymous, &observe, 10);
+
+        assert_eq!(decision.kind, ChannelHistoryDecisionKind::Skipped);
+        assert_eq!(decision.reason_code, "channel.history.skipped.missing_stable_sender_handle");
+        assert!(store.records().is_empty());
+        assert!(store.ambient_observe_only_context(&anonymous, 4).is_none());
     }
 
     #[test]
