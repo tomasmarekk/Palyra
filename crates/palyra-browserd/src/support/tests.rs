@@ -1519,7 +1519,7 @@ async fn chromium_session_proxy_allows_private_targets_after_session_opt_in() {
 }
 
 #[test]
-fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
+fn chromium_private_target_policy_scopes_navigation_override_to_exact_tab_url() {
     let policy = Arc::new(ChromiumPrivateTargetPolicy::new(false));
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1539,8 +1539,8 @@ fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
         "passive URL checks must not widen the scoped navigation URL"
     );
     assert!(
-        policy.allows_tab_request_target("tab-a", "http://127.0.0.1:7143/styles.css"),
-        "response guard should allow same-target subresources during active navigation"
+        !policy.allows_tab_request_target("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "response guard must not widen the scoped URL to same-target subresources"
     );
     assert!(
         !policy.allows_tab_url("tab-b", "http://127.0.0.1:7143/status"),
@@ -1555,16 +1555,12 @@ fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
         "owning tab request should arm one proxy CONNECT allowance"
     );
     assert!(
-        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/styles.css"),
-        "same-origin subresource should be authorized while the navigation scope is active"
+        !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "same-origin subresource must not inherit an exact navigation allowance"
     );
     assert!(
         policy.allows_host_port("127.0.0.1", 7143),
         "SOCKS5 proxy should consume the armed target allowance"
-    );
-    assert!(
-        policy.allows_host_port("127.0.0.1", 7143),
-        "second same-target request should arm its own one-shot proxy allowance"
     );
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1598,12 +1594,8 @@ fn chromium_private_target_policy_revokes_target_after_navigation_scope() {
         "navigation request should arm one proxy CONNECT allowance"
     );
     assert!(
-        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
-        "same-target subresources should remain available during the navigation scope"
-    );
-    assert!(
-        policy.allows_host_port("127.0.0.1", 7143),
-        "authorized subresource should arm its own proxy CONNECT allowance"
+        !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
+        "same-target subresources must not widen the exact navigation scope"
     );
     drop(scoped);
     assert!(

@@ -1340,7 +1340,7 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return false;
         };
-        self.allows_request_target_scope(&scope)
+        self.allows_exact_request_scope(&scope)
     }
 
     pub(crate) fn authorize_tab_request_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
@@ -1355,12 +1355,10 @@ impl ChromiumPrivateTargetPolicy {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        let requested_target = scope.target_scope();
-        if !state.scoped_requests.keys().any(|scoped| {
-            scoped.tab_target_id == scope.tab_target_id && scoped.target_scope() == requested_target
-        }) {
+        if !state.scoped_requests.contains_key(&scope) {
             return false;
         }
+        let requested_target = scope.target_scope();
         if matches!(requested_target, ChromiumPrivateTargetScope::Network { .. }) {
             let count = state.pending_proxy_targets.entry(scope.tab_scope()).or_insert(0);
             *count = count.saturating_add(1);
@@ -1411,22 +1409,8 @@ impl ChromiumPrivateTargetPolicy {
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
-    #[cfg(test)]
     fn allows_exact_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
         self.state.lock().map(|state| state.scoped_requests.contains_key(scope)).unwrap_or(false)
-    }
-
-    fn allows_request_target_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        self.state
-            .lock()
-            .map(|state| {
-                let requested_target = scope.target_scope();
-                state.scoped_requests.keys().any(|scoped| {
-                    scoped.tab_target_id == scope.tab_target_id
-                        && scoped.target_scope() == requested_target
-                })
-            })
-            .unwrap_or(false)
     }
 
     fn consume_proxy_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
