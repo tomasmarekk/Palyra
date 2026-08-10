@@ -22,7 +22,8 @@ use crate::{
         current_unix_ms, truncate_with_ellipsis, GatewayRuntimeState, ToolApprovalOutcome,
         ToolSkillContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, APPROVAL_DENIED_REASON,
         APPROVAL_POLICY_ID, APPROVAL_PROMPT_TIMEOUT_SECONDS, APPROVAL_REQUEST_SUMMARY_MAX_BYTES,
-        PROCESS_INPUT_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME, PROCESS_SEND_KEYS_TOOL_NAME,
+        BROWSER_UPLOAD_TOOL_NAME, PROCESS_INPUT_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME,
+        PROCESS_SEND_KEYS_TOOL_NAME,
     },
     journal::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
@@ -382,6 +383,8 @@ fn add_process_runner_background_lifetime_context(
 /// OS-file calls additionally include a fingerprint of the requested
 /// operation, paths, and content-affecting inputs so a session approval for one
 /// local file operation cannot cover a different OS path or mutation.
+/// Browser-upload calls include the browser session, target selector, and
+/// local file path so approval for one transfer cannot authorize another.
 /// Detached process-runner handoffs include the requested lifetime boundary so
 /// an ordinary run-owned process approval cannot silently cover post-run
 /// process persistence.
@@ -394,6 +397,10 @@ pub(crate) fn build_tool_approval_subject_id(
     if tool_name == OS_FILE_TOOL_NAME {
         subject_id.push_str("|os_file:");
         subject_id.push_str(os_file_approval_fingerprint(input_json).as_str());
+    }
+    if tool_name == BROWSER_UPLOAD_TOOL_NAME {
+        subject_id.push_str("|browser_upload:");
+        subject_id.push_str(browser_upload_approval_fingerprint(input_json).as_str());
     }
     if tool_name == PROCESS_RUNNER_TOOL_NAME {
         if let Some(lifetime) = process_runner_lifetime_approval_subject(input_json) {
@@ -428,6 +435,19 @@ fn process_input_approval_pid(input_json: &[u8]) -> Option<String> {
         .get("pid")
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok()))?;
     (pid > 0).then(|| pid.to_string())
+}
+
+fn browser_upload_approval_fingerprint(input_json: &[u8]) -> String {
+    let payload = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(payload)) => json!({
+            "session_id": normalized_string_field(&payload, "session_id"),
+            "selector": normalized_string_field(&payload, "selector"),
+            "file_path": normalized_string_field(&payload, "file_path"),
+        }),
+        _ => json!({ "raw_sha256": sha256_hex(input_json) }),
+    };
+    let payload_json = serde_json::to_vec(&payload).unwrap_or_else(|_| input_json.to_vec());
+    sha256_hex(payload_json.as_slice())
 }
 
 fn os_file_approval_fingerprint(input_json: &[u8]) -> String {
@@ -1049,7 +1069,40 @@ mod tests {
     }
 
     #[test]
-    fn non_os_file_approval_subjects_remain_tool_and_skill_scoped() {
+    fn browser_upload_approval_subject_scopes_cache_to_exact_transfer() {
+        let first = build_tool_approval_subject_id(
+            BROWSER_UPLOAD_TOOL_NAME,
+            None,
+            br##"{"session_id":"session-1","selector":"#upload","file_path":"fixtures/report.csv"}"##,
+        );
+        let other_path = build_tool_approval_subject_id(
+            BROWSER_UPLOAD_TOOL_NAME,
+            None,
+            br##"{"session_id":"session-1","selector":"#upload","file_path":"home/.ssh/id_rsa"}"##,
+        );
+        let other_selector = build_tool_approval_subject_id(
+            BROWSER_UPLOAD_TOOL_NAME,
+            None,
+            br##"{"session_id":"session-1","selector":"#avatar","file_path":"fixtures/report.csv"}"##,
+        );
+        let other_session = build_tool_approval_subject_id(
+            BROWSER_UPLOAD_TOOL_NAME,
+            None,
+            br##"{"session_id":"session-2","selector":"#upload","file_path":"fixtures/report.csv"}"##,
+        );
+
+        assert!(first.starts_with("tool:palyra.browser.upload|browser_upload:"));
+        assert_ne!(first, other_path);
+        assert_ne!(first, other_selector);
+        assert_ne!(first, other_session);
+        assert!(
+            !first.contains("report.csv"),
+            "approval subject must not expose raw local path components"
+        );
+    }
+
+    #[test]
+    fn generic_tool_approval_subjects_remain_tool_and_skill_scoped() {
         let skill_context =
             ToolSkillContext::new("acme.audit".to_owned(), Some("1.0.0".to_owned()));
         assert_eq!(

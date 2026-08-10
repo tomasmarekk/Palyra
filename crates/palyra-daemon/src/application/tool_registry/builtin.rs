@@ -2463,7 +2463,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "file_path",
-                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, run-launch workspace roots, approved user-owned OS roots, or explicit launch environment path prefix to upload. The daemon resolves and audits the path; protected system paths are denied."}),
+                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, or explicit run-launch environment path prefix to upload. Implicit user-profile and temp roots are not readable by this tool. The daemon resolves and audits the path; protected system paths are denied."}),
             ));
             properties
                 .push(("capture_failure_screenshot", json!({"type":"boolean","default":true})));
@@ -3190,8 +3190,8 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("upload file_path description should be visible to models");
         assert!(file_path_description.contains("Workspace-relative path"));
-        assert!(file_path_description.contains("approved user-owned OS roots"));
-        assert!(file_path_description.contains("launch environment path prefix"));
+        assert!(file_path_description.contains("run-launch environment path prefix"));
+        assert!(file_path_description.contains("user-profile and temp roots are not readable"));
 
         let downloads_list =
             registry_entry("palyra.browser.downloads.list").expect("downloads list entry exists");
