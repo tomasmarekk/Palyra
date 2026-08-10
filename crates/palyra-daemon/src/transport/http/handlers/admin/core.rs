@@ -150,7 +150,6 @@ pub(crate) async fn admin_status_handler(
         });
     let support_runtime = crate::support::build_support_runtime_snapshot(
         generated_at_unix_ms,
-        None,
         vec!["daemon".to_owned(), "runtime_diagnostics".to_owned(), "support_bundle".to_owned()],
         json!({
             "lifecycle": lifecycle.clone(),

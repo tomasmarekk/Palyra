@@ -2807,7 +2807,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
     let Some(path_value) = path.clone() else {
         return SupportBundleConfigSnapshot {
             path,
-            config_hash_sha256: None,
             redacted_document: None,
             redacted_summary: None,
             fingerprint_sha256: None,
@@ -2820,7 +2819,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
     if !path_ref.exists() {
         return SupportBundleConfigSnapshot {
             path,
-            config_hash_sha256: None,
             redacted_document: None,
             redacted_summary: None,
             fingerprint_sha256: None,
@@ -2829,8 +2827,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
         };
     }
 
-    let config_hash_sha256 =
-        fs::read(path_ref.as_path()).ok().map(|bytes| sha256_hex(bytes.as_slice()));
     match load_document_from_existing_path(path_ref.as_path()) {
         Ok((mut document, migration)) => {
             redact_secret_config_values(&mut document);
@@ -2842,7 +2838,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
                         serde_json::to_vec(&payload).ok().map(|bytes| sha256_hex(bytes.as_slice()));
                     SupportBundleConfigSnapshot {
                         path,
-                        config_hash_sha256,
                         redacted_document: Some(payload),
                         redacted_summary,
                         fingerprint_sha256,
@@ -2852,7 +2847,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
                 }
                 Err(error) => SupportBundleConfigSnapshot {
                     path,
-                    config_hash_sha256,
                     redacted_document: None,
                     redacted_summary: None,
                     fingerprint_sha256: None,
@@ -2863,7 +2857,6 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
         }
         Err(error) => SupportBundleConfigSnapshot {
             path,
-            config_hash_sha256,
             redacted_document: None,
             redacted_summary: None,
             fingerprint_sha256: None,
@@ -3157,7 +3150,6 @@ fn build_support_bundle_runtime_snapshot(
         schema_version: 1,
         generated_at_unix_ms,
         daemon_version: build.version.to_owned(),
-        config_hash_sha256: config.config_hash_sha256.clone(),
         enabled_modules,
         active_sessions_count,
         active_runs_count,
@@ -13198,8 +13190,6 @@ struct SupportBundleConfigSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    config_hash_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     redacted_document: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     redacted_summary: Option<Value>,
@@ -13270,8 +13260,6 @@ struct SupportBundleRuntimeSnapshot {
     schema_version: u32,
     generated_at_unix_ms: i64,
     daemon_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config_hash_sha256: Option<String>,
     enabled_modules: Vec<String>,
     active_sessions_count: u64,
     active_runs_count: u64,
@@ -15464,7 +15452,6 @@ mod diagnostics_bundle_tests {
             })),
             config: SupportBundleConfigSnapshot {
                 path: Some("palyra.toml".to_owned()),
-                config_hash_sha256: Some("c".repeat(64)),
                 redacted_document: Some(json!({
                     "model_provider": {
                         "openai_api_key": "<redacted>",
@@ -15584,7 +15571,6 @@ mod diagnostics_bundle_tests {
                 schema_version: 1,
                 generated_at_unix_ms: 1_730_000_000_000,
                 daemon_version: "0.1.0".to_owned(),
-                config_hash_sha256: Some("c".repeat(64)),
                 enabled_modules: vec![
                     "cli".to_owned(),
                     "daemon".to_owned(),
@@ -15730,6 +15716,19 @@ mod diagnostics_bundle_tests {
             truncated: false,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn support_bundle_serializes_only_the_redacted_config_fingerprint() {
+        let payload =
+            serde_json::to_value(oversized_bundle()).expect("support bundle should serialize");
+
+        assert!(payload.pointer("/config/config_hash_sha256").is_none());
+        assert!(payload.pointer("/runtime/config_hash_sha256").is_none());
+        assert_eq!(
+            payload.pointer("/config/fingerprint_sha256").and_then(Value::as_str),
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        );
     }
 
     #[test]

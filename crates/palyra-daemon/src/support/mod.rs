@@ -97,7 +97,6 @@ pub(crate) fn build_shutdown_forensic_snapshot(
 /// Produces a compact runtime support snapshot from already redacted inputs.
 pub(crate) fn build_support_runtime_snapshot(
     generated_at_unix_ms: i64,
-    config_hash_sha256: Option<String>,
     enabled_modules: Vec<String>,
     runtime: Value,
 ) -> Value {
@@ -106,7 +105,6 @@ pub(crate) fn build_support_runtime_snapshot(
     json!({
         "schema_version": SUPPORT_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
         "generated_at_unix_ms": generated_at_unix_ms,
-        "config_hash_sha256": config_hash_sha256,
         "enabled_modules": enabled_modules,
         "runtime": runtime,
         "redaction": {
@@ -240,7 +238,6 @@ mod tests {
     fn support_runtime_snapshot_redacts_runtime_payload() {
         let snapshot = build_support_runtime_snapshot(
             1_730_000_000_000,
-            Some("f".repeat(64)),
             vec!["daemon".to_owned()],
             json!({
                 "oauth": {"refresh_token": "raw-refresh"},
@@ -249,6 +246,7 @@ mod tests {
         );
         let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
         assert!(encoded.contains("support_bundle_strict"));
+        assert!(snapshot.get("config_hash_sha256").is_none());
         assert!(!encoded.contains("raw-refresh"));
         assert!(!encoded.contains("/home/palo"));
     }
