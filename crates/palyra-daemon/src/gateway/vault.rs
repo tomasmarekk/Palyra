@@ -179,14 +179,40 @@ fn normalize_vault_ref_literal(scope: &VaultScope, key: &str) -> String {
     format!("{scope}/{key}").to_ascii_lowercase()
 }
 
+fn is_mcp_oauth_credential(scope: &VaultScope, key: &str) -> bool {
+    if !matches!(scope, VaultScope::Global) {
+        return false;
+    }
+
+    let normalized = key.to_ascii_lowercase();
+    let Some((credential_prefix, suffix)) = normalized.rsplit_once('.') else {
+        return false;
+    };
+    if !matches!(suffix, "access" | "refresh") {
+        return false;
+    }
+
+    let Some((slug, digest)) =
+        credential_prefix.strip_prefix("mcp.").and_then(|prefix| prefix.rsplit_once('.'))
+    else {
+        return false;
+    };
+    !slug.is_empty() && digest.len() == 12 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Whether reading this secret is configured to require an explicit
-/// approval. Configured refs are `scope/key` literals matched
+/// approval. MCP OAuth credentials are intrinsically gated so operators
+/// cannot accidentally remove their protection by replacing the configured
+/// ref list. Other configured refs are `scope/key` literals matched
 /// case-insensitively against the request.
 pub(crate) fn vault_get_requires_approval(
     scope: &VaultScope,
     key: &str,
     approval_required_refs: &[String],
 ) -> bool {
+    if is_mcp_oauth_credential(scope, key) {
+        return true;
+    }
     if approval_required_refs.is_empty() {
         return false;
     }

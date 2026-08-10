@@ -6177,6 +6177,47 @@ fn vault_get_approval_matcher_checks_selected_scope_key_refs() {
 }
 
 #[test]
+fn vault_get_approval_matcher_intrinsically_gates_mcp_oauth_credentials() {
+    let refs = Vec::new();
+    for key in ["mcp.github.012345abcdef.access", "mcp.github.012345abcdef.refresh"] {
+        assert!(
+            vault_get_requires_approval(&super::VaultScope::Global, key, refs.as_slice()),
+            "MCP OAuth credential {key} must require approval without configured refs"
+        );
+    }
+
+    assert!(
+        !vault_get_requires_approval(
+            &super::VaultScope::Global,
+            "mcp.github.012345abcdef.grant",
+            refs.as_slice()
+        ),
+        "non-credential MCP grant metadata should not be implicitly approval-gated"
+    );
+    assert!(
+        !vault_get_requires_approval(
+            &super::VaultScope::Principal { principal_id: "user:ops".to_owned() },
+            "mcp.github.012345abcdef.access",
+            refs.as_slice()
+        ),
+        "intrinsic MCP OAuth matching must stay scoped to canonical global refs"
+    );
+}
+
+#[test]
+fn vault_get_approval_policy_denies_mcp_oauth_without_configured_refs() {
+    let error = enforce_vault_get_approval_policy(
+        "user:ops",
+        &super::VaultScope::Global,
+        "mcp.github.012345abcdef.access",
+        &[],
+        false,
+    )
+    .expect_err("MCP OAuth credentials must be denied without explicit approval");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+}
+
+#[test]
 fn vault_get_approval_policy_denies_without_explicit_approval() {
     let refs = vec!["global/openai_api_key".to_owned(), "global/anthropic_api_key".to_owned()];
     for key in ["openai_api_key", "anthropic_api_key"] {
