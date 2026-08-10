@@ -2044,7 +2044,7 @@ async fn prepare_run_stream_tool_gate_without_approval(
         BeforeToolDecisionKind::RequireApproval => {
             proposal_approval_required = true;
         }
-        BeforeToolDecisionKind::Block | BeforeToolDecisionKind::FailRun => {
+        BeforeToolDecisionKind::Block => {
             proposal_approval_required = false;
             skill_gate_decision = Some(crate::tool_protocol::ToolDecision {
                 allowed: false,
@@ -2058,6 +2058,9 @@ async fn prepare_run_stream_tool_gate_without_approval(
                 approval_required: false,
                 policy_enforced: true,
             });
+        }
+        BeforeToolDecisionKind::FailRun => {
+            return Err(before_tool_fail_run_status(&before_tool_report));
         }
         BeforeToolDecisionKind::SynthesizeResult => {
             proposal_approval_required = false;
@@ -2200,6 +2203,13 @@ async fn resolve_run_stream_tool_gate_approval(
         synthetic_outcome,
         approval_timed_out,
     })
+}
+
+fn before_tool_fail_run_status(report: &BeforeToolDecisionReport) -> Status {
+    Status::failed_precondition(format!(
+        "inline before-tool hook requested fail_run before tool execution; reason_code={}",
+        report.final_reason_code
+    ))
 }
 
 #[allow(clippy::result_large_err)]
@@ -5121,19 +5131,22 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_process_progress_backpressure_tape_event, classify_tool_parallelism,
-        classify_tool_result_replay_safety, commit_run_stream_tool_execution_outcome,
-        drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
-        finalize_drained_tool_execution_before_error, process_progress_channel_for_tool,
-        process_progress_status_message, projection_policy_contract,
-        retain_commit_projected_tool_execution_outcome, sessions_spawn_tape_payload,
-        settle_failed_tool_finalization, tool_side_effect_cleanup_outcome_request,
-        workspace_spill_policy_grants_sensitivity, workspace_spill_unavailable_projection,
-        OrchestratorTapeAppendRequest, ParallelToolExecutionTaskOutcome,
-        RunStreamPreparedToolExecution, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
-        TOOL_RESULT_REPLAY_SAFETY_EVENT,
+        append_process_progress_backpressure_tape_event, before_tool_fail_run_status,
+        classify_tool_parallelism, classify_tool_result_replay_safety,
+        commit_run_stream_tool_execution_outcome, drain_parallel_tool_group_after_cancel,
+        drain_parallel_tool_group_after_error, finalize_drained_tool_execution_before_error,
+        process_progress_channel_for_tool, process_progress_status_message,
+        projection_policy_contract, retain_commit_projected_tool_execution_outcome,
+        sessions_spawn_tape_payload, settle_failed_tool_finalization,
+        tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
+        workspace_spill_unavailable_projection, OrchestratorTapeAppendRequest,
+        ParallelToolExecutionTaskOutcome, RunStreamPreparedToolExecution, ToolParallelism,
+        TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
-    use crate::application::tool_governance::build_tool_call_signature;
+    use crate::application::tool_governance::{
+        build_tool_call_signature, evaluate_before_tool_decision_pipeline, BeforeToolDecisionInput,
+        BeforeToolDecisionKind,
+    };
     use crate::application::tool_registry::{
         tool_execution_semantics, ToolReplaySafetyClass, ToolResultProjectionPolicy,
     };
@@ -5165,6 +5178,26 @@ mod tests {
 
     const MAX_PREPARED_TOOL_RUNTIME_WRAPPER_BYTES: usize = 1024;
     const MAX_BOXED_TOOL_DISPATCH_TASK_BYTES: usize = 128;
+
+    #[test]
+    fn before_tool_fail_run_maps_to_terminal_stream_status() {
+        let report = evaluate_before_tool_decision_pipeline(BeforeToolDecisionInput {
+            tool_name: "palyra.process.run",
+            normalized_input_json: br#"{"command":"echo"}"#,
+            hook_decision: Some(BeforeToolDecisionKind::FailRun),
+            hook_reason: Some("dlp policy rejected the proposal"),
+            guardrail_decision: None,
+        });
+
+        let status = before_tool_fail_run_status(&report);
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "inline before-tool hook requested fail_run before tool execution; \
+             reason_code=hook.failed_run"
+        );
+    }
 
     fn start_backpressure_test_run(state: &GatewayRuntimeState, session_id: &str, run_id: &str) {
         start_test_orchestrator_run(state, session_id, run_id);
