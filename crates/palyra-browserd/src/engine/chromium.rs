@@ -1263,12 +1263,6 @@ struct ChromiumPrivateTargetRequestScope {
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
-struct ChromiumPrivateTargetTabScope {
-    tab_target_id: String,
-    target: ChromiumPrivateTargetScope,
-}
-
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 enum ChromiumPrivateTargetUrlScope {
     Network { scheme: String, host: String, port: u16, path: String, query: Option<String> },
     File(PathBuf),
@@ -1277,12 +1271,11 @@ enum ChromiumPrivateTargetUrlScope {
 /// Tracks which private/local targets a session may reach.
 ///
 /// Deny-by-default: unless the whole session allows private targets, a private
-/// destination is reachable only for the tab and URL that owns a scoped allowance.
+/// destination is reachable only while its tab-bound navigation scope is alive.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
     scoped_requests: std::sync::Mutex<HashMap<ChromiumPrivateTargetRequestScope, usize>>,
-    tab_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetTabScope, ()>>,
     pending_proxy_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetScope, usize>>,
 }
 
@@ -1299,7 +1292,6 @@ impl ChromiumPrivateTargetPolicy {
         Self {
             allow_session_private_targets,
             scoped_requests: std::sync::Mutex::new(HashMap::new()),
-            tab_targets: std::sync::Mutex::new(HashMap::new()),
             pending_proxy_targets: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1400,72 +1392,22 @@ impl ChromiumPrivateTargetPolicy {
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
-    pub(crate) fn grant_tab_target_after_navigation(
-        &self,
-        tab_target_id: &str,
-        raw_url: &str,
-    ) -> Result<(), String> {
-        if self.allow_session_private_targets
-            || validate_target_url_blocking(raw_url, false).is_ok()
-        {
-            return Ok(());
-        }
-        let Some(scope) = ChromiumPrivateTargetRequestScope::from_tab_url(tab_target_id, raw_url)?
-        else {
-            return Ok(());
-        };
-        let mut tab_targets = self
-            .tab_targets
-            .lock()
-            .map_err(|_| "private-target policy lock was poisoned".to_owned())?;
-        tab_targets.insert(
-            ChromiumPrivateTargetTabScope {
-                tab_target_id: tab_target_id.to_owned(),
-                target: scope.target_scope(),
-            },
-            (),
-        );
-        Ok(())
-    }
-
     #[cfg(test)]
     fn allows_exact_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        if self
-            .scoped_requests
+        self.scoped_requests
             .lock()
             .map(|scoped_requests| scoped_requests.contains_key(scope))
             .unwrap_or(false)
-        {
-            return true;
-        }
-        self.allows_retained_tab_target(scope)
     }
 
     fn allows_request_target_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        if self
-            .scoped_requests
+        self.scoped_requests
             .lock()
             .map(|scoped_requests| {
                 let requested_target = scope.target_scope();
                 scoped_requests.keys().any(|scoped| {
                     scoped.tab_target_id == scope.tab_target_id
                         && scoped.target_scope() == requested_target
-                })
-            })
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        self.allows_retained_tab_target(scope)
-    }
-
-    fn allows_retained_tab_target(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        self.tab_targets
-            .lock()
-            .map(|tab_targets| {
-                tab_targets.contains_key(&ChromiumPrivateTargetTabScope {
-                    tab_target_id: scope.tab_target_id.clone(),
-                    target: scope.target_scope(),
                 })
             })
             .unwrap_or(false)
@@ -4852,15 +4794,6 @@ pub(crate) async fn navigate_tab_with_chromium(
         outcome.success = false;
         outcome.error = error;
         return outcome;
-    }
-    if params.allow_private_targets {
-        if let Err(error) = private_target_policy
-            .grant_tab_target_after_navigation(tab_target_id.as_str(), snapshot.page_url.as_str())
-        {
-            outcome.success = false;
-            outcome.error = format!("failed to retain navigated private-target policy: {error}");
-            return outcome;
-        }
     }
     let body_bytes = snapshot.page_body.len() as u64;
     let page_body = if body_bytes > params.max_response_bytes {

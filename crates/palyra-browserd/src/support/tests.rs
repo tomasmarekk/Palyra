@@ -1471,7 +1471,7 @@ fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
 }
 
 #[test]
-fn chromium_private_target_policy_retains_navigated_tab_target() {
+fn chromium_private_target_policy_revokes_target_after_navigation_scope() {
     let policy = Arc::new(ChromiumPrivateTargetPolicy::new(false));
     let scoped = policy
         .scoped_url_allowance("tab-a", "http://127.0.0.1:7143/")
@@ -1485,26 +1485,26 @@ fn chromium_private_target_policy_retains_navigated_tab_target() {
         policy.allows_host_port("127.0.0.1", 7143),
         "navigation request should arm one proxy CONNECT allowance"
     );
+    assert!(
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
+        "same-target subresources should remain available during the navigation scope"
+    );
+    assert!(
+        policy.allows_host_port("127.0.0.1", 7143),
+        "authorized subresource should arm its own proxy CONNECT allowance"
+    );
     drop(scoped);
     assert!(
         !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
         "temporary navigation scope must not widen after guard release"
     );
-
-    policy
-        .grant_tab_target_after_navigation("tab-a", "http://127.0.0.1:7143/")
-        .expect("post-navigation target grant should parse");
     assert!(
-        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
-        "owning tab should retain access to the navigated private target"
-    );
-    assert!(
-        policy.allows_host_port("127.0.0.1", 7143),
-        "retained tab target should arm one proxy CONNECT allowance"
+        !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
+        "the tab must not retain private-target access after navigation completes"
     );
     assert!(
         !policy.authorize_tab_request_url("tab-b", "http://127.0.0.1:7143/mock-data.json"),
-        "another tab must not inherit the retained private target"
+        "another tab must not inherit the expired private target"
     );
     assert!(
         !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7144/mock-data.json"),
