@@ -15084,7 +15084,8 @@ impl JournalStore {
         Ok(record)
     }
 
-    /// Returns the public compat response record for its owner, excluding deleted views.
+    /// Returns the public compat response record for its owner, excluding
+    /// deleted and retention-expired views.
     ///
     /// # Errors
     /// Returns [`JournalError::CompatResponseNotFound`],
@@ -15097,6 +15098,7 @@ impl JournalStore {
         if response_id.trim().is_empty() {
             return Err(JournalError::InvalidArgument("response_id cannot be empty".to_owned()));
         }
+        let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
         let record = load_compat_response_record(&transaction, response_id)?.ok_or_else(|| {
@@ -15107,7 +15109,9 @@ impl JournalStore {
                 response_id: response_id.to_owned(),
             });
         }
-        if record.deleted_at_unix_ms.is_some() {
+        if record.deleted_at_unix_ms.is_some()
+            || record.retention_expires_at_unix_ms.is_some_and(|expires_at| expires_at <= now)
+        {
             return Err(JournalError::CompatResponseNotFound {
                 response_id: response_id.to_owned(),
             });
@@ -49072,7 +49076,7 @@ mod tests {
                     redaction_state_json: json!({"policy": "compat_response_store.v1"}).to_string(),
                     created_at_unix_ms: 1_700_000_000_000,
                     completed_at_unix_ms: Some(1_700_000_000_050),
-                    retention_expires_at_unix_ms: Some(1_700_086_400_000),
+                    retention_expires_at_unix_ms: Some(i64::MAX),
                 })
                 .expect("compat response should persist");
         }
@@ -49083,7 +49087,7 @@ mod tests {
             .compat_response_record_for_owner(response_id, "user:ops")
             .expect("compat response should be readable after reopen");
         assert_eq!(loaded.run_id, run_id);
-        assert_eq!(loaded.retention_expires_at_unix_ms, Some(1_700_086_400_000));
+        assert_eq!(loaded.retention_expires_at_unix_ms, Some(i64::MAX));
         assert_eq!(
             serde_json::from_str::<Value>(loaded.response_json.as_str())
                 .expect("response json should parse")
@@ -49091,6 +49095,20 @@ mod tests {
                 .and_then(Value::as_str),
             Some("hello")
         );
+
+        {
+            let guard = reopened.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute(
+                    "UPDATE compat_response_records SET retention_expires_at_unix_ms = 0 WHERE response_ulid = ?1",
+                    params![response_id],
+                )
+                .expect("test should expire compat response");
+        }
+        let get_after_expiry = reopened
+            .compat_response_record_for_owner(response_id, "user:ops")
+            .expect_err("expired public view should not be readable");
+        assert!(matches!(get_after_expiry, JournalError::CompatResponseNotFound { .. }));
 
         let outcome = reopened
             .delete_compat_response_public_view(response_id, "user:ops", "test_delete")
