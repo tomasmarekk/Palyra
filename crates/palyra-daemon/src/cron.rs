@@ -4199,6 +4199,7 @@ async fn execute_single_job_attempt(
     let mut tool_calls = 0_u64;
     let mut tool_denies = 0_u64;
     let mut successful_completion_tools = 0_u64;
+    let completion_target_hints = cron_completion_target_hints(job);
     let mut completion_candidates_by_proposal = HashMap::<String, CronCompletionCandidate>::new();
     while let Some(event) = stream.next().await {
         let event =
@@ -4222,7 +4223,10 @@ async fn execute_single_job_attempt(
                         completion_candidates_by_proposal.get(proposal_id.ulid.as_str())
                     });
                     if candidate.is_some_and(|candidate| {
-                        candidate.is_confirmed_by_output(result.output_json.as_slice())
+                        candidate.is_confirmed_by_output(
+                            result.output_json.as_slice(),
+                            completion_target_hints.as_slice(),
+                        )
                     }) {
                         successful_completion_tools = successful_completion_tools.saturating_add(1);
                     }
@@ -4358,107 +4362,108 @@ fn cron_prompt_mentions_file_or_workspace_target(prompt: &str) -> bool {
     {
         return true;
     }
-    [
-        ".md", ".log", ".txt", ".json", ".csv", ".toml", ".yaml", ".yml", ".ts", ".tsx", ".js",
-        ".jsx", ".rs", ".py", ".html", ".css",
-    ]
-    .iter()
-    .any(|needle| prompt.contains(needle))
+    CRON_FILE_TARGET_SUFFIXES.iter().any(|needle| prompt.contains(needle))
 }
 
-/// Whether a proposed tool call can serve as completion evidence, and whether
-/// a backgrounded result must be rejected (a background process does not
-/// prove the side effect actually happened).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CronCompletionCandidate {
-    completion_surface: bool,
-    reject_background_output: bool,
-    require_saved_file: bool,
+const CRON_FILE_TARGET_SUFFIXES: &[&str] = &[
+    ".md", ".log", ".txt", ".json", ".csv", ".toml", ".yaml", ".yml", ".ts", ".tsx", ".js", ".jsx",
+    ".rs", ".py", ".html", ".css", ".pdf",
+];
+
+fn cron_completion_target_hints(job: &CronJobRecord) -> Vec<String> {
+    let prompt = format!("{} {}", job.name, job.prompt).to_ascii_lowercase();
+    let mut hints = Vec::new();
+    for token in prompt.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        });
+        let normalized = normalize_cron_completion_path(token);
+        if normalized.is_empty()
+            || !CRON_FILE_TARGET_SUFFIXES.iter().any(|suffix| normalized.ends_with(suffix))
+            || hints.iter().any(|existing| existing == &normalized)
+        {
+            continue;
+        }
+        hints.push(normalized);
+        if hints.len() == 16 {
+            break;
+        }
+    }
+    hints
+}
+
+/// Structured file-mutation evidence expected from a successful tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CronCompletionCandidate {
+    None,
+    WorkspacePatch,
+    OsFile { operation: String },
+    BrowserSavedFile,
 }
 
 impl CronCompletionCandidate {
-    fn is_confirmed_by_output(self, output_json: &[u8]) -> bool {
-        self.completion_surface
-            && (!self.reject_background_output || !cron_tool_output_is_background(output_json))
-            && (!self.require_saved_file || cron_tool_output_has_saved_file(output_json))
+    fn is_confirmed_by_output(&self, output_json: &[u8], target_hints: &[String]) -> bool {
+        match self {
+            Self::None => false,
+            Self::WorkspacePatch => {
+                cron_workspace_patch_output_confirms_mutation(output_json, target_hints)
+            }
+            Self::OsFile { operation } => {
+                cron_os_file_output_confirms_mutation(output_json, operation.as_str(), target_hints)
+            }
+            Self::BrowserSavedFile => {
+                cron_browser_output_confirms_saved_file(output_json, target_hints)
+            }
+        }
     }
 }
 
 /// Maps a tool proposal to its completion-evidence classification.
 ///
-/// Only explicit mutation surfaces qualify; `palyra.process.run` qualifies
-/// when foreground and not a known read-only command.
+/// Only file tools whose proposal requests a real mutation qualify. The
+/// corresponding result must independently attest that mutation.
 fn cron_completion_candidate_for_tool_proposal(
     tool_name: &str,
     input_json: &[u8],
 ) -> CronCompletionCandidate {
-    if matches!(
-        tool_name,
-        "palyra.fs.apply_patch"
-            | "palyra.memory.retain"
-            | "palyra.retain"
-            | "palyra.memory.delete"
-            | "palyra.memory.replace"
-            | "palyra.routines.control"
-            | "palyra.secrets.put"
-    ) {
-        return CronCompletionCandidate {
-            completion_surface: true,
-            reject_background_output: false,
-            require_saved_file: false,
-        };
+    if tool_name == "palyra.fs.apply_patch"
+        && cron_workspace_patch_input_requests_mutation(input_json)
+    {
+        return CronCompletionCandidate::WorkspacePatch;
     }
-    if tool_name == "palyra.fs.os_file" && cron_os_file_operation_is_mutation(input_json) {
-        return CronCompletionCandidate {
-            completion_surface: true,
-            reject_background_output: false,
-            require_saved_file: false,
-        };
+    if tool_name == "palyra.fs.os_file" {
+        if let Some(operation) = cron_os_file_mutation_operation(input_json) {
+            return CronCompletionCandidate::OsFile { operation };
+        }
     }
     if tool_name == crate::gateway::BROWSER_PDF_TOOL_NAME {
-        return CronCompletionCandidate {
-            completion_surface: true,
-            reject_background_output: false,
-            require_saved_file: true,
-        };
+        return CronCompletionCandidate::BrowserSavedFile;
     }
-    if tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME
-        && cron_process_run_is_foreground_side_effect_candidate(input_json)
-    {
-        return CronCompletionCandidate {
-            completion_surface: true,
-            reject_background_output: true,
-            require_saved_file: false,
-        };
-    }
-    CronCompletionCandidate {
-        completion_surface: false,
-        reject_background_output: false,
-        require_saved_file: false,
-    }
+    CronCompletionCandidate::None
 }
 
-fn cron_process_run_is_foreground_side_effect_candidate(input_json: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(input_json) else {
-        return false;
-    };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if object.get("background").and_then(Value::as_bool).unwrap_or(false) {
-        return false;
-    }
-    let Some(command) = object.get("command").and_then(Value::as_str).map(str::trim) else {
-        return false;
-    };
-    !cron_process_run_command_is_read_only(command)
+fn cron_workspace_patch_input_requests_mutation(input_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(input_json).ok().is_some_and(|value| {
+        value
+            .as_object()
+            .is_some_and(|object| !object.get("dry_run").and_then(Value::as_bool).unwrap_or(false))
+    })
 }
 
-fn cron_os_file_operation_is_mutation(input_json: &[u8]) -> bool {
+fn cron_os_file_mutation_operation(input_json: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(input_json)
         .ok()
-        .and_then(|value| value.get("operation").and_then(Value::as_str).map(str::to_owned))
-        .is_some_and(|operation| {
+        .and_then(|value| {
+            let object = value.as_object()?;
+            if object.get("dry_run").and_then(Value::as_bool).unwrap_or(false) {
+                return None;
+            }
+            object.get("operation").and_then(Value::as_str).map(str::to_owned)
+        })
+        .filter(|operation| {
             matches!(
                 operation.as_str(),
                 "write" | "copy" | "move" | "delete_file" | "delete_empty_dir" | "mkdir"
@@ -4466,38 +4471,73 @@ fn cron_os_file_operation_is_mutation(input_json: &[u8]) -> bool {
         })
 }
 
-fn cron_process_run_command_is_read_only(command: &str) -> bool {
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "dir", "env", "find", "grep", "head", "id", "ls", "pwd", "rg", "stat", "tail",
-        "type", "uname", "wc", "where", "which", "whoami",
-    ];
-
-    READ_ONLY_COMMANDS.iter().any(|candidate| candidate.eq_ignore_ascii_case(command.trim()))
-}
-
-fn cron_tool_output_is_background(output_json: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
-        return false;
-    };
-    cron_tool_output_background(&value).unwrap_or_else(|| {
-        cron_tool_output_summary_value(&value)
-            .and_then(|summary| cron_tool_output_background(&summary))
-            .unwrap_or(false)
+fn cron_workspace_patch_output_confirms_mutation(
+    output_json: &[u8],
+    target_hints: &[String],
+) -> bool {
+    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
+        value.get("dry_run").and_then(Value::as_bool) == Some(false)
+            && value.get("files_touched").and_then(Value::as_array).is_some_and(|files| {
+                !files.is_empty()
+                    && files.iter().any(|file| {
+                        file.get("path").and_then(Value::as_str).is_some_and(|path| {
+                            cron_completion_path_matches_hints(path, target_hints)
+                        })
+                    })
+            })
     })
 }
 
-fn cron_tool_output_has_saved_file(output_json: &[u8]) -> bool {
+fn cron_os_file_output_confirms_mutation(
+    output_json: &[u8],
+    expected_operation: &str,
+    target_hints: &[String],
+) -> bool {
+    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
+        value.get("operation").and_then(Value::as_str) == Some(expected_operation)
+            && value.get("dry_run").and_then(Value::as_bool) == Some(false)
+            && ["path", "resolved_path"].iter().any(|field| {
+                value
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
+            })
+    })
+}
+
+fn cron_browser_output_confirms_saved_file(output_json: &[u8], target_hints: &[String]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
         return false;
     };
-    cron_tool_output_saved_file_path(&value).is_some_and(|path| !path.trim().is_empty())
+    cron_tool_output_saved_file_path(&value)
+        .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
         || cron_tool_output_summary_value(&value).is_some_and(|summary| {
-            cron_tool_output_saved_file_path(&summary).is_some_and(|path| !path.trim().is_empty())
+            cron_tool_output_saved_file_path(&summary)
+                .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
         })
 }
 
-fn cron_tool_output_background(value: &Value) -> Option<bool> {
-    value.get("background").and_then(Value::as_bool)
+fn cron_completion_path_matches_hints(path: &str, target_hints: &[String]) -> bool {
+    let path = normalize_cron_completion_path(path);
+    !path.is_empty()
+        && (target_hints.is_empty()
+            || target_hints.iter().any(|hint| {
+                path == *hint || path.strip_suffix(hint).is_some_and(|prefix| prefix.ends_with('/'))
+            }))
+}
+
+fn normalize_cron_completion_path(path: &str) -> String {
+    path.trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        })
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase()
 }
 
 fn cron_tool_output_saved_file_path(value: &Value) -> Option<&str> {
@@ -5675,6 +5715,11 @@ mod tests {
             cron_job_requires_completion_tool(&file_job),
             "append-to-file routines require structured completion evidence"
         );
+        assert_eq!(
+            cron_completion_target_hints(&file_job),
+            vec!["reports/heartbeat-cron.log".to_owned()],
+            "explicit file targets must bind the accepted mutation result"
+        );
 
         let mut text_job =
             sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAW", Some(1_000), CronMisfirePolicy::Skip);
@@ -5699,64 +5744,99 @@ mod tests {
 
     #[test]
     fn cron_completion_tools_are_explicit_mutation_surfaces() {
-        assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.apply_patch", b"{}")
-            .is_confirmed_by_output(b"{}"));
+        let target_hints = vec!["reports/feed.md".to_owned()];
+        let applied_patch = br#"{"dry_run":false,"files_touched":[{"path":"reports/feed.md"}]}"#;
+        assert!(cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch","dry_run":false}"#
+        )
+        .is_confirmed_by_output(applied_patch, target_hints.as_slice()));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch","dry_run":true}"#
+        )
+        .is_confirmed_by_output(applied_patch, target_hints.as_slice()));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch"}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"dry_run":false,"files_touched":[]}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch"}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"dry_run":false,"files_touched":[{"path":"reports/unrelated.md"}]}"#,
+            target_hints.as_slice()
+        ));
         assert!(cron_completion_candidate_for_tool_proposal(
             "palyra.fs.os_file",
             br#"{"operation":"write"}"#
         )
-        .is_confirmed_by_output(b"{}"));
-        assert!(cron_completion_candidate_for_tool_proposal("palyra.memory.retain", b"{}")
-            .is_confirmed_by_output(b"{}"));
-        assert!(cron_completion_candidate_for_tool_proposal("palyra.retain", b"{}")
-            .is_confirmed_by_output(b"{}"));
+        .is_confirmed_by_output(
+            br#"{"operation":"write","path":"reports/feed.md","dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"write","dry_run":true}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"operation":"write","path":"reports/feed.md","dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"write"}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"operation":"read","path":"reports/feed.md","dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.memory.retain", b"{}")
+            .is_confirmed_by_output(b"{}", target_hints.as_slice()));
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.retain", b"{}")
+            .is_confirmed_by_output(b"{}", target_hints.as_slice()));
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.fs.read_file", b"{}")
-            .is_confirmed_by_output(b"{}"));
+            .is_confirmed_by_output(b"{}", target_hints.as_slice()));
         assert!(!cron_completion_candidate_for_tool_proposal(
             "palyra.fs.os_file",
             br#"{"operation":"read"}"#
         )
-        .is_confirmed_by_output(b"{}"));
+        .is_confirmed_by_output(b"{}", target_hints.as_slice()));
 
         let process_script =
             br#"{"command":"node","args":["scripts/update-feed.js"],"background":false}"#;
-        assert!(cron_completion_candidate_for_tool_proposal("palyra.process.run", process_script)
-            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", process_script)
-            .is_confirmed_by_output(br#"{"summary":"{\"background\":true,\"pid\":1234}"}"#));
+            .is_confirmed_by_output(
+                br#"{"background":false,"exit_code":0}"#,
+                target_hints.as_slice()
+            ));
 
-        let read_only = br#"{"command":"rg","args":["feed-001","reports/feed.md"]}"#;
-        assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", read_only)
-            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
-
-        let background = br#"{"command":"node","args":["server.js"],"background":true}"#;
-        assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", background)
-            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
-
-        let auto_backgrounded = br#"{"command":"python","args":["-m","http.server"]}"#;
-        assert!(!cron_completion_candidate_for_tool_proposal(
-            "palyra.process.run",
-            auto_backgrounded
-        )
-        .is_confirmed_by_output(br#"{"background":true,"pid":1234}"#));
-
-        assert!(cron_completion_candidate_for_tool_proposal(
-            crate::gateway::BROWSER_PDF_TOOL_NAME,
-            b"{}"
-        )
-        .is_confirmed_by_output(br#"{"success":true,"saved_file":{"path":"reports/weekly.pdf"}}"#));
         assert!(cron_completion_candidate_for_tool_proposal(
             crate::gateway::BROWSER_PDF_TOOL_NAME,
             b"{}"
         )
         .is_confirmed_by_output(
-            br#"{"summary":"{\"success\":true,\"saved_file\":{\"path\":\"reports/weekly.pdf\"}}"}"#
+            br#"{"success":true,"saved_file":{"path":"reports/feed.md"}}"#,
+            target_hints.as_slice()
+        ));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            crate::gateway::BROWSER_PDF_TOOL_NAME,
+            b"{}"
+        )
+        .is_confirmed_by_output(
+            br#"{"summary":"{\"success\":true,\"saved_file\":{\"path\":\"reports/feed.md\"}}"}"#,
+            target_hints.as_slice()
         ));
         assert!(!cron_completion_candidate_for_tool_proposal(
             crate::gateway::BROWSER_PDF_TOOL_NAME,
             b"{}"
         )
-        .is_confirmed_by_output(br#"{"success":true,"saved_file":null}"#));
+        .is_confirmed_by_output(br#"{"success":true,"saved_file":null}"#, target_hints.as_slice()));
     }
 
     #[test]
