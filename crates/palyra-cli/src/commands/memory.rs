@@ -25,12 +25,27 @@ fn cli_inferred_workspace_memory_prefix() -> Option<String> {
     cli_project_memory_prefix_from_workspace_root(current_dir.as_path())
 }
 
-/// Normalizes a user-provided workspace-memory prefix without inventing one.
-fn cli_explicit_workspace_memory_prefix(prefix: Option<String>) -> Option<String> {
-    prefix.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    })
+fn resolve_cli_workspace_memory_prefix(
+    prefix: Option<String>,
+    inferred_prefix: Option<String>,
+) -> Result<String> {
+    prefix
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
+        .or(inferred_prefix)
+        .ok_or_else(|| {
+            anyhow!(
+                "unable to derive the current workspace-memory prefix; pass an explicit workspace prefix"
+            )
+        })
+}
+
+/// Resolves an explicit workspace-memory prefix or derives one from the
+/// current directory, failing closed instead of searching every workspace.
+fn cli_workspace_memory_prefix(prefix: Option<String>) -> Result<String> {
+    resolve_cli_workspace_memory_prefix(prefix, cli_inferred_workspace_memory_prefix())
 }
 
 /// Builds the `projects/project-<slug>-<hash>` prefix that scopes workspace memory to
@@ -884,14 +899,14 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     1.0,
                     Some(0.0),
                 )?;
-                let prefix = cli_explicit_workspace_memory_prefix(prefix);
+                let prefix = cli_workspace_memory_prefix(prefix)?;
                 let path = build_console_query_path(
                     "console/v1/memory/workspace/search",
                     vec![
                         ("query", Some(query)),
                         ("channel", channel),
                         ("agent_id", agent_id),
-                        ("prefix", prefix),
+                        ("prefix", Some(prefix)),
                         ("top_k", top_k.map(|value| value.to_string())),
                         ("min_score", Some(min_score.to_string())),
                         ("include_historical", include_historical.then(|| "true".to_owned())),
@@ -922,7 +937,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
         } => {
             let min_score =
                 parse_float_arg(min_score, "memory recall --min-score", 0.0, 1.0, Some(0.0))?;
-            let workspace_prefix = workspace_prefix.or_else(cli_inferred_workspace_memory_prefix);
+            let workspace_prefix = cli_workspace_memory_prefix(workspace_prefix)?;
             let request = json!({
                 "query": query,
                 "session_id": session,
@@ -972,7 +987,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             let query = resolve_optional_query_arg(query, query_option, "memory search-all")?;
             let min_score =
                 parse_float_arg(min_score, "memory search-all --min-score", 0.0, 1.0, Some(0.0))?;
-            let workspace_prefix = cli_explicit_workspace_memory_prefix(workspace_prefix);
+            let workspace_prefix = cli_workspace_memory_prefix(workspace_prefix)?;
             let path = build_console_query_path(
                 "console/v1/memory/search-all",
                 vec![
@@ -982,7 +997,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     ("agent_id", agent_id),
                     ("top_k", top_k.map(|value| value.to_string())),
                     ("min_score", Some(min_score.to_string())),
-                    ("workspace_prefix", workspace_prefix),
+                    ("workspace_prefix", Some(workspace_prefix)),
                 ],
             );
             let payload = context.client.get_json_value(path.as_str()).await?;
@@ -1743,11 +1758,10 @@ fn attach_manual_ingest_visibility(payload: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_manual_ingest_visibility, build_console_query_path,
-        cli_explicit_workspace_memory_prefix, memory_embeddings_degraded_line,
+        attach_manual_ingest_visibility, build_console_query_path, memory_embeddings_degraded_line,
         memory_search_claim_boundary, memory_search_output_payload, memory_session_scope_label,
-        replace_memory_item, resolve_optional_query_arg, validate_memory_purge_confirmation,
-        MemoryReplaceOptions, MemoryReplaceRpc,
+        replace_memory_item, resolve_cli_workspace_memory_prefix, resolve_optional_query_arg,
+        validate_memory_purge_confirmation, MemoryReplaceOptions, MemoryReplaceRpc,
     };
     use crate::{common_v1, memory_v1, AgentConnection, CANONICAL_PROTOCOL_MAJOR};
     use serde_json::{json, Value};
@@ -1980,15 +1994,27 @@ mod tests {
     }
 
     #[test]
-    fn cli_workspace_search_prefix_only_uses_explicit_value() {
+    fn cli_workspace_search_defaults_to_inferred_project_prefix() {
         let path = build_console_query_path(
             "console/v1/memory/workspace/search",
             vec![
                 ("query", Some("Playwright".to_owned())),
-                ("prefix", cli_explicit_workspace_memory_prefix(None)),
+                (
+                    "prefix",
+                    Some(
+                        resolve_cli_workspace_memory_prefix(
+                            None,
+                            Some("projects/current-workspace".to_owned()),
+                        )
+                        .expect("inferred workspace prefix should resolve"),
+                    ),
+                ),
             ],
         );
-        assert_eq!(path, "console/v1/memory/workspace/search?query=Playwright");
+        assert_eq!(
+            path,
+            "console/v1/memory/workspace/search?query=Playwright&prefix=projects%2Fcurrent-workspace"
+        );
 
         let path = build_console_query_path(
             "console/v1/memory/workspace/search",
@@ -1996,7 +2022,13 @@ mod tests {
                 ("query", Some("Playwright".to_owned())),
                 (
                     "prefix",
-                    cli_explicit_workspace_memory_prefix(Some(" projects/workspace ".to_owned())),
+                    Some(
+                        resolve_cli_workspace_memory_prefix(
+                            Some(" projects/workspace ".to_owned()),
+                            Some("projects/current-workspace".to_owned()),
+                        )
+                        .expect("explicit workspace prefix should resolve"),
+                    ),
                 ),
             ],
         );
@@ -2007,15 +2039,27 @@ mod tests {
     }
 
     #[test]
-    fn cli_search_all_workspace_prefix_only_uses_explicit_value() {
+    fn cli_search_all_defaults_to_inferred_project_prefix() {
         let path = build_console_query_path(
             "console/v1/memory/search-all",
             vec![
                 ("q", Some("S033-PALYRA-E2E".to_owned())),
-                ("workspace_prefix", cli_explicit_workspace_memory_prefix(None)),
+                (
+                    "workspace_prefix",
+                    Some(
+                        resolve_cli_workspace_memory_prefix(
+                            None,
+                            Some("projects/current-workspace".to_owned()),
+                        )
+                        .expect("inferred workspace prefix should resolve"),
+                    ),
+                ),
             ],
         );
-        assert_eq!(path, "console/v1/memory/search-all?q=S033-PALYRA-E2E");
+        assert_eq!(
+            path,
+            "console/v1/memory/search-all?q=S033-PALYRA-E2E&workspace_prefix=projects%2Fcurrent-workspace"
+        );
 
         let path = build_console_query_path(
             "console/v1/memory/search-all",
@@ -2023,7 +2067,13 @@ mod tests {
                 ("q", Some("S033-PALYRA-E2E".to_owned())),
                 (
                     "workspace_prefix",
-                    cli_explicit_workspace_memory_prefix(Some(" projects/workspace ".to_owned())),
+                    Some(
+                        resolve_cli_workspace_memory_prefix(
+                            Some(" projects/workspace ".to_owned()),
+                            Some("projects/current-workspace".to_owned()),
+                        )
+                        .expect("explicit workspace prefix should resolve"),
+                    ),
                 ),
             ],
         );
@@ -2031,6 +2081,10 @@ mod tests {
             path,
             "console/v1/memory/search-all?q=S033-PALYRA-E2E&workspace_prefix=projects%2Fworkspace"
         );
+
+        let missing = resolve_cli_workspace_memory_prefix(None, None)
+            .expect_err("missing explicit and inferred scope must fail closed");
+        assert!(missing.to_string().contains("explicit workspace prefix"));
     }
 
     #[test]
