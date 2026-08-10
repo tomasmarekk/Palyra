@@ -7041,7 +7041,11 @@ fn sanitize_json_approval_summary_text(value: &str) -> Option<String> {
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    let parsed = match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) => parsed,
+        Err(_) if trimmed.starts_with(['{', '[']) => return Some(REDACTED.to_owned()),
+        Err(_) => return None,
+    };
     if !matches!(parsed, Value::Object(_) | Value::Array(_)) {
         return None;
     }
@@ -8473,6 +8477,24 @@ mod agent_stream_output_tests {
         assert!(!line.contains("summary-token"), "{line}");
         assert!(!line.contains("summary-auth"), "{line}");
         assert!(!line.contains("raw-token"), "{line}");
+    }
+
+    #[test]
+    fn terminal_approval_prompt_fails_closed_on_truncated_json_summary() {
+        let approval = common_v1::ToolApprovalRequest {
+            proposal_id: None,
+            approval_id: None,
+            tool_name: "palyra.process.run".to_owned(),
+            input_json: Vec::new(),
+            approval_required: true,
+            request_summary: r#"{"input_json":{"token":"summary-token""#.to_owned(),
+            prompt: None,
+        };
+
+        let line = tool_approval_prompt_line(&approval);
+
+        assert!(line.contains(REDACTED), "{line}");
+        assert!(!line.contains("summary-token"), "{line}");
     }
 
     #[test]
