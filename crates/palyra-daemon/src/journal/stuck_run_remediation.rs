@@ -279,13 +279,17 @@ impl JournalStore {
         Ok(Some(incident))
     }
 
-    /// Appends a redacted, stable decision for diagnostics and replay.
+    /// Appends a redacted decision unless the latest observation is unchanged.
     pub fn record_stuck_run_remediation_decision(
         &self,
         decision: &RemediationDecision,
     ) -> Result<(), JournalError> {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if latest_decision_matches(&transaction, decision)? {
+            transaction.commit()?;
+            return Ok(());
+        }
         append_decision_event(&transaction, decision, "decision", None, None)?;
         transaction.commit()?;
         Ok(())
@@ -668,6 +672,33 @@ fn append_decision_event(
     Ok(())
 }
 
+fn latest_decision_matches(
+    connection: &rusqlite::Connection,
+    decision: &RemediationDecision,
+) -> Result<bool, JournalError> {
+    let previous = connection
+        .query_row(
+            r#"
+                SELECT decision_json
+                FROM stuck_run_remediation_events
+                WHERE incident_ulid = ?1 AND event_type = 'decision'
+                ORDER BY created_at_unix_ms DESC, event_ulid DESC
+                LIMIT 1
+            "#,
+            params![decision.incident_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| serde_json::from_str::<RemediationDecision>(raw.as_str()).ok());
+    Ok(previous.is_some_and(|previous| {
+        previous.incident_id == decision.incident_id
+            && previous.policy == decision.policy
+            && previous.decision == decision.decision
+            && previous.reason_code == decision.reason_code
+            && previous.schema_version == decision.schema_version
+    }))
+}
+
 fn sqlite_generation(generation: u64) -> Result<i64, JournalError> {
     i64::try_from(generation).map_err(|_| {
         JournalError::InvalidArgument("runtime generation exceeds SQLite range".to_owned())
@@ -783,6 +814,58 @@ mod tests {
 
         assert_eq!(first, StuckRunRemediationClaimOutcome::Claimed { claim_epoch: 1 });
         assert_eq!(second, StuckRunRemediationClaimOutcome::Busy);
+    }
+
+    #[test]
+    fn repeated_identical_decisions_are_persisted_once() {
+        let store = open_store(temp_db_path());
+        insert_run_fixture(&store, false);
+        let incident = inspect_read_only_incident(&store);
+        let first = RemediationDecision::new(
+            incident.incident_id.clone(),
+            StuckRunRemediationPolicy::ObserveOnly,
+            StuckRunRemediationDecisionKind::ObserveOnly,
+            2_000,
+        );
+        let repeated = RemediationDecision::new(
+            incident.incident_id.clone(),
+            StuckRunRemediationPolicy::ObserveOnly,
+            StuckRunRemediationDecisionKind::ObserveOnly,
+            3_000,
+        );
+        store.record_stuck_run_remediation_decision(&first).expect("first decision should persist");
+        store
+            .record_stuck_run_remediation_decision(&repeated)
+            .expect("unchanged decision should coalesce");
+        let changed = RemediationDecision::new(
+            incident.incident_id.clone(),
+            StuckRunRemediationPolicy::ObserveOnly,
+            StuckRunRemediationDecisionKind::FreshHeartbeat,
+            4_000,
+        );
+        store
+            .record_stuck_run_remediation_decision(&changed)
+            .expect("changed decision should persist");
+
+        let guard = store.connection.lock().expect("journal connection should lock");
+        let event_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM stuck_run_remediation_events \
+                 WHERE incident_ulid = ?1 AND event_type = 'decision'",
+                params![incident.incident_id],
+                |row| row.get(0),
+            )
+            .expect("decision event count should load");
+        let tape_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tape \
+                 WHERE run_ulid = ?1 AND event_type = 'stuck_run_remediation_decision'",
+                params![incident.run_id],
+                |row| row.get(0),
+            )
+            .expect("decision tape count should load");
+        assert_eq!(event_count, 2);
+        assert_eq!(tape_count, 2);
     }
 
     #[test]
