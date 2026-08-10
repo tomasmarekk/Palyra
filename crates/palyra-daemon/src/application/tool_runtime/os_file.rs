@@ -3,10 +3,10 @@
 //! Unlike the workspace tools, this backend may reach outside the agent
 //! workspace, but only within the allowlist of workspace roots, user-owned
 //! roots (`USERPROFILE`/`HOME` or configured `PALYRA_OS_FILE_ROOTS`), temp
-//! directories, and run-launch path-env roots. Every requested path must be
-//! absolute, free of `.`/`..` components, canonicalized (or resolved through
-//! its nearest existing ancestor for new targets), and outside protected OS
-//! paths before I/O.
+//! directories. Run-launch path-env values are aliases only and never grant
+//! access to a root. Every requested path must be absolute, free of `.`/`..`
+//! components, canonicalized (or resolved through its nearest existing
+//! ancestor for new targets), and outside protected OS paths before I/O.
 //! Treat any change to that pipeline as a security change.
 //!
 //! Reads stay model-visible even when the safety scanner finds secrets: the
@@ -33,9 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::{
-        run_launch_context_path_env, workspace_roots_with_run_launch_context_for_agent_source,
-    },
+    application::tool_runtime::workspace_scope::run_launch_context_path_env,
     gateway::{GatewayRuntimeState, ToolRuntimeExecutionContext, OS_FILE_TOOL_NAME},
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -204,21 +202,15 @@ async fn resolve_os_file_policy(
         })?;
     let agent_workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
-        runtime_state,
-        context.run_id,
-        agent_workspace_roots.as_slice(),
-        agent_outcome.source,
-    )
-    .await
-    .iter()
-    .filter_map(|root| canonicalize_existing_dir(root.as_path()).ok())
-    .collect::<Vec<_>>();
+    let authoritative_workspace_roots = runtime_state
+        .managed_coding_workspace_root(context.run_id)
+        .map_or(agent_workspace_roots, |root| vec![root]);
+    let workspace_roots = authoritative_workspace_roots
+        .iter()
+        .filter_map(|root| canonicalize_existing_dir(root.as_path()).ok())
+        .collect::<Vec<_>>();
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
-    let mut user_os_roots = user_owned_os_roots();
-    for root in path_env.values() {
-        push_canonical_root(&mut user_os_roots, root.clone());
-    }
+    let user_os_roots = user_owned_os_roots();
     Ok(OsFilePolicy { workspace_roots, user_os_roots, path_env })
 }
 
@@ -2045,6 +2037,48 @@ mod tests {
             read.get("text").and_then(Value::as_str),
             Some("default_model = \"MiniMax-M3\"\n")
         );
+    }
+
+    #[test]
+    fn os_file_launch_context_path_env_does_not_grant_root_authority() {
+        let allowed_root = os_file_tempdir();
+        let spoofed_root = os_file_tempdir();
+        let secret_path = spoofed_root.path().join("outside.txt");
+        fs::write(secret_path.as_path(), "outside approved roots\n")
+            .expect("outside fixture should be written");
+        let canonical_spoofed_root =
+            fs::canonicalize(spoofed_root.path()).expect("spoofed root should canonicalize");
+        let policy = OsFilePolicy {
+            workspace_roots: vec![
+                fs::canonicalize(allowed_root.path()).expect("allowed root should canonicalize")
+            ],
+            user_os_roots: Vec::new(),
+            path_env: BTreeMap::from([("PALYRA_SPOOFED_ROOT".to_owned(), canonical_spoofed_root)]),
+        };
+
+        let error = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Read,
+                path: "$PALYRA_SPOOFED_ROOT/outside.txt".to_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect_err("launch-context aliases must not expand filesystem authority");
+
+        assert!(error.contains("outside agent workspace roots"), "{error}");
     }
 
     #[test]
