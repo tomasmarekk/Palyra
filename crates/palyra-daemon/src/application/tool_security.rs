@@ -141,10 +141,18 @@ fn parse_tool_skill_context(
 }
 
 fn tool_input_requires_proposal_approval(tool_name: &str, input_json: &[u8]) -> bool {
-    if tool_name != "palyra.memory.search" {
-        return false;
+    match tool_name {
+        "palyra.memory.search" => memory_search_input_requires_workspace_approval(input_json),
+        "palyra.plan.manage" => plan_manage_input_requires_mutation_approval(input_json),
+        _ => false,
     }
-    memory_search_input_requires_workspace_approval(input_json)
+}
+
+fn plan_manage_input_requires_mutation_approval(input_json: &[u8]) -> bool {
+    let Ok(Value::Object(payload)) = serde_json::from_slice::<Value>(input_json) else {
+        return true;
+    };
+    trimmed_tool_input_string(&payload, "operation") != Some("read")
 }
 
 fn memory_search_input_requires_workspace_approval(input_json: &[u8]) -> bool {
@@ -1123,6 +1131,33 @@ mod tests {
         assert!(!tool_input_requires_proposal_approval(
             "palyra.echo",
             br#"{"query":"project notes","scope":"workspace"}"#
+        ));
+    }
+
+    #[test]
+    fn plan_manage_mutations_require_proposal_approval() {
+        for input in [
+            r#"{"operation":"upsert","title":"Persisted state"}"#,
+            r#"{"operation":"reorder","item_id":"plan-1","priority":1}"#,
+            r#"{"operation":"block","item_id":"plan-1","blocked_reason":"waiting"}"#,
+            r#"{"operation":"complete","item_id":"plan-1"}"#,
+            r#"{"operation":"cancel","item_id":"plan-1"}"#,
+            r#"{"operation":"clear_active"}"#,
+            r#"{}"#,
+            r#"not-json"#,
+        ] {
+            assert!(
+                tool_input_requires_proposal_approval("palyra.plan.manage", input.as_bytes()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_manage_read_does_not_require_proposal_approval() {
+        assert!(!tool_input_requires_proposal_approval(
+            "palyra.plan.manage",
+            br#"{"operation":"read"}"#
         ));
     }
 
