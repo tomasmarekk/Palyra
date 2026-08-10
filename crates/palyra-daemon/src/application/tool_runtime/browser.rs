@@ -597,38 +597,9 @@ fn canonical_file_path_is_inside_workspace_roots(
     canonical_target: &Path,
     canonical_roots: &[PathBuf],
 ) -> bool {
-    canonical_roots.iter().any(|root| browser_path_starts_with(canonical_target, root.as_path()))
-}
-
-fn browser_path_starts_with(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        let path = browser_windows_path_prefix_text(path);
-        let root = browser_windows_path_prefix_text(root);
-        path == root || path.starts_with(format!("{root}/").as_str())
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-#[cfg(windows)]
-fn browser_windows_path_prefix_text(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-    if let Some(rest) = normalized.strip_prefix("//?/unc/") {
-        return format!("//{rest}");
-    }
-    if let Some(rest) = normalized.strip_prefix("//?/") {
-        return rest.to_owned();
-    }
-    if let Some(rest) = normalized.strip_prefix("//./") {
-        return rest.to_owned();
-    }
-    normalized
+    // Canonical path components must retain their identity because Windows can
+    // host case-sensitive directories and shares.
+    canonical_roots.iter().any(|root| canonical_target.starts_with(root))
 }
 
 /// Resolves the agent for this execution context plus run-launch workspace roots.
@@ -7409,15 +7380,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn browser_path_scope_accepts_verbatim_user_root_case_variants() {
-        let target =
-            std::path::PathBuf::from(r"\\?\C:\Users\Palo\Downloads\palyra-e2e\S053\upload.csv");
-        let user_root = std::path::PathBuf::from(r"C:\Users\palo\Downloads");
+    fn browser_path_scope_rejects_case_colliding_windows_root() {
+        let target = std::path::PathBuf::from(r"\\?\C:\case\workspace\secret.html");
+        let allowed_root = std::path::PathBuf::from(r"\\?\C:\case\Workspace");
+        let matching_root = std::path::PathBuf::from(r"\\?\C:\case\workspace");
 
         assert!(
-            canonical_file_path_is_inside_workspace_roots(target.as_path(), &[user_root]),
-            "browser file-transfer policy should match Windows verbatim paths case-insensitively"
+            !canonical_file_path_is_inside_workspace_roots(
+                target.as_path(),
+                std::slice::from_ref(&allowed_root)
+            ),
+            "case-colliding Windows roots must remain distinct"
         );
+        assert!(canonical_file_path_is_inside_workspace_roots(target.as_path(), &[matching_root]));
     }
 
     #[test]
