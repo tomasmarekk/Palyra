@@ -61,14 +61,15 @@ use crate::{
         HEADER_PRINCIPAL,
     },
     journal::{
-        ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
-        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalRiskLevel,
-        ApprovalSubjectType, AutonomousWakeAdmissionRecord, AutonomousWakeAdmissionRequest,
-        AutonomousWakeDecision, CronConcurrencyPolicy, CronJobRecord, CronJobUpdatePatch,
-        CronMisfirePolicy, CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest,
-        CronRunStatus, CronScheduleType, MemoryRetentionPolicy, OrchestratorCancelRequest,
-        OrchestratorRunStatusSnapshot, OrchestratorSessionQuickControlsUpdateRequest,
-        SkillExecutionStatus, SkillStatusUpsertRequest,
+        max_runs_from_schedule_payload_json, ApprovalCreateRequest, ApprovalDecision,
+        ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
+        ApprovalRecord, ApprovalRiskLevel, ApprovalSubjectType, AutonomousWakeAdmissionRecord,
+        AutonomousWakeAdmissionRequest, AutonomousWakeDecision, CronConcurrencyPolicy,
+        CronJobRecord, CronJobUpdatePatch, CronMisfirePolicy, CronRunFinalizeRequest,
+        CronRunRecord, CronRunStartRequest, CronRunStatus, CronScheduleType, MemoryRetentionPolicy,
+        OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
+        OrchestratorSessionQuickControlsUpdateRequest, SkillExecutionStatus,
+        SkillStatusUpsertRequest, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND, ROUTINE_GATE_ERROR_KIND,
     },
     objectives::{ObjectiveLifecycleRecord, ObjectiveRecord, ObjectiveState, ObjectiveUpsert},
     routines::{
@@ -114,8 +115,6 @@ pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 const CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND: &str = "cron_max_runs_exhausted";
-const ROUTINE_GATE_ERROR_KIND: &str = "routine_gate";
-pub(crate) const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
 const OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND: &str = "objective_budget_exhausted";
 const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
 const OBJECTIVE_LIFECYCLE_DENIED_ERROR_KIND: &str = "objective_lifecycle_denied";
@@ -998,12 +997,6 @@ fn one_shot_schedule_is_exhausted(job: &CronJobRecord, next_run_at_unix_ms: Opti
 #[must_use]
 pub fn max_runs_for_job(job: &CronJobRecord) -> Option<u32> {
     max_runs_from_schedule_payload_json(job.schedule_payload_json.as_str())
-}
-
-fn max_runs_from_schedule_payload_json(schedule_payload_json: &str) -> Option<u32> {
-    let payload = serde_json::from_str::<Value>(schedule_payload_json).ok()?;
-    let value = payload.get("max_runs")?.as_u64()?;
-    u32::try_from(value).ok().filter(|max_runs| *max_runs > 0)
 }
 
 /// Next tick to persist when toggling a job's enabled flag.
@@ -2050,6 +2043,11 @@ fn decide_concurrency_policy(
 fn is_cron_active_claim_conflict(error: &Status) -> bool {
     error.code() == Code::FailedPrecondition
         && error.message().starts_with("cron job already has active run:")
+}
+
+fn is_cron_max_runs_claim_conflict(error: &Status) -> bool {
+    error.code() == Code::ResourceExhausted
+        && error.message().starts_with("cron max_runs exhausted:")
 }
 
 async fn handle_atomic_concurrency_claim_conflict(
@@ -3181,6 +3179,19 @@ async fn dispatch_job(
         error_message_redacted: None,
     };
     if let Err(error) = state.start_cron_run(start_request).await {
+        if is_cron_max_runs_claim_conflict(&error) {
+            if let Some(exhaustion) =
+                disable_cron_if_max_run_slots_exhausted(Arc::clone(&state), &job).await?
+            {
+                return Ok(DispatchOutcome {
+                    run_id: None,
+                    status: CronRunStatus::Skipped,
+                    message: cron_max_run_slots_exhausted_message(&exhaustion),
+                    session_key: None,
+                    session_label: None,
+                });
+            }
+        }
         if is_cron_active_claim_conflict(&error) {
             return handle_atomic_concurrency_claim_conflict(
                 Arc::clone(&state),

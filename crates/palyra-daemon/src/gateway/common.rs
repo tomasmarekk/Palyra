@@ -243,6 +243,11 @@ pub(crate) fn map_cron_store_error(operation: &str, error: JournalError) -> Stat
                 "cron job already has active run: job_id={job_id} active_run_id={active_run_id} requested_run_id={requested_run_id}"
             ))
         }
+        JournalError::CronMaxRunsExhausted { job_id, max_runs, reserved_runs } => {
+            Status::resource_exhausted(format!(
+                "cron max_runs exhausted: job_id={job_id} reserved_runs={reserved_runs} max_runs={max_runs}"
+            ))
+        }
         JournalError::CronRunNotFound { run_id } => {
             Status::not_found(format!("cron run not found: {run_id}"))
         }

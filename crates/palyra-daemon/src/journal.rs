@@ -573,6 +573,54 @@ pub struct CronRunStartRequest {
     pub error_message_redacted: Option<String>,
 }
 
+pub(crate) const ROUTINE_GATE_ERROR_KIND: &str = "routine_gate";
+pub(crate) const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
+
+/// Parses the optional positive execution cap shared by scheduler prechecks
+/// and the journal's authoritative run-slot reservation.
+pub(crate) fn max_runs_from_schedule_payload_json(schedule_payload_json: &str) -> Option<u32> {
+    let payload = serde_json::from_str::<Value>(schedule_payload_json).ok()?;
+    let value = payload.get("max_runs")?.as_u64()?;
+    u32::try_from(value).ok().filter(|max_runs| *max_runs > 0)
+}
+
+/// Counts capacity-consuming runs while the caller holds the insertion
+/// transaction, closing the check-then-insert race between dispatchers.
+fn count_reserved_cron_run_slots_tx(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+) -> Result<u32, JournalError> {
+    let count = transaction.query_row(
+        r#"
+            SELECT COUNT(*)
+            FROM cron_runs
+            WHERE job_ulid = ?1
+              AND (
+                    status IN ('accepted', 'running', 'succeeded', 'failed')
+                    OR (
+                        status = 'denied'
+                        AND NOT (
+                            orchestrator_run_ulid IS NULL
+                            AND tool_calls = 0
+                            AND tool_denies = 0
+                            AND (
+                                COALESCE(error_kind, '') = ?2
+                                OR (
+                                    COALESCE(error_kind, '') = ?3
+                                    AND COALESCE(error_message_redacted, '')
+                                        LIKE 'routine approval is required before the first%'
+                                )
+                            )
+                        )
+                    )
+              )
+        "#,
+        params![job_id, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND, ROUTINE_GATE_ERROR_KIND],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// Terminal status and usage counters recorded when a cron run finishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronRunFinalizeRequest {
@@ -5012,6 +5060,8 @@ pub enum JournalError {
         "cron job {job_id} already has active run {active_run_id}; cannot start run {requested_run_id}"
     )]
     CronRunAlreadyActive { job_id: String, active_run_id: String, requested_run_id: String },
+    #[error("cron max_runs exhausted for job {job_id}: {reserved_runs}/{max_runs}")]
+    CronMaxRunsExhausted { job_id: String, max_runs: u32, reserved_runs: u32 },
     #[error("memory item already exists: {memory_id}")]
     DuplicateMemoryId { memory_id: String },
     #[error("recall artifact already exists: {artifact_id}")]
@@ -23610,8 +23660,9 @@ impl JournalStore {
     /// job's last-run time.
     ///
     /// # Errors
-    /// Returns [`JournalError::DuplicateCronRunId`], [`JournalError::CronRunAlreadyActive`], or
-    /// [`JournalError::CronJobNotFound`], or [`JournalError`] on storage failure.
+    /// Returns [`JournalError::DuplicateCronRunId`], [`JournalError::CronRunAlreadyActive`],
+    /// [`JournalError::CronMaxRunsExhausted`], [`JournalError::CronJobNotFound`], or
+    /// [`JournalError`] on storage failure.
     pub fn start_cron_run(&self, request: &CronRunStartRequest) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -23628,14 +23679,27 @@ impl JournalStore {
             return Err(JournalError::DuplicateCronRunId { run_id: request.run_id.clone() });
         }
         if request.status.is_active() {
-            let concurrency_policy_raw = transaction
+            let (concurrency_policy_raw, schedule_payload_json) = transaction
                 .query_row(
-                    "SELECT concurrency_policy FROM cron_jobs WHERE job_ulid = ?1",
+                    "SELECT concurrency_policy, schedule_payload_json FROM cron_jobs WHERE job_ulid = ?1",
                     params![request.job_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| JournalError::CronJobNotFound { job_id: request.job_id.clone() })?;
+            if let Some(max_runs) =
+                max_runs_from_schedule_payload_json(schedule_payload_json.as_str())
+            {
+                let reserved_runs =
+                    count_reserved_cron_run_slots_tx(&transaction, request.job_id.as_str())?;
+                if reserved_runs >= max_runs {
+                    return Err(JournalError::CronMaxRunsExhausted {
+                        job_id: request.job_id.clone(),
+                        max_runs,
+                        reserved_runs,
+                    });
+                }
+            }
             let concurrency_policy = CronConcurrencyPolicy::from_str(
                 concurrency_policy_raw.as_str(),
             )
@@ -53445,6 +53509,61 @@ mod tests {
                 ),
             })
             .expect("terminal concurrency audit row should persist while active");
+    }
+
+    #[test]
+    fn cron_run_start_atomically_enforces_max_runs_for_replace_policy() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let mut request = sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FC4");
+        request.concurrency_policy = CronConcurrencyPolicy::Replace;
+        request.schedule_payload_json = r#"{"interval_ms":60000,"max_runs":1}"#.to_owned();
+        let job = store.create_cron_job(&request).expect("cron job should be inserted");
+
+        store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FC5".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Accepted,
+                error_kind: None,
+                error_message_redacted: None,
+            })
+            .expect("first active run should reserve the only slot");
+
+        let error = store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FC6".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Accepted,
+                error_kind: None,
+                error_message_redacted: None,
+            })
+            .expect_err("replace must not start beyond max_runs");
+
+        assert!(matches!(
+            error,
+            JournalError::CronMaxRunsExhausted {
+                job_id,
+                max_runs: 1,
+                reserved_runs: 1
+            } if job_id == job.job_id
+        ));
+        let runs = store
+            .list_cron_runs(CronRunsListFilter {
+                job_id: Some(job.job_id.as_str()),
+                owner_principal: None,
+                after_run_id: None,
+                limit: 10,
+            })
+            .expect("cron runs should remain queryable");
+        assert_eq!(runs.len(), 1, "rejected claim must not persist another run");
     }
 
     #[test]
