@@ -92,6 +92,7 @@ use palyra_sandbox::{
     build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
     current_backend_kind, TierCBackendError, TierCCommandPlan, TierCCommandRequest, TierCPolicy,
 };
+use palyra_vault::ensure_owner_only_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11912,19 +11913,93 @@ fn process_runner_child_temp_root(
     workspace_root: &Path,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     let workspace_key = process_runner_workspace_cache_key(workspace_root);
-    let temp_root = join_relative_components(
-        process_runner_runtime_root()?.as_path(),
-        PROCESS_RUNNER_TEMP_RELATIVE_PATH,
-    )
-    .join(workspace_key);
-    fs::create_dir_all(temp_root.as_path()).map_err(|error| SandboxProcessRunError {
+    let mut temp_root = process_runner_runtime_root()?;
+    ensure_private_process_runner_directory(temp_root.as_path())?;
+    for component in PROCESS_RUNNER_TEMP_RELATIVE_PATH
+        .iter()
+        .copied()
+        .chain(std::iter::once(workspace_key.as_str()))
+    {
+        temp_root.push(component);
+        ensure_private_process_runner_directory(temp_root.as_path())?;
+    }
+    Ok(temp_root)
+}
+
+fn ensure_private_process_runner_directory(path: &Path) -> Result<(), SandboxProcessRunError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if process_runner_directory_is_link(&metadata) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "palyra.process.run rejected child temp directory {} because it is a symbolic link or reparse point",
+                    path.display()
+                ),
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "palyra.process.run rejected child temp path {} because it is not a directory",
+                    path.display()
+                ),
+            });
+        }
+    }
+    ensure_owner_only_dir(path).map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!(
-            "palyra.process.run failed to create child temp directory {}: {error}",
-            temp_root.display()
+            "palyra.process.run failed to secure child temp directory {}: {error}",
+            path.display()
         ),
     })?;
-    Ok(temp_root)
+    let metadata = fs::symlink_metadata(path).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.run failed to verify child temp directory {}: {error}",
+            path.display()
+        ),
+    })?;
+    if process_runner_directory_is_link(&metadata) || !metadata.is_dir() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.run rejected child temp directory {} after security hardening",
+                path.display()
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` only reads current process credentials and has no preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "palyra.process.run rejected child temp directory {} because it is not owner-only",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn process_runner_directory_is_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn process_runner_runtime_root() -> Result<PathBuf, SandboxProcessRunError> {
@@ -16107,6 +16182,42 @@ mod tests {
         );
         assert!(!temp_root.starts_with(workspace.as_path()));
         assert!(temp_root.is_dir(), "temp root should exist before process spawn");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(temp_root.as_path())
+                .expect("temp root metadata should resolve")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "process child temp root must be owner-only"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_runner_child_temp_root_rejects_symlinked_components() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-child-temp-symlink");
+        let state_root = unique_temp_dir("state-child-temp-symlink");
+        let outside = unique_temp_dir("outside-child-temp-symlink");
+        fs::create_dir_all(state_root.as_path()).expect("state root should exist");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should exist");
+        symlink(outside.as_path(), state_root.join("process-runner"))
+            .expect("hostile process-runner symlink should be created");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+
+        let error = super::process_runner_child_temp_root(workspace.as_path())
+            .expect_err("symlinked temp-root components must fail closed");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
+        assert!(error.message.contains("symbolic link or reparse point"), "{}", error.message);
+        assert!(!outside.join("tmp").exists(), "symlink target must not be mutated");
     }
 
     #[test]
