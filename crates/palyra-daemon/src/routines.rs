@@ -62,7 +62,7 @@ const MAX_ROUTINE_RUN_METADATA_COUNT: usize = 8_192;
 const MIN_EVERY_INTERVAL_MS: u64 = 30 * 1_000;
 /// Recurring routine schedules below this interval require review before they
 /// can be enabled, even when the caller omits an approval policy.
-pub const MIN_AUTO_ENABLE_EVERY_INTERVAL_MS: u64 = 30_000;
+pub const MIN_AUTO_ENABLE_EVERY_INTERVAL_MS: u64 = 60_000;
 /// Far-future timestamp used as a never-firing `at` schedule placeholder for routines that are
 /// triggered manually or by hooks instead of by the cron clock.
 pub const SHADOW_AT_TIMESTAMP_RFC3339: &str = "2100-01-01T00:00:00Z";
@@ -4216,6 +4216,19 @@ mod tests {
 
         assert!(schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
 
+        let guarded = routine_approval_policy_with_auto_enable_guard(
+            CronScheduleType::Every,
+            payload.as_str(),
+            RoutineApprovalPolicy::default(),
+        );
+        assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
+    }
+
+    #[test]
+    fn schedule_auto_enable_guard_covers_scheduler_minimum_interval() {
+        let payload = json!({ "interval_ms": 30_000_u64 }).to_string();
+
+        assert!(schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
         let guarded = routine_approval_policy_with_auto_enable_guard(
             CronScheduleType::Every,
             payload.as_str(),
