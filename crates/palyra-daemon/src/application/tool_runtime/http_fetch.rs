@@ -1287,6 +1287,8 @@ fn normalize_html_text(text: &str) -> String {
     text.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
+const MAX_BASIC_HTML_ENTITY_BYTES: usize = 32;
+
 fn decode_basic_html_entities(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut index = 0_usize;
@@ -1299,20 +1301,17 @@ fn decode_basic_html_entities(text: &str) -> String {
         let ampersand = index.saturating_add(relative_ampersand);
         output.push_str(&text[index..ampersand]);
         let entity_start = ampersand.saturating_add(1);
-        let Some(relative_semicolon) = text[entity_start..].find(';') else {
+        let search_end =
+            entity_start.saturating_add(MAX_BASIC_HTML_ENTITY_BYTES + 1).min(text.len());
+        let Some(relative_semicolon) =
+            text.as_bytes()[entity_start..search_end].iter().position(|byte| *byte == b';')
+        else {
             output.push('&');
             index = entity_start;
             continue;
         };
         let semicolon = entity_start.saturating_add(relative_semicolon);
         let entity = &text[entity_start..semicolon];
-        // Real entities are short; a distant stray ';' would otherwise make
-        // this swallow a long span of legitimate text as one bogus entity.
-        if entity.len() > 32 {
-            output.push('&');
-            index = entity_start;
-            continue;
-        }
         if let Some(decoded) = decode_basic_html_entity(entity) {
             output.push_str(decoded.as_str());
         } else {
@@ -1435,8 +1434,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        export_http_fetch_body, http_fetch_model_body_text, parse_credential_bindings,
-        redacted_http_headers,
+        decode_basic_html_entities, export_http_fetch_body, http_fetch_model_body_text,
+        parse_credential_bindings, redacted_http_headers,
     };
 
     #[test]
@@ -1504,6 +1503,13 @@ mod tests {
         assert!(!model_body.body_text.contains("Preload bundle"));
         assert!(!model_body.body_text.contains("window.__BOOT"));
         assert!(!model_body.body_text.contains("display: grid"));
+    }
+
+    #[test]
+    fn html_entity_decode_is_linear_for_unterminated_ampersands() {
+        let malformed = format!("{};tail", "&".repeat(64 * 1024));
+
+        assert_eq!(decode_basic_html_entities(malformed.as_str()), malformed);
     }
 
     #[test]
