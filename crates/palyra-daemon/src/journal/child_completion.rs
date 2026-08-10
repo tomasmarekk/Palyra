@@ -9,6 +9,7 @@ const CHILD_COMPLETION_SCAN_LIMIT: i64 = 256;
 const CHILD_COMPLETION_SUMMARY_BYTES: usize = 2_048;
 const CHILD_COMPLETION_RESULT_BYTES: usize = 16 * 1_024;
 const CHILD_COMPLETION_REF_LIMIT: usize = 32;
+const CHILD_COMPLETION_REF_FIELD_BYTES: usize = 512;
 const CHILD_COMPLETION_MAX_NESTING_DEPTH: usize = 32;
 const CHILD_COMPLETION_MAX_DESCENDANT_SESSIONS: usize = 256;
 
@@ -594,14 +595,22 @@ fn bounded_reference_array(value: &Value) -> Value {
             .iter()
             .take(CHILD_COMPLETION_REF_LIMIT)
             .filter_map(|item| match item {
-                Value::String(reference) => Some(Value::String(truncate_utf8(reference, 512))),
+                Value::String(reference) => {
+                    Some(Value::String(truncate_utf8(reference, CHILD_COMPLETION_REF_FIELD_BYTES)))
+                }
                 Value::Object(object) => {
                     let mut bounded = serde_json::Map::new();
                     for key in
                         ["artifact_id", "reference", "path", "media_type", "sha256", "evidence_id"]
                     {
-                        if let Some(value) = object.get(key) {
-                            bounded.insert(key.to_owned(), value.clone());
+                        if let Some(value) = object.get(key).and_then(Value::as_str) {
+                            bounded.insert(
+                                key.to_owned(),
+                                Value::String(truncate_utf8(
+                                    value,
+                                    CHILD_COMPLETION_REF_FIELD_BYTES,
+                                )),
+                            );
                         }
                     }
                     (!bounded.is_empty()).then_some(Value::Object(bounded))

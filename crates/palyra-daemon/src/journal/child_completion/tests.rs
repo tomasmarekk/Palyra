@@ -181,6 +181,30 @@ fn successful_result() -> Value {
 }
 
 #[test]
+fn reference_objects_bound_every_selected_field() {
+    let oversized = "x".repeat(CHILD_COMPLETION_REF_FIELD_BYTES * 4);
+    let bounded = bounded_reference_array(&json!([{
+        "artifact_id": oversized,
+        "path": ["nested", "values"],
+        "evidence_id": 42,
+        "ignored": "not projected"
+    }]));
+    let object = bounded
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+        .expect("one bounded reference object should remain");
+
+    assert_eq!(
+        object.get("artifact_id").and_then(Value::as_str).map(str::len),
+        Some(CHILD_COMPLETION_REF_FIELD_BYTES)
+    );
+    assert!(!object.contains_key("path"));
+    assert!(!object.contains_key("evidence_id"));
+    assert!(!object.contains_key("ignored"));
+}
+
+#[test]
 fn terminal_commit_delivers_once_across_restart() {
     let fixture = fixture();
     complete(&fixture, successful_result());
