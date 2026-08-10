@@ -3763,6 +3763,12 @@ fn sanitize_public_event_for_compat_stream(public_event: &Value) -> Value {
             }
             Some("tool.call.completed") => {
                 payload.insert("output_json".to_owned(), json!({ "visibility": "artifact_ref" }));
+                if let Some(error) = payload.get_mut("error") {
+                    *error = error
+                        .as_str()
+                        .map(sanitize_http_error_message)
+                        .map_or(Value::Null, Value::String);
+                }
             }
             Some("approval.required") => {
                 payload.insert("input_json".to_owned(), json!({ "visibility": "withheld" }));
@@ -6333,14 +6339,14 @@ mod tests {
             "payload": {
                 "success": true,
                 "output_json": { "secret": "sk-test-secret" },
-                "error": ""
+                "error": "Authorization: Bearer sk-error-secret"
             }
         });
         let result = common_v1::ToolResult {
             proposal_id: Some(common_v1::CanonicalId { ulid: "tool_01".to_owned() }),
             success: true,
             output_json: br#"{"secret":"sk-test-secret"}"#.to_vec(),
-            error: String::new(),
+            error: "Authorization: Bearer sk-error-secret".to_owned(),
         };
 
         let payload = build_compat_responses_tool_result_stream_payload(
@@ -6369,8 +6375,8 @@ mod tests {
             Some("artifact_ref")
         );
         assert!(
-            !encoded.contains("sk-test-secret"),
-            "Responses SSE tool result payload must not contain raw tool output: {encoded}"
+            !encoded.contains("sk-test-secret") && !encoded.contains("sk-error-secret"),
+            "Responses SSE tool result payload must not contain raw tool output or error: {encoded}"
         );
     }
 
