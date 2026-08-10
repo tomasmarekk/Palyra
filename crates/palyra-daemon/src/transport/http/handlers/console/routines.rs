@@ -59,6 +59,7 @@ const DEFAULT_ROUTINE_PAGE_LIMIT: usize = 100;
 const MAX_ROUTINE_PAGE_LIMIT: usize = 500;
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
+const ROUTINE_APPROVAL_POLICY_ID: &str = "routine.approval.v1";
 const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
@@ -422,13 +423,8 @@ pub(crate) async fn console_routine_import_handler(
     );
     // Before-enable approvals gate activation, not persistence: the routine is
     // stored disabled and re-enabled later by apply_routine_approval_decision.
-    let approval_required = requested_enabled
-        && approval_policy.mode == RoutineApprovalMode::BeforeEnable
-        && !routine_approval_granted(
-            &state,
-            routine_approval_subject_id(routine_id.as_str(), RoutineApprovalMode::BeforeEnable),
-        )
-        .await?;
+    let approval_required =
+        requested_enabled && approval_policy.mode == RoutineApprovalMode::BeforeEnable;
     let effective_enabled = requested_enabled && !approval_required;
     require_routines_automation_enabled_for_write(&state, effective_enabled)?;
     let job_record = persist_routine_job(
@@ -598,13 +594,7 @@ pub(crate) async fn console_routine_upsert_handler(
     let misfire_policy = parse_misfire_policy(payload.misfire_policy.as_deref())?;
     // Before-enable approvals gate activation, not persistence: the routine is
     // stored disabled and re-enabled later by apply_routine_approval_decision.
-    let approval_required = enabled
-        && approval_policy.mode == RoutineApprovalMode::BeforeEnable
-        && !routine_approval_granted(
-            &state,
-            routine_approval_subject_id(routine_id.as_str(), RoutineApprovalMode::BeforeEnable),
-        )
-        .await?;
+    let approval_required = enabled && approval_policy.mode == RoutineApprovalMode::BeforeEnable;
     let effective_enabled = enabled && !approval_required;
     require_routines_automation_enabled_for_write(&state, effective_enabled)?;
     let job_record = persist_routine_job(
@@ -750,15 +740,8 @@ pub(crate) async fn console_routine_set_enabled_handler(
         upsert_routine_metadata_approval_policy(&state, &routine.metadata, approval_policy.clone())?
     };
     let approval_required = payload.enabled
-        && approval_policy.mode == RoutineApprovalMode::BeforeEnable
-        && !routine_approval_granted(
-            &state,
-            routine_approval_subject_id(
-                metadata.routine_id.as_str(),
-                RoutineApprovalMode::BeforeEnable,
-            ),
-        )
-        .await?;
+        && !routine.job.enabled
+        && approval_policy.mode == RoutineApprovalMode::BeforeEnable;
     let effective_enabled = payload.enabled && !approval_required;
     require_routines_automation_enabled_for_write(&state, effective_enabled)?;
     let next_run_at_unix_ms = cron::next_run_at_for_enabled_state(
@@ -787,7 +770,7 @@ pub(crate) async fn console_routine_set_enabled_handler(
                 ensure_routine_approval_requested(
                     &state,
                     session.context.principal.as_str(),
-                    session.context.channel.as_deref(),
+                    Some(updated.channel.as_str()),
                     &updated,
                     &metadata,
                     RoutineApprovalMode::BeforeEnable,
@@ -1580,13 +1563,20 @@ fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> S
 
 fn parse_routine_approval_subject(subject_id: &str) -> Option<(String, RoutineApprovalMode)> {
     let (routine_id, mode) = subject_id.strip_prefix("routine:")?.rsplit_once(':')?;
-    if routine_id.trim().is_empty() {
+    if validate_canonical_id(routine_id).is_err() {
         return None;
     }
     Some((routine_id.to_owned(), RoutineApprovalMode::from_str(mode)?))
 }
 
-async fn routine_approval_granted(state: &AppState, subject_id: String) -> Result<bool, Response> {
+async fn routine_approval_granted(
+    state: &AppState,
+    principal: &str,
+    job: &CronJobRecord,
+    metadata: &RoutineMetadataRecord,
+    mode: RoutineApprovalMode,
+) -> Result<bool, Response> {
+    let subject_id = routine_approval_subject_id(metadata.routine_id.as_str(), mode);
     let (approvals, _) = state
         .runtime
         .list_approval_records(
@@ -1595,15 +1585,81 @@ async fn routine_approval_granted(state: &AppState, subject_id: String) -> Resul
             None,
             None,
             Some(subject_id),
-            None,
+            Some(principal.to_owned()),
             Some(ApprovalDecision::Allow),
             Some(ApprovalSubjectType::Tool),
         )
         .await
         .map_err(runtime_status_response)?;
-    Ok(approvals
-        .into_iter()
-        .any(|approval| matches!(approval.decision, Some(ApprovalDecision::Allow))))
+    Ok(approvals.into_iter().any(|approval| {
+        matches!(approval.decision, Some(ApprovalDecision::Allow))
+            && routine_approval_matches_definition(&approval, principal, job, metadata, mode)
+    }))
+}
+
+fn routine_approval_details_json(
+    job: &CronJobRecord,
+    metadata: &RoutineMetadataRecord,
+    mode: RoutineApprovalMode,
+) -> String {
+    json!({
+        "routine_id": metadata.routine_id.as_str(),
+        "name": job.name.as_str(),
+        "approval_mode": mode.as_str(),
+        "trigger_kind": metadata.trigger_kind.as_str(),
+        "workdir": job.workdir.as_deref(),
+        "run_mode": metadata.execution.run_mode.as_str(),
+        "execution_posture": metadata.execution.execution_posture.as_str(),
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution, &metadata.approval_policy),
+        "procedure_profile_id": metadata.execution.procedure_profile_id.as_deref(),
+        "skill_profile_id": metadata.execution.skill_profile_id.as_deref(),
+        "provider_profile_id": metadata.execution.provider_profile_id.as_deref(),
+        "delivery_mode": metadata.delivery.mode.as_str(),
+        "channel": job.channel.as_str(),
+        "template_id": metadata.template_id.as_deref(),
+        "definition_sha256": routine_approval_definition_hash(job, metadata),
+    })
+    .to_string()
+}
+
+fn routine_approval_definition_hash(
+    job: &CronJobRecord,
+    metadata: &RoutineMetadataRecord,
+) -> String {
+    let definition = json!({
+        "job": {
+            "job_id": job.job_id.as_str(),
+            "name": job.name.as_str(),
+            "prompt": job.prompt.as_str(),
+            "owner_principal": job.owner_principal.as_str(),
+            "channel": job.channel.as_str(),
+            "session_key": job.session_key.as_deref(),
+            "session_label": job.session_label.as_deref(),
+            "workdir": job.workdir.as_deref(),
+            "schedule_type": job.schedule_type,
+            "schedule_payload_json": job.schedule_payload_json.as_str(),
+            "concurrency_policy": job.concurrency_policy,
+            "retry_policy": &job.retry_policy,
+            "misfire_policy": job.misfire_policy,
+            "jitter_ms": job.jitter_ms,
+        },
+        "metadata": {
+            "routine_id": metadata.routine_id.as_str(),
+            "trigger_kind": metadata.trigger_kind,
+            "trigger_payload_json": metadata.trigger_payload_json.as_str(),
+            "execution": &metadata.execution,
+            "delivery": &metadata.delivery,
+            "quiet_hours": &metadata.quiet_hours,
+            "cooldown_ms": metadata.cooldown_ms,
+            "approval_policy": &metadata.approval_policy,
+            "template_id": metadata.template_id.as_deref(),
+        },
+    });
+    hex::encode(Sha256::digest(definition.to_string().as_bytes()))
+}
+
+fn routine_approval_policy_hash(details_json: &str) -> String {
+    hex::encode(Sha256::digest(details_json.as_bytes()))
 }
 
 // Returns the existing undecided approval for this routine/mode if one is
@@ -1632,11 +1688,11 @@ async fn ensure_routine_approval_requested(
         )
         .await
         .map_err(runtime_status_response)?;
-    if let Some(approval) = existing
-        .into_iter()
-        .rev()
-        .find(|approval| approval.subject_id == subject_id && approval.decision.is_none())
-    {
+    if let Some(approval) = existing.into_iter().rev().find(|approval| {
+        approval.subject_id == subject_id
+            && approval.decision.is_none()
+            && routine_approval_matches_definition(approval, principal, job, metadata, mode)
+    }) {
         return serde_json::to_value(approval).map_err(|error| {
             runtime_status_response(tonic::Status::internal(format!(
                 "failed to serialize routine approval record: {error}"
@@ -1644,23 +1700,7 @@ async fn ensure_routine_approval_requested(
         });
     }
 
-    let details_json = json!({
-        "routine_id": metadata.routine_id.as_str(),
-        "name": job.name.as_str(),
-        "approval_mode": mode.as_str(),
-        "trigger_kind": metadata.trigger_kind.as_str(),
-        "workdir": job.workdir.as_deref(),
-        "run_mode": metadata.execution.run_mode.as_str(),
-        "execution_posture": metadata.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution, &metadata.approval_policy),
-        "procedure_profile_id": metadata.execution.procedure_profile_id.as_deref(),
-        "skill_profile_id": metadata.execution.skill_profile_id.as_deref(),
-        "provider_profile_id": metadata.execution.provider_profile_id.as_deref(),
-        "delivery_mode": metadata.delivery.mode.as_str(),
-        "channel": job.channel.as_str(),
-        "template_id": metadata.template_id.as_deref(),
-    })
-    .to_string();
+    let details_json = routine_approval_details_json(job, metadata, mode);
     let prompt = ApprovalPromptRecord {
         title: format!("Approve routine {}", job.name),
         risk_level: ApprovalRiskLevel::High,
@@ -1696,7 +1736,7 @@ async fn ensure_routine_approval_requested(
             "Routine approvals are explicit operator gates for sensitive automation activation."
                 .to_owned(),
     };
-    let policy_hash = hex::encode(Sha256::digest(details_json.as_bytes()));
+    let policy_hash = routine_approval_policy_hash(details_json.as_str());
     let record = state
         .runtime
         .create_approval_record(ApprovalCreateRequest {
@@ -1716,7 +1756,7 @@ async fn ensure_routine_approval_requested(
                 metadata.execution.execution_posture.as_str()
             ),
             policy_snapshot: ApprovalPolicySnapshot {
-                policy_id: "routine.approval.v1".to_owned(),
+                policy_id: ROUTINE_APPROVAL_POLICY_ID.to_owned(),
                 policy_hash,
                 evaluation_summary: format!(
                     "routine approval required mode={} trigger={} execution_posture={} delivery={}",
@@ -1741,8 +1781,9 @@ async fn ensure_routine_approval_requested(
 /// approval record is mutated.
 ///
 /// # Errors
-/// Returns permission-denied when the approval principal or routine owner does
-/// not match the authenticated console principal, or a mapped runtime error.
+/// Returns permission-denied when the approval provenance does not match the
+/// authenticated owner and current routine definition, or a mapped runtime
+/// error.
 pub(crate) async fn authorize_routine_approval_decision(
     state: &AppState,
     approval: &ApprovalRecord,
@@ -1754,8 +1795,8 @@ pub(crate) async fn authorize_routine_approval_decision(
     let Some((routine_id, _)) = parse_routine_approval_subject(approval.subject_id.as_str()) else {
         return Ok(());
     };
-    ensure_routine_approval_principal(approval, principal)?;
-    ensure_routine_approval_job_owner(state, routine_id.as_str(), principal).await
+    let routine = load_routine_parts_for_owner(state, routine_id.as_str(), principal).await?;
+    ensure_routine_approval_matches_definition(approval, principal, &routine.job, &routine.metadata)
 }
 
 /// Applies the side effect of an allowed routine approval: re-enables a
@@ -1766,9 +1807,10 @@ pub(crate) async fn authorize_routine_approval_decision(
 /// non-tool subjects, or foreign subject ids).
 ///
 /// # Errors
-/// Returns permission-denied when the approval principal or routine owner does
-/// not match the authenticated console principal, when the routines automation
-/// feature flag is disabled, or when a runtime/registry operation fails.
+/// Returns permission-denied when the approval provenance does not match the
+/// authenticated owner and current routine definition, when the routines
+/// automation feature flag is disabled, or when a runtime/registry operation
+/// fails.
 pub(crate) async fn apply_routine_approval_decision(
     state: &AppState,
     approval: &ApprovalRecord,
@@ -1783,58 +1825,72 @@ pub(crate) async fn apply_routine_approval_decision(
     else {
         return Ok(None);
     };
-    ensure_routine_approval_principal(approval, principal)?;
+    let routine = load_routine_parts_for_owner(state, routine_id.as_str(), principal).await?;
+    ensure_routine_approval_matches_definition(
+        approval,
+        principal,
+        &routine.job,
+        &routine.metadata,
+    )?;
     match mode {
         RoutineApprovalMode::BeforeEnable => {
-            apply_before_enable_routine_approval(state, routine_id.as_str(), principal).await
+            apply_before_enable_routine_approval(state, &routine.job).await
         }
         RoutineApprovalMode::BeforeFirstRun => {
-            apply_before_first_run_routine_approval(state, routine_id.as_str(), principal).await
+            apply_before_first_run_routine_approval(state, &routine.job).await
         }
         RoutineApprovalMode::None => Ok(None),
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn ensure_routine_approval_principal(
+fn routine_approval_matches_definition(
     approval: &ApprovalRecord,
     principal: &str,
+    job: &CronJobRecord,
+    metadata: &RoutineMetadataRecord,
+    mode: RoutineApprovalMode,
+) -> bool {
+    let subject_id = routine_approval_subject_id(metadata.routine_id.as_str(), mode);
+    let details_json = routine_approval_details_json(job, metadata, mode);
+    let policy_hash = routine_approval_policy_hash(details_json.as_str());
+    approval.subject_type == ApprovalSubjectType::Tool
+        && approval.subject_id == subject_id
+        && approval.prompt.subject_id == subject_id
+        && approval.principal == principal
+        && approval.device_id == ROUTINE_APPROVAL_DEVICE_ID
+        && approval.channel.as_deref() == Some(job.channel.as_str())
+        && job.owner_principal == principal
+        && job.job_id == metadata.routine_id
+        && metadata.approval_policy.mode == mode
+        && approval.policy_snapshot.policy_id == ROUTINE_APPROVAL_POLICY_ID
+        && approval.policy_snapshot.policy_hash == policy_hash
+        && approval.prompt.details_json == details_json
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_routine_approval_matches_definition(
+    approval: &ApprovalRecord,
+    principal: &str,
+    job: &CronJobRecord,
+    metadata: &RoutineMetadataRecord,
 ) -> Result<(), Response> {
-    if approval.principal != principal {
+    let Some((_, mode)) = parse_routine_approval_subject(approval.subject_id.as_str()) else {
         return Err(runtime_status_response(tonic::Status::permission_denied(
-            "routine approval principal mismatch for authenticated principal",
+            "routine approval provenance does not match the current routine definition",
+        )));
+    };
+    if !routine_approval_matches_definition(approval, principal, job, metadata, mode) {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "routine approval provenance does not match the current routine definition",
         )));
     }
     Ok(())
 }
 
-async fn ensure_routine_approval_job_owner(
-    state: &AppState,
-    routine_id: &str,
-    principal: &str,
-) -> Result<(), Response> {
-    let Some(job) =
-        state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
-    else {
-        return Ok(());
-    };
-    ensure_job_owner(&job, principal)
-}
-
 async fn apply_before_enable_routine_approval(
     state: &AppState,
-    routine_id: &str,
-    principal: &str,
+    job: &CronJobRecord,
 ) -> Result<Option<Value>, Response> {
-    let Some(job) =
-        state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
-    else {
-        return Ok(Some(json!({
-            "action": "missing_routine",
-            "routine_id": routine_id,
-        })));
-    };
-    ensure_job_owner(&job, principal)?;
     require_routines_automation_enabled_for_write(state, true)?;
     let next_run_at_unix_ms = cron::next_run_at_for_enabled_state(
         &job,
@@ -1861,18 +1917,8 @@ async fn apply_before_enable_routine_approval(
 
 async fn apply_before_first_run_routine_approval(
     state: &AppState,
-    routine_id: &str,
-    principal: &str,
+    job: &CronJobRecord,
 ) -> Result<Option<Value>, Response> {
-    let Some(job) =
-        state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
-    else {
-        return Ok(Some(json!({
-            "action": "missing_routine",
-            "routine_id": routine_id,
-        })));
-    };
-    ensure_job_owner(&job, principal)?;
     if !job.enabled {
         return routine_approval_apply_outcome(state, "routine_disabled", &job);
     }
@@ -2071,10 +2117,10 @@ async fn dispatch_single_routine(
     if routine.metadata.approval_policy.mode == RoutineApprovalMode::BeforeFirstRun
         && !routine_approval_granted(
             state,
-            routine_approval_subject_id(
-                routine.metadata.routine_id.as_str(),
-                RoutineApprovalMode::BeforeFirstRun,
-            ),
+            principal,
+            &routine.job,
+            &routine.metadata,
+            RoutineApprovalMode::BeforeFirstRun,
         )
         .await?
     {
@@ -3340,14 +3386,20 @@ mod tests {
         compare_optional_matchers, is_in_quiet_hours, normalize_channel,
         output_delivered_for_outcome, parse_delivery, parse_execution_config,
         parse_optional_schedule_timezone_mode, parse_quiet_hours, parse_routine_approval_subject,
-        parse_timezone_mode, routine_approval_subject_id,
+        parse_timezone_mode, routine_approval_details_json, routine_approval_matches_definition,
+        routine_approval_policy_hash, routine_approval_subject_id,
         routine_automation_flag_permits_enabled_write, routine_cooldown_deadline_is_after,
         routine_matches_trigger, routine_output_fields_from_session,
         routine_output_text_from_tape_events, routine_run_allows_output_preview,
         routine_troubleshooting_recommended_action,
     };
     use crate::cron::CronTimezoneMode;
-    use crate::journal::{CronScheduleType, OrchestratorSessionRecord, OrchestratorTapeRecord};
+    use crate::journal::{
+        ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptRecord,
+        ApprovalRecord, ApprovalRiskLevel, ApprovalSubjectType, CronConcurrencyPolicy,
+        CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronScheduleType,
+        OrchestratorSessionRecord, OrchestratorTapeRecord,
+    };
     use crate::routines::{
         RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
         RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode,
@@ -3447,6 +3499,105 @@ mod tests {
             Some((routine_id.to_owned(), RoutineApprovalMode::BeforeFirstRun))
         );
         assert_eq!(parse_routine_approval_subject("tool:other"), None);
+        assert_eq!(parse_routine_approval_subject("routine:not-a-ulid:before_enable"), None);
+    }
+
+    #[test]
+    fn routine_approval_requires_host_provenance_and_current_definition_hash() {
+        let routine_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let principal = "user:ops";
+        let mode = RoutineApprovalMode::BeforeEnable;
+        let job = CronJobRecord {
+            job_id: routine_id.to_owned(),
+            name: "health-check".to_owned(),
+            prompt: "check health".to_owned(),
+            owner_principal: principal.to_owned(),
+            channel: "system:routines".to_owned(),
+            session_key: None,
+            session_label: None,
+            workdir: None,
+            schedule_type: CronScheduleType::Every,
+            schedule_payload_json: json!({ "interval_ms": 60_000_u64 }).to_string(),
+            enabled: false,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1_000 },
+            misfire_policy: CronMisfirePolicy::Skip,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let metadata = RoutineMetadataRecord {
+            routine_id: routine_id.to_owned(),
+            trigger_kind: RoutineTriggerKind::Schedule,
+            trigger_payload_json: json!({}).to_string(),
+            execution: RoutineExecutionConfig::default(),
+            delivery: RoutineDeliveryConfig::default(),
+            quiet_hours: None,
+            cooldown_ms: 0,
+            approval_policy: RoutineApprovalPolicy { mode },
+            template_id: None,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let subject_id = routine_approval_subject_id(routine_id, mode);
+        let details_json = routine_approval_details_json(&job, &metadata, mode);
+        let approval = ApprovalRecord {
+            approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAY".to_owned(),
+            principal: principal.to_owned(),
+            device_id: super::ROUTINE_APPROVAL_DEVICE_ID.to_owned(),
+            channel: Some(job.channel.clone()),
+            requested_at_unix_ms: 0,
+            resolved_at_unix_ms: Some(1),
+            subject_type: ApprovalSubjectType::Tool,
+            subject_id: subject_id.clone(),
+            request_summary: "routine approval".to_owned(),
+            decision: Some(ApprovalDecision::Allow),
+            decision_scope: Some(ApprovalDecisionScope::Once),
+            decision_reason: Some("approved".to_owned()),
+            decision_scope_ttl_ms: None,
+            policy_snapshot: ApprovalPolicySnapshot {
+                policy_id: super::ROUTINE_APPROVAL_POLICY_ID.to_owned(),
+                policy_hash: routine_approval_policy_hash(details_json.as_str()),
+                evaluation_summary: "routine approval required".to_owned(),
+            },
+            prompt: ApprovalPromptRecord {
+                title: "Approve routine".to_owned(),
+                risk_level: ApprovalRiskLevel::High,
+                subject_id,
+                summary: "Approve routine".to_owned(),
+                options: Vec::new(),
+                timeout_seconds: 900,
+                details_json,
+                policy_explanation: "Routine approval".to_owned(),
+            },
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 1,
+        };
+
+        assert!(routine_approval_matches_definition(&approval, principal, &job, &metadata, mode));
+
+        let mut forged = approval.clone();
+        forged.device_id = "acp-client".to_owned();
+        assert!(!routine_approval_matches_definition(&forged, principal, &job, &metadata, mode));
+
+        let mut stale = metadata.clone();
+        stale.execution.execution_posture = RoutineExecutionPosture::SensitiveTools;
+        assert!(!routine_approval_matches_definition(&approval, principal, &job, &stale, mode));
+
+        let mut changed_job = job.clone();
+        changed_job.prompt = "run a different task".to_owned();
+        assert!(!routine_approval_matches_definition(
+            &approval,
+            principal,
+            &changed_job,
+            &metadata,
+            mode
+        ));
     }
 
     #[test]
