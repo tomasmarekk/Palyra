@@ -102,7 +102,7 @@ pub(super) fn build_test_control_center(root: &Path) -> ControlCenter {
         active_profile,
         profile_catalog,
         admin_token: runtime_secret_fallbacks.admin_token.clone(),
-        admin_bound_principal: Some(CONSOLE_PRINCIPAL.to_owned()),
+        admin_bound_principal: CONSOLE_PRINCIPAL.to_owned(),
         browser_auth_token: runtime_secret_fallbacks.browser_auth_token.clone(),
         browser_state_encryption_key: Some(
             BrowserStateEncryptionKey::parse(

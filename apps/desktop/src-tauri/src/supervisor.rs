@@ -269,7 +269,7 @@ pub(crate) struct ControlCenter {
     pub(crate) profile_catalog: DesktopProfileCatalog,
     pub(crate) runtime_secret_fallbacks: DesktopRuntimeSecrets,
     pub(crate) admin_token: String,
-    pub(crate) admin_bound_principal: Option<String>,
+    pub(crate) admin_bound_principal: String,
     pub(crate) browser_auth_token: String,
     pub(crate) browser_state_encryption_key: Option<BrowserStateEncryptionKey>,
     pub(crate) runtime: RuntimeConfig,
@@ -369,7 +369,6 @@ struct ConfigRuntimeTokenOverrides {
     admin_bound_principal: Option<String>,
     browser_auth_token: Option<String>,
     browser_state_encryption_key: Option<BrowserStateEncryptionKey>,
-    config_file_present: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -384,7 +383,7 @@ struct ConfigRuntimePortOverrides {
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopRuntimeAuthConfig {
     admin_token: String,
-    admin_bound_principal: Option<String>,
+    admin_bound_principal: String,
     browser_auth_token: String,
     browser_state_encryption_key: Option<BrowserStateEncryptionKey>,
 }
@@ -418,9 +417,8 @@ fn runtime_auth_with_config_overrides(
     config_path: Option<&Path>,
 ) -> Result<DesktopRuntimeAuthConfig> {
     let overrides = config_runtime_token_overrides(config_path)?;
-    let admin_bound_principal = overrides
-        .admin_bound_principal
-        .or_else(|| (!overrides.config_file_present).then(|| CONSOLE_PRINCIPAL.to_owned()));
+    let admin_bound_principal =
+        overrides.admin_bound_principal.unwrap_or_else(|| CONSOLE_PRINCIPAL.to_owned());
     Ok(DesktopRuntimeAuthConfig {
         admin_token: overrides.admin_token.unwrap_or_else(|| fallback.admin_token.clone()),
         admin_bound_principal,
@@ -514,7 +512,6 @@ fn config_runtime_token_overrides(
             &document,
             config_path.parent(),
         )?,
-        config_file_present: true,
     })
 }
 
@@ -1561,10 +1558,11 @@ impl ControlCenter {
 
     fn gateway_env(&self) -> Vec<(String, String)> {
         let browser_enabled = self.persisted.browser_service_enabled;
-        let mut env = vec![
+        vec![
             ("PALYRA_DEPLOYMENT_MODE".to_owned(), "local_desktop".to_owned()),
             ("PALYRA_ADMIN_REQUIRE_AUTH".to_owned(), "true".to_owned()),
             ("PALYRA_ADMIN_TOKEN".to_owned(), self.admin_token.clone()),
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), self.admin_bound_principal.clone()),
             ("PALYRA_STATE_ROOT".to_owned(), self.runtime_root.to_string_lossy().into_owned()),
             ("PALYRA_DAEMON_BIND_ADDR".to_owned(), LOOPBACK_HOST.to_owned()),
             ("PALYRA_DAEMON_PORT".to_owned(), self.runtime.gateway_admin_port.to_string()),
@@ -1578,11 +1576,7 @@ impl ControlCenter {
                 format!("http://{LOOPBACK_HOST}:{}", self.runtime.browser_grpc_port),
             ),
             ("PALYRA_BROWSER_SERVICE_AUTH_TOKEN".to_owned(), self.browser_auth_token.clone()),
-        ];
-        if let Some(principal) = self.admin_bound_principal.as_deref() {
-            env.push(("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), principal.to_owned()));
-        }
-        env
+        ]
     }
 
     fn browserd_env(&self) -> Vec<(String, String)> {
@@ -2313,7 +2307,7 @@ bound_principal = "admin:local"
             .expect("config auth overrides should load");
 
         assert_eq!(effective.admin_token, "config-admin-token");
-        assert_eq!(effective.admin_bound_principal.as_deref(), Some("admin:local"));
+        assert_eq!(effective.admin_bound_principal, "admin:local");
         assert_eq!(effective.browser_auth_token, "desktop-browser-token");
         assert_eq!(
             effective.browser_state_encryption_key.as_ref().map(|key| key.as_str()),
@@ -2338,12 +2332,37 @@ bound_principal = "admin:local"
             .expect("fallback auth should load");
 
         assert_eq!(effective.admin_token, "desktop-admin-token");
-        assert_eq!(effective.admin_bound_principal.as_deref(), Some(super::CONSOLE_PRINCIPAL));
+        assert_eq!(effective.admin_bound_principal, super::CONSOLE_PRINCIPAL);
         assert_eq!(effective.browser_auth_token, "desktop-browser-token");
         assert_eq!(
             effective.browser_state_encryption_key.as_ref().map(|key| key.as_str()),
             Some(TEST_BROWSER_STATE_KEY)
         );
+        let _ = fs::remove_dir_all(fixture.as_path());
+    }
+
+    #[test]
+    fn runtime_auth_with_existing_config_keeps_desktop_principal_binding() {
+        let fixture =
+            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::new()));
+        fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
+        let config_path = fixture.join("palyra.toml");
+        fs::write(
+            config_path.as_path(),
+            "version = 1\n\n[admin]\nauth_token = \"config-admin-token\"\n",
+        )
+        .expect("config fixture should be written");
+        let fallback = DesktopRuntimeSecrets {
+            admin_token: "desktop-admin-token".to_owned(),
+            browser_auth_token: "desktop-browser-token".to_owned(),
+            browser_state_encryption_key: TEST_BROWSER_STATE_KEY.to_owned(),
+        };
+
+        let effective = runtime_auth_with_config_overrides(&fallback, Some(config_path.as_path()))
+            .expect("config auth overrides should load");
+
+        assert_eq!(effective.admin_token, "config-admin-token");
+        assert_eq!(effective.admin_bound_principal, super::CONSOLE_PRINCIPAL);
         let _ = fs::remove_dir_all(fixture.as_path());
     }
 
