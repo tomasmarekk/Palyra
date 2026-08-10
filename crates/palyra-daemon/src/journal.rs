@@ -270,6 +270,8 @@ const CURRENT_WORKSPACE_TEMPLATE_VERSION: i64 = 1;
 const MAX_WORKSPACE_DOCUMENT_LIST_LIMIT: usize = 256;
 const MAX_WORKSPACE_SEARCH_CANDIDATES: usize = 256;
 const MAX_WORKSPACE_VECTOR_SCAN_CANDIDATES: usize = 1_024;
+/// Maximum task-list page, including the scheduler's saturation sentinel.
+pub(crate) const ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX: usize = 257;
 const WORKSPACE_CHUNK_TARGET_BYTES: usize = 1_024;
 const WORKSPACE_CHUNK_OVERLAP_BYTES: usize = 160;
 const MAX_TOOL_JOBS_LIST_LIMIT: usize = 500;
@@ -19394,7 +19396,9 @@ impl JournalStore {
         filter: &OrchestratorBackgroundTaskListFilter,
     ) -> Result<Vec<OrchestratorBackgroundTaskRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let limit = filter.limit.clamp(1, 256) as i64;
+        // The background scheduler requests one row beyond its 256-task
+        // processing window so saturation is detected and fails closed.
+        let limit = filter.limit.clamp(1, ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX) as i64;
         let mut statement = guard.prepare(
             r#"
                 SELECT

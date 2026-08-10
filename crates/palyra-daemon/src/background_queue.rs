@@ -74,7 +74,7 @@ use crate::{
         OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
         OrchestratorBackgroundTaskWorkerUpdateRequest, OrchestratorParentGenerationGuard,
         OrchestratorRunMetadataUpdateRequest, OrchestratorTapeAppendRequest,
-        RuntimeStaleEventDiagnosticRequest,
+        RuntimeStaleEventDiagnosticRequest, ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX,
     },
     objective_judge::{
         build_objective_judge_prompt_from_payload, invalid_objective_judge_input_result,
@@ -160,7 +160,7 @@ async fn poll_background_queue(
             channel: None,
             session_id: None,
             include_completed: false,
-            limit: 256,
+            limit: ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX,
         })
         .await?;
     // Indexed loop because the snapshot vector is refreshed in place after
@@ -1091,8 +1091,8 @@ enum DelegationSchedulerDecision {
 ///
 /// Structural violations (lineage cycle, max depth, total/per-parent
 /// fan-out) fail closed; capacity pressure (concurrent children, parallel
-/// groups) defers. Counts come from the current poll snapshot, so the
-/// per-task refresh in `poll_background_queue` is what keeps them honest.
+/// groups) defers. The extra snapshot row is a saturation sentinel: if it is
+/// present, no delegation may run against the incomplete scheduler view.
 fn evaluate_delegation_scheduler_limits(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     task: &OrchestratorBackgroundTaskRecord,
@@ -1100,6 +1100,15 @@ fn evaluate_delegation_scheduler_limits(
     let delegation = task.delegation.as_ref()?;
     let parent_run_id = task.parent_run_id.as_deref()?;
     let limits = &delegation.runtime_limits;
+    if all_tasks.len() >= ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX {
+        return Some(DelegationSchedulerDecision::Fail {
+            reason: "scheduler_snapshot_capacity",
+            message: format!(
+                "delegated child cannot be scheduled because the active task snapshot reached {} records",
+                ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX - 1
+            ),
+        });
+    }
     if delegated_lineage_has_cycle(all_tasks, parent_run_id) {
         return Some(DelegationSchedulerDecision::Fail {
             reason: "delegation_cycle",
@@ -4887,6 +4896,43 @@ mod tests {
             }
             DelegationSchedulerDecision::Fail { .. } => {
                 panic!("concurrency pressure should defer, not fail");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_delegation_scheduler_limits_fails_saturated_snapshot() {
+        let limits = DelegationRuntimeLimits {
+            max_concurrent_children: u64::MAX,
+            max_children_per_parent: u64::MAX,
+            max_total_children: u64::MAX,
+            max_parallel_groups: u64::MAX,
+            max_depth: u64::MAX,
+            max_budget_share_bps: 10_000,
+            child_budget_override: None,
+            child_timeout_ms: 60_000,
+        };
+        let tasks = (0..ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX)
+            .map(|index| {
+                sample_task(
+                    format!("task-{index}").as_str(),
+                    AuxiliaryTaskState::Queued.as_str(),
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    "group-a",
+                    limits.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let decision = evaluate_delegation_scheduler_limits(tasks.as_slice(), &tasks[0])
+            .expect("saturated snapshots must fail closed");
+
+        match decision {
+            DelegationSchedulerDecision::Fail { reason, .. } => {
+                assert_eq!(reason, "scheduler_snapshot_capacity");
+            }
+            DelegationSchedulerDecision::Defer { .. } => {
+                panic!("an incomplete scheduler snapshot must not defer indefinitely");
             }
         }
     }
