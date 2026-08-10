@@ -480,7 +480,10 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         | "palyra.mcp.prompts.get" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
-        "palyra.memory.status" | "palyra.context.inspect" => {
+        "palyra.memory.status" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.context.inspect" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.memory.search" => {
@@ -790,8 +793,8 @@ mod tests {
     }
 
     #[test]
-    fn memory_status_is_read_only_without_approval() {
-        assert!(!tool_requires_approval("palyra.memory.status"));
+    fn runtime_wide_memory_status_requires_approval() {
+        assert!(tool_requires_approval("palyra.memory.status"));
         assert!(tool_policy_capability_names("palyra.memory.status").is_empty());
         assert!(!tool_requires_approval("palyra.context.inspect"));
         assert!(tool_policy_capability_names("palyra.context.inspect").is_empty());
