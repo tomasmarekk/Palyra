@@ -1410,10 +1410,22 @@ impl TrustedEndpointRegistry {
         policy: &TrustedEndpointPolicy,
     ) -> Result<TrustedEndpointRecord, TrustedEndpointError> {
         validate_trusted_endpoint_record(&record)?;
-        if !policy.allow_trust_on_first_use_without_approval
-            && matches!(record.trust_state, TrustedEndpointTrustState::Unknown)
-        {
+        let existing = self.endpoints.get(record.endpoint_id.as_str());
+        let identity_changed = existing.is_some_and(|existing| {
+            existing.identity_digest_sha256 != record.identity_digest_sha256
+        });
+        if identity_changed {
             record.trust_state = TrustedEndpointTrustState::PendingApproval;
+            record.policy_bindings.clear();
+        } else if let Some(existing) = existing {
+            record.trust_state = match existing.trust_state {
+                TrustedEndpointTrustState::Unknown => initial_observed_trust_state(policy),
+                trust_state => trust_state,
+            };
+            record.policy_bindings.clone_from(&existing.policy_bindings);
+        } else {
+            record.trust_state = initial_observed_trust_state(policy);
+            record.policy_bindings.clear();
         }
         record.capabilities.sort_by_key(|capability| capability.to_ascii_lowercase());
         record.capabilities.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
@@ -1521,6 +1533,14 @@ impl TrustedEndpointRegistry {
             denied,
             if usable { "granted" } else { "capability_denied" },
         ))
+    }
+}
+
+fn initial_observed_trust_state(policy: &TrustedEndpointPolicy) -> TrustedEndpointTrustState {
+    if policy.allow_trust_on_first_use_without_approval {
+        TrustedEndpointTrustState::Trusted
+    } else {
+        TrustedEndpointTrustState::PendingApproval
     }
 }
 

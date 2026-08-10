@@ -94,6 +94,53 @@ fn trusted_endpoint_observation_requires_explicit_approval() {
 }
 
 #[test]
+fn trusted_endpoint_observation_cannot_self_grant_trust() {
+    let mut registry = TrustedEndpointRegistry::default();
+    let policy = TrustedEndpointPolicy::default();
+    let mut record = trusted_endpoint_record();
+    record.trust_state = TrustedEndpointTrustState::Trusted;
+    record.policy_bindings = vec!["self-granted".to_owned()];
+
+    let observed =
+        registry.observe_endpoint(record, &policy).expect("endpoint observation should persist");
+    let negotiation = registry
+        .negotiate_capabilities(
+            observed.endpoint_id.as_str(),
+            &["tool:palyra.fs.read_file".to_owned()],
+            &policy,
+        )
+        .expect("observed endpoint should be negotiable");
+
+    assert_eq!(observed.trust_state, TrustedEndpointTrustState::PendingApproval);
+    assert!(observed.policy_bindings.is_empty());
+    assert!(!negotiation.usable);
+    assert_eq!(negotiation.decision_reason, "trust_required");
+}
+
+#[test]
+fn trusted_endpoint_identity_change_requires_new_approval() {
+    let mut registry = TrustedEndpointRegistry::default();
+    let policy = TrustedEndpointPolicy::default();
+    registry
+        .observe_endpoint(trusted_endpoint_record(), &policy)
+        .expect("endpoint observation should persist");
+    registry
+        .approve_endpoint("worker-endpoint-a", vec!["operator-approved".to_owned()], 2_100)
+        .expect("endpoint approval should succeed");
+
+    let mut replacement = trusted_endpoint_record();
+    replacement.identity_digest_sha256 = hex_digest("b");
+    replacement.trust_state = TrustedEndpointTrustState::Trusted;
+    replacement.policy_bindings = vec!["self-granted".to_owned()];
+    let observed = registry
+        .observe_endpoint(replacement, &policy)
+        .expect("replacement identity should remain observable");
+
+    assert_eq!(observed.trust_state, TrustedEndpointTrustState::PendingApproval);
+    assert!(observed.policy_bindings.is_empty());
+}
+
+#[test]
 fn trusted_endpoint_negotiation_grants_only_policy_capabilities() {
     let mut registry = TrustedEndpointRegistry::default();
     let policy = TrustedEndpointPolicy::default();
