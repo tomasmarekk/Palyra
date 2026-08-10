@@ -2147,6 +2147,31 @@ async fn cron_max_runs_exhaustion_for_job(
     Ok(Some(CronMaxRunsExhaustion { max_runs, completed_runs }))
 }
 
+/// Reports whether a linked objective may consume another autonomous turn
+/// without exceeding its routine's configured `max_runs`.
+pub(crate) async fn cron_allows_objective_continuation(
+    state: &Arc<GatewayRuntimeState>,
+    job_id: &str,
+) -> Result<bool, Status> {
+    let Some(job) = state.cron_job(job_id.to_owned()).await? else {
+        return Ok(false);
+    };
+    Ok(cron_max_runs_exhaustion_for_job(Arc::clone(state), &job).await?.is_none())
+}
+
+/// Returns the linked routine limit that also bounds objective continuation
+/// turns. A missing routine fails closed because its authority was revoked.
+pub(crate) async fn cron_objective_continuation_max_runs(
+    state: &Arc<GatewayRuntimeState>,
+    job_id: &str,
+) -> Result<Option<u32>, Status> {
+    let job = state
+        .cron_job(job_id.to_owned())
+        .await?
+        .ok_or_else(|| Status::failed_precondition("objective routine no longer exists"))?;
+    Ok(max_runs_for_job(&job))
+}
+
 /// Disables the job once reserved slots (including still-active runs) have
 /// consumed the `max_runs` budget; used pre-dispatch so concurrent runs
 /// cannot over-commit the budget.

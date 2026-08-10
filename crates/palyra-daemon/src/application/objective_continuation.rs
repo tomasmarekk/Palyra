@@ -59,6 +59,9 @@ pub(crate) async fn schedule_after_cron_terminal(
     job_id: &str,
     cron_run_id: &str,
 ) -> Result<bool, Status> {
+    if !crate::cron::cron_allows_objective_continuation(runtime, job_id).await? {
+        return Ok(false);
+    }
     let config = runtime.routines_runtime_config()?;
     let objective = {
         let registry = Arc::clone(&config.objectives);
@@ -144,9 +147,31 @@ pub(crate) async fn reconcile_terminal_task(
     if !is_terminal_run_state(source_run.state.as_str()) {
         return Ok(true);
     }
+    if let Some(routine_id) = attempt.routine_id.as_deref() {
+        if !crate::cron::cron_allows_objective_continuation(runtime, routine_id).await? {
+            pause_attempt(
+                runtime,
+                &attempt,
+                "objective.continuation.routine_budget_exhausted",
+                "The linked routine has exhausted its autonomous run budget.",
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
     let objective = load_objective(runtime, attempt.objective_id.clone())
         .await?
         .ok_or_else(|| Status::not_found("objective continuation target no longer exists"))?;
+    if routine_turn_budget_exhausted(runtime, &objective, attempt.routine_id.as_deref()).await? {
+        pause_attempt(
+            runtime,
+            &attempt,
+            "objective.continuation.routine_budget_exhausted",
+            "The linked routine has exhausted its autonomous run budget.",
+        )
+        .await?;
+        return Ok(true);
+    }
     reserve_and_enqueue_judge(
         runtime,
         &objective,
@@ -579,6 +604,16 @@ pub(crate) async fn revalidate_continuation_policy(
         .await?;
         return Ok(false);
     }
+    if routine_turn_budget_exhausted(runtime, &objective, attempt.routine_id.as_deref()).await? {
+        pause_attempt(
+            runtime,
+            attempt,
+            "objective.continuation.routine_budget_exhausted",
+            "The linked routine has exhausted its autonomous run budget.",
+        )
+        .await?;
+        return Ok(false);
+    }
     if has_active_user_input(runtime, attempt.session_id.as_str()).await? {
         pause_attempt(
             runtime,
@@ -588,6 +623,18 @@ pub(crate) async fn revalidate_continuation_policy(
         )
         .await?;
         return Ok(false);
+    }
+    if let Some(routine_id) = attempt.routine_id.as_deref() {
+        if !crate::cron::cron_allows_objective_continuation(runtime, routine_id).await? {
+            pause_attempt(
+                runtime,
+                attempt,
+                "objective.continuation.routine_budget_exhausted",
+                "The linked routine has exhausted its autonomous run budget.",
+            )
+            .await?;
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -1118,6 +1165,19 @@ async fn load_objective(
     })
     .await
     .map_err(|_| Status::internal("objective registry read worker panicked"))?
+}
+
+async fn routine_turn_budget_exhausted(
+    runtime: &Arc<GatewayRuntimeState>,
+    objective: &ObjectiveRecord,
+    routine_id: Option<&str>,
+) -> Result<bool, Status> {
+    let Some(routine_id) = routine_id else {
+        return Ok(false);
+    };
+    let max_runs = crate::cron::cron_objective_continuation_max_runs(runtime, routine_id).await?;
+    let completed_turns = u32::try_from(objective.attempt_history.len()).unwrap_or(u32::MAX);
+    Ok(max_runs.is_some_and(|limit| completed_turns >= limit))
 }
 
 async fn has_active_user_input(
