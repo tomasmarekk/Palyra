@@ -683,12 +683,13 @@ async fn find_lifecycle_duplicate(
         request.content_text.as_str(),
         request.replaces_terms.as_slice(),
     ) {
+        let query_kind = query.kind;
         let hits = runtime_state
             .search_memory(MemorySearchRequest {
                 principal: request.principal.clone(),
                 channel: channel_scope.clone(),
                 session_id: session_scope.clone(),
-                query,
+                query: query.text,
                 top_k: 8.min(MAX_MEMORY_SEARCH_TOP_K),
                 min_score: MEMORY_RETAIN_DEDUPE_MIN_SCORE,
                 tags: Vec::new(),
@@ -713,7 +714,8 @@ async fn find_lifecycle_duplicate(
                     match_kind: LifecycleDuplicateMatchKind::Exact,
                 }));
             }
-            if hit.score >= MEMORY_RETAIN_NEAR_DUPLICATE_SCORE
+            if query_kind.allows_near_duplicate()
+                && hit.score >= MEMORY_RETAIN_NEAR_DUPLICATE_SCORE
                 && lifecycle_near_duplicate_categories_compatible(
                     classification.category,
                     &hit.item,
@@ -858,6 +860,25 @@ fn lifecycle_item_matches_scan_scope(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleDuplicateQueryKind {
+    FullContent,
+    ReplacementTerms,
+    SignificantContext,
+}
+
+impl LifecycleDuplicateQueryKind {
+    fn allows_near_duplicate(self) -> bool {
+        matches!(self, Self::FullContent)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleDuplicateSearchQuery {
+    text: String,
+    kind: LifecycleDuplicateQueryKind,
+}
+
 /// Builds the dedupe search queries: the full candidate text, the caller's
 /// replacement terms (so corrections find the value they supersede even when
 /// the new wording shares little with the old), and a significant-terms
@@ -865,19 +886,29 @@ fn lifecycle_item_matches_scan_scope(
 fn lifecycle_duplicate_search_queries(
     content_text: &str,
     replaces_terms: &[String],
-) -> Vec<String> {
-    let mut queries = vec![content_text.to_owned()];
+) -> Vec<LifecycleDuplicateSearchQuery> {
+    let mut queries = vec![LifecycleDuplicateSearchQuery {
+        text: content_text.to_owned(),
+        kind: LifecycleDuplicateQueryKind::FullContent,
+    }];
     let replacement_query = replaces_terms
         .iter()
         .flat_map(|term| lifecycle_duplicate_terms(term))
         .collect::<Vec<_>>()
         .join(" ");
-    if !replacement_query.is_empty() && !queries.iter().any(|query| query == &replacement_query) {
-        queries.push(replacement_query);
+    if !replacement_query.is_empty() && !queries.iter().any(|query| query.text == replacement_query)
+    {
+        queries.push(LifecycleDuplicateSearchQuery {
+            text: replacement_query,
+            kind: LifecycleDuplicateQueryKind::ReplacementTerms,
+        });
     }
     if let Some(significant_context) = lifecycle_significant_context_query(content_text) {
-        if !queries.iter().any(|query| query == &significant_context) {
-            queries.push(significant_context);
+        if !queries.iter().any(|query| query.text == significant_context) {
+            queries.push(LifecycleDuplicateSearchQuery {
+                text: significant_context,
+                kind: LifecycleDuplicateQueryKind::SignificantContext,
+            });
         }
     }
     queries
@@ -2025,7 +2056,26 @@ mod tests {
             replacement_terms.as_slice(),
         );
 
-        assert!(queries.iter().any(|query| query.contains("vitest")));
+        assert!(queries.iter().any(|query| {
+            query.kind == LifecycleDuplicateQueryKind::ReplacementTerms
+                && query.text.contains("vitest")
+        }));
+    }
+
+    #[test]
+    fn fallback_duplicate_queries_cannot_authorize_near_duplicate_replacement() {
+        let replacement_terms = vec!["Vitest".to_owned()];
+        let queries = lifecycle_duplicate_search_queries(
+            "Project UI smoke tests prefer concise TypeScript reports.",
+            replacement_terms.as_slice(),
+        );
+
+        assert_eq!(queries[0].kind, LifecycleDuplicateQueryKind::FullContent);
+        assert!(queries[0].kind.allows_near_duplicate());
+        assert!(
+            queries.iter().skip(1).all(|query| !query.kind.allows_near_duplicate()),
+            "broad fallback scores must not authorize content replacement"
+        );
     }
 
     #[test]
