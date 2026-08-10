@@ -4515,18 +4515,36 @@ pub(crate) fn load_console_document_for_mutation(
     })
 }
 
-/// Resolves the config path for console config operations: explicit request
-/// path first, then the `PALYRA_CONFIG` env var, then the first existing
-/// default search path. `Ok(None)` means "no config file" (defaults).
+/// Resolves the config path for console config operations from the
+/// operator-selected `PALYRA_CONFIG` path or the platform defaults.
+/// `Ok(None)` means "no config file" (defaults).
 ///
 /// # Errors
-/// Returns an invalid-argument `Response` for unparsable paths and, with
-/// `require_existing`, a not-found one when the resolved file is missing.
+/// Returns an invalid-argument `Response` for unparsable paths, a
+/// permission-denied response when an explicit path is outside the
+/// operator-selected candidates, and, with `require_existing`, a not-found
+/// response when the resolved file is missing.
 #[allow(clippy::result_large_err)]
 pub(crate) fn resolve_console_config_path(
     path: Option<&str>,
     require_existing: bool,
 ) -> Result<Option<String>, Response> {
+    let (allowed_paths, operator_override) = match std::env::var("PALYRA_CONFIG") {
+        Ok(path_raw) => {
+            let parsed = parse_config_path(path_raw.as_str()).map_err(|error| {
+                runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "PALYRA_CONFIG contains an invalid config path: {error}"
+                )))
+            })?;
+            (vec![parsed], true)
+        }
+        Err(std::env::VarError::NotPresent) => (default_config_search_paths(), false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "PALYRA_CONFIG contains non-Unicode path data",
+            )));
+        }
+    };
     let resolved = match path.map(str::trim).filter(|value| !value.is_empty()) {
         Some(explicit) => {
             let parsed = parse_config_path(explicit).map_err(|error| {
@@ -4534,23 +4552,26 @@ pub(crate) fn resolve_console_config_path(
                     "config path is invalid: {error}"
                 )))
             })?;
-            Some(parsed.to_string_lossy().into_owned())
-        }
-        None => {
-            if let Ok(path_raw) = std::env::var("PALYRA_CONFIG") {
-                let parsed = parse_config_path(path_raw.as_str()).map_err(|error| {
-                    runtime_status_response(tonic::Status::invalid_argument(format!(
-                        "PALYRA_CONFIG contains an invalid config path: {error}"
+            let authorized = match_console_config_path(parsed.as_path(), allowed_paths.as_slice())
+                .map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to resolve authorized config paths: {error}"
                     )))
+                })?
+                .ok_or_else(|| {
+                    runtime_status_response(tonic::Status::permission_denied(
+                        "explicit config path is not an operator-selected config file",
+                    ))
                 })?;
-                Some(parsed.to_string_lossy().into_owned())
-            } else {
-                default_config_search_paths()
-                    .into_iter()
-                    .find(|candidate| candidate.exists())
-                    .map(|candidate| candidate.to_string_lossy().into_owned())
-            }
+            Some(authorized.to_string_lossy().into_owned())
         }
+        None if operator_override => {
+            allowed_paths.first().map(|candidate| candidate.to_string_lossy().into_owned())
+        }
+        None => allowed_paths
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .map(|candidate| candidate.to_string_lossy().into_owned()),
     };
 
     if require_existing {
@@ -4564,6 +4585,52 @@ pub(crate) fn resolve_console_config_path(
     }
 
     Ok(resolved)
+}
+
+fn match_console_config_path(
+    requested: &FsPath,
+    allowed_paths: &[PathBuf],
+) -> std::io::Result<Option<PathBuf>> {
+    let requested = normalize_console_config_path(requested)?;
+    for allowed in allowed_paths {
+        if normalize_console_config_path(allowed.as_path())? == requested {
+            return Ok(Some(allowed.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn normalize_console_config_path(path: &FsPath) -> std::io::Result<PathBuf> {
+    let absolute =
+        if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let mut cursor = absolute.as_path();
+    let mut missing_components = Vec::new();
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "config path has no existing ancestor",
+                    )
+                })?;
+                missing_components.push(component.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "config path has no existing ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut normalized = fs::canonicalize(cursor)?;
+    for component in missing_components.into_iter().rev() {
+        normalized.push(component);
+    }
+    Ok(normalized)
 }
 
 /// Loads the active config document plus migration info, reporting the
@@ -6622,6 +6689,35 @@ mod diagnostic_text_tests {
     fn truncate_diagnostic_text_counts_trimmed_content() {
         assert_eq!(truncate_diagnostic_text("  abc  ", 3), "abc");
         assert_eq!(truncate_diagnostic_text("  abcd  ", 3), "abc...");
+    }
+}
+
+#[cfg(test)]
+mod console_config_path_security_tests {
+    use super::match_console_config_path;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn explicit_console_config_path_must_match_an_operator_candidate() {
+        let temp = tempdir().expect("temporary directory should be available");
+        let allowed = temp.path().join("configured").join("palyra.toml");
+        let outside = temp.path().join("outside.toml");
+        fs::create_dir_all(allowed.parent().expect("allowed path should have a parent"))
+            .expect("allowed parent should be created");
+        fs::write(&allowed, "version = 1\n").expect("allowed config should be written");
+        fs::write(&outside, "version = 1\n").expect("outside config should be written");
+
+        assert_eq!(
+            match_console_config_path(allowed.as_path(), std::slice::from_ref(&allowed))
+                .expect("allowed path comparison should succeed"),
+            Some(allowed.clone())
+        );
+        assert_eq!(
+            match_console_config_path(outside.as_path(), std::slice::from_ref(&allowed))
+                .expect("outside path comparison should succeed"),
+            None
+        );
     }
 }
 
