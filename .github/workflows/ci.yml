@@ -48,7 +48,7 @@ jobs:
             check: Workspace / Test
             mode: test
           - os: windows-latest
-            runner: windows-2025-vs2026
+            runner: windows-latest
             check: Workspace / Build and test
             mode: build-and-test
     steps:
@@ -202,7 +202,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2025-vs2026]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: "0"
@@ -593,7 +593,7 @@ jobs:
 
   protocol-windows:
     name: Protocol / Windows (windows-latest)
-    runs-on: windows-2025-vs2026
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -630,7 +630,7 @@ jobs:
           - os: macos-latest
             runner: macos-latest
           - os: windows-latest
-            runner: windows-2025-vs2026
+            runner: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
