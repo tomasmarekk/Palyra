@@ -189,19 +189,52 @@ fn write_trust_store_atomically(path: &Path, payload: &[u8]) -> Result<(), Skill
             ))
         })?;
         drop(temp_file);
-        fs::rename(temp_path.as_path(), path).map_err(|error| {
-            SkillPackagingError::Io(format!(
-                "failed to replace trust store {} with {}: {error}",
-                path.display(),
-                temp_path.display()
-            ))
-        })?;
+        replace_trust_store(temp_path.as_path(), path)?;
         harden_trust_store_file_permissions(path)
     })();
     if result.is_err() && created_temp {
         let _ = fs::remove_file(temp_path);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_trust_store(source: &Path, destination: &Path) -> Result<(), SkillPackagingError> {
+    fs::rename(source, destination).map_err(|error| {
+        SkillPackagingError::Io(format!(
+            "failed to replace trust store {} with {}: {error}",
+            destination.display(),
+            source.display()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn replace_trust_store(source: &Path, destination: &Path) -> Result<(), SkillPackagingError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let destination =
+        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let moved = unsafe {
+        // SAFETY: Both owned vectors remain valid, nul-terminated UTF-16 paths
+        // for the call; the flags request replacement with durable completion.
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(SkillPackagingError::Io(format!(
+            "failed to replace trust store with its temporary file: {error}"
+        )));
+    }
+    Ok(())
 }
 
 fn create_trust_store_temp_file(path: &Path) -> Result<fs::File, SkillPackagingError> {
