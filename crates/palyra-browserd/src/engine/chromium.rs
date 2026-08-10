@@ -765,6 +765,11 @@ const MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES: usize =
 const MAX_CHROMIUM_ELEMENT_CAPTURE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHROMIUM_OBSERVE_FORM_CONTROLS: usize = 128;
 const MAX_CHROMIUM_OBSERVE_STATE_TEXT_BYTES: usize = 16 * 1024;
+const CHROMIUM_SELECT_STATUS_NOT_FOUND: u64 = 0;
+const CHROMIUM_SELECT_STATUS_NOT_SELECT: u64 = 1;
+const CHROMIUM_SELECT_STATUS_DISABLED: u64 = 2;
+const CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND: u64 = 3;
+const CHROMIUM_SELECT_STATUS_SELECTED: u64 = 4;
 
 #[derive(Debug, Default, Deserialize)]
 struct ChromiumObserveStatePayload {
@@ -5639,6 +5644,40 @@ pub(crate) async fn press_with_chromium(
     }
 }
 
+fn chromium_select_script(selector_json: &str, value_json: &str) -> String {
+    format!(
+        r#"
+(() => {{
+  const selector = {selector_json};
+  const value = {value_json};
+  const element = document.querySelector(selector);
+  if (!element) {{
+    return {status_not_found};
+  }}
+  if ((element.tagName || "").toLowerCase() !== "select") {{
+    return {status_not_select};
+  }}
+  if (element.disabled) {{
+    return {status_disabled};
+  }}
+  const option = Array.from(element.options || []).find((candidate) => candidate.value === value);
+  if (!option) {{
+    return {status_value_not_found};
+  }}
+  element.value = value;
+  element.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  return {status_selected};
+}})()
+"#,
+        status_not_found = CHROMIUM_SELECT_STATUS_NOT_FOUND,
+        status_not_select = CHROMIUM_SELECT_STATUS_NOT_SELECT,
+        status_disabled = CHROMIUM_SELECT_STATUS_DISABLED,
+        status_value_not_found = CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND,
+        status_selected = CHROMIUM_SELECT_STATUS_SELECTED,
+    )
+}
+
 /// Selects an option by value on a `<select>` element of the active tab.
 pub(crate) async fn select_with_chromium(
     runtime: &BrowserRuntimeState,
@@ -5680,84 +5719,58 @@ pub(crate) async fn select_with_chromium(
             }
         }
     };
-    let script = format!(
-        r#"
-(() => {{
-  const selector = {selector_json};
-  const value = {value_json};
-  const respond = (payload) => JSON.stringify(payload);
-  const element = document.querySelector(selector);
-  if (!element) {{
-    return respond({{ status: "not_found" }});
-  }}
-  if ((element.tagName || "").toLowerCase() !== "select") {{
-    return respond({{ status: "not_select" }});
-  }}
-  if (element.disabled) {{
-    return respond({{ status: "disabled" }});
-  }}
-  const option = Array.from(element.options || []).find((candidate) => candidate.value === value);
-  if (!option) {{
-    return respond({{ status: "value_not_found" }});
-  }}
-  element.value = value;
-  element.dispatchEvent(new Event("input", {{ bubbles: true }}));
-  element.dispatchEvent(new Event("change", {{ bubbles: true }}));
-  return respond({{ status: "selected", value: element.value }});
-}})()
-"#
-    );
+    let script = chromium_select_script(selector_json.as_str(), value_json.as_str());
     let result = run_chromium_blocking("chromium select", move || {
         tab.set_default_timeout(Duration::from_millis(timeout_ms.max(1)));
-        let value = tab
-            .evaluate(script.as_str(), true)
+        tab.evaluate(script.as_str(), true)
             .map_err(|error| format!("failed to execute Chromium select script: {error}"))?
             .value
-            .unwrap_or(serde_json::Value::Null);
-        Ok(decode_chromium_json_script_value(value))
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "Chromium select script returned an invalid primitive status".to_owned())
     })
     .await;
     match result {
-        Ok(value) => {
-            let status =
-                value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-            match status {
-                "selected" => {
-                    let _ =
-                        chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
-                    ChromiumActionOutcome {
-                        success: true,
-                        outcome: "selected".to_owned(),
-                        error: String::new(),
-                        attempts: 1,
-                    }
+        Ok(status) => match status {
+            CHROMIUM_SELECT_STATUS_SELECTED => {
+                let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
+                ChromiumActionOutcome {
+                    success: true,
+                    outcome: "selected".to_owned(),
+                    error: String::new(),
+                    attempts: 1,
                 }
-                "disabled" => ChromiumActionOutcome {
-                    success: false,
-                    outcome: "selector_disabled".to_owned(),
-                    error: format!("selector '{selector}' is disabled"),
-                    attempts: 1,
-                },
-                "not_select" => ChromiumActionOutcome {
-                    success: false,
-                    outcome: "selector_not_select".to_owned(),
-                    error: format!("selector '{selector}' does not target a <select> element"),
-                    attempts: 1,
-                },
-                "value_not_found" => ChromiumActionOutcome {
-                    success: false,
-                    outcome: "value_not_found".to_owned(),
-                    error: format!("value '{value}' was not found for selector '{selector}'"),
-                    attempts: 1,
-                },
-                _ => ChromiumActionOutcome {
-                    success: false,
-                    outcome: "selector_not_found".to_owned(),
-                    error: format!("selector '{selector}' was not found"),
-                    attempts: 1,
-                },
             }
-        }
+            CHROMIUM_SELECT_STATUS_DISABLED => ChromiumActionOutcome {
+                success: false,
+                outcome: "selector_disabled".to_owned(),
+                error: format!("selector '{selector}' is disabled"),
+                attempts: 1,
+            },
+            CHROMIUM_SELECT_STATUS_NOT_SELECT => ChromiumActionOutcome {
+                success: false,
+                outcome: "selector_not_select".to_owned(),
+                error: format!("selector '{selector}' does not target a <select> element"),
+                attempts: 1,
+            },
+            CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND => ChromiumActionOutcome {
+                success: false,
+                outcome: "value_not_found".to_owned(),
+                error: format!("value '{value}' was not found for selector '{selector}'"),
+                attempts: 1,
+            },
+            CHROMIUM_SELECT_STATUS_NOT_FOUND => ChromiumActionOutcome {
+                success: false,
+                outcome: "selector_not_found".to_owned(),
+                error: format!("selector '{selector}' was not found"),
+                attempts: 1,
+            },
+            _ => ChromiumActionOutcome {
+                success: false,
+                outcome: "select_failed".to_owned(),
+                error: "Chromium select script returned an unknown primitive status".to_owned(),
+                attempts: 1,
+            },
+        },
         Err(error) => ChromiumActionOutcome {
             success: false,
             outcome: "select_failed".to_owned(),
@@ -6553,6 +6566,22 @@ mod tests {
             decoded.as_array().is_some_and(Vec::is_empty),
             "oversized network diagnostics payload must be dropped before serde parsing"
         );
+    }
+
+    #[test]
+    fn chromium_select_script_returns_only_host_defined_primitive_statuses() {
+        let script = chromium_select_script(r##""#country""##, r#""cz""#);
+
+        assert!(!script.contains("JSON.stringify"));
+        for status in [
+            CHROMIUM_SELECT_STATUS_NOT_FOUND,
+            CHROMIUM_SELECT_STATUS_NOT_SELECT,
+            CHROMIUM_SELECT_STATUS_DISABLED,
+            CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND,
+            CHROMIUM_SELECT_STATUS_SELECTED,
+        ] {
+            assert!(script.contains(format!("return {status};").as_str()));
+        }
     }
 
     #[test]
