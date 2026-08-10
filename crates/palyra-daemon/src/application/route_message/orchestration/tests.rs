@@ -310,6 +310,89 @@ fn pin_existing_legacy_route_session(
 }
 
 #[tokio::test]
+async fn default_v2_admits_new_connector_route_messages() {
+    let state = build_test_runtime_state(false);
+    let input = route_input();
+    let plan = route_plan(&input);
+    let context = route_context();
+    let resolved_session = state
+        .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
+            session_id: None,
+            session_key: Some(plan.session_key),
+            session_label: plan.session_label,
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+            require_existing: false,
+            reset_session: false,
+        })
+        .await
+        .expect("new route session should resolve");
+    assert!(resolved_session.created);
+    let session = resolved_session.session;
+    let dispatcher =
+        crate::application::runtime_kernel_v2::dispatcher::RuntimeKernelDispatcher::resolve(
+            &crate::config::RuntimeKernelConfig::default(),
+            &crate::config::FeatureRolloutsConfig::default(),
+            None,
+            false,
+            crate::application::runtime_kernel_v2::selection::V2RuntimeAvailability::Ready,
+        )
+        .expect("default V2 runtime dispatcher should initialize");
+    let typed_session_id = RuntimeSessionId::parse(session.session_id.as_str())
+        .expect("route session id should parse");
+    let authority_intent = dispatcher
+        .resolve_authority_intent(
+            &state.journal_store,
+            &typed_session_id,
+            Some(context.principal.as_str()),
+            true,
+            true,
+            RuntimeAuthorityProgressEvidence::pristine(),
+        )
+        .expect("default V2 route authority should resolve");
+    assert_eq!(authority_intent.selected_runtime(), Some(RuntimeAuthority::V2));
+    let run_id = Ulid::new().to_string();
+    let outcome = admit_v2_route_message_run(
+        &state,
+        &context,
+        &session,
+        &dispatcher,
+        authority_intent,
+        run_id.as_str(),
+        input.envelope_id.as_str(),
+    )
+    .await
+    .expect("default V2 route admission should execute");
+    let token = match outcome {
+        RunAdmissionControllerOutcome::Admitted { token, .. } => token,
+        RunAdmissionControllerOutcome::Rejected { journal } => {
+            panic!("default V2 route admission rejected: {}", journal.reason_code)
+        }
+        RunAdmissionControllerOutcome::Queued { journal } => {
+            panic!("default V2 route admission queued: {}", journal.reason_code)
+        }
+    };
+    assert_eq!(token.run_id(), run_id);
+    assert_eq!(token.identities().session_id.as_str(), session.session_id);
+    let pin = state
+        .journal_store
+        .load_session_runtime_authority(session.session_id.as_str())
+        .expect("route session authority should load")
+        .expect("route session authority should be pinned");
+    assert_eq!(pin.configured_profile, JournalRuntimeProfile::V2);
+    assert_eq!(pin.selected_runtime, JournalRuntimeAuthority::V2);
+    assert!(
+        state
+            .journal_store
+            .load_runtime_kernel_head(run_id.as_str())
+            .expect("route V2 kernel state should load")
+            .is_some(),
+        "route V2 admission should initialize durable kernel state"
+    );
+}
+
+#[tokio::test]
 async fn route_provider_supersession_retries_with_replacement_and_settles_done() {
     let mut feature_rollouts = crate::config::FeatureRolloutsConfig::default();
     feature_rollouts.context_engine =

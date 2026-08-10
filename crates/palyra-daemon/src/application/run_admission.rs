@@ -117,6 +117,7 @@ impl AdmissionEnvironmentSnapshot {
     ///
     /// This is distinct from daemon drain and access denial so durable
     /// admission evidence retains the operational cause.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_ingress_block(mut self, reason: String) -> Self {
         self.ingress_block_reason = Some(reason);
