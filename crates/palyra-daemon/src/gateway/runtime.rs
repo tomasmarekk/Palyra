@@ -2894,6 +2894,7 @@ impl ClosedBrowserSessionLedger {
 struct RunParameterDeltaCache {
     entries: HashMap<String, String>,
     order: VecDeque<String>,
+    total_bytes: usize,
 }
 
 impl RunParameterDeltaCache {
@@ -2903,18 +2904,38 @@ impl RunParameterDeltaCache {
         if run_id.is_empty() || parameter_delta_json.is_empty() {
             return;
         }
+        if parameter_delta_json.len() > RUN_PARAMETER_DELTA_CACHE_MAX_ENTRY_BYTES {
+            self.remove(run_id);
+            return;
+        }
         if let Some(existing) = self.entries.get_mut(run_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(existing.len());
             *existing = parameter_delta_json.to_owned();
+            self.total_bytes = self.total_bytes.saturating_add(existing.len());
+            self.evict_to_limits();
             return;
         }
 
         self.entries.insert(run_id.to_owned(), parameter_delta_json.to_owned());
         self.order.push_back(run_id.to_owned());
-        while self.entries.len() > RUN_PARAMETER_DELTA_CACHE_CAPACITY {
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(run_id.len())
+            .saturating_add(parameter_delta_json.len());
+        self.evict_to_limits();
+    }
+
+    fn evict_to_limits(&mut self) {
+        while self.entries.len() > RUN_PARAMETER_DELTA_CACHE_CAPACITY
+            || self.total_bytes > RUN_PARAMETER_DELTA_CACHE_MAX_TOTAL_BYTES
+        {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.entries.remove(oldest.as_str());
+            if let Some(value) = self.entries.remove(oldest.as_str()) {
+                self.total_bytes =
+                    self.total_bytes.saturating_sub(oldest.len().saturating_add(value.len()));
+            }
         }
     }
 
@@ -2924,6 +2945,15 @@ impl RunParameterDeltaCache {
             return None;
         }
         self.entries.get(run_id).cloned()
+    }
+
+    fn remove(&mut self, run_id: &str) {
+        let run_id = run_id.trim();
+        if let Some(value) = self.entries.remove(run_id) {
+            self.total_bytes =
+                self.total_bytes.saturating_sub(run_id.len().saturating_add(value.len()));
+        }
+        self.order.retain(|existing| existing != run_id);
     }
 }
 
@@ -5073,6 +5103,20 @@ impl GatewayRuntimeState {
                     "failed to lock run launch context cache"
                 );
                 error.into_inner().insert(run_id, parameter_delta_json);
+            }
+        }
+    }
+
+    fn forget_run_parameter_delta_json(&self, run_id: &str) {
+        match self.run_parameter_delta_cache.lock() {
+            Ok(mut cache) => cache.remove(run_id),
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to lock run launch context cache for eviction"
+                );
+                error.into_inner().remove(run_id);
             }
         }
     }
@@ -11183,6 +11227,12 @@ impl GatewayRuntimeState {
             self.mark_feature_usage_run_terminal(run_id.as_str());
             self.orchestrator_run_notify.notify_waiters();
         }
+        if matches!(
+            settlement.effective_state,
+            RunLifecycleState::Done | RunLifecycleState::Failed | RunLifecycleState::Cancelled
+        ) {
+            self.forget_run_parameter_delta_json(run_id.as_str());
+        }
         Ok(settlement)
     }
 
@@ -11278,6 +11328,7 @@ impl GatewayRuntimeState {
             RunLifecycleState::Done | RunLifecycleState::Failed | RunLifecycleState::Cancelled
         ) {
             self.mark_feature_usage_run_terminal(run_id.as_str());
+            self.forget_run_parameter_delta_json(run_id.as_str());
         }
         self.orchestrator_run_notify.notify_waiters();
         Ok(())
@@ -21113,7 +21164,10 @@ pub(crate) mod tests {
         RunInterruptLatencyObservation, RunInterruptPhase, RUN_INTERRUPT_LATENCY_MAX_MS,
     };
     use crate::domain::work_graph::WorkRuntimeLiveness;
-    use crate::gateway::RUN_PARAMETER_DELTA_CACHE_CAPACITY;
+    use crate::gateway::{
+        RUN_PARAMETER_DELTA_CACHE_CAPACITY, RUN_PARAMETER_DELTA_CACHE_MAX_ENTRY_BYTES,
+        RUN_PARAMETER_DELTA_CACHE_MAX_TOTAL_BYTES,
+    };
     use crate::journal::{
         CanvasStatePatchRecord, JournalConfig, JournalStore, OrchestratorRunStartRequest,
         OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
@@ -22255,6 +22309,31 @@ pub(crate) mod tests {
         assert_eq!(cache.entries.len(), RUN_PARAMETER_DELTA_CACHE_CAPACITY);
         let newest_run_id = format!("run-{}", RUN_PARAMETER_DELTA_CACHE_CAPACITY + 1);
         assert_eq!(cache.get(newest_run_id.as_str()).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn run_parameter_delta_cache_bounds_bytes_and_supports_terminal_eviction() {
+        let mut cache = super::RunParameterDeltaCache::default();
+        let oversized = "x".repeat(RUN_PARAMETER_DELTA_CACHE_MAX_ENTRY_BYTES + 1);
+        cache.insert("oversized-run", oversized.as_str());
+        assert_eq!(cache.get("oversized-run"), None);
+
+        let payload = "x".repeat(RUN_PARAMETER_DELTA_CACHE_MAX_ENTRY_BYTES);
+        for index in
+            0..=(RUN_PARAMETER_DELTA_CACHE_MAX_TOTAL_BYTES / payload.len()).saturating_add(1)
+        {
+            cache.insert(format!("bounded-run-{index}").as_str(), payload.as_str());
+        }
+
+        assert!(cache.total_bytes <= RUN_PARAMETER_DELTA_CACHE_MAX_TOTAL_BYTES);
+        assert_eq!(cache.get("bounded-run-0"), None);
+        let newest_run_id = format!(
+            "bounded-run-{}",
+            (RUN_PARAMETER_DELTA_CACHE_MAX_TOTAL_BYTES / payload.len()).saturating_add(1)
+        );
+        assert!(cache.get(newest_run_id.as_str()).is_some());
+        cache.remove(newest_run_id.as_str());
+        assert_eq!(cache.get(newest_run_id.as_str()), None);
     }
 
     #[test]
