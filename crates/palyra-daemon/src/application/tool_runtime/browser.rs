@@ -439,9 +439,8 @@ fn browser_session_profile_id_from_payload(
 
 /// Resolves `(persistence_enabled, persistence_id)` for `session.create`.
 ///
-/// Persistence defaults to on and is keyed by a daemon-derived id for the
-/// current agent session, so browser state survives daemon/browserd restarts
-/// without allowing callers to pick another session's persistence namespace.
+/// Explicitly enabled persistence is keyed by a daemon-derived id for the
+/// current agent session, so callers cannot pick another session's namespace.
 fn browser_session_persistence_from_payload(
     payload: &serde_json::Map<String, Value>,
     agent_session_id: &str,
@@ -456,7 +455,7 @@ fn browser_session_persistence_from_payload(
         return Ok((false, String::new()));
     }
     let persistence_enabled =
-        payload.get("persistence_enabled").and_then(Value::as_bool).unwrap_or(true);
+        payload.get("persistence_enabled").and_then(Value::as_bool).unwrap_or(false);
     if !persistence_enabled {
         return Ok((false, String::new()));
     }
@@ -6553,14 +6552,28 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_create_defaults_to_session_scoped_persistence() {
+    fn browser_session_create_defaults_to_ephemeral() {
         let payload = json!({});
+
+        assert_eq!(
+            browser_session_persistence_from_payload(
+                payload.as_object().expect("payload must be an object"),
+                "browser-recovery-export-20260527",
+            )
+            .expect("default ephemeral mode should be accepted"),
+            (false, String::new())
+        );
+    }
+
+    #[test]
+    fn browser_session_create_derives_persistence_id_when_enabled() {
+        let payload = json!({"persistence_enabled": true});
 
         let (enabled, persistence_id) = browser_session_persistence_from_payload(
             payload.as_object().expect("payload must be an object"),
             "browser-recovery-export-20260527",
         )
-        .expect("default persistence should be accepted");
+        .expect("explicit persistence should be accepted");
 
         assert!(enabled);
         assert!(persistence_id.starts_with("agent-session-sha256-"));
