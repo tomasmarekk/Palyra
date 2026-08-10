@@ -682,7 +682,7 @@ impl ManagedWorktreeExecutor {
             .process_supervisor
             .launch(ProcessLaunchSpec {
                 executable: self.config.git_executable.clone(),
-                args,
+                args: hardened_git_arguments(args),
                 cwd: cwd.to_path_buf(),
                 env: git_environment(),
                 owner: ProcessOwnerV2 {
@@ -964,6 +964,19 @@ fn disabled_hooks_config() -> String {
     }
 }
 
+fn hardened_git_arguments(mut args: Vec<String>) -> Vec<String> {
+    let mut hardened = vec![
+        "-c".to_owned(),
+        disabled_hooks_config(),
+        "-c".to_owned(),
+        "protocol.file.allow=never".to_owned(),
+        "-c".to_owned(),
+        "core.fsmonitor=false".to_owned(),
+    ];
+    hardened.append(&mut args);
+    hardened
+}
+
 fn git_environment() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for key in ["HOME", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE"] {
@@ -1163,6 +1176,25 @@ mod tests {
         for key in ["core.repositoryformatversion", "filter.audit.required", "remote.origin.url"] {
             assert!(!git_config_key_can_execute_during_checkout(key), "{key}");
         }
+    }
+
+    #[test]
+    fn every_host_git_invocation_disables_executable_repository_config() {
+        let args =
+            hardened_git_arguments(vec!["-C".to_owned(), "/repo".to_owned(), "status".to_owned()]);
+
+        assert_eq!(
+            &args[..6],
+            &[
+                "-c".to_owned(),
+                disabled_hooks_config(),
+                "-c".to_owned(),
+                "protocol.file.allow=never".to_owned(),
+                "-c".to_owned(),
+                "core.fsmonitor=false".to_owned(),
+            ]
+        );
+        assert_eq!(&args[6..], &["-C".to_owned(), "/repo".to_owned(), "status".to_owned()]);
     }
 
     #[test]
