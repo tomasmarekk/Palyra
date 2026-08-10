@@ -217,6 +217,13 @@ pub(crate) fn build_core_performance_qualification_snapshot() -> serde_json::Val
 pub(crate) fn evaluate_core_performance(
     baseline: &CorePerformanceBaseline,
 ) -> CorePerformanceQualification {
+    evaluate_core_performance_for_platform(baseline, std::env::consts::OS)
+}
+
+fn evaluate_core_performance_for_platform(
+    baseline: &CorePerformanceBaseline,
+    platform: &str,
+) -> CorePerformanceQualification {
     let mut issues = Vec::new();
 
     if baseline.schema_version != CORE_PERFORMANCE_SCHEMA_VERSION {
@@ -272,7 +279,7 @@ pub(crate) fn evaluate_core_performance(
                 format!("{:?}", latency.stage),
             );
         }
-        if latency.p99_ms > effective_p99_limit(baseline, latency) {
+        if latency.p99_ms > effective_p99_limit(baseline, latency, platform) {
             blocker(
                 &mut issues,
                 "core_performance.tail_latency_regressed",
@@ -366,11 +373,19 @@ pub(crate) fn evaluate_core_performance(
     }
 }
 
-fn effective_p99_limit(baseline: &CorePerformanceBaseline, latency: &StageLatencyBaseline) -> u64 {
+fn effective_p99_limit(
+    baseline: &CorePerformanceBaseline,
+    latency: &StageLatencyBaseline,
+    platform: &str,
+) -> u64 {
     baseline
         .platform_waivers
         .iter()
-        .filter(|waiver| waiver.stage == latency.stage && waiver.expires_on >= baseline.as_of)
+        .filter(|waiver| {
+            waiver.stage == latency.stage
+                && waiver.expires_on >= baseline.as_of
+                && waiver.platform.trim().eq_ignore_ascii_case(platform)
+        })
         .map(|waiver| waiver.replacement_limit_p99_ms)
         .max()
         .unwrap_or(latency.release_limit_p99_ms)
@@ -453,5 +468,34 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "core_performance.platform_waiver_invalid"));
+    }
+
+    #[test]
+    fn platform_waiver_applies_only_to_its_target_platform() {
+        let mut baseline =
+            builtin_core_performance_baseline().expect("built-in performance evidence must parse");
+        let (stage, waived_p99_ms) = {
+            let admission =
+                baseline.stage_latencies.first_mut().expect("baseline must include admission");
+            admission.p99_ms = admission.release_limit_p99_ms.saturating_add(1);
+            (admission.stage, admission.p99_ms)
+        };
+        baseline.platform_waivers.push(PlatformGuardrailWaiver {
+            platform: "windows".to_owned(),
+            stage,
+            replacement_limit_p99_ms: waived_p99_ms,
+            reason: "bounded Windows variance".to_owned(),
+            owner: "runtime".to_owned(),
+            expires_on: "2099-12-31".to_owned(),
+        });
+
+        let linux = evaluate_core_performance_for_platform(&baseline, "linux");
+        let windows = evaluate_core_performance_for_platform(&baseline, "windows");
+
+        assert!(linux
+            .issues
+            .iter()
+            .any(|issue| issue.code == "core_performance.tail_latency_regressed"));
+        assert!(windows.qualified, "unexpected issues: {:?}", windows.issues);
     }
 }
