@@ -5595,7 +5595,8 @@ fn browser_page_diagnostics_to_json(
 }
 
 fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> BrowserValueExport {
-    let entry_id = browser_network_log_entry_id(&entry);
+    let request_url = redact_url(entry.request_url.as_str());
+    let entry_id = browser_network_log_entry_id(&entry, request_url.as_str());
     let raw_scan_input = {
         let mut buffer = String::new();
         buffer.push_str("request_url=");
@@ -5624,7 +5625,6 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Brow
         left_name.cmp(right_name)
     });
     let scan = export_browser_text(raw_scan_input.as_str(), SafetyContentKind::BrowserNetwork);
-    let request_url = redact_url(entry.request_url.as_str());
     BrowserValueExport {
         value: json!({
             "entry_id": entry_id,
@@ -5642,10 +5642,13 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Brow
     }
 }
 
-fn browser_network_log_entry_id(entry: &browser_v1::NetworkLogEntry) -> String {
+fn browser_network_log_entry_id(
+    entry: &browser_v1::NetworkLogEntry,
+    redacted_request_url: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"palyra.browser.network_log.entry.v1");
-    hasher.update(entry.request_url.as_bytes());
+    hasher.update(b"palyra.browser.network_log.entry.v2");
+    hasher.update(redacted_request_url.as_bytes());
     hasher.update(entry.status_code.to_be_bytes());
     hasher.update(entry.timing_bucket.as_bytes());
     hasher.update(entry.latency_ms.to_be_bytes());
@@ -6147,7 +6150,7 @@ mod tests {
 
     #[test]
     fn network_log_export_redacts_sensitive_headers() {
-        let exported = browser_network_log_entry_to_json(browser_v1::NetworkLogEntry {
+        let entry = browser_v1::NetworkLogEntry {
             v: CANONICAL_PROTOCOL_MAJOR,
             request_url: "https://example.test/api?token=abc123".to_owned(),
             status_code: 200,
@@ -6159,7 +6162,12 @@ mod tests {
                 name: "Authorization".to_owned(),
                 value: "Bearer super-secret-token-value".to_owned(),
             }],
-        });
+        };
+        let mut alternate_secret_entry = entry.clone();
+        alternate_secret_entry.request_url =
+            "https://example.test/api?token=different-secret".to_owned();
+        let exported = browser_network_log_entry_to_json(entry);
+        let alternate_secret_export = browser_network_log_entry_to_json(alternate_secret_entry);
         assert_eq!(exported.value["headers"][0]["value"], "<redacted>");
         assert_eq!(exported.value["phase"], "response");
         assert!(
@@ -6170,6 +6178,10 @@ mod tests {
                 .is_some_and(|entry_id| entry_id.starts_with("net_")),
             "{}",
             exported.value
+        );
+        assert_eq!(
+            exported.value["entry_id"], alternate_secret_export.value["entry_id"],
+            "network entry IDs must not verify pre-redaction query secrets"
         );
         assert_eq!(exported.value["safety"]["action"], "redact");
         assert!(exported.redacted);
