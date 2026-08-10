@@ -240,7 +240,6 @@ pub(crate) async fn console_chat_session_reset_handler(
             "session_id must be a canonical ULID",
         ))
     })?;
-    let _cancelled_media_jobs = state.audio_sessions.cancel_session(session_id.as_str());
     let outcome = state
         .runtime
         .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
@@ -255,6 +254,8 @@ pub(crate) async fn console_chat_session_reset_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let _cancelled_media_jobs =
+        state.audio_sessions.cancel_session(outcome.session.session_id.as_str());
     Ok(Json(json!({
         "session": outcome.session,
         "created": outcome.created,
@@ -7269,6 +7270,8 @@ fn build_console_run_lineage_payload(
 /// guarantee that attachment index content omits extracted text.
 #[cfg(test)]
 mod tests {
+    const CHAT_SOURCE: &str = include_str!("chat.rs");
+
     use super::{
         build_background_task_cancel_requested_result_json,
         build_background_task_cancel_requested_update, build_background_task_cancelled_result_json,
@@ -7286,6 +7289,28 @@ mod tests {
         ConsoleChatAudioOutputRequest,
     };
     use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
+
+    #[test]
+    fn session_reset_authorizes_owner_before_cancelling_audio() {
+        let handler_start = CHAT_SOURCE
+            .find("pub(crate) async fn console_chat_session_reset_handler")
+            .expect("session reset handler should exist");
+        let handler_end = CHAT_SOURCE[handler_start..]
+            .find("// --- Message submission and run-stream bridging ---")
+            .map(|offset| handler_start + offset)
+            .expect("message submission section should follow reset handler");
+        let handler = &CHAT_SOURCE[handler_start..handler_end];
+        let ownership_resolution = handler
+            .find(".resolve_orchestrator_session(")
+            .expect("session reset should resolve ownership");
+        let audio_cancellation =
+            handler.find(".cancel_session(").expect("session reset should cancel audio jobs");
+
+        assert!(ownership_resolution < audio_cancellation);
+        assert!(handler[ownership_resolution..audio_cancellation]
+            .contains(".map_err(runtime_status_response)?;"));
+        assert!(handler[audio_cancellation..].contains("outcome.session.session_id.as_str()"));
+    }
 
     #[test]
     fn audio_transcription_requires_its_product_rollout() {
