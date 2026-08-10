@@ -79,9 +79,8 @@ impl ConsoleLogFailure {
 /// Emits recent log records, optionally following the selected source.
 ///
 /// # Errors
-/// Returns an error when `--follow --json` is combined on the local fallback
-/// path, or when the fallback sources (journal database, service log files)
-/// fail to open or read.
+/// Returns an error when `--follow --json` is combined, or when the selected
+/// console or fallback log source fails after output has begun.
 pub(crate) fn run_logs(
     db_path: Option<String>,
     lines: usize,
@@ -89,6 +88,11 @@ pub(crate) fn run_logs(
     poll_interval_ms: u64,
     json: bool,
 ) -> Result<()> {
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for logs command"))?;
+    let json = json || root_context.prefers_json();
+    ensure_follow_output_supported(follow, json)?;
+
     let runtime = build_runtime()?;
     match runtime.block_on(run_console_logs(lines, follow, poll_interval_ms, json)) {
         Ok(()) => return Ok(()),
@@ -103,12 +107,6 @@ pub(crate) fn run_logs(
     // Console API errors before the first emitted record are intentionally
     // swallowed: `logs` must keep working from local journal/service files
     // precisely when the authenticated daemon console is unavailable.
-    let root_context = app::current_root_context()
-        .ok_or_else(|| anyhow!("CLI root context is unavailable for logs command"))?;
-    if (json || root_context.prefers_json()) && follow {
-        anyhow::bail!("`palyra logs --follow --json` is not supported; use NDJSON output instead");
-    }
-
     let lines = lines.clamp(1, 500);
     let input = resolve_log_input(db_path.clone())?;
     match input {
@@ -122,6 +120,13 @@ pub(crate) fn run_logs(
             run_unavailable_logs(db_path, lines, follow, poll_interval_ms, message, json)
         }
     }
+}
+
+fn ensure_follow_output_supported(follow: bool, json: bool) -> Result<()> {
+    if follow && json {
+        anyhow::bail!("`palyra logs --follow --json` is not supported; use NDJSON output instead");
+    }
+    Ok(())
 }
 
 async fn run_console_logs(
@@ -461,7 +466,10 @@ fn emit_log_record(record: &CliLogRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_follow_file_records, collect_recent_file_records, ConsoleLogFailure};
+    use super::{
+        collect_follow_file_records, collect_recent_file_records, ensure_follow_output_supported,
+        ConsoleLogFailure,
+    };
     use std::fs;
     use tempfile::tempdir;
 
@@ -477,6 +485,16 @@ mod tests {
         let failure = ConsoleLogFailure::from_error(anyhow::anyhow!("stream failed"), true);
 
         assert!(!failure.allows_local_fallback());
+    }
+
+    #[test]
+    fn follow_rejects_json_before_selecting_a_log_source() {
+        let error = ensure_follow_output_supported(true, true)
+            .expect_err("follow mode cannot emit one JSON document");
+
+        assert!(error.to_string().contains("--follow --json"));
+        assert!(ensure_follow_output_supported(true, false).is_ok());
+        assert!(ensure_follow_output_supported(false, true).is_ok());
     }
 
     #[test]
