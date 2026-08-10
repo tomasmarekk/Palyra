@@ -1304,12 +1304,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             .await;
             return outcome;
         }
-        let execution_input_json = process_runner_input_with_launch_context_env(
-            runtime_state,
-            context,
-            facade_input_json.as_slice(),
-        )
-        .await;
+        let execution_input_json = facade_input_json;
         let ssh_health_authority = if context.execution_backend
             == ExecutionBackendPreference::SshTunnel
         {
@@ -3824,12 +3819,12 @@ async fn process_runner_tool_config_for_session(
     config
 }
 
-async fn process_runner_input_with_launch_context_env(
+pub(crate) async fn process_runner_input_with_launch_context_env(
     runtime_state: &Arc<GatewayRuntimeState>,
-    context: ToolRuntimeExecutionContext<'_>,
+    run_id: &str,
     input_json: &[u8],
 ) -> Vec<u8> {
-    let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
+    let path_env = run_launch_context_path_env(runtime_state, run_id).await;
     process_runner_input_with_path_env(input_json, &path_env).unwrap_or_else(|| input_json.to_vec())
 }
 

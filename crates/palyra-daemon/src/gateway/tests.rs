@@ -837,7 +837,7 @@ async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_rep
 }
 
 #[test]
-fn process_runner_input_inherits_launch_path_env_when_missing() {
+fn process_runner_approval_input_inherits_launch_path_env_when_missing() {
     let tempdir = gateway_tempdir("gateway-");
     let e2e_home = tempdir.path().join("home");
     let e2e_os_root = tempdir.path().join("os-root");

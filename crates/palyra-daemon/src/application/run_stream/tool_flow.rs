@@ -92,11 +92,13 @@ use crate::{
         await_tool_approval_response, best_effort_mark_approval_error,
         build_and_ingest_tool_result_memory_summary,
         execute_tool_with_runtime_dispatch_with_cancellation_and_progress,
-        record_tool_execution_outcome_metrics, shared_tool_budget, shared_tool_budget_remaining,
+        process_runner_input_with_launch_context_env, record_tool_execution_outcome_metrics,
+        shared_tool_budget, shared_tool_budget_remaining,
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
         RunStreamToolExecutionOutcome, SharedToolBudget, ToolApprovalOutcome,
-        ToolRuntimeDispatchControls, ToolRuntimeExecutionContext, PROCESS_RUNNER_TOOL_NAME,
-        SESSIONS_SPAWN_TOOL_NAME, SESSIONS_YIELD_TOOL_NAME, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+        ToolRuntimeDispatchControls, ToolRuntimeExecutionContext, PROCESS_RUNNER_ALIAS_TOOL_NAME,
+        PROCESS_RUNNER_TOOL_NAME, SESSIONS_SPAWN_TOOL_NAME, SESSIONS_YIELD_TOOL_NAME,
+        TOOL_APPROVAL_RESPONSE_TIMEOUT,
     },
     journal::{
         ApprovalCreateRequest, ApprovalResolveRequest, OrchestratorTapeAppendRequest,
@@ -657,6 +659,17 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         tape_seq,
     )
     .await?;
+    if matches!(
+        execution_tool_name.as_str(),
+        PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME
+    ) {
+        execution_input_json = process_runner_input_with_launch_context_env(
+            runtime_state,
+            run_id,
+            execution_input_json.as_slice(),
+        )
+        .await;
+    }
 
     let mut preparation = prepare_run_stream_tool_proposal_execution(
         sender,
