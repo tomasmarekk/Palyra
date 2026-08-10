@@ -1104,6 +1104,28 @@ last_used_at_unix_ms = 3
 }
 
 #[test]
+fn desktop_profile_catalog_rejects_path_escaping_profile_names() {
+    let _env_guard = lock_env();
+    let fixture = TempFixtureDir::new();
+    let _profiles_override = ScopedEnvVar::unset("PALYRA_CLI_PROFILES_PATH");
+    write_cli_profiles_file(
+        fixture.path(),
+        r#"
+version = 1
+default_profile = "../escape"
+
+[profiles."../escape"]
+mode = "local"
+"#,
+    );
+
+    let error = DesktopProfileCatalog::load(fixture.path())
+        .expect_err("path-escaping profile names must fail closed");
+
+    assert!(error.to_string().contains("profile name must use only"), "{error:#}");
+}
+
+#[test]
 fn portable_install_metadata_does_not_override_explicit_env_paths() {
     let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();

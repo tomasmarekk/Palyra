@@ -1049,6 +1049,9 @@ pub(crate) fn validate_profile_name(raw: &str) -> Result<String> {
     if normalized.len() > 64 {
         anyhow::bail!("profile name must be 64 characters or fewer");
     }
+    if matches!(normalized, "." | "..") {
+        anyhow::bail!("profile name must not be a filesystem dot segment");
+    }
     let is_valid = normalized
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'));
@@ -1538,9 +1541,9 @@ fn read_normalized_env_var(name: &str) -> Option<String> {
 mod tests {
     use super::{
         build_active_profile_context, build_root_context, cli_profiles_registry_path, context_cell,
-        ensure_bootstrap_local_profile, state_root_config_path, CliConnectionProfile,
-        ConnectionDefaults, ConnectionOverrides, ExplicitConfigPathPolicy, RootOptions,
-        CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
+        ensure_bootstrap_local_profile, state_root_config_path, validate_profile_name,
+        CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, ExplicitConfigPathPolicy,
+        RootOptions, CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
@@ -1585,6 +1588,14 @@ mod tests {
                 Some(value) => env::set_var(self.key, value),
                 None => env::remove_var(self.key),
             }
+        }
+    }
+
+    #[test]
+    fn profile_names_reject_filesystem_dot_segments() {
+        for name in [".", ".."] {
+            let error = validate_profile_name(name).expect_err("dot segment must fail closed");
+            assert!(error.to_string().contains("filesystem dot segment"));
         }
     }
 

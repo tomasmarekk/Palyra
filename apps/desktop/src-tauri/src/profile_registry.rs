@@ -72,8 +72,11 @@ impl DesktopProfileCatalog {
     pub(crate) fn load(base_state_root: &Path) -> Result<Self> {
         let registry_path = resolve_cli_profiles_registry_path(base_state_root)?;
         let document = load_profiles_document(registry_path.as_deref())?;
+        let default_profile_name =
+            document.default_profile.as_deref().map(validate_profile_name).transpose()?;
         let mut profiles = BTreeMap::new();
         for (name, profile) in document.profiles {
+            let name = validate_profile_name(name.as_str())?;
             profiles.insert(name.clone(), resolve_profile(name.as_str(), profile)?);
         }
         if !profiles.contains_key(IMPLICIT_DESKTOP_PROFILE_NAME) {
@@ -82,11 +85,31 @@ impl DesktopProfileCatalog {
                 implicit_profile_from_environment(IMPLICIT_DESKTOP_PROFILE_NAME)?,
             );
         }
-        Ok(Self {
-            default_profile_name: normalize_optional_text(document.default_profile.as_deref()),
-            profiles,
-        })
+        Ok(Self { default_profile_name, profiles })
     }
+}
+
+/// Keeps registry keys safe for use as one derived runtime-root path segment.
+fn validate_profile_name(raw: &str) -> Result<String> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("profile name cannot be empty");
+    }
+    if normalized.len() > 64 {
+        anyhow::bail!("profile name must be 64 characters or fewer");
+    }
+    if matches!(normalized, "." | "..") {
+        anyhow::bail!("profile name must not be a filesystem dot segment");
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "profile name must use only lowercase ASCII letters, digits, '.', '-', or '_'"
+        );
+    }
+    Ok(normalized.to_owned())
 }
 
 fn resolve_cli_profiles_registry_path(base_state_root: &Path) -> Result<Option<PathBuf>> {
