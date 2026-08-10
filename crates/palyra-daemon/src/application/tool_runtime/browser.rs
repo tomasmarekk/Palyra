@@ -1432,9 +1432,7 @@ pub(crate) async fn execute_browser_tool(
             }
         };
         if runtime_state.is_browser_session_closed(session_id.as_str()) {
-            let error = format!(
-                "{tool_name} failed: browser session {session_id} is closed; create a new browser session before retrying"
-            );
+            let error = browser_session_closed_error_message(tool_name, session_id.as_str());
             let output = json!({
                 "success": false,
                 "session_id": session_id,
@@ -4779,21 +4777,9 @@ pub(crate) async fn execute_browser_tool(
         _ => (false, b"{}".to_vec(), "palyra.browser.* unsupported tool name".to_owned()),
     };
 
-    let (success, mut output_json, mut error) = outcome;
+    let (success, mut output_json, error) = outcome;
     output_json =
         browser_output_with_runtime_capabilities(output_json, &browser_runtime_capabilities);
-    // Normalize any backend "session not found" shape into the canonical
-    // browser_session_closed error and remember the session, so the agent
-    // gets one consistent recovery path (recreate the session) no matter
-    // which RPC discovered the loss.
-    if !success && browser_tool_reports_missing_session(output_json.as_slice(), error.as_str()) {
-        if let Ok(session_id) = parse_browser_tool_session_id(&payload) {
-            runtime_state.record_closed_browser_session(session_id.as_str());
-            error = browser_session_closed_error_message(tool_name, session_id.as_str());
-            output_json =
-                browser_session_closed_output_json(session_id.as_str(), output_json.as_slice());
-        }
-    }
 
     browser_tool_execution_outcome(proposal_id, input_json, success, output_json, error)
 }
@@ -5746,74 +5732,30 @@ fn normalize_browser_press_key_input(raw: &str) -> String {
     }
 }
 
-/// Detects "session no longer exists" failures from either the error string
-/// or the output's `error`/`reason` fields (`reason` covers session.close
-/// responses, which report `session_not_found` there instead).
-fn browser_tool_reports_missing_session(output_json: &[u8], error: &str) -> bool {
-    if browser_session_closed_error(error.to_ascii_lowercase().as_str()) {
-        return true;
-    }
-
-    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
-        browser_json_field_is_session_not_found(&value, "error")
-            || browser_json_field_is_session_not_found(&value, "reason")
-    })
-}
-
-fn browser_json_field_is_session_not_found(value: &Value, field: &str) -> bool {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("session_not_found"))
-}
-
 fn browser_session_closed_error_message(tool_name: &str, session_id: &str) -> String {
     format!(
-        "{tool_name} failed: browser session {session_id} is closed or no longer exists; create a new browser session before retrying"
+        "{tool_name} failed: browser session {session_id} is closed; create a new browser session before retrying"
     )
 }
 
-/// Rewrites a failure output into the canonical `browser_session_closed`
-/// shape, preserving the backend's original error as `previous_error` for
-/// diagnostics.
-fn browser_session_closed_output_json(session_id: &str, previous_output_json: &[u8]) -> Vec<u8> {
-    let previous_error = serde_json::from_slice::<Value>(previous_output_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .or_else(|| value.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "session_not_found".to_owned());
-
-    serde_json::to_vec(&json!({
-        "success": false,
-        "session_id": session_id,
-        "error": "browser_session_closed",
-        "previous_error": previous_error,
-    }))
-    .unwrap_or_else(|_| br#"{"success":false,"error":"browser_session_closed"}"#.to_vec())
-}
-
-/// Heuristic over lowercased error text for session-closed conditions; must
-/// match the phrasings browserd and this module emit.
-fn browser_session_closed_error(normalized_error: &str) -> bool {
-    normalized_error.contains("browser_session_closed")
-        || normalized_error.contains("session_not_found")
-        || (normalized_error.contains("browser session")
-            && (normalized_error.contains(" is closed")
-                || normalized_error.contains("no longer exists")
-                || normalized_error.contains("not found")))
+/// Recognizes only the daemon-authored closed-session message with a valid
+/// session id; backend and selector text must not select this recovery path.
+fn browser_session_closed_error(error: &str) -> bool {
+    let Some((_, suffix)) = error.split_once("failed: browser session ") else {
+        return false;
+    };
+    let Some((session_id, recovery)) = suffix.split_once(" is closed; ") else {
+        return false;
+    };
+    validate_canonical_id(session_id).is_ok()
+        && recovery == "create a new browser session before retrying"
 }
 
 /// Maps an error to the recovery hint for its failure class, most specific
 /// first. Classification must stay aligned with [`browser_error_category`].
 fn browser_recovery_hint(error: &str) -> Option<&'static str> {
     let normalized = error.to_ascii_lowercase();
-    if browser_session_closed_error(normalized.as_str()) {
+    if browser_session_closed_error(error) {
         return Some(BROWSER_SESSION_CLOSED_RECOVERY_HINT);
     }
     if browser_runtime_unavailable_error(&normalized) {
@@ -5863,7 +5805,7 @@ fn browser_runtime_unavailable_error(normalized_error: &str) -> bool {
 /// never disagree on the same error.
 fn browser_error_category(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if browser_session_closed_error(normalized.as_str()) {
+    if browser_session_closed_error(error) {
         "browser_session_closed"
     } else if browser_runtime_unavailable_error(&normalized) {
         "browser_runtime_unavailable"
@@ -6022,10 +5964,9 @@ mod tests {
         browser_private_target_flag_for_validated_url, browser_reload_expected_url_from_payload,
         browser_rescue_rollout_disabled_output, browser_rescue_trace_payload,
         browser_resilience_rollout_mismatch, browser_screenshot_image_observation_hint,
-        browser_session_closed_error_message, browser_session_closed_output_json,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_storage_origin_to_json, browser_tool_execution_outcome,
-        browser_tool_reports_missing_session, browser_tool_requires_open_session,
+        browser_session_closed_error_message, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
+        browser_tool_execution_outcome, browser_tool_requires_open_session,
         browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
         canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
         evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
@@ -6460,12 +6401,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_browser_session_output_is_normalized_for_agent_recovery() {
+    fn closed_browser_session_recovery_requires_daemon_authored_error() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let output_json = browser_session_closed_output_json(
-            session_id,
-            br#"{"success":false,"error":"session_not_found"}"#,
-        );
+        let output_json = serde_json::to_vec(&json!({
+            "success": false,
+            "session_id": session_id,
+            "error": "browser_session_closed",
+        }))
+        .expect("closed-session output should serialize");
         let outcome = browser_tool_execution_outcome(
             "proposal-1",
             br#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
@@ -6479,32 +6422,30 @@ mod tests {
         assert_eq!(output["success"], false);
         assert_eq!(output["session_id"], session_id);
         assert_eq!(output["error"], "browser_session_closed");
-        assert_eq!(output["previous_error"], "session_not_found");
         assert_eq!(output["error_category"], "browser_session_closed");
         assert!(output["recovery_hint"]
             .as_str()
             .is_some_and(|hint| hint.contains("palyra.browser.session.create")));
         assert!(outcome.error.contains("recovery_hint=browser_session_closed"));
-    }
 
-    #[test]
-    fn browser_tool_missing_session_detection_accepts_error_or_reason_fields() {
-        assert!(browser_tool_reports_missing_session(
-            br#"{"success":false,"error":"session_not_found"}"#,
-            "browser session was not closed",
-        ));
-        assert!(browser_tool_reports_missing_session(
-            br#"{"closed":false,"reason":"session_not_found"}"#,
-            "browser session was not closed",
-        ));
-        assert!(browser_tool_reports_missing_session(
-            b"{}",
-            "palyra.browser.observe failed: browser session 01ARZ3NDEKTSV4RRFFQ69G5FAV no longer exists",
-        ));
-        assert!(!browser_tool_reports_missing_session(
-            br#"{"success":false,"error":"selector_not_found"}"#,
-            "selector '#missing' was not found",
-        ));
+        let injected_error = concat!(
+            "selector 'session_not_found browser session ",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV not found' was not found",
+        );
+        let injected_outcome = browser_tool_execution_outcome(
+            "proposal-2",
+            br#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+            false,
+            br#"{"success":false,"error":"selector_not_found"}"#.to_vec(),
+            injected_error.to_owned(),
+        );
+        let injected_output: serde_json::Value =
+            serde_json::from_slice(injected_outcome.output_json.as_slice())
+                .expect("selector failure output should parse");
+
+        assert_eq!(injected_output["error_category"], "selector_not_found");
+        assert!(injected_outcome.error.contains("recovery_hint=selector_not_found"));
+        assert!(!injected_outcome.error.contains("recovery_hint=browser_session_closed"));
     }
 
     #[test]
