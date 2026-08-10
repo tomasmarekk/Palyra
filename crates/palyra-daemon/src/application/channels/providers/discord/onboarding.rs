@@ -71,6 +71,39 @@ struct DiscordOnboardingConfigRollback {
     previous_content: Option<String>,
 }
 
+enum DiscordOnboardingVaultRollback {
+    DeleteNewSecret,
+    RestorePrevious(palyra_vault::SensitiveBytes),
+}
+
+impl DiscordOnboardingVaultRollback {
+    fn capture(vault: &palyra_vault::Vault, parsed_ref: &VaultRef) -> Result<Self, String> {
+        match vault.get_secret(&parsed_ref.scope, parsed_ref.key.as_str()) {
+            Ok(secret) => Ok(Self::RestorePrevious(palyra_vault::SensitiveBytes::new(secret))),
+            Err(palyra_vault::VaultError::NotFound) => Ok(Self::DeleteNewSecret),
+            Err(error) => {
+                Err(format!("failed to snapshot discord onboarding token from vault: {error}"))
+            }
+        }
+    }
+
+    fn restore(&self, vault: &palyra_vault::Vault, parsed_ref: &VaultRef) -> Result<(), String> {
+        match self {
+            Self::DeleteNewSecret => vault
+                .delete_secret(&parsed_ref.scope, parsed_ref.key.as_str())
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("failed to delete discord onboarding token from vault: {error}")
+                }),
+            Self::RestorePrevious(secret) => vault
+                .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), secret.as_ref())
+                .map_err(|error| {
+                    format!("failed to restore discord onboarding token in vault: {error}")
+                }),
+        }
+    }
+}
+
 impl DiscordOnboardingConfigRollback {
     fn restore(&self) -> Result<(), String> {
         match &self.previous_content {
@@ -148,6 +181,12 @@ pub(crate) async fn apply_discord_onboarding(
             "failed to parse discord token vault ref: {error}"
         )))
     })?;
+    let vault_rollback = DiscordOnboardingVaultRollback::capture(state.vault.as_ref(), &parsed_ref)
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to prepare discord token update: {error}"
+            )))
+        })?;
     state
         .vault
         .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), evaluation.token.as_bytes())
@@ -163,6 +202,7 @@ pub(crate) async fn apply_discord_onboarding(
             rollback_discord_onboarding_after_failure(
                 state,
                 &parsed_ref,
+                &vault_rollback,
                 None,
                 evaluation.plan.connector_id.as_str(),
                 !connector_existed,
@@ -178,6 +218,7 @@ pub(crate) async fn apply_discord_onboarding(
             rollback_discord_onboarding_after_failure(
                 state,
                 &parsed_ref,
+                &vault_rollback,
                 Some(&config_write.rollback),
                 evaluation.plan.connector_id.as_str(),
                 !connector_existed,
@@ -219,6 +260,7 @@ pub(crate) async fn apply_discord_onboarding(
 fn rollback_discord_onboarding_after_failure(
     state: &AppState,
     parsed_ref: &VaultRef,
+    vault_rollback: &DiscordOnboardingVaultRollback,
     config_rollback: Option<&DiscordOnboardingConfigRollback>,
     connector_id: &str,
     remove_created_connector: bool,
@@ -229,9 +271,9 @@ fn rollback_discord_onboarding_after_failure(
             discord_onboarding_rollback_error_response(failed_stage, error.as_str())
         })?;
     }
-    rollback_discord_onboarding_vault_secret(state.vault.as_ref(), parsed_ref).map_err(
-        |error| discord_onboarding_rollback_error_response(failed_stage, error.as_str()),
-    )?;
+    vault_rollback.restore(state.vault.as_ref(), parsed_ref).map_err(|error| {
+        discord_onboarding_rollback_error_response(failed_stage, error.as_str())
+    })?;
     if remove_created_connector {
         state.channels.remove_connector(connector_id).map_err(|error| {
             let message = error.to_string();
@@ -239,15 +281,6 @@ fn rollback_discord_onboarding_after_failure(
         })?;
     }
     Ok(())
-}
-
-fn rollback_discord_onboarding_vault_secret(
-    vault: &palyra_vault::Vault,
-    parsed_ref: &VaultRef,
-) -> Result<bool, String> {
-    vault
-        .delete_secret(&parsed_ref.scope, parsed_ref.key.as_str())
-        .map_err(|error| format!("failed to delete discord onboarding token from vault: {error}"))
 }
 
 fn discord_onboarding_rollback_error_response(
@@ -1368,7 +1401,7 @@ mod tests {
     use palyra_vault::{BackendPreference, Vault, VaultConfig, VaultError, VaultRef};
     use tempfile::tempdir;
 
-    use super::{rollback_discord_onboarding_vault_secret, DiscordOnboardingConfigRollback};
+    use super::{DiscordOnboardingConfigRollback, DiscordOnboardingVaultRollback};
 
     #[test]
     fn discord_onboarding_config_rollback_restores_previous_content() {
@@ -1391,7 +1424,33 @@ mod tests {
     }
 
     #[test]
-    fn discord_onboarding_vault_rollback_deletes_stored_token() {
+    fn discord_onboarding_vault_rollback_deletes_new_token() {
+        let temp = tempdir().expect("tempdir should be created");
+        let vault = Vault::open_with_config(VaultConfig {
+            root: Some(temp.path().join("vault")),
+            identity_store_root: Some(temp.path().join("identity")),
+            backend_preference: BackendPreference::EncryptedFile,
+            max_secret_bytes: 1024,
+        })
+        .expect("vault should open");
+        let parsed_ref =
+            VaultRef::parse("channel:discord:default/bot_token").expect("vault ref should parse");
+        let rollback = DiscordOnboardingVaultRollback::capture(&vault, &parsed_ref)
+            .expect("missing token should be captured");
+        vault
+            .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), b"discord-token")
+            .expect("token should be stored");
+
+        rollback.restore(&vault, &parsed_ref).expect("rollback should delete token");
+
+        assert!(matches!(
+            vault.get_secret(&parsed_ref.scope, parsed_ref.key.as_str()),
+            Err(VaultError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn discord_onboarding_vault_rollback_restores_previous_token() {
         let temp = tempdir().expect("tempdir should be created");
         let vault = Vault::open_with_config(VaultConfig {
             root: Some(temp.path().join("vault")),
@@ -1403,16 +1462,21 @@ mod tests {
         let parsed_ref =
             VaultRef::parse("channel:discord:default/bot_token").expect("vault ref should parse");
         vault
-            .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), b"discord-token")
-            .expect("token should be stored");
+            .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), b"previous-token")
+            .expect("previous token should be stored");
+        let rollback = DiscordOnboardingVaultRollback::capture(&vault, &parsed_ref)
+            .expect("previous token should be captured");
+        vault
+            .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), b"replacement-token")
+            .expect("replacement token should be stored");
 
-        let deleted = rollback_discord_onboarding_vault_secret(&vault, &parsed_ref)
-            .expect("rollback should delete token");
+        rollback.restore(&vault, &parsed_ref).expect("rollback should restore token");
 
-        assert!(deleted);
-        assert!(matches!(
-            vault.get_secret(&parsed_ref.scope, parsed_ref.key.as_str()),
-            Err(VaultError::NotFound)
-        ));
+        assert_eq!(
+            vault
+                .get_secret(&parsed_ref.scope, parsed_ref.key.as_str())
+                .expect("restored token should be readable"),
+            b"previous-token"
+        );
     }
 }
