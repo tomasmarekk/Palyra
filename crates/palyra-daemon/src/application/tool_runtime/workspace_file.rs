@@ -3278,7 +3278,7 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_preserves_public_benchmark_password_fixtures() {
+    fn read_workspace_file_redacts_weak_password_values() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("verify.sh");
         let contents = "ENV PASSWORD=password1\nsend \"password\\r\"\npassword: password\n";
@@ -3295,11 +3295,15 @@ mod tests {
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
             .expect("workspace file should be readable");
 
-        assert!(!output.redacted);
-        assert_eq!(output.text.as_deref(), Some(contents));
-        assert_eq!(output.text_authoritative, None);
-        assert_eq!(output.redaction_notice, None);
-        assert_eq!(output.redaction_reasons, None);
+        let text = output.text.as_deref().expect("redacted text should be returned");
+        assert!(output.redacted);
+        assert_eq!(output.text_authoritative, Some(false));
+        assert!(text.contains("ENV PASSWORD=[REDACTED_SECRET]"));
+        assert!(text.contains("password: [REDACTED_SECRET]"));
+        assert!(!text.contains("password1"));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == "secret_leak.assignment.password")
+        }));
     }
 
     #[test]

@@ -2111,7 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn os_file_read_preserves_public_password_fixture_values() {
+    fn os_file_read_redacts_weak_password_values() {
         let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("Dockerfile");
@@ -2140,9 +2140,14 @@ mod tests {
         )
         .expect("absolute user path read should succeed");
 
-        assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(false));
-        assert_eq!(read.get("text").and_then(Value::as_str), Some(contents));
-        assert_eq!(read.get("redaction_reasons"), Some(&Value::Null));
+        assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(true));
+        let text = read.get("text").and_then(Value::as_str).expect("redacted text");
+        assert!(text.contains("ENV PASSWORD=[REDACTED_SECRET]"));
+        assert!(text.contains("RUN echo password"));
+        assert!(!text.contains("password1"));
+        assert!(read.get("redaction_reasons").and_then(Value::as_array).is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason == "secret_leak.assignment.password")
+        }));
     }
 
     #[test]

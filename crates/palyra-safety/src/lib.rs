@@ -1195,10 +1195,7 @@ fn comparison_value_requires_redaction(classification: &str, value: &str) -> boo
     let Some(literal) = comparison_literal_value(value) else {
         return false;
     };
-    if literal.is_empty()
-        || is_benign_mock_credential_fixture_value(literal)
-        || is_obvious_placeholder_secret_value(literal)
-    {
+    if literal.is_empty() || is_obvious_placeholder_secret_value(literal) {
         return false;
     }
     if classification == "token" {
@@ -1369,7 +1366,6 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_env_identifier_reference_expression(key, reference)
         || is_safe_standalone_env_identifier_literal(raw_key, key, reference)
         || is_vault_reference_value(reference)
-        || is_benign_mock_credential_fixture_value(reference)
         || (sensitive_assignment_key_allows_path_reference(key)
             && is_benign_path_reference_value(reference))
         || is_dom_input_value_reference(reference)
@@ -1606,10 +1602,7 @@ fn is_benign_mock_credential_fixture_value(value: &str) -> bool {
         .trim_matches(['"', '\'', '`'])
         .to_ascii_lowercase()
         .replace(['-', ' '], "_");
-    matches!(
-        normalized.as_str(),
-        "demo" | "demo/demo" | "test" | "test/test" | "password" | "password1" | "git"
-    )
+    matches!(normalized.as_str(), "demo" | "demo/demo" | "test" | "test/test")
 }
 
 fn is_benign_path_reference_value(value: &str) -> bool {
@@ -3801,7 +3794,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_login_fixture_credentials_and_comparisons_are_not_redacted() {
+    fn mock_login_fixture_password_comparison_is_redacted() {
         let source = "const sessionKey = \"s058.mockSession\";\n\
                       const credentials = { username: \"demo\", password: \"demo/demo\" };\n\
                       if (username === \"demo\" && password === \"demo\") {\n\
@@ -3814,16 +3807,14 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
-        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted);
         assert!(outcome.redacted_text.contains("demo/demo"));
-        assert!(outcome.redacted_text.contains("password === \"demo\""));
-        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
-        assert!(!outcome
+        assert!(outcome.redacted_text.contains("password === \"[REDACTED_SECRET]\""));
+        assert!(outcome
             .scan
             .finding_codes()
             .iter()
-            .any(|code| code.starts_with("secret_leak.assignment.")));
+            .any(|code| code == "secret_leak.assignment.password"));
     }
 
     #[test]
@@ -3910,7 +3901,7 @@ mod tests {
     }
 
     #[test]
-    fn public_benchmark_password_fixture_values_are_not_redacted() {
+    fn weak_password_fixture_values_are_redacted() {
         let source = "ENV PASSWORD=password1\n\
                       send \"password\\r\"\n\
                       password: password\n\
@@ -3923,16 +3914,18 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
-        assert_eq!(outcome.redacted_text, source);
-        assert!(outcome.redacted_text.contains("PASSWORD=password1"));
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("PASSWORD=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("password: [REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("password=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("send \"password\\r\""));
         assert!(outcome.redacted_text.contains("add_special_tokens=False"));
-        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
-        assert!(!outcome
+        assert!(!outcome.redacted_text.contains("password1"));
+        assert!(outcome
             .scan
             .finding_codes()
             .iter()
-            .any(|code| code.starts_with("secret_leak.assignment.")));
+            .any(|code| code == "secret_leak.assignment.password"));
     }
 
     #[test]
