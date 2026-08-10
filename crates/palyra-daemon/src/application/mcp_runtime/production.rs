@@ -34,7 +34,7 @@ use reqwest::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::{
@@ -104,6 +104,7 @@ const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RESOURCE_LEASE: Duration = Duration::from_secs(60);
 const DEFAULT_ELICITATION_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const MCP_SAMPLING_LEASE_WAIT_MS: u64 = 5_000;
+const MCP_BROKER_MAX_CONCURRENT_WORKERS: usize = 1;
 const MCP_BROKER_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const REMOTE_CONTENT_TYPE_JSON: &str = "application/json";
@@ -117,6 +118,7 @@ pub(crate) struct McpProductionRuntime {
     registry: Arc<McpActorRegistry>,
     transport: McpRuntimeTransport,
     broker: Mutex<McpBroker>,
+    broker_worker_slots: Arc<Semaphore>,
     supervisor: Arc<Mutex<McpRuntimeSupervisor>>,
     discovery_reports: RwLock<Vec<McpToolDiscoveryReport>>,
     authorities: Arc<RwLock<BTreeMap<String, Arc<McpCatalogAuthority>>>>,
@@ -196,6 +198,7 @@ impl McpProductionRuntime {
             registry,
             transport,
             broker: Mutex::new(broker),
+            broker_worker_slots: Arc::new(Semaphore::new(MCP_BROKER_MAX_CONCURRENT_WORKERS)),
             supervisor,
             discovery_reports: RwLock::new(Vec::new()),
             authorities,
@@ -290,6 +293,7 @@ impl McpProductionRuntime {
                 format!("MCP tool '{tool_name}' is not in the active catalog"),
             )
         })?;
+        let worker_permit = acquire_broker_worker_slot(&self.broker_worker_slots)?;
         self.registry
             .wait_until_ready(server_id.as_str(), DEFAULT_HANDSHAKE_TIMEOUT)
             .await
@@ -301,13 +305,14 @@ impl McpProductionRuntime {
             })?;
         let production = Arc::clone(self);
         let (result_sender, result_receiver) = oneshot::channel();
-        // The synchronous broker composes catalog, policy, projection, and
-        // transport frames. Keep that stack off Tokio's smaller shared
-        // blocking workers while preserving the same non-cancellable drain.
+        // The broker mutex already serializes this path. Admit only one worker
+        // before reserving its large native stack so contenders cannot consume
+        // process-wide thread or memory capacity while waiting for that lock.
         thread::Builder::new()
             .name("palyra-mcp-broker".to_owned())
             .stack_size(MCP_BROKER_WORKER_STACK_BYTES)
             .spawn(move || {
+                let _worker_permit = worker_permit;
                 let result = production
                     .broker
                     .lock()
@@ -693,6 +698,17 @@ impl McpProductionRuntime {
             reports.sort_by(|left, right| left.server_name.cmp(&right.server_name));
         }
     }
+}
+
+fn acquire_broker_worker_slot(
+    worker_slots: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, crate::application::mcp_broker::McpBrokerError> {
+    Arc::clone(worker_slots).try_acquire_owned().map_err(|_| {
+        crate::application::mcp_broker::McpBrokerError::new(
+            "mcp.broker_backpressure",
+            "MCP broker worker capacity is exhausted; retry after the active invocation completes",
+        )
+    })
 }
 
 /// Production MCP assembly failure.
@@ -2994,6 +3010,19 @@ mod tests {
 
     use super::*;
     use crate::application::local_resource_governor::LocalResourceGovernorConfig;
+
+    #[test]
+    fn broker_worker_admission_rejects_over_capacity_and_recovers() {
+        let worker_slots = Arc::new(Semaphore::new(1));
+        let active = acquire_broker_worker_slot(&worker_slots).expect("first worker is admitted");
+
+        let error = acquire_broker_worker_slot(&worker_slots)
+            .expect_err("a concurrent worker must receive backpressure");
+        assert_eq!(error.reason_code, "mcp.broker_backpressure");
+
+        drop(active);
+        assert!(acquire_broker_worker_slot(&worker_slots).is_ok());
+    }
 
     struct UnavailableConnector;
 
