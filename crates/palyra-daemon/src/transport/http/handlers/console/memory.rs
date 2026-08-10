@@ -32,13 +32,13 @@ use crate::journal::{
 use crate::*;
 use crate::{
     application::learning::{
-        apply_patch_learning_candidate, apply_preference_candidate, learning_graph_projection,
-        learning_memory_mutation_plan_for_candidate, preference_procedure_conflict_report,
-        project_skill_invocation_hygiene_for_candidate, shadow_learning_candidate_lifecycle,
-        LearningCurator, LearningCuratorInput, LearningCuratorReport, LearningGraphProjectionInput,
-        LearningMemoryMutationPlan, LearningMemoryMutationPlanRequest,
-        PreferenceProcedureConflictReport, LEARNING_CURATOR_EVENT_REPORT_CREATED,
-        LEARNING_MEMORY_MUTATION_PLAN_EVENT_COMPLETED,
+        apply_patch_learning_candidate, apply_preference_candidate, learning_eval_gate_passed,
+        learning_graph_projection, learning_memory_mutation_plan_for_candidate,
+        preference_procedure_conflict_report, project_skill_invocation_hygiene_for_candidate,
+        shadow_learning_candidate_lifecycle, LearningCurator, LearningCuratorInput,
+        LearningCuratorReport, LearningGraphProjectionInput, LearningMemoryMutationPlan,
+        LearningMemoryMutationPlanRequest, PreferenceProcedureConflictReport,
+        LEARNING_CURATOR_EVENT_REPORT_CREATED, LEARNING_MEMORY_MUTATION_PLAN_EVENT_COMPLETED,
     },
     application::memory_provider::{
         explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
@@ -1086,7 +1086,7 @@ pub(crate) async fn console_learning_candidate_history_handler(
         .map_err(runtime_status_response)?;
     let evals = state
         .runtime
-        .list_learning_candidate_evals(candidate.candidate_id.clone(), 64)
+        .list_learning_candidate_evals(candidate.candidate_id.clone(), 256)
         .await
         .map_err(runtime_status_response)?;
     let rollouts = state
@@ -1321,7 +1321,7 @@ pub(crate) async fn console_learning_candidate_eval_handler(
         .map_err(runtime_status_response)?;
     let evals = state
         .runtime
-        .list_learning_candidate_evals(candidate.candidate_id.clone(), 64)
+        .list_learning_candidate_evals(candidate.candidate_id.clone(), 256)
         .await
         .map_err(runtime_status_response)?;
     let rollouts = state
@@ -2834,8 +2834,7 @@ fn learning_candidate_state_machine(
 ) -> Value {
     let requires_review = learning_candidate_requires_review(candidate);
     let requires_eval = learning_candidate_requires_eval(candidate);
-    let eval_passed =
-        evals.iter().any(|eval| eval.decision == "pass" && eval.score >= eval.threshold);
+    let eval_passed = learning_eval_gate_passed(evals);
     let reviewed = matches!(
         candidate.status.as_str(),
         "approved" | "accepted" | "eval_passed" | "applied" | "deployed"

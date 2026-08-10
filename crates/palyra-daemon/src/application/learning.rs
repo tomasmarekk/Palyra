@@ -45,9 +45,9 @@ use crate::{
     },
     gateway::{GatewayRuntimeState, LearningRuntimeConfig, RequestContext},
     journal::{
-        LearningCandidateCreateRequest, LearningCandidateRecord, LearningCandidateReviewRequest,
-        LearningCandidateRolloutCreateRequest, LearningPreferenceListFilter,
-        LearningPreferenceRecord, LearningPreferenceUpsertRequest,
+        LearningCandidateCreateRequest, LearningCandidateEvalRecord, LearningCandidateRecord,
+        LearningCandidateReviewRequest, LearningCandidateRolloutCreateRequest,
+        LearningPreferenceListFilter, LearningPreferenceRecord, LearningPreferenceUpsertRequest,
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
         OrchestratorBackgroundTaskRecord, OrchestratorSessionResolveRequest,
         OrchestratorSessionTranscriptRecord,
@@ -1714,17 +1714,42 @@ async fn ensure_learning_activation_gate(
         ));
     }
     let evals =
-        runtime_state.list_learning_candidate_evals(candidate.candidate_id.clone(), 16).await?;
-    let passed = evals.iter().any(|eval| {
-        matches!(eval.decision.as_str(), "pass" | "passed" | "approved")
-            && eval.score >= eval.threshold
-    });
-    if !passed {
+        runtime_state.list_learning_candidate_evals(candidate.candidate_id.clone(), 256).await?;
+    if !learning_eval_gate_passed(evals.as_slice()) {
         return Err(Status::failed_precondition(
             "risky learning candidate requires a passing eval before activation",
         ));
     }
     Ok(())
+}
+
+/// Requires the latest record for every observed evaluation suite to pass.
+///
+/// The caller supplies a bounded history; ordering is recomputed here so a
+/// stale pass cannot override a newer fail or hold record.
+#[must_use]
+pub(crate) fn learning_eval_gate_passed(evals: &[LearningCandidateEvalRecord]) -> bool {
+    let mut latest_by_suite = BTreeMap::<String, &LearningCandidateEvalRecord>::new();
+    for eval in evals {
+        let suite = eval.eval_suite.trim().to_ascii_lowercase();
+        if suite.is_empty() {
+            return false;
+        }
+        let replace = latest_by_suite.get(suite.as_str()).is_none_or(|current| {
+            (eval.created_at_unix_ms, eval.eval_id.as_str())
+                > (current.created_at_unix_ms, current.eval_id.as_str())
+        });
+        if replace {
+            latest_by_suite.insert(suite, eval);
+        }
+    }
+    !latest_by_suite.is_empty()
+        && latest_by_suite.values().all(|eval| {
+            matches!(
+                eval.decision.trim().to_ascii_lowercase().as_str(),
+                "pass" | "passed" | "approved"
+            ) && eval.score >= eval.threshold
+        })
 }
 
 fn learning_candidate_requires_eval(candidate: &LearningCandidateRecord) -> bool {
@@ -5092,6 +5117,42 @@ mod tests {
         assert!(projection.reason_codes.contains(&LearningLifecycleGateReasonCode::EvalRequired));
         assert!(!projection.active_memory_activation);
         assert!(!projection.trace_json.contains("candidate-1"));
+    }
+
+    #[test]
+    fn learning_eval_gate_requires_every_suite_head_to_pass() {
+        let eval = |eval_id: &str,
+                    eval_suite: &str,
+                    decision: &str,
+                    score: f64,
+                    created_at_unix_ms: i64| {
+            LearningCandidateEvalRecord {
+                eval_id: eval_id.to_owned(),
+                candidate_id: "candidate-1".to_owned(),
+                eval_suite: eval_suite.to_owned(),
+                result: decision.to_owned(),
+                threshold: 0.8,
+                score,
+                decision: decision.to_owned(),
+                actor_principal: "operator".to_owned(),
+                policy_decision: "operator_recorded_eval_gate".to_owned(),
+                evidence_refs_json: "[]".to_owned(),
+                created_at_unix_ms,
+            }
+        };
+        let mut evals = vec![
+            eval("security-fail", "security", "fail", 0.4, 30),
+            eval("smoke-pass", "smoke", "pass", 0.9, 20),
+            eval("security-old-pass", "security", "pass", 0.9, 10),
+        ];
+
+        assert!(!learning_eval_gate_passed(evals.as_slice()));
+
+        evals.push(eval("security-new-pass", "security", "pass", 0.95, 40));
+        assert!(learning_eval_gate_passed(evals.as_slice()));
+
+        evals.push(eval("smoke-hold", "smoke", "hold", 0.95, 50));
+        assert!(!learning_eval_gate_passed(evals.as_slice()));
     }
 
     #[test]
