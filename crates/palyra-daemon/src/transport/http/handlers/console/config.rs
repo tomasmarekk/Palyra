@@ -373,9 +373,6 @@ pub(crate) async fn apply_config_reload_for_context(
                 applied_steps.push(step.clone());
             }
         }
-        if current.mcp_servers != candidate.mcp_servers {
-            next_loaded.mcp_servers = candidate.mcp_servers.clone();
-        }
         let next_generation = state
             .configured_secrets
             .lock()
@@ -408,24 +405,6 @@ pub(crate) async fn apply_config_reload_for_context(
         }
         if current.memory != candidate.memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
-        }
-        if current.mcp_servers != candidate.mcp_servers {
-            state.runtime.try_configure_mcp_runtime_health(&next_loaded.mcp_servers).map_err(
-                |error| {
-                    runtime_status_response(tonic::Status::internal(format!(
-                        "failed to activate replacement MCP runtime health: {error}"
-                    )))
-                },
-            )?;
-            let reload_at_unix_ms = unix_ms_now().unwrap_or(0);
-            state
-                .mcp_supervisor
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .reload_from_config(&next_loaded.mcp_servers, reload_at_unix_ms);
-            if let Some(step) = plan.steps.iter().find(|step| step.config_path == "mcp_servers") {
-                applied_steps.push(step.clone());
-            }
         }
         {
             let mut loaded_guard =
@@ -633,13 +612,13 @@ fn build_reload_plan(
         steps.push(reload_plan_step(
             "mcp_runtime",
             "mcp_servers",
-            "hot_safe",
-            "MCP registry changes invalidate future tool catalogs without mutating active run snapshots",
+            "restart_required",
+            "persistent MCP actors, transports, and vault-bound process environments are owned by the startup runtime",
             "MCP import disabled until configured",
             "MCP registry validation plus vault-ref-only secret binding",
             "secret_refs_redacted",
-            "hot_safe",
-            "new runs use a refreshed MCP supervisor and catalog generation",
+            "restart_required",
+            "requires daemon restart to revoke existing actor and process owners before activating registry changes",
             "MCP server registry changed; command args, URLs, and vault refs are summarized without secret values",
         ));
     }
@@ -902,24 +881,53 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_reload_is_hot_safe_and_catalog_scoped() {
+    fn mcp_server_reload_requires_restart_for_process_revocation() {
         let current = loaded_with_model_provider(ModelProviderConfig::default());
         let mut candidate = current.clone();
         candidate.mcp_servers = test_mcp_servers_config();
 
         let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 3);
 
-        assert!(!plan.requires_restart);
-        assert!(plan.hot_safe_applicable);
-        assert_eq!(plan.summary.hot_safe, 1);
+        assert!(plan.requires_restart);
+        assert!(!plan.hot_safe_applicable);
+        assert_eq!(plan.summary.restart_required, 1);
         let step = plan
             .steps
             .iter()
             .find(|step| step.config_path == "mcp_servers")
             .expect("MCP reload step should be present");
-        assert_eq!(step.category, "hot_safe");
+        assert_eq!(step.category, "restart_required");
+        assert_eq!(step.reloadability, "restart_required");
         assert_eq!(step.component, "mcp_runtime");
-        assert!(step.reason.contains("active run snapshots"));
+        assert!(step.reason.contains("startup runtime"));
+        assert!(step.impact.contains("revoke existing actor and process owners"));
+    }
+
+    #[test]
+    fn mixed_reload_does_not_apply_restart_required_mcp_change() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let mut candidate = current.clone();
+        candidate.model_provider = openai_model_provider_config();
+        candidate.mcp_servers = test_mcp_servers_config();
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 0);
+
+        assert!(plan.hot_safe_applicable);
+        assert!(plan.requires_restart);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .find(|step| step.config_path == "model_provider")
+                .map(|step| step.category.as_str()),
+            Some("hot_safe")
+        );
+        assert_eq!(
+            plan.steps
+                .iter()
+                .find(|step| step.config_path == "mcp_servers")
+                .map(|step| step.category.as_str()),
+            Some("restart_required")
+        );
     }
 
     #[test]

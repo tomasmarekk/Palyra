@@ -8644,7 +8644,9 @@ impl GatewayRuntimeState {
         self.replace_managed_runtime_health_family(ManagedRuntimeHealthFamily::Plugin, plugin_ids)
     }
 
-    /// Re-activates the exact enabled MCP server inventory before supervisor reload.
+    /// Seeds MCP health authority for broker tests without exposing a live
+    /// config-reload path in production.
+    #[cfg(test)]
     pub(crate) fn try_configure_mcp_runtime_health(
         &self,
         config: &crate::config::McpServersConfig,
