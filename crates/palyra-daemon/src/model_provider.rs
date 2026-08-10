@@ -2302,13 +2302,9 @@ impl ModelProvider for RegistryBackedModelProvider {
                             runtime,
                         );
                         cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
-                        cached.qa_lane_attestation = qa_registry_provider_lane_attestation(
-                            request.qa_attestation_context.as_ref(),
-                            cached.qa_lane_attestation.take(),
-                            &self.config,
-                            model,
-                            runtime,
-                        )?;
+                        // Cache lookup deliberately clears this field: no provider adapter
+                        // executed for the current request, so there is no lane to attest.
+                        debug_assert!(cached.qa_lane_attestation.is_none());
                         self.record_runtime_metrics(
                             false,
                             cached.prompt_tokens,
@@ -10533,27 +10529,32 @@ turns:
         ))
         .expect("registry-backed provider should build");
 
-        let first = provider
-            .complete(ProviderRequest::from_input_text(
-                "cache me".to_owned(),
-                false,
-                Vec::new(),
-                None,
-            ))
-            .await
-            .expect("first upstream request should succeed");
+        let mut first_request =
+            ProviderRequest::from_input_text("cache me".to_owned(), false, Vec::new(), None);
+        first_request.qa_attestation_context = Some(QaProviderAttestationContext {
+            execution_key_digest: "e".repeat(64),
+            provider_binding_sha256: "a".repeat(64),
+        });
+        let first =
+            provider.complete(first_request).await.expect("first upstream request should succeed");
+        let mut second_request =
+            ProviderRequest::from_input_text("cache me".to_owned(), false, Vec::new(), None);
+        second_request.qa_attestation_context = Some(QaProviderAttestationContext {
+            execution_key_digest: "f".repeat(64),
+            provider_binding_sha256: "b".repeat(64),
+        });
         let second = provider
-            .complete(ProviderRequest::from_input_text(
-                "cache me".to_owned(),
-                false,
-                Vec::new(),
-                None,
-            ))
+            .complete(second_request)
             .await
             .expect("second request should be served from cache");
 
         assert!(!first.served_from_cache);
+        assert!(first.qa_lane_attestation.is_some());
         assert!(second.served_from_cache);
+        assert!(
+            second.qa_lane_attestation.is_none(),
+            "cache hits cannot attest a provider lane that did not execute"
+        );
         assert_eq!(second.attempts.len(), 1);
         let cache_state =
             second.attempts[0].state.as_ref().expect("cache hit should expose attempt state");
