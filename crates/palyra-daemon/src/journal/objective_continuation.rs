@@ -375,6 +375,15 @@ impl JournalStore {
         load_objective_attempt_by_column_tx(&guard, "continuation_task_ulid", continuation_task_id)
     }
 
+    /// Loads an attempt by its durable identity.
+    pub(crate) fn objective_attempt_by_id(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<ObjectiveContinuationAttemptRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_objective_attempt_tx(&guard, attempt_id)
+    }
+
     /// Loads the current runtime binding for one objective.
     pub(crate) fn objective_runtime_binding(
         &self,

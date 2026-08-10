@@ -221,6 +221,23 @@ async fn deliver_intent(
         .await?;
         return Ok(WakeDelivery::Deferred);
     }
+    if let Some(attempt) = objective_attempt_if_needed(runtime, &barrier).await? {
+        if !crate::application::objective_continuation::revalidate_continuation_policy(
+            runtime, &attempt,
+        )
+        .await?
+        {
+            settle_intent(
+                runtime,
+                intent.intent_id.clone(),
+                "cancelled",
+                WakeDecision::Cancel,
+                "wake.objective_continuation_not_authorized",
+            )
+            .await?;
+            return Ok(WakeDelivery::Cancelled);
+        }
+    }
     let task_id = intent.continuation_task_id.clone().unwrap_or_else(|| Ulid::new().to_string());
     let reserved = reserve_wake_task(runtime, intent.intent_id.clone(), task_id.clone()).await?;
     let WakeTaskReserveOutcome::Reserved(reserved) = reserved else {
@@ -337,6 +354,29 @@ async fn reserve_objective_task_if_needed(
             Err(Status::cancelled("user input preempted objective wake"))
         }
     }
+}
+
+async fn objective_attempt_if_needed(
+    runtime: &Arc<GatewayRuntimeState>,
+    barrier: &WaitBarrierV1,
+) -> Result<Option<ObjectiveContinuationAttemptRecord>, Status> {
+    if barrier.owner_kind != "objective_attempt" {
+        return Ok(None);
+    }
+    let state = Arc::clone(runtime);
+    let attempt_id = barrier.owner_id.clone();
+    tokio::task::spawn_blocking(move || {
+        state
+            .journal_store
+            .objective_attempt_by_id(attempt_id.as_str())
+            .map_err(wake_journal_status)
+    })
+    .await
+    .map_err(|_| Status::internal("objective wake lookup worker panicked"))?
+    .and_then(|attempt| {
+        attempt.ok_or_else(|| Status::failed_precondition("objective wake attempt is missing"))
+    })
+    .map(Some)
 }
 
 async fn mark_objective_task_enqueued(

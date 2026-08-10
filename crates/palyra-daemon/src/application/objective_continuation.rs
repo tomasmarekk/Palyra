@@ -485,12 +485,11 @@ async fn apply_decision(
         .await;
     }
     match attempt.decision {
-        ObjectiveContinuationDecision::Continue => continue_after_decision(runtime, &attempt).await,
+        ObjectiveContinuationDecision::Continue | ObjectiveContinuationDecision::Wait => {
+            continue_after_decision(runtime, &attempt).await
+        }
         ObjectiveContinuationDecision::Done => {
             finalize_after_decision(runtime, &attempt, &guard).await
-        }
-        ObjectiveContinuationDecision::Wait => {
-            crate::application::wake_coordinator::register_objective_wait(runtime, &attempt).await
         }
         ObjectiveContinuationDecision::Blocked => {
             pause_attempt(
@@ -522,15 +521,26 @@ async fn continue_after_decision(
     runtime: &Arc<GatewayRuntimeState>,
     attempt: &ObjectiveContinuationAttemptRecord,
 ) -> Result<(), Status> {
+    if !revalidate_continuation_policy(runtime, attempt).await? {
+        return Ok(());
+    }
+    crate::application::wake_coordinator::register_objective_wait(runtime, attempt).await
+}
+
+pub(crate) async fn revalidate_continuation_policy(
+    runtime: &Arc<GatewayRuntimeState>,
+    attempt: &ObjectiveContinuationAttemptRecord,
+) -> Result<bool, Status> {
     let lifecycle = runtime.daemon_lifecycle_snapshot()?;
     if lifecycle.phase != DaemonLifecyclePhase::Running {
-        return pause_attempt(
+        pause_attempt(
             runtime,
             attempt,
             "objective.continuation.daemon_draining",
             "Daemon drain stopped autonomous continuation.",
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
     let objective = load_objective(runtime, attempt.objective_id.clone())
         .await?
@@ -548,35 +558,38 @@ async fn continue_after_decision(
         || current_contract_sha256 != attempt.contract_sha256
         || binding.contract_sha256 != attempt.contract_sha256
     {
-        return pause_attempt(
+        pause_attempt(
             runtime,
             attempt,
             "objective.continuation.policy_changed",
             "Objective policy changed after the judge snapshot.",
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
     let completed_turns = objective.attempt_history.len() as u32;
     let max_turns = objective.contract.max_turns.or(objective.budget.max_runs);
     if max_turns.is_some_and(|limit| completed_turns >= limit) {
-        return pause_attempt(
+        pause_attempt(
             runtime,
             attempt,
             "objective.continuation.budget_exhausted",
             "Objective continuation turn budget is exhausted.",
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
     if has_active_user_input(runtime, attempt.session_id.as_str()).await? {
-        return pause_attempt(
+        pause_attempt(
             runtime,
             attempt,
             "objective.continuation.user_preempted",
             "Queued user input preempted autonomous continuation.",
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
-    crate::application::wake_coordinator::register_objective_wait(runtime, attempt).await
+    Ok(true)
 }
 
 async fn ensure_continuation_task(
