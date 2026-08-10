@@ -36,6 +36,16 @@ pub const PLUGIN_ABI_V2_CORE_DEALLOC_EXPORT: &str = "palyra-abi-v2-dealloc";
 pub const PLUGIN_CORE_WIRE_MAGIC_V2: [u8; 8] = *b"PLYRABI2";
 /// Schema version encoded in every core-Wasm request header.
 pub const PLUGIN_CORE_WIRE_SCHEMA_VERSION_V2: u16 = 2;
+/// Maximum request payload budget admitted by the ABI v2 host.
+pub const PLUGIN_INVOCATION_MAX_INPUT_BYTES_V2: u32 = 16 * 1024 * 1024;
+/// Maximum terminal output budget admitted by the ABI v2 host.
+pub const PLUGIN_INVOCATION_MAX_OUTPUT_BYTES_V2: u32 = 16 * 1024 * 1024;
+/// Maximum single-event budget admitted by the ABI v2 host.
+pub const PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2: u32 = 1024 * 1024;
+/// Maximum event-count budget admitted by the ABI v2 host.
+pub const PLUGIN_INVOCATION_MAX_EVENTS_V2: u32 = 1024;
+/// Maximum aggregate event payload retained for one ABI v2 invocation.
+pub const PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2: u32 = 16 * 1024 * 1024;
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const SHA256_HEX_BYTES: usize = 64;
@@ -52,7 +62,7 @@ pub enum PluginAbiValueError {
     InvalidSha256 { field: &'static str },
     /// Runtime generation zero is reserved for unbound values.
     InvalidRuntimeGeneration,
-    /// A budget is zero or internally inconsistent.
+    /// A budget is zero, exceeds an ABI limit, or is internally inconsistent.
     InvalidBudget { field: &'static str },
     /// A capability handle expires before it is issued.
     InvalidCapabilityLifetime,
@@ -496,20 +506,25 @@ pub struct PluginInvocationBudgetV2 {
 }
 
 impl PluginInvocationBudgetV2 {
-    /// Validates nonzero byte/event budgets.
+    /// Validates byte/event budgets against closed host-allocation limits.
     ///
     /// # Errors
-    /// Returns [`PluginAbiValueError::InvalidBudget`] for a zero bound.
+    /// Returns [`PluginAbiValueError::InvalidBudget`] for a zero or excessive
+    /// bound.
     pub fn validate(&self) -> Result<(), PluginAbiValueError> {
-        for (field, value) in [
-            ("max_input_bytes", self.max_input_bytes),
-            ("max_output_bytes", self.max_output_bytes),
-            ("max_event_bytes", self.max_event_bytes),
-            ("max_events", self.max_events),
+        for (field, value, maximum) in [
+            ("max_input_bytes", self.max_input_bytes, PLUGIN_INVOCATION_MAX_INPUT_BYTES_V2),
+            ("max_output_bytes", self.max_output_bytes, PLUGIN_INVOCATION_MAX_OUTPUT_BYTES_V2),
+            ("max_event_bytes", self.max_event_bytes, PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2),
+            ("max_events", self.max_events, PLUGIN_INVOCATION_MAX_EVENTS_V2),
         ] {
-            if value == 0 {
+            if value == 0 || value > maximum {
                 return Err(PluginAbiValueError::InvalidBudget { field });
             }
+        }
+        let maximum_transcript_bytes = u64::from(self.max_event_bytes) * u64::from(self.max_events);
+        if maximum_transcript_bytes > u64::from(PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2) {
+            return Err(PluginAbiValueError::InvalidBudget { field: "max_event_transcript_bytes" });
         }
         if self.absolute_deadline_unix_ms == 0 {
             return Err(PluginAbiValueError::InvalidBudget { field: "absolute_deadline_unix_ms" });
@@ -1184,10 +1199,12 @@ mod tests {
     use super::{
         executable_plugin_abi_snapshot_v2, executable_plugin_contract_schema_v2,
         ExecutablePluginContractKindV2, PluginBindingIdV2, PluginCallIdV2,
-        PluginInvocationAcceptedV2, PluginInvocationFrameV2, PluginInvocationTerminalOutcomeV2,
-        PluginInvocationTerminalV2, PluginInvocationTranscriptV2, PluginLifecycleErrorV2,
-        PluginRuntimeGenerationV2, EXECUTABLE_PLUGIN_CONTRACTS_V2, PLUGIN_ABI_V2_VERSION,
-        WIT_SOURCE_V2,
+        PluginInvocationAcceptedV2, PluginInvocationBudgetV2, PluginInvocationFrameV2,
+        PluginInvocationTerminalOutcomeV2, PluginInvocationTerminalV2,
+        PluginInvocationTranscriptV2, PluginLifecycleErrorV2, PluginRuntimeGenerationV2,
+        EXECUTABLE_PLUGIN_CONTRACTS_V2, PLUGIN_ABI_V2_VERSION, PLUGIN_INVOCATION_MAX_EVENTS_V2,
+        PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2, PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2,
+        PLUGIN_INVOCATION_MAX_INPUT_BYTES_V2, PLUGIN_INVOCATION_MAX_OUTPUT_BYTES_V2, WIT_SOURCE_V2,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -1262,6 +1279,59 @@ mod tests {
             super::ExecutablePluginOperationV2::PlanContext.contract(),
             ExecutablePluginContractKindV2::ContextEngine
         );
+    }
+
+    #[test]
+    fn invocation_budget_enforces_closed_host_allocation_limits() {
+        let budget = PluginInvocationBudgetV2 {
+            absolute_deadline_unix_ms: 1,
+            max_input_bytes: PLUGIN_INVOCATION_MAX_INPUT_BYTES_V2,
+            max_output_bytes: PLUGIN_INVOCATION_MAX_OUTPUT_BYTES_V2,
+            max_event_bytes: PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2,
+            max_events: PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2
+                / PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2,
+        };
+        assert_eq!(budget.validate(), Ok(()));
+
+        for (field, invalid) in [
+            (
+                "max_input_bytes",
+                PluginInvocationBudgetV2 {
+                    max_input_bytes: PLUGIN_INVOCATION_MAX_INPUT_BYTES_V2 + 1,
+                    ..budget.clone()
+                },
+            ),
+            (
+                "max_output_bytes",
+                PluginInvocationBudgetV2 {
+                    max_output_bytes: PLUGIN_INVOCATION_MAX_OUTPUT_BYTES_V2 + 1,
+                    ..budget.clone()
+                },
+            ),
+            (
+                "max_event_bytes",
+                PluginInvocationBudgetV2 {
+                    max_event_bytes: PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2 + 1,
+                    ..budget.clone()
+                },
+            ),
+            (
+                "max_events",
+                PluginInvocationBudgetV2 {
+                    max_events: PLUGIN_INVOCATION_MAX_EVENTS_V2 + 1,
+                    ..budget.clone()
+                },
+            ),
+            (
+                "max_event_transcript_bytes",
+                PluginInvocationBudgetV2 { max_events: budget.max_events + 1, ..budget.clone() },
+            ),
+        ] {
+            assert_eq!(
+                invalid.validate(),
+                Err(super::PluginAbiValueError::InvalidBudget { field })
+            );
+        }
     }
 
     #[test]

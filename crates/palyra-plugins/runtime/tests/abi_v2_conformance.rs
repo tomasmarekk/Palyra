@@ -25,7 +25,8 @@ use palyra_plugins_sdk::{
     PluginSchemaHashV2, PluginTimeoutDispositionV2, ProviderRequestPatchV2, RunLifecycleActionV2,
     RunLifecycleHookInvocationV2, RunLifecycleHookResultV2, RunLifecycleHookRoleV2,
     ToolMutationClassV2, ToolResultMiddlewareInvocationV2, ToolResultMiddlewareResultV2,
-    ToolResultVisibilityV2,
+    ToolResultVisibilityV2, PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2,
+    PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2,
 };
 
 const AGENT_HARNESS_TEMPLATE: &str = include_str!("fixtures/agent_harness_v2.wat");
@@ -265,6 +266,21 @@ fn admission_rejects_oversize_expired_schema_and_handle_inputs() {
     assert_admission_code(
         runtime.invoke(&module, &request, NOW_UNIX_MS, PluginCoreWasmCancellationTokenV2::new()),
         PluginInvocationErrorCodeV2::InputTooLarge,
+    );
+
+    let mut inflated_event_budget_request = request.clone();
+    inflated_event_budget_request.budget.max_input_bytes = 4_096;
+    inflated_event_budget_request.budget.max_event_bytes = PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2;
+    inflated_event_budget_request.budget.max_events =
+        PLUGIN_INVOCATION_MAX_EVENT_TRANSCRIPT_BYTES_V2 / PLUGIN_INVOCATION_MAX_EVENT_BYTES_V2 + 1;
+    assert_admission_code(
+        runtime.invoke(
+            &module,
+            &inflated_event_budget_request,
+            NOW_UNIX_MS,
+            PluginCoreWasmCancellationTokenV2::new(),
+        ),
+        PluginInvocationErrorCodeV2::BindingMismatch,
     );
 
     let (_, mut schema_request) = binding_and_request(
