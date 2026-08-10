@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -23,8 +23,12 @@ fn main() -> Result<()> {
     let options = RunnerOptions::parse()?;
     let repo_root = repo_root_from_manifest_dir()?;
     let manifest_path = resolve_repo_relative_path(repo_root.as_path(), options.manifest.as_str());
-    let report_dir = resolve_repo_relative_path(repo_root.as_path(), options.report_dir.as_str());
-    ensure_report_dir_under_release_artifacts(repo_root.as_path(), report_dir.as_path())?;
+    let requested_report_dir =
+        resolve_repo_relative_path(repo_root.as_path(), options.report_dir.as_str());
+    let report_dir = resolve_report_dir_under_release_artifacts(
+        repo_root.as_path(),
+        requested_report_dir.as_path(),
+    )?;
 
     recreate_directory(report_dir.as_path())?;
     let replay_dir = report_dir.join("replay-bundles");
@@ -154,42 +158,138 @@ fn write_json_artifact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn ensure_report_dir_under_release_artifacts(repo_root: &Path, report_dir: &Path) -> Result<()> {
+fn resolve_report_dir_under_release_artifacts(
+    repo_root: &Path,
+    report_dir: &Path,
+) -> Result<PathBuf> {
     let target_root = repo_root.join("target").join("release-artifacts");
     fs::create_dir_all(target_root.as_path())
         .with_context(|| format!("failed to create {}", target_root.display()))?;
     let canonical_target = target_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", target_root.display()))?;
-    let canonical_report_parent =
-        canonical_existing_ancestor(report_dir.parent().unwrap_or(report_dir))
-            .with_context(|| format!("failed to resolve parent for {}", report_dir.display()))?;
-    if canonical_report_parent.starts_with(canonical_target.as_path()) {
-        return Ok(());
+
+    let normalized_report = lexical_normalize_absolute(report_dir)?;
+    let normalized_target = lexical_normalize_absolute(target_root.as_path())?;
+    let relative_report =
+        normalized_report.strip_prefix(normalized_target.as_path()).with_context(|| {
+            format!(
+                "report directory '{}' must be under '{}'",
+                report_dir.display(),
+                target_root.display()
+            )
+        })?;
+    if relative_report.as_os_str().is_empty() {
+        anyhow::bail!(
+            "report directory '{}' must be a child of '{}'",
+            report_dir.display(),
+            target_root.display()
+        );
     }
-    anyhow::bail!(
-        "report directory '{}' must be under '{}'",
-        report_dir.display(),
-        target_root.display()
-    );
+
+    let canonical_candidate = canonical_target.join(relative_report);
+    let (existing_ancestor, missing_tail) =
+        existing_ancestor_and_tail(canonical_candidate.as_path())?;
+    let canonical_ancestor = existing_ancestor
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", existing_ancestor.display()))?;
+    if !canonical_ancestor.starts_with(canonical_target.as_path()) {
+        anyhow::bail!(
+            "report directory '{}' resolves outside '{}'",
+            report_dir.display(),
+            target_root.display()
+        );
+    }
+
+    Ok(missing_tail.iter().rev().fold(canonical_ancestor, |path, component| path.join(component)))
 }
 
-fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf> {
-    let mut cursor = path;
-    loop {
-        if cursor.exists() {
-            return cursor
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", cursor.display()));
+fn lexical_normalize_absolute(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("path '{}' must be absolute", path.display());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("path '{}' escapes its filesystem root", path.display());
+                }
+            }
         }
+    }
+    Ok(normalized)
+}
+
+fn existing_ancestor_and_tail(path: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut cursor = path.to_path_buf();
+    let mut missing_tail = Vec::new();
+    while !cursor.exists() {
+        let component = cursor
+            .file_name()
+            .map(PathBuf::from)
+            .with_context(|| format!("no existing ancestor for {}", path.display()))?;
+        missing_tail.push(component);
         cursor = cursor
             .parent()
+            .map(Path::to_path_buf)
             .with_context(|| format!("no existing ancestor for {}", path.display()))?;
     }
+    Ok((cursor, missing_tail))
 }
 
 fn relative_display_path(repo_root: &Path, path: &Path) -> String {
     path.strip_prefix(repo_root)
         .map(|value| value.display().to_string())
         .unwrap_or_else(|_| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_dir_resolution_rejects_nonexistent_traversal_tail() {
+        let repo = tempfile::tempdir().expect("temporary repository should be available");
+        let requested = repo.path().join("target/release-artifacts/missing/../../outside/report");
+
+        let error = resolve_report_dir_under_release_artifacts(repo.path(), requested.as_path())
+            .expect_err("normalized traversal must leave the allowed report root");
+
+        assert!(error.to_string().contains("must be under"));
+        assert!(!repo.path().join("target/outside").exists());
+    }
+
+    #[test]
+    fn report_dir_resolution_returns_normalized_child_path() {
+        let repo = tempfile::tempdir().expect("temporary repository should be available");
+        let requested =
+            repo.path().join("target/release-artifacts/missing/../release-evals/report");
+
+        let resolved = resolve_report_dir_under_release_artifacts(repo.path(), requested.as_path())
+            .expect("normalized child should be accepted");
+        let expected_root = repo
+            .path()
+            .join("target/release-artifacts")
+            .canonicalize()
+            .expect("report root should be created");
+
+        assert_eq!(resolved, expected_root.join("release-evals/report"));
+    }
+
+    #[test]
+    fn report_dir_resolution_rejects_artifact_root_itself() {
+        let repo = tempfile::tempdir().expect("temporary repository should be available");
+        let requested = repo.path().join("target/release-artifacts");
+
+        let error = resolve_report_dir_under_release_artifacts(repo.path(), requested.as_path())
+            .expect_err("the shared artifact root must not be removable");
+
+        assert!(error.to_string().contains("must be a child"));
+    }
 }
