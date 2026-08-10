@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::{
     remote_protocol::RemoteWorkerProtocolV1, WorkerRemoteToolRequestEnvelope,
-    WorkerRemoteToolResultEnvelope,
+    WorkerRemoteToolResultEnvelope, WORKER_REMOTE_COMPUTER_USE_CAPABILITY,
 };
 
 const MAX_CAPABILITIES: usize = 128;
@@ -334,7 +334,7 @@ impl DesktopNodeBindingV2 {
         }
         let requests_computer_use = required_capabilities
             .iter()
-            .any(|value| matches!(value.as_str(), "computer_use" | "tool:palyra.computer.use"));
+            .any(|value| value == "computer_use" || value == WORKER_REMOTE_COMPUTER_USE_CAPABILITY);
         if requests_computer_use && !self.computer_use_authorized {
             return Err(WorkerTransportAdapterError::ComputerUseNotAuthorized);
         }
@@ -1132,14 +1132,18 @@ mod tests {
 
     #[test]
     fn desktop_binding_requires_separate_computer_use_and_fresh_presence() {
-        let computer_use_capability = "tool:palyra.computer.use".to_owned();
+        let computer_use_capability = WORKER_REMOTE_COMPUTER_USE_CAPABILITY.to_owned();
+        assert_eq!(
+            WorkerRemoteToolKind::ComputerUse.required_capability(),
+            computer_use_capability
+        );
         let mut binding = DesktopNodeBindingV2 {
             device_id: "desktop-1".to_owned(),
             identity_fingerprint_sha256: "b".repeat(64),
             platform: "windows".to_owned(),
             capabilities: vec![computer_use_capability.clone()],
-            user_presence_required: true,
-            user_presence_confirmed_at_unix_ms: Some(10_000),
+            user_presence_required: false,
+            user_presence_confirmed_at_unix_ms: None,
             user_presence_ttl_ms: 5_000,
             computer_use_authorized: false,
             generation: 1,
@@ -1151,6 +1155,11 @@ mod tests {
             Err(WorkerTransportAdapterError::ComputerUseNotAuthorized)
         );
         binding.computer_use_authorized = true;
+        assert_eq!(
+            binding.authorize(std::slice::from_ref(&computer_use_capability), 12_000),
+            Err(WorkerTransportAdapterError::UserPresenceRequired)
+        );
+        binding.user_presence_confirmed_at_unix_ms = Some(10_000);
         assert!(binding.authorize(std::slice::from_ref(&computer_use_capability), 12_000).is_ok());
         assert_eq!(
             binding.authorize(std::slice::from_ref(&computer_use_capability), 20_000),

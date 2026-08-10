@@ -276,6 +276,9 @@ pub const WORKER_REMOTE_TOOL_PROTOCOL: &str = "palyra-worker-rpc/v2";
 /// [`WorkerRemoteToolResultEnvelope`].
 pub const WORKER_REMOTE_TOOL_SCHEMA_VERSION: u32 = 2;
 
+/// Canonical capability required for attended computer-use execution.
+pub const WORKER_REMOTE_COMPUTER_USE_CAPABILITY: &str = "tool:palyra.computer.use";
+
 /// Capability strings trusted for the initial networked-worker remote tool subset.
 pub const WORKER_REMOTE_TOOL_CAPABILITIES: &[&str] = &[
     "tool:palyra.fs.read_file",
@@ -285,7 +288,7 @@ pub const WORKER_REMOTE_TOOL_CAPABILITIES: &[&str] = &[
     "tool:palyra.fs.apply_patch",
     "tool:palyra.artifact.read",
     "tool:palyra.tool_program.run",
-    "tool:palyra.computer.use",
+    WORKER_REMOTE_COMPUTER_USE_CAPABILITY,
 ];
 
 /// Tool families a networked worker may execute through the remote RPC envelope.
