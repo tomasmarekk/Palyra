@@ -1941,6 +1941,26 @@ impl DockerBackendCapabilityReport {
         daemon_os: String,
         daemon_arch: String,
     ) -> Self {
+        Self::from_profile_for_platform(
+            profile,
+            env::consts::OS,
+            env::consts::ARCH,
+            daemon_version,
+            daemon_api_version,
+            daemon_os,
+            daemon_arch,
+        )
+    }
+
+    fn from_profile_for_platform(
+        profile: &ContainerBackendProfile,
+        host_os: &str,
+        host_arch: &str,
+        daemon_version: String,
+        daemon_api_version: String,
+        daemon_os: String,
+        daemon_arch: String,
+    ) -> Self {
         let image_digest_pinned = docker_image_digest_sha256(profile.image.as_str()).is_some();
         let non_root_user = !container_user_is_root(profile.user.as_str());
         let workspace_mounts_scoped =
@@ -1954,18 +1974,24 @@ impl DockerBackendCapabilityReport {
         });
         let daemon_supported = docker_version_at_least(daemon_version.as_str(), 24, 0)
             && docker_version_at_least(daemon_api_version.as_str(), 1, 43);
-        let qualified = image_digest_pinned
+        let platform_qualified = docker_platform_is_qualified(
+            host_os,
+            host_arch,
+            daemon_os.as_str(),
+            daemon_arch.as_str(),
+        );
+        let profile_qualified = image_digest_pinned
             && profile.readonly_rootfs
             && non_root_user
             && workspace_mounts_scoped
             && resource_limits_bounded
-            && vault_env_scoped
-            && daemon_supported;
+            && vault_env_scoped;
+        let qualified = platform_qualified && daemon_supported && profile_qualified;
         Self {
             schema_version: 1,
             profile_id: profile.profile_id.clone(),
-            host_os: env::consts::OS.to_owned(),
-            host_arch: env::consts::ARCH.to_owned(),
+            host_os: host_os.to_owned(),
+            host_arch: host_arch.to_owned(),
             daemon_os,
             daemon_arch,
             daemon_version,
@@ -1980,6 +2006,8 @@ impl DockerBackendCapabilityReport {
             qualified,
             reason_code: if qualified {
                 "docker.capability.qualified"
+            } else if !platform_qualified {
+                "docker.capability.platform_not_qualified"
             } else if !daemon_supported {
                 "docker.capability.daemon_unsupported"
             } else {
@@ -1988,6 +2016,21 @@ impl DockerBackendCapabilityReport {
             .to_owned(),
         }
     }
+}
+
+/// Matches the sole live-qualified tuple in `infra/release/docker-backend-support-matrix.json`.
+///
+/// Widening this predicate requires a corresponding production qualification lane.
+fn docker_platform_is_qualified(
+    host_os: &str,
+    host_arch: &str,
+    daemon_os: &str,
+    daemon_arch: &str,
+) -> bool {
+    host_os.trim().eq_ignore_ascii_case("linux")
+        && host_arch.trim().eq_ignore_ascii_case("x86_64")
+        && daemon_os.trim().eq_ignore_ascii_case("linux")
+        && daemon_arch.trim().eq_ignore_ascii_case("amd64")
 }
 
 impl ContainerBackendProfile {
@@ -6876,8 +6919,10 @@ mod tests {
                 reason_code: "docker.cleanup.ok".to_owned(),
             },
             patch_bundle: None,
-            capability_report: DockerBackendCapabilityReport::from_profile(
+            capability_report: DockerBackendCapabilityReport::from_profile_for_platform(
                 &safe_container_profile(),
+                "linux",
+                "x86_64",
                 "29.0.0".to_owned(),
                 "1.52".to_owned(),
                 "linux".to_owned(),
@@ -7849,8 +7894,10 @@ mod tests {
     #[test]
     fn docker_capability_report_enforces_supported_daemon_matrix() {
         let profile = safe_container_profile();
-        let qualified = DockerBackendCapabilityReport::from_profile(
+        let qualified = DockerBackendCapabilityReport::from_profile_for_platform(
             &profile,
+            "linux",
+            "x86_64",
             "29.0.1".to_owned(),
             "1.52".to_owned(),
             "linux".to_owned(),
@@ -7862,8 +7909,10 @@ mod tests {
         assert!(qualified.workspace_mounts_scoped);
         assert!(qualified.resource_limits_bounded);
 
-        let unsupported = DockerBackendCapabilityReport::from_profile(
+        let unsupported = DockerBackendCapabilityReport::from_profile_for_platform(
             &profile,
+            "linux",
+            "x86_64",
             "23.0.6".to_owned(),
             "1.42".to_owned(),
             "linux".to_owned(),
@@ -7871,6 +7920,36 @@ mod tests {
         );
         assert!(!unsupported.qualified);
         assert_eq!(unsupported.reason_code, "docker.capability.daemon_unsupported");
+    }
+
+    #[test]
+    fn docker_capability_report_rejects_unqualified_platforms() {
+        let profile = safe_container_profile();
+        for (host_os, host_arch, daemon_os, daemon_arch) in [
+            ("windows", "x86_64", "linux", "amd64"),
+            ("macos", "x86_64", "linux", "amd64"),
+            ("linux", "aarch64", "linux", "arm64"),
+            ("linux", "x86_64", "windows", "amd64"),
+            ("linux", "x86_64", "linux", "arm64"),
+        ] {
+            let report = DockerBackendCapabilityReport::from_profile_for_platform(
+                &profile,
+                host_os,
+                host_arch,
+                "29.0.1".to_owned(),
+                "1.52".to_owned(),
+                daemon_os.to_owned(),
+                daemon_arch.to_owned(),
+            );
+            assert!(
+                !report.qualified,
+                "unsupported platform {host_os}/{host_arch} -> {daemon_os}/{daemon_arch} qualified"
+            );
+            assert_eq!(
+                report.reason_code, "docker.capability.platform_not_qualified",
+                "{host_os}/{host_arch} -> {daemon_os}/{daemon_arch}"
+            );
+        }
     }
 
     #[test]
