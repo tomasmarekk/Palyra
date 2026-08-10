@@ -723,6 +723,22 @@ const CHROMIUM_DRAIN_CLIENT_DOWNLOADS_SCRIPT: &str = r#"
 })()
 "#;
 
+const CHROMIUM_BEGIN_CLIENT_DOWNLOAD_CAPTURE_SCRIPT: &str = r#"
+(() => {
+  const diagnostics = window.__palyraDiagnostics;
+  if (!diagnostics || !Array.isArray(diagnostics.client_download_entries)) {
+    return false;
+  }
+  const previousGeneration = Number(diagnostics.client_download_generation || 0);
+  diagnostics.client_download_generation =
+    Number.isSafeInteger(previousGeneration) && previousGeneration >= 0
+      ? previousGeneration + 1
+      : 1;
+  diagnostics.client_download_entries.length = 0;
+  return true;
+})()
+"#;
+
 // Page-side JSON budgets get headroom over the decoded-entry budgets because
 // the raw JSON also carries field names and escaping overhead before parsing.
 const MAX_CHROMIUM_CONSOLE_JSON_BYTES: usize = (DEFAULT_MAX_CONSOLE_LOG_BYTES as usize) * 4;
@@ -4870,7 +4886,7 @@ pub(crate) async fn click_with_chromium(
     allow_downloads: bool,
 ) -> ChromiumActionOutcome {
     enum ClickAttempt {
-        Clicked { download_like: bool, opened_window: bool },
+        Clicked { download_like: bool },
         DownloadBlocked,
         Disabled,
         NotFound,
@@ -4894,54 +4910,53 @@ pub(crate) async fn click_with_chromium(
         let selector_for_attempt = selector.to_owned();
         let tab_for_attempt = Arc::clone(&tab);
         let attempt = run_chromium_blocking("chromium click", move || {
-            let script = chromium_click_script(selector_for_attempt.as_str(), allow_downloads)?;
-            let raw_value = tab_for_attempt
-                .evaluate(script.as_str(), true)
-                .map_err(|error| {
+            let page_body = tab_for_attempt
+                .get_content()
+                .map_err(|error| format!("failed to read Chromium DOM before click: {error}"))?;
+            let Some(tag) =
+                find_matching_html_tag(selector_for_attempt.as_str(), page_body.as_str())
+            else {
+                return Ok(ClickAttempt::NotFound);
+            };
+            let download_like = is_download_like_tag(tag.as_str());
+            if download_like && !allow_downloads {
+                return Ok(ClickAttempt::DownloadBlocked);
+            }
+            let tag_lower = tag.to_ascii_lowercase();
+            if tag_lower.contains(" disabled")
+                || tag_lower.contains(" aria-disabled=\"true\"")
+                || tag_lower.contains(" aria-disabled='true'")
+            {
+                return Ok(ClickAttempt::Disabled);
+            }
+            if allow_downloads {
+                tab_for_attempt
+                    .evaluate(CHROMIUM_BEGIN_CLIENT_DOWNLOAD_CAPTURE_SCRIPT, false)
+                    .map_err(|error| {
+                        format!("failed to initialize Chromium download capture: {error}")
+                    })?;
+            }
+            let element =
+                tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(|error| {
                     format!(
-                        "failed to execute Chromium click script for selector '{}': {error}",
+                        "failed to resolve selector '{}' on Chromium page: {error}",
                         selector_for_attempt
                     )
-                })?
-                .value
-                .unwrap_or(serde_json::Value::Null);
-            let value = decode_chromium_json_script_value(raw_value);
-            let status =
-                value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-            match status {
-                "clicked" => Ok(ClickAttempt::Clicked {
-                    download_like: false,
-                    opened_window: value
-                        .get("opened_window")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                }),
-                "download_allowed" => Ok(ClickAttempt::Clicked {
-                    download_like: true,
-                    opened_window: value
-                        .get("opened_window")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                }),
-                "download_blocked" => Ok(ClickAttempt::DownloadBlocked),
-                "disabled" => Ok(ClickAttempt::Disabled),
-                "not_found" => Ok(ClickAttempt::NotFound),
-                _ => Err(format!(
-                    "Chromium click script returned unexpected status '{}' for selector '{}'",
-                    status, selector_for_attempt
-                )),
-            }
+                })?;
+            element.click().map_err(|error| {
+                format!(
+                    "failed to click selector '{}' through Chromium input dispatch: {error}",
+                    selector_for_attempt
+                )
+            })?;
+            Ok(ClickAttempt::Clicked { download_like })
         })
         .await;
 
         match attempt {
-            Ok(ClickAttempt::Clicked { download_like, opened_window }) => {
+            Ok(ClickAttempt::Clicked { download_like }) => {
                 let new_tab_count = match chromium_sync_session_tabs_after_click(
-                    runtime,
-                    session_id,
-                    opened_window,
-                    started,
-                    timeout_ms,
+                    runtime, session_id, false, started, timeout_ms,
                 )
                 .await
                 {
@@ -4962,7 +4977,7 @@ pub(crate) async fn click_with_chromium(
                     success: true,
                     outcome: if download_like {
                         "download_allowed".to_owned()
-                    } else if opened_window || new_tab_count > 0 {
+                    } else if new_tab_count > 0 {
                         "clicked_new_tab".to_owned()
                     } else {
                         "clicked".to_owned()
@@ -5062,78 +5077,6 @@ async fn chromium_sync_session_tabs_after_click(
             return Ok(new_tab_count);
         }
     }
-}
-
-/// Builds the click script; anchors with a download attribute or a known
-/// file-extension href are reported as download-like so policy can block them.
-fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String, String> {
-    let selector_json = serde_json::to_string(selector)
-        .map_err(|error| format!("failed to encode selector for Chromium click: {error}"))?;
-    let allow_downloads_json = if allow_downloads { "true" } else { "false" };
-    Ok(format!(
-        r#"
-(() => {{
-  const selector = {selector_json};
-  const allowDownloads = {allow_downloads_json};
-  const respond = (payload) => JSON.stringify(payload);
-  const element = document.querySelector(selector);
-  if (!element) {{
-    return respond({{ status: "not_found" }});
-  }}
-  const tagName = String(element.tagName || "").toLowerCase();
-  const href = String(element.getAttribute("href") || "").split("?")[0].toLowerCase();
-  const hasDownloadAttribute = element.hasAttribute("download");
-  const downloadLike = tagName === "a" && (
-    hasDownloadAttribute ||
-    [".zip", ".gz", ".tar", ".7z", ".rar", ".pdf", ".csv", ".json", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".exe", ".msi"]
-      .some((suffix) => href.endsWith(suffix))
-  );
-  if (downloadLike && !allowDownloads) {{
-    return respond({{ status: "download_blocked" }});
-  }}
-  if (element.disabled || element.getAttribute("aria-disabled") === "true") {{
-    return respond({{ status: "disabled" }});
-  }}
-  if (typeof element.scrollIntoView === "function") {{
-    element.scrollIntoView({{ block: "center", inline: "center", behavior: "auto" }});
-  }}
-  if (typeof element.focus === "function") {{
-    try {{ element.focus({{ preventScroll: true }}); }} catch (_) {{ element.focus(); }}
-  }}
-  if (allowDownloads) {{
-    const diagnostics = window.__palyraDiagnostics;
-    if (diagnostics && Array.isArray(diagnostics.client_download_entries)) {{
-      const previousGeneration = Number(diagnostics.client_download_generation || 0);
-      diagnostics.client_download_generation =
-        Number.isSafeInteger(previousGeneration) && previousGeneration >= 0
-          ? previousGeneration + 1
-          : 1;
-      diagnostics.client_download_entries.length = 0;
-    }}
-  }}
-  let openedWindow = false;
-  let restoreWindowOpen = null;
-  try {{
-    const originalOpen = window.open;
-    if (typeof originalOpen === "function") {{
-      window.open = function(...args) {{
-        openedWindow = true;
-        return originalOpen.apply(this, args);
-      }};
-      restoreWindowOpen = () => {{ window.open = originalOpen; }};
-    }}
-  }} catch (_) {{}}
-  try {{
-    element.click();
-  }} finally {{
-    if (restoreWindowOpen) {{
-      try {{ restoreWindowOpen(); }} catch (_) {{}}
-    }}
-  }}
-  return respond({{ status: downloadLike ? "download_allowed" : "clicked", opened_window: openedWindow }});
-}})()
-"#
-    ))
 }
 
 /// Types text into an input-like or content-editable element on the active
