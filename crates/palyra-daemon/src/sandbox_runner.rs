@@ -8,7 +8,7 @@
 //! - Tier C delegates isolation planning to the `palyra-sandbox` backend planners
 //!   ([`build_tier_c_command_plan`]) and fails closed when the compiled backend cannot enforce
 //!   the requested network isolation.
-//! - Host path access is explicit and limited to the workspace plus approved user-owned roots.
+//! - Host path access is explicit and limited to the workspace plus configured OS roots.
 //!
 //! Every validation failure here is a deny-by-default security decision. Error message strings
 //! are pinned by tests and critical attack-scenario fixtures; do not reword them casually.
@@ -241,7 +241,7 @@ impl SandboxProcessRunnerTier {
 /// Path validation posture for process-runner host fields and runtime arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathAccessMode {
-    /// Allow only the workspace and explicitly approved user-owned OS roots.
+    /// Allow only the workspace and explicitly configured OS roots.
     ApprovedRoots,
     /// Confine process paths to the configured workspace root.
     WorkspaceOnly,
@@ -6099,7 +6099,7 @@ fn validate_host_interpreter_argument_guardrails(
     command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
+    let host_roots = host_access_roots();
     validate_host_interpreter_argument_guardrails_with_roots(
         workspace_root,
         cwd,
@@ -6413,7 +6413,7 @@ fn resolve_host_working_directory(
     workspace_root: &Path,
     cwd: Option<&str>,
 ) -> Result<PathBuf, SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
+    let host_roots = host_access_roots();
     let path_env = BTreeMap::new();
     resolve_host_working_directory_with_roots(workspace_root, cwd, host_roots.as_slice(), &path_env)
 }
@@ -6487,7 +6487,7 @@ fn validate_host_argument_scope(
     command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
+    let host_roots = host_access_roots();
     validate_host_argument_scope_with_roots(
         workspace_root,
         cwd,
@@ -6533,7 +6533,7 @@ fn validate_host_command_path_scope(
     cwd: &Path,
     command: &str,
 ) -> Result<(), SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
+    let host_roots = host_access_roots();
     validate_host_command_path_scope_with_roots(workspace_root, cwd, command, host_roots.as_slice())
 }
 
@@ -7086,7 +7086,7 @@ fn resolve_scoped_path(
 }
 
 // Host-access counterpart of `resolve_scoped_path`: the scope check accepts the workspace plus
-// the approved user-owned `host_roots`, and additionally refuses protected OS paths outright.
+// explicitly approved `host_roots`, and additionally refuses protected OS paths outright.
 fn resolve_host_access_path_with_roots(
     workspace_root: &Path,
     base: &Path,
@@ -7191,7 +7191,7 @@ fn ensure_host_access_path_allowed(
     Err(SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
         message: format!(
-            "host process runner path '{}' is outside workspace and approved user-owned OS roots",
+            "host process runner path '{}' is outside workspace and explicitly approved OS roots",
             inspected.display()
         ),
     })
@@ -7298,7 +7298,7 @@ fn ensure_host_executable_path_allowed(
     Err(SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
         message: format!(
-            "host process runner executable path '{}' is outside workspace, approved user-owned OS roots, and installed-program roots",
+            "host process runner executable path '{}' is outside workspace, explicitly configured OS roots, and installed-program roots",
             inspected.display()
         ),
     })
@@ -7318,7 +7318,15 @@ fn windows_program_files_path(path: &Path) -> bool {
 }
 
 fn host_access_roots() -> Vec<PathBuf> {
-    user_owned_host_roots()
+    // `palyra.fs.os_file` has its own audited user-profile policy. Process execution must never
+    // inherit HOME or USERPROFILE implicitly because a child could bypass that policy entirely.
+    let mut roots = Vec::new();
+    if let Some(configured_roots) = configured_user_host_roots() {
+        for root in configured_roots {
+            push_canonical_host_root(&mut roots, root);
+        }
+    }
+    roots
 }
 
 fn host_access_path_env_for_input(input: &ProcessRunnerInput) -> BTreeMap<String, PathBuf> {
@@ -7393,26 +7401,6 @@ fn require_prepend_path_directory(
         kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
         message: format!("palyra.process.run prepend_path entry '{raw}' is not a directory"),
     })
-}
-
-// Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS), or the default user
-// profile roots when no explicit roots are configured. Roots that fail to canonicalize, are not
-// directories, or have unsafe ownership/permissions are silently dropped: a missing or unsafe root
-// must narrow the scope, never widen it.
-fn user_owned_host_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(configured_roots) = configured_user_host_roots() {
-        for root in configured_roots {
-            push_canonical_host_root(&mut roots, root);
-        }
-        return roots;
-    }
-    for key in ["USERPROFILE", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            push_canonical_host_root(&mut roots, PathBuf::from(value));
-        }
-    }
-    roots
 }
 
 fn configured_user_host_roots() -> Option<Vec<PathBuf>> {
@@ -12804,10 +12792,9 @@ mod tests {
         resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
         rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
         run_constrained_process, run_constrained_process_with_fault_injection,
-        same_path_case_aware, tier_c_plan_inner_path_index, user_owned_host_roots,
-        validate_argument_workspace_scope, validate_cmd_invocation_shape,
-        validate_host_argument_scope, validate_host_argument_scope_with_roots,
-        validate_host_interpreter_argument_guardrails,
+        same_path_case_aware, tier_c_plan_inner_path_index, validate_argument_workspace_scope,
+        validate_cmd_invocation_shape, validate_host_argument_scope,
+        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
         validate_host_interpreter_argument_guardrails_with_roots, validate_input_shape,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
@@ -13597,7 +13584,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_host_working_directory_allows_user_owned_os_roots() {
+    fn resolve_host_working_directory_allows_configured_os_roots() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13606,8 +13593,9 @@ mod tests {
         let outside = unique_temp_dir("outside-host-cwd");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
-        let _userprofile = ScopedEnvVar::set("USERPROFILE", outside.as_os_str());
-        let _home = ScopedEnvVar::set("HOME", outside.as_os_str());
+        let configured_env =
+            std::env::join_paths([outside.as_os_str()]).expect("root path should join");
+        let _configured_roots = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_env);
         let canonical_workspace = fs::canonicalize(workspace.as_path())
             .expect("workspace root should canonicalize for host access");
         let canonical_outside =
@@ -13617,7 +13605,7 @@ mod tests {
             canonical_workspace.as_path(),
             Some(canonical_outside.to_string_lossy().as_ref()),
         )
-        .expect("host access should allow user-owned OS cwd");
+        .expect("host access should allow explicitly configured OS cwd");
 
         assert_eq!(resolved, canonical_outside);
 
@@ -13625,27 +13613,50 @@ mod tests {
         let _ = fs::remove_dir_all(outside.as_path());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn default_host_access_roots_exclude_shared_temp_directories() {
+    fn host_access_roots_require_explicit_configuration() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("process env lock should not be poisoned");
-        let home = unique_temp_dir("safe-home-host-roots");
+        let workspace = unique_temp_dir("workspace-explicit-host-roots");
+        let home = unique_temp_dir("unconfigured-home-host-root");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(home.as_path()).expect("home fixture should be created");
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(ssh_dir.as_path()).expect("ssh fixture directory should be created");
+        let secret = ssh_dir.join("id_ed25519");
+        fs::write(secret.as_path(), b"private key fixture")
+            .expect("secret fixture should be written");
+        let _configured_roots = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, "");
         let _userprofile = ScopedEnvVar::set("USERPROFILE", home.as_os_str());
         let _home = ScopedEnvVar::set("HOME", home.as_os_str());
-        let roots = user_owned_host_roots();
-        let canonical_temp =
-            fs::canonicalize(std::env::temp_dir()).expect("temp dir should canonicalize");
-        let canonical_var_tmp = fs::canonicalize("/var/tmp").ok();
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
 
-        assert!(!roots.iter().any(|root| same_path_case_aware(root, canonical_temp.as_path())));
-        if let Some(var_tmp) = canonical_var_tmp {
-            assert!(!roots.iter().any(|root| same_path_case_aware(root, var_tmp.as_path())));
-        }
+        assert!(
+            host_access_roots().is_empty(),
+            "HOME and USERPROFILE must not become implicit process roots"
+        );
+        let argument_error = validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "cat",
+            &[secret.display().to_string()],
+        )
+        .expect_err("process arguments outside explicit roots must be denied");
+        assert_eq!(argument_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
 
+        let interpreter_error = validate_host_interpreter_argument_guardrails(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "python",
+            &[secret.display().to_string()],
+        )
+        .expect_err("interpreter paths outside explicit roots must be denied");
+        assert_eq!(interpreter_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(home.as_path());
     }
 
@@ -13717,7 +13728,7 @@ mod tests {
     }
 
     #[test]
-    fn host_access_allows_user_owned_script_argument() {
+    fn host_access_allows_configured_script_argument() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -13726,8 +13737,9 @@ mod tests {
         let outside = unique_temp_dir("outside-host-script-arg");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
-        let _userprofile = ScopedEnvVar::set("USERPROFILE", outside.as_os_str());
-        let _home = ScopedEnvVar::set("HOME", outside.as_os_str());
+        let configured_env =
+            std::env::join_paths([outside.as_os_str()]).expect("root path should join");
+        let _configured_roots = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_env);
         let script = outside.join("slow-preview.cjs");
         fs::write(script.as_path(), b"console.log('ok');\n").expect("helper should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
@@ -13744,14 +13756,14 @@ mod tests {
             "node",
             args.as_slice(),
         )
-        .expect("host access should allow interpreter scripts under user-owned OS roots");
+        .expect("host access should allow interpreter scripts under configured OS roots");
         validate_host_argument_scope(
             canonical_workspace.as_path(),
             canonical_outside.as_path(),
             "node",
             args.as_slice(),
         )
-        .expect("host access should allow absolute script args under user-owned OS roots");
+        .expect("host access should allow absolute script args under configured OS roots");
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
