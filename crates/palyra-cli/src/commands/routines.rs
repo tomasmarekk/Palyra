@@ -1181,14 +1181,17 @@ fn emit_routine_runs(routine_id: &str, payload: &Value, json: bool) -> Result<()
         if let Some(output_preview) =
             json_optional_string_at(run, "/output_preview").filter(|value| !value.is_empty())
         {
-            println!(
-                "routines.run.output run_id={} source={} preview={} inspect={}",
-                json_optional_string_at(run, "/run_id").unwrap_or_else(|| "unknown".to_owned()),
-                json_optional_string_at(run, "/output_source")
-                    .unwrap_or_else(|| "session_preview".to_owned()),
-                output_preview,
-                json_optional_string_at(run, "/output_lookup/command").unwrap_or_default(),
-            );
+            output::print_text_line(
+                format!(
+                    "routines.run.output run_id={} source={} preview={} inspect={}",
+                    json_optional_string_at(run, "/run_id").unwrap_or_else(|| "unknown".to_owned()),
+                    json_optional_string_at(run, "/output_source")
+                        .unwrap_or_else(|| "session_preview".to_owned()),
+                    output_preview,
+                    json_optional_string_at(run, "/output_lookup/command").unwrap_or_default(),
+                )
+                .as_str(),
+            )?;
         }
         println!(
             "routines.run.details run_id={} execution_posture={} provider_profile_id={} delivery_reason={} skip_reason={} approval_note={} safety_note={}",

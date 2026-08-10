@@ -1066,13 +1066,19 @@ fn routine_run_allows_output_preview(run: &Value) -> bool {
     !matches!(run.pointer("/outcome_kind").and_then(Value::as_str), Some("denied" | "failed"))
 }
 
-// Strips control characters (except newline/tab) and caps the preview at
-// 2000 chars so model output cannot inject terminal escapes or bloat views.
+// Redacts the complete input before truncation, then renders one bounded line
+// so transcript content cannot expose credentials or forge log records.
 fn normalize_routine_output_text(value: Option<&str>) -> Option<String> {
-    let normalized = value?
-        .trim()
+    let redacted = palyra_common::redaction::redact_url_segments_in_text(
+        palyra_common::redaction::redact_auth_error(value?).as_str(),
+    );
+    let terminal_safe =
+        redacted.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect::<String>();
+    let normalized = terminal_safe
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .chars()
-        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
         .take(2_000)
         .collect::<String>();
     (!normalized.is_empty()).then_some(normalized)
@@ -4285,6 +4291,20 @@ mod tests {
             suppressed_fields.get("output_source").and_then(|value| value.as_str()),
             Some("suppressed_terminal_failure")
         );
+    }
+
+    #[test]
+    fn routine_output_text_redacts_secrets_and_line_controls() {
+        let normalized = normalize_routine_output_text(Some(
+            "done\nAuthorization: Bearer sk-live-abcdefghijklmnopqrstuvwx\t\
+             https://example.test/callback?token=secret-value",
+        ))
+        .expect("redacted preview should remain present");
+
+        assert!(normalized.starts_with("done "));
+        assert!(!normalized.contains("sk-live-abcdefghijklmnopqrstuvwx"));
+        assert!(!normalized.contains("secret-value"));
+        assert!(!normalized.chars().any(char::is_control));
     }
 
     #[test]
