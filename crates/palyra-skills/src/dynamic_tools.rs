@@ -23,6 +23,7 @@ use zeroize::{Zeroize, Zeroizing};
 const DYNAMIC_TOOL_SCHEMA_VERSION: u32 = 1;
 const DYNAMIC_TOOL_SIGNATURE_ALGORITHM: &str = "ed25519";
 const DYNAMIC_TOOL_SIGNATURE_DOMAIN: &[u8] = b"palyra.dynamic-tool.payload.v1\0";
+const DYNAMIC_TOOL_SIGNED_METADATA_DOMAIN: &[u8] = b"palyra.dynamic-tool.signed-metadata.v1\0";
 const DYNAMIC_TOOL_ARTIFACT_DOMAIN: &[u8] = b"palyra.dynamic-tool.artifact.v1\0";
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 2_048;
@@ -195,7 +196,7 @@ pub struct DynamicToolProvenanceV1 {
     pub built_at_unix_ms: i64,
 }
 
-/// Detached signature over the domain-separated artifact payload digest.
+/// Detached signature over the payload digest and immutable publisher trust metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicToolSignatureV1 {
@@ -358,16 +359,18 @@ pub fn build_signed_dynamic_tool_artifact(
     let payload_sha256 = sha256_domain_json(DYNAMIC_TOOL_SIGNATURE_DOMAIN, &payload)?;
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let verifying_key = signing_key.verifying_key();
-    let signature_bytes = signing_key.sign(payload_sha256.as_bytes());
-    let signature = DynamicToolSignatureV1 {
+    let mut signature = DynamicToolSignatureV1 {
         algorithm: DYNAMIC_TOOL_SIGNATURE_ALGORITHM.to_owned(),
         publisher: request.publisher,
         key_id: key_id_for(&verifying_key),
         public_key_base64: BASE64_STANDARD.encode(verifying_key.as_bytes()),
         payload_sha256: payload_sha256.clone(),
-        signature_base64: BASE64_STANDARD.encode(signature_bytes.to_bytes()),
+        signature_base64: String::new(),
         signed_at_unix_ms: request.built_at_unix_ms,
     };
+    let signed_metadata_sha256 = signed_metadata_digest(&signature)?;
+    let signature_bytes = signing_key.sign(signed_metadata_sha256.as_bytes());
+    signature.signature_base64 = BASE64_STANDARD.encode(signature_bytes.to_bytes());
     let artifact_sha256 = artifact_digest(payload_sha256.as_str(), &signature)?;
     Ok(SignedToolArtifact {
         v: DYNAMIC_TOOL_SCHEMA_VERSION,
@@ -1194,6 +1197,8 @@ fn validate_schema_node(
 fn verify_signature(signature: &DynamicToolSignatureV1) -> Result<(), DynamicToolError> {
     if signature.algorithm != DYNAMIC_TOOL_SIGNATURE_ALGORITHM
         || signature.publisher.trim().is_empty()
+        || signature.publisher.len() > 128
+        || signature.signed_at_unix_ms < 0
         || !valid_sha256(signature.payload_sha256.as_str())
     {
         return Err(DynamicToolError::SignatureInvalid);
@@ -1213,9 +1218,33 @@ fn verify_signature(signature: &DynamicToolSignatureV1) -> Result<(), DynamicToo
         .map_err(|_| DynamicToolError::SignatureInvalid)?;
     let signature_bytes: [u8; 64] =
         signature_bytes.as_slice().try_into().map_err(|_| DynamicToolError::SignatureInvalid)?;
+    let signed_metadata_sha256 = signed_metadata_digest(signature)?;
     verifying_key
-        .verify(signature.payload_sha256.as_bytes(), &Signature::from_bytes(&signature_bytes))
+        .verify(signed_metadata_sha256.as_bytes(), &Signature::from_bytes(&signature_bytes))
         .map_err(|_| DynamicToolError::SignatureInvalid)
+}
+
+fn signed_metadata_digest(signature: &DynamicToolSignatureV1) -> Result<String, DynamicToolError> {
+    #[derive(Serialize)]
+    struct SignedMetadata<'a> {
+        algorithm: &'a str,
+        publisher: &'a str,
+        key_id: &'a str,
+        public_key_base64: &'a str,
+        payload_sha256: &'a str,
+        signed_at_unix_ms: i64,
+    }
+    sha256_domain_json(
+        DYNAMIC_TOOL_SIGNED_METADATA_DOMAIN,
+        &SignedMetadata {
+            algorithm: signature.algorithm.as_str(),
+            publisher: signature.publisher.as_str(),
+            key_id: signature.key_id.as_str(),
+            public_key_base64: signature.public_key_base64.as_str(),
+            payload_sha256: signature.payload_sha256.as_str(),
+            signed_at_unix_ms: signature.signed_at_unix_ms,
+        },
+    )
 }
 
 fn artifact_digest(
@@ -1527,6 +1556,30 @@ mod tests {
         let decision = decide_dynamic_tool_activation(&artifact, &stale);
         assert!(!decision.activated);
         assert_eq!(decision.reason_code, "dynamic_tool.catalog_epoch_stale");
+    }
+
+    #[test]
+    fn trust_metadata_mutation_invalidates_signature_after_digest_recomputation() {
+        let mutations: [fn(&mut DynamicToolSignatureV1); 2] = [
+            |signature: &mut DynamicToolSignatureV1| {
+                signature.publisher = "rebound.publisher".to_owned();
+            },
+            |signature: &mut DynamicToolSignatureV1| {
+                signature.signed_at_unix_ms += 1;
+            },
+        ];
+        for mutate in mutations {
+            let mut artifact = build(None);
+            mutate(&mut artifact.signature);
+            artifact.artifact_sha256 =
+                artifact_digest(artifact.payload_sha256.as_str(), &artifact.signature)
+                    .expect("mutated artifact digest should recompute");
+
+            assert_eq!(
+                verify_signed_dynamic_tool_artifact(&artifact),
+                Err(DynamicToolError::SignatureInvalid)
+            );
+        }
     }
 
     #[test]
