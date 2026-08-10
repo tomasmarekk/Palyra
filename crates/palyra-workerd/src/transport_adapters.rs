@@ -202,7 +202,12 @@ impl SshWorkerTransportProfile {
         }
         arguments.push(OsString::from(endpoint.target));
         arguments.push(OsString::from(CANONICAL_SSH_WORKER_COMMAND));
-        CanonicalWorkerStdioAdapter::new(ssh_executable, arguments, timeout_ms)
+        CanonicalWorkerStdioAdapter::new_with_authority(
+            ssh_executable,
+            arguments,
+            timeout_ms,
+            CanonicalWorkerStdioAuthority::Ssh(self.clone()),
+        )
     }
 
     /// Executes a canonical request with bounded reconnect and cancellation.
@@ -327,8 +332,9 @@ impl DesktopNodeBindingV2 {
         {
             return Err(WorkerTransportAdapterError::CapabilityMismatch);
         }
-        let requests_computer_use =
-            required_capabilities.iter().any(|value| value == "computer_use");
+        let requests_computer_use = required_capabilities
+            .iter()
+            .any(|value| matches!(value.as_str(), "computer_use" | "tool:palyra.computer.use"));
         if requests_computer_use && !self.computer_use_authorized {
             return Err(WorkerTransportAdapterError::ComputerUseNotAuthorized);
         }
@@ -358,12 +364,23 @@ impl DesktopNodeBindingV2 {
         timeout_ms: u64,
     ) -> Result<CanonicalWorkerStdioAdapter, WorkerTransportAdapterError> {
         self.authorize(required_capabilities, observed_at_unix_ms)?;
-        CanonicalWorkerStdioAdapter::new(
+        CanonicalWorkerStdioAdapter::new_with_authority(
             workerd_executable,
             vec![OsString::from("--stdio")],
             timeout_ms,
+            CanonicalWorkerStdioAuthority::Desktop {
+                binding: self.clone(),
+                capabilities: required_capabilities.to_vec(),
+            },
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalWorkerStdioAuthority {
+    Local,
+    Ssh(SshWorkerTransportProfile),
+    Desktop { binding: DesktopNodeBindingV2, capabilities: Vec<String> },
 }
 
 /// Fixed child-process adapter shared by SSH and paired-desktop transports.
@@ -372,6 +389,7 @@ pub struct CanonicalWorkerStdioAdapter {
     executable: PathBuf,
     arguments: Vec<OsString>,
     timeout_ms: u64,
+    authority: CanonicalWorkerStdioAuthority,
 }
 
 impl CanonicalWorkerStdioAdapter {
@@ -391,6 +409,20 @@ impl CanonicalWorkerStdioAdapter {
         arguments: Vec<OsString>,
         timeout_ms: u64,
     ) -> Result<Self, WorkerTransportAdapterError> {
+        Self::new_with_authority(
+            executable,
+            arguments,
+            timeout_ms,
+            CanonicalWorkerStdioAuthority::Local,
+        )
+    }
+
+    fn new_with_authority(
+        executable: impl Into<PathBuf>,
+        arguments: Vec<OsString>,
+        timeout_ms: u64,
+        authority: CanonicalWorkerStdioAuthority,
+    ) -> Result<Self, WorkerTransportAdapterError> {
         validate_remote_worker_threat_model()?;
         let executable = executable.into();
         if executable.as_os_str().is_empty() || !executable.is_absolute() || !executable.is_file() {
@@ -399,7 +431,7 @@ impl CanonicalWorkerStdioAdapter {
         if arguments.is_empty() || timeout_ms == 0 || timeout_ms > MAX_ADAPTER_TIMEOUT_MS {
             return Err(WorkerTransportAdapterError::InvalidProfile);
         }
-        Ok(Self { executable, arguments, timeout_ms })
+        Ok(Self { executable, arguments, timeout_ms, authority })
     }
 
     /// Executes one canonical request and validates the terminal response.
@@ -421,9 +453,7 @@ impl CanonicalWorkerStdioAdapter {
         cancellation_requested: Option<&AtomicBool>,
     ) -> Result<WorkerRemoteToolResultEnvelope, WorkerTransportAdapterError> {
         let started = Instant::now();
-        request
-            .validate(observed_at_unix_ms)
-            .map_err(|error| WorkerTransportAdapterError::Protocol(error.to_string()))?;
+        self.authorize_request(request, observed_at_unix_ms)?;
         let encoded = serde_json::to_vec(request)
             .map_err(|error| WorkerTransportAdapterError::Protocol(error.to_string()))?;
         if encoded.len() > MAX_STDIO_MESSAGE_BYTES {
@@ -498,11 +528,85 @@ impl CanonicalWorkerStdioAdapter {
         Ok(result)
     }
 
+    fn authorize_request(
+        &self,
+        request: &WorkerRemoteToolRequestEnvelope,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), WorkerTransportAdapterError> {
+        request
+            .validate(observed_at_unix_ms)
+            .map_err(|error| WorkerTransportAdapterError::Protocol(error.to_string()))?;
+        match &self.authority {
+            CanonicalWorkerStdioAuthority::Local => Ok(()),
+            CanonicalWorkerStdioAuthority::Ssh(profile) => {
+                authorize_worker_identity(profile.profile_id.as_str(), request)?;
+                authorize_capability_scope(
+                    profile.capabilities.as_slice(),
+                    request.lease.required_capabilities.as_slice(),
+                )?;
+                let protocol = request.canonical_protocol.as_ref().ok_or_else(|| {
+                    WorkerTransportAdapterError::Protocol(
+                        "canonical remote worker protocol is required".to_owned(),
+                    )
+                })?;
+                profile.authorize(protocol, observed_at_unix_ms)
+            }
+            CanonicalWorkerStdioAuthority::Desktop { binding, capabilities } => {
+                authorize_worker_identity(binding.device_id.as_str(), request)?;
+                authorize_capability_scope(
+                    capabilities.as_slice(),
+                    request.lease.required_capabilities.as_slice(),
+                )?;
+                let protocol = request.canonical_protocol.as_ref().ok_or_else(|| {
+                    WorkerTransportAdapterError::Protocol(
+                        "canonical remote worker protocol is required".to_owned(),
+                    )
+                })?;
+                protocol
+                    .validate(observed_at_unix_ms)
+                    .map_err(|error| WorkerTransportAdapterError::Protocol(error.to_string()))?;
+                if request.lease.run_generation.get() != binding.generation
+                    || protocol.task.run_generation.get() != binding.generation
+                    || protocol.task.fence_generation != binding.generation
+                {
+                    return Err(WorkerTransportAdapterError::GenerationMismatch);
+                }
+                binding
+                    .authorize(request.lease.required_capabilities.as_slice(), observed_at_unix_ms)
+            }
+        }
+    }
+
     /// Returns the exact operator-owned process plan for diagnostics and tests.
     #[must_use]
     pub fn process_plan(&self) -> (&Path, &[OsString]) {
         (self.executable.as_path(), self.arguments.as_slice())
     }
+}
+
+fn authorize_worker_identity(
+    expected_worker_id: &str,
+    request: &WorkerRemoteToolRequestEnvelope,
+) -> Result<(), WorkerTransportAdapterError> {
+    if request.lease.worker_id != expected_worker_id
+        || request.worker_identity.worker_id != expected_worker_id
+    {
+        return Err(WorkerTransportAdapterError::WorkerIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn authorize_capability_scope(
+    authorized_capabilities: &[String],
+    requested_capabilities: &[String],
+) -> Result<(), WorkerTransportAdapterError> {
+    if requested_capabilities
+        .iter()
+        .any(|required| !authorized_capabilities.iter().any(|allowed| allowed == required))
+    {
+        return Err(WorkerTransportAdapterError::CapabilityMismatch);
+    }
+    Ok(())
 }
 
 /// Explicit platform availability projection for worker transports.
@@ -555,6 +659,9 @@ pub enum WorkerTransportAdapterError {
     /// Binding was revoked.
     #[error("worker transport binding is revoked")]
     Revoked,
+    /// Request identity does not match the transport authority.
+    #[error("worker transport identity does not match the active profile")]
+    WorkerIdentityMismatch,
     /// Canonical task generation does not match the active transport generation.
     #[error("worker transport generation does not match the active profile")]
     GenerationMismatch,
@@ -609,6 +716,7 @@ impl WorkerTransportAdapterError {
             Self::HostKeyMismatch => "worker.transport.host_key_mismatch",
             Self::AuthenticationFailed => "worker.transport.authentication_failed",
             Self::Revoked => "worker.transport.revoked",
+            Self::WorkerIdentityMismatch => "worker.transport.identity_mismatch",
             Self::GenerationMismatch => "worker.transport.generation_mismatch",
             Self::CapabilityMismatch => "worker.transport.capability_mismatch",
             Self::ComputerUseNotAuthorized => "worker.transport.computer_use_denied",
@@ -1024,11 +1132,12 @@ mod tests {
 
     #[test]
     fn desktop_binding_requires_separate_computer_use_and_fresh_presence() {
+        let computer_use_capability = "tool:palyra.computer.use".to_owned();
         let mut binding = DesktopNodeBindingV2 {
             device_id: "desktop-1".to_owned(),
             identity_fingerprint_sha256: "b".repeat(64),
             platform: "windows".to_owned(),
-            capabilities: vec!["computer_use".to_owned()],
+            capabilities: vec![computer_use_capability.clone()],
             user_presence_required: true,
             user_presence_confirmed_at_unix_ms: Some(10_000),
             user_presence_ttl_ms: 5_000,
@@ -1038,20 +1147,105 @@ mod tests {
             revoked: false,
         };
         assert_eq!(
-            binding.authorize(&["computer_use".to_owned()], 12_000),
+            binding.authorize(std::slice::from_ref(&computer_use_capability), 12_000),
             Err(WorkerTransportAdapterError::ComputerUseNotAuthorized)
         );
         binding.computer_use_authorized = true;
-        assert!(binding.authorize(&["computer_use".to_owned()], 12_000).is_ok());
+        assert!(binding.authorize(std::slice::from_ref(&computer_use_capability), 12_000).is_ok());
         assert_eq!(
-            binding.authorize(&["computer_use".to_owned()], 20_000),
+            binding.authorize(std::slice::from_ref(&computer_use_capability), 20_000),
             Err(WorkerTransportAdapterError::UserPresenceExpired)
         );
 
         binding.revoked = true;
         assert_eq!(
-            binding.authorize(&["computer_use".to_owned()], 12_000),
+            binding.authorize(std::slice::from_ref(&computer_use_capability), 12_000),
             Err(WorkerTransportAdapterError::Revoked)
+        );
+    }
+
+    #[test]
+    fn ssh_adapter_reauthorizes_the_request_bound_to_its_profile() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let profile = ssh_profile();
+        let adapter = CanonicalWorkerStdioAdapter::new_with_authority(
+            executable,
+            vec![OsString::from("--stdio")],
+            10_000,
+            CanonicalWorkerStdioAuthority::Ssh(profile.clone()),
+        )
+        .expect("SSH adapter");
+        let mut request = adapter_request();
+        bind_request_to_worker(&mut request, profile.profile_id.as_str(), profile.generation);
+        assert!(adapter.authorize_request(&request, 60_000).is_ok());
+
+        let mut identity_swap = request.clone();
+        bind_request_to_worker(&mut identity_swap, "ssh-worker-2", profile.generation);
+        assert_eq!(
+            adapter.execute(&identity_swap, 60_000),
+            Err(WorkerTransportAdapterError::WorkerIdentityMismatch)
+        );
+
+        let mut capability_swap = request.clone();
+        capability_swap.lease.required_capabilities.push("tool:palyra.process.run".to_owned());
+        refresh_protocol(&mut capability_swap);
+        assert_eq!(
+            adapter.authorize_request(&capability_swap, 60_000),
+            Err(WorkerTransportAdapterError::CapabilityMismatch)
+        );
+
+        let mut generation_swap = request;
+        bind_request_to_worker(&mut generation_swap, profile.profile_id.as_str(), 2);
+        assert_eq!(
+            adapter.authorize_request(&generation_swap, 60_000),
+            Err(WorkerTransportAdapterError::GenerationMismatch)
+        );
+    }
+
+    #[test]
+    fn desktop_adapter_reauthorizes_its_creation_scope_before_spawn() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let authorized_capability = "tool:palyra.fs.read_file".to_owned();
+        let binding = DesktopNodeBindingV2 {
+            device_id: "desktop-worker-1".to_owned(),
+            identity_fingerprint_sha256: "b".repeat(64),
+            platform: "windows".to_owned(),
+            capabilities: vec![authorized_capability.clone(), "tool:palyra.process.run".to_owned()],
+            user_presence_required: false,
+            user_presence_confirmed_at_unix_ms: None,
+            user_presence_ttl_ms: 5_000,
+            computer_use_authorized: false,
+            generation: 1,
+            expires_at_unix_ms: 100_000,
+            revoked: false,
+        };
+        let adapter = binding
+            .stdio_adapter(executable, std::slice::from_ref(&authorized_capability), 60_000, 10_000)
+            .expect("desktop adapter");
+        let mut request = adapter_request();
+        bind_request_to_worker(&mut request, binding.device_id.as_str(), binding.generation);
+        assert!(adapter.authorize_request(&request, 60_000).is_ok());
+
+        let mut capability_swap = request.clone();
+        capability_swap.lease.required_capabilities.push("tool:palyra.process.run".to_owned());
+        refresh_protocol(&mut capability_swap);
+        assert_eq!(
+            adapter.authorize_request(&capability_swap, 60_000),
+            Err(WorkerTransportAdapterError::CapabilityMismatch)
+        );
+
+        let mut identity_swap = request.clone();
+        bind_request_to_worker(&mut identity_swap, "desktop-worker-2", binding.generation);
+        assert_eq!(
+            adapter.execute(&identity_swap, 60_000),
+            Err(WorkerTransportAdapterError::WorkerIdentityMismatch)
+        );
+
+        let mut generation_swap = request;
+        bind_request_to_worker(&mut generation_swap, binding.device_id.as_str(), 2);
+        assert_eq!(
+            adapter.authorize_request(&generation_swap, 60_000),
+            Err(WorkerTransportAdapterError::GenerationMismatch)
         );
     }
 
@@ -1293,6 +1487,22 @@ mod tests {
         };
         request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(&request));
         request
+    }
+
+    fn bind_request_to_worker(
+        request: &mut WorkerRemoteToolRequestEnvelope,
+        worker_id: &str,
+        generation: u64,
+    ) {
+        request.lease.worker_id = worker_id.to_owned();
+        request.worker_identity.worker_id = worker_id.to_owned();
+        request.lease.run_generation = RuntimeGeneration::new(generation).expect("generation");
+        refresh_protocol(request);
+    }
+
+    fn refresh_protocol(request: &mut WorkerRemoteToolRequestEnvelope) {
+        request.canonical_protocol = None;
+        request.canonical_protocol = Some(RemoteWorkerProtocolV1::from_remote_request(request));
     }
 
     fn successful_result(
