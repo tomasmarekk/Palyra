@@ -8,7 +8,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -3205,19 +3207,18 @@ impl TypescriptLanguageServerProvider {
                 "No tsconfig.json, jsconfig.json, or package.json was found for touched TypeScript files.",
             );
         }
+        let search_path = env::var_os("PATH");
+        let Some(check_command) = resolve_typescript_check_command(search_path.as_deref()) else {
+            return TypescriptCaptureOutcome::degraded(
+                "code_intel.typescript.tsc_missing",
+                "Install tsc in the daemon PATH; workspace-local executables are not eligible for automatic diagnostics.",
+            );
+        };
 
         let mut items = Vec::new();
         let mut truncated = false;
         let mut failed_without_items_hint = None;
         for project_root in project_roots {
-            let Some(check_command) =
-                resolve_typescript_check_command(project_root.as_path(), workspace_root)
-            else {
-                return TypescriptCaptureOutcome::degraded(
-                    "code_intel.typescript.tsc_missing",
-                    "Install TypeScript locally or make tsc available on PATH for language-server diagnostics.",
-                );
-            };
             let output =
                 match self.run_tsc_no_emit(project_root.as_path(), check_command.as_path()).await {
                     Ok(output) => output,
@@ -3925,16 +3926,8 @@ fn nearest_typescript_project_root(workspace_root: &Path, relative_path: &str) -
     package_root
 }
 
-fn resolve_typescript_check_command(project_root: &Path, workspace_root: &Path) -> Option<PathBuf> {
-    for root in [project_root, workspace_root] {
-        for name in executable_candidates(TYPESCRIPT_TSC_COMMAND) {
-            let candidate = root.join("node_modules").join(".bin").join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    executable_is_available(TYPESCRIPT_TSC_COMMAND).then(|| PathBuf::from(TYPESCRIPT_TSC_COMMAND))
+fn resolve_typescript_check_command(search_path: Option<&OsStr>) -> Option<PathBuf> {
+    resolve_executable_path_with_search_path(TYPESCRIPT_TSC_COMMAND, search_path)
 }
 
 fn resolve_pyright_check_command(
@@ -4178,12 +4171,19 @@ fn executable_is_available(binary: &str) -> bool {
 /// Resolves an operator-configured executable before any child process adopts
 /// a workspace-controlled current directory.
 fn resolve_executable_path(binary: &str) -> Option<PathBuf> {
+    let search_path = env::var_os("PATH");
+    resolve_executable_path_with_search_path(binary, search_path.as_deref())
+}
+
+fn resolve_executable_path_with_search_path(
+    binary: &str,
+    search_path: Option<&OsStr>,
+) -> Option<PathBuf> {
     let candidate = Path::new(binary);
     if candidate.components().count() > 1 || candidate.is_absolute() {
         return if candidate.is_file() { fs::canonicalize(candidate).ok() } else { None };
     }
-    let paths = env::var_os("PATH")?;
-    env::split_paths(&paths).find_map(|directory| {
+    env::split_paths(search_path?).find_map(|directory| {
         executable_candidates(binary).into_iter().map(|name| directory.join(name)).find_map(
             |candidate| {
                 if candidate.is_file() {
@@ -4753,6 +4753,33 @@ mod tests {
         assert_eq!(items[0].severity, DiagnosticSeverity::Error);
         assert_eq!(items[0].code.as_deref(), Some("TS2304"));
         assert_eq!(items[0].source, TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE);
+    }
+
+    #[test]
+    fn typescript_check_command_uses_only_daemon_search_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let trusted_bin = tempdir.path().join("trusted-bin");
+        let workspace_bin = tempdir.path().join("workspace").join("node_modules").join(".bin");
+        fs::create_dir_all(trusted_bin.as_path()).expect("trusted bin should be created");
+        fs::create_dir_all(workspace_bin.as_path()).expect("workspace bin should be created");
+        let executable_suffix = if cfg!(windows) { ".exe" } else { "" };
+        let workspace_tsc = workspace_bin.join(format!("tsc{executable_suffix}"));
+        fs::write(workspace_tsc.as_path(), b"workspace-controlled")
+            .expect("workspace tsc should exist");
+        let search_path =
+            env::join_paths([trusted_bin.as_path()]).expect("trusted search path should join");
+
+        assert!(
+            resolve_typescript_check_command(Some(search_path.as_os_str())).is_none(),
+            "workspace-local tsc must not satisfy daemon diagnostics"
+        );
+
+        let trusted_tsc = trusted_bin.join(format!("tsc{executable_suffix}"));
+        fs::write(trusted_tsc.as_path(), b"trusted").expect("trusted tsc should exist");
+        assert_eq!(
+            resolve_typescript_check_command(Some(search_path.as_os_str())),
+            Some(fs::canonicalize(trusted_tsc).expect("trusted tsc should canonicalize"))
+        );
     }
 
     #[test]
