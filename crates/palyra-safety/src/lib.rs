@@ -1127,10 +1127,6 @@ struct SensitiveComparison {
     separator_index: usize,
 }
 
-fn detect_sensitive_comparison(line: &str) -> Option<SensitiveComparison> {
-    detect_sensitive_comparisons(line).into_iter().next()
-}
-
 fn detect_sensitive_comparisons(line: &str) -> Vec<SensitiveComparison> {
     let mut comparisons = Vec::new();
     for (operator_start, operator_len, separator_index) in comparison_operators(line) {
