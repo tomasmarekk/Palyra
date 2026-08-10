@@ -521,7 +521,7 @@ fn validate_browser_file_url_path_scope(
         return Ok(());
     }
     Err(format!(
-        "palyra.browser.navigate file:// URL {url} must point at a regular file inside the active agent or run-launch workspace roots"
+        "palyra.browser.navigate file:// URL {url} must point at a regular file inside the active agent workspace roots"
     ))
 }
 
@@ -571,9 +571,9 @@ fn canonical_file_path_is_inside_workspace_roots(
     canonical_roots.iter().any(|root| canonical_target.starts_with(root))
 }
 
-/// Resolves the agent for this execution context plus run-launch workspace roots.
-/// Use this for browser read/navigation authorization where the CLI launch
-/// directory is an explicit workspace boundary for the current run.
+/// Resolves only the configured agent roots for browser reads and navigation.
+/// Run-launch roots are intentionally excluded because client-supplied launch
+/// context cannot widen local-file authority.
 ///
 /// # Errors
 /// Returns a tool-facing message when agent resolution fails or the roots do
@@ -583,15 +583,8 @@ async fn resolve_browser_read_workspace_roots(
     context: ToolRuntimeExecutionContext<'_>,
     tool_name: &str,
 ) -> Result<Vec<PathBuf>, String> {
-    let (workspace_roots, source) =
+    let (workspace_roots, _) =
         browser_agent_workspace_root_inputs(runtime_state, context, tool_name).await?;
-    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
-        runtime_state,
-        context.run_id,
-        workspace_roots.as_slice(),
-        source,
-    )
-    .await;
     canonicalize_browser_workspace_roots(tool_name, workspace_roots.as_slice())
 }
 
@@ -7394,7 +7387,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_file_url_scope_accepts_run_launch_workspace_root() {
+    fn browser_file_url_scope_rejects_run_launch_workspace_root() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let agent_workspace = temp.path().join("agent-workspace");
         let launch_workspace = temp.path().join("launch-workspace");
@@ -7412,24 +7405,13 @@ mod tests {
             .expect("launch file should canonicalize");
         let canonical_agent =
             agent_workspace.canonicalize().expect("workspace should canonicalize");
-        let canonical_launch =
-            launch_workspace.canonicalize().expect("launch workspace should canonicalize");
-
-        let denied = validate_browser_file_url_path_scope(
+        let error = validate_browser_file_url_path_scope(
             launch_url.as_str(),
             launch_target.as_path(),
             std::slice::from_ref(&canonical_agent),
         )
-        .expect_err("agent-only roots should still reject the launch sibling");
-        assert!(denied.contains("run-launch workspace roots"), "{denied}");
-        assert!(
-            validate_browser_file_url_path_scope(
-                launch_url.as_str(),
-                launch_target.as_path(),
-                &[canonical_launch, canonical_agent]
-            )
-            .is_ok(),
-            "run-launch roots are an explicit browser file:// read boundary for the current run"
-        );
+        .expect_err("launch siblings must not widen browser file authority");
+
+        assert!(error.contains("active agent workspace roots"), "{error}");
     }
 }
