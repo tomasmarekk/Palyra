@@ -382,7 +382,7 @@ fn push_anthropic_expanded_multi_tool_exchange(
 mod tests {
     use super::{
         anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
-        messages_payload,
+        messages_payload, JSON_MODE_SYSTEM_INSTRUCTION,
     };
     use crate::config::{ModelProviderAuthProviderKind, ModelProviderCredentialSource};
     use crate::{
