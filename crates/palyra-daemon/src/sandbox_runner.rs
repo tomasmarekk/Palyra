@@ -120,8 +120,7 @@ const BUILTIN_LIST_MAX_ENTRIES: usize = 512;
 const BUILTIN_READ_FILE_MAX_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
 const CAPTURE_CHUNK_BYTES: usize = 4 * 1024;
-const PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
-const PROCESS_FAILURE_OUTPUT_TAIL_BYTES: usize = 4 * 1024;
+const PROCESS_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
 const PROCESS_STREAM_INLINE_TEXT_BYTES: usize = 8 * 1024;
 const PROCESS_STREAM_HEAD_BYTES: usize = 4 * 1024;
 const PROCESS_STREAM_TAIL_BYTES: usize = 4 * 1024;
@@ -430,7 +429,7 @@ impl ProcessFailureClass {
                 "inspect cancellation/signal cause and rerun only if the process tree can complete within the run lifecycle"
             }
             Self::NonzeroExit => {
-                "inspect the redacted stdout/stderr tail, fix the command or inputs, then rerun"
+                "fix the command or inputs, then rerun with diagnostics written to an approved workspace artifact if output inspection is required"
             }
             Self::OutputLimit => {
                 "rerun with narrower output, redirect verbose logs to a file, or raise max_output_bytes by policy"
@@ -3289,32 +3288,16 @@ fn process_failure_message(
     stdout: &StreamCapture,
     stderr: &StreamCapture,
 ) -> String {
-    let stdout_preview = redacted_process_output_preview(stdout.bytes.as_slice())
-        .map(|preview| format!(", stdout_preview={preview:?}"))
-        .unwrap_or_default();
-    let stderr_preview = redacted_process_output_preview(stderr.bytes.as_slice())
-        .map(|preview| format!(", stderr_preview={preview:?}"))
-        .unwrap_or_default();
-    let stdout_tail = redacted_process_output_tail(stdout.bytes.as_slice())
-        .map(|tail| format!(", stdout_tail={tail:?}"))
-        .unwrap_or_default();
-    let stderr_tail = redacted_process_output_tail(stderr.bytes.as_slice())
-        .map(|tail| format!(", stderr_tail={tail:?}"))
-        .unwrap_or_default();
     let diagnostic_hint = process_failure_diagnostic_hint(stdout, stderr)
         .map(|hint| format!(", hint={hint:?}"))
         .unwrap_or_default();
     format!(
-        "sandbox process exited unsuccessfully (failure_class={}, code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{}{}{})",
+        "sandbox process exited unsuccessfully (failure_class={}, code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}); child output omitted from error",
         failure_class.as_str(),
         stdout.bytes.len(),
         stdout.truncated,
         stderr.bytes.len(),
         stderr.truncated,
-        stdout_preview,
-        stderr_preview,
-        stdout_tail,
-        stderr_tail,
         diagnostic_hint,
     )
 }
@@ -3337,22 +3320,15 @@ fn process_failure_diagnostic_hint(
     None
 }
 
-// Failure previews flatten control characters and collapse whitespace before redaction so the
-// preview stays a single safe log line regardless of what the child printed.
+// Structured success output previews flatten control characters and collapse whitespace before
+// redaction. Failure errors never embed this content because heuristic redaction cannot prove that
+// arbitrary child output is safe for model-visible error channels.
 fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
     if output.is_empty() {
         return None;
     }
-    let take_len = output.len().min(PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES);
+    let take_len = output.len().min(PROCESS_OUTPUT_PREVIEW_BYTES);
     redacted_process_output_single_line(&output[..take_len])
-}
-
-fn redacted_process_output_tail(output: &[u8]) -> Option<String> {
-    if output.len() <= PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES {
-        return None;
-    }
-    let tail_start = output.len().saturating_sub(PROCESS_FAILURE_OUTPUT_TAIL_BYTES);
-    redacted_process_output_single_line(&output[tail_start..])
 }
 
 fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
@@ -3690,32 +3666,25 @@ fn process_output_diagnostic_summary(stdout: &StreamCapture, stderr: &StreamCapt
 
 fn process_stream_diagnostic_summary(stream_name: &str, stream: &StreamCapture) -> Value {
     let size_bytes = stream.bytes.len();
-    let sha256 = sha256_hex(stream.bytes.as_slice());
     if process_output_looks_binary(stream.bytes.as_slice()) {
         return json!({
+            "stream": stream_name,
             "size_bytes": size_bytes,
             "truncated": stream.truncated,
             "binary": true,
             "binary_output_omitted": !stream.bytes.is_empty(),
-            "sha256": sha256,
-            "tail_hex": process_bytes_tail_hex(stream.bytes.as_slice()),
         });
     }
 
     let decoded = decode_process_output_text(stream.bytes.as_slice());
-    let RedactedProcessOutputText { text, redacted, redaction_reasons } =
-        redacted_process_output_text(decoded.text.as_str());
     json!({
+        "stream": stream_name,
         "size_bytes": size_bytes,
         "truncated": stream.truncated,
         "binary": false,
         "encoding": decoded.encoding,
         "decode_replacement_count": decoded.decode_replacement_count,
-        "sha256": sha256,
-        "tail": process_text_suffix(text.as_str(), PROCESS_STREAM_TAIL_BYTES),
-        "redacted": redacted,
-        "redaction_reasons": redaction_reasons,
-        "stream": stream_name,
+        "content_omitted": !stream.bytes.is_empty(),
     })
 }
 
@@ -9641,16 +9610,14 @@ fn background_process_startup_failure(
     SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!(
-            "sandbox background process exited before startup check (failure_class={}, code={}) for command '{}'{}{}; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
+            "sandbox background process exited before startup check (failure_class={}, code={}) for command '{}', stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}; child output omitted from error; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
             failure_class.as_str(),
             status.code().unwrap_or(-1),
             input.command,
-            redacted_process_output_preview(stdout.bytes.as_slice())
-                .map(|preview| format!(", stdout_preview={preview:?}"))
-                .unwrap_or_default(),
-            redacted_process_output_preview(stderr.bytes.as_slice())
-                .map(|preview| format!(", stderr_preview={preview:?}"))
-                .unwrap_or_default(),
+            stdout.bytes.len(),
+            stdout.truncated,
+            stderr.bytes.len(),
+            stderr.truncated,
         ),
     }
 }
@@ -18624,7 +18591,7 @@ mod tests {
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::write(
             workspace.join("delayed_fail.py"),
-            "import sys\nprint('Unknown command: \"node\"', flush=True)\nsys.exit(1)\n",
+            "import sys\nprint('arbitrary-private-background-output', flush=True)\nsys.exit(1)\n",
         )
         .expect("delayed failure script should be written");
         let mut policy =
@@ -18645,7 +18612,12 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
         assert!(error.message.contains("exited before startup check"), "{}", error.message);
-        assert!(error.message.contains("Unknown command"), "{}", error.message);
+        assert!(error.message.contains("child output omitted from error"), "{}", error.message);
+        assert!(
+            !error.message.contains("arbitrary-private-background-output"),
+            "{}",
+            error.message
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -19521,11 +19493,8 @@ mod tests {
             !error.message.contains(secret_marker),
             "runtime failure message must not leak raw stderr payload"
         );
-        assert!(
-            error.message.contains("stderr_preview="),
-            "runtime failure should include a redacted stderr preview: {}",
-            error.message
-        );
+        assert!(!error.message.contains("stderr_preview="), "{}", error.message);
+        assert!(error.message.contains("child output omitted from error"), "{}", error.message);
     }
 
     #[test]
@@ -19718,17 +19687,21 @@ mod tests {
     }
 
     #[test]
-    fn process_output_diagnostic_summary_includes_tail_after_timeout() {
+    fn process_output_diagnostic_summary_omits_child_content() {
         let mut stdout = b"build progress\n".repeat(2_000);
-        stdout.extend_from_slice(b"last visible progress before timeout\n");
+        let secret_marker = "arbitrary-private-build-context";
+        stdout.extend_from_slice(secret_marker.as_bytes());
         let stdout = StreamCapture { bytes: stdout, truncated: false, read_error: None };
         let stderr = StreamCapture::default();
 
         let summary = process_output_diagnostic_summary(&stdout, &stderr);
 
-        assert!(summary.contains("last visible progress before timeout"), "{summary}");
-        assert!(summary.contains("\"sha256\""), "{summary}");
-        assert!(summary.contains("\"tail\""), "{summary}");
+        assert!(summary.contains("\"size_bytes\""), "{summary}");
+        assert!(summary.contains("\"content_omitted\":true"), "{summary}");
+        assert!(!summary.contains(secret_marker), "{summary}");
+        assert!(!summary.contains("\"sha256\""), "{summary}");
+        assert!(!summary.contains("\"head\""), "{summary}");
+        assert!(!summary.contains("\"tail\""), "{summary}");
     }
 
     #[test]
@@ -19770,14 +19743,14 @@ mod tests {
     }
 
     #[test]
-    fn process_failure_message_includes_redacted_stdout_and_stderr_previews() {
+    fn process_failure_message_omits_stdout_and_stderr_content() {
         let stdout = StreamCapture {
-            bytes: b"AssertionError: expected 180 but got 190\naccess_token=stdout-secret".to_vec(),
+            bytes: b"arbitrary-private-stdout\naccess_token=stdout-secret".to_vec(),
             truncated: false,
             read_error: None,
         };
         let stderr = StreamCapture {
-            bytes: b"stderr token=stderr-secret\n".to_vec(),
+            bytes: b"arbitrary-private-stderr\ntoken=stderr-secret\n".to_vec(),
             truncated: false,
             read_error: None,
         };
@@ -19788,16 +19761,17 @@ mod tests {
         assert!(message.contains("failure_class=nonzero_exit"), "{message}");
         assert!(message.contains("stdout_bytes="), "{message}");
         assert!(message.contains("stderr_bytes="), "{message}");
-        assert!(message.contains("stdout_preview="), "{message}");
-        assert!(message.contains("stderr_preview="), "{message}");
-        assert!(message.contains("AssertionError"), "{message}");
+        assert!(message.contains("child output omitted from error"), "{message}");
+        assert!(!message.contains("stdout_preview="), "{message}");
+        assert!(!message.contains("stderr_preview="), "{message}");
+        assert!(!message.contains("arbitrary-private-stdout"), "{message}");
+        assert!(!message.contains("arbitrary-private-stderr"), "{message}");
         assert!(!message.contains("stdout-secret"), "{message}");
         assert!(!message.contains("stderr-secret"), "{message}");
-        assert!(message.contains("<redacted>"), "{message}");
     }
 
     #[test]
-    fn process_failure_message_includes_redacted_stderr_tail_for_long_diagnostics() {
+    fn process_failure_message_omits_long_stderr_tail() {
         let stdout = StreamCapture { bytes: Vec::new(), truncated: false, read_error: None };
         let mut stderr = b"Downloading crate progress line\n".repeat(260);
         stderr.extend_from_slice(
@@ -19808,12 +19782,13 @@ mod tests {
         let message =
             process_failure_message(super::ProcessFailureClass::NonzeroExit, 101, &stdout, &stderr);
 
-        assert!(message.contains("stderr_preview="), "{message}");
-        assert!(message.contains("stderr_tail="), "{message}");
-        assert!(message.contains("error[E0425]"), "{message}");
-        assert!(message.contains("missing_symbol"), "{message}");
+        assert!(message.contains("stderr_bytes="), "{message}");
+        assert!(message.contains("child output omitted from error"), "{message}");
+        assert!(!message.contains("stderr_preview="), "{message}");
+        assert!(!message.contains("stderr_tail="), "{message}");
+        assert!(!message.contains("error[E0425]"), "{message}");
+        assert!(!message.contains("missing_symbol"), "{message}");
         assert!(!message.contains("tail-secret"), "{message}");
-        assert!(message.contains("<redacted>"), "{message}");
     }
 
     #[test]
