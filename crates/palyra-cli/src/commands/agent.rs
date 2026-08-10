@@ -547,6 +547,20 @@ async fn read_next_interactive_prompt(
     Ok(None)
 }
 
+async fn read_next_interactive_approval_line(
+    input_rx: &mut mpsc::UnboundedReceiver<Result<String, String>>,
+) -> Result<Option<String>> {
+    input_rx
+        .recv()
+        .await
+        .transpose()
+        .map_err(|error| anyhow!("failed to read interactive approval from stdin: {error}"))
+}
+
+fn interactive_approval_line_is_approved(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 fn interactive_interrupt_message(cancel_requested: bool, queued_prompt_count: usize) -> String {
     format!(
         "agent.interactive.interrupt run_id={} cancel_requested={} queued_prompt_count={} reason=interactive_interrupt",
@@ -861,8 +875,8 @@ async fn prompt_tool_approval_decision_from_interactive_input(
     eprintln!("{}", tool_approval_prompt_line(approval));
     eprint!("{}", tool_approval_terminal_prompt_text());
     std::io::stderr().flush().context("stderr flush failed")?;
-    let input = read_next_interactive_prompt(input_rx).await?.unwrap_or_default();
-    let approved = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    let input = read_next_interactive_approval_line(input_rx).await?.unwrap_or_default();
+    let approved = interactive_approval_line_is_approved(input.as_str());
     Ok(ToolApprovalDecision {
         approved,
         reason: if approved {
@@ -929,9 +943,10 @@ mod tests {
     use super::{
         cli_launch_parameter_delta_json_for_cwd,
         deny_tool_approval_due_to_pending_interactive_input, drain_ready_interactive_prompts,
-        ensure_agent_run_approval_flags, interactive_interrupt_message,
-        interactive_session_started_message, normalize_interactive_prompt_line,
-        normalize_reasoning_effort_arg, normalize_service_tier_arg,
+        ensure_agent_run_approval_flags, interactive_approval_line_is_approved,
+        interactive_interrupt_message, interactive_session_started_message,
+        normalize_interactive_prompt_line, normalize_reasoning_effort_arg,
+        normalize_service_tier_arg, read_next_interactive_approval_line,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -1014,6 +1029,21 @@ mod tests {
         assert!(!drained.input_closed);
         assert!(!decision.approved);
         assert_eq!(decision.reason, "denied_due_to_pending_interactive_input");
+    }
+
+    #[tokio::test]
+    async fn blank_approval_line_is_consumed_as_default_deny() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Ok(" \t ".to_owned())).expect("blank approval should enqueue");
+        tx.send(Ok("yes".to_owned())).expect("following prompt should enqueue");
+
+        let input = read_next_interactive_approval_line(&mut rx)
+            .await
+            .expect("approval input should be readable")
+            .expect("approval input should remain open");
+
+        assert!(!interactive_approval_line_is_approved(input.as_str()));
+        assert_eq!(rx.try_recv(), Ok(Ok("yes".to_owned())));
     }
 
     #[test]
