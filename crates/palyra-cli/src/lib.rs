@@ -4874,17 +4874,17 @@ async fn resolve_memory_session_id(
                 .await
                 .with_context(|| {
                     format!(
-                        "{argument_name} `{session_key}` is not a canonical session ULID and could not be resolved as a session key; run `palyra sessions show --session-key {session_key} --json` to verify it or pass the returned session_id"
+                        "{argument_name} is not a canonical session ULID and could not be resolved as a session key; verify it through an explicit JSON session lookup or pass the returned session_id"
                     )
                 })?;
             let resolved = response.session.with_context(|| {
                 format!(
-                    "{argument_name} `{session_key}` resolved as a session key, but the gateway returned no session payload"
+                    "{argument_name} resolved as a session key, but the gateway returned no session payload"
                 )
             })?;
             let session_id = resolved.session_id.with_context(|| {
                 format!(
-                    "{argument_name} `{session_key}` resolved as a session key, but the gateway returned no session_id"
+                    "{argument_name} resolved as a session key, but the gateway returned no session_id"
                 )
             })?;
             Ok(session_id)

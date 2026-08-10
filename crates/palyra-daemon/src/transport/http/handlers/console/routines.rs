@@ -1044,10 +1044,6 @@ fn routine_output_fields_from_session(
         json!({
             "session_id": session_id,
             "session_key": session.session_key.as_str(),
-            "command": format!(
-                "palyra sessions show --session-key {} --json",
-                session.session_key
-            ),
         }),
     );
     if !allow_preview {
@@ -2276,7 +2272,6 @@ async fn dispatch_single_routine(
     let output_lookup = outcome.session_key.as_ref().map(|session_key| {
         json!({
             "session_key": session_key,
-            "command": format!("palyra sessions show --session-key {session_key} --json"),
         })
     });
     Ok(json!({
@@ -4008,7 +4003,7 @@ mod tests {
     fn routine_output_fields_expose_owner_session_preview() {
         let session = OrchestratorSessionRecord {
             session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
-            session_key: "cron:daily".to_owned(),
+            session_key: "cron:daily; echo injected".to_owned(),
             session_label: Some("Daily routine".to_owned()),
             principal: "operator".to_owned(),
             device_id: "system:scheduler".to_owned(),
@@ -4070,19 +4065,18 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("01ARZ3NDEKTSV4RRFFQ69G5FAW")
         );
-        assert_eq!(fields.get("session_key").and_then(|value| value.as_str()), Some("cron:daily"));
+        assert_eq!(
+            fields.get("session_key").and_then(|value| value.as_str()),
+            Some("cron:daily; echo injected")
+        );
         assert_eq!(
             fields
                 .get("output_lookup")
                 .and_then(|value| value.get("session_key"))
                 .and_then(|value| value.as_str()),
-            Some("cron:daily")
+            Some("cron:daily; echo injected")
         );
-        assert!(fields
-            .get("output_lookup")
-            .and_then(|value| value.get("command"))
-            .and_then(|value| value.as_str())
-            .is_some_and(|command| command.contains("sessions show --session-key cron:daily")));
+        assert!(fields.get("output_lookup").and_then(|value| value.get("command")).is_none());
         assert!(
             routine_output_fields_from_session(
                 "01ARZ3NDEKTSV4RRFFQ69G5FAW",
