@@ -1236,9 +1236,6 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
         return None;
     }
     let classification = classify_sensitive_assignment_key(key.as_str())?;
-    if classification == "token" && !bare_token_assignment_value_requires_redaction(value) {
-        return None;
-    }
     // "key" is too generic (storage keys, parser keys, ...) to flag on the
     // name alone; require the value itself to look like a secret.
     if classification == "key" && !generic_key_assignment_value_looks_secret(key.as_str(), value) {
@@ -4013,13 +4010,9 @@ mod tests {
     }
 
     #[test]
-    fn benign_bare_token_fixture_values_are_not_redacted() {
-        let source = "const fixtureUrl = '/callback?token=a%3Db%3Dc';\n\
-                      const params = 'token=a%3Db%3Dc';\n\
-                      const selector = '#password';\n\
+    fn fixture_shaped_bare_token_values_are_redacted() {
+        let source = "token=a%3Db%3Dc\n\
                       token=value=with=equals\n\
-                      expected=token=value=with=equals\n\
-                      KEY=VITE_APP_LABEL\n\
                       token=palyra_e2e_delete_me\n\
                       token=palyra_e2e_keep_me";
         let outcome = redact_text_for_export(
@@ -4029,17 +4022,16 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
-        assert_eq!(outcome.redacted_text, source);
-        assert!(outcome.redacted_text.contains("token=value=with=equals"));
-        assert!(outcome.redacted_text.contains("KEY=VITE_APP_LABEL"));
-        assert!(outcome.redacted_text.contains("palyra_e2e_delete_me"));
-        assert!(outcome.redacted_text.contains("palyra_e2e_keep_me"));
-        assert!(!outcome
+        assert!(outcome.redacted);
+        assert!(!outcome.redacted_text.contains("a%3Db%3Dc"));
+        assert!(!outcome.redacted_text.contains("value=with=equals"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_delete_me"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_keep_me"));
+        assert!(outcome
             .scan
             .finding_codes()
             .iter()
-            .any(|code| code.starts_with("secret_leak.assignment.")));
+            .any(|code| code == "secret_leak.assignment.token"));
     }
 
     #[test]

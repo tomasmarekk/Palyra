@@ -35251,28 +35251,14 @@ fn contains_secret_like_bare_token_assignment(normalized: &str) -> bool {
         if bare_token_value_looks_secret(&normalized[value_start..value_end]) {
             return true;
         }
-        search_start = value_end.saturating_add(1).min(normalized.len());
+        search_start = value_end;
     }
     false
 }
 
 fn bare_token_value_looks_secret(value: &str) -> bool {
     let trimmed = value.trim().trim_end_matches([',', ';', ':', '.', ')', ']', '}']);
-    !trimmed.is_empty() && !is_benign_bare_token_fixture_value(trimmed)
-}
-
-fn is_benign_bare_token_fixture_value(value: &str) -> bool {
-    let lowered = value.trim_matches(['"', '\'', '`']).to_ascii_lowercase();
-    lowered == "a%3db%3dc" || looks_like_parser_fixture_value(lowered.as_str())
-}
-
-fn looks_like_parser_fixture_value(value: &str) -> bool {
-    value.contains('=')
-        && value.len() <= 96
-        && value
-            .split('=')
-            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
-        && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
+    !trimmed.is_empty()
 }
 
 fn redact_secret_like_markers(input: &str) -> String {
@@ -39053,15 +39039,15 @@ mod tests {
     }
 
     #[test]
-    fn redact_payload_json_preserves_structural_password_selectors_and_benign_tokens() {
+    fn redact_payload_json_preserves_structural_selectors_and_masks_fixture_shaped_tokens() {
         let redacted = super::redact_payload_json(
             br##"{"selector":"#password","tool_output":"const fixture = 'token=a%3Db%3Dc';"}"##,
         )
         .expect("payload redaction should succeed");
 
         assert!(redacted.contains(r##""selector":"#password""##), "{redacted}");
-        assert!(redacted.contains("token=a%3Db%3Dc"), "{redacted}");
-        assert!(!redacted.contains("<redacted>"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        assert!(!redacted.contains("token=a%3Db%3Dc"), "{redacted}");
     }
 
     #[test]
@@ -39081,6 +39067,16 @@ mod tests {
 
         assert!(redacted.contains("<redacted>"), "{redacted}");
         assert!(!redacted.contains("token=abc123"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_payload_json_handles_multibyte_whitespace_after_empty_token() {
+        let redacted =
+            super::redact_payload_json("{\"tool_output\":\"token=\u{2003}token=abc\"}".as_bytes())
+                .expect("payload redaction should succeed");
+
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        assert!(!redacted.contains("token=abc"), "{redacted}");
     }
 
     #[test]

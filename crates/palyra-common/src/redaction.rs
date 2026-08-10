@@ -1,9 +1,9 @@
 //! Secret redaction for headers, URLs, and free-form diagnostic text.
 //!
-//! Heuristic variants minimize false positives on benign fixture text; `_strict` variants
-//! redact every sensitive-looking assignment for diagnostics that leave the host. Outcomes
-//! are pinned by fixtures and exercised by `fuzz/fuzz_targets/redaction_routines.rs` —
-//! placeholder strings and redaction decisions must stay byte-identical.
+//! Heuristic variants preserve sanctioned reference metadata; `_strict` variants redact every
+//! sensitive-looking assignment for diagnostics that leave the host. Outcomes are pinned by
+//! fixtures and exercised by `fuzz/fuzz_targets/redaction_routines.rs` — placeholder strings and
+//! redaction decisions must stay byte-identical.
 
 use std::borrow::Cow;
 
@@ -40,7 +40,7 @@ const SENSITIVE_KEY_MARKERS: &[&str] = &[
 
 /// How aggressively assignment values are redacted.
 ///
-/// `Heuristic` keeps benign short bare `token=` values visible; `Diagnostic` redacts every
+/// `Heuristic` preserves sanctioned reference metadata; `Diagnostic` redacts every
 /// sensitive-keyed assignment because diagnostic exports must err on the side of removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedactionStrictness {
@@ -592,11 +592,11 @@ fn looks_like_url_token(token: &str) -> bool {
     let base = token[..separator_index]
         .trim_matches(['"', '\'', '`', '(', '[', '{'])
         .trim_end_matches(['"', '\'', '`', ')', ']', '}']);
-    if base.is_empty() || base.contains('(') || base.contains(')') {
-        return false;
-    }
     if query_or_fragment_contains_sensitive_value(&token[separator_index + 1..]) {
         return true;
+    }
+    if base.is_empty() || base.contains('(') || base.contains(')') {
+        return false;
     }
     base.starts_with('/') || base.starts_with("./") || base.starts_with("../") || base.contains('.')
 }
@@ -647,15 +647,6 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
         && is_public_e2e_key_name_reference(sensitive_key, value)
     {
         return false;
-    }
-    if strictness == RedactionStrictness::Diagnostic {
-        return true;
-    }
-    // Heuristic mode: bare "token" keys are common in benign fixture/test text, but
-    // real callback, CSRF, and magic-link tokens can be very short. Keep only the
-    // narrow source-fixture shapes known to be non-secret.
-    if normalize_key(sensitive_key) == "token" {
-        return !is_benign_bare_token_fixture_value(value);
     }
     true
 }
@@ -746,27 +737,6 @@ fn trailing_plain_key_segment(value: &str) -> Option<PlainKeySegment<'_>> {
         .unwrap_or(0);
     let prefix = if start == 0 { None } else { value[..start].chars().next_back() };
     Some(PlainKeySegment { segment: &value[start..end], prefix })
-}
-
-fn is_benign_bare_token_fixture_value(value: &str) -> bool {
-    let trimmed = value
-        .trim()
-        .trim_matches(['"', '\'', '`'])
-        .trim_end_matches([',', ';', ':', '.', ')', ']', '}']);
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lowered = trimmed.to_ascii_lowercase();
-    lowered == "a%3db%3dc" || looks_like_parser_fixture_value(lowered.as_str())
-}
-
-fn looks_like_parser_fixture_value(value: &str) -> bool {
-    value.contains('=')
-        && value.len() <= 96
-        && value
-            .split('=')
-            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
-        && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
 }
 
 fn split_assignment(token: &str) -> Option<(&str, char, &str)> {
@@ -896,10 +866,10 @@ mod tests {
     }
 
     #[test]
-    fn url_redaction_preserves_short_benign_bare_token_values() {
+    fn url_redaction_masks_fixture_shaped_bare_token_values() {
         let redacted = redact_url("https://example.test/path?token=a%3Db%3Dc&mode=full");
 
-        assert_eq!(redacted, "https://example.test/path?token=a%3Db%3Dc&mode=full");
+        assert_eq!(redacted, "https://example.test/path?token=<redacted>&mode=full");
     }
 
     #[test]
@@ -952,11 +922,12 @@ mod tests {
     }
 
     #[test]
-    fn auth_error_redaction_preserves_short_benign_bare_token_assignments() {
+    fn auth_error_redaction_masks_fixture_shaped_bare_token_assignments() {
         let redacted =
             redact_auth_error("fixture line: token=a%3Db%3Dc selector=#password code=ok");
 
-        assert!(redacted.contains("token=a%3Db%3Dc"), "{redacted}");
+        assert!(redacted.contains("token=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("a%3Db%3Dc"), "{redacted}");
         assert!(redacted.contains("selector=#password"), "{redacted}");
     }
 
@@ -1075,6 +1046,15 @@ mod tests {
         assert!(redacted.contains("refresh_token=<redacted>"), "{redacted}");
         assert!(!redacted.contains("access_token=abc"), "{redacted}");
         assert!(!redacted.contains("refresh_token=r"), "{redacted}");
+    }
+
+    #[test]
+    fn url_segments_in_text_redacts_bare_sensitive_query_params() {
+        let redacted = redact_url_segments_in_text("callback failed: ?token=abc123&state=ok");
+
+        assert!(redacted.contains("token=<redacted>"), "{redacted}");
+        assert!(redacted.contains("state=ok"), "{redacted}");
+        assert!(!redacted.contains("token=abc123"), "{redacted}");
     }
 
     #[test]
