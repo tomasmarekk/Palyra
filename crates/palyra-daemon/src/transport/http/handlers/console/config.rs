@@ -332,7 +332,11 @@ pub(crate) async fn apply_config_reload_for_context(
     } else {
         let mut next_loaded = current.clone();
         let mut next_model_provider = None;
-        if current.model_provider != candidate.model_provider {
+        let apply_model_provider = current.model_provider != candidate.model_provider
+            && reload_plan_step_is_hot_safe(&plan, "model_provider");
+        let apply_memory =
+            current.memory != candidate.memory && reload_plan_step_is_hot_safe(&plan, "memory");
+        if apply_model_provider {
             next_loaded.model_provider = candidate.model_provider.clone();
             let resolver = SecretResolver::with_working_dir(
                 Some(state.vault.as_ref()),
@@ -367,7 +371,7 @@ pub(crate) async fn apply_config_reload_for_context(
                 applied_steps.push(step.clone());
             }
         }
-        if current.memory != candidate.memory {
+        if apply_memory {
             next_loaded.memory = candidate.memory.clone();
             if let Some(step) = plan.steps.iter().find(|step| step.config_path == "memory") {
                 applied_steps.push(step.clone());
@@ -403,7 +407,7 @@ pub(crate) async fn apply_config_reload_for_context(
                 })?,
             );
         }
-        if current.memory != candidate.memory {
+        if apply_memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
         }
         {
@@ -535,6 +539,13 @@ fn validate_reload_plan_reference(
     Err(Box::new(runtime_status_response(tonic::Status::failed_precondition(
         "reload plan_id is stale or unknown; create a new plan or pass force=true after review",
     ))))
+}
+
+fn reload_plan_step_is_hot_safe(
+    plan: &control_plane::ConfigReloadPlanEnvelope,
+    config_path: &str,
+) -> bool {
+    plan.steps.iter().any(|step| step.config_path == config_path && step.category == "hot_safe")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -947,5 +958,19 @@ mod tests {
             .find(|step| step.config_path == "model_provider")
             .expect("model-provider reload step should be present");
         assert_eq!(step.category, "blocked_while_runs_active");
+    }
+
+    #[test]
+    fn mixed_reload_only_selects_hot_safe_memory_change() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let mut candidate = loaded_with_model_provider(openai_model_provider_config());
+        candidate.memory.max_item_bytes = candidate.memory.max_item_bytes.saturating_add(1);
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 1);
+
+        assert!(reload_plan_step_is_hot_safe(&plan, "memory"));
+        assert!(!reload_plan_step_is_hot_safe(&plan, "model_provider"));
+        assert_eq!(plan.summary.hot_safe, 1);
+        assert_eq!(plan.summary.blocked_while_runs_active, 1);
     }
 }
