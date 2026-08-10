@@ -810,7 +810,6 @@ fn session_search_group_payload(
         "session": {
             "session_id": labels.session_label(group.session.session_id.as_str()),
             "session_search_label": labels.session_label(group.session.session_id.as_str()),
-            "session_key": group.session.session_key,
             "title": group.session.title,
             "preview": group.session.preview,
             "last_run_state": group.session.last_run_state,
@@ -959,7 +958,6 @@ fn session_search_session_hit_payload(
         "source_type": "session",
         "session_id": labels.session_label(session.session_id.as_str()),
         "session_search_label": labels.session_label(session.session_id.as_str()),
-        "session_key": session.session_key.as_str(),
         "title": session.title.as_str(),
         "preview": session.preview.as_deref(),
         "last_intent": session.last_intent.as_deref(),
@@ -5218,9 +5216,10 @@ mod tests {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAS";
         let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAT";
         let origin_run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAU";
+        let session_key = "s036-session-a";
         let session = OrchestratorSessionRecord {
             session_id: session_id.to_owned(),
-            session_key: "s036-session-a".to_owned(),
+            session_key: session_key.to_owned(),
             session_label: None,
             principal: "user:ops".to_owned(),
             device_id: "device".to_owned(),
@@ -5329,7 +5328,8 @@ mod tests {
             },
         };
 
-        let payload = memory_session_search_tool_output_payload(&outcome, &[session]);
+        let payload =
+            memory_session_search_tool_output_payload(&outcome, std::slice::from_ref(&session));
         let serialized = payload.to_string();
 
         assert_eq!(payload["groups"][0]["session"]["session_id"], "prior_session_1");
@@ -5350,6 +5350,8 @@ mod tests {
         assert!(!serialized.contains(session_id), "{serialized}");
         assert!(!serialized.contains(run_id), "{serialized}");
         assert!(!serialized.contains(origin_run_id), "{serialized}");
+        assert!(!serialized.contains(session_key), "{serialized}");
+        assert!(payload["session_hits"][0].get("session_key").is_none());
 
         let v2_outcome = SessionSearchOutcomeV2 {
             schema_version: SESSION_SEARCH_V2_SCHEMA_VERSION,
@@ -5389,14 +5391,19 @@ mod tests {
             }],
             diagnostics: outcome.diagnostics,
         };
-        let v2_payload = memory_session_search_v2_tool_output_payload(&v2_outcome, &[]);
+        let v2_payload = memory_session_search_v2_tool_output_payload(
+            &v2_outcome,
+            std::slice::from_ref(&session),
+        );
         let v2_serialized = v2_payload.to_string();
         assert_eq!(v2_payload["hits"][0]["session_search_label"], "prior_session_1");
         assert_eq!(v2_payload["hits"][0]["bookends"][0]["anchor"]["cursor_sha256"], "a".repeat(64));
         assert_eq!(v2_payload["hits"][0]["artifacts"][0]["artifact_ref"], "session_artifact_1");
         assert!(!v2_serialized.contains(session_id), "{v2_serialized}");
         assert!(!v2_serialized.contains(run_id), "{v2_serialized}");
+        assert!(!v2_serialized.contains(session_key), "{v2_serialized}");
         assert!(!v2_serialized.contains("RAW_ARTIFACT_ID"), "{v2_serialized}");
+        assert!(v2_payload["session_hits"][0].get("session_key").is_none());
     }
 
     #[test]

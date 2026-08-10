@@ -16425,12 +16425,13 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
     let context = routines_tool_test_context();
     ensure_tool_context_session(&state, &context);
     let prior_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FF1";
+    let prior_session_key = "scenario-S036-session-A-20260606";
 
     state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
             session_id: prior_session_id.to_owned(),
-            session_key: "scenario-S036-session-A-20260606".to_owned(),
+            session_key: prior_session_key.to_owned(),
             session_label: Some("Session A transient PALYRA_E2E_BETA handoff".to_owned()),
             principal: context.principal.to_owned(),
             device_id: context.device_id.to_owned(),
@@ -16477,6 +16478,14 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
     assert!(
         !session_hits[0].to_string().contains(prior_session_id),
         "session fallback hit must not expose raw internal ids: {payload}"
+    );
+    assert!(
+        !session_hits[0].to_string().contains(prior_session_key),
+        "session fallback hit must not expose custom session keys: {payload}"
+    );
+    assert!(
+        session_hits[0].get("session_key").is_none(),
+        "model-visible session fallback must omit the host-owned session key: {payload}"
     );
     assert!(
         session_hits[0]
