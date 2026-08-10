@@ -59,7 +59,7 @@ const DEFAULT_ROUTINE_PAGE_LIMIT: usize = 100;
 const MAX_ROUTINE_PAGE_LIMIT: usize = 500;
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
-const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
 /// Query filters for `GET /console/v1/routines`; all filters are optional and
@@ -3362,6 +3362,14 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use ulid::Ulid;
+
+    #[test]
+    fn parse_retry_policy_defaults_to_single_attempt() {
+        let retry = super::parse_retry_policy(None, None).expect("default retry should parse");
+
+        assert_eq!(retry.max_attempts, 1);
+        assert_eq!(retry.backoff_ms, 1_000);
+    }
 
     #[test]
     fn webhook_matcher_requires_matching_identifiers() {

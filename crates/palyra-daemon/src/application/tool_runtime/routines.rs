@@ -76,7 +76,7 @@ const COMPLETION_TOOL_MISSING_ERROR_KIND: &str = "completion_tool_missing";
 const ROUTINE_APPROVAL_POLICY_ID: &str = "routine.approval.v1";
 const DEFAULT_SCHEDULE_PREVIEW_LIMIT: usize = 1;
 const MAX_SCHEDULE_PREVIEW_LIMIT: usize = 64;
-const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
 /// Executes one `palyra.routines.query` or `palyra.routines.control` call.
@@ -3796,10 +3796,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_policy_defaults_to_one_recovery_attempt() {
+    fn parse_retry_policy_defaults_to_single_attempt() {
         let retry = super::parse_retry_policy(None, None).expect("default retry should parse");
 
-        assert_eq!(retry.max_attempts, 2);
+        assert_eq!(retry.max_attempts, 1);
         assert_eq!(retry.backoff_ms, 1_000);
     }
 
