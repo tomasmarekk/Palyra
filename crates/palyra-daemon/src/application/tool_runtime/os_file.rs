@@ -42,6 +42,7 @@ const MAX_OS_FILE_READ_BYTES: u64 = 128 * 1024;
 const MAX_OS_FILE_TOOL_INPUT_BYTES: usize = 384 * 1024;
 const MAX_OS_FILE_WRITE_BYTES: usize = 256 * 1024;
 const MAX_OS_FILE_LIST_ENTRIES: usize = 200;
+const MAX_OS_FILE_LIST_SCAN_MULTIPLIER: usize = 4;
 const MAX_OS_FILE_SEARCH_QUERY_BYTES: usize = 512;
 const MAX_OS_FILE_SEARCH_MATCHES: usize = 100;
 const MAX_OS_FILE_SEARCH_FILES: usize = 10_000;
@@ -554,16 +555,20 @@ fn list_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, St
     }
     let max_entries =
         input.max_entries.unwrap_or(MAX_OS_FILE_LIST_ENTRIES).clamp(1, MAX_OS_FILE_LIST_ENTRIES);
+    let max_scanned_entries = max_entries.saturating_mul(MAX_OS_FILE_LIST_SCAN_MULTIPLIER);
     let mut entries = Vec::new();
+    let mut entries_scanned = 0usize;
     let mut skipped_entries = 0usize;
+    let mut traversal_truncated = false;
     let read_dir = fs::read_dir(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to list directory {}: {error}", input.path.trim())
     })?;
     for entry in read_dir {
-        if entries.len() >= max_entries {
-            skipped_entries = skipped_entries.saturating_add(1);
-            continue;
+        if entries.len() >= max_entries || entries_scanned >= max_scanned_entries {
+            traversal_truncated = true;
+            break;
         }
+        entries_scanned = entries_scanned.saturating_add(1);
         let Ok(entry) = entry else {
             skipped_entries = skipped_entries.saturating_add(1);
             continue;
@@ -607,8 +612,9 @@ fn list_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, St
         "resolved_path": display_path(path.resolved_path.as_path()),
         "entries": entries,
         "entry_count": entry_count,
+        "entries_scanned": entries_scanned,
         "skipped_entries": skipped_entries,
-        "truncated": skipped_entries > 0,
+        "truncated": traversal_truncated || skipped_entries > 0,
         "dry_run": false,
     }))
 }
@@ -2537,6 +2543,42 @@ mod tests {
         assert!(state.resource_budget_exhausted);
         assert!(state.truncated);
         assert!(!state.has_capacity());
+    }
+
+    #[test]
+    fn os_file_list_dir_stops_after_the_requested_output_limit() {
+        let tempdir = os_file_tempdir();
+        let policy = test_policy(tempdir.path());
+        for index in 0..10 {
+            fs::write(tempdir.path().join(format!("entry-{index:02}.txt")), "data\n")
+                .expect("list fixture should be written");
+        }
+
+        let listed = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::ListDir,
+                path: tempdir.path().to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: Some(3),
+                max_matches: None,
+            },
+        )
+        .expect("bounded OS directory list should succeed");
+
+        assert_eq!(listed.get("entry_count").and_then(Value::as_u64), Some(3));
+        assert_eq!(listed.get("entries_scanned").and_then(Value::as_u64), Some(3));
+        assert_eq!(listed.get("truncated").and_then(Value::as_bool), Some(true));
     }
 
     #[test]
