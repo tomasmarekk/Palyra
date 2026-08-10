@@ -1631,12 +1631,13 @@ pub fn spawn_scheduler_loop(
             if lifecycle.borrow().phase.blocks_admission() {
                 break;
             }
+            let automation_enabled = routines_automation_enabled(&access_registry);
             if let Err(error) = process_due_jobs(
                 Arc::clone(&state),
                 auth.clone(),
                 grpc_url.clone(),
                 Arc::clone(&wake_signal),
-                Arc::clone(&access_registry),
+                automation_enabled,
             )
             .await
             {
@@ -1648,7 +1649,7 @@ pub fn spawn_scheduler_loop(
                 auth.clone(),
                 grpc_url.clone(),
                 Arc::clone(&wake_signal),
-                Arc::clone(&access_registry),
+                automation_enabled,
             )
             .await
             {
@@ -1682,23 +1683,23 @@ pub fn spawn_scheduler_loop(
                     Instant::now() + MEMORY_EMBEDDINGS_BACKFILL_INTERVAL;
             }
 
-            let sleep_duration = match state.first_due_cron_job_time().await {
-                Ok(Some(next_due_ms)) => {
-                    let now = now_unix_ms_or_fallback(
-                        now_unix_ms(),
-                        next_due_ms,
-                        "cron scheduler failed to read system time; using next due timestamp fallback",
-                    );
-                    if next_due_ms <= now {
-                        Duration::from_millis(10)
-                    } else {
-                        Duration::from_millis((next_due_ms - now) as u64)
+            let sleep_duration = if !automation_enabled {
+                scheduler_sleep_duration(false, None, 0)
+            } else {
+                match state.first_due_cron_job_time().await {
+                    Ok(Some(next_due_ms)) => {
+                        let now = now_unix_ms_or_fallback(
+                            now_unix_ms(),
+                            next_due_ms,
+                            "cron scheduler failed to read system time; using next due timestamp fallback",
+                        );
+                        scheduler_sleep_duration(true, Some(next_due_ms), now)
                     }
-                }
-                Ok(None) => SCHEDULER_IDLE_SLEEP,
-                Err(error) => {
-                    warn!(error = %error, "cron scheduler failed to compute next wake time");
-                    Duration::from_secs(1)
+                    Ok(None) => scheduler_sleep_duration(true, None, 0),
+                    Err(error) => {
+                        warn!(error = %error, "cron scheduler failed to compute next wake time");
+                        Duration::from_secs(1)
+                    }
                 }
             };
 
@@ -1713,6 +1714,24 @@ pub fn spawn_scheduler_loop(
             }
         }
     })
+}
+
+fn scheduler_sleep_duration(
+    automation_enabled: bool,
+    next_due_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> Duration {
+    if !automation_enabled {
+        return SCHEDULER_IDLE_SLEEP;
+    }
+    let Some(next_due_unix_ms) = next_due_unix_ms else {
+        return SCHEDULER_IDLE_SLEEP;
+    };
+    if next_due_unix_ms <= now_unix_ms {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis((next_due_unix_ms - now_unix_ms) as u64)
+    }
 }
 
 /// Fails active runs left behind by a previous daemon process so jobs are not
@@ -1810,9 +1829,9 @@ async fn process_due_jobs(
     auth: GatewayAuthConfig,
     grpc_url: String,
     wake_signal: Arc<Notify>,
-    access_registry: Arc<Mutex<AccessRegistry>>,
+    automation_enabled: bool,
 ) -> Result<(), Status> {
-    if !routines_automation_enabled(&access_registry) {
+    if !automation_enabled {
         return Ok(());
     }
     let now_unix_ms = now_unix_ms()?;
@@ -1935,9 +1954,9 @@ async fn process_queued_jobs(
     auth: GatewayAuthConfig,
     grpc_url: String,
     wake_signal: Arc<Notify>,
-    access_registry: Arc<Mutex<AccessRegistry>>,
+    automation_enabled: bool,
 ) -> Result<(), Status> {
-    if !routines_automation_enabled(&access_registry) {
+    if !automation_enabled {
         return Ok(());
     }
     let mut after_job_id = None::<String>;
@@ -5276,6 +5295,12 @@ mod tests {
             !routines_automation_enabled(&registry),
             "routine scheduler automation should still honor explicit operator disablement"
         );
+    }
+
+    #[test]
+    fn disabled_routines_ignore_overdue_cron_wakeups() {
+        assert_eq!(scheduler_sleep_duration(false, Some(1), 10_000), SCHEDULER_IDLE_SLEEP);
+        assert_eq!(scheduler_sleep_duration(true, Some(1), 10_000), Duration::from_millis(10));
     }
 
     #[test]
