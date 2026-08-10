@@ -12256,14 +12256,6 @@ fn windows_program_candidates_from_path_env(command: &str, path: &OsStr) -> Vec<
         .collect()
 }
 
-#[cfg(windows)]
-fn windows_path_program_candidates(command: &str) -> Vec<PathBuf> {
-    let Some(path) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    windows_program_candidates_from_path_env(command, path.as_os_str())
-}
-
 // Expands a bare command name into the PATHEXT candidate list (npm -> npm.COM, npm.EXE, ...)
 // because std::process does not emulate cmd.exe extension resolution.
 #[cfg(windows)]
@@ -12273,8 +12265,10 @@ fn windows_command_candidates(command: &str) -> Vec<String> {
         return vec![command.to_owned()];
     }
 
-    let raw_pathext = std::env::var("PATHEXT").unwrap_or_default();
-    windows_command_candidates_from_pathext(command, raw_pathext.as_str())
+    windows_command_candidates_from_pathext(
+        command,
+        WINDOWS_DEFAULT_PATH_EXTENSIONS.join(";").as_str(),
+    )
 }
 
 #[cfg(windows)]
@@ -12309,7 +12303,7 @@ fn build_windows_tier_b_process_command(
     // /S plus the outer quotes pins cmd's quote parsing, and every argument is validated and
     // quoted by windows_cmd_wrapper_command_line to prevent metacharacter injection.
     if windows_program_requires_cmd_wrapper(program) {
-        let mut command = Command::new(windows_command_processor());
+        let mut command = Command::new(windows_command_processor()?);
         command.raw_arg(format!("/D /S /C {}", windows_cmd_wrapper_command_line(program, args)?));
         command.current_dir(cwd);
         return Ok(command);
@@ -12328,11 +12322,15 @@ fn windows_program_requires_cmd_wrapper(program: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_command_processor() -> PathBuf {
-    std::env::var_os("COMSPEC")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"))
+fn windows_command_processor() -> Result<PathBuf, SandboxProcessRunError> {
+    trusted_windows_system32_dir().map(|system32| system32.join("cmd.exe")).map_err(|error| {
+        SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: format!(
+                "sandbox denied: trusted Windows command processor could not be resolved: {error}"
+            ),
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -12403,53 +12401,45 @@ fn configure_windows_tier_b_process_environment(
     program: &Path,
     policy: &SandboxProcessRunnerPolicy,
 ) -> Result<(), SandboxProcessRunError> {
-    for key in WINDOWS_TIER_B_SAFE_ENV_KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
+    let system32 = trusted_windows_system32_dir().map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::SpawnFailed,
+        message: format!(
+            "sandbox denied: trusted Windows system directory could not be resolved: {error}"
+        ),
+    })?;
+    let windows_dir = system32.parent().ok_or_else(|| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::SpawnFailed,
+        message: "sandbox denied: trusted Windows system directory has no parent".to_owned(),
+    })?;
     let temp_root = process_runner_child_temp_root(policy.workspace_root.as_path())?;
     command
-        .env("PATH", windows_tier_b_process_path(program, policy))
+        .env("PATH", windows_tier_b_process_path(program, system32.as_path()))
         .env("TEMP", temp_root.as_path())
         .env("TMP", temp_root.as_path())
+        .env("COMSPEC", system32.join("cmd.exe"))
+        .env("PATHEXT", WINDOWS_DEFAULT_PATH_EXTENSIONS.join(";"))
+        .env("SystemRoot", windows_dir)
+        .env("WINDIR", windows_dir)
         .env("LANG", "C")
         .env("LC_ALL", "C");
     Ok(())
 }
 
+// The selected program may need a colocated runtime (for example npm.cmd -> node.exe), but
+// directories belonging only to other allowlisted commands must not become ambient child authority.
 #[cfg(windows)]
-const WINDOWS_TIER_B_SAFE_ENV_KEYS: &[&str] = &[
-    "COMSPEC",
-    "PATHEXT",
-    "PROGRAMDATA",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "ProgramW6432",
-    "SystemDrive",
-    "SystemRoot",
-    "WINDIR",
-];
-
-// Builds the minimal child PATH for tier B: the fixed system directories plus only the parent
-// directories of the resolved program and of allowlisted executables, so the child can find
-// its own toolchain shims without inheriting the daemon's full PATH.
-#[cfg(windows)]
-fn windows_tier_b_process_path(program: &Path, policy: &SandboxProcessRunnerPolicy) -> String {
-    let mut directories = std::env::split_paths(sandbox_process_path()).collect::<Vec<_>>();
+fn windows_tier_b_process_path(program: &Path, system32: &Path) -> String {
+    let mut directories = vec![system32.to_path_buf()];
+    if let Some(windows_dir) = system32.parent() {
+        push_unique_windows_path(&mut directories, windows_dir.to_path_buf());
+        push_unique_windows_path(&mut directories, system32.join("WindowsPowerShell").join("v1.0"));
+    }
     if let Some(parent) = program.parent() {
         push_unique_windows_path(&mut directories, parent.to_path_buf());
     }
-    for allowed in &policy.allowed_executables {
-        for candidate in windows_path_program_candidates(allowed) {
-            if let Some(parent) = candidate.parent() {
-                push_unique_windows_path(&mut directories, parent.to_path_buf());
-            }
-        }
-    }
     std::env::join_paths(directories)
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| sandbox_process_path().to_owned())
+        .unwrap_or_else(|_| system32.to_string_lossy().into_owned())
 }
 
 #[cfg(windows)]
@@ -15848,23 +15838,70 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn windows_tier_b_safe_env_keys_exclude_host_profile_locations() {
-        for key in ["APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "USERPROFILE", "VOLTA_HOME"] {
-            assert!(
-                !super::WINDOWS_TIER_B_SAFE_ENV_KEYS
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(key)),
-                "{key} must not be copied from the daemon host environment"
-            );
+    fn windows_tier_b_environment_ignores_host_profile_and_command_resolution_values() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let _host_values = [
+            ScopedEnvVar::set("APPDATA", r"C:\HostProfile\AppData\Roaming"),
+            ScopedEnvVar::set("LOCALAPPDATA", r"C:\HostProfile\AppData\Local"),
+            ScopedEnvVar::set("USERPROFILE", r"C:\HostProfile"),
+            ScopedEnvVar::set("VOLTA_HOME", r"C:\HostProfile\Volta"),
+            ScopedEnvVar::set("COMSPEC", r"C:\HostProfile\bin\cmd.exe"),
+            ScopedEnvVar::set("PATHEXT", ".EVIL"),
+        ];
+        let workspace = unique_temp_dir("workspace-tier-b-env");
+        let state_root = unique_temp_dir("state-tier-b-env");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["node".to_owned()]);
+        let mut command = Command::new("node");
+        command.env_clear();
+
+        super::configure_windows_tier_b_process_environment(
+            &mut command,
+            Path::new(r"C:\Tools\node.exe"),
+            &policy,
+        )
+        .expect("tier-B environment should use trusted Windows runtime values");
+
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for key in ["APPDATA", "LOCALAPPDATA", "USERPROFILE", "VOLTA_HOME"] {
+            assert!(!env.contains_key(key), "{key} must not be inherited");
         }
-        for key in ["COMSPEC", "PATHEXT", "SystemRoot", "WINDIR"] {
-            assert!(
-                super::WINDOWS_TIER_B_SAFE_ENV_KEYS
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(key)),
-                "{key} should remain available for Windows process startup"
-            );
-        }
+        assert_ne!(
+            env.get("COMSPEC").and_then(Option::as_deref),
+            Some(r"C:\HostProfile\bin\cmd.exe")
+        );
+        assert_eq!(env.get("PATHEXT").and_then(Option::as_deref), Some(".com;.exe;.bat;.cmd"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tier_b_path_contains_only_system_and_selected_program_directories() {
+        let path = super::windows_tier_b_process_path(
+            Path::new(r"C:\Tools\Node\node.exe"),
+            Path::new(r"C:\Windows\System32"),
+        );
+        let directories = std::env::split_paths(OsStr::new(path.as_str())).collect::<Vec<_>>();
+
+        assert_eq!(
+            directories,
+            vec![
+                PathBuf::from(r"C:\Windows\System32"),
+                PathBuf::from(r"C:\Windows"),
+                PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0"),
+                PathBuf::from(r"C:\Tools\Node"),
+            ]
+        );
     }
 
     #[test]
