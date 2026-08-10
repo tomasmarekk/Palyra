@@ -15,10 +15,7 @@ use std::{
     time::Duration,
 };
 
-use palyra_common::{
-    redaction::{redact_auth_error, redact_url_segments_in_text},
-    runtime_contracts::CancellationContextV1,
-};
+use palyra_common::runtime_contracts::CancellationContextV1;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -1062,8 +1059,8 @@ fn project_rpc_output(
 }
 
 fn summarize_rpc_output(output_json: &[u8], max_bytes: usize) -> String {
-    let raw = String::from_utf8_lossy(output_json);
-    let redacted = redact_url_segments_in_text(redact_auth_error(raw.as_ref()).as_str());
+    let redacted = crate::journal::redact_payload_json(output_json)
+        .unwrap_or_else(|_| r#"{"redacted":true,"reason":"summary_redaction_failed"}"#.to_owned());
     if redacted.len() <= max_bytes {
         return redacted;
     }
@@ -1083,7 +1080,7 @@ mod tests {
     use super::{
         build_python_tool_rpc_bridge_context_with_transports,
         child_tool_may_inherit_parent_approval, python_tool_rpc_sdk_source,
-        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers,
+        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers, summarize_rpc_output,
         PythonToolRpcTransportDescriptor, ToolRpcTransportKind, TOOL_RPC_SCHEMA_VERSION,
     };
 
@@ -1179,5 +1176,17 @@ mod tests {
             crate::gateway::PROCESS_RUNNER_TOOL_NAME,
             &approval_gate_decision
         ));
+    }
+
+    #[test]
+    fn summary_projection_structurally_redacts_nested_sensitive_fields() {
+        let summary = summarize_rpc_output(
+            br#"{"status":"ok","nested":{"api_key":"summary-secret","label":"safe"}}"#,
+            1_024,
+        );
+
+        assert!(!summary.contains("summary-secret"));
+        assert!(summary.contains("<redacted>"));
+        assert!(summary.contains("\"label\":\"safe\""));
     }
 }
