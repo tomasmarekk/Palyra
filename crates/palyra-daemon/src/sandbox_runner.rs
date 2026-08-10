@@ -12792,9 +12792,10 @@ mod tests {
         resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
         rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
         run_constrained_process, run_constrained_process_with_fault_injection,
-        same_path_case_aware, tier_c_plan_inner_path_index, validate_argument_workspace_scope,
-        validate_cmd_invocation_shape, validate_host_argument_scope,
-        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
+        same_path_case_aware, tier_c_plan_inner_path_index, validate_allowed_executable,
+        validate_argument_workspace_scope, validate_cmd_invocation_shape,
+        validate_host_argument_scope, validate_host_argument_scope_with_roots,
+        validate_host_interpreter_argument_guardrails,
         validate_host_interpreter_argument_guardrails_with_roots, validate_input_shape,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
@@ -12812,9 +12813,7 @@ mod tests {
         BACKGROUND_TERMINATION_WAIT_MS,
     };
     #[cfg(windows)]
-    use super::{
-        validate_allowed_executable, validate_host_command_path_scope, windows_program_files_path,
-    };
+    use super::{validate_host_command_path_scope, windows_program_files_path};
     #[cfg(not(target_os = "macos"))]
     use std::sync::atomic::AtomicBool;
 
@@ -14072,6 +14071,25 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
         assert!(error.message.contains("shell-eval flags"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn node_aliases_require_interpreter_opt_in() {
+        let workspace = unique_temp_dir("workspace-node-alias-policy");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy =
+            sandbox_policy_with_allowed_executables(canonical_workspace, vec!["nodejs".to_owned()]);
+
+        for command in ["nodejs", "nodejs.exe"] {
+            let error = validate_allowed_executable(&policy, command)
+                .expect_err("Node aliases must require explicit interpreter opt-in");
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+            assert!(error.message.contains("allow_interpreters=true"), "{}", error.message);
+        }
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }

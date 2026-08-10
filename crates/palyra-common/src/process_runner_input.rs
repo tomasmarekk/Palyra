@@ -20,6 +20,7 @@ const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
     "python",
     "python3",
     "node",
+    "nodejs",
     "ruby",
     "perl",
     "deno",
@@ -379,6 +380,8 @@ mod tests {
     fn interpreter_policy_classifies_versioned_python_and_inline_eval_flags() {
         assert!(process_executable_is_interpreter("/usr/bin/python3.12"));
         assert!(process_executable_is_interpreter(r"C:\Tools\node.exe"));
+        assert!(process_executable_is_interpreter("/usr/bin/nodejs"));
+        assert!(process_executable_is_interpreter(r"C:\Tools\nodejs.exe"));
         assert!(!process_executable_is_interpreter("cargo"));
 
         assert!(interpreter_args_contain_blocked_eval_flag(
@@ -388,6 +391,10 @@ mod tests {
         assert!(interpreter_args_contain_blocked_eval_flag(
             "node",
             &["--eval".to_owned(), "process.exit()".to_owned()]
+        ));
+        assert!(interpreter_args_contain_blocked_eval_flag(
+            "nodejs.exe",
+            &["-e".to_owned(), "process.exit()".to_owned()]
         ));
         assert!(!interpreter_args_contain_blocked_eval_flag(
             "python",
