@@ -3108,6 +3108,34 @@ fn canonical_docker_mount_host_path(raw: &str) -> Result<PathBuf, DockerEngineEr
     Ok(canonical)
 }
 
+fn scoped_docker_workspace_mount(
+    mount: &ContainerMountPolicy,
+    workspace_root: &Path,
+) -> Result<ContainerMountPolicy, DockerEngineError> {
+    let canonical_workspace_root = canonical_docker_mount_host_path(
+        workspace_root.to_string_lossy().as_ref(),
+    )
+    .map_err(|error| DockerEngineError {
+        reason_code: "docker.mount.workspace_root_invalid".to_owned(),
+        message: format!("Docker workspace root is unavailable: {}", error.message),
+    })?;
+    let canonical_host_path = canonical_docker_mount_host_path(mount.host_path.as_str())?;
+    if !canonical_host_path.starts_with(canonical_workspace_root.as_path()) {
+        return Err(DockerEngineError {
+            reason_code: "docker.mount.workspace_scope_denied".to_owned(),
+            message: format!(
+                "Docker mount host path {} resolves outside configured workspace root {}",
+                canonical_host_path.display(),
+                canonical_workspace_root.display()
+            ),
+        });
+    }
+    let mut scoped = mount.clone();
+    scoped.host_path = canonical_host_path.display().to_string();
+    scoped.workspace_scoped = true;
+    Ok(scoped)
+}
+
 fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<(), DockerEngineError> {
     fs::create_dir_all(destination).map_err(|error| DockerEngineError {
         reason_code: "docker.writeback.copy_failed".to_owned(),
@@ -4014,12 +4042,16 @@ fn docker_process_run_plan(
             reason_code: "docker.profile.image_digest_missing".to_owned(),
             message: "DockerRunner requires image references pinned by sha256 digest".to_owned(),
         })?;
-    let Some(workspace_mount) = profile.primary_workspace_mount() else {
+    let Some(configured_workspace_mount) = profile.primary_workspace_mount() else {
         return Err(DockerEngineError {
             reason_code: "docker.profile.workspace_mount_missing".to_owned(),
             message: "DockerRunner requires a workspace-scoped mount".to_owned(),
         });
     };
+    let workspace_mount = scoped_docker_workspace_mount(
+        configured_workspace_mount,
+        config.process_runner.workspace_root.as_path(),
+    )?;
     let env_file = materialize_docker_vault_env_file(
         profile.profile_id.as_str(),
         profile.env.as_slice(),
@@ -4035,7 +4067,7 @@ fn docker_process_run_plan(
         user: profile.user.clone(),
         readonly_rootfs: profile.readonly_rootfs,
         network: profile.network,
-        mounts: vec![workspace_mount.clone()],
+        mounts: vec![workspace_mount],
         env: docker_plan_env_bindings(profile.env.as_slice()),
         env_file,
         background: input.background || input.keep_running_after_run,
@@ -6760,14 +6792,14 @@ mod tests {
         build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
         build_execution_backend_status_reports, collect_workspace_file_snapshots,
-        parse_execution_backend_preference, plan_stuck_tool_job_recovery, prepare_docker_run_plan,
-        resolve_execution_backend, resolve_execution_backend_for_request, sha256_hex,
-        validate_execution_backend_selection, CanonicalSshWorkerTransport, ContainerBackendProfile,
-        ContainerCleanupAttestation, ContainerEnvBinding, ContainerEnvSourceKind,
-        ContainerMountPolicy, ContainerNetworkPolicy, ContainerResourceLimits,
-        ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine, DockerEngineError,
-        DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner,
-        ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        docker_process_run_plan, parse_execution_backend_preference, plan_stuck_tool_job_recovery,
+        prepare_docker_run_plan, resolve_execution_backend, resolve_execution_backend_for_request,
+        sha256_hex, validate_execution_backend_selection, CanonicalSshWorkerTransport,
+        ContainerBackendProfile, ContainerCleanupAttestation, ContainerEnvBinding,
+        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
+        ContainerResourceLimits, ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine,
+        DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
+        DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
@@ -6833,7 +6865,7 @@ mod tests {
             runtime: ContainerRuntimeKind::Docker,
             image: SAFE_DOCKER_IMAGE.to_owned(),
             mounts: vec![ContainerMountPolicy {
-                host_path: "workspace".to_owned(),
+                host_path: ".".to_owned(),
                 container_path: "/workspace".to_owned(),
                 read_only: false,
                 workspace_scoped: true,
@@ -8146,6 +8178,32 @@ mod tests {
             .validate()
             .expect_err("writable rootfs must fail")
             .contains("read-only"));
+    }
+
+    #[test]
+    fn docker_process_plan_rejects_mount_outside_configured_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should exist");
+        let mut profile = safe_container_profile();
+        profile.mounts[0].host_path = outside.display().to_string();
+        let mut policy = test_policy();
+        policy.workspace_root = workspace;
+        let config = test_tool_call_config(policy);
+
+        let error = docker_process_run_plan(
+            &profile,
+            &config,
+            br#"{"command":"cargo","args":["--version"]}"#,
+            None,
+            None,
+        )
+        .expect_err("out-of-workspace Docker mount must fail before engine dispatch");
+
+        assert_eq!(error.reason_code, "docker.mount.workspace_scope_denied");
+        assert!(error.message.contains("outside configured workspace root"));
     }
 
     #[test]
