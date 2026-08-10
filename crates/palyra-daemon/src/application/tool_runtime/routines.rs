@@ -10,7 +10,7 @@
 //! reaches the cron trigger path.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -1981,42 +1981,7 @@ async fn list_latest_cron_runs_for_job(
     job_id: &str,
     limit: usize,
 ) -> Result<(Vec<CronRunRecord>, bool), Status> {
-    let limit = limit.max(1);
-    let mut after_run_id = None::<String>;
-    let mut window = VecDeque::with_capacity(limit);
-    let mut total_seen = 0_usize;
-    loop {
-        let (page, next_after_run_id) = runtime_state
-            .list_cron_runs(
-                Some(job_id.to_owned()),
-                after_run_id.clone(),
-                Some(MAX_ROUTINE_PAGE_LIMIT),
-            )
-            .await?;
-        for run in page {
-            total_seen = total_seen.saturating_add(1);
-            retain_latest_cron_run_window(&mut window, run, limit);
-        }
-        let Some(next_after_run_id) = next_after_run_id else {
-            break;
-        };
-        after_run_id = Some(next_after_run_id);
-    }
-    Ok((window.into_iter().collect(), total_seen > limit))
-}
-
-fn retain_latest_cron_run_window(
-    window: &mut VecDeque<CronRunRecord>,
-    run: CronRunRecord,
-    limit: usize,
-) {
-    if limit == 0 {
-        return;
-    }
-    if window.len() == limit {
-        window.pop_front();
-    }
-    window.push_back(run);
+    runtime_state.list_latest_cron_runs(job_id.to_owned(), limit).await
 }
 
 async fn enrich_routine_view_with_latest_run(
@@ -3285,7 +3250,7 @@ fn routines_tool_execution_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs};
+    use std::fs;
 
     use crate::journal::{
         CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord,
@@ -3498,24 +3463,6 @@ mod tests {
             .as_str()
             .expect("retry guidance should be returned")
             .contains("required completion tool result"));
-    }
-
-    #[test]
-    fn latest_cron_run_window_keeps_newest_limit() {
-        let mut window = VecDeque::new();
-        for index in 0..5 {
-            let run_id = format!("run-{index}");
-            super::retain_latest_cron_run_window(
-                &mut window,
-                test_cron_run(run_id.as_str(), CronRunStatus::Succeeded),
-                3,
-            );
-        }
-
-        assert_eq!(
-            window.iter().map(|run| run.run_id.as_str()).collect::<Vec<_>>(),
-            vec!["run-2", "run-3", "run-4"]
-        );
     }
 
     #[test]

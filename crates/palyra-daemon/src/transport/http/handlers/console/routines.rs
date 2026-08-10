@@ -1485,7 +1485,7 @@ async fn enrich_routine_view_with_latest_run(
     }
     let (runs, _) = state
         .runtime
-        .list_cron_runs(Some(job_id.to_owned()), None, Some(10))
+        .list_latest_cron_runs(job_id.to_owned(), 10)
         .await
         .map_err(runtime_status_response)?;
     if runs.is_empty() && !automation_enabled {

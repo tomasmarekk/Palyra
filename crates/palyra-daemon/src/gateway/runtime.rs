@@ -17068,6 +17068,35 @@ impl GatewayRuntimeState {
             .await
     }
 
+    /// Lists the newest runs for one cron job without scanning its history.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_latest_cron_runs(
+        self: &Arc<Self>,
+        job_id: String,
+        requested_limit: usize,
+    ) -> Result<(Vec<CronRunRecord>, bool), Status> {
+        let limit = requested_limit.clamp(1, MAX_CRON_PAGE_LIMIT);
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .list_latest_cron_runs(job_id.as_str(), limit.saturating_add(1))
+                .map_err(|error| map_cron_store_error("list latest cron runs", error))
+        })
+        .await
+        .map_err(|_| Status::internal("latest cron runs list worker panicked"))?
+        .map(|mut runs| {
+            let has_more = runs.len() > limit;
+            if has_more {
+                runs.remove(0);
+            }
+            (runs, has_more)
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     async fn list_cron_runs_filtered(
         self: &Arc<Self>,

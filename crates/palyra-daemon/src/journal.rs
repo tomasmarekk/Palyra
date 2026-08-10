@@ -23888,6 +23888,51 @@ impl JournalStore {
         Ok(runs)
     }
 
+    /// Lists the newest runs for one cron job in chronological order.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn list_latest_cron_runs(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CronRunRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, MAX_CRON_RUNS_LIST_LIMIT.saturating_add(1));
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    run_ulid,
+                    job_ulid,
+                    attempt,
+                    session_ulid,
+                    orchestrator_run_ulid,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
+                    status,
+                    error_kind,
+                    error_message_redacted,
+                    model_tokens_in,
+                    model_tokens_out,
+                    tool_calls,
+                    tool_denies,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM cron_runs
+                WHERE job_ulid = ?1
+                ORDER BY run_ulid DESC
+                LIMIT ?2
+            "#,
+        )?;
+        let mut rows = statement.query(params![job_id, limit as i64])?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next()? {
+            runs.push(map_cron_run_row(row)?);
+        }
+        runs.reverse();
+        Ok(runs)
+    }
+
     /// Persists a pending approval.
     ///
     /// # Errors
@@ -53297,6 +53342,48 @@ mod tests {
             .expect("cron runs listing should succeed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "01ARZ3NDEKTSV4RRFFQ69G5FBD");
+    }
+
+    #[test]
+    fn cron_run_latest_listing_queries_tail_window() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let job = store
+            .create_cron_job(&sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FC0"))
+            .expect("cron job should be inserted");
+        for run_id in [
+            "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC2",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC3",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC4",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC5",
+        ] {
+            store
+                .start_cron_run(&CronRunStartRequest {
+                    run_id: run_id.to_owned(),
+                    job_id: job.job_id.clone(),
+                    attempt: 1,
+                    session_id: None,
+                    orchestrator_run_id: None,
+                    status: CronRunStatus::Succeeded,
+                    error_kind: None,
+                    error_message_redacted: None,
+                })
+                .expect("terminal cron run should persist");
+        }
+
+        let latest =
+            store.list_latest_cron_runs(job.job_id.as_str(), 3).expect("latest runs should load");
+
+        assert_eq!(
+            latest.iter().map(|run| run.run_id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "01ARZ3NDEKTSV4RRFFQ69G5FC3",
+                "01ARZ3NDEKTSV4RRFFQ69G5FC4",
+                "01ARZ3NDEKTSV4RRFFQ69G5FC5",
+            ]
+        );
     }
 
     #[test]
