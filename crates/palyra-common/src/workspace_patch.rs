@@ -813,6 +813,33 @@ fn normalize_supported_patch_document(patch: &str) -> Cow<'_, str> {
     normalize_unified_diff_patch(patch).map_or(Cow::Borrowed(patch), Cow::Owned)
 }
 
+/// Extracts primary operation paths after applying the same format
+/// normalization used by the patch executor.
+///
+/// Move destinations are intentionally excluded because callers use this
+/// helper to choose the root for the source operations before parsing.
+#[must_use]
+pub fn normalized_workspace_patch_operation_paths(patch: &str) -> Vec<String> {
+    let normalized = normalize_supported_patch_document(patch);
+    normalized
+        .lines()
+        .filter_map(|line| {
+            let control_line = patch_control_line(line);
+            [
+                "*** Add File:",
+                "*** Update File:",
+                "*** Replace File:",
+                "*** Replace Line:",
+                "*** Delete File:",
+            ]
+            .iter()
+            .find_map(|prefix| control_line.strip_prefix(prefix).map(str::trim))
+        })
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn normalize_palyra_patch_fences(patch: &str) -> Option<String> {
     let normalized = patch.replace("\r\n", "\n").replace('\r', "\n");
     let original_lines = normalized.split('\n').collect::<Vec<_>>();
@@ -2417,9 +2444,9 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
 mod tests {
     use super::{
         apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
-        compute_patch_sha256, redact_patch_preview, sha256_hex, WorkspacePatchError,
-        WorkspacePatchLimits, WorkspacePatchOutcome, WorkspacePatchRedactionPolicy,
-        WorkspacePatchRequest,
+        compute_patch_sha256, normalized_workspace_patch_operation_paths, redact_patch_preview,
+        sha256_hex, WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchOutcome,
+        WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
     };
     use std::{fs, path::PathBuf};
     use tempfile::tempdir;
@@ -3138,6 +3165,19 @@ mod tests {
             fs::read_to_string(workspace.join("notes.txt")).expect("updated file should read"),
             "alpha\nbeta-updated\n"
         );
+    }
+
+    #[test]
+    fn normalized_operation_paths_include_unified_diff_targets() {
+        let patch = concat!(
+            "--- a/reports/summary.md\n",
+            "+++ b/reports/summary.md\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+
+        assert_eq!(normalized_workspace_patch_operation_paths(patch), vec!["reports/summary.md"]);
     }
 
     #[test]

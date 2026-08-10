@@ -21,8 +21,9 @@ use std::{
 
 use palyra_common::workspace_patch::{
     apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
-    compute_patch_sha256, redact_patch_preview, WorkspacePatchError, WorkspacePatchLimits,
-    WorkspacePatchOutcome, WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
+    compute_patch_sha256, normalized_workspace_patch_operation_paths, redact_patch_preview,
+    WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchOutcome,
+    WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -612,32 +613,13 @@ fn patch_should_use_active_root(
     patch: &str,
     active_root: &crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot,
 ) -> bool {
-    let operation_paths = patch_operation_paths(patch);
-    !operation_paths.is_empty()
-        && operation_paths
+    let operation_paths = normalized_workspace_patch_operation_paths(patch);
+    // Unknown or malformed formats remain under the narrowest available root;
+    // the patch parser can reject them later without widening write authority.
+    operation_paths.is_empty()
+        || operation_paths
             .iter()
             .all(|path| relative_path_should_use_active_root(path, active_root))
-}
-
-/// Extracts operation target paths (excluding `Move to:` destinations) for
-/// the active-root decision.
-fn patch_operation_paths(patch: &str) -> Vec<String> {
-    patch
-        .lines()
-        .filter_map(|line| {
-            [
-                "*** Add File:",
-                "*** Update File:",
-                "*** Replace File:",
-                "*** Replace Line:",
-                "*** Delete File:",
-            ]
-            .iter()
-            .find_map(|prefix| line.strip_prefix(prefix).map(str::trim))
-        })
-        .filter(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 /// Rejects patches whose header paths start with a Palyra OS environment
@@ -1855,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_operation_paths_extracts_add_update_replace_line_delete_targets() {
+    fn active_workspace_patch_scope_recognizes_all_supported_operation_headers() {
         let patch = concat!(
             "*** Begin Patch\n",
             "*** Add File: package.json\n",
@@ -1874,7 +1856,7 @@ mod tests {
         );
 
         assert_eq!(
-            patch_operation_paths(patch),
+            normalized_workspace_patch_operation_paths(patch),
             vec!["package.json", "src/index.js", "README.md", "public/app.js", "tmp.txt"]
         );
     }
@@ -1928,6 +1910,19 @@ mod tests {
             "+summary\n",
             "*** End Patch\n",
         );
+        let unified_patch = concat!(
+            "--- /dev/null\n",
+            "+++ b/generated/report.md\n",
+            "@@ -0,0 +1 @@\n",
+            "+generated\n",
+        );
+        let explicit_active_unified_patch = concat!(
+            "--- a/reports/summary.md\n",
+            "+++ b/reports/summary.md\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
 
         assert!(
             patch_should_use_active_root(audit_patch, &active),
@@ -1940,6 +1935,18 @@ mod tests {
         assert!(
             patch_should_use_active_root(report_patch, &active),
             "single-file writes without an explicit prefix should still target the active focus"
+        );
+        assert!(
+            patch_should_use_active_root(unified_patch, &active),
+            "unified diffs must use the same active-root decision as canonical patches"
+        );
+        assert!(
+            !patch_should_use_active_root(explicit_active_unified_patch, &active),
+            "root-relative unified paths must not be nested under the active focus twice"
+        );
+        assert!(
+            patch_should_use_active_root("not a supported patch", &active),
+            "unrecognized patches must fail closed under the narrowest available root"
         );
     }
 
