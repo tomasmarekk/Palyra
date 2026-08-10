@@ -20015,6 +20015,38 @@ mod tests {
     }
 
     #[test]
+    fn process_failure_payload_omits_separated_stderr_secrets() {
+        let stdout = StreamCapture::default();
+        let stderr = StreamCapture {
+            bytes: br#"password: hunter2
+api key: qwerty
+{"access_token": "abc123"}
+"#
+            .to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let error = SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: process_failure_message(
+                super::ProcessFailureClass::NonzeroExit,
+                1,
+                &stdout,
+                &stderr,
+            ),
+        };
+
+        let payload =
+            String::from_utf8(process_failure_output_json(&error, "host_process", "none"))
+                .expect("failure output should be UTF-8 JSON");
+
+        for secret in ["hunter2", "qwerty", "abc123"] {
+            assert!(!payload.contains(secret), "failure payload leaked {secret}: {payload}");
+        }
+        assert!(payload.contains("child output omitted from error"), "{payload}");
+    }
+
+    #[test]
     fn process_failure_message_omits_secret_suffix_when_marker_precedes_tail() {
         let stdout = StreamCapture { bytes: Vec::new(), truncated: false, read_error: None };
         let mut stderr = b"access_token=".to_vec();
