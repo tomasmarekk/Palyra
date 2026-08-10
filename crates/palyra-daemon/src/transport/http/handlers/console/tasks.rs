@@ -292,21 +292,24 @@ pub(crate) async fn console_workboard_list_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(DEFAULT_TASK_LIMIT).clamp(1, MAX_TASK_LIMIT);
-    let items = state
+    let channel = session.context.channel.clone();
+    let mut items = state
         .runtime
         .list_work_items(WorkItemListFilter {
             owner_principal: Some(session.context.principal.clone()),
             device_id: Some(session.context.device_id.clone()),
-            channel: session.context.channel.clone(),
+            channel: channel.clone(),
             parent_work_item_id: query.parent_work_item_id,
             objective_id: query.objective_id,
             routine_id: query.routine_id,
             state: query.state,
             include_terminal: query.include_terminal.unwrap_or(false),
-            limit,
+            limit: MAX_TASK_LIMIT,
         })
         .await
         .map_err(runtime_status_response)?;
+    items.retain(|item| item.channel == channel);
+    items.truncate(limit);
     let next_cursor = items.last().map(|item| item.work_item_id.clone());
     Ok(Json(json!({
         "contract": workboard_contract_descriptor(),

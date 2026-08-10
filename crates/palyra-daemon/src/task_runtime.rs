@@ -239,10 +239,12 @@ pub(crate) struct TaskAccessPolicy {
 }
 
 impl TaskAccessPolicy {
+    /// Checks the exact owner/device/channel scope. A missing channel grants
+    /// access only to records that are also unscoped; it is never a wildcard.
     pub(crate) fn allows(&self, owner: &str, device_id: &str, channel: Option<&str>) -> bool {
         self.owner_principal == owner
             && self.device_id.as_deref().is_none_or(|expected| expected == device_id)
-            && self.channel.as_deref().is_none_or(|expected| Some(expected) == channel)
+            && self.channel.as_deref() == channel
     }
 }
 
@@ -1166,6 +1168,7 @@ async fn list_agent_plan_items(
     limit: usize,
 ) -> Result<Vec<AgentPlanItem>, Status> {
     let state = Arc::clone(runtime);
+    let access = filter.access.clone();
     let query = AgentPlanQuery {
         owner_principal: Some(filter.access.owner_principal.clone()),
         device_id: filter.access.device_id.clone(),
@@ -1184,6 +1187,13 @@ async fn list_agent_plan_items(
                 item.reason_code == crate::application::plan_state::V2_COMPLEX_PLAN_REASON
             });
         }
+        items.retain(|item| {
+            access.allows(
+                item.owner_principal.as_str(),
+                item.device_id.as_str(),
+                item.channel.as_deref(),
+            )
+        });
         Ok::<_, crate::journal::JournalError>(items)
     })
     .await
@@ -1968,6 +1978,18 @@ mod tests {
         assert!(!policy.allows("user:two", "device", Some("cli")));
         assert!(!policy.allows("user:one", "other", Some("cli")));
         assert!(!policy.allows("user:one", "device", Some("web")));
+    }
+
+    #[test]
+    fn unscoped_access_policy_is_not_a_channel_wildcard() {
+        let policy = TaskAccessPolicy {
+            owner_principal: "user:one".to_owned(),
+            device_id: Some("device".to_owned()),
+            channel: None,
+        };
+
+        assert!(policy.allows("user:one", "device", None));
+        assert!(!policy.allows("user:one", "device", Some("cli")));
     }
 
     #[test]

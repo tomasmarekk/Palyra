@@ -94,19 +94,22 @@ pub(crate) async fn console_commitments_list_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(DEFAULT_COMMITMENT_LIMIT).clamp(1, MAX_COMMITMENT_LIMIT);
-    let commitments = state
+    let channel = session.context.channel.clone();
+    let mut commitments = state
         .runtime
         .list_commitments(CommitmentListFilter {
-            owner_principal: Some(session.context.principal),
-            device_id: Some(session.context.device_id),
-            channel: session.context.channel,
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: Some(session.context.device_id.clone()),
+            channel: channel.clone(),
             status: query.status,
             due_before_unix_ms: query.due_before_unix_ms,
             include_terminal: query.include_terminal.unwrap_or(false),
-            limit,
+            limit: MAX_COMMITMENT_LIMIT,
         })
         .await
         .map_err(runtime_status_response)?;
+    commitments.retain(|commitment| commitment.channel == channel);
+    commitments.truncate(limit);
     let next_cursor = commitments.last().map(|commitment| commitment.commitment_id.clone());
     Ok(Json(json!({
         "contract": commitment_contract_descriptor(),
