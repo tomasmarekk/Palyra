@@ -6025,7 +6025,7 @@ fn replace_storage_entries_for_origin_replaces_and_removes_deleted_keys() {
 }
 
 #[test]
-fn replace_network_log_entries_for_navigation_removes_stale_entries() {
+fn append_network_log_entries_preserves_current_navigation_audit() {
     let mut tab = BrowserTabRecord::new("tab-1".to_owned());
     tab.network_log.push_back(NetworkLogEntryInternal {
         request_url: "https://app.example.com/api/alerts?include=all".to_owned(),
@@ -6036,7 +6036,7 @@ fn replace_network_log_entries_for_navigation_removes_stale_entries() {
         headers: Vec::new(),
     });
 
-    super::replace_network_log_entries_for_navigation(
+    super::append_network_log_entries(
         &mut tab,
         &[NetworkLogEntryInternal {
             request_url: "https://app.example.com/api/alerts?include=summary".to_owned(),
@@ -6053,11 +6053,17 @@ fn replace_network_log_entries_for_navigation_removes_stale_entries() {
         16 * 1024,
     );
 
-    assert_eq!(tab.network_log.len(), 1);
-    let entry = tab.network_log.front().expect("replacement entry should remain");
+    assert_eq!(tab.network_log.len(), 2);
+    let mut entries = tab.network_log.iter();
+    let chromium_entry = entries.next().expect("Chromium audit entry should remain");
     assert_eq!(
-        entry.request_url, "https://app.example.com/api/alerts?include=summary",
-        "navigation network log should be scoped to the latest navigation boundary"
+        chromium_entry.request_url, "https://app.example.com/api/alerts?include=all",
+        "open-tab bookkeeping must not erase entries drained during the Chromium refresh"
+    );
+    let guard_entry = entries.next().expect("navigation guard entry should remain");
+    assert_eq!(
+        guard_entry.request_url, "https://app.example.com/api/alerts?include=summary",
+        "the navigation guard entry should follow the Chromium audit entry"
     );
 }
 

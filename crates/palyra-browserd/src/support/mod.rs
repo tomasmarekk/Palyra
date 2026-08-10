@@ -43,17 +43,6 @@ pub(crate) fn append_network_log_entries(
     );
 }
 
-/// Resets a tab's network log to the entries captured by a fresh navigation.
-pub(crate) fn replace_network_log_entries_for_navigation(
-    tab: &mut BrowserTabRecord,
-    entries: &[NetworkLogEntryInternal],
-    max_entries: usize,
-    max_bytes: u64,
-) {
-    tab.network_log.clear();
-    append_network_log_entries(tab, entries, max_entries, max_bytes);
-}
-
 fn trim_network_log_to_budget(
     network_log: &mut VecDeque<NetworkLogEntryInternal>,
     total_bytes: &mut usize,
