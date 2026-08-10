@@ -4834,11 +4834,11 @@ async fn memory_auto_inject_searches_current_scope_without_cross_session_or_chan
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prompt() {
+async fn default_memory_auto_inject_does_not_add_manual_memory_to_fresh_session_prompt() {
     let state = build_test_runtime_state(false);
     assert!(
-        state.memory_config_snapshot().auto_inject_enabled,
-        "manual/import memory auto-inject should be enabled by default for cross-session recall"
+        !state.memory_config_snapshot().auto_inject_enabled,
+        "manual/import memory auto-inject must be disabled until the operator opts in"
     );
 
     let context = RequestContext {
@@ -4853,7 +4853,7 @@ async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prom
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: current_run_id.to_owned(),
             session_id: current_session_id.to_owned(),
-            origin_kind: "memory_auto_inject_default_test".to_owned(),
+            origin_kind: "memory_auto_inject_default_disabled_test".to_owned(),
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
@@ -4877,7 +4877,7 @@ async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prom
             ttl_unix_ms: None,
         })
         .await
-        .expect("manual memory ingest should seed default auto-inject recall");
+        .expect("manual memory ingest should seed the opt-in boundary regression");
 
     let mut tape_seq = 1_i64;
     let prepared = prepare_model_provider_input(
@@ -4895,29 +4895,29 @@ async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prom
             provider_kind_hint: None,
             provider_model_id_hint: None,
             tool_catalog_snapshot: None,
-            memory_ingest_reason: "memory_auto_inject_default_test",
+            memory_ingest_reason: "memory_auto_inject_default_disabled_test",
             memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
             channel_for_log: "cli",
         },
     )
     .await
-    .expect("provider input preparation should succeed with auto-inject enabled by default");
+    .expect("provider input preparation should succeed with auto-inject disabled by default");
 
     assert!(
-        prepared.provider_input_text.contains("<memory_context"),
-        "fresh-session provider input should include automatic memory context by default: {}",
+        !prepared.provider_input_text.contains("<memory_context"),
+        "fresh-session provider input must not include durable memory without opt-in: {}",
         prepared.provider_input_text
     );
     assert!(
-        prepared.provider_input_text.contains("TypeScript, Playwright, and concise reports"),
-        "stored manual memory should be available to the next session through default auto-inject: {}",
+        !prepared.provider_input_text.contains("TypeScript, Playwright, and concise reports"),
+        "stored manual memory must not cross into a fresh provider prompt by default: {}",
         prepared.provider_input_text
     );
     let tape =
         state.journal_store.orchestrator_tape(current_run_id).expect("test tape should load");
     assert!(
-        tape.iter().any(|event| event.event_type == "memory_auto_inject"),
-        "default-enabled auto-inject must append a memory_auto_inject tape event"
+        tape.iter().all(|event| event.event_type != "memory_auto_inject"),
+        "disabled auto-inject must not append a memory_auto_inject tape event"
     );
 }
 

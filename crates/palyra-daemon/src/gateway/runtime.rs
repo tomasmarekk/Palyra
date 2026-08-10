@@ -1059,7 +1059,7 @@ impl Default for MemoryRuntimeConfig {
         Self {
             max_item_bytes: MAX_MEMORY_ITEM_BYTES,
             max_item_tokens: MAX_MEMORY_ITEM_TOKENS,
-            auto_inject_enabled: true,
+            auto_inject_enabled: false,
             auto_inject_max_items: 3,
             default_ttl_ms: Some(30 * 24 * 60 * 60 * 1_000),
             retention_max_entries: None,

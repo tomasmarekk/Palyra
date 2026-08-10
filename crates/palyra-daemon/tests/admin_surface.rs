@@ -3577,7 +3577,7 @@ fn console_memory_status_and_index_surface_return_operator_payloads() -> Result<
     );
     assert_eq!(
         status_response.pointer("/auto_inject/enabled").and_then(Value::as_bool),
-        Some(true),
+        Some(false),
         "memory status should report the default prompt auto-inject posture"
     );
     assert_eq!(

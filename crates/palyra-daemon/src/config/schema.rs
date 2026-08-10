@@ -75,7 +75,7 @@ const DEFAULT_RUNTIME_PREVIEW_SECTION_MODE: RuntimePreviewMode = RuntimePreviewM
 const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
 const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
 const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
-const DEFAULT_MEMORY_AUTO_INJECT_ENABLED: bool = true;
+const DEFAULT_MEMORY_AUTO_INJECT_ENABLED: bool = false;
 const DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS: usize = 3;
 const DEFAULT_MEMORY_RETENTION_VACUUM_SCHEDULE: &str = "0 0 * * 0";
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
@@ -1095,7 +1095,7 @@ pub struct MemoryConfig {
     pub retrieval: RetrievalRuntimeConfig,
 }
 
-/// Automatic memory injection into prompts: on/off and per-prompt item cap.
+/// Explicitly enabled automatic memory injection and its per-prompt item cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryAutoInjectConfig {
     pub enabled: bool,
