@@ -217,6 +217,7 @@ pub(crate) const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 pub(crate) const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration =
     Duration::from_secs(APPROVAL_PROMPT_TIMEOUT_SECONDS as u64);
 const TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const TOOL_APPROVAL_MAX_IGNORED_STREAM_MESSAGES: usize = 16;
 const PROCESS_INPUT_WRITE_TIMEOUT_MS: u64 = 1_500;
 pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
     "skill execution blocked by security gate";
@@ -536,6 +537,7 @@ pub(crate) async fn await_tool_approval_response(
     proposal_id: &str,
     approval_id: &str,
 ) -> Result<ToolApprovalOutcome, Status> {
+    let mut ignored_stream_messages = 0_usize;
     loop {
         // Register before reading durable state because `notify_waiters` does
         // not retain a permit when no waiter exists. This ordering closes the
@@ -552,28 +554,40 @@ pub(crate) async fn await_tool_approval_response(
             return Ok(outcome);
         }
 
-        // Every branch is cancel-safe: `Streaming::next` yields whole
-        // messages, and the bounded timer covers notification receiver lag.
-        tokio::select! {
-            item = stream.next() => {
-                let Some(item) = item else {
-                    return external_or_unavailable_tool_approval_outcome(runtime_state, approval_id).await;
-                };
-                let message = item.map_err(|error| {
-                    Status::internal(format!("failed to read approval stream item: {error}"))
-                })?;
-                if let Some(outcome) = tool_approval_outcome_from_stream_message(
-                    message,
-                    expected_session_id,
-                    expected_run_id,
-                    proposal_id,
-                    approval_id,
-                )? {
-                    return Ok(outcome);
+        let recovery_delay = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL);
+        tokio::pin!(recovery_delay);
+        loop {
+            // Keep the notification and recovery futures registered while
+            // unrelated stream messages are discarded. Returning to the
+            // durable checks for attacker-controlled input would amplify each
+            // tiny message into cancellation and approval database reads.
+            tokio::select! {
+                item = stream.next() => {
+                    let Some(item) = item else {
+                        return external_or_unavailable_tool_approval_outcome(runtime_state, approval_id).await;
+                    };
+                    let message = item.map_err(|error| {
+                        Status::internal(format!("failed to read approval stream item: {error}"))
+                    })?;
+                    if let Some(outcome) = tool_approval_outcome_from_stream_message(
+                        message,
+                        expected_session_id,
+                        expected_run_id,
+                        proposal_id,
+                        approval_id,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    ignored_stream_messages = ignored_stream_messages.saturating_add(1);
+                    if ignored_stream_messages > TOOL_APPROVAL_MAX_IGNORED_STREAM_MESSAGES {
+                        return Err(Status::resource_exhausted(
+                            "too many unrelated messages while awaiting tool approval response",
+                        ));
+                    }
                 }
+                () = &mut decision_notified => break,
+                () = &mut recovery_delay => break,
             }
-            () = &mut decision_notified => {}
-            () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_RECOVERY_INTERVAL) => {}
         }
     }
 }

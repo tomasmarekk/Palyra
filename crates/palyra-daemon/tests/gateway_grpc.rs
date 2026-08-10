@@ -8726,6 +8726,106 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_bounds_unrelated_messages_during_approval_wait() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            openai_tool_call_response(
+                "custom.noop",
+                &serde_json::json!({"payload": "approval-noise"}),
+            )?,
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "custom.noop",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let (request_sender, request_receiver) = tokio_mpsc::channel(32);
+    request_sender
+        .send(sample_run_stream_request_with_text("approval noise limit".to_owned()))
+        .await
+        .context("failed to send initial approval-noise request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_approval_request = false;
+    let mut saw_bounded_denial = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("approval-noise stream stalled instead of exhausting its message budget")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read approval-noise RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(_) => {
+                    let unrelated = common_v1::RunStreamRequest {
+                        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+                        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+                        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+                        input: None,
+                        allow_sensitive_tools: false,
+                        session_key: String::new(),
+                        session_label: String::new(),
+                        reset_session: false,
+                        require_existing: true,
+                        tool_approval_response: None,
+                        origin_kind: String::new(),
+                        origin_run_id: None,
+                        parameter_delta_json: Vec::new(),
+                        queued_input_id: None,
+                    };
+                    for _ in 0..17 {
+                        request_sender
+                            .send(unrelated.clone())
+                            .await
+                            .context("failed to send unrelated approval-wait message")?;
+                    }
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolApprovalResponse(response)
+                    if !response.approved
+                        && response.reason.contains("too many unrelated messages") =>
+                {
+                    saw_bounded_denial = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_approval_request, "tool proposal should enter approval wait");
+    assert!(saw_bounded_denial, "unrelated stream messages should exhaust a bounded noise budget");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "approval-wait noise must not start another provider turn"
+    );
+
+    drop(request_sender);
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Result<()> {
     let response_body = openai_tool_call_response(
         "custom.noop",
