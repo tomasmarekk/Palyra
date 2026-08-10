@@ -3283,6 +3283,22 @@ pub(crate) async fn execute_memory_recall_tool(
         device_id: context.device_id.to_owned(),
         channel: context.channel.map(str::to_owned),
     };
+    let request_session_id = optional_trimmed_string(parsed.get("session_id"))
+        .or_else(|| Some(context.session_id.to_owned()));
+    for resource in memory_recall_policy_resources(request_session_id.as_deref(), workspace_top_k) {
+        if let Err(error) =
+            authorize_memory_action(context.principal, "memory.search", resource.as_str())
+        {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("memory policy denied recall request: {}", error.message()),
+            );
+        }
+    }
     let raw_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
         .or_else(|| optional_trimmed_string(parsed.get("prefix")));
     let workspace_scope = memory_recall_workspace_scope_text(&parsed);
@@ -3312,8 +3328,7 @@ pub(crate) async fn execute_memory_recall_tool(
     let request = RecallRequest {
         query,
         channel,
-        session_id: optional_trimmed_string(parsed.get("session_id"))
-            .or_else(|| Some(context.session_id.to_owned())),
+        session_id: request_session_id,
         agent_id: optional_trimmed_string(parsed.get("agent_id")),
         memory_top_k,
         workspace_top_k,
@@ -4946,6 +4961,17 @@ fn memory_recall_workspace_scope_text(parsed: &Map<String, Value>) -> String {
     }
 }
 
+fn memory_recall_policy_resources(session_id: Option<&str>, workspace_top_k: usize) -> Vec<String> {
+    let mut resources = vec![session_id.map_or_else(
+        || "memory:principal".to_owned(),
+        |session_id| format!("memory:session:{session_id}"),
+    )];
+    if workspace_top_k > 0 {
+        resources.push("memory:workspace".to_owned());
+    }
+    resources
+}
+
 fn memory_scope_text(parsed: &Map<String, Value>, default_scope: &str) -> String {
     parsed
         .get("scope")
@@ -5542,6 +5568,19 @@ mod tests {
         let mut project_recall = Map::new();
         project_recall.insert("scope".to_owned(), serde_json::json!("project"));
         assert_eq!(memory_recall_workspace_scope_text(&project_recall), "project");
+    }
+
+    #[test]
+    fn memory_recall_policy_resources_cover_session_and_workspace_sources() {
+        assert_eq!(
+            memory_recall_policy_resources(Some("session-1"), 4),
+            vec!["memory:session:session-1".to_owned(), "memory:workspace".to_owned()]
+        );
+        assert_eq!(
+            memory_recall_policy_resources(Some("session-1"), 0),
+            vec!["memory:session:session-1".to_owned()]
+        );
+        assert_eq!(memory_recall_policy_resources(None, 0), vec!["memory:principal".to_owned()]);
     }
 
     #[test]
