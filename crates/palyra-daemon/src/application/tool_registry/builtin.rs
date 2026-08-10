@@ -2391,13 +2391,6 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                     "description":"Target URL. file:// URLs are supported only for regular files inside active agent workspace roots or run-launch workspace roots; after opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
                 }),
             ));
-            properties.push((
-                "allow_private_targets",
-                json!({
-                    "type":"boolean",
-                    "description":"Optional private-target access override for requests that are explicitly authorized by runtime policy."
-                }),
-            ));
             required.push("url");
         }
         "palyra.browser.tabs.switch" => {
@@ -2416,13 +2409,6 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 json!({
                     "type":"string",
                     "description":"Required active tab URL expected to be reloaded. Obtain it from palyra.browser.tabs.list or palyra.browser.session.create output and copy it exactly so approval shows the destination and runtime can fail closed if the active tab changed."
-                }),
-            ));
-            properties.push((
-                "allow_private_targets",
-                json!({
-                    "type":"boolean",
-                    "description":"Optional private-target access override for reloading a current URL that is explicitly authorized by runtime policy."
                 }),
             ));
             properties.push((
@@ -2551,7 +2537,6 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "persistence_enabled",
                 json!({"type":"boolean","description":"Defaults to true for ordinary sessions so close/recreate recovery preserves browser state within the current agent session. Set false only for explicit ephemeral sessions."}),
             ));
-            properties.push(("allow_private_targets", json!({"type":"boolean"})));
             properties.push(("allow_downloads", json!({"type":"boolean"})));
             properties.push((
                 "budget",
@@ -3272,13 +3257,10 @@ mod tests {
         assert!(!url_description.contains("localhost"));
         assert!(url_description.contains("file:// URLs"));
         assert!(url_description.contains("active agent workspace roots"));
-        let private_override_description = navigate
-            .input_schema
-            .pointer("/properties/allow_private_targets/description")
-            .and_then(serde_json::Value::as_str)
-            .expect("private-target override description should be visible to models");
-        assert!(private_override_description.contains("explicitly authorized by runtime policy"));
-        assert!(!private_override_description.contains("Required when"));
+        assert!(
+            navigate.input_schema.pointer("/properties/allow_private_targets").is_none(),
+            "model-facing navigation schema must not expose private-target policy controls"
+        );
 
         let reload = registry_entry("palyra.browser.reload").expect("reload entry exists");
         assert_eq!(
@@ -3286,8 +3268,14 @@ mod tests {
             Some("session_id")
         );
         assert!(reload.input_schema.pointer("/properties/url").is_none());
+        assert!(reload.input_schema.pointer("/properties/allow_private_targets").is_none());
         assert!(reload.input_schema.pointer("/properties/allow_redirects").is_some());
         assert!(reload.input_schema.pointer("/properties/max_redirects").is_some());
+        let session_create =
+            registry_entry("palyra.browser.session.create").expect("session create entry exists");
+        assert!(session_create.input_schema.pointer("/properties/allow_private_targets").is_none());
+        let tabs_open = registry_entry("palyra.browser.tabs.open").expect("tabs open entry exists");
+        assert!(tabs_open.input_schema.pointer("/properties/allow_private_targets").is_none());
 
         let screenshot =
             registry_entry("palyra.browser.screenshot").expect("screenshot entry exists");

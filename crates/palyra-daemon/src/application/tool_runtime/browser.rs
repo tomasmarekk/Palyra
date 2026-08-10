@@ -373,20 +373,19 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
     )
 }
 
-/// Whether navigation to a private network target should be requested.
+/// Whether runtime policy permits navigation to a private network target.
 ///
 /// Loopback URLs are auto-allowed only when the process-runner policy already
 /// grants host access, keeping browser reach aligned with the sandbox posture
-/// (an agent that can run servers locally may also browse them). browserd
-/// still enforces its own private-target policy on top of this flag.
+/// (an agent that can run servers locally may also browse them). Model tool
+/// payloads cannot relax this decision; browserd still enforces its own
+/// private-target policy on top of the runtime-derived flag.
 fn browser_tool_allows_private_targets_for_url(
     runtime_state: &GatewayRuntimeState,
-    payload: &serde_json::Map<String, Value>,
     url: &str,
 ) -> bool {
-    payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false)
-        || (process_runner_allows_host_access(&runtime_state.config.tool_call.process_runner)
-            && browser_url_targets_loopback(url))
+    process_runner_allows_host_access(&runtime_state.config.tool_call.process_runner)
+        && browser_url_targets_loopback(url)
 }
 
 /// Returns `true` only for http(s) URLs whose host is `localhost` or a
@@ -1534,8 +1533,6 @@ pub(crate) async fn execute_browser_tool(
     let outcome = match tool_name {
         BROWSER_SESSION_CREATE_TOOL_NAME => {
             let idle_ttl_ms = payload.get("idle_ttl_ms").and_then(Value::as_u64).unwrap_or(0);
-            let allow_private_targets =
-                payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false);
             let (profile_id, ignored_profile_id) =
                 match browser_session_profile_id_from_payload(&payload) {
                     Ok(value) => value,
@@ -1630,7 +1627,7 @@ pub(crate) async fn execute_browser_tool(
                 principal: principal.to_owned(),
                 idle_ttl_ms,
                 budget,
-                allow_private_targets,
+                allow_private_targets: false,
                 allow_downloads: payload
                     .get("allow_downloads")
                     .and_then(Value::as_bool)
@@ -1830,7 +1827,7 @@ pub(crate) async fn execute_browser_tool(
             // the private-target flag implicitly (browserd would otherwise
             // refuse non-network schemes as private).
             let allow_private_targets =
-                browser_tool_allows_private_targets_for_url(runtime_state, &payload, url)
+                browser_tool_allows_private_targets_for_url(runtime_state, url)
                     || browser_url_uses_file_scheme(url);
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -2029,11 +2026,9 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            let allow_private_targets = browser_tool_allows_private_targets_for_url(
-                runtime_state,
-                &payload,
-                current_url.as_str(),
-            ) || browser_url_uses_file_scheme(current_url.as_str());
+            let allow_private_targets =
+                browser_tool_allows_private_targets_for_url(runtime_state, current_url.as_str())
+                    || browser_url_uses_file_scheme(current_url.as_str());
             let requested_url = redact_url(current_url.as_str());
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -4169,7 +4164,7 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
             let allow_private_targets =
-                browser_tool_allows_private_targets_for_url(runtime_state, &payload, url)
+                browser_tool_allows_private_targets_for_url(runtime_state, url)
                     || browser_url_uses_file_scheme(url);
             let mut request = Request::new(browser_v1::OpenTabRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
