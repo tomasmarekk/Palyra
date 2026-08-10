@@ -19876,6 +19876,45 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_guardrails_reject_python_module_eval_command() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec![
+            "-m".to_owned(),
+            "pdb".to_owned(),
+            "-c".to_owned(),
+            "!__import__('os').system('whoami')".to_owned(),
+            "scripts/check.py".to_owned(),
+        ];
+
+        let workspace_error = validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "python",
+            args.as_slice(),
+        )
+        .expect_err("Python module eval commands must stay blocked in workspace mode");
+        assert_eq!(workspace_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(
+            workspace_error.message.contains("shell-eval flags"),
+            "{}",
+            workspace_error.message
+        );
+
+        let host_error = validate_host_interpreter_argument_guardrails_with_roots(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "python",
+            args.as_slice(),
+            &[workspace_root.clone()],
+        )
+        .expect_err("Python module eval commands must stay blocked in host-access mode");
+        assert_eq!(host_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(host_error.message.contains("shell-eval flags"), "{}", host_error.message);
+    }
+
+    #[test]
     fn interpreter_guardrails_reject_absolute_python_exe_shell_eval_flags() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let workspace_root = canonical_workspace_root(workspace.as_path())

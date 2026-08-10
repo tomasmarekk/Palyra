@@ -207,13 +207,13 @@ pub fn process_executable_is_interpreter(command: &str) -> bool {
 
 /// Returns whether interpreter arguments request inline code evaluation.
 ///
-/// Python options after a script or module target belong to that target and are not treated as
-/// interpreter flags.
+/// Python options after a script target belong to that script. Options after a module target
+/// remain blocked unless the module/flag pair is known to have non-eval semantics.
 #[must_use]
 pub fn interpreter_args_contain_blocked_eval_flag(command: &str, args: &[String]) -> bool {
     args.iter().enumerate().any(|(index, arg)| {
         is_blocked_eval_flag(command, arg.as_str())
-            && !python_arg_is_after_execution_target(command, args, index)
+            && !python_arg_is_safe_downstream_flag(command, args, index)
     })
 }
 
@@ -287,11 +287,22 @@ fn node_eval_flag_is_blocked(command: &str, arg: &str) -> bool {
         && matches!(arg.trim().to_ascii_lowercase().as_str(), "-e" | "-p")
 }
 
-fn python_arg_is_after_execution_target(command: &str, args: &[String], index: usize) -> bool {
+fn python_arg_is_safe_downstream_flag(command: &str, args: &[String], index: usize) -> bool {
     if !is_python_interpreter_command(command) {
         return false;
     }
-    python_execution_target_index(args).is_some_and(|target_index| index > target_index)
+    let Some(target) = python_execution_target(args) else {
+        return false;
+    };
+    if index <= target.index {
+        return false;
+    }
+    match target.kind {
+        PythonExecutionTargetKind::Script => true,
+        PythonExecutionTargetKind::Module => {
+            python_module_flag_is_known_non_eval(target.value, args[index].as_str())
+        }
+    }
 }
 
 fn is_python_interpreter_command(command: &str) -> bool {
@@ -299,24 +310,56 @@ fn is_python_interpreter_command(command: &str) -> bool {
     matches!(command.as_str(), "python" | "python3" | "py") || command.starts_with("python3.")
 }
 
-fn python_execution_target_index(args: &[String]) -> Option<usize> {
+#[derive(Clone, Copy)]
+enum PythonExecutionTargetKind {
+    Script,
+    Module,
+}
+
+struct PythonExecutionTarget<'a> {
+    index: usize,
+    value: &'a str,
+    kind: PythonExecutionTargetKind,
+}
+
+fn python_execution_target(args: &[String]) -> Option<PythonExecutionTarget<'_>> {
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| arg.trim()) {
         if arg == "--" {
-            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+            let index = index.saturating_add(1);
+            return args.get(index).map(|value| PythonExecutionTarget {
+                index,
+                value: value.trim(),
+                kind: PythonExecutionTargetKind::Script,
+            });
         }
         if arg.eq_ignore_ascii_case("-m") {
-            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+            let index = index.saturating_add(1);
+            return args.get(index).map(|value| PythonExecutionTarget {
+                index,
+                value: value.trim(),
+                kind: PythonExecutionTargetKind::Module,
+            });
         }
         if is_generic_blocked_eval_flag(arg) {
             return None;
         }
         if !arg.starts_with('-') {
-            return Some(index);
+            return Some(PythonExecutionTarget {
+                index,
+                value: arg,
+                kind: PythonExecutionTargetKind::Script,
+            });
         }
         index = index.saturating_add(if python_option_consumes_next_value(arg) { 2 } else { 1 });
     }
     None
+}
+
+fn python_module_flag_is_known_non_eval(module: &str, flag: &str) -> bool {
+    // Unknown modules stay fail-closed because their parsers may assign executable semantics to
+    // otherwise familiar flags, as the standard-library `pdb -c` command option does.
+    matches!((module, flag.trim()), ("bandit", "-c"))
 }
 
 fn python_option_consumes_next_value(arg: &str) -> bool {
@@ -349,6 +392,30 @@ mod tests {
         assert!(!interpreter_args_contain_blocked_eval_flag(
             "python",
             &["scripts/check.py".to_owned(), "-c".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn interpreter_policy_rejects_python_module_eval_flags() {
+        assert!(interpreter_args_contain_blocked_eval_flag(
+            "python",
+            &[
+                "-m".to_owned(),
+                "pdb".to_owned(),
+                "-c".to_owned(),
+                "!__import__('os').system('whoami')".to_owned(),
+                "scripts/check.py".to_owned(),
+            ]
+        ));
+        assert!(!interpreter_args_contain_blocked_eval_flag(
+            "python",
+            &[
+                "-m".to_owned(),
+                "bandit".to_owned(),
+                "-c".to_owned(),
+                "bandit.yaml".to_owned(),
+                "package".to_owned(),
+            ]
         ));
     }
 
