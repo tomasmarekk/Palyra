@@ -19,22 +19,23 @@ use super::{
     provider_request_timeout_status, provider_status_recovery_decision_payload,
     provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
     provider_turn_anomaly_from_status, provider_waiting_status_message,
-    repeated_tool_failure_signature, run_loop_phase_timeout_message,
-    run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
-    run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
-    run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
-    run_stream_harness_cancelled_tape_events, run_stream_harness_cleanup_payload,
-    run_stream_harness_selection_payload, run_stream_harness_started_payload,
-    run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
-    run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
-    seed_orchestration_test_run, selected_v2_shadow_route_semantics,
-    shadow_catalog_matches_selected_v2_route, should_emit_budget_exhausted_partial_summary,
-    terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-    tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-    tool_result_to_provider_message, truncated_final_answer_without_tools,
-    ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-    RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-    RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+    repeated_tool_failure_signature, revoke_inherited_tool_approvals_after_steering,
+    run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
+    run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
+    run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
+    run_stream_agent_harness_selection_mode, run_stream_harness_cancelled_tape_events,
+    run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
+    run_stream_harness_started_payload, run_stream_harness_terminal_event,
+    run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
+    run_stream_harness_terminal_payload, seed_orchestration_test_run,
+    selected_v2_shadow_route_semantics, shadow_catalog_matches_selected_v2_route,
+    should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+    tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+    tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+    truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+    ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+    RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+    RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
     RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
     BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT,
     MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
@@ -62,10 +63,10 @@ use crate::application::run_stream::{
     tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
 };
 use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
-use crate::gateway::tests::build_test_runtime_state;
+use crate::gateway::{tests::build_test_runtime_state, RequestContext, ToolApprovalOutcome};
 use crate::journal::{
-    OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
-    OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+    ApprovalDecision, ApprovalDecisionScope, OrchestratorQueuedInputCreateRequest,
+    OrchestratorQueuedInputRecord, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
 };
 use crate::model_provider::{
     AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderAttemptState,
@@ -490,7 +491,7 @@ async fn active_run_steering_supersedes_generation_and_replaces_flow_control() {
         AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
     let mut tape_seq = 0;
 
-    drain_active_run_steering_before_provider_call(
+    let steering_injected = drain_active_run_steering_before_provider_call(
         &state,
         session_id,
         run_id,
@@ -500,6 +501,7 @@ async fn active_run_steering_supersedes_generation_and_replaces_flow_control() {
     )
     .await
     .expect("active steering should drain");
+    assert!(steering_injected);
 
     let (_, replacement_generation) = state
         .runtime_generation_for_run(run_id.to_owned())
@@ -539,6 +541,44 @@ async fn active_run_steering_supersedes_generation_and_replaces_flow_control() {
 }
 
 #[tokio::test]
+async fn active_run_steering_revokes_inherited_session_tool_approval() {
+    let state = build_test_runtime_state(false);
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "device-active-steering".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let session_id = "session-active-steer-approval";
+    let approval = ToolApprovalOutcome {
+        approval_id: "approval-active-steer".to_owned(),
+        approved: true,
+        reason: "allow_session".to_owned(),
+        decision: ApprovalDecision::Allow,
+        decision_scope: ApprovalDecisionScope::Session,
+        decision_scope_ttl_ms: None,
+    };
+    state.remember_tool_approval(&context, session_id, "tool:palyra.process.run", &approval);
+    assert!(state
+        .resolve_cached_tool_approval(&context, session_id, "tool:palyra.process.run")
+        .is_some());
+    let mut approval_cache_generation =
+        Some(state.tool_approval_cache_generation_for_session(&context, session_id));
+    let inherited_generation = approval_cache_generation;
+
+    revoke_inherited_tool_approvals_after_steering(
+        &state,
+        &context,
+        session_id,
+        &mut approval_cache_generation,
+    );
+
+    assert!(state
+        .resolve_cached_tool_approval(&context, session_id, "tool:palyra.process.run")
+        .is_none());
+    assert_ne!(approval_cache_generation, inherited_generation);
+}
+
+#[tokio::test]
 async fn active_run_drain_leaves_followup_for_next_turn() {
     let state = build_test_runtime_state(false);
     let session_id = "session-followup-boundary";
@@ -568,7 +608,7 @@ async fn active_run_drain_leaves_followup_for_next_turn() {
     let original_messages = loop_state.messages();
     let mut tape_seq = 0;
 
-    drain_active_run_steering_before_provider_call(
+    let steering_injected = drain_active_run_steering_before_provider_call(
         &state,
         session_id,
         run_id,
@@ -578,6 +618,7 @@ async fn active_run_drain_leaves_followup_for_next_turn() {
     )
     .await
     .expect("next-turn followup should be ignored by active drain");
+    assert!(!steering_injected);
 
     let (_, observed_generation) = state
         .runtime_generation_for_run(run_id.to_owned())
@@ -624,7 +665,7 @@ async fn active_run_drain_supersedes_stale_generation_input() {
         AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
     let mut tape_seq = 0;
 
-    drain_active_run_steering_before_provider_call(
+    let steering_injected = drain_active_run_steering_before_provider_call(
         &state,
         session_id,
         run_id,
@@ -634,6 +675,7 @@ async fn active_run_drain_supersedes_stale_generation_input() {
     )
     .await
     .expect("stale steering should settle without injection");
+    assert!(!steering_injected);
 
     let queued = state
         .list_orchestrator_queued_inputs(session_id.to_owned())
@@ -677,7 +719,7 @@ async fn terminal_run_wins_after_queue_claim_without_injection() {
         AgentRunLoopState::new(vec![ProviderMessage::user_text("initial")], 4, 8, 10_000);
     let mut tape_seq = 0;
 
-    drain_active_run_steering_before_provider_call(
+    let steering_injected = drain_active_run_steering_before_provider_call(
         &state,
         session_id,
         run_id,
@@ -687,6 +729,7 @@ async fn terminal_run_wins_after_queue_claim_without_injection() {
     )
     .await
     .expect("terminal race should settle the queued input");
+    assert!(!steering_injected);
 
     let queued = state
         .list_orchestrator_queued_inputs(session_id.to_owned())

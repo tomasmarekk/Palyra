@@ -2588,7 +2588,7 @@ async fn drain_active_run_steering_before_provider_call(
     tape_seq: &mut i64,
     loop_state: &mut AgentRunLoopState,
     active_flow_control: &mut Option<RunStreamFlowControl>,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let current_flow_control = active_flow_control.as_ref().ok_or_else(|| {
         Status::internal("active run steering requires an initialized flow-control scope")
     })?;
@@ -2618,7 +2618,7 @@ async fn drain_active_run_steering_before_provider_call(
         })
         .collect::<Vec<_>>();
     if targeted_inputs.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     targeted_inputs.sort_by(|left, right| {
         queued_input_sort_key(left)
@@ -2707,7 +2707,7 @@ async fn drain_active_run_steering_before_provider_call(
         }
     }
     if claimed_inputs.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let replacement_generation = match runtime_state
         .supersede_run_generation_for_steer(session_id.to_owned(), run_id.to_owned())
@@ -2750,7 +2750,7 @@ async fn drain_active_run_steering_before_provider_call(
                 }
             }
             if matches!(error.code(), Code::FailedPrecondition | Code::Aborted | Code::NotFound) {
-                return Ok(());
+                return Ok(false);
             }
             return Err(error);
         }
@@ -2841,7 +2841,21 @@ async fn drain_active_run_steering_before_provider_call(
         .to_string(),
     )
     .await?;
-    Ok(())
+    Ok(true)
+}
+
+fn revoke_inherited_tool_approvals_after_steering(
+    runtime_state: &GatewayRuntimeState,
+    request_context: &RequestContext,
+    session_id: &str,
+    active_approval_cache_generation: &mut Option<u64>,
+) {
+    // Queued input is a new authority boundary even though it is delivered
+    // inside the active run. Revoking the session cache also bumps its
+    // generation, fencing approval writes that raced the steering handoff.
+    runtime_state.clear_tool_approval_cache_for_session(request_context, session_id);
+    *active_approval_cache_generation =
+        Some(runtime_state.tool_approval_cache_generation_for_session(request_context, session_id));
 }
 
 fn queued_targets_active_run(queued: &OrchestratorQueuedInputRecord, run_id: &str) -> bool {
@@ -5279,7 +5293,7 @@ async fn process_run_stream_message_inner(
             "agent_loop.provider_request_preparing",
         )
         .await?;
-        drain_active_run_steering_before_provider_call(
+        let steering_injected = drain_active_run_steering_before_provider_call(
             runtime_state,
             session_id_for_message.as_str(),
             run_id.as_str(),
@@ -5288,6 +5302,14 @@ async fn process_run_stream_message_inner(
             active_flow_control,
         )
         .await?;
+        if steering_injected {
+            revoke_inherited_tool_approvals_after_steering(
+                runtime_state,
+                request_context,
+                session_id_for_message.as_str(),
+                active_approval_cache_generation,
+            );
+        }
         let mut provider_request = ProviderRequest::from_input_text(
             base_provider_request.input_text.clone(),
             base_provider_request.json_mode,
