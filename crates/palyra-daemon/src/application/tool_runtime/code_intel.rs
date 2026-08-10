@@ -3527,12 +3527,12 @@ impl PyrightProvider {
         workspace_root: &Path,
         touched_files: &BTreeSet<String>,
     ) -> PyrightCaptureOutcome {
-        if !executable_is_available(self.binary.as_str()) {
+        let Some(provider_command) = resolve_executable_path(self.binary.as_str()) else {
             return PyrightCaptureOutcome::degraded(
                 "code_intel.provider_missing.python",
                 "Install pyright-langserver or set tool_call.code_intel.pyright_binary to an executable path.",
             );
-        }
+        };
         if !workspace_root.is_dir() {
             return PyrightCaptureOutcome::degraded(
                 "code_intel.python.workspace_root_missing",
@@ -3540,11 +3540,11 @@ impl PyrightProvider {
             );
         }
         let Some(check_command) =
-            resolve_pyright_check_command(self.binary.as_str(), workspace_root)
+            resolve_pyright_check_command(self.binary.as_str(), provider_command.as_path())
         else {
             return PyrightCaptureOutcome::degraded(
                 "code_intel.python.pyright_cli_missing",
-                "Install the pyright CLI next to pyright-langserver or make pyright available on PATH.",
+                "Install the pyright CLI next to the configured pyright-langserver or configure tool_call.code_intel.pyright_binary to a trusted pyright executable.",
             );
         };
 
@@ -3939,32 +3939,20 @@ fn resolve_typescript_check_command(project_root: &Path, workspace_root: &Path) 
 
 fn resolve_pyright_check_command(
     configured_binary: &str,
-    workspace_root: &Path,
+    configured_command: &Path,
 ) -> Option<PathBuf> {
-    if !configured_binary.to_ascii_lowercase().contains("langserver")
-        && executable_is_available(configured_binary)
-    {
-        return Some(PathBuf::from(configured_binary));
+    if !configured_binary.to_ascii_lowercase().contains("langserver") {
+        return Some(configured_command.to_path_buf());
     }
 
-    let configured_path = Path::new(configured_binary);
-    if configured_path.components().count() > 1 || configured_path.is_absolute() {
-        if let Some(parent) = configured_path.parent() {
-            for name in executable_candidates(PYRIGHT_CLI_COMMAND) {
-                let candidate = parent.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
+    let parent = configured_command.parent()?;
     for name in executable_candidates(PYRIGHT_CLI_COMMAND) {
-        let candidate = workspace_root.join("node_modules").join(".bin").join(name);
+        let candidate = parent.join(name);
         if candidate.is_file() {
-            return Some(candidate);
+            return fs::canonicalize(candidate).ok();
         }
     }
-    executable_is_available(PYRIGHT_CLI_COMMAND).then(|| PathBuf::from(PYRIGHT_CLI_COMMAND))
+    None
 }
 
 /// Parses an LSP-like JSON diagnostic payload used by provider adapters and
@@ -4184,6 +4172,27 @@ fn executable_is_available(binary: &str) -> bool {
     };
     env::split_paths(&paths).any(|directory| {
         executable_candidates(binary).iter().any(|name| directory.join(name).is_file())
+    })
+}
+
+/// Resolves an operator-configured executable before any child process adopts
+/// a workspace-controlled current directory.
+fn resolve_executable_path(binary: &str) -> Option<PathBuf> {
+    let candidate = Path::new(binary);
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        return if candidate.is_file() { fs::canonicalize(candidate).ok() } else { None };
+    }
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths).find_map(|directory| {
+        executable_candidates(binary).into_iter().map(|name| directory.join(name)).find_map(
+            |candidate| {
+                if candidate.is_file() {
+                    fs::canonicalize(candidate).ok()
+                } else {
+                    None
+                }
+            },
+        )
     })
 }
 
@@ -4744,6 +4753,49 @@ mod tests {
         assert_eq!(items[0].severity, DiagnosticSeverity::Error);
         assert_eq!(items[0].code.as_deref(), Some("TS2304"));
         assert_eq!(items[0].source, TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE);
+    }
+
+    #[test]
+    fn pyright_check_command_stays_with_configured_provider_installation() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let provider_bin = tempdir.path().join("provider-bin");
+        let workspace_bin = tempdir.path().join("workspace").join("node_modules").join(".bin");
+        fs::create_dir_all(provider_bin.as_path()).expect("provider bin should be created");
+        fs::create_dir_all(workspace_bin.as_path()).expect("workspace bin should be created");
+        let executable_suffix = if cfg!(windows) { ".exe" } else { "" };
+        let configured_binary = provider_bin.join(format!("pyright-langserver{executable_suffix}"));
+        let workspace_pyright = workspace_bin.join(format!("pyright{executable_suffix}"));
+        fs::write(configured_binary.as_path(), b"provider")
+            .expect("configured provider should exist");
+        fs::write(workspace_pyright.as_path(), b"workspace-controlled")
+            .expect("workspace pyright should exist");
+        let configured_command = resolve_executable_path(
+            configured_binary.to_str().expect("configured provider path should be UTF-8"),
+        )
+        .expect("configured provider should resolve");
+
+        assert!(
+            resolve_pyright_check_command(
+                configured_binary.to_str().expect("configured provider path should be UTF-8"),
+                configured_command.as_path(),
+            )
+            .is_none(),
+            "workspace-local pyright must not satisfy the configured provider"
+        );
+
+        let trusted_pyright = provider_bin.join(format!("pyright{executable_suffix}"));
+        fs::write(trusted_pyright.as_path(), b"trusted")
+            .expect("trusted pyright sibling should exist");
+        assert_eq!(
+            resolve_pyright_check_command(
+                configured_binary.to_str().expect("configured provider path should be UTF-8"),
+                configured_command.as_path(),
+            ),
+            Some(
+                fs::canonicalize(trusted_pyright)
+                    .expect("trusted pyright sibling should canonicalize")
+            )
+        );
     }
 
     #[test]
