@@ -33,16 +33,9 @@ resolve_cargo() {
 
 CARGO_BIN="$(resolve_cargo)"
 
-cleanup_runtime_artifacts() {
-  local scope="${1:-generated during local validation}"
-  echo "Cleaning runtime artifacts ${scope}..."
-  bash "$ROOT_DIR/scripts/clean-runtime-artifacts.sh" >/dev/null
-}
-
 check_runtime_artifact_hygiene() {
   local label="$1"
   echo "$label"
-  cleanup_runtime_artifacts "before runtime artifact hygiene check"
   bash "$ROOT_DIR/scripts/check-runtime-artifacts.sh"
 }
 
@@ -228,9 +221,6 @@ run_full_profile() {
   echo "Running high-risk pattern scan..."
   bash "$ROOT_DIR/scripts/check-high-risk-patterns.sh"
 }
-
-trap cleanup_runtime_artifacts EXIT
-cleanup_runtime_artifacts "from prior local validation runs"
 
 case "$PROFILE" in
   fast)
