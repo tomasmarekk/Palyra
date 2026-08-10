@@ -102,7 +102,7 @@ struct ErrorEntry<'a> {
     kind: &'a str,
     message: String,
     trace_id: Option<&'a str>,
-    profile: Option<&'a str>,
+    profile: Option<String>,
     state_root: Option<String>,
     log_level: Option<String>,
     no_color: Option<bool>,
@@ -162,6 +162,10 @@ fn sanitize_text_output_line(line: &str) -> String {
     sanitized
 }
 
+fn sanitize_error_context_field(value: &str) -> String {
+    sanitize_text_output_line(value)
+}
+
 /// Redacts credential-shaped material (tokens, authorization headers, secret
 /// query parameters) from diagnostic text before it reaches any output sink.
 pub(crate) fn sanitize_diagnostic_text(line: &str) -> String {
@@ -193,10 +197,12 @@ pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
     let kind = exit_code.kind();
     let context = app::current_error_render_context();
     let trace_id = context.as_ref().map(|value| value.trace_id());
-    let profile = context.as_ref().and_then(|value| value.profile_name());
+    let profile =
+        context.as_ref().and_then(|value| value.profile_name()).map(sanitize_error_context_field);
     let state_root = context
         .as_ref()
-        .and_then(|value| value.state_root().map(|path| path.display().to_string()));
+        .and_then(|value| value.state_root().map(|path| path.display().to_string()))
+        .map(|value| sanitize_error_context_field(value.as_str()));
     let log_level =
         context.as_ref().map(|value| format!("{:?}", value.log_level()).to_ascii_lowercase());
     let no_color = context.as_ref().map(|value| value.no_color());
@@ -208,7 +214,7 @@ pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
         OutputFormatArg::Text => {
             if let Some(trace_id) = trace_id {
                 let profile_suffix =
-                    profile.map(|value| format!(" profile={value}")).unwrap_or_default();
+                    profile.as_ref().map(|value| format!(" profile={value}")).unwrap_or_default();
                 let state_root_suffix = state_root
                     .as_ref()
                     .map(|value| format!(" state_root={value}"))
@@ -720,5 +726,19 @@ mod tests {
             "task<LF>forged<CR>record<ESC>]52;c;clipboard<U+0007><U+0009>trailing"
         );
         assert!(!sanitized.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn error_context_sanitizer_redacts_and_neutralizes_early_option_values() {
+        let profile = sanitize_error_context_field("api_key=profile-secret\nforged");
+        let state_root =
+            sanitize_error_context_field("/tmp/state?access_token=root-secret\rforged\x1b");
+
+        assert!(!profile.contains("profile-secret"));
+        assert!(!state_root.contains("root-secret"));
+        assert!(profile.contains("<redacted>"));
+        assert!(state_root.contains("<redacted>"));
+        assert!(!profile.chars().any(char::is_control));
+        assert!(!state_root.chars().any(char::is_control));
     }
 }
