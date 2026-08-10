@@ -2114,7 +2114,9 @@ async fn record_process_run_verification_classification(
     if !classification.is_verification {
         return;
     }
-    let status = verification_status_from_tool_outcome(outcome);
+    let Some(status) = verification_status_from_tool_outcome(outcome) else {
+        return;
+    };
     let event = match crate::application::verification::VerificationEvent::create(
         crate::application::verification::VerificationEventCreateRequest {
             event_id: Ulid::new().to_string(),
@@ -2193,18 +2195,31 @@ async fn record_verification_journal_projection(
 
 fn verification_status_from_tool_outcome(
     outcome: &ToolExecutionOutcome,
-) -> crate::application::verification::VerificationStatus {
+) -> Option<crate::application::verification::VerificationStatus> {
     if outcome.attestation.timed_out {
-        return crate::application::verification::VerificationStatus::TimedOut;
+        return Some(crate::application::verification::VerificationStatus::TimedOut);
+    }
+    let output = serde_json::from_slice::<Value>(outcome.output_json.as_slice()).ok();
+    let background = output.as_ref().and_then(|value| value.get("background"));
+    let completed = output.as_ref().and_then(|value| value.get("completed"));
+    let process_state =
+        output.as_ref().and_then(|value| value.get("process_state")).and_then(Value::as_str);
+    if completed.and_then(Value::as_bool) == Some(false)
+        || process_state == Some("running")
+        || (background.and_then(Value::as_bool) == Some(true)
+            && completed.and_then(Value::as_bool) != Some(true))
+    {
+        return None;
     }
     if outcome.success {
-        return crate::application::verification::VerificationStatus::Passed;
+        return (process_run_exit_code(outcome.output_json.as_slice()) == Some(0))
+            .then_some(crate::application::verification::VerificationStatus::Passed);
     }
     let lower_error = outcome.error.to_ascii_lowercase();
     if lower_error.contains("cancelled") || lower_error.contains("canceled") {
-        crate::application::verification::VerificationStatus::Cancelled
+        Some(crate::application::verification::VerificationStatus::Cancelled)
     } else {
-        crate::application::verification::VerificationStatus::Failed
+        Some(crate::application::verification::VerificationStatus::Failed)
     }
 }
 

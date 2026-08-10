@@ -2804,7 +2804,36 @@ fn process_run_verification_status_maps_attested_timeout() {
 
     assert_eq!(
         verification_status_from_tool_outcome(&outcome),
-        crate::application::verification::VerificationStatus::TimedOut
+        Some(crate::application::verification::VerificationStatus::TimedOut)
+    );
+}
+
+#[test]
+fn process_run_verification_status_rejects_background_startup_as_terminal_evidence() {
+    let outcome = cleanup_test_tool_outcome(
+        true,
+        json!({
+            "exit_code": null,
+            "background": true,
+            "started": true,
+            "completed": false,
+            "startup_success": true,
+            "process_state": "running"
+        }),
+    );
+
+    assert_eq!(verification_status_from_tool_outcome(&outcome), None);
+}
+
+#[test]
+fn process_run_verification_status_requires_a_zero_terminal_exit_code_to_pass() {
+    let missing_exit_code = cleanup_test_tool_outcome(true, json!({}));
+    let completed = cleanup_test_tool_outcome(true, json!({ "exit_code": 0 }));
+
+    assert_eq!(verification_status_from_tool_outcome(&missing_exit_code), None);
+    assert_eq!(
+        verification_status_from_tool_outcome(&completed),
+        Some(crate::application::verification::VerificationStatus::Passed)
     );
 }
 
