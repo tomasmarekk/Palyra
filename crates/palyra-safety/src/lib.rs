@@ -1202,7 +1202,7 @@ fn comparison_value_requires_redaction(classification: &str, value: &str) -> boo
         return bare_token_assignment_value_requires_redaction(literal);
     }
     if classification == "key" {
-        return generic_key_assignment_value_looks_secret(literal);
+        return generic_key_assignment_value_looks_secret("", literal);
     }
     true
 }
@@ -1241,7 +1241,7 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     }
     // "key" is too generic (storage keys, parser keys, ...) to flag on the
     // name alone; require the value itself to look like a secret.
-    if classification == "key" && !generic_key_assignment_value_looks_secret(value) {
+    if classification == "key" && !generic_key_assignment_value_looks_secret(key.as_str(), value) {
         return None;
     }
     Some(classification)
@@ -1368,7 +1368,7 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_env_getter_reference(reference, "os.getenv")
         || is_os_environ_index_reference(reference)
         || is_env_identifier_reference_expression(key, reference)
-        || is_safe_standalone_env_identifier_literal(raw_key, key, reference)
+        || is_safe_standalone_env_identifier_literal(key, reference)
         || (sensitive_assignment_key_allows_path_reference(key)
             && is_benign_path_reference_value(reference))
         || is_dom_input_value_reference(reference)
@@ -1554,10 +1554,8 @@ fn is_trusted_env_identifier_helper_call(value: &str) -> bool {
     rest.trim_end().ends_with(')')
 }
 
-fn is_safe_standalone_env_identifier_literal(raw_key: &str, key: &str, value: &str) -> bool {
-    is_standalone_env_identifier_literal(value)
-        && (assignment_key_describes_env_identifier(key)
-            || source_declaration_target_is_env_identifier(raw_key))
+fn is_safe_standalone_env_identifier_literal(key: &str, value: &str) -> bool {
+    is_standalone_env_identifier_literal(value) && assignment_key_describes_env_identifier(key)
 }
 
 // Requires SCREAMING_SNAKE shape (underscore, no lowercase) so ordinary words
@@ -1595,19 +1593,6 @@ fn is_source_declaration_assignment(raw_key: &str) -> bool {
         || trimmed.starts_with("static ")
         || trimmed.starts_with("pub const ")
         || trimmed.starts_with("pub static ")
-}
-
-fn source_declaration_target_is_env_identifier(raw_key: &str) -> bool {
-    if !is_source_declaration_assignment(raw_key) {
-        return false;
-    }
-    let Some(target) = raw_key
-        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-        .find(|segment| !segment.is_empty())
-    else {
-        return false;
-    };
-    is_env_reference_identifier_literal(target)
 }
 
 fn is_obvious_placeholder_secret_value(value: &str) -> bool {
@@ -2184,9 +2169,7 @@ fn bare_token_assignment_value_requires_redaction(value: &str) -> bool {
     if looks_like_segmented_auth_secret_value(lowered.as_str()) {
         return true;
     }
-    if is_env_reference_identifier_literal(normalized)
-        || looks_like_application_identifier(lowered.as_str())
-        || looks_like_parser_fixture_value(lowered.as_str())
+    if looks_like_parser_fixture_value(lowered.as_str())
         || looks_like_url_encoded_parser_fixture_value(lowered.as_str())
         || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
     {
@@ -2203,7 +2186,7 @@ fn bare_token_assignment_value_requires_redaction(value: &str) -> bool {
 
 /// Heuristic for whether the value of a generic `key` assignment looks like
 /// real secret material after allowlisting identifiers and fixture markers.
-fn generic_key_assignment_value_looks_secret(value: &str) -> bool {
+fn generic_key_assignment_value_looks_secret(key: &str, value: &str) -> bool {
     let candidate = value.trim().trim_start_matches(['"', '\'', '`']);
     let bounded_value = candidate
         .char_indices()
@@ -2225,8 +2208,8 @@ fn generic_key_assignment_value_looks_secret(value: &str) -> bool {
     if looks_like_segmented_auth_secret_value(lowered.as_str()) {
         return true;
     }
-    if is_env_reference_identifier_literal(normalized)
-        || looks_like_application_identifier(lowered.as_str())
+    if (assignment_key_describes_application_identifier(key)
+        && looks_like_application_identifier(lowered.as_str()))
         || looks_like_parser_fixture_value(lowered.as_str())
         || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
     {
@@ -2234,7 +2217,7 @@ fn generic_key_assignment_value_looks_secret(value: &str) -> bool {
     }
     if quoted_string_literals(value).iter().any(|literal| {
         let literal = literal.trim();
-        !literal.is_empty() && generic_key_assignment_value_looks_secret(literal)
+        !literal.is_empty() && generic_key_assignment_value_looks_secret(key, literal)
     }) {
         return true;
     }
@@ -2245,6 +2228,12 @@ fn generic_key_assignment_value_looks_secret(value: &str) -> bool {
         || lowered.starts_with("github_pat_")
         || lowered.starts_with("xox")
         || normalized.len() >= 16
+}
+
+fn assignment_key_describes_application_identifier(key: &str) -> bool {
+    ["cache", "filter", "fixture", "identifier", "namespace", "route", "state", "storage"]
+        .iter()
+        .any(|component| key.contains(component))
 }
 
 fn looks_like_segmented_auth_secret_value(value: &str) -> bool {
@@ -2282,9 +2271,9 @@ fn looks_like_palyra_e2e_fixture_marker(value: &str) -> bool {
     SAFE_MARKERS.contains(&value)
 }
 
-/// Allowlists app/storage identifiers assigned to generic key/token names,
-/// e.g. `todo-app:items:v1` or `s024.wizard.state.v1`; never anything that
-/// mentions secret/token/password.
+/// Recognizes app/storage identifiers after the assignment key has established
+/// storage-like semantics, e.g. `todo-app:items:v1`; never values that mention
+/// secret/token/password.
 fn looks_like_application_identifier(value: &str) -> bool {
     let looks_like_scenario_identifier = looks_like_scenario_application_identifier(value);
     value.len() <= 128
@@ -3374,8 +3363,7 @@ mod tests {
     fn local_storage_keys_are_not_redacted_as_secret_values() {
         let source = "const STORAGE_KEY = \"todo-app:items:v1\";\n\
                       const FILTER_KEY = \"todo-app:filter:v1\";\n\
-                      const WIZARD_STORAGE_KEY = \"s024.wizard.state.v1\";\n\
-                      const AUTH_KEY = \"s062.mock.auth.v1\";";
+                      const WIZARD_STORAGE_KEY = \"s024.wizard.state.v1\";";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -3388,7 +3376,6 @@ mod tests {
         assert!(outcome.redacted_text.contains("todo-app:items:v1"));
         assert!(outcome.redacted_text.contains("todo-app:filter:v1"));
         assert!(outcome.redacted_text.contains("s024.wizard.state.v1"));
-        assert!(outcome.redacted_text.contains("s062.mock.auth.v1"));
         assert!(!outcome
             .scan
             .finding_codes()
@@ -3397,9 +3384,8 @@ mod tests {
     }
 
     #[test]
-    fn segmented_auth_session_storage_keys_are_not_redacted_as_secret_values() {
-        let source = "const sessionKey = \"s058-auth-session\";\n\
-                      const authStorageKey = \"mock-auth-session\";\n\
+    fn segmented_storage_and_route_keys_are_not_redacted_as_secret_values() {
+        let source = "const authStorageKey = \"mock-auth-session\";\n\
                       const routeGuardKey = \"app-auth-state\";";
         let outcome = redact_text_for_export(
             source,
@@ -3410,7 +3396,6 @@ mod tests {
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
-        assert!(outcome.redacted_text.contains("s058-auth-session"));
         assert!(outcome.redacted_text.contains("mock-auth-session"));
         assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
@@ -3465,9 +3450,9 @@ mod tests {
     }
 
     #[test]
-    fn env_identifier_literals_are_not_redacted_as_secret_values() {
-        let source = "const SECRET_KEY = 'VITE_SECRET_TOKEN';\n\
-                      const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';";
+    fn env_identifier_metadata_literals_are_not_redacted_as_secret_values() {
+        let source = "const SECRET_ENV_NAME = 'VITE_SECRET_TOKEN';\n\
+                      const PRIVATE_KEY_ENV_VAR = 'SERVER_PRIVATE_KEY';";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -3484,6 +3469,52 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn sensitive_keys_do_not_treat_env_shaped_literals_as_references() {
+        let source = "const JWT_SECRET_KEY = \"HS256_SECRET_VALUE_1234567890\";\n\
+                      const API_KEY = \"APP_PRODUCTION_CREDENTIAL_1234567890\";\n\
+                      const REFRESH_TOKEN = \"HS256_TOKEN_VALUE_1234567890\";\n\
+                      const TOKEN = \"todo-app:items:v1\";\n\
+                      const AUTH_KEY = \"app:prod:credential\";";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        for leaked in [
+            "HS256_SECRET_VALUE_1234567890",
+            "APP_PRODUCTION_CREDENTIAL_1234567890",
+            "HS256_TOKEN_VALUE_1234567890",
+            "todo-app:items:v1",
+            "app:prod:credential",
+        ] {
+            assert!(!outcome.redacted_text.contains(leaked), "{leaked}");
+        }
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.secret"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.key"));
     }
 
     #[test]

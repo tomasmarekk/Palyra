@@ -3174,13 +3174,13 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_preserves_safe_storage_and_env_key_identifiers() {
+    fn read_workspace_file_redacts_sensitive_env_shaped_literals() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");
         let contents = "const STORAGE_KEY = \"todo-app:items:v1\";\n\
                         const FILTER_KEY = \"todo-app:filter:v1\";\n\
-                        const SECRET_KEY = 'VITE_SECRET_TOKEN';\n\
-                        const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';\n";
+                        const SECRET_ENV_NAME = 'VITE_SECRET_TOKEN';\n\
+                        const JWT_SECRET_KEY = 'HS256_SECRET_VALUE_1234567890';\n";
         fs::write(file_path, contents).expect("workspace file should be written");
         let input = WorkspaceReadFileInput {
             path: "app.js".to_owned(),
@@ -3193,19 +3193,24 @@ mod tests {
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
             .expect("workspace file should be readable");
+        let text = output.text.as_deref().expect("utf8 text should be returned");
 
-        assert!(!output.redacted);
-        assert_eq!(output.text.as_deref(), Some(contents));
-        assert_eq!(output.text_authoritative, None);
-        assert_eq!(output.redaction_notice, None);
+        assert!(output.redacted);
+        assert_eq!(output.text_authoritative, Some(false));
+        assert!(output.redaction_notice.is_some());
+        assert!(text.contains("todo-app:items:v1"));
+        assert!(text.contains("todo-app:filter:v1"));
+        assert!(text.contains("VITE_SECRET_TOKEN"));
+        assert!(text.contains("JWT_SECRET_KEY = '[REDACTED_SECRET]'"));
+        assert!(!text.contains("HS256_SECRET_VALUE_1234567890"));
     }
 
     #[test]
     fn read_workspace_file_preserves_benign_auth_session_storage_key() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");
-        let contents = "const sessionKey = \"s058-auth-session\";\n\
-                        localStorage.setItem(sessionKey, JSON.stringify(state));\n";
+        let contents = "const sessionStorageKey = \"s058-auth-session\";\n\
+                        localStorage.setItem(sessionStorageKey, JSON.stringify(state));\n";
         fs::write(file_path, contents).expect("workspace file should be written");
         let input = WorkspaceReadFileInput {
             path: "app.js".to_owned(),
