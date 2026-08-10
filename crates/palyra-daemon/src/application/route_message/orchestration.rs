@@ -110,6 +110,60 @@ const MAX_ROUTE_PROVIDER_SUPERSESSION_RETRIES: u8 = 1;
 /// Route-message runs keep a surface-owned 15-minute wall-clock budget.
 const ROUTE_MESSAGE_WALL_CLOCK_BUDGET_MS: u64 = 15 * 60 * 1_000;
 
+fn with_routed_attachment_context(
+    text: &str,
+    attachments: &[common_v1::MessageAttachment],
+) -> String {
+    if attachments.is_empty() {
+        return text.to_owned();
+    }
+    let mut lines = Vec::with_capacity(attachments.len().saturating_add(1));
+    lines.push("[attachment-metadata]".to_owned());
+    for (index, attachment) in attachments.iter().enumerate() {
+        let kind =
+            match common_v1::message_attachment::AttachmentKind::try_from(attachment.kind).ok() {
+                Some(common_v1::message_attachment::AttachmentKind::Image) => "image",
+                Some(common_v1::message_attachment::AttachmentKind::File) => "file",
+                Some(common_v1::message_attachment::AttachmentKind::Audio) => "audio",
+                Some(common_v1::message_attachment::AttachmentKind::Video) => "video",
+                _ => "unspecified",
+            };
+        let filename = non_empty_or_unknown(attachment.filename.as_str());
+        let content_type = non_empty_or_unknown(attachment.declared_content_type.as_str());
+        let source = attachment
+            .artifact_id
+            .as_ref()
+            .map(|value| value.ulid.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| non_empty_or_unknown(attachment.source_url.as_str()));
+        let size = if attachment.size_bytes > 0 {
+            attachment.size_bytes.to_string()
+        } else {
+            "unknown".to_owned()
+        };
+        lines.push(format!(
+            "- {}: kind={kind}, filename={filename}, content_type={content_type}, size_bytes={size}, source={source}",
+            index.saturating_add(1)
+        ));
+    }
+    let metadata = lines.join("\n");
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        metadata
+    } else {
+        format!("{trimmed}\n\n{metadata}")
+    }
+}
+
+fn non_empty_or_unknown(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "unknown"
+    } else {
+        trimmed
+    }
+}
+
 fn route_message_status_tape_payload(state: RunLifecycleState, message: &str) -> String {
     match state {
         RunLifecycleState::Done => json!({
@@ -468,6 +522,10 @@ pub(crate) async fn handle_routed_route_message(
     plan.binding_kind = Some(binding_outcome.record.binding_kind.as_str().to_owned());
     plan.binding_expires_at_unix_ms = binding_outcome.record.expires_at_unix_ms;
     plan.binding_reason = Some(binding_outcome.reason.clone());
+    // Attachment metadata is model context only. Construct it after the router
+    // has evaluated mentions against the original message body.
+    let routed_input_text =
+        with_routed_attachment_context(input.text.as_str(), content.attachments.as_slice());
     let (input_is_command, input_urgent_stop) =
         match ChannelCommandRegistry::builtin().parse_text(input.text.as_str()) {
             ChannelCommandParseOutcome::Parsed(invocation) => (
@@ -491,10 +549,10 @@ pub(crate) async fn handle_routed_route_message(
         conversation_id: input.conversation_id.clone(),
         thread_id: plan.reply_thread_id.clone().or_else(|| input.adapter_thread_id.clone()),
         sender_identity: plan.sender_identity.clone(),
-        text: input.text.clone(),
+        text: routed_input_text.clone(),
         max_coalesced_text_bytes: usize::try_from(input.max_payload_bytes)
             .unwrap_or(usize::MAX)
-            .max(input.text.len())
+            .max(routed_input_text.len())
             .max(1),
         received_at_unix_ms: current_unix_ms(),
         has_media: !content.attachments.is_empty(),
@@ -574,7 +632,7 @@ pub(crate) async fn handle_routed_route_message(
         .as_ref()
         .map(|coalesced| coalesced.text.trim().to_owned())
         .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| input.text.clone());
+        .unwrap_or(routed_input_text);
     if let Some(active_run) = active_session_run {
         let active_run_id = active_run.run_id;
         let requested_mode =

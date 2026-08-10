@@ -28,6 +28,21 @@ struct BlockingRouteProvider {
     status: ProviderStatusSnapshot,
 }
 
+#[test]
+fn attachment_context_is_added_only_after_route_admission() {
+    let attachment = common_v1::MessageAttachment {
+        kind: common_v1::message_attachment::AttachmentKind::File as i32,
+        filename: "@palyra.txt".to_owned(),
+        source_url: "https://example.test/@palyra.txt".to_owned(),
+        ..Default::default()
+    };
+
+    let routed = with_routed_attachment_context("plain body", &[attachment]);
+
+    assert!(routed.starts_with("plain body\n\n[attachment-metadata]"));
+    assert!(routed.contains("filename=@palyra.txt"));
+}
+
 impl ModelProvider for BlockingRouteProvider {
     fn complete<'a>(
         &'a self,

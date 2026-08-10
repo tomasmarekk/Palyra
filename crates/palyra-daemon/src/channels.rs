@@ -56,9 +56,7 @@ mod gateway_auth;
 mod media;
 mod proto;
 
-use attachments::{
-    prepare_outbound_attachments, preprocess_discord_inbound_attachments, with_attachment_context,
-};
+use attachments::{prepare_outbound_attachments, preprocess_discord_inbound_attachments};
 use defaults::{
     default_connector_specs, media_content_root_from_connector_db_path,
     media_db_path_from_connector_db_path, route_message_max_payload_bytes, unix_ms_now,
@@ -1105,8 +1103,7 @@ impl ConnectorRouter for GrpcChannelRouter {
         } else {
             event.attachments.clone()
         };
-        let content_text = with_attachment_context(event.body.as_str(), attachments.as_slice());
-        let message_attachments = to_proto_message_attachments(attachments.as_slice());
+        let content = inbound_message_content(event.body.as_str(), attachments.as_slice());
         let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(
             self.grpc_url.clone(),
         )
@@ -1130,10 +1127,7 @@ impl ConnectorRouter for GrpcChannelRouter {
                     // gates that require verification reject them.
                     sender_verified: discord_connector,
                 }),
-                content: Some(common_v1::MessageContent {
-                    text: content_text.clone(),
-                    attachments: message_attachments,
-                }),
+                content: Some(content),
                 security: None,
                 max_payload_bytes: route_message_max_payload_bytes(
                     &ConnectorSupervisorConfig::default(),
@@ -1217,6 +1211,16 @@ impl ConnectorRouter for GrpcChannelRouter {
     }
 }
 
+fn inbound_message_content(
+    body: &str,
+    attachments: &[palyra_connectors::AttachmentRef],
+) -> common_v1::MessageContent {
+    common_v1::MessageContent {
+        text: body.to_owned(),
+        attachments: to_proto_message_attachments(attachments),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use palyra_connectors::{
@@ -1225,12 +1229,11 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::attachments::render_attachment_context;
     use super::{
         default_connector_specs, discord, discord_connector_id, discord_token_vault_ref,
-        from_proto_a2ui_update, normalize_discord_account_id, parse_positive_i64_env,
-        parse_positive_u32_env, resolve_connector_gateway_auth, route_message_max_payload_bytes,
-        to_proto_message_attachments, with_attachment_context, ChannelPlatform,
+        from_proto_a2ui_update, inbound_message_content, normalize_discord_account_id,
+        parse_positive_i64_env, parse_positive_u32_env, resolve_connector_gateway_auth,
+        route_message_max_payload_bytes, to_proto_message_attachments, ChannelPlatform,
         ChannelPlatformError,
     };
     use crate::gateway::GatewayAuthConfig;
@@ -1320,31 +1323,21 @@ mod tests {
     }
 
     #[test]
-    fn attachment_context_block_preserves_text_and_metadata_fields() {
-        let text = with_attachment_context(
+    fn attachment_metadata_stays_out_of_routing_text() {
+        let content = inbound_message_content(
             "user message",
             &[AttachmentRef {
                 kind: AttachmentKind::Image,
-                url: Some("https://cdn.discordapp.com/a.png".to_owned()),
+                url: Some("https://cdn.discordapp.com/@palyra.png".to_owned()),
                 artifact_ref: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
-                filename: Some("a.png".to_owned()),
+                filename: Some("@palyra.png".to_owned()),
                 content_type: Some("image/png".to_owned()),
                 size_bytes: Some(512),
                 ..AttachmentRef::default()
             }],
         );
-        assert!(
-            text.contains("[attachment-metadata]"),
-            "attachment context marker must be appended when attachments are present"
-        );
-        assert!(
-            text.contains("filename=a.png"),
-            "attachment filename should be represented in metadata block"
-        );
-        assert!(
-            text.starts_with("user message"),
-            "original message text should stay at the beginning"
-        );
+        assert_eq!(content.text, "user message");
+        assert_eq!(content.attachments[0].filename, "@palyra.png");
     }
 
     #[test]
@@ -1400,14 +1393,6 @@ mod tests {
             }))
             .is_none(),
             "empty A2UI patch_json should be rejected"
-        );
-    }
-
-    #[test]
-    fn attachment_context_renderer_returns_none_for_empty_slice() {
-        assert!(
-            render_attachment_context(&[]).is_none(),
-            "empty attachment list should not emit metadata block"
         );
     }
 

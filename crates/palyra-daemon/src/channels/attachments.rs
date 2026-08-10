@@ -2,13 +2,12 @@
 //!
 //! Ingests inbound Discord attachments into the media store, enforces the
 //! outbound upload policy (enablement, content-type allowlist, size cap)
-//! by neutralizing -- never erroring on -- violating attachments, and
-//! renders the attachment-metadata context block appended to inbound text.
+//! by neutralizing -- never erroring on -- violating attachments.
 
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use palyra_connectors::{AttachmentKind, AttachmentRef, InboundMessageEvent, OutboundAttachment};
+use palyra_connectors::{AttachmentRef, InboundMessageEvent, OutboundAttachment};
 
 use crate::media::{InboundAttachmentIngestRequest, MediaArtifactStore};
 
@@ -176,67 +175,5 @@ fn block_outbound_upload_attachment(
         attachment.artifact_ref.as_deref(),
         attachment.filename.as_deref(),
         reason,
-    )
-}
-
-/// Appends the attachment-metadata block to the message text so the model
-/// sees what was attached; returns the text unchanged when there are no
-/// attachments.
-pub(super) fn with_attachment_context(text: &str, attachments: &[AttachmentRef]) -> String {
-    let Some(summary) = render_attachment_context(attachments) else {
-        return text.to_owned();
-    };
-    let trimmed = text.trim_end();
-    if trimmed.is_empty() {
-        summary
-    } else {
-        format!("{trimmed}\n\n{summary}")
-    }
-}
-
-/// Renders the `[attachment-metadata]` summary block, one line per
-/// attachment; `None` for an empty slice.
-pub(super) fn render_attachment_context(attachments: &[AttachmentRef]) -> Option<String> {
-    if attachments.is_empty() {
-        return None;
-    }
-    let mut lines = Vec::with_capacity(attachments.len().saturating_add(1));
-    lines.push("[attachment-metadata]".to_owned());
-    for (index, attachment) in attachments.iter().enumerate() {
-        lines.push(format!("- {}: {}", index.saturating_add(1), summarize_attachment(attachment)));
-    }
-    Some(lines.join("\n"))
-}
-
-fn summarize_attachment(attachment: &AttachmentRef) -> String {
-    let kind = match attachment.kind {
-        AttachmentKind::Image => "image",
-        AttachmentKind::File => "file",
-    };
-    let source = attachment
-        .url
-        .as_deref()
-        .or(attachment.artifact_ref.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
-    let filename = attachment
-        .filename
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
-    let content_type = attachment
-        .content_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
-    let size = attachment
-        .size_bytes
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    format!(
-        "kind={kind}, filename={filename}, content_type={content_type}, size_bytes={size}, source={source}"
     )
 }
