@@ -1127,13 +1127,13 @@ async fn navigate_with_guards_does_not_replay_cookie_header_to_cross_host_redire
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn navigate_with_guards_truncates_oversized_successful_response() {
+async fn navigate_with_guards_rejects_oversized_successful_response() {
     let (url, handle) = spawn_chunked_http_server(
         200,
         &["<html><head><title>Oversized</title></head>", "<body>very ", "large</body></html>"],
     );
     let outcome = navigate_with_guards(url.as_str(), 2_000, true, 3, true, 16, None).await;
-    assert!(outcome.success, "oversized successful page should still navigate");
+    assert!(!outcome.success, "oversized responses must fail the navigation preflight");
     assert!(
         outcome.error.contains("max_response_bytes"),
         "size limit warning should be explicit: {}",

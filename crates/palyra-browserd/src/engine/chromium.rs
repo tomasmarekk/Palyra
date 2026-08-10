@@ -4865,6 +4865,7 @@ pub(crate) async fn navigate_tab_with_chromium(
     }
     let body_bytes = snapshot.page_body.len() as u64;
     let page_body = if body_bytes > params.max_response_bytes {
+        outcome.success = false;
         if outcome.error.is_empty() {
             outcome.error = format!(
                 "response exceeds max_response_bytes ({} > {}); page_body truncated",
