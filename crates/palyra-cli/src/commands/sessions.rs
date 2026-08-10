@@ -2,8 +2,8 @@
 //! retry/branch, transcript search/export, compaction, checkpoints, and background tasks.
 //!
 //! Mixes the gateway gRPC operator runtime (session resolution, runs) with the admin
-//! console HTTP API (queue, compaction, checkpoints, background tasks). Text output
-//! preserves command identifiers needed for resume/debug while redacting free-form labels.
+//! console HTTP API (queue, compaction, checkpoints, background tasks). Every output
+//! mode redacts reusable identifiers and user-routing labels.
 
 use crate::*;
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -80,7 +80,7 @@ pub(crate) async fn run_sessions_async(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "sessions": response.sessions.iter().map(session_to_json).collect::<Vec<_>>(),
-                        "next_after_session_key": empty_to_json_or_null(
+                        "next_after_session_key": redacted_text_json_or_null(
                             response.next_after_session_key.as_str()
                         ),
                         "include_archived": include_archived,
@@ -1202,9 +1202,9 @@ fn session_id_matches(session: &gateway_v1::SessionSummary, expected: &str) -> b
 
 fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
     json!({
-        "session_id": optional_canonical_id_json_value(&session.session_id),
-        "session_key": empty_to_json_or_null(session.session_key.as_str()),
-        "session_label": empty_to_json_or_null(session.session_label.as_str()),
+        "session_id": redacted_canonical_id_json_value(&session.session_id),
+        "session_key": redacted_text_json_or_null(session.session_key.as_str()),
+        "session_label": redacted_text_json_or_null(session.session_label.as_str()),
         "title": empty_to_json_or_null(session.title.as_str()),
         "title_source": empty_to_json_or_null(session.title_source.as_str()),
         "title_generator_version": empty_to_json_or_null(session.title_generator_version.as_str()),
@@ -1214,22 +1214,17 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
         "last_summary": empty_to_json_or_null(session.last_summary.as_str()),
         "match_snippet": empty_to_json_or_null(session.match_snippet.as_str()),
         "branch_state": empty_to_json_or_null(session.branch_state.as_str()),
-        "parent_session_id": optional_canonical_id_json_value(&session.parent_session_id),
+        "parent_session_id": redacted_canonical_id_json_value(&session.parent_session_id),
         "last_run_state": empty_to_json_or_null(session.last_run_state.as_str()),
         "created_at_unix_ms": session.created_at_unix_ms,
         "updated_at_unix_ms": session.updated_at_unix_ms,
-        "last_run_id": optional_canonical_id_json_value(&session.last_run_id),
+        "last_run_id": redacted_canonical_id_json_value(&session.last_run_id),
         "archived_at_unix_ms": empty_unix_ms(session.archived_at_unix_ms),
     })
 }
 
-fn optional_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
-    value
-        .as_ref()
-        .map(|id| id.ulid.trim())
-        .filter(|ulid| !ulid.is_empty())
-        .map(|ulid| Value::String(ulid.to_owned()))
-        .unwrap_or(Value::Null)
+fn redacted_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
+    redacted_identifier_json_value(value.as_ref().map(|id| id.ulid.as_str()))
 }
 
 fn redacted_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String {
@@ -1238,8 +1233,8 @@ fn redacted_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String 
     )
 }
 
-// Identifiers, labels, and reasons can all carry user-routing content, so
-// human-facing renderers expose only presence while structured output stays explicit.
+// Identifiers, labels, and reasons can all carry user-routing content, so every
+// renderer exposes presence only.
 fn redacted_text_or_none(present: bool) -> String {
     redacted_presence_for_output(present)
 }
@@ -1770,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn session_json_preserves_command_identifiers_and_label() {
+    fn session_json_redacts_command_identifiers_and_label() {
         let session = gateway_v1::SessionSummary {
             session_id: Some(common_v1::CanonicalId {
                 ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
@@ -1787,25 +1782,16 @@ mod tests {
         };
         let payload = session_to_json(&session);
 
-        assert_eq!(
-            payload.get("session_id").and_then(serde_json::Value::as_str),
-            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
-        );
-        assert_eq!(
-            payload.get("session_key").and_then(serde_json::Value::as_str),
-            Some("onboarding-smoke")
-        );
+        assert_eq!(payload.get("session_id").and_then(serde_json::Value::as_str), Some(REDACTED));
+        assert_eq!(payload.get("session_key").and_then(serde_json::Value::as_str), Some(REDACTED));
         assert_eq!(
             payload.get("parent_session_id").and_then(serde_json::Value::as_str),
-            Some("01ARZ3NDEKTSV4RRFFQ69G5FAW")
+            Some(REDACTED)
         );
-        assert_eq!(
-            payload.get("last_run_id").and_then(serde_json::Value::as_str),
-            Some("01ARZ3NDEKTSV4RRFFQ69G5FAX")
-        );
+        assert_eq!(payload.get("last_run_id").and_then(serde_json::Value::as_str), Some(REDACTED));
         assert_eq!(
             payload.get("session_label").and_then(serde_json::Value::as_str),
-            Some("Sensitive user label")
+            Some(REDACTED)
         );
     }
 
