@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use palyra_model_providers::provider_request_has_vision;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
@@ -550,6 +551,7 @@ pub(crate) fn context_recovery_input_for_request(
         .filter(|model| {
             model.enabled && model.role == "chat" && model.provider_id == selected_provider_id
         })
+        .filter(|model| model_supports_recovery_request(request, &model.capabilities))
         .filter_map(|model| {
             let context_window_tokens = u64::from(model.capabilities.max_context_tokens?);
             (context_window_tokens > provider_limit_tokens).then_some(ContextRouteFallback {
@@ -724,6 +726,14 @@ fn recover_provider_request(
             });
         }
     }
+}
+
+fn model_supports_recovery_request(
+    request: &ProviderRequest,
+    capabilities: &crate::model_provider::ProviderCapabilitiesSnapshot,
+) -> bool {
+    (!request.json_mode || capabilities.json_mode)
+        && (!provider_request_has_vision(request) || capabilities.vision)
 }
 
 fn cost_tier_rank(tier: &str) -> u8 {
@@ -914,11 +924,15 @@ pub(crate) fn reduce_optional_context(
 #[cfg(test)]
 mod tests {
     use super::{
-        reduce_optional_context, truncate_old_tool_tails, ContextRecoveryAction,
-        ContextRecoveryBudget, ContextRecoveryController, ContextRecoveryInput,
-        ContextRouteFallback, TokenBreakdown, TokenBreakdownCategory, TokenBreakdownItem,
+        model_supports_recovery_request, reduce_optional_context, truncate_old_tool_tails,
+        ContextRecoveryAction, ContextRecoveryBudget, ContextRecoveryController,
+        ContextRecoveryInput, ContextRouteFallback, TokenBreakdown, TokenBreakdownCategory,
+        TokenBreakdownItem,
     };
-    use crate::model_provider::{ProviderMessage, ProviderMessageContentPart, ProviderMessageRole};
+    use crate::model_provider::{
+        ProviderCapabilitiesSnapshot, ProviderImageInput, ProviderMessage,
+        ProviderMessageContentPart, ProviderMessageRole, ProviderRequest,
+    };
     use serde_json::json;
 
     fn item(category: TokenBreakdownCategory, estimated_tokens: u64) -> TokenBreakdownItem {
@@ -1089,6 +1103,51 @@ mod tests {
             routed.route_fallback.as_ref().map(|route| route.model_id.as_str()),
             Some("large-window")
         );
+    }
+
+    #[test]
+    fn recovery_fallback_requires_json_and_vision_capabilities() {
+        let json_request =
+            ProviderRequest::from_input_text("json".to_owned(), true, Vec::new(), None);
+        let vision_request = ProviderRequest::from_input_text(
+            "vision".to_owned(),
+            false,
+            vec![ProviderImageInput {
+                mime_type: "image/png".to_owned(),
+                bytes_base64: "AA==".to_owned(),
+                file_name: None,
+                width_px: None,
+                height_px: None,
+                artifact_id: None,
+            }],
+            None,
+        );
+        let mut capabilities = ProviderCapabilitiesSnapshot {
+            streaming_tokens: true,
+            tool_calls: true,
+            json_mode: false,
+            vision: false,
+            audio_transcribe: false,
+            embeddings: false,
+            reasoning: false,
+            reasoning_efforts: Vec::new(),
+            service_tier: false,
+            service_tiers: Vec::new(),
+            max_context_tokens: Some(16_000),
+            cost_tier: "standard".to_owned(),
+            latency_tier: "standard".to_owned(),
+            recommended_use_cases: Vec::new(),
+            known_limitations: Vec::new(),
+            operator_override: false,
+            metadata_source: "test".to_owned(),
+        };
+
+        assert!(!model_supports_recovery_request(&json_request, &capabilities));
+        assert!(!model_supports_recovery_request(&vision_request, &capabilities));
+        capabilities.json_mode = true;
+        capabilities.vision = true;
+        assert!(model_supports_recovery_request(&json_request, &capabilities));
+        assert!(model_supports_recovery_request(&vision_request, &capabilities));
     }
 
     #[test]
