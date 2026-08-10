@@ -223,46 +223,18 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
     const text = String(value || "");
     return text.length > maxChars ? text.slice(0, maxChars) : text;
   };
-  const jsonPreview = (value) => {
-    const seen = new WeakSet();
-    return JSON.stringify(value, (_key, nested) => {
-      if (typeof nested === "bigint") return `${nested}n`;
-      if (typeof nested === "function") return `[Function ${nested.name || "anonymous"}]`;
-      if (typeof nested === "symbol") return String(nested);
-      if (nested instanceof Error) {
-        return {
-          name: nested.name || "Error",
-          message: nested.message || "",
-          stack: nested.stack || ""
-        };
-      }
-      if (nested && typeof nested === "object") {
-        if (seen.has(nested)) return "[Circular]";
-        seen.add(nested);
-      }
-      return nested;
-    });
-  };
   const stringify = (value) => {
     try {
-      if (typeof value === "string") return clampString(value, MAX_CONSOLE_MESSAGE_CHARS);
-      if (typeof value === "bigint") return clampString(`${value}n`, MAX_CONSOLE_MESSAGE_CHARS);
-      if (typeof value === "symbol") return clampString(String(value), MAX_CONSOLE_MESSAGE_CHARS);
-      if (value && typeof value === "object") {
-        if (value instanceof Error) {
-          return clampString(value.stack || value.message || "Error", MAX_CONSOLE_MESSAGE_CHARS);
-        }
-        const preview = jsonPreview(value);
-        if (preview && preview !== "{}") return clampString(preview, MAX_CONSOLE_MESSAGE_CHARS);
-        return clampString(Object.prototype.toString.call(value), MAX_CONSOLE_MESSAGE_CHARS);
-      }
+      const valueType = typeof value;
+      if (valueType === "string") return clampString(value, MAX_CONSOLE_MESSAGE_CHARS);
+      if (valueType === "bigint") return clampString(`${value}n`, MAX_CONSOLE_MESSAGE_CHARS);
+      if (valueType === "symbol") return clampString(String(value), MAX_CONSOLE_MESSAGE_CHARS);
+      if (valueType === "function") return "[Function]";
+      if (value === null) return "null";
+      if (valueType === "object") return Array.isArray(value) ? "[Array]" : "[Object]";
       return clampString(value, MAX_CONSOLE_MESSAGE_CHARS);
     } catch (_) {
-      try {
-        return clampString(Object.prototype.toString.call(value), MAX_CONSOLE_MESSAGE_CHARS);
-      } catch (_) {
-        return "";
-      }
+      return "[Unserializable]";
     }
   };
   const normalizeEntry = (severity, kind, message, source, stackTrace) => ({
@@ -6475,9 +6447,12 @@ mod tests {
             "diagnostics reads should not call page-overridable array slice methods"
         );
         assert!(
-            CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("JSON.stringify(value")
-                && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Circular]\""),
-            "console hook should preserve object arguments as bounded JSON previews"
+            !CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("JSON.stringify(value")
+                && !CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT
+                    .contains("Object.prototype.toString.call(value)")
+                && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Object]\"")
+                && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Array]\""),
+            "console hook must represent objects without traversing page-controlled values"
         );
     }
 
